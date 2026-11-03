@@ -147,12 +147,15 @@ abstract class Connection {
   protected declaration(): Record<string, unknown> {
     return { ...(this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}), ...(this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {}) };
   }
-  // The session's facts as `_meta`: only non-empty strings; a provider that throws sends none (absence never clears on the
-  // server). HostedClient's provider says its own failures; this guard keeps any other host's from failing the request.
+  // The session's facts as `_meta`: a non-empty string as itself, `null` as an empty string (the server clears it, #558),
+  // anything else as nothing; a provider that throws sends none (absence never clears on the server). HostedClient's
+  // provider says its own failures; this guard keeps any other host's from failing the request.
   protected facts(sessionID: string): Record<string, string> {
     let f: SessionFacts | undefined;
     try { f = this.wireOptions.facts?.(sessionID); } catch { return {}; }
-    return { ...(typeof f?.model === "string" && f.model ? { [MODEL_META]: f.model } : {}), ...(typeof f?.effort === "string" && f.effort ? { [EFFORT_META]: f.effort } : {}) };
+    const wire = (v: unknown) => v === null ? "" : typeof v === "string" && v ? v : undefined;
+    const model = wire(f?.model), effort = wire(f?.effort);
+    return { ...(model === undefined ? {} : { [MODEL_META]: model }), ...(effort === undefined ? {} : { [EFFORT_META]: effort }) };
   }
   // An abort of this wire's own signal is the controller stopping, never an outage.
   protected async reachable<T>(pending: Promise<T>): Promise<T> {

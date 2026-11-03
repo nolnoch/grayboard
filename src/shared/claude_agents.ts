@@ -74,7 +74,13 @@ function putFact(dir: string, fact: Fact, value: unknown) {
   put(join(dir, fact), value);
 }
 
+// Unknown: the reader sends nothing, so the server keeps its last value.
 const dropFact = (dir: string, fact: Fact) => rmSync(join(dir, fact), { force: true });
+// None (an empty file): the reader sends a clear (#558).
+function noFact(dir: string, fact: Fact) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  put(join(dir, fact), "");
+}
 
 // Write through a temporary name, so a reader never sees a partial file.
 function put(path: string, text: string) {
@@ -122,11 +128,12 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       put(join(dir, id), content);
       pruneRecords(dir, now);
-      // The root's effort, which the call this record names carries.
-      // None means the model has no effort level, so the old one goes.
+      // The root's effort, which the call this record names carries. None means
+      // the model has no effort level: an empty file, which the reader sends as
+      // a clear (#558); a removed file is only "unknown" and keeps the server's.
       if (o.hosted && content === ROOT) {
         const level = (input.effort as { level?: unknown } | undefined)?.level;
-        if (level === undefined) dropFact(dir, "effort");
+        if (level === undefined) noFact(dir, "effort");
         else putFact(dir, "effort", level);
       }
     } else if (event === "model-switch") {
@@ -251,22 +258,25 @@ function readSmall(path: string, max: number): string {
 /**
  * The root's latest facts in `claudePid`'s dir, read whole per request: none
  * without a SessionStart record or for a recycled pid's dir, and only the
- * facts a hook wrote. A fact file that can't be read or isn't one is left out
- * and passed to `bad` (the caller says it), so the other fact still goes.
+ * facts a hook wrote: an empty file is `null` (the host has none, #558), a
+ * missing one is left out (unknown). A fact file that can't be read or isn't
+ * one is left out and passed to `bad` (the caller says it), so the other fact
+ * still goes.
  */
-export function readFacts(base: string, claudePid: number, harnessStart: string | null, bad: (fact: Fact, error: string) => void): { model?: string; effort?: string } | undefined {
+export function readFacts(base: string, claudePid: number, harnessStart: string | null, bad: (fact: Fact, error: string) => void): { model?: string | null; effort?: string | null } | undefined {
   const dir = sessionDir(base, claudePid);
   let start: string;
   try { start = readFileSync(join(dir, "start"), "utf8"); } catch { return undefined; }
   if (harnessStart !== null && start !== "" && start !== harnessStart) return undefined;
-  const out: { model?: string; effort?: string } = {};
+  const out: { model?: string | null; effort?: string | null } = {};
   for (const fact of FACTS) {
     let value: string;
     try { value = readSmall(join(dir, fact), SESSION_FACT_MAX + 1); } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") bad(fact, `couldn't read ${join(dir, fact)}: ${(e as Error).message}`);
       continue;
     }
-    if (validFact(value)) out[fact] = value;
+    if (value === "") out[fact] = null;
+    else if (validFact(value)) out[fact] = value;
     else bad(fact, `${join(dir, fact)} isn't a Claude Code ${fact}`);
   }
   return out;

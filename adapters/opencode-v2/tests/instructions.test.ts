@@ -174,7 +174,7 @@ test("the native fetcher names the root on a native connection with the launcher
   }
 });
 
-// Each session's model as its latest context request used it (#364): `providerID/id`, the variant as effort; a request
+// Each session's model as its latest context request used it (#364): `providerID/id`, the variant as effort, none (null, a clear: #558) without one; a request
 // with no model leaves what was noted; past 256 sessions the least recently noted is forgotten.
 test("the controller keeps each session's latest model for its wires, for the 256 most recent sessions", async () => {
   const f = fixture();
@@ -185,13 +185,13 @@ test("the controller keeps each session's latest model for its wires, for the 25
     controller.noteModel("R", { providerID: "anthropic", id: "claude-opus-5-5", variant: "high" });
     controller.noteModel("S", { providerID: "openai", id: "gpt-6" });
     expect(facts("R")).toEqual({ model: "anthropic/claude-opus-5-5", effort: "high" });
-    expect(facts("S")).toEqual({ model: "openai/gpt-6" });
+    expect(facts("S")).toEqual({ model: "openai/gpt-6", effort: null });
     controller.noteModel("R", undefined);
     expect(facts("R")).toEqual({ model: "anthropic/claude-opus-5-5", effort: "high" });
     controller.noteModel("R", { providerID: "anthropic", id: "claude-sonnet-5-5" });
     for (let i = 0; i < 255; i++) controller.noteModel(`X${i}`, { providerID: "p", id: `m${i}` });
     expect(facts("S")).toBeUndefined();
-    expect(facts("R")).toEqual({ model: "anthropic/claude-sonnet-5-5" });
+    expect(facts("R")).toEqual({ model: "anthropic/claude-sonnet-5-5", effort: null });
   } finally { await controller.close(); }
 });
 

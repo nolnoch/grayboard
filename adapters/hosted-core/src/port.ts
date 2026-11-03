@@ -8,7 +8,9 @@ export type Configuration = { type: "remote"; url: string; issuer: string; clien
 // `held`: the root's holds as full addresses, oldest first; the first is the one it sends as (#451).
 export type Enrollment = { version: 2; sessionID: string; configuration: Configuration; held?: string[] };
 export type Delivery = { mode: "push" | "poll"; source: string };
-export type SessionFacts = { model?: string; effort?: string };
+// A fact's three states (#558): a string is the value, `null` is "the host has none" (sent as an empty string, which
+// clears the server's), and absent is "unknown" (sent as nothing, which keeps it).
+export type SessionFacts = { model?: string | null; effort?: string | null };
 
 export interface KeyValueStorage { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> }
 

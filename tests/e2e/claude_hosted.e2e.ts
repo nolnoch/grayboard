@@ -32,6 +32,8 @@ const SOURCE = "plugin:grayboard:grayboard";
 const TOOL = (name: string) => `mcp__plugin_grayboard_grayboard__${name}`;
 const TAG = process.env.GRAYBOARD_E2E_TAG;
 const SHA = process.env.GRAYBOARD_E2E_SHA;
+// A model the pinned Claude Code runs without an effort level: its root PreToolUse carries no `effort`.
+const NO_EFFORT = "claude-haiku-4-5";
 
 let bin: string;
 let dir: string;
@@ -116,12 +118,13 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
   }
 }, 240_000);
 
-test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort (#545), after /effort, a confirmed /model switch and /clear`, async () => {
+test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort (#545), after /effort, a confirmed /model switch and /clear, and clears the effort on a model without one (#558)`, async () => {
   const srv = hostedServer();
   const model = startFakeAnthropic([
     onUserText("FACTS-1", SOURCE, TOOL("bind"), { name: "facts", create: true }),
     onUserText("FACTS-2", SOURCE, TOOL("whoami"), {}),
     onUserText("FACTS-3", SOURCE, TOOL("whoami"), {}),
+    onUserText("FACTS-4", SOURCE, TOOL("whoami"), {}),
   ]);
   const home = join(dir, "facts");
   const h = claudeHome(home, model.url, ["mcp__plugin_grayboard_grayboard"]);
@@ -133,6 +136,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort 
     const t = tty;
     const facts = () => srv.app.db.query<{ model: string | null; effort: string | null }, []>(
       "SELECT i.model, i.effort FROM hosted_sessions s JOIN ids i ON i.id = s.session_id WHERE s.root_session_id IS NULL").all();
+    const changes = () => srv.app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'id.facts_changed' ORDER BY id").all().map((r) => r.detail);
     // A slash command, typed, then answered; `seen` is what the screen shows once it ran.
     const slash = async (command: string, seen: string, confirm?: string) => {
       const mark = t.screen().length;
@@ -158,10 +162,19 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort 
     expect(facts()).toEqual([{ model: "claude-sonnet-5-5", effort: "high" }]);
 
     // /clear: the plugin's root continues, and SessionStart(clear) reports the model it continues on.
+    const changedBefore = changes();
     await t.submit("/clear");
     await t.submit("FACTS-3");
     await until(() => toolResults(model, "toolu_FACTS_3").length > 0, 60_000, "the whoami after /clear");
     expect(facts()).toEqual([{ model: "claude-sonnet-5-5", effort: "high" }]);
+    // Every root grayboard call carries the effort, so repeated calls never clear and restore it (#558).
+    expect(changes()).toEqual(changedBefore);
+
+    // A model without effort: the root's next call says none, and the server clears it (#558).
+    await slash(`/model ${NO_EFFORT}`, "Set model to", "Switch model?");
+    await t.submit("FACTS-4");
+    await until(() => toolResults(model, "toolu_FACTS_4").length > 0, 60_000, `the whoami on ${NO_EFFORT}`);
+    expect(facts()).toEqual([{ model: NO_EFFORT, effort: null }]);
     expect(model.unhandled).toEqual([]);
   } finally {
     await tty?.stop();

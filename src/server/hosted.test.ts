@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { openDatabase } from "./db.ts";
-import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, sessionContext } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, sessionContext, withoutFacts } from "./hosted.ts";
 import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
@@ -606,11 +606,43 @@ test("a request's model and effort are the session's latest: registered, updated
   ]);
 });
 
-test("a model or effort that isn't a string is refused, an empty one is none, and format characters and length are cut when stored (#364)", async () => {
+test("an empty model or effort clears the stored one, audited once; an absent key keeps it; a first request or a new ownership with one stores none (#558)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = (extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "facts-clear", ...extra });
+  const id = (ctx() as { id: string }).id;
+  const facts = () => database.db.prepare("SELECT model, effort FROM ids WHERE id = ?").get(id);
+  const audit = (action: string) => database.db.query<{ detail: string }, [string, string]>("SELECT detail FROM access_log WHERE action = ? AND target = ?").all(action, id).map(r => JSON.parse(r.detail));
+  // A first request's empty effort registers none, with no change row.
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_MODEL_META]: "claude-opus-5-5", [GRAYBOARD_EFFORT_META]: "" }));
+  expect(facts()).toEqual({ model: "claude-opus-5-5", effort: null });
+  expect(audit("id.registered")).toEqual([{ harness: expect.any(String), model: "claude-opus-5-5" }]);
+  expect(audit("id.facts_changed")).toEqual([]);
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_EFFORT_META]: "high" }));
+  // Absent keeps it; empty clears it, once.
+  await hosted.whoami(generic, ctx());
+  expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "high" });
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_EFFORT_META]: "" }));
+  expect(facts()).toEqual({ model: "claude-opus-5-5", effort: null });
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_EFFORT_META]: "" }));
+  expect(audit("id.facts_changed")).toEqual([
+    { before: { model: "claude-opus-5-5", effort: null }, after: { model: "claude-opus-5-5", effort: "high" }, why: "request" },
+    { before: { model: "claude-opus-5-5", effort: "high" }, after: { model: "claude-opus-5-5", effort: null }, why: "request" },
+  ]);
+  // A new ownership's first request with an empty model stores none.
+  await hosted.end(generic, ctx());
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_MODEL_META]: "", [GRAYBOARD_EFFORT_META]: "low" }));
+  expect(facts()).toEqual({ model: null, effort: "low" });
+  expect(audit("id.facts_changed").at(-1)).toEqual({ before: { model: "claude-opus-5-5", effort: null }, after: { model: null, effort: "low" }, why: "ownership" });
+  // A legacy replay never carries a clear.
+  expect(withoutFacts({ [GRAYBOARD_SESSION_META]: "r", [GRAYBOARD_EFFORT_META]: "" })).toEqual({ [GRAYBOARD_SESSION_META]: "r" });
+});
+
+test("a model or effort that isn't a string is refused, an empty one is a clear, and format characters and length are cut when stored (#364)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = (extra: Record<string, unknown>) => ({ [GRAYBOARD_SESSION_META]: "facts-bad", ...extra });
   expect(() => sessionContext(generic, meta({ [GRAYBOARD_MODEL_META]: 5 }))).toThrow(`_meta["${GRAYBOARD_MODEL_META}"] must be a string`);
-  expect(sessionContext(generic, meta({ [GRAYBOARD_MODEL_META]: "" }))).not.toHaveProperty("facts");
+  // An empty one is a clear (#558), kept so the server can tell it from an absent key.
+  expect(sessionContext(generic, meta({ [GRAYBOARD_MODEL_META]: "" }))).toMatchObject({ facts: { model: "" } });
   // Any client's facts are read, not only a generic key's.
   expect(sessionContext(principal, { [OPENCODE_SESSION_META]: "root", [GRAYBOARD_EFFORT_META]: "low" })).toMatchObject({ facts: { effort: "low" } });
   const ctx = sessionContext(generic, meta({ [GRAYBOARD_MODEL_META]: `a\u202eb\u2066c\u200e\u200b\n${"x".repeat(200)}` }));

@@ -837,7 +837,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (db.prepare(`UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1`).run(id).changes) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
-    // before and after, only when one changed. Absent fields keep the stored value.
+    // before and after, only when one changed. Absent fields keep the stored value; an empty one clears it (#558).
     hostedFacts(authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
       const changed = setIdFacts(db, id, facts);
       if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "request" });
