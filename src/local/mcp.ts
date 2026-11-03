@@ -51,8 +51,10 @@ import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
 import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, detachSession, endLocalSession, keyedHarness, liveSessions, registerSession, releaseName, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
+import { MISSING_TEXT, TOOL_USE_META, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
+import { hooksDisabledBy, recordHookInstalled } from "../cli/claude_hooks.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
-import { isAlive, launcherName } from "../shared/proc.ts";
+import { isAlive, launcherName, procStart } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { LateCancels } from "../shared/latecancel.ts";
@@ -181,6 +183,20 @@ if (CHANNELS_OFF) console.error(`[grayboard] Claude Code channels are off (${CHA
 // Notifications such a session drops would still count as delivered, so it
 // runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
 const DELIVER = PUSH && !CHANNELS_OFF;
+
+// Claude Code subagents (#551): Claude Code tells this server only a call's
+// tool_use_id, and grayboard's PreToolUse hook records which agent made it.
+// Read once at start: whether that hook is in user settings, and the harness
+// the records are kept under (the pid bindings hold; its start time catches a
+// recycled pid). Without the hook (settings from before it), calls act as the
+// root, audited once and said in the instructions and whoami.
+const UNDER_CLAUDE = process.env.CLAUDECODE === "1";
+const CLAUDE_HARNESS = UNDER_CLAUDE && recordHookInstalled()
+  ? { pid: HARNESS?.pid ?? process.ppid, start: HARNESS ? HARNESS.proc_start : procStart(process.ppid) ?? null }
+  : null;
+const ATTRIBUTION_OFF = UNDER_CLAUDE && CLAUDE_HARNESS === null;
+const ATTRIBUTION_OFF_NOTE = "Claude Code subagent attribution is off: grayboard's hooks aren't in Claude Code's user settings, so subagents' calls act as this session. Run `grayboard update` (or `grayboard setup`) and restart Claude Code.";
+let attributionOffAudited = false;
 
 // The names this session holds, oldest first (#284 S1): the first is its
 // primary, which it sends as. bind() and unbind() change it, only between
@@ -373,7 +389,7 @@ const mcp = new Server(
       tools: {},
     },
     // Unbound: the session acts as its ID, with a line on binding a name.
-    instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...localInstructions(true, startNotes)].join(" "),
+    instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" "),
   },
 );
 
@@ -427,14 +443,36 @@ const late = new LateCancels();
 let shuttingDown = false;
 let sessionEnded = false;
 const calls = new Set<Promise<unknown>>();
+// A Claude Code call with no usable subagent record (#551 §3): refused and
+// audited, never run as the root; the cause names a settings layer that turns
+// hooks off when one does.
+function recordMissing(tool: string, toolUseId: unknown, cause: MissingCause) {
+  const layer = hooksDisabledBy(process.cwd());
+  writeCoreAudit(db, "claude.agent_record_missing", SESSION_ID, null, { tool_use_id: String(toolUseId).slice(0, 128), tool, cause, ...(layer ? { layer } : {}) });
+  const why = layer ? `${MISSING_TEXT[cause]}; ${layer}` : MISSING_TEXT[cause];
+  return { ...text(`error: grayboard can't tell which Claude Code agent made this call (${why}), so it didn't run. Rerun \`grayboard setup\` and restart Claude Code.`), isError: true };
+}
 // The child sessions this process has seen within the idle window (#523).
 const children = new ChildSessions(db, SESSION_ID, SESSION_KEY);
 mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
   if (shuttingDown) return { ...text("error: this session is ending"), isError: true };
   // A harness subagent's call (#523): harness-asserted, it makes the call the
-  // subagent's child session, acting under this session's addresses.
-  const agent = req.params._meta?.[GRAYBOARD_AGENT_META];
+  // subagent's child session, acting under this session's addresses. Claude
+  // Code names the agent only through its hook's record (#551): a root marker
+  // leaves the call the root's, and a missing record refuses it.
+  const meta = req.params._meta;
+  let agent: unknown = meta?.[GRAYBOARD_AGENT_META];
+  if (agent === undefined && meta?.[TOOL_USE_META] !== undefined) {
+    if (CLAUDE_HARNESS) {
+      const taken = takeRecord(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start, meta[TOOL_USE_META]);
+      if ("missing" in taken) return recordMissing(name, meta[TOOL_USE_META], taken.missing);
+      if (taken.agent !== null) agent = taken.agent;
+    } else if (ATTRIBUTION_OFF && !attributionOffAudited) {
+      attributionOffAudited = true;
+      writeCoreAudit(db, "claude.attribution_off", SESSION_ID, null, { tool: name });
+    }
+  }
   const run = async () => {
     for (const a of WRITES_AS ? [WRITES_AS] : held) touchAlias(db, a);
     touchId(db, SESSION_ID);
@@ -502,7 +540,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   if (name === "bind") return bind(a, signal);
   if (name === "unbind") return unbind(a, signal);
   // Local mode has one implicit scope: no principal (#284 S6).
-  if (name === "whoami") return text({ id: child ?? SESSION_ID, primary: primary(), aliases: held, principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}), ...(child !== undefined ? { root: SESSION_ID, child: true } : {}) });
+  if (name === "whoami") return text({ id: child ?? SESSION_ID, primary: primary(), aliases: held, principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}), ...(child !== undefined ? { root: SESSION_ID, child: true } : {}), ...(ATTRIBUTION_OFF ? { note: ATTRIBUTION_OFF_NOTE } : {}) });
   // The session the write is from (sender_id, author_id): the child making
   // the call, which its writes also name as `via` (#523), else this one.
   const WRITER = child ?? SESSION_ID;

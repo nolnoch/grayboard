@@ -170,11 +170,22 @@ jobs:
     with:
       suite: claude-hosted
 
+  # Real Claude Code with local-mode grayboard and its hooks: a subagent's
+  # calls act as a child session of the root, across /clear (#551).
+  claude-local:
+    name: Claude Code local children
+    permissions:
+      contents: read
+      issues: write   # e2e.yml's tracking-issue job asks for it; that job runs only on schedule
+    uses: ./.github/workflows/e2e.yml
+    with:
+      suite: claude-local
+
   # Signs SHA256SUMS with the release key, which only the `release`
   # environment holds: a v* tag run its required reviewer approves (#162).
   release:
     name: Publish release
-    needs: [build, e2e, upgrade-matrix, hosted-network, claude-hosted]
+    needs: [build, e2e, upgrade-matrix, hosted-network, claude-hosted, claude-local]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release
