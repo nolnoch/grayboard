@@ -37220,7 +37220,7 @@ var CLIENT_ID = "grayboard-claude-code";
 var SOURCE = "plugin:grayboard:grayboard";
 var ENTRY = `plugin:${CLAUDE_PLUGIN}`;
 var RESUME_HINT = "call any grayboard tool to retry";
-var LOGIN_INTERACTIVE = "open the sign-in link each grayboard tool result carries, or approve the sign-in prompt Claude Code shows";
+var LOGIN_INTERACTIVE = "open the sign-in link a grayboard tool result carries, or approve the sign-in prompt Claude Code shows";
 var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 var INSTRUCTIONS_MS = 5000;
 var FLOW_MS2 = 10 * 60000;
@@ -37281,12 +37281,12 @@ function createPlugin(o) {
       } catch (error) {
         if (prompt.withdraw.signal.aborted)
           return;
-        say(`sign-in prompt ended without an answer: ${message(error)}`);
+        say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
         throw error;
       }
-      say(`sign-in prompt answered: ${result.action}`);
-      if (result.action !== "accept")
-        throw new LoginFailed(result.action === "decline" ? "sign-in declined" : "sign-in cancelled");
+      say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action}`);
+      if (result.action === "decline")
+        throw new LoginFailed("sign-in declined");
     },
     notify: (message) => {
       say(message);
@@ -37347,19 +37347,17 @@ function createPlugin(o) {
     const { promise: link, resolve: show } = Promise.withResolvers();
     failed = undefined;
     const done = login.login(abort.signal, true).then(async () => {
-      const prompt = flow.prompt;
-      if (prompt) {
-        await server.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
-        prompt.withdraw.abort();
-      }
+      if (flow.prompt)
+        await server.createElicitationCompletionNotifier(flow.prompt.id)().catch(() => {});
       say("signed in");
       await root.credentialChanged();
     }, (error) => {
       if (abort.signal.aborted)
         return;
       failed = message(error);
-      say(`sign-in failed: ${failed}`);
+      say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
     }).finally(() => {
+      flow.prompt?.withdraw.abort();
       show(undefined);
       if (signingIn === flow)
         signingIn = undefined;
@@ -37377,6 +37375,8 @@ function createPlugin(o) {
     })]);
     if (url)
       return `open ${url} to sign in to grayboard`;
+    if (flow.abort.signal.aborted)
+      return;
     if (flow.elsewhere && signingIn === flow)
       return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
     return failed ? `sign-in failed: ${failed}` : "sign-in is starting; call a grayboard tool again for its link";

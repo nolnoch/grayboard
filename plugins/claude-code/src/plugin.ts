@@ -37,12 +37,13 @@ export const SOURCE = "plugin:grayboard:grayboard";
 export const ENTRY = `plugin:${CLAUDE_PLUGIN}` as const;
 export const RESUME_HINT = "call any grayboard tool to retry";
 // How each kind of session signs in, for AccessExpired and the instructions.
-export const LOGIN_INTERACTIVE = "open the sign-in link each grayboard tool result carries, or approve the sign-in prompt Claude Code shows";
+export const LOGIN_INTERACTIVE = "open the sign-in link a grayboard tool result carries, or approve the sign-in prompt Claude Code shows";
 export const LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 const INSTRUCTIONS_MS = 5_000;
 const FLOW_MS = 10 * 60_000;
-// How long a signed-out call waits for its sign-in link: discovery's two
-// requests time out at 10 s each, so a longer wait would only see the flow fail.
+// How long a signed-out call waits for its sign-in link: past discovery's
+// two 10 s request timeouts the server is likely down, and the result says
+// the sign-in is still starting rather than hold the call.
 const LINK_MS = 20_000;
 
 export type PluginOptions = {
@@ -94,7 +95,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   const { promise: ready, resolve: markInitialized } = Promise.withResolvers<void>();
   // The sign-in in flight: `link` resolves with its authorization URL once
   // the flow has one, or undefined if it ends first. `failed` is why the
-  // last flow ended without signing in, for the next call's result.
+  // flow ended without signing in, for the result of a call waiting on it.
   // `prompt` is its open elicitation, withdrawn once the browser answers.
   // `elsewhere` says another process's sign-in is the one in flight.
   type Flow = { abort: AbortController; done: Promise<void>; link: Promise<string | undefined>; show(url: string | undefined): void; prompt?: { id: string; withdraw: AbortController }; elsewhere?: string };
@@ -134,11 +135,13 @@ export function createPlugin(o: PluginOptions): Plugin {
       } catch (error) {
         // Withdrawn: the browser answered first, and the flow went on without it.
         if (prompt.withdraw.signal.aborted) return;
-        say(`sign-in prompt ended without an answer: ${message(error)}`);
+        say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
         throw error;
       }
-      say(`sign-in prompt answered: ${result.action}`);
-      if (result.action !== "accept") throw new LoginFailed(result.action === "decline" ? "sign-in declined" : "sign-in cancelled");
+      say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action}`);
+      // Only a decline ends the flow: Esc (cancel) may just free the keyboard
+      // from a prompt Claude Code keeps up while the user finishes the link.
+      if (result.action === "decline") throw new LoginFailed("sign-in declined");
     },
     notify: message => {
       say(message);
@@ -193,20 +196,21 @@ export function createPlugin(o: PluginOptions): Plugin {
       async () => {
         // The prompt is done either way: completed if it was accepted, and
         // withdrawn if the link in a tool result was opened instead.
-        const prompt = flow.prompt;
-        if (prompt) {
-          await server!.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
-          prompt.withdraw.abort();
-        }
+        if (flow.prompt) await server!.createElicitationCompletionNotifier(flow.prompt.id)().catch(() => {});
         say("signed in");
         await root.credentialChanged();
       },
       error => {
         if (abort.signal.aborted) return;
         failed = message(error);
-        say(`sign-in failed: ${failed}`);
+        say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
       },
-    ).finally(() => { show(undefined); if (signingIn === flow) signingIn = undefined; });
+    ).finally(() => {
+      // However the flow ended, its prompt points at a closed callback.
+      flow.prompt?.withdraw.abort();
+      show(undefined);
+      if (signingIn === flow) signingIn = undefined;
+    });
     const flow: Flow = { abort, done, link, show };
     signingIn = flow;
   };
@@ -218,6 +222,8 @@ export function createPlugin(o: PluginOptions): Plugin {
     if (!flow) return failed ? `sign-in failed: ${failed}` : undefined;
     const url = await Promise.race([flow.link, after(LINK_MS).then(() => undefined)]);
     if (url) return `open ${url} to sign in to grayboard`;
+    // Aborted: another process signed in, or this one is closing.
+    if (flow.abort.signal.aborted) return undefined;
     if (flow.elsewhere && signingIn === flow) return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
     return failed ? `sign-in failed: ${failed}` : "sign-in is starting; call a grayboard tool again for its link";
   };

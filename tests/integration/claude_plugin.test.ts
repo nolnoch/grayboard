@@ -269,7 +269,7 @@ test("sign-in by URL elicitation: offered at startup, re-offered by the next cal
   await until(() => s.elicits.length === 1, 10_000, "the startup sign-in prompt");
   expect(s.elicits[0]!.url).toStartWith(`${srv.issuer}/`);
   expect(s.elicits[0]!.message).toContain(srv.issuer);
-  await until(() => s.stderr().includes("sign-in failed: sign-in declined"), 10_000, "the decline");
+  await until(() => /sign-in failed \(elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the decline");
 
   // Two calls while signed out: one prompt between them.
   const calls = await Promise.all([texts(s, "whoami"), texts(s, "peer_list")]);
@@ -357,7 +357,7 @@ test("a logout elsewhere is said once on stderr; the next tool result says it to
   expect(r.error).toBe(true);
   expect(r.texts.join("\n")).toContain(said);
   // The call offered a sign-in, declined: an event later than any sign-out line.
-  await until(() => s.stderr().includes("sign-in failed: sign-in declined"), 10_000, "the declined sign-in");
+  await until(() => /sign-in failed \(elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the declined sign-in");
   expect(count(s.stderr(), said)).toBe(1);
 }, 30_000);
 
