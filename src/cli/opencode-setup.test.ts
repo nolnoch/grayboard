@@ -428,6 +428,62 @@ test("optional name explicitly defaults create false and preserves unrelated plu
   expect(f.read().plugins[0].options).toEqual({ name: "be", create: true });
 });
 
+test("launcher: --launcher declares it, omitting the flag keeps it, --no-launcher removes only that key (#564)", () => {
+  const f = fixture();
+  expect(f.run({ launcher: true, name: "fe", dryRun: true })).toEqual({ changed: true, migrated: false, dryRun: true, launcher: "declared" });
+  expect(existsSync(f.config)).toBe(false);
+  f.run({ launcher: true, name: "fe" });
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false, launcher: true });
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false });
+  expect(f.run({ launcher: true })).toEqual({ changed: false, migrated: false, dryRun: false, launcher: "unchanged" });
+  expect(f.read().plugins[0].options.launcher).toBe(true);
+  // Removal edits an existing entry, as a name change does, and keeps the other option bytes and comments.
+  const text = readFileSync(f.config, "utf8").replace('"name":"fe"', '/* keep */ "name" : "fe"');
+  expect(text).toContain("/* keep */");
+  writeFileSync(f.config, text);
+  expect(() => f.run({ launcher: false })).toThrow("--migrate");
+  expect(f.run({ launcher: false, migrate: true, dryRun: true })).toEqual({ changed: true, migrated: true, dryRun: true, launcher: "removed" });
+  expect(readFileSync(f.config, "utf8")).toBe(text);
+  const removed = f.run({ launcher: false, migrate: true });
+  expect(removed).toEqual({ changed: true, migrated: true, dryRun: false, launcher: "removed", backups: [f.config + ".grayboard-backup"] });
+  expect(readFileSync(f.config + ".grayboard-backup", "utf8")).toBe(text);
+  expect(readFileSync(f.config, "utf8")).toContain('/* keep */ "name" : "fe"');
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false });
+  expect(f.run({ launcher: false })).toEqual({ changed: false, migrated: false, dryRun: false, launcher: "unchanged" });
+  // Declaring it on an existing entry is a migration too.
+  expect(() => f.run({ launcher: true })).toThrow("--migrate");
+  f.run({ launcher: true, migrate: true });
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false, launcher: true });
+});
+
+test("launcher: an entry without options gains one; a prior non-true value is replaced by --launcher (#564)", () => {
+  const f = fixture();
+  const mcp = { servers: { grayboard: { type: "remote", url: f.opts.url } } };
+  writeFileSync(f.config, JSON.stringify({ mcp, plugins: [{ package: f.plugin }] }));
+  f.run({ launcher: true, migrate: true });
+  expect(f.read().plugins[0]).toEqual({ package: f.plugin, options: { launcher: true } });
+  writeFileSync(f.config, JSON.stringify({ mcp, plugins: [{ package: f.plugin, options: { launcher: "yes" } }] }));
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false });
+  f.run({ launcher: true, migrate: true });
+  expect(f.read().plugins[0].options).toEqual({ launcher: true });
+});
+
+test("CLI parses --launcher and --no-launcher; neither leaves the declaration alone (#564)", () => {
+  const f = fixture();
+  const declared = invoke(f, [...cliArgs(f), "--launcher"]);
+  expect(declared.exitCode, declared.stderr.toString()).toBe(0);
+  expect(declared.stdout.toString()).toContain("launcher declared");
+  expect(f.read().plugins[0].options).toEqual({ launcher: true });
+  const kept = invoke(f, cliArgs(f));
+  expect(kept.exitCode, kept.stderr.toString()).toBe(0);
+  expect(kept.stdout.toString()).not.toContain("launcher");
+  expect(f.read().plugins[0].options).toEqual({ launcher: true });
+  const removed = invoke(f, [...cliArgs(f), "--no-launcher", "--migrate"]);
+  expect(removed.exitCode, removed.stderr.toString()).toBe(0);
+  expect(removed.stdout.toString()).toContain("launcher removed");
+  expect(f.read().plugins[0].options).toEqual({});
+});
+
 for (const directive of ["{env:PRIVATE_TOKEN}", "{file:./private-token}", "prefix-{env:PRIVATE_TOKEN}-suffix", "prefix-{file:./private-token}-suffix"]) test("installed plugin path rejects substitutions before writes", () => {
   const f = fixture();
   // Positive control: the same valid source shape reaches and passes directory validation.

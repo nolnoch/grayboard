@@ -72,7 +72,7 @@ function shape(cfg: ObjectValue): void {
   }
 }
 
-function removeOwnedProperty(text: string, path: string[]): string {
+function removeOwnedProperty(text: string, path: (string | number)[]): string {
   const tree = parseTree(text);
   if (!tree) fail("Cannot locate configuration object");
   const prop = findNodeAtLocation(tree, path)?.parent;
@@ -189,13 +189,15 @@ function grayboardPackage(entry: unknown, base: string): boolean {
 
 export type OpenCodeSetupOptions = {
   url: string; config: string; revision?: string; plugin?: string; name?: string; create?: boolean;
+  // true declares the root a delegation launcher, false removes the declaration, absent keeps what is configured.
+  launcher?: boolean;
   migrate?: boolean; dryRun?: boolean;
 };
 
 type Move = { path: string; backup: string; source: string };
 
 /** Adapter source is supplied by the CLI's existing build macro, not loaded from a checkout. */
-export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean; backups?: string[] } {
+export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean; launcher?: "declared" | "removed" | "unchanged"; backups?: string[] } {
   const url = hostedEndpoint(opts.url);
   if (!url.startsWith("https://")) fail("Hosted OpenCode setup requires HTTPS; use the existing local adapter for HTTP/local development");
   if (opts.name !== undefined && !identity(opts.name)) fail("Name must be a lowercase simple agent name, not human or a full handle");
@@ -223,6 +225,17 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   if (object(priorPlugin) && Object.keys(priorPlugin).some(k => !["package", "options"].includes(k))) fail("Unknown Grayboard plugin fields");
   const pluginEntry: ObjectValue = object(priorPlugin) ? { ...priorPlugin, package: plugin } : { package: plugin };
   if (opts.name !== undefined) pluginEntry.options = { ...pluginEntry.options, name: opts.name, create: !!opts.create };
+  // Absence and false mean the same to the plugin; removal keeps one representation.
+  const priorLauncher = object(pluginEntry.options) && Object.hasOwn(pluginEntry.options, "launcher");
+  const action: "declared" | "removed" | "unchanged" = opts.launcher
+    ? (pluginEntry.options?.launcher === true ? "unchanged" : "declared")
+    : (priorLauncher ? "removed" : "unchanged");
+  const launcher = opts.launcher === undefined ? {} : { launcher: action };
+  if (opts.launcher === true) pluginEntry.options = { ...pluginEntry.options, launcher: true };
+  else if (opts.launcher === false && priorLauncher) {
+    const { launcher: _, ...rest } = pluginEntry.options;
+    pluginEntry.options = rest;
+  }
   const moves: Move[] = [];
   const adapterPaths = [join(dirname(path), "plugin", "grayboard.ts")];
   if (basename(dirname(path)) !== ".opencode") adapterPaths.push(join(dirname(path), ".opencode", "plugin", "grayboard.ts"));
@@ -258,11 +271,13 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
         set(["plugins", pluginIndex, "options", "name"], opts.name);
         set(["plugins", pluginIndex, "options", "create"], !!opts.create);
       }
+      if (opts.launcher === true && priorPlugin.options?.launcher !== true) set(["plugins", pluginIndex, "options", "launcher"], true);
+      if (opts.launcher === false && priorLauncher) text = removeOwnedProperty(text, ["plugins", pluginIndex, "options", "launcher"]);
     } else set(["plugins", pluginIndex], pluginEntry);
   }
   const changed = text !== current.text;
   let configBackup = backupPath(path);
-  if (opts.dryRun || (!changed && !moves.length)) return { changed, migrated: migration, dryRun: !!opts.dryRun };
+  if (opts.dryRun || (!changed && !moves.length)) return { changed, migrated: migration, dryRun: !!opts.dryRun, ...launcher };
   // Preflight is complete. Keep the selected file atomic and roll back adapter moves on failure.
   const temp = path + `.grayboard-${process.pid}-${crypto.randomUUID()}.tmp`;
   const moved: Move[] = [];
@@ -316,5 +331,5 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     throw e;
   }
   const backups = [...(backedUp ? [configBackup] : []), ...moves.map(move => move.backup)];
-  return { changed, migrated: migration, dryRun: false, ...(backups.length ? { backups } : {}) };
+  return { changed, migrated: migration, dryRun: false, ...launcher, ...(backups.length ? { backups } : {}) };
 }
