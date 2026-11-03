@@ -67,3 +67,19 @@ test("a token without the tools scope is a scope refusal, never a refresh", asyn
   expect(error).toBeInstanceOf(InsufficientScope);
   expect(refreshes).toBe(0);
 });
+
+// OpenCode's native client starts a root's ownership with no plugin `_meta`; the plugin's subscriber wire declares
+// the launcher on a later request, and that turns the ownership's flag on (#520).
+test("a root's later subscriber request declares the launcher its native first request didn't", async () => {
+  const token = issue();
+  const native = new NativeWire(options(), { token: async () => token }, new AbortController().signal, "raw-root");
+  wires.push(native);
+  await native.connect();
+  await native.callTool("bind", { name: "lead", create: true }, "raw-root");
+  const launcher = () => (srv.app.db.query("SELECT launcher FROM ids WHERE principal = ? AND ended_at IS NULL").all("alice@example.com") as { launcher: number }[]).map(r => r.launcher);
+  expect(launcher()).toEqual([0]);
+  const wire = subscriber(token, { ...options(), launcher: true });
+  await wire.connect();
+  await wire.call("whoami");
+  expect(launcher()).toEqual([1]);
+});

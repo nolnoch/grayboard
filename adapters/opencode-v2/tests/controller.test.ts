@@ -7,7 +7,7 @@ import { Controller as CoreController } from "../src/core/controller.js";
 import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
 import { observeEvents } from "../src/core/events.js";
-import { Wire, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
+import { Wire, LAUNCHER_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
 import { METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
@@ -909,6 +909,36 @@ test.each([true, false, undefined, "true", "false", 1, {}, null])("Promise lifec
     expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "fe", create: create === true, where: "/worktree" } }]);
     expect(r.storage.get("rootSessionIDs")).toBeUndefined();
     expect(r.nodes.get("R")!.metadata).toEqual({});
+  } finally {
+    await cleanup?.(); await r.controller.close();
+    call.mockRestore(); connect.mockRestore(); close.mockRestore();
+  }
+});
+test.each([[true, true], ["true", false], [1, false], [undefined, false]])("plugin option launcher %j: the Controller's wires declare the launcher only for literal true (#520)", async (launcher, declared) => {
+  const { setup } = await import("../src/lifecycle.js");
+  const r = runtime();
+  let complete!: () => void;
+  const bound = new Promise<void>(resolve => { complete = resolve; });
+  const seen: unknown[] = [];
+  const connect = spyOn(Client.prototype, "connect").mockResolvedValue(undefined);
+  const close = spyOn(Client.prototype, "close").mockResolvedValue(undefined);
+  const call = spyOn(Wire.prototype, "call").mockImplementation(async function(this: Wire) {
+    seen.push((this as unknown as { meta(): Record<string, unknown> }).meta());
+    complete();
+    return {};
+  });
+  let cleanup: (() => void | Promise<void>) | void = undefined;
+  try {
+    cleanup = await setup({ ...r.ctx, options: { name: "fe", launcher },
+      rpc: { register: async () => ({ dispose: async () => {} }) },
+      tool: { ...r.ctx.tool, hook: async () => ({ dispose: async () => {} }) },
+      event: { async *subscribe({ signal }: { signal: AbortSignal }) {
+        yield { type: "session.created", data: { sessionID: "R" } };
+        if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+      } },
+    } as unknown as Context, () => {});
+    await bound;
+    expect(seen).toEqual([declared ? { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true } : { "ai.opencode/sessionID": "R" }]);
   } finally {
     await cleanup?.(); await r.controller.close();
     call.mockRestore(); connect.mockRestore(); close.mockRestore();

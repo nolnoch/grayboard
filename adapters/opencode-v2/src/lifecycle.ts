@@ -10,7 +10,7 @@ import { Approval, type OpenCodeEnrollment } from "./approval.js";
 import { Binding, SIGN_IN } from "./binding.js";
 import { Grayboard } from "./rpc.js";
 
-export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean };
+export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean };
 type Invocation = { tool: string; sessionID: string; id: string };
 const VERSION = "1.10.0";
 // OpenCode's own root session IDs: restored diagnostics for them skip the root lookup.
@@ -22,6 +22,8 @@ function hostPort(ctx: Context, options: Options, binding: Binding): HostPort<Op
   return {
     harness: "OpenCode", resumeHint: "explicitly enroll again", loginAction: SIGN_IN,
     sessionKey: "ai.opencode/sessionID", client: { name: "grayboard-opencode", version: VERSION },
+    // Plugin option `launcher: true`, OpenCode's BUS_LAUNCHER=1 (#520): the Controller's wires declare it.
+    ...(options.launcher ? { launcher: true as const } : {}),
     storage: ctx.storage,
     place: () => ctx.location.directory,
     ancestry: sessionID => resolveRoot(sessionID, id => ctx.session.get({ sessionID: id })),
@@ -86,6 +88,7 @@ export async function setup(ctx: Context, sink: DiagnosticSink) {
     issuer: typeof ctx.options.issuer === "string" ? ctx.options.issuer : "",
     name: typeof ctx.options.name === "string" ? ctx.options.name : undefined,
     create: ctx.options.create === true,
+    launcher: ctx.options.launcher === true,
   };
   const controller = new OpenCodeController(ctx, options, undefined, undefined, sink);
   let restoring: Promise<unknown> = Promise.resolve();
