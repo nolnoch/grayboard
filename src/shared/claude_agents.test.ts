@@ -1,15 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LEFTOVER_TTL_MS, RECORD_CAP, ROOT, runHook, sessionDir, takeEnded, takeRecord } from "./claude_agents.ts";
+import { LEFTOVER_TTL_MS, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, takeEnded, takeRecord } from "./claude_agents.ts";
 import { procStart } from "./proc.ts";
 
 let base: string;
 const pid = process.pid;
 const env = { CLAUDE_PID: String(pid) };
-const hook = (event: string, input: Record<string, unknown>, ended = false, now?: number) =>
-  runHook(event, JSON.stringify(input), { base, env, ended, ...(now ? { now } : {}) });
+const hook = (event: string, input: Record<string, unknown>, hosted = false, now?: number) =>
+  runHook(event, JSON.stringify(input), { base, env, hosted, ...(now ? { now } : {}) });
 const start = () => procStart(pid) ?? null;
 const id = (n: number | string) => `toolu_01ABC${n}`;
 
@@ -137,7 +138,7 @@ describe("session lifecycle", () => {
   test("SubagentStop keeps at most RECORD_CAP undrained markers, dropping the oldest", () => {
     hook("session-start", {});
     for (let i = 0; i <= RECORD_CAP + 2; i++) {
-      runHook("subagent-stop", JSON.stringify({ agent_id: `a${i}` }), { base, env: { CLAUDE_PID: String(pid) }, ended: true, now: 1_000 + i });
+      runHook("subagent-stop", JSON.stringify({ agent_id: `a${i}` }), { base, env: { CLAUDE_PID: String(pid) }, hosted: true, now: 1_000 + i });
     }
     const got = takeEnded(base, pid);
     expect(got.length).toBe(RECORD_CAP);
@@ -146,8 +147,91 @@ describe("session lifecycle", () => {
   });
 
   test("a hook without CLAUDE_PID or with bad input does nothing and never throws", () => {
-    runHook("session-start", "{}", { base, env: {}, ended: false });
-    runHook("pre-tool-use", "not json", { base, env, ended: false });
+    runHook("session-start", "{}", { base, env: {}, hosted: false });
+    runHook("pre-tool-use", "not json", { base, env, hosted: false });
     expect(existsSync(join(base, "claude-agents"))).toBe(false);
+  });
+});
+
+describe("facts (#545)", () => {
+  const said: string[] = [];
+  const facts = () => readFacts(base, pid, start(), (fact, error) => said.push(`${fact}: ${error}`));
+  beforeEach(() => { said.length = 0; });
+
+  test("SessionStart's model, then PostModelSwitch's; the root's PreToolUse effort", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "medium" } }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "medium" });
+    // A switch drops the old model's effort until the next root call names one.
+    hook("model-switch", { from_model: "claude-opus-5-5", to_model: "claude-haiku-4-5" }, true);
+    expect(facts()).toEqual({ model: "claude-haiku-4-5" });
+    hook("pre-tool-use", { tool_use_id: id(2), effort: { level: "high" } }, true);
+    expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
+    // /clear: SessionStart rewrites the model; the effort stays.
+    hook("session-start", { source: "clear", model: "claude-opus-5-5[1m]" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5[1m]", effort: "high" });
+    // A root call on a model without effort drops it.
+    hook("pre-tool-use", { tool_use_id: id(3) }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5[1m]" });
+    expect(said).toEqual([]);
+  });
+
+  test("a subagent's effort and malformed values write nothing", () => {
+    hook("session-start", { model: "claude-opus-5-5" }, true);
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "low" } }, true);
+    hook("pre-tool-use", { tool_use_id: id(2), agent_id: "a1", effort: { level: "max" } }, true);
+    hook("pre-tool-use", { tool_use_id: id(3), agent_id: "a1" }, true);
+    for (const bad of ["", "has space", "x".repeat(65), 5, { level: "high" }, "bad\nline"]) {
+      hook("pre-tool-use", { tool_use_id: id(4), effort: { level: bad } }, true);
+      hook("model-switch", { to_model: bad }, true);
+    }
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "low" });
+    // The server's limit is the hook's.
+    hook("model-switch", { to_model: "x".repeat(64) }, true);
+    expect(facts()?.model).toBe("x".repeat(64));
+  });
+
+  test("the local hook writes no facts", () => {
+    hook("session-start", { model: "claude-opus-5-5" });
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "high" } });
+    hook("model-switch", { to_model: "claude-haiku-4-5" });
+    expect(facts()).toEqual({});
+    expect(readdirSync(sessionDir(base, pid)).sort()).toEqual(["start", id(1)]);
+  });
+
+  test("no SessionStart record, a recycled pid's dir, and a malformed file", () => {
+    expect(facts()).toBeUndefined();
+    hook("model-switch", { to_model: "claude-haiku-4-5" }, true);
+    expect(facts()).toBeUndefined();
+    hook("session-start", { model: "claude-opus-5-5" }, true);
+    expect(readFacts(base, pid, "another start", () => {})).toBeUndefined();
+    // A bad file is left out and said; the good one still reads.
+    writeFileSync(join(sessionDir(base, pid), "effort"), "two words");
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    expect(said).toEqual([`effort: ${join(sessionDir(base, pid), "effort")} isn't a Claude Code effort`]);
+  });
+
+  test("a new process's SessionStart drops facts an earlier holder of the pid left; /clear keeps the effort", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "max" } }, true);
+    hook("session-start", { source: "clear", model: "claude-opus-5-5" }, true);
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "max" });
+    hook("session-start", { source: "startup" }, true);
+    expect(facts()).toEqual({});
+  });
+
+  test("a link, a FIFO or an oversized fact file is said and left out, never followed, waited on or read whole", () => {
+    hook("session-start", { model: "claude-opus-5-5" }, true);
+    const dir = sessionDir(base, pid);
+    symlinkSync("/dev/zero", join(dir, "effort"));
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    rmSync(join(dir, "effort"));
+    execFileSync("mkfifo", [join(dir, "effort")]);
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    rmSync(join(dir, "model"));
+    writeFileSync(join(dir, "model"), "x".repeat(10_000));
+    expect(facts()).toEqual({});
+    expect(said.map(s => s.split(":")[0])).toEqual(["effort", "effort", "model", "effort"]);
   });
 });

@@ -34,7 +34,7 @@ async function claudeBus(hooks: boolean): Promise<Bus> {
 
 // The hook events Claude Code would run for this session's harness.
 const hook = (b: Bus, event: "session-start" | "pre-tool-use", input: Record<string, unknown>) =>
-  runHook(event, JSON.stringify(input), { base: b.dir, env: { CLAUDE_PID: String(b.s.harnessPid) }, ended: false });
+  runHook(event, JSON.stringify(input), { base: b.dir, env: { CLAUDE_PID: String(b.s.harnessPid) }, hosted: false });
 
 let seq = 0;
 const toolUse = () => `toolu_rec${++seq}`;
