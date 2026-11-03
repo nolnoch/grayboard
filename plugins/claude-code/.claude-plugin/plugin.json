@@ -1,6 +1,6 @@
 {
   "name": "grayboard",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Grayboard for Claude Code on a grayboard server: the bus's tools, with direct messages and board posts pushed into the session as channel messages.",
   "author": { "name": "nolnoch" },
   "homepage": "https://github.com/nolnoch/grayboard",
