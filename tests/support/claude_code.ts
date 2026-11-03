@@ -1,4 +1,4 @@
-// Real Claude Code for the claude-hosted e2e (#281): the pinned release from
+// Real Claude Code for the claude-hosted and claude-local e2e suites (#281, #551): the pinned release from
 // npm, cached in .e2e-cache/claude-code/<version>/, driven interactively in a
 // pty (channels need an interactive session) against a fake Anthropic API
 // (fake_anthropic.ts), with all of its state in a scratch dir.

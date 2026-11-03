@@ -1,6 +1,6 @@
 // Claude Code's step of `grayboard setup` and `refresh-adapters` (#281).
-// Local mode: the user-scope `grayboard mcp` entry and the SessionStart hook,
-// as before; an installed hosted plugin is disabled (its grant is kept for a
+// Local mode: the user-scope `grayboard mcp` entry and grayboard's hooks (the
+// session title, and the subagent records of #551); an installed hosted plugin is disabled (its grant is kept for a
 // switch back). Server mode: the hosted plugin from this repo's marketplace,
 // with no grayboard process at runtime, so the entry (which would run a
 // second server in the same session) and the hook go.
@@ -15,7 +15,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { CLAUDE_PLUGIN, launchCommand } from "../shared/claude_channels.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
-import { claudeSettingsPath, installSessionStartHook, removeSessionStartHook } from "./session_start.ts";
+import { claudeSettingsPath, installClaudeHooks, removeClaudeHooks } from "./claude_hooks.ts";
 import { RELEASE_TAG } from "../shared/release_verify.ts";
 import { REPO, VERSION, versionOrder } from "./update.ts";
 
@@ -79,7 +79,7 @@ export function installClaudePlugin(run: ClaudeCli, server: string, which: (cmd:
   }
   const notes = [`Installed the Claude Code plugin ${CLAUDE_PLUGIN} for ${pluginServerUrl(server)}`];
   if (run(remove!).exitCode === 0) notes.push("Removed the user-scope grayboard MCP entry (the plugin serves the tools)");
-  if (removeSessionStartHook()) notes.push(`Removed grayboard's SessionStart hook from ${claudeSettingsPath()}`);
+  if (removeClaudeHooks()) notes.push(`Removed grayboard's hooks from ${claudeSettingsPath()} (the plugin ships its own)`);
   return notes;
 }
 
@@ -186,19 +186,19 @@ export function projectEntryWarnings(dir: string): string[] {
 }
 
 /**
- * Local mode: register `command args` at user scope, title sessions with the
- * SessionStart hook, and disable the hosted plugin if it's enabled. Returns
- * what changed; throws on a failed registration.
+ * Local mode: register `command args` at user scope, install grayboard's hooks
+ * (run by the same command, without its `mcp`), and disable the hosted plugin
+ * if it's enabled. Returns what changed; throws on a failed registration.
  */
-export function registerClaudeLocal(run: ClaudeCli, command: string, args: string[], hook: string): string[] {
+export function registerClaudeLocal(run: ClaudeCli, command: string, args: string[]): string[] {
   run(["mcp", "remove", "--scope", "user", "grayboard"]);
   const add = ["mcp", "add", "--scope", "user", "grayboard", "--", command, ...args];
   const r = run(add, true);
   if (r.exitCode !== 0) throw new Error(`\`${shown(add)}\` failed`);
   // Title each session with its handle, so Claude Code's name for it is the
-  // one dm_send takes.
-  installSessionStartHook(hook);
-  const notes = [`Sessions are titled with their grayboard handle (SessionStart hook in ${claudeSettingsPath()}).`];
+  // one dm_send takes, and record which agent makes each grayboard call.
+  installClaudeHooks([command, ...args.slice(0, -1)]);
+  const notes = [`Installed grayboard's hooks in ${claudeSettingsPath()}: sessions are titled with their grayboard handle, and subagents' calls are attributed to them.`];
   // `disable` fails on a plugin that's disabled or absent, so it runs only
   // where user settings enable it.
   if (pluginEnabled()) {
@@ -210,9 +210,24 @@ export function registerClaudeLocal(run: ClaudeCli, command: string, args: strin
   return notes;
 }
 
+type Entry = { command?: unknown; args?: unknown };
+const userEntry = (env = process.env) => userJson<{ mcpServers?: Record<string, Entry> }>(join(env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json"))?.mcpServers?.grayboard;
+
 /** Whether Claude Code's user config holds the local-mode `grayboard` MCP entry. Throws when the file can't be parsed. */
 export function hasUserEntry(env = process.env): boolean {
-  return !!userJson<{ mcpServers?: Record<string, unknown> }>(join(env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json"))?.mcpServers?.grayboard;
+  return !!userEntry(env);
+}
+
+/**
+ * Local mode, on `update`/`refresh-adapters`: install grayboard's hooks for the
+ * command the user-scope entry runs, without asking, so a setup that predates
+ * a hook gets it (#551). Notes what changed; nothing without the entry, or for
+ * an entry setup didn't write (its last argument isn't `mcp`).
+ */
+export function refreshClaudeHooks(): string[] {
+  const e = userEntry();
+  if (!e || typeof e.command !== "string" || !Array.isArray(e.args) || e.args.at(-1) !== "mcp" || !e.args.every((a) => typeof a === "string")) return [];
+  return installClaudeHooks([e.command, ...(e.args as string[]).slice(0, -1)]) ? [`Installed grayboard's hooks in ${claudeSettingsPath()}; restart Claude Code sessions to attribute subagents' calls to them`] : [];
 }
 
 /** A Claude Code JSON file, or null when it's missing (or holds JSON null). Throws when it can't be parsed. */

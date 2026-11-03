@@ -22,6 +22,7 @@ import { keep } from "../support/run_dir.ts";
 import { TestServer } from "../support/server.ts";
 import { copyFileSync } from "node:fs";
 import { RELEASE_KEYS } from "../../src/shared/release_keys.ts";
+import { claudeHooks } from "../../src/cli/claude_hooks.ts";
 
 const ASSET = `grayboard-${TARGET}`;
 const TAG = `v${pkg.version}`;
@@ -116,9 +117,7 @@ function expectRegistered(server?: string): void {
     expect(existsSync(join(home, ".claude", "settings.json"))).toBe(false);
   } else {
     expect(argv).toEqual(["claude mcp remove --scope user grayboard", `claude mcp add --scope user grayboard -- ${exe} mcp`]);
-    expect(json(".claude", "settings.json").hooks.SessionStart).toEqual([
-      { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] },
-    ]);
+    expect(json(".claude", "settings.json").hooks).toEqual(claudeHooks([exe]));
   }
   if (server) {
     // opencode reaches a server only through its hosted entry (setup-opencode), which setup doesn't write (#282).
@@ -291,6 +290,12 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   // Their entries stay as they are: the checkout's adapter, or none, is what reads them.
   writeOldEntries(realpathSync(join(bin, "grayboard")));
   const entries = [json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")];
+  // Claude Code set up before #551: the user-scope entry and the title hook alone, beside a hook of the user's.
+  const exe = realpathSync(join(bin, "grayboard"));
+  const own = { matcher: "Bash", hooks: [{ type: "command", command: "~/.claude/hooks/bash.sh" }] };
+  writeFileSync(join(home, ".claude.json"), JSON.stringify({ mcpServers: { grayboard: { type: "stdio", command: exe, args: ["mcp"] } } }));
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ hooks: { SessionStart: [claudeHooks([exe]).SessionStart![0]], PreToolUse: [own] } }));
 
   const out = await expectOk(grayboard("update"));
   expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG} from ${releases.url}`);
@@ -303,6 +308,9 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   expect(existsSync(join(home, ...ADAPTERS.pi))).toBe(false);
   expect([json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")]).toEqual(entries);
   expect(out).not.toContain("Disabled the grayboard entry");
+  expect(out).toContain(`Installed grayboard's hooks in ${join(home, ".claude", "settings.json")}`);
+  const hooks = claudeHooks([exe]);
+  expect(json(".claude", "settings.json").hooks).toEqual({ ...hooks, PreToolUse: [own, ...hooks.PreToolUse!] });
 }, 60_000);
 
 // The plugin's pin merges after the release, so an update that finds the CLI
