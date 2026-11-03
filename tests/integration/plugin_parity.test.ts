@@ -10,6 +10,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import type { SendResult } from "../../src/server/application.ts";
+import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
@@ -68,12 +69,10 @@ test("dm_ack takes a list: unknown ids are reported beside the acked, and all un
   await expect(be.call("dm_ack", { message_id: [mine] })).rejects.toThrow(/no message/);
 });
 
-// The application's refusal (forbidden, HUMAN_RESERVED's fix) is asserted at
-// application level in slack_org.test.ts; hosted bind refuses on its own
-// check (hosted.ts), with bad_request and a shorter reason.
+// The hosted bind reaches the application's refusal (bindNow: forbidden, HUMAN_RESERVED), also asserted at application level in slack_org.test.ts.
 test("a bind to the reserved human name is refused and leaves the session unbound", async () => {
   const s = await srv.hosted(A, null);
-  await expect(s.bind("human")).rejects.toMatchObject({ code: "bad_request", message: "human is reserved for the trusted bridge" });
+  await expect(s.bind("human")).rejects.toMatchObject({ code: "forbidden", message: HUMAN_RESERVED });
   expect(await s.call("whoami")).toHaveProperty("unbound", true);
 });
 

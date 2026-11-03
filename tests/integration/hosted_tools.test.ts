@@ -508,3 +508,12 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
     { actor: A, identity: `${A}/be`, filename: "c.txt", size: 30, reason: over.body.message },
   ]);
 });
+
+// #463 item 2: the hosted whoami names the session ID and the principal beside the holds, as the local and WSS ones did.
+test("#463: whoami names the session ID, the holds oldest first and the principal", async () => {
+  const s = await srv.hosted(A, null);
+  expect(await s.call("whoami")).toMatchObject({ id: expect.stringMatching(/^id:/), principal: A, held: [], primary: null, unbound: true });
+  await s.bind("zed");
+  await s.bind("alpha");
+  expect(await s.call("whoami")).toMatchObject({ principal: A, held: [`${A}/zed`, `${A}/alpha`], primary: `${A}/zed` });
+});
