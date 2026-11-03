@@ -89,7 +89,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (previous) finish(previous);
         const { row, expiresAt } = result;
         let lease!: Lease;
-        const selected = application.hostedSession(p.authed, row.session_id, application.hostedHolds(row.session_id), null, row.place, {
+        const selected = application.hostedSession(p.authed, row.session_id, application.hostedHolds(row.session_id), null, row, {
           deliver() { if (lease && matches(lease, store.get(lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
           probe: async () => true,
           closed() { if (lease) finish(lease); },

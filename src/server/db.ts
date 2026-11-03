@@ -172,8 +172,8 @@ export interface Repo {
     thread(userId: number, kind: "dm" | "board", board: string | null, rootId: number): SlackThread | undefined;
     threadByTs(userId: number, threadTs: string): SlackThread | undefined;
     addThread(userId: number, t: SlackThread): void;
-    // Moves a thread's reply target forward, never back.
-    advanceThread(userId: number, threadTs: string, id: number): void;
+    // Moves a thread's reply target forward, never back; a DM item's sender becomes its peer (#524).
+    advanceThread(userId: number, threadTs: string, id: number, peer?: string): void;
     // How far an outbound item got in Slack, keyed by its grayboard ref
     // ("dm:<message id>" or "post:<post id>"); cleared once it's done.
     progress(userId: number, ref: string): unknown;
@@ -252,6 +252,8 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
 function migrateHostedHolds(db: Database): void {
   const cols = new Set((db.prepare(`PRAGMA table_info(hosted_sessions)`).all() as { name: string }[]).map((c) => c.name));
   if (!cols.has("writes_as")) db.exec(`ALTER TABLE hosted_sessions ADD COLUMN writes_as TEXT`);
+  // The name a root's first request suggested (#443): written at insert, never updated.
+  if (!cols.has("suggested")) db.exec(`ALTER TABLE hosted_sessions ADD COLUMN suggested TEXT`);
   db.exec(`
     INSERT OR IGNORE INTO alias_holds(address, id, bound_at)
       SELECT u.email || '/' || h.name, h.session_id, h.last_seen_at FROM hosted_sessions h JOIN users u ON u.id = h.user_id WHERE h.name IS NOT NULL;
@@ -955,8 +957,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           [userId, t.thread_ts, t.kind, t.board ?? "", t.root_id, t.peer, t.last_id],
         );
       },
-      advanceThread(userId, threadTs, id) {
-        db.run("UPDATE slack_threads SET last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?", [id, userId, threadTs]);
+      advanceThread(userId, threadTs, id, peer) {
+        db.run(
+          "UPDATE slack_threads SET peer = CASE WHEN ? IS NOT NULL AND ? > last_id THEN ? ELSE peer END, last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?",
+          [peer ?? null, id, peer ?? null, id, userId, threadTs],
+        );
       },
       progress(userId, ref) {
         const r = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);
@@ -1300,8 +1305,8 @@ function makeHostedStore(db: Database): HostedStore {
       return id;
     },
     insert(row) {
-      db.run("INSERT INTO hosted_sessions(session_id, ownership_id, user_id, client_id, grant_id, source_session_id, writes_as, bind_gen, root_session_id, place, lease_deadline, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [row.session_id, row.ownership_id, row.user_id, row.client_id, row.grant_id, row.source_session_id, row.writes_as, row.bind_gen, row.root_session_id, row.place, row.lease_deadline, row.created_at, row.last_seen_at]);
+      db.run("INSERT INTO hosted_sessions(session_id, ownership_id, user_id, client_id, grant_id, source_session_id, writes_as, bind_gen, root_session_id, place, lease_deadline, created_at, last_seen_at, suggested) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [row.session_id, row.ownership_id, row.user_id, row.client_id, row.grant_id, row.source_session_id, row.writes_as, row.bind_gen, row.root_session_id, row.place, row.lease_deadline, row.created_at, row.last_seen_at, row.suggested]);
     },
     update(row) {
       db.run("UPDATE hosted_sessions SET grant_id = ?, bind_gen = ?, root_session_id = ?, ownership_id = ?, place = ?, lease_deadline = ?, last_seen_at = ? WHERE session_id = ?",

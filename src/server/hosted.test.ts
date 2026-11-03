@@ -9,7 +9,7 @@ import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, sess
 import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
 import { aliasUser, boundInstructions } from "../core/bindings.ts";
 import { COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
@@ -564,6 +564,26 @@ test("cleanFact drops format characters before folding the line, and stores NFC,
   expect(cleanFact("x\u200fy\u061c\ufeff")).toBe("xy");
   expect(cleanFact("e\u0301")).toBe("\u00e9");
   expect(cleanFact("\u200b")).toBeNull();
+});
+
+test("a root's suggested name is its first request's, offered first among its unbound candidates while free, refused when not a string, and no suggestion when not an identity name (#443)", async () => {
+  const ctx = (raw: string, suggested?: unknown) => sessionContext(principal, { [OPENCODE_SESSION_META]: raw, ...(suggested === undefined ? {} : { [GRAYBOARD_SUGGESTED_META]: suggested }) });
+  await hosted.bind(principal, ctx("other"), { name: "older", create: true });
+  await hosted.unbind(principal, ctx("other"), { name: "older" });
+  const first = await hosted.whoami(principal, ctx("root", "Grayboard-GB-Aux"));
+  expect(first.candidates).toEqual([{ name: "grayboard-gb-aux", queued: 0, claims: 0, where: null, fresh: true, suggested: true }, expect.objectContaining({ name: "older" })]);
+  // Fixed for the root's life: a later request's suggestion, or none, changes nothing.
+  expect((await hosted.whoami(principal, ctx("root", "elsewhere"))).candidates?.[0]).toMatchObject({ name: "grayboard-gb-aux", suggested: true });
+  expect((await hosted.whoami(principal, ctx("root"))).candidates?.[0]).toMatchObject({ name: "grayboard-gb-aux", suggested: true });
+  expect(database.repo.hosted.get((ctx("root") as { id: string }).id)).toMatchObject({ suggested: "grayboard-gb-aux" });
+  // After an unbind the instructions offer it again; while another session holds it, it isn't offered.
+  await hosted.bind(principal, ctx("root"), { name: "fe", create: true });
+  const released = await hosted.unbind(principal, ctx("root"), { name: "fe" });
+  expect(released.content[0]!.text).toContain("grayboard-gb-aux (this checkout's default: ");
+  await hosted.bind(principal, ctx("other"), { name: "grayboard-gb-aux", create: true });
+  expect((await hosted.whoami(principal, ctx("root"))).candidates?.map(c => c.name)).not.toContain("grayboard-gb-aux");
+  expect(() => ctx("root", 5)).toThrow(`_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
+  for (const bad of ["", "a/b", "human", "x".repeat(33)]) expect(ctx("root", bad)).not.toHaveProperty("suggested");
 });
 
 test("a request's launcher declaration is the ownership's: registered and audited, restated by a new ownership, cleared at its end, refused unless a boolean (#473)", async () => {

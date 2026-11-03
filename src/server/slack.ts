@@ -253,7 +253,7 @@ export class SlackBridge implements SlackLinker {
       thread: (kind, board, root) => repo.slack.thread(link.user_id, kind, board, root),
       byTs: (ts) => repo.slack.threadByTs(link.user_id, ts),
       addThread: (row) => repo.slack.addThread(link.user_id, row),
-      advance: (ts, id) => repo.slack.advanceThread(link.user_id, ts, id),
+      advance: (ts, id, peer) => repo.slack.advanceThread(link.user_id, ts, id, peer),
       enqueue: (params) => {
         outbox.set(++next, params as ChannelParams);
         return next;
