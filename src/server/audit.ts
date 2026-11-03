@@ -40,6 +40,7 @@ export type AuditAction =
   | "id.reattached"
   | "id.registered"
   | "id.reused"
+  | "id.signed_in_local"
   | "message.retracted"
   | "request.replayed"
   | "request.resent"
