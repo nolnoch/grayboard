@@ -124,3 +124,24 @@ test("the CLI command reads the hook input from stdin", () => {
   });
   expect(title(r.stdout.toString())).toBe("web");
 });
+
+test("`hook claude <event>` writes the record through the light entry, prints nothing and never fails (#551)", () => {
+  const sock = mkdtempSync(join(tmpdir(), "gb-ss-"));
+  const hook = (event: string, input: string) => Bun.spawnSync(["bun", join(import.meta.dir, "main.ts"), "hook", "claude", event], {
+    stdin: new TextEncoder().encode(input),
+    env: { ...process.env, BUS_SOCK_DIR: sock, CLAUDE_PID: String(process.pid) },
+  });
+  const dir = join(sock, "claude-agents", String(process.pid));
+  for (const r of [
+    hook("session-start", JSON.stringify({ source: "startup" })),
+    hook("pre-tool-use", JSON.stringify({ tool_use_id: "toolu_1", agent_id: "a573e90bd84bce7ff" })),
+    hook("pre-tool-use", JSON.stringify({ tool_use_id: "toolu_2" })),
+    hook("pre-tool-use", "not json"),
+    hook("no-such-event", "{}"),
+  ]) {
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.toString() + r.stderr.toString()).toBe("");
+  }
+  expect(readFileSync(join(dir, "toolu_1"), "utf8")).toBe("a573e90bd84bce7ff");
+  expect(readFileSync(join(dir, "toolu_2"), "utf8")).toBe("-");
+});
