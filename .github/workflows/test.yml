@@ -8,31 +8,102 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR cancels that PR's older runs (#507). Every other run gets
+# a group of its own, so no push to master is ever cancelled or replaced.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('test-pr-{0}', github.event.pull_request.number) || format('test-run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 jobs:
+  # A PR whose only change is .claude-plugin/marketplace.json (the release's
+  # plugin-pin PR) runs the pin check below instead of the suites (#507). The
+  # diff is of the run's own head commit against its base.
+  scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pin-only: ${{ steps.files.outputs.pin-only }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: files
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pin=false
+          if [ -n "$HEAD" ]; then
+            files="$(git diff --name-only "$BASE...$HEAD")"
+            printf '%s\n' "$files"
+            [ "$files" = ".claude-plugin/marketplace.json" ] && pin=true
+          fi
+          echo "pin-only=$pin" | tee -a "$GITHUB_OUTPUT"
+
+  # The required "test" check. On a pin-only PR it checks the pin instead:
+  # the marketplace tests, and that the pinned tag is a published, immutable
+  # release whose commit is the pinned sha.
+  # A skipped required check counts as passed, so this job runs even when
+  # scope fails, and then fails itself.
   test:
+    needs: scope
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      PIN_ONLY: ${{ needs.scope.outputs.pin-only }}
     steps:
+      - name: Scope decided
+        env:
+          SCOPE: ${{ needs.scope.result }}
+        run: test "$SCOPE" = success
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - uses: ./.github/actions/setup
         with:
-          node: "true"
-          release-cache: "true"
+          node: ${{ env.PIN_ONLY != 'true' }}
+          release-cache: ${{ env.PIN_ONLY != 'true' }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Typecheck
+        if: env.PIN_ONLY != 'true'
         run: bun run typecheck
 
       - name: Test
+        if: env.PIN_ONLY != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
         run: bun run test
 
+      - name: Marketplace tests
+        if: env.PIN_ONLY == 'true'
+        run: bun test tests/integration/claude_plugin_package.test.ts
+
+      - name: The pin names an immutable release at its commit
+        if: env.PIN_ONLY == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ref="$(jq -r '.plugins[0].source.ref' .claude-plugin/marketplace.json)"
+          sha="$(jq -r '.plugins[0].source.sha' .claude-plugin/marketplace.json)"
+          [ "$(gh release view "$ref" --json isImmutable --jq .isImmutable)" = true ] || { echo "::error::$ref isn't an immutable published release"; exit 1; }
+          git fetch --no-tags origin "+refs/tags/${ref}:refs/tags/${ref}"
+          tagged="$(git rev-parse "${ref}^{commit}")"
+          [ "$tagged" = "$sha" ] || { echo "::error::$ref is $tagged, not the pinned $sha"; exit 1; }
+          echo "$ref is immutable at $sha"
+
   hosted:
+    needs: scope
+    if: ${{ !cancelled() }}
     uses: ./.github/workflows/hosted.yml
+    with:
+      skip: ${{ needs.scope.outputs.pin-only == 'true' }}
 
   # deploy/grayboard.service as systemd reads it. verify also checks that the
   # user, env file and binary it names exist, so stand-ins go in first. It
@@ -40,6 +111,8 @@ jobs:
   # lines about the runner's own units (/usr/lib, /lib, /etc/systemd) don't.
   # A copy with an unknown key must fail, so the lint can't go quiet.
   deploy-lint:
+    needs: scope
+    if: needs.scope.outputs.pin-only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
