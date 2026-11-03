@@ -209,7 +209,7 @@ export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachment
 export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
              LEFT JOIN mailbox_cursors c ON c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient
             WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient_type = 'user' AND m.recipient != m.sender
-              AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+              AND m.id > COALESCE(c.last_seen_id, 0) AND m.delivered_at IS NULL AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
 
 // queuedTo: per recipient, the DMs its read point hasn't reached. Exported
@@ -223,7 +223,7 @@ export const QUEUED_TO_SQL = `SELECT m.recipient, COUNT(*) AS n FROM messages m
 // the same EXPLAIN pin.
 export const RETRACTABLE_SQL = `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
                AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0)
+                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0) AND delivered_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`;
 
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {

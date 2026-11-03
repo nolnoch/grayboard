@@ -154,7 +154,7 @@ function threadRows(id: number): Message[] {
 export const LOCAL_UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
         LEFT JOIN cursors c ON c.reader = m.recipient
         WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
-          AND m.id > COALESCE(c.last_seen_id, 0) AND m.created_at < ?
+          AND m.id > COALESCE(c.last_seen_id, 0) AND m.delivered_at IS NULL AND m.created_at < ?
         GROUP BY m.recipient ORDER BY m.recipient`;
 export function undeliveredFrom(
   senders: string[],
@@ -249,7 +249,7 @@ export function retractMessage(sender: string, id: number): boolean {
     const retractable = db
       .prepare(
         `SELECT recipient FROM messages WHERE id = ? AND sender = ?
-           AND id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = messages.recipient), 0)
+           AND id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = messages.recipient), 0) AND delivered_at IS NULL
            AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`,
       )
       .get(id, sender) as { recipient: string } | null;

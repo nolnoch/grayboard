@@ -280,8 +280,14 @@ test("a pushed DM carries delivered_at in history, thread and inbox; queued and 
   expect(waiting.delivered).toBe(false);
   expect(waiting).not.toHaveProperty("delivered_at");
 
+  // A stamp outlives its recipient's cursor (dropped with the session): the
+  // read message is still delivered, so it isn't queued or retractable.
   const db = new Database(join(dir, "bus.db"));
+  db.run(`DELETE FROM cursors WHERE reader = 'fe'`);
+  await expect(call(be, "dm_retract", { message_id: pushed.message_id })).rejects.toThrow(/already reached fe/);
+  expect((await call(be, "dm_inbox")).undelivered_from_you).toEqual([expect.objectContaining({ n: 1, oldest_id: queued.message_id })]);
   db.run(`UPDATE messages SET delivered_at = NULL WHERE id = ?`, [pushed.message_id]);
+  db.run(`INSERT INTO cursors (reader, last_seen_id) VALUES ('fe', ?)`, [pushed.message_id]);
   db.close();
   const old = (await history()).find((m: { id: number }) => m.id === pushed.message_id);
   expect(old.delivered).toBe(true);

@@ -623,7 +623,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     if (done !== undefined) return text(`ok: ${alreadyRetracted(done)}`);
     if (!m || !ADDRS.includes(m.sender)) return refuse(retractRefusal.notYours(a.message_id as number));
     // A probe is a wakeup: a live recipient drains the message now.
-    if (getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
+    if (m.delivered_at !== null || getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
     if (!retractMessage(m.sender, m.id)) {
       return refuse(getCursor(m.recipient) >= m.id ? retractRefusal.reached(m.id, m.recipient) : retractRefusal.replied(m.id));
     }

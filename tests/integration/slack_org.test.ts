@@ -82,6 +82,22 @@ test("link, then a hosted agent's DM to human is a Slack thread whose reply come
   expect(post.thread_ts).toBe(tsOf(top));
 }, 30_000);
 
+// #470: delivered_at means the message reached Slack; one Slack refuses is
+// given up (its cursor moves, so it isn't retried) but never stamped.
+test("a DM Slack posts is stamped delivered_at; one Slack refuses is given up unstamped", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const ok = await be.call<SendResult>("dm_send", { to: "human", body: "posted" });
+  await until(() => slack.posts().find((p) => p.markdown_text === "**be** posted"));
+  const stamp = (id: number) => srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(id) as { delivered_at: number | null };
+  await until(() => stamp(ok.message_id).delivered_at !== null);
+  slack.refusePosts = "msg_too_long";
+  const refused = await be.call<SendResult>("dm_send", { to: "human", body: "too long" });
+  await until(() => srv.app.repo.cursors.directFor("alice@example.com/human") >= refused.message_id);
+  expect(stamp(refused.message_id).delivered_at).toBeNull();
+}, 30_000);
+
 test("attachments cross the org bridge both ways for a hosted session, and the audit log says where they went", async () => {
   const alice = await login("alice@example.com");
   await link(alice);

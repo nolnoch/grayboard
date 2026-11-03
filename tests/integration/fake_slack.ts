@@ -18,6 +18,8 @@ export class FakeSlack {
   badAppToken = false;
   /** An error files.getUploadURLExternal answers with, e.g. "file_type_not_allowed". */
   refuseUploads: string | null = null;
+  /** An error chat.postMessage answers with, e.g. "msg_too_long". */
+  refusePosts: string | null = null;
   /** Bytes sent to each upload URL, by file id. */
   readonly uploaded = new Map<string, Uint8Array>();
   /** Where completeUploadExternal shared each uploaded file: files.info's `shares`. */
@@ -62,6 +64,7 @@ export class FakeSlack {
             this.failPosts--;
             return new Response("unavailable", { status: 503 });
           }
+          if (this.refusePosts) return Response.json({ ok: false, error: this.refusePosts });
           const ts = `${++this.ts}.000100`;
           this.postTs.set(body, ts);
           return Response.json({ ok: true, channel: body.channel, ts });
