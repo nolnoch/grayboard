@@ -40,8 +40,11 @@ export function rebuild(text: string, mcpName: string, current: string): { plan:
 }
 
 // Only a new sign-in fetches them again: the root's cached text is dropped.
+// An `expired` access is token rollover, which the Controller waits out, so it
+// keeps the last text like any other transient failure.
 function signedOut(error: unknown): boolean {
-  if (accessExpiry(error)) return true;
+  const expiry = accessExpiry(error);
+  if (expiry) return expiry.reason !== "expired";
   for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
     if (e instanceof InsufficientScope || e instanceof Refusal && (e.code === "auth" || e.code === "binding")) return true;
   }
@@ -65,6 +68,12 @@ export class RootInstructions {
   }
   forget(sessionID: string) { this.invalidate(sessionID); this.roots.delete(sessionID); }
   close() { this.closing.abort(); this.roots.clear(); }
+  // What the root's next request carries: fresh text, the last fetched (a
+  // refetch running, or the last one failed), or none.
+  state(sessionID: string): "fresh" | "stale" | "none" {
+    const r = this.roots.get(sessionID);
+    return r?.text === undefined ? "none" : r.fresh && !r.reported ? "fresh" : "stale";
+  }
   // The root's instructions within the deadline: fresh, or the last fetched while a refetch runs.
   async current(sessionID: string): Promise<string | undefined> {
     if (this.closing.signal.aborted) return;
@@ -88,7 +97,11 @@ export class RootInstructions {
           if (generation === r.generation) { r.fresh = true; return; }
         } catch (error) {
           if (this.roots.get(sessionID) !== r || this.closing.signal.aborted) return;
+          // A transient failure (outage, deadline, rollover) keeps the last text
+          // and stops refetching until the next invalidation, so an outage
+          // costs one wait per root rather than one per request.
           if (signedOut(error)) r.text = undefined;
+          else if (generation === r.generation) r.fresh = true;
           if (!r.reported) { r.reported = true; this.report(sessionID, error); }
           return;
         }

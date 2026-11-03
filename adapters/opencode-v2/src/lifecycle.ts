@@ -1,6 +1,6 @@
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller, type Wait } from "./core/controller.js";
-import type { DiagnosticSink } from "./core/diagnostics.js";
+import { failureCode, type DiagnosticSink } from "./core/diagnostics.js";
 import type { HostPort } from "./core/port.js";
 import { Refusal, render } from "./core/model.js";
 import { resolveRoot } from "./core/sessions.js";
@@ -64,9 +64,20 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   }
   // A native bind or unbind ran for this session: its server instructions may have changed (#531).
   bindingChanged?: (sessionID: string) => void;
-  // An enrolled root's enrollment (any state); children and unenrolled sessions have none.
-  enrollment(sessionID: string): OpenCodeEnrollment | undefined { return this.roots.get(sessionID)?.e; }
-  instructionsFailure(error: unknown) { this.failure("instructions", error); }
+  // An enrolled root's enrollment while it isn't paused; children, unenrolled and
+  // paused roots (a drift pauses every root) have none, so no fetch runs on a
+  // stale enrollment or starts an ownership a pause ended.
+  enrollment(sessionID: string): OpenCodeEnrollment | undefined {
+    const r = this.roots.get(sessionID);
+    return r && !r.paused ? r.e : undefined;
+  }
+  // A fetch failure goes on the root's own record, its state and message kept,
+  // so a later success or restart doesn't leave a background `degraded` behind.
+  instructionsFailure(sessionID: string, error: unknown) {
+    const r = this.roots.get(sessionID);
+    if (!r) return;
+    this.record({ state: r.status.state, message: r.status.message, operation: "instructions", sessionID, ...(r.e.held?.length ? { held: r.e.held } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}), code: failureCode(error) });
+  }
   async observe(type: string, data: unknown) {
     if (this.stopped) return;
     if (type === "session.created") {
@@ -132,7 +143,7 @@ export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = (
   };
   let instructions: RootInstructions | undefined;
   const controller = new OpenCodeController(ctx, options, undefined, undefined, watchRoots(sink, id => instructions?.invalidate(id)));
-  instructions = new RootInstructions(fetcher ?? nativeFetcher(controller), (_sessionID, error) => controller.instructionsFailure(error));
+  instructions = new RootInstructions(fetcher ?? nativeFetcher(controller), (sessionID, error) => controller.instructionsFailure(sessionID, error));
   controller.bindingChanged = id => instructions?.invalidate(id);
   // Every primary request of an enrolled root carries its current instructions; other sessions' go as built.
   // A rejected hook fails OpenCode's step, so it never rejects.
@@ -140,7 +151,7 @@ export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = (
     try {
       if (!controller.enrollment(request.sessionID)) { instructions?.forget(request.sessionID); return; }
       const plan: Plan = await rewrite(request, options.mcpName, id => instructions!.current(id));
-      debug("Grayboard instructions", { root: request.sessionID, plan });
+      debug("Grayboard instructions", { root: request.sessionID, plan, text: instructions!.state(request.sessionID) });
     } catch {}
   });
   let restoring: Promise<unknown> = Promise.resolve();

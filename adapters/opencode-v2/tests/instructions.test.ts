@@ -6,7 +6,7 @@ import { OpenCodeController, nativeFetcher, setup, watchRoots } from "../src/lif
 import { LAUNCHER_META, NativeWire, ServerUnreachable, type Wire } from "../src/core/wire.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import type { RecordStatus } from "../src/core/diagnostics.js";
-import { fixture } from "./binding.test.js";
+import { fixture } from "./native-fixture.js";
 
 // OpenCode's `entries()` (core/mcp-guidance, @opencode/core 2.1.4) for a codemode server and a plain one.
 const execute = '    Use tools from this server through `execute` under `tools["grayboard"]`.';
@@ -63,9 +63,17 @@ test("RootInstructions caches per root, refetches after invalidate, falls back t
   expect(await cache.current("R")).toBe("two");
   // Outage: the last text, reported once until a fetch succeeds.
   fail = new ServerUnreachable(new Error("down")); cache.invalidate("R");
+  const outage = fetches;
   expect(await cache.current("R")).toBe("two");
   expect(await cache.current("R")).toBe("two");
   expect(reports).toHaveLength(1);
+  // The failed fetch keeps the last text until the next invalidation: one wait per outage, not per request.
+  expect(fetches).toBe(outage + 1);
+  expect(cache.state("R")).toBe("stale");
+  // Token rollover (`expired`) is transient too: the last text stays.
+  fail = new AccessExpired("OpenCode", "sign in"); cache.invalidate("R");
+  expect(await cache.current("R")).toBe("two");
+  cache.invalidate("R");
   // A hung fetch: the deadline returns the last text, and the late result still fills the cache.
   fail = undefined; text = "three";
   let release!: () => void; hang = new Promise<void>(resolve => { release = resolve; });
@@ -87,9 +95,11 @@ test("RootInstructions caches per root, refetches after invalidate, falls back t
   await pending; await Bun.sleep(0);
   expect(await cache.current("R")).toBe("four");
   // Sign-out clears the root's text; a later success reports again on the next failure.
-  for (const error of [new AccessExpired("OpenCode", "sign in"), new Refusal("auth", "x"), new Refusal("binding", "y")]) {
+  expect(cache.state("R")).toBe("fresh");
+  for (const error of [new AccessExpired("OpenCode", "sign in", "login_required"), new AccessExpired("OpenCode", "sign in", "refresh_outcome_unknown"), new Refusal("auth", "x"), new Refusal("binding", "y")]) {
     fail = error; cache.invalidate("R");
     expect(await cache.current("R")).toBeUndefined();
+    expect(cache.state("R")).toBe("none");
     fail = undefined; text = "back"; cache.invalidate("R");
     expect(await cache.current("R")).toBe("back");
   }
@@ -99,6 +109,17 @@ test("RootInstructions caches per root, refetches after invalidate, falls back t
   expect(await cache.current("R")).toBe("back");
   cache.close();
   expect(await cache.current("R")).toBeUndefined();
+});
+
+test("close aborts an in-flight fetch and answers nothing after it", async () => {
+  let seen: AbortSignal | undefined;
+  const cache = new RootInstructions((_id, signal) => { seen = signal; return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })); }, () => {}, 5_000);
+  const pending = cache.current("R");
+  await Bun.sleep(0);
+  expect(seen?.aborted).toBe(false);
+  cache.close();
+  expect(seen?.aborted).toBe(true);
+  expect(await pending).toBeUndefined();
 });
 
 test("watchRoots invalidates a root when its state, holds or ownership change, never on the instructions operation or a background record", async () => {
@@ -118,10 +139,10 @@ test("watchRoots invalidates a root when its state, holds or ownership change, n
 });
 
 test("the native fetcher names the root on a native connection with the launcher declaration and no delivery, and the controller reports bind and unbind", async () => {
-  const f = fixture();
+  const f = fixture(), metadata = new Map<string, Record<string, unknown>>();
   const ctx = {
     ...f.ctx, location: { directory: "/worktree" },
-    session: { get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, time: {}, metadata: {} }), update: async () => {}, synthetic: async () => {} },
+    session: { get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, time: {}, metadata: metadata.get(sessionID) ?? {} }), update: async ({ sessionID, metadata: m }: { sessionID: string; metadata: Record<string, unknown> }) => { metadata.set(sessionID, m); }, synthetic: async () => {} },
     tool: { list: async () => ["bind", "unbind", "whoami"].map(name => ({ id: `grayboard_${name}`, options: { namespace: "grayboard" } })) },
   } as unknown as Context;
   class IdleWire { client = { setNotificationHandler: () => {} }; constructor(_o: unknown, _a: unknown, readonly signal: AbortSignal, readonly sessionID: string) {} async connect() {} async close() {} async call(name: string) { return name === "whoami" ? { held: [], primary: null, unbound: true, candidates: [] } : {}; } async read() { return { items: [] }; } async listen() { return { closed: new Promise<void>(() => {}), close: async () => {} }; } }
@@ -136,7 +157,7 @@ test("the native fetcher names the root on a native connection with the launcher
   try {
     const fetch = nativeFetcher(controller);
     expect(await fetch("R", new AbortController().signal)).toBeUndefined();
-    await controller.enroll("R");
+    expect((await controller.enroll("R")).state).toBe("approved");
     expect(await fetch("R", new AbortController().signal)).toBe(bound);
     expect(seen).toEqual([{ meta: { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true }, headers: [] }]);
     const changed: string[] = [];
@@ -163,12 +184,14 @@ test("setup's context hook leaves unenrolled sessions as built, never rejects, a
     tool: { list: async () => [], hook: async (name: string) => ({ dispose: async () => { order.push(name); } }) },
     event: { async *subscribe({ signal }: { signal: AbortSignal }) { if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); } },
   } as unknown as Context;
+  const close = spyOn(RootInstructions.prototype, "close").mockImplementation(function(this: RootInstructions) { order.push("instructions"); close.mockRestore(); this.close(); });
   const cleanup = await setup(ctx, () => {}, () => {}, async () => bound);
   const system = [{ type: "text", text: "agent" }, { type: "text", text: render(unbound) }];
   await hook!({ sessionID: "ses_unenrolled", system, messages: [] });
   expect(system[1]!.text).toBe(render(unbound));
   await expect(hook!({ sessionID: "R", system: null, messages: null })).resolves.toBeUndefined();
   await cleanup!();
-  expect(order[0]).toBe("context");
+  // In-flight fetches abort first, then the hook goes, before the controller closes.
+  expect(order.slice(0, 2)).toEqual(["instructions", "context"]);
   expect(order).toContain("execute.before");
 });

@@ -12,7 +12,7 @@ import { METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
-import { fixture } from "./binding.test.js";
+import { fixture } from "./native-fixture.js";
 import { FailedContinuation } from "./failed-continuation.js";
 import { observeRuns } from "./subscriber-work.js";
 import { barrier, bounded } from "./reload-state.js";
