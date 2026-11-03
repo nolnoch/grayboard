@@ -7,6 +7,7 @@
 // binary carries. Server mode (#279, the hosted section below): the hosted
 // extension bundle against an in-process server, no grayboard process at all.
 import { expect } from "bun:test";
+import { Database } from "bun:sqlite";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -313,6 +314,164 @@ async function unboundScenario(dir: string, bin?: string): Promise<void> {
     await stopAll(procs);
     model?.stop();
   }
+}
+
+// pi-subagents' detached runner (#523 step 5). pi-subagents isn't a
+// dependency here, so the closest real path stands in for it: a second real
+// pi, in print mode, that the root pi's bash tool execs with the env the
+// runner gets (PI_SUBAGENT_CHILD=1, PI_SUBAGENT_PARENT_SESSION). Like the
+// runner, it is a direct process child of the root pi in a process group of
+// its own (spawned detached) that loads this extension. Three runners: one
+// whose parent session no live session recorded is its own session from its
+// start; one acts as the root's child, writing as the root's name with its
+// child ID as via, then binds a name, which promotes it to its own session
+// that receives the name's DMs; one acts as the child until the root pi is
+// killed while it runs on, then is its own session.
+export function piRunnerScenario(dir: string): Promise<void> {
+  const gate = (name: string) => join(dir, `gate-${name}`);
+  const pidFile = (name: string) => join(dir, `runner-${name}.pid`);
+  const node = Bun.which("node");
+  let rootSession = "";
+  // The root's one step: exec runner `name`, whose parent session is `parent`.
+  const launch = (name: string, parent: () => string): Rule => (req) => scripted(`launch ${name}`, [{
+    tool: "bash",
+    args: { command: `echo $$ > '${pidFile(name)}'; exec env PI_SUBAGENT_CHILD=1 PI_SUBAGENT_PARENT_SESSION='${parent()}' '${node}' '${PI_CLI}' -p --offline --provider fake --model fake-1 --no-session 'runner ${name}'` },
+  }])(req);
+  const wait = (name: string): Reply => ({ tool: "bash", args: { command: `while [ ! -f '${gate(name)}' ]; do sleep 0.1; done` } });
+  const whoami: Reply = { tool: "mcp__grayboard__whoami", args: {} };
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      launch("orphan", () => "no-such-session"),
+      launch("promote", () => rootSession),
+      launch("fallback", () => rootSession),
+      scripted("runner orphan", [whoami]),
+      scripted("runner promote", [
+        whoami,
+        { tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "from the runner" } },
+        { tool: "mcp__grayboard__bind", args: { name: "pi-runner", create: true } },
+        wait("promoted"),
+      ]),
+      scripted("runner fallback", [whoami, wait("killed"), whoami]),
+      onChannelDm("peer", (id) => ({ tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "pong", parent_id: id } })),
+    ]);
+    let db: Database | undefined;
+    try {
+      const peer = await localSession(dir, "peer");
+      const pi = startPi(dir, model.port, procs);
+      rootSession = (await pi.command({ type: "get_state" })).sessionId;
+      await until(async () => (await peer.call("peer_list")).peers.some((x: { handle: string }) => x.handle === "pi"), 15_000, "pi online");
+      db = new Database(join(dir, "bus.db"));
+      const bus = db;
+      const idRow = (id: string) => bus.query<{ root_id: string | null; ended_at: number | null; harness_session: string | null }, [string]>(
+        `SELECT root_id, ended_at, harness_session FROM ids WHERE id = ?`).get(id);
+      const audit = (action: string) => bus.query<{ actor: string; target: string; detail: string }, [string]>(
+        `SELECT actor, target, detail FROM audit_log WHERE action = ? ORDER BY rowid`).all(action)
+        .map((r) => ({ ...r, detail: JSON.parse(r.detail) as Record<string, unknown> }));
+      // The fake model's requests in the conversation `prompt` started, and the tool results its latest carries.
+      const asked = (prompt: string) => model.requests.map((r) => r.body).filter((b) => b.messages.some((m) => m.role === "user" && promptText(m) === prompt));
+      const results = (prompt: string) => (asked(prompt).at(-1)?.messages ?? []).filter((m) => m.role === "tool").map(messageText);
+      // Runner `name` exited: the root's next request carries its bash result.
+      const ran = async (name: string) => {
+        await until(() => asked(`launch ${name}`).some((b) => b.messages.some((m) => m.role === "tool")), 60_000, `runner ${name} exited`);
+        await idle(pi);
+      };
+      // The root pi's session, which recorded its pi session id.
+      const root = bus.query<{ id: string }, [string]>(`SELECT id FROM ids WHERE harness_session = ? AND root_id IS NULL AND ended_at IS NULL`).get(rootSession)?.id;
+      if (root === undefined) throw new Error(`no live session recorded pi session ${rootSession}`);
+
+      // No live session recorded its parent session: its own session from the start, unbound.
+      await pi.command({ type: "prompt", message: "launch orphan" });
+      await ran("orphan");
+      const orphan = JSON.parse(results("runner orphan")[0]!);
+      expect(orphan).toEqual({ id: orphan.id, primary: orphan.id, aliases: [], principal: null });
+      expect(orphan.id).not.toBe(root);
+      expect(audit("id.child_fallback")).toEqual([{
+        actor: orphan.id, target: orphan.id,
+        detail: { parent_session: "no-such-session", why: "no live session recorded harness session no-such-session", pid: expect.any(Number) },
+      }]);
+      expect(idRow(orphan.id)).toMatchObject({ root_id: null, harness_session: expect.any(String) });
+
+      // The root's child: it writes as the root's name with its ID as via,
+      // and its bind promotes it to its own session, which receives.
+      await pi.command({ type: "prompt", message: "launch promote" });
+      const promoted = await until(() => audit("id.promoted").at(0), 60_000, "the runner's bind");
+      // The ping goes once the model has the bind's result, so it is answering
+      // with the gate step: pi steers a push in after the step running when it
+      // lands, and one landing during the bind would come before the gate step,
+      // which the scripted model takes as having acted on it.
+      await until(() => results("runner promote").some((t) => t.includes('Bound to "pi-runner"')), 30_000, "the bind's result at the model");
+      const ping = await peer.call("dm_send", { to: "pi-runner", body: "ping" });
+      await until(() => bus.query<{ delivered_at: number | null }, [number]>(`SELECT delivered_at FROM messages WHERE id = ?`).get(ping.message_id)?.delivered_at, 30_000, "ping pushed to the runner");
+      writeFileSync(gate("promoted"), "");
+      await until(() => peer.pushes.find((x) => x.content === "pong"), 30_000, "pong from the runner");
+      await ran("promote");
+      const [asChild, , bound] = results("runner promote");
+      const child = JSON.parse(asChild!);
+      expect(child).toEqual({ id: child.id, primary: "pi", aliases: ["pi"], principal: null, root, child: true });
+      // Its liveness row copies the root's (#539).
+      const rootLive = bus.query<{ pid: number }, [string]>(`SELECT pid FROM bindings WHERE session_id = ?`).get(root)!.pid;
+      expect(audit("id.child_seen").filter((a) => a.target === child.id)).toEqual([{
+        actor: root, target: child.id,
+        detail: { child: child.id, root, raw: idRow(child.id)!.harness_session, pid: expect.any(Number), liveness_pid: rootLive, parent_session: rootSession },
+      }]);
+      expect(bus.query(`SELECT sender, sender_id, via FROM messages WHERE body = 'from the runner'`).get()).toEqual({ sender: "pi", sender_id: child.id, via: child.id });
+      expect(peer.pushes.find((x) => x.content === "from the runner")?.meta.from).toBe("pi");
+      expect(bound).toContain('Bound to "pi-runner"');
+      expect(promoted).toEqual({
+        actor: promoted.actor, target: promoted.actor,
+        detail: { child: child.id, root, pid: expect.any(Number), parent_session: rootSession, harness_session: idRow(child.id)!.harness_session },
+      });
+      expect(promoted.actor).not.toBe(child.id);
+      expect(idRow(child.id)).toMatchObject({ root_id: root, ended_at: expect.any(Number) });
+      expect(idRow(promoted.actor)).toMatchObject({ root_id: null, harness_session: idRow(child.id)!.harness_session });
+      expect((await peer.call("dm_thread", { thread: ping.message_id })).map((m: { sender: string; body: string }) => [m.sender, m.body])).toEqual([["peer", "ping"], ["pi-runner", "pong"]]);
+      expect(bus.query(`SELECT sender_id, via FROM messages WHERE body = 'pong'`).get()).toEqual({ sender_id: promoted.actor, via: null });
+      // The root keeps its name throughout.
+      expect(bus.query(`SELECT id FROM alias_holds WHERE address = 'pi'`).get()).toEqual({ id: root });
+
+      // The root pi exits while its child runs on (SIGKILL: no shutdown of
+      // its process children, as when pi-subagents' parent exits): the
+      // child's next call finds no live root and it is its own session.
+      await pi.command({ type: "prompt", message: "launch fallback" });
+      await until(() => asked("runner fallback").length >= 2 && existsSync(pidFile("fallback")), 60_000, "the runner at its gate");
+      process.kill(pi.pid, "SIGKILL");
+      await pi.exited;
+      await until(() => idRow(root)?.ended_at, 15_000, "the root session ended");
+      writeFileSync(gate("killed"), "");
+      const runner = Number(readFileSync(pidFile("fallback"), "utf8"));
+      await until(() => !alive(runner), 60_000, "the orphaned runner exited");
+      const [first, , second] = results("runner fallback");
+      const before = JSON.parse(first!), after = JSON.parse(second!);
+      expect(before).toEqual({ id: before.id, primary: "pi", aliases: ["pi"], principal: null, root, child: true });
+      expect(after).toEqual({ id: after.id, primary: after.id, aliases: [], principal: null });
+      expect(after.id).not.toBe(before.id);
+      expect(audit("id.child_fallback").filter((a) => a.actor === after.id)).toEqual([{
+        actor: after.id, target: after.id,
+        detail: { child: before.id, root, pid: expect.any(Number), parent_session: rootSession, harness_session: idRow(before.id)!.harness_session },
+      }]);
+      expect(idRow(before.id)).toMatchObject({ root_id: root, ended_at: expect.any(Number) });
+      expect(idRow(after.id)).toMatchObject({ root_id: null, harness_session: idRow(before.id)!.harness_session });
+      expect(model.unhandled).toEqual([]);
+    } finally {
+      // A runner left at a gate by a failure: its whole process group.
+      for (const name of ["orphan", "promote", "fallback"]) {
+        const pid = existsSync(pidFile(name)) ? Number(readFileSync(pidFile(name), "utf8")) : 0;
+        if (pid > 0 && alive(pid)) process.kill(-pid, "SIGKILL");
+      }
+      await stopAll(procs);
+      model.stop();
+      db?.close();
+    }
+  });
 }
 
 // An enabled grayboard MCP entry would give pi a second grayboard with the same

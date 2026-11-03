@@ -477,6 +477,22 @@ export function boundInstructions(name: string, source: string | null, general: 
   ];
 }
 
+/**
+ * What a runner child (#523 step 5) is told: a subagent process of its own
+ * acting under its root's session, which writes as the root's primary
+ * (`rootPrimary` at start: the root's holds are re-read on each call) with
+ * its own ID as `via`, is pushed nothing, and becomes its own session by
+ * binding. `modeGeneral` adds a mode's general sentences.
+ */
+export function runnerChildInstructions(child: string, root: string, rootPrimary: string, modeGeneral: string[]): string[] {
+  return [
+    `You are a subagent of session ${root} on the grayboard bus, which coordinates between agents: you send, post and claim as its name ("${rootPrimary}" at your start; whoami shows it now), and what you write shows your ID ${child} as via.`,
+    `Mail and board pushes are your root's and never reach you: dm_thread a thread you wrote to see its replies; board_read reads without marking anything read. bind(name) makes this process its own session holding that name, which receives that name's mail; unbind is your root's.`,
+    ...COORDINATION_INSTRUCTIONS,
+    ...modeGeneral,
+  ];
+}
+
 /** bind's refusal in a tools-only process. */
 export const TOOLS_ONLY_BIND = "this grayboard process is tools-only (BUS_PUSH=off); its name comes from the session that owns delivery";
 
