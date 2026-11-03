@@ -146,10 +146,17 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call's r
     await until(() => hosted() > 0, 30_000, "the signed-in plugin to open its hosted session");
     // 2.1.316 keeps the URL prompt up after the plugin's completion notice and
     // its cancel, and the prompt takes the keyboard: the user dismisses it.
+    // A prompt that reached Claude Code while it was still wiring the
+    // connection was cancelled unshown; the plugin sends it again only while
+    // the flow is open, and this sign-in can finish first: then none is up.
     const debug = () => readFileSync(join(signedOut, "debug.log"), "utf8");
     expect(debug()).toContain("Received elicitation completion notification");
-    tty.proc.terminal!.write("\x1b");
-    await until(() => debug().includes('Elicitation response: {"action":"cancel"}'), 10_000, "Esc to dismiss the sign-in prompt");
+    if (debug().includes("Received elicitation request: ")) {
+      tty.proc.terminal!.write("\x1b");
+      await until(() => debug().includes('Elicitation response: {"action":"cancel"}'), 10_000, "Esc to dismiss the sign-in prompt");
+    } else {
+      expect(debug()).toContain("Elicitation request received during initialization");
+    }
     await tty.submit("WHOAMI-AGAIN");
     const again = "toolu_WHOAMI_AGAIN";
     await until(() => toolResults(model, again).length > 0, 30_000, "the second whoami result");

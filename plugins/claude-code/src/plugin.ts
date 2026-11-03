@@ -45,6 +45,13 @@ const FLOW_MS = 10 * 60_000;
 // two 10 s request timeouts the server is likely down, and the result says
 // the sign-in is still starting rather than hold the call.
 const LINK_MS = 20_000;
+// Claude Code 2.1.316 answers an elicitation that lands while it is still
+// wiring the connection with an immediate cancel, never shown. A cancel this
+// fast came from that handler, not a person: the prompt is sent again, up to
+// RESENDS times, RESEND_MS apart, while the flow is still open.
+const UNSHOWN_MS = 1_000;
+const RESEND_MS = 500;
+const RESENDS = 3;
 
 export type PluginOptions = {
   env: Record<string, string | undefined>;
@@ -123,25 +130,33 @@ export function createPlugin(o: PluginOptions): Plugin {
       say(`open ${url} to sign in to grayboard`);
       // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation): the link alone.
       if (!server!.getClientCapabilities()?.elicitation?.url) return;
-      const prompt = { id: randomUUID(), withdraw: new AbortController() };
-      if (flow) flow.prompt = prompt;
-      say(`sign-in prompt sent (elicitation ${prompt.id})`);
-      let result;
-      try {
-        result = await server!.elicitInput(
-          { mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
-          { timeout: FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
-        );
-      } catch (error) {
-        // Withdrawn: the browser answered first, and the flow went on without it.
-        if (prompt.withdraw.signal.aborted) return;
-        say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
-        throw error;
+      for (let sent = 0; ; sent++) {
+        const prompt = { id: randomUUID(), withdraw: new AbortController() };
+        if (flow) flow.prompt = prompt;
+        say(`sign-in prompt sent (elicitation ${prompt.id})`);
+        const start = Date.now();
+        let result;
+        try {
+          result = await server!.elicitInput(
+            { mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
+            { timeout: FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
+          );
+        } catch (error) {
+          // Withdrawn: the browser answered first, and the flow went on without it.
+          if (prompt.withdraw.signal.aborted) return;
+          say(`sign-in prompt (elicitation ${prompt.id}) ended without an answer: ${message(error)}`);
+          throw error;
+        }
+        const ms = Date.now() - start;
+        say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action} after ${ms} ms`);
+        // Only a decline ends the flow: Esc (cancel) may just free the keyboard
+        // from a prompt Claude Code keeps up while the user finishes the link.
+        if (result.action === "decline") throw new LoginFailed("sign-in declined");
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS || sent >= RESENDS || !flow) return;
+        await after(RESEND_MS);
+        // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
+        if (signingIn !== flow || flow.abort.signal.aborted) return;
       }
-      say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action}`);
-      // Only a decline ends the flow: Esc (cancel) may just free the keyboard
-      // from a prompt Claude Code keeps up while the user finishes the link.
-      if (result.action === "decline") throw new LoginFailed("sign-in declined");
     },
     notify: message => {
       say(message);
