@@ -3,8 +3,8 @@
 // revision, the server's own status and body for a refusal at initialize, and
 // a scope refusal classified for a new sign-in.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { ConnectRefused, DELIVERY_META, InsufficientScope, NativeWire, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
+import { ConnectRefused, DELIVERY_META, InsufficientScope, LAUNCHER_META, NativeWire, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -29,6 +29,7 @@ function subscriber(token: string, wireOptions = options()) {
 // it keeps its own copy of the key the server reads (#444).
 test("the wire's delivery key is the one the server reads", () => {
   expect(DELIVERY_META).toBe(GRAYBOARD_DELIVERY_META);
+  expect(LAUNCHER_META).toBe(GRAYBOARD_LAUNCHER_META);
 });
 
 // Pins that the 2026-07-28 stream isn't held back like the legacy GET (#431).

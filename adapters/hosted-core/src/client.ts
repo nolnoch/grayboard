@@ -32,6 +32,7 @@ export type HostedClientOptions = {
   retryHint: string;        // a failed tool call's remedy: pi/omp "call the tool again"; Claude Code its resume hint
   roots?: string[];         // ToolProxy attachment roots
   env?: Record<string, string | undefined>;
+  launcher?: boolean;       // the harness can spawn subagents (BUS_LAUNCHER=1): every request declares it (#473)
   log(message: string, level: Level): void;
 };
 
@@ -70,7 +71,7 @@ export class HostedClient {
   get login(): Login { return this.options.login; }
 
   wireOptions(mode: "push" | "poll"): WireOptions {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source } };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...(this.options.launcher ? { launcher: true as const } : {}) };
   }
 
   // One short-lived poll wire under `sessionID` (a child's register and end, a session's end).

@@ -16,3 +16,7 @@ export const GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost
 // session's `ids.model`/`ids.effort`, which peer_list shows and match:{model, effort} filters on.
 export const GRAYBOARD_MODEL_META = "io.github.nolnoch.grayboard/model";
 export const GRAYBOARD_EFFORT_META = "io.github.nolnoch.grayboard/effort";
+// Beside the session key, a launcher declaration (#473): `true` says this session's harness can spawn subagents, the
+// hosted counterpart of a local session's BUS_LAUNCHER=1. It is stated when an ownership starts and kept until it
+// ends (`ids.launcher`); a later request's value is not read, and anything but a boolean is refused.
+export const GRAYBOARD_LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
