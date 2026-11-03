@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { storeAttachment } from "../../src/core/attachments.ts";
-import { mintSessionKey } from "../../src/core/bindings.ts";
+import { MAX_CHILDREN, childCapacity, mintSessionKey } from "../../src/core/bindings.ts";
 import { GRAYBOARD_AGENT_META } from "../../src/shared/session_meta.ts";
 import { SqliteBlobs } from "../../src/local/blobs.ts";
 import { runCli } from "../support/cli.ts";
@@ -468,6 +468,55 @@ test("a runner child acts under the root its harness started; a subagent calling
   expect(await childRefusal(runner, "worker-1", "bind", { name: "qa", create: true })).toBe(`error: child_session: this session acts under its root ${root}; bind and unbind are the root's. Call them from the root session.`);
   await until(() => be.pushes.some((p) => p.content === "from the nested subagent"));
   expect(be.pushes.find((p) => p.content === "from the nested subagent")!.meta).toMatchObject({ from: "fe", via: nested.id });
+}, 30_000);
+
+// A runner child's root as the tests above make one: keyed to this test
+// process, which every session's harness descends from, under pi session `harnessSession`.
+const runnerRootSession = (identity: string, harnessSession: string): Promise<Session> =>
+  localSession(dir, identity, { extra: { BUS_SESSION_KEY: mintSessionKey(), BUS_HARNESS_PID: String(process.pid), BUS_HARNESS_SESSION: harnessSession } });
+const fallbacks = (actor: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'id.child_fallback' AND actor = ?`, actor)
+  .map((r) => JSON.parse(r.detail) as Record<string, unknown>);
+
+// #523 step 5: a root at its child capacity refuses a runner as a child; the
+// runner runs as its own session, as with no live parent, audited and logged
+// once with the reason, instead of exiting where only its stderr says why.
+test("a runner its root refuses for child capacity runs as its own session, audited and logged once with the reason", async () => {
+  const fe = await runnerRootSession("fe", "pi-1");
+  const root = (await fe.call("whoami")).id as string;
+  for (let i = 0; i < MAX_CHILDREN; i++) await asChild(fe, `sub-${i}`, "whoami");
+  const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1" } });
+  const own = (await runner.call("whoami")) as Who;
+  expect(own).toEqual({ id: own.id, primary: own.id, aliases: [], principal: null });
+  expect(fallbacks(own.id)).toEqual([{ parent_session: "pi-1", why: childCapacity(root), pid: expect.any(Number) }]);
+  expect(rows(`SELECT root_id, delivery FROM ids WHERE id = ?`, own.id)).toEqual([{ root_id: null, delivery: "push" }]);
+  expect(runner.stderr().split("\n").filter((l) => l.includes("this process runs as its own session"))).toEqual([
+    `[grayboard] BUS_PARENT_SESSION pi-1: ${childCapacity(root)}; this process runs as its own session`,
+  ]);
+}, 60_000);
+
+// #523 step 5: a runner's BUS_LAUNCHER is its launching session's, inherited
+// with its env, and pi-subagents doesn't load in a runner: whether it falls
+// back at start or is promoted by a bind, its own session isn't a launcher.
+test("a runner with an inherited BUS_LAUNCHER=1 is never a launcher: not when it falls back at start, not when a bind promotes it", async () => {
+  const fe = await runnerRootSession("fe", "pi-1");
+  const root = (await fe.call("whoami")).id as string;
+  const launcherOf = (id: string) => rows<{ launcher: number }>(`SELECT launcher FROM ids WHERE id = ?`, id)[0]!.launcher;
+  const launcherSet = (id: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'handle.launcher_set' AND actor = ?`, id).map((r) => JSON.parse(r.detail));
+
+  const orphan = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-none", BUS_LAUNCHER: "1" } });
+  const own = (await orphan.call("whoami")) as Who;
+  expect(fallbacks(own.id)).toHaveLength(1);
+  expect(launcherOf(own.id)).toBe(0);
+  expect(launcherSet(own.id)).toEqual([{ on: false }]);
+
+  const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1", BUS_LAUNCHER: "1" } });
+  expect(((await runner.call("whoami")) as Who).root).toBe(root);
+  expect(await runner.call("bind", { name: "qa", create: true })).toContain('Bound to "qa"');
+  const promoted = ((await runner.call("whoami")) as Who).id;
+  expect(rows(`SELECT root_id FROM ids WHERE id = ?`, promoted)).toEqual([{ root_id: null }]);
+  expect(launcherOf(promoted)).toBe(0);
+  expect(launcherSet(promoted)).toEqual([{ on: false }]);
+  expect((await fe.call("peer_list")).peers.find((p: { handle: string }) => p.handle === "qa")).not.toHaveProperty("launcher");
 }, 30_000);
 
 test("a DM or @mention to a child's ID is refused child_session naming its root's primary; the child ends with its root and stays refused", async () => {

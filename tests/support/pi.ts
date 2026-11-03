@@ -404,6 +404,11 @@ export function piRunnerScenario(dir: string): Promise<void> {
       // and its bind promotes it to its own session, which receives.
       await pi.command({ type: "prompt", message: "launch promote" });
       const promoted = await until(() => audit("id.promoted").at(0), 60_000, "the runner's bind");
+      // The ping goes once the model has the bind's result, so it is answering
+      // with the gate step: pi steers a push in after the step running when it
+      // lands, and one landing during the bind would come before the gate step,
+      // which the scripted model takes as having acted on it.
+      await until(() => results("runner promote").some((t) => t.includes('Bound to "pi-runner"')), 30_000, "the bind's result at the model");
       const ping = await peer.call("dm_send", { to: "pi-runner", body: "ping" });
       await until(() => bus.query<{ delivered_at: number | null }, [number]>(`SELECT delivered_at FROM messages WHERE id = ?`).get(ping.message_id)?.delivered_at, 30_000, "ping pushed to the runner");
       writeFileSync(gate("promoted"), "");

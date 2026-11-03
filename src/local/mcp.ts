@@ -136,11 +136,6 @@ const HUMAN = process.env.BUS_HUMAN === "1";
 // telling peers what its harness can do, and it's the one that acts on a
 // delegation request when one arrives by DM.
 const LAUNCHER = process.env.BUS_LAUNCHER === "1";
-// A launcher must be able to RECEIVE delegation requests: a tools-only
-// session (BUS_PUSH=off) isn't one, whatever its env says — it doesn't hold
-// the name, has no socket, and never touches the launcher flag (a sidecar
-// must not overwrite the owner's opt-in).
-const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH;
 // BUS_MODEL, BUS_EFFORT: what this session's harness runs on, shown on its
 // peer_list rows (#284 S12). Self-reported, read once, ended with the session.
 const MODEL = process.env.BUS_MODEL || undefined;
@@ -168,6 +163,14 @@ if (PARENT_SESSION !== undefined && (!PUSH || HUMAN || KEYED)) {
   console.error("[grayboard] BUS_PARENT_SESSION makes this process a subagent of the session that recorded it, in place of a session that owns its delivery; it can't be combined with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY");
   process.exit(1);
 }
+// A launcher must be able to RECEIVE delegation requests: a tools-only
+// session (BUS_PUSH=off) isn't one, whatever its env says — it doesn't hold
+// the name, has no socket, and never touches the launcher flag (a sidecar
+// must not overwrite the owner's opt-in). Nor is a runner (BUS_PARENT_SESSION),
+// child or its own session: its BUS_LAUNCHER is its launching session's,
+// inherited with its env, and pi-subagents doesn't load in a runner, so it
+// can't spawn the subagent a request asks for.
+const EFFECTIVE_LAUNCHER = LAUNCHER && PUSH && PARENT_SESSION === undefined;
 // What this process registers its own root session as: at start, or when a
 // runner child becomes its own session.
 const ROOT_KIND: SessionKind = { launcher: EFFECTIVE_LAUNCHER, model: MODEL, effort: EFFORT, ...(HARNESS_SESSION ? { harnessSession: HARNESS_SESSION } : {}) };
@@ -219,7 +222,8 @@ const DELIVER = PUSH && !CHANNELS_OFF;
 // a copy of its root's liveness, registerChild). A bind promotes it to its
 // own session (bind); its root ending makes it one (rootGone).
 let liveParent: string | null = null;
-// Why a BUS_PARENT_SESSION process started as its own session: no live root.
+// Why a BUS_PARENT_SESSION process started as its own session: no live root,
+// or its root refused it as a child.
 let ownWhy: string | null = null;
 if (PARENT_SESSION !== undefined) {
   const found = runnerRoot(db, PARENT_SESSION);
@@ -233,12 +237,9 @@ if (PARENT_SESSION !== undefined) {
       liveParent = found.root;
     } catch (e) {
       if (!(e instanceof CoreError)) throw e;
-      // The root ended since the lookup: no live parent. Anything else (the
-      // root's child capacity) is a refusal.
-      if (!e.message.startsWith("id_ended:")) {
-        console.error(`[grayboard] ${e.message}`);
-        process.exit(1);
-      }
+      // Refused (its root ended since the lookup, or has its fill of
+      // children): it runs as its own session, as with no live parent, rather
+      // than lose grayboard for its whole life over a reason only stderr sees.
       ownWhy = e.message;
     }
   }
@@ -331,8 +332,9 @@ if (WRITES_AS) {
     }
   }
   if (ownWhy !== null) {
-    // A runner with no live parent runs as its own session, logged once
-    // (hosted's rule for a subagent with no parent session).
+    // A runner with no live parent, or one that refused it as a child, runs
+    // as its own session, logged once (hosted's rule for a subagent with no
+    // parent session).
     console.error(`[grayboard] BUS_PARENT_SESSION ${PARENT_SESSION}: ${ownWhy}; this process runs as its own session`);
     writeCoreAudit(db, "id.child_fallback", SESSION_ID, SESSION_ID, { parent_session: PARENT_SESSION, why: ownWhy, pid: process.pid });
   }
@@ -414,7 +416,7 @@ console.error(`[grayboard] local mode, session ${SESSION_ID}, ${liveParent !== n
 function localInstructions(general: boolean, notes: string[] = []): string[] {
   const name = primary();
   const modeGeneral = () => [
-    ...(EFFECTIVE_LAUNCHER && liveParent === null ? launcherInstruction() : []),
+    ...(EFFECTIVE_LAUNCHER ? launcherInstruction() : []),
     ...humanInstruction(humanHandles(db).filter((h) => h !== name)),
     ...(HUMAN ? [] : announcementsInstruction(activeAnnouncements(db))),
   ];
@@ -1049,7 +1051,6 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     testPause("bind:after-acquire");
     try {
       listen(n.name);
-      touchAlias(db, n.name);
     } catch (e) {
       console.error(`[grayboard] session ${SESSION_ID} bound "${n.name}" but its setup failed:`, e);
       throw new CoreError(`bound "${n.name}", but setting it up failed: ${(e as Error).message}`);

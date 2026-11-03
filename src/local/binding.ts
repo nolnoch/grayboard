@@ -599,6 +599,9 @@ export async function acquireName(
     db.prepare(`UPDATE bindings SET name = ?, bound_at = ? WHERE session_id = ? AND name IS NULL`).run(name, now, sessionId);
     ensureAlias(db, name, sessionId, now);
     holdAlias(db, name, sessionId, now);
+    // Used from the moment the hold commits: a peer's dm_send to a name that
+    // has never had a session is refused, and this one has one now.
+    touchAlias(db, name, now);
     if (opts.meta) setAliasMeta(db, name, opts.meta, sessionId, coreAuditSink(db));
     const restart = opts.restartOf === undefined ? null : continuityOf(db, name, opts.restartOf);
     logBinding(db, sessionId, name, "bound", restart?.detail ?? null, now);
