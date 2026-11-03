@@ -39,7 +39,7 @@ export type AppEvent =
 // bind's probe of its alias (a contender asking whether the holder is alive):
 // "answer" (the default), "silent" (no answer: false after the probe's ms), or
 // a function of the ms. launcher: the declaration a hosted request's
-// `_meta` carries (#473), registered as hostedRegister does.
+// `_meta` carries (#473), declared as `rowFor` does.
 export type AppSessionOptions = {
   push?: boolean;
   launcher?: boolean;
@@ -138,7 +138,8 @@ export class AppSession {
     let info: IdentityInfo;
     try {
       const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
-      this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs, undefined, this.opts.launcher ? { launcher: true } : undefined);
+      this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
+      if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
       ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.hold === true, this.opts.push !== false));
     } catch (e) {
       this.drop(`connect refused: ${(e as Error).message}`);

@@ -48,9 +48,9 @@ afterEach(async () => {
 const storeLogin = () => new Login({ resource: srv.resource, clientId: CLIENT, stateDir, harness: "pi", loginAction: "run /grayboard login", present: () => {}, notify: () => {}, diagnostic: () => {} });
 
 // One hosted session's client as pi builds it, logging what it would say.
-function client(logs: { message: string; level: Level }[]) {
+function client(logs: { message: string; level: Level }[], launcher = false) {
   return new HostedClient({
-    harness: "pi", clientId: CLIENT, version: "1.0.0", login: storeLogin(), source: "grayboard",
+    harness: "pi", clientId: CLIENT, version: "1.0.0", login: storeLogin(), source: "grayboard", launcher,
     loginAction: "run /grayboard login", resumeHint: "run /grayboard resume", retryHint: "call the tool again",
     log: (message, level) => { logs.push({ message, level }); },
   });
@@ -215,6 +215,14 @@ test("detach keeps the lease and name for the next runtime; release ends the ses
   await b.root.shutdown("release");
   expect(row("detach-1")).toBeNull();
   expect([...a.logs, ...b.logs]).toEqual([]);
+});
+
+// The Controller's wires (subscriber, temporary, child registration) declare a launcher client's flag too, not only
+// its proxy wire (#520): the port root.ts builds carries it.
+test.each([true, false])("a launcher client (%p) gives the Controller's port its launcher flag", launcher => {
+  const root = new RootDelivery(client([], launcher), { sessionID: `port-${launcher}`, stateDir, place: () => "hosted-core-root test", push: true, admit: async () => {}, onTools: () => {} });
+  const port = (Reflect.get(root, "port") as () => { launcher?: true }).call(root);
+  expect(port.launcher).toBe(launcher ? true : undefined);
 });
 
 test("admit gets the run loop's signal; once it aborts, the host's admit is never called", async () => {

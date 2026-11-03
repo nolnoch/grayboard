@@ -604,7 +604,7 @@ test("a root's suggested name is its first request's, offered first among its un
   for (const bad of ["", "a/b", "human", "x".repeat(33)]) expect(ctx("root", bad)).not.toHaveProperty("suggested");
 });
 
-test("a request's launcher declaration is the ownership's: registered and audited, restated by a new ownership, cleared at its end, refused unless a boolean (#473)", async () => {
+test("a request's launcher declaration is the ownership's: set by any root request and audited once, restated by a new ownership, cleared at its end, ignored for a child, refused unless a boolean (#473, #520)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const ctx = (extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-root", ...extra });
   const id = (ctx() as { id: string }).id;
@@ -622,7 +622,7 @@ test("a request's launcher declaration is the ownership's: registered and audite
   await hosted.end(generic, toolsOnly);
   await hosted.bind(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }), { name: "lead", create: true });
   expect(flag()).toBe(1);
-  expect(audited()).toEqual([{ target: id, detail: JSON.stringify({ on: true }) }]);
+  expect(audited().map(a => ({ target: a.target, ...JSON.parse(a.detail) }))).toEqual([{ target: id, on: true, ownership: expect.any(Number), client_id: "grayboard-pi" }]);
   // The ownership's end clears it; a new ownership that declares nothing isn't one, and one that declares restates it.
   await hosted.end(generic, ctx());
   expect(flag()).toBe(0);
@@ -632,6 +632,22 @@ test("a request's launcher declaration is the ownership's: registered and audite
   await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
   expect(flag()).toBe(1);
   expect(audited()).toHaveLength(2);
+  // A later request of the ownership turns it on (#520: OpenCode's native client starts the ownership without the
+  // plugin's `_meta`), audited once; a repeat, or a request that declares nothing, changes nothing.
+  await hosted.end(generic, ctx());
+  await hosted.whoami(generic, ctx());
+  expect(flag()).toBe(0);
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
+  await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
+  await hosted.whoami(generic, ctx());
+  expect(flag()).toBe(1);
+  expect(audited()).toHaveLength(3);
+  // A child's declaration is ignored: the root launches, not its subagent.
+  await hosted.register(generic, ctx(), "launcher-child");
+  const child = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-child", [GRAYBOARD_LAUNCHER_META]: true });
+  await hosted.whoami(generic, child);
+  expect((database.db.prepare("SELECT launcher FROM ids WHERE id = ?").get((child as { id: string }).id) as { launcher: number }).launcher).toBe(0);
+  expect(audited()).toHaveLength(3);
 });
 
 test("a declared launcher is a delegation target, and only its own session's initialize and bind text carry the launcher instruction (#473)", async () => {

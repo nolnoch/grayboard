@@ -1,6 +1,6 @@
 // Delegation (#184): local-mode sessions (separate `grayboard mcp --mode
 // local` children) over real processes, and the server's: a requester on a
-// hosted MCP session, a launcher on an application session registered as a hosted
+// hosted MCP session, a launcher on an application session declared as a hosted
 // request's launcher declaration is (#473). The launcher opt-in, the delegate
 // tool's resolution rules, the payload's harness-neutrality, the human
 // fallback, refusals and their audit rows (kept by a hosted call since #452),
@@ -26,7 +26,7 @@ type Inbox = { unanswered?: { id: number; from: string }[]; promised?: { to: str
 // A server whose hosted sessions can poll their inbox freely.
 const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
 
-// A connected application session that registers as a launcher, as a hosted
+// A connected application session declared a launcher, as a hosted
 // request's launcher declaration does (#473).
 async function launcher(srv: TestServer, token: string, identity: string): Promise<AppSession> {
   const s = srv.appSession(token, identity, { launcher: true });

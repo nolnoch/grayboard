@@ -19,6 +19,7 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   readonly sessionKey: string;   // "ai.opencode/sessionID" | "io.github.nolnoch.grayboard/sessionID"
   readonly client: { name: string; version: string };
   readonly delivery?: Delivery;  // adapters only; OpenCode omits it
+  readonly launcher?: true;      // the harness can spawn subagents: every wire declares it, and the server turns the ownership's flag on (#473, #520)
   readonly storage: KeyValueStorage;
   place(): string;               // bind `where`; captured at construction, guard refuses once it differs
   ancestry(sessionID: string): Promise<SessionPath>; // {sessionID, root, via}; throws AncestryError

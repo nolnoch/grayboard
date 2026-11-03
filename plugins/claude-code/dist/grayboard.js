@@ -36194,7 +36194,7 @@ class Controller {
     check();
   }
   wireOptions(e) {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {} };
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {} };
   }
   async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
     let current;
@@ -36989,6 +36989,7 @@ class RootDelivery {
       sessionKey: wire.sessionKey,
       client: wire.client,
       delivery: wire.delivery,
+      ...wire.launcher ? { launcher: true } : {},
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
       ancestry: async (sessionID) => {
