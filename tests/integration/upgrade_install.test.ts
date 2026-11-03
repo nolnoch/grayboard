@@ -124,7 +124,7 @@ function expectRegistered(server?: string): void {
     expect(existsSync(join(home, ".config", "opencode", "opencode.json"))).toBe(false);
     expect(existsSync(join(home, ...ADAPTERS.opencode))).toBe(false);
   } else {
-    // Disabled: the opencode and local pi adapters serve the tools and read their command here.
+    // Disabled: the opencode and local omp and pi adapters serve the tools and read their command here.
     expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
     for (const harness of ["omp", "opencode", "pi"] as const) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
   }
@@ -137,8 +137,7 @@ function expectRegistered(server?: string): void {
       expect(json(dot, "agent", "grayboard", "config.json"), harness).toEqual({ url: `${server}/mcp` });
     }
   } else {
-    expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"] });
-    expect(json(".pi", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
+    for (const dot of [".omp", ".pi"]) expect(json(dot, "agent", "mcp.json").mcpServers.grayboard, dot).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
     for (const dot of [".omp", ".pi"]) expect(existsSync(join(home, dot, "agent", "extensions", "grayboard.js")), dot).toBe(false);
   }
 }
@@ -288,10 +287,13 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   writeFileSync(join(dir, "checkout.ts"), "// mine");
   symlinkSync(join(dir, "checkout.ts"), opencode);
   // Their entries stay as they are: the checkout's adapter, or none, is what reads them.
-  writeOldEntries(realpathSync(join(bin, "grayboard")));
-  const entries = [json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")];
-  // Claude Code set up before #551: the user-scope entry and the title hook alone, beside a hook of the user's.
   const exe = realpathSync(join(bin, "grayboard"));
+  writeOldEntries(exe);
+  const entries = [json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")];
+  // omp's enabled entry from before #523, when omp's client served its tools: its adapter now reads it, disabled.
+  const ompMcp = join(home, ".omp", "agent", "mcp.json");
+  writeFileSync(ompMcp, JSON.stringify({ mcpServers: { grayboard: { command: exe, args: ["mcp"] } } }));
+  // Claude Code set up before #551: the user-scope entry and the title hook alone, beside a hook of the user's.
   const own = { matcher: "Bash", hooks: [{ type: "command", command: "~/.claude/hooks/bash.sh" }] };
   writeFileSync(join(home, ".claude.json"), JSON.stringify({ mcpServers: { grayboard: { type: "stdio", command: exe, args: ["mcp"] } } }));
   mkdirSync(join(home, ".claude"), { recursive: true });
@@ -307,7 +309,8 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   expect(readlinkSync(opencode)).toBe(join(dir, "checkout.ts"));
   expect(existsSync(join(home, ...ADAPTERS.pi))).toBe(false);
   expect([json(".config", "opencode", "opencode.json"), json(".pi", "agent", "mcp.json")]).toEqual(entries);
-  expect(out).not.toContain("Disabled the grayboard entry");
+  expect(json(".omp", "agent", "mcp.json").mcpServers.grayboard).toEqual({ command: exe, args: ["mcp"], enabled: false, env: { BUS_PUSH: "off" } });
+  expect(out.match(/Disabled the grayboard entry in .*/g)).toEqual([`Disabled the grayboard entry in ${ompMcp} (the adapter serves the tools)`]);
   expect(out).toContain(`Installed grayboard's hooks in ${join(home, ".claude", "settings.json")}`);
   const hooks = claudeHooks([exe]);
   expect(json(".claude", "settings.json").hooks).toEqual({ ...hooks, PreToolUse: [own, ...hooks.PreToolUse!] });

@@ -82,11 +82,11 @@ export function actingIdentity(as?: string, env = process.env, cwd = process.cwd
     return { name: n.name, source: "BUS_IDENTITY" };
   }
   if (local) return boundSession(local, cwd);
-  const pin = pinnedIdentity(cwd);
+  const pin = pinnedIdentity(cwd, env);
   // `||`, not `??`: an empty BUS_IDENTITY falls through to the pin, as in
   // sessionIdentity — with `??` it skipped the pin and changed the handle.
-  const base = env.BUS_IDENTITY || pin || defaultIdentity(cwd);
-  const rule = pin ? "the repo's .mcp.json pin" : "the directory name";
+  const base = env.BUS_IDENTITY || pin?.name || defaultIdentity(cwd);
+  const rule = pin ? `the repo's ${pin.file} pin` : "the directory name";
   const name = resolveIdentity(base, cwd);
   return { name, source: name === base ? rule : `${rule}, plus worktree "${linkedWorktreeName(cwd)}"` };
 }

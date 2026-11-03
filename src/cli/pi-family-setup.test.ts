@@ -1,10 +1,10 @@
 // `grayboard setup` and `refresh-adapters` install pi's and omp's adapter for
-// the mode (#279, #280): local mode the local adapter and its mcp.json entry
-// (pi's disabled, omp's enabled), server mode the hosted extension bundle and
-// its config.json, with no entry. Each install removes the other variant. A
-// server URL the hosted extension would refuse changes nothing for pi, and
-// leaving a hosted install's server signs the harness out of it, revoking its
-// grant.
+// the mode (#279, #280): local mode the local adapter and its disabled
+// mcp.json entry (#523: omp's adapter serves the tools too), server mode the
+// hosted extension bundle and its config.json, with no entry. Each install
+// removes the other variant. A server URL the hosted extension would refuse
+// changes nothing for pi, and leaving a hosted install's server signs the
+// harness out of it, revoking its grant.
 import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -58,14 +58,14 @@ function fixture(h: Harness = "pi") {
   return { h, root, dir, paths, exec, run, signIn, entry, grant, seedGrant };
 }
 
-// From source the command is bun, as mcpCommand() names it. pi's entry is
-// disabled (its adapter serves the tools); omp serves its entry's tools.
-const localEntry = (h: Harness) => h === "pi" ? { command: "bun", args: [cli, "mcp"], enabled: false, env: { BUS_PUSH: "off" } } : { command: "bun", args: [cli, "mcp"] };
+// From source the command is bun, as mcpCommand() names it. The entry is
+// disabled: the adapter serves the tools.
+const localEntry = { command: "bun", args: [cli, "mcp"], enabled: false, env: { BUS_PUSH: "off" } };
 
 function expectLocal(f: ReturnType<typeof fixture>) {
   expect(readFileSync(f.paths.local, "utf8")).toBe(localSource(f.h));
   expect(existsSync(f.paths.hosted)).toBe(false);
-  expect(f.entry()).toEqual(localEntry(f.h));
+  expect(f.entry()).toEqual(localEntry);
 }
 
 function expectHosted(f: ReturnType<typeof fixture>) {
@@ -88,7 +88,7 @@ for (const h of HARNESSES) test(`setup switches ${h}'s adapter local → server 
 
   f.signIn();
   // A user's own MCP servers stay.
-  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { other: { command: "x" }, grayboard: localEntry(h) } }));
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { other: { command: "x" }, grayboard: localEntry } }));
   expect(f.run("setup", "--server", SERVER, "-y")).toContain(`Run /grayboard login in ${h}`);
   expectHosted(f);
   expect(JSON.parse(readFileSync(f.paths.mcp, "utf8")).mcpServers.other).toEqual({ command: "x" });
@@ -177,7 +177,7 @@ for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${
   // An old local install migrates to the hosted extension in server mode.
   mkdirSync(join(f.paths.local, ".."), { recursive: true });
   writeFileSync(f.paths.local, "// stale");
-  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry(h) } }));
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry } }));
   expect(f.run("refresh-adapters")).toContain(`Refreshed ${f.paths.hosted}`);
   expectHosted(f);
 
@@ -194,4 +194,20 @@ for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${
   f.run("refresh-adapters");
   expect(lstatSync(f.paths.local).isSymbolicLink()).toBe(true);
   expect(existsSync(f.paths.hosted)).toBe(false);
+}, 60_000);
+
+// Before #523 omp's local entry was enabled (omp's client served its tools
+// and a relay adapter woke the session). `update` runs refresh-adapters, which
+// disables it beside the new adapter, keeping the user's own env.
+test("refresh-adapters migrates an omp local install's enabled entry to the disabled one the adapter reads", () => {
+  const f = fixture("omp");
+  mkdirSync(join(f.paths.local, ".."), { recursive: true });
+  writeFileSync(f.paths.local, "// the relay adapter");
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { other: { command: "x" }, grayboard: { command: "bun", args: [cli, "mcp"], env: { BUS_MODEL: "m" } } } }));
+  expect(f.run("refresh-adapters")).toContain(`Disabled the grayboard entry in ${f.paths.mcp} (the adapter serves the tools)`);
+  expect(readFileSync(f.paths.local, "utf8")).toBe(localSource("omp"));
+  expect(f.entry()).toEqual({ command: "bun", args: [cli, "mcp"], enabled: false, env: { BUS_MODEL: "m", BUS_PUSH: "off" } });
+  expect(JSON.parse(readFileSync(f.paths.mcp, "utf8")).mcpServers.other).toEqual({ command: "x" });
+  // A second refresh changes nothing.
+  expect(f.run("refresh-adapters")).not.toContain("Disabled the grayboard entry");
 }, 60_000);
