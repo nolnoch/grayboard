@@ -111,6 +111,9 @@ export class ApplicationSession {
   place: string | null = null;
   // A hosted session with no name: it reads and nothing else.
   readOnly = false;
+  // Whether peer_list shows it among the user's unbound sessions; an idle
+  // legacy GET receives nothing, so it isn't (#431).
+  listed = true;
   // The ID its writes carry as provenance; unset for a writer with no
   // session (the bridge's humans, a hosted request with no context).
   writerId?: string;
@@ -1057,12 +1060,12 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput?: string): Cand
 }
 
 // The user's live sessions with no alias, for peer_list: never another
-// user's (`where` describes their machine). A hold or tools-only connection
-// isn't listed: it receives nothing. A hosted session with no name is
+// user's (`where` describes their machine). A hold, a tools-only connection or
+// an idle legacy GET isn't listed: it receives nothing. A hosted session with no name is
 // listed as master listed it (#402).
 function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
   const mine = [
-    ...[...hub.sessions].filter((c) => c.transport === "hosted" && c.readOnly),
+    ...[...hub.sessions].filter((c) => c.transport === "hosted" && c.readOnly && c.listed),
   ].filter((c) => c.authed.user_id === session.authed.user_id);
   const statuses = idStatuses(hub.db, mine.map((c) => c.sessionId));
   const now = hub.now();

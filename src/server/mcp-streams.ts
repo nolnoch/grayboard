@@ -43,7 +43,8 @@ export async function readMcpBody(request: Request, shutdown?: AbortSignal): Pro
 export type OwnedStream = { stop(): Promise<void>; done: Promise<void> };
 
 // Forward SDK bytes, owning cancellation and reader release rather than a hidden pipe promise.
-export function forwardMcpStream(response: Response, signal: AbortSignal, finish: () => void): { response: Response; stream: OwnedStream } {
+// `prime` is enqueued before any SDK byte, so the response's headers flush at once.
+export function forwardMcpStream(response: Response, signal: AbortSignal, finish: () => void, prime?: Uint8Array): { response: Response; stream: OwnedStream } {
   const reader = response.body!.getReader();
   let controller: ReadableStreamDefaultController<Uint8Array>;
   let stopped = false, finalized = false;
@@ -67,7 +68,7 @@ export function forwardMcpStream(response: Response, signal: AbortSignal, finish
   })();
   const abort = () => { void stop(); };
   const body = new ReadableStream<Uint8Array>({
-    start(c) { controller = c; },
+    start(c) { controller = c; if (prime) c.enqueue(prime); },
     async pull(c) {
       try {
         const next = await reader.read();

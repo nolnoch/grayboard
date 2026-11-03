@@ -135,26 +135,18 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox hints are l
   subscriber.headers.set("X-Grayboard-Lease", lease.capability);
   if (version !== "2026-07-28") {
     expect(await pending(subscriber)).toEqual([]);
-    const resume = subscriber.pauseGets();
-    try {
-      // The first current POST registers successfully without upgrading the old GET.
-      expect(await subscriber.client.subscribeResource({ uri: "grayboard://inbox" })).toEqual({});
-      await until(() => subscriber.getHeaders.length === 2);
-      expect(subscriber.getHeaders[0]!.has("X-Grayboard-Lease")).toBe(false);
-      expect(subscriber.getHeaders[1]!.get("X-Grayboard-Lease")).toBe(lease.capability);
-      expect(app.mcp.activeGetStreams).toBe(1);
-      expect(app.mcp.activeInboxListeners).toBe(0);
-      await call(native, "dm_send", { to: "be", body: "before fresh GET", pending: true });
-      expect(await pending(subscriber)).toHaveLength(1);
-      expect(subscriber.hints).toEqual([]);
-      expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
-    } finally { resume(); }
-    await until(() => app.mcp.activeInboxListeners === 1);
+    // The GET opened before the lease watches nothing, so the current POST re-authorizes it in place
+    // (#431): it watches the inbox under the POST's lease without the client reopening it.
+    expect(await subscriber.client.subscribeResource({ uri: "grayboard://inbox" })).toEqual({});
+    expect(app.mcp.activeGetStreams).toBe(2);
+    expect(app.mcp.activeInboxListeners).toBe(1);
+    expect(subscriber.getHeaders).toHaveLength(1);
+    expect(subscriber.getHeaders[0]!.has("X-Grayboard-Lease")).toBe(false);
   } else await watch(subscriber, "grayboard://inbox");
   const sent = await call(native, "dm_send", { to: "be", body: "durable", pending: true });
   await until(() => subscriber.hints.length > 0);
   const batch = await pending(subscriber);
-  expect(batch).toHaveLength(version === "2026-07-28" ? 1 : 2);
+  expect(batch).toHaveLength(1);
   expect(batch.at(-1).id).toBe(`direct:${sent.message_id}`);
   expect(await pending(subscriber)).toEqual(batch);
   expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);

@@ -33,9 +33,11 @@ afterEach(async () => {
 const token = () => issueOAuth(app.repo, app.oauth.resource, A, ["grayboard:tools", "grayboard:delivery"], Date.now(), "grayboard-pi").token;
 
 // A client whose every POST carries the session key and the current facts, as hosted-core's wire sends them.
-async function connect(version: string, raw: string, facts: { model?: unknown; effort?: unknown }) {
+// `get: false`: the client opens no standalone GET (a 405 tells the SDK the server offers none), so a test's own GET is the session's only one.
+async function connect(version: string, raw: string, facts: { model?: unknown; effort?: unknown }, get = true) {
   const tok = token();
-  const inject = async (request: Request): Promise<Request> => {
+  const inject = async (request: Request): Promise<Request | Response> => {
+    if (request.method === "GET" && !get) return new Response(null, { status: 405 });
     if (request.method !== "POST") return request;
     const body = await request.clone().json() as { params?: Record<string, unknown> };
     const meta = { ...(body.params?._meta as Record<string, unknown> | undefined), [GRAYBOARD_SESSION_META]: raw,
@@ -44,7 +46,7 @@ async function connect(version: string, raw: string, facts: { model?: unknown; e
   };
   const client = new Client({ name: "facts", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
-  const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${tok}` } }, fetch: async (i, init) => fetch(await inject(new Request(i, init))) });
+  const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${tok}` } }, fetch: async (i, init) => { const sent = await inject(new Request(i, init)); return sent instanceof Response ? sent : fetch(sent); } });
   await client.connect(transport);
   return { client, transport, tok };
 }
@@ -64,7 +66,7 @@ test("a hosted session's model and effort show in peer_list and match:{model}, a
 
 for (const version of MCP_PROTOCOL_VERSIONS.filter(v => v !== "2026-07-28")) test(`${version}: a legacy GET, routed by its creating POST's _meta, doesn't revert the latest model (#364)`, async () => {
   const facts: { model?: unknown } = { model: "first" };
-  const { client, transport, tok } = await connect(version, "facts-legacy", facts);
+  const { client, transport, tok } = await connect(version, "facts-legacy", facts, false);
   await client.callTool({ name: "whoami", arguments: {} });
   facts.model = "latest";
   await client.callTool({ name: "whoami", arguments: {} });
