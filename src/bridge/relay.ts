@@ -255,7 +255,7 @@ export class Relay {
           if (this.stopped) throw new Error("relay stopped");
           ts = await this.postText(text(), name, row?.thread_ts);
         }
-        if (row) this.store.advance(row.thread_ts, x.id);
+        if (row) this.store.advance(row.thread_ts, x.id, x.kind === "dm" ? x.from : undefined);
         else if (ts) this.store.addThread({ thread_ts: ts, kind: x.kind, board: x.board, root_id: x.root, peer: x.kind === "dm" ? x.from : null, last_id: x.id });
         const errors = [progress.refused?.length ? "files_refused" : null, !row && !ts ? "ts_unknown" : null].filter(Boolean);
         progress.error = errors.length ? errors.join(",") : null;

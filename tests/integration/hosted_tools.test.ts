@@ -329,6 +329,15 @@ test("only a message's sender and recipient can read its thread or reply to it",
   await expect(c.call("dm_send", { to: `${A}/be`, body: "x", parent_id: root.message_id })).rejects.toMatchObject({
     message: `parent_id ${root.message_id} is not a message you sent or received`,
   });
+  // #524: a reply goes to the parent's other party; to anyone else it would thread where that party can't read it.
+  await expect(b.call("dm_send", { to: `${C}/sim`, body: "x", parent_id: root.message_id })).rejects.toMatchObject({
+    message: `parent_id ${root.message_id} is a thread with ${A}/be, so a reply goes to ${A}/be; to write to someone else, send without parent_id`,
+  });
+  await expect(a.call("dm_send", { to: `${C}/sim`, body: "x", parent_id: reply.message_id })).rejects.toMatchObject({
+    message: `parent_id ${reply.message_id} is a thread with ${B}/fe, so a reply goes to ${B}/fe; to write to someone else, send without parent_id`,
+  });
+  expect((await b.call<DirectMessage[]>("dm_thread", { thread: root.message_id })).map((m) => m.id)).toEqual([root.message_id, reply.message_id]);
+  await b.call("dm_send", { to: `${C}/sim`, body: "new thread" });
   await expect(a.call("dm_send", { to: `${B}/fe`, body: "x", parent_id: 99999 })).rejects.toBeInstanceOf(HostedToolError);
 });
 

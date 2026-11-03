@@ -11,7 +11,7 @@ import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, ch
 import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
 import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, logBinding, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, logBinding, replyPeer, replyPeerError, replySender, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -546,6 +546,10 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
         ...text(`error: parent_id ${parent_id} is not a message you sent or received`),
         isError: true,
       };
+    }
+    const peer = parent ? replyPeer(parent, ADDRS) : null;
+    if (parent && peer !== recipient) {
+      return { ...text(`error: ${replyPeerError(parent.id, peer!)}`), isError: true };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, SESSION_ID, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }));
