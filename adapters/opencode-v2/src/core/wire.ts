@@ -147,7 +147,8 @@ abstract class Connection {
   protected declaration(): Record<string, unknown> {
     return { ...(this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}), ...(this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {}) };
   }
-  // The session's facts as `_meta`: only non-empty strings; a provider that throws sends none (absence never clears on the server).
+  // The session's facts as `_meta`: only non-empty strings; a provider that throws sends none (absence never clears on the
+  // server). HostedClient's provider says its own failures; this guard keeps any other host's from failing the request.
   protected facts(sessionID: string): Record<string, string> {
     let f: SessionFacts | undefined;
     try { f = this.wireOptions.facts?.(sessionID); } catch { return {}; }

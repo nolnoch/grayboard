@@ -17,7 +17,7 @@ import { sha256Hex } from "../../src/shared/hash.ts";
 import { cleanEnv, localEnv } from "./env.ts";
 import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
-import { answerPeer, expectDeliveryRecords, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
+import { answerPeer, expectDeliveryRecords, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
 import { grayboardDescendants } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
@@ -220,6 +220,9 @@ export function ompHostedScenario(dir: string): Promise<void> {
     expect(bound.isError).toBeFalsy();
     expect(resultText(bound)).toStartWith('Bound to "omp-task"');
     await until(() => leasedAs(srv, sessionId, "omp-task"), 15_000, "omp-task holds the lease");
+    // Its requests report omp's model and thinking level; `inherit` is none (#364).
+    const { thinkingLevel } = await omp.command({ type: "get_state" }, 30_000);
+    expect(factsOf(srv, OMP_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel && thinkingLevel !== "inherit" ? thinkingLevel : null });
     const first = model.requests[0]!.body;
     expect(requestTools(first).filter((n) => n.startsWith(PREFIX)).sort()).toEqual(GRAYBOARD_TOOLS);
     expect(systemText(first)).toContain("no bus name yet");

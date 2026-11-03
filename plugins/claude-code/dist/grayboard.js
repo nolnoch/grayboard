@@ -35928,8 +35928,20 @@ class HostedClient {
     return this.options.login;
   }
   wireOptions(mode) {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.options.facts } : {} };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.facts } : {} };
   }
+  factsFailed = new Set;
+  facts = (sessionID) => {
+    try {
+      return this.options.facts(sessionID);
+    } catch (error) {
+      if (!this.factsFailed.has(sessionID)) {
+        this.factsFailed.add(sessionID);
+        this.options.log(`couldn't read session ${sessionID}'s model and effort; the server gets none: ${message(error)}`, "warning");
+      }
+      return;
+    }
+  };
   temporary = async (sessionID, run) => {
     const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(1e4), sessionID);
     try {

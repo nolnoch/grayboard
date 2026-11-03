@@ -174,9 +174,6 @@ test("the native fetcher names the root on a native connection with the launcher
   }
 });
 
-// Each session's model as its latest context request used it (#364): the wires the Controller opens for that session
-// carry it as `providerID/id`, the variant as effort; a request with no model leaves what was noted; the oldest
-// session is forgotten past 256.
 // Each session's model as its latest context request used it (#364): `providerID/id`, the variant as effort; a request
 // with no model leaves what was noted; past 256 sessions the least recently noted is forgotten.
 test("the controller keeps each session's latest model for its wires, for the 256 most recent sessions", async () => {
@@ -213,9 +210,14 @@ test("setup's context hook leaves unenrolled sessions as built, never rejects, a
     event: { async *subscribe({ signal }: { signal: AbortSignal }) { if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); } },
   } as unknown as Context;
   const close = spyOn(RootInstructions.prototype, "close").mockImplementation(function(this: RootInstructions) { order.push("instructions"); close.mockRestore(); this.close(); });
+  const noted = spyOn(OpenCodeController.prototype, "noteModel");
   const cleanup = await setup(ctx, () => {}, () => {}, async () => bound);
   const system = [{ type: "text", text: "agent" }, { type: "text", text: render(unbound) }];
-  await hook!({ sessionID: "ses_unenrolled", system, messages: [] });
+  // Every session's model is noted, enrolled or not: a child's wires report its own (#364).
+  const model = { providerID: "anthropic", id: "claude-opus-5-5", variant: "high" };
+  await hook!({ sessionID: "ses_unenrolled", model, system, messages: [] });
+  expect(noted.mock.calls).toEqual([["ses_unenrolled", model]]);
+  noted.mockRestore();
   expect(system[1]!.text).toBe(render(unbound));
   await expect(hook!({ sessionID: "R", system: null, messages: null })).resolves.toBeUndefined();
   await cleanup!();

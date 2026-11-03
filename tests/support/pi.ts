@@ -480,6 +480,9 @@ export const leased = (srv: HostedServer, client: string, raw: string, name: str
   const row = hostedRow(srv, client, raw);
   return row?.name === name && row.lease_deadline !== null && srv.app.mcp.activeLeases === 1;
 };
+// The model and effort the server holds for `raw`'s hosted session (#364).
+export const factsOf = (srv: HostedServer, client: string, raw: string) => srv.app.db.query<{ model: string | null; effort: string | null }, [string, string]>(
+  "SELECT model, effort FROM ids WHERE id = (SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?)").get(client, raw) ?? undefined;
 const piRow = (srv: HostedServer, raw: string) => hostedRow(srv, PI_CLIENT, raw);
 const leasedAs = (srv: HostedServer, raw: string, name: string) => leased(srv, PI_CLIENT, raw, name);
 export const ownershipEnded = (srv: HostedServer, id: number): boolean =>
@@ -643,6 +646,9 @@ export function piHostedScenario(dir: string): Promise<void> {
     expect(bound.isError).toBeFalsy();
     expect(resultText(bound)).toStartWith('Bound to "pi-task"');
     await until(() => leasedAs(srv, sessionId, "pi-task"), 15_000, "pi-task holds the lease");
+    // Its requests report pi's model and thinking level (#364).
+    const { thinkingLevel } = await pi.command({ type: "get_state" });
+    expect(factsOf(srv, PI_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel });
     const first = model.requests[0]!.body;
     expect(requestTools(first).filter((n) => n.startsWith("mcp__grayboard__")).sort()).toEqual(GRAYBOARD_TOOLS);
     expect(systemText(first)).toContain("no bus name yet");

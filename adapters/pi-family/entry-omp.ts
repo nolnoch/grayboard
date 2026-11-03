@@ -15,7 +15,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi
 import { version } from "../../package.json" with { type: "json" };
 import type { Level } from "../hosted-core/src/client.ts";
 import { loadMode } from "../hosted-core/src/proxy.ts";
-import { COMMAND, createGrayboard, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
+import { COMMAND, createGrayboard, modelName, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
 import { registry, rootOf } from "./omp-ancestry.ts";
 import { plan, replaceText } from "./omp-instructions.ts";
 
@@ -119,10 +119,13 @@ export default function grayboard(pi: ExtensionAPI) {
       if (ctx?.sessionManager.getSessionId() === data.root) pi.appendEntry("grayboard-delivery", data);
       else pi.logger.warn("grayboard: a delivery record for a session no longer current; logged here, not in its file", { ...data });
     },
+    // Like `record`: between omp's switch and session_switch, ctx already
+    // shows the next session's model, so only the session it names answers.
     // omp's `inherit` names no level of its own: none is sent.
-    facts: () => {
+    facts: sessionID => {
+      if (ctx?.sessionManager.getSessionId() !== sessionID) return undefined;
       const effort = pi.getThinkingLevel();
-      return { ...(ctx?.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}), ...(effort && effort !== "inherit" ? { effort } : {}) };
+      return { ...(ctx.model ? { model: modelName(ctx.model) } : {}), ...(effort && effort !== "inherit" ? { effort } : {}) };
     },
   });
 
@@ -207,7 +210,7 @@ export default function grayboard(pi: ExtensionAPI) {
     if (rewritten > 0 || !main) return undefined;
     // The text changed on the way (Cursor encodes the prompt; omp redacts
     // credentials): this request keeps the stale instructions.
-    const model = context.model ? `${context.model.provider}/${context.model.id}` : "an unknown model";
+    const model = context.model ? modelName(context.model) : "an unknown model";
     pi.logger.warn(`grayboard: couldn't refresh the instructions in a request to ${model}; it carries the ones from the last prompt`);
     if (!warned.has(next.from)) {
       warned.add(next.from);

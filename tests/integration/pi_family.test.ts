@@ -66,7 +66,7 @@ type Instance = {
 };
 // `marker`, a function, is read live (omp's entry: the root as it is now).
 // `facts`: the harness's current model and effort (#364), read live.
-function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void, facts?: () => SessionFacts | undefined): Instance {
+function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void, facts?: (sessionID: string) => SessionFacts | undefined): Instance {
   let tools: NativeTool[] = [];
   let run: ((tool: string, args: Record<string, unknown>) => Promise<CallToolResult>) | undefined;
   const self: Instance = {
@@ -197,9 +197,12 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
 
 // The harness's model and effort ride its session's requests (#364): peer_list shows the latest, and a switch mid-session
 // moves them on the next call. A child of this root, its own pi process, sends its own harness's facts, never the root's.
+// The harness is asked for its own session only; a provider that throws is said once and sends none.
 test("a root's model and effort show in peer_list and follow a switch; its child reports its own (#364)", async () => {
   const facts: SessionFacts = { model: "anthropic/claude-opus-5-5", effort: "high" };
-  const lead = instance(undefined, undefined, () => ({ ...facts }));
+  const asked = new Set<string>();
+  let broken = false;
+  const lead = instance(undefined, undefined, id => { asked.add(id); if (broken) throw new Error("runtime gone"); return { ...facts }; });
   await lead.ext.start({ id: "facts-root", reason: "startup" });
   expect((await lead.call("bind", { name: "lead", create: true })).isError).toBeUndefined();
   type Peers = { peers: Array<{ handle: string; model?: string | null; effort?: string | null }> };
@@ -213,6 +216,14 @@ test("a root's model and effort show in peer_list and follow a switch; its child
   await child.call("whoami");
   expect(srv.app.db.query<{ model: string | null }, [string]>("SELECT model FROM ids WHERE id = ?").get(hostedId("facts-child"))?.model).toBe("anthropic/claude-haiku-5-5");
   expect(await peers(lead)).toContainEqual(expect.objectContaining({ handle: `${EMAIL}/lead`, model: "openai/gpt-6" }));
+  expect([...asked]).toEqual(["facts-root"]);
+  broken = true;
+  await lead.call("whoami");
+  await lead.call("whoami");
+  const warned = lead.notices.filter(n => n.message.includes("model and effort"));
+  expect(warned).toEqual([{ message: "grayboard: couldn't read session facts-root's model and effort; the server gets none: runtime gone", level: "warning" }]);
+  broken = false;
+  expect(await peers(lead)).toContainEqual(expect.objectContaining({ handle: `${EMAIL}/lead`, model: "openai/gpt-6", effort: "low" }));
 });
 
 test("an explicit BUS_IDENTITY binds at a new root's start (#443), created if new (precedence: hosted_core_root.test.ts)", async () => {
