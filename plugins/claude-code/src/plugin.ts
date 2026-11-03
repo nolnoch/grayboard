@@ -27,7 +27,7 @@ import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
-import { describeLocation } from "../../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation } from "../../../src/shared/identity.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
 
 export const HARNESS = "Claude Code";
@@ -92,6 +92,8 @@ export function createPlugin(o: PluginOptions): Plugin {
   // first tool result and stderr each say it once, as the local servers do.
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
   const place = describeLocation(o.cwd) ?? HARNESS;
+  // An explicit BUS_IDENTITY: this session binds it at its first start (#443).
+  const configured = configuredIdentity(o.env, o.cwd);
   // Attachments come from and go to the session's directory and the project's.
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...(project ? attachRoots({}, project) : [])])];
@@ -186,7 +188,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   };
 
   const root = client && !("error" in config) ? new RootDelivery(client, {
-    sessionID: config.id, stateDir: config.dataDir, place: () => place, push,
+    sessionID: config.id, stateDir: config.dataDir, place: () => place, push, ...(configured && "name" in configured ? { configured: configured.name } : {}),
     // Claude Code drops a notification sent before `initialized`; the
     // Controller receipts only after this resolves, and its admission set
     // keeps a failed receipt from showing an item twice. A stop (the run
@@ -197,7 +199,10 @@ export function createPlugin(o: PluginOptions): Plugin {
     },
     onTools: () => listChanged(),
   }) : undefined;
-  if (offNotice) root?.noticeOnce(offNotice, "first");
+  const badIdentity = configured && "error" in configured ? `BUS_IDENTITY is ignored: ${configured.error}` : undefined;
+  if (badIdentity) say(badIdentity);
+  const firstNotice = [offNotice, badIdentity].filter(Boolean).join(" ");
+  if (firstNotice) root?.noticeOnce(firstNotice, "first");
   // Another process's sign-in landed: this one's prompt is moot.
   const changes = client?.onChange(signedIn => { if (signedIn) signingIn?.abort.abort(); });
 

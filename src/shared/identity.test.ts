@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
+import { configuredIdentity, defaultIdentity, describeLocation, linkedWorktreeName, resolveIdentity, sessionIdentity } from "./identity.ts";
 
 let root: string;
 const at = (...p: string[]) => join(root, ...p);
@@ -68,6 +68,27 @@ describe("describeLocation", () => {
     expect(describeLocation(at("repo"))).toBe("repo on 0123456");
   });
   test("outside git: the directory name", () => expect(describeLocation(at("plain", "sub"))).toBe("sub"));
+});
+
+describe("configuredIdentity (#443: a hosted adapter's start bind)", () => {
+  test("nothing without an explicit BUS_IDENTITY", () => {
+    expect(configuredIdentity({}, at("repo"))).toBeUndefined();
+    expect(configuredIdentity({ BUS_IDENTITY: "" }, at("repo"))).toBeUndefined();
+  });
+  test("a pin echo is none", () => {
+    const pin = { mcpServers: { grayboard: { command: "grayboard", args: ["mcp"], env: { BUS_IDENTITY: "be" } } } };
+    writeFileSync(at("repo", ".mcp.json"), JSON.stringify(pin));
+    try { expect(configuredIdentity({ BUS_IDENTITY: "be" }, at("repo", ".wt", "stream"))).toBeUndefined(); }
+    finally { rmSync(at("repo", ".mcp.json")); }
+  });
+  test("an explicit one is lowercased, verbatim otherwise; one the naming rule refuses is an error", () => {
+    expect(configuredIdentity({ BUS_IDENTITY: "Sim" }, at("repo", ".wt", "stream"))).toEqual({ name: "sim" });
+    expect(configuredIdentity({ BUS_IDENTITY: "no spaces" }, at("repo"))).toEqual({ error: expect.stringContaining("invalid identity name") });
+  });
+  test("a server name may carry a scope (#543 audit 2)", () => {
+    expect(configuredIdentity({ BUS_IDENTITY: "Eng/Deploy" }, at("repo"))).toEqual({ name: "eng/deploy" });
+    expect(configuredIdentity({ BUS_IDENTITY: "you@example.com/sim" }, at("repo"))).toEqual({ name: "you@example.com/sim" });
+  });
 });
 
 describe("sessionIdentity", () => {

@@ -192,6 +192,34 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
   expect(JSON.stringify(alpha.records)).not.toContain("hello from");
 });
 
+test("an explicit BUS_IDENTITY binds at a new root's start (#443), created if new (precedence: hosted_core_root.test.ts)", async () => {
+  const saved = process.env.BUS_IDENTITY;
+  process.env.BUS_IDENTITY = "Pi-Conf";
+  try {
+    const i = instance();
+    await i.ext.start({ id: "conf-root", reason: "startup" });
+    await active(i, "conf-root", "pi-conf");
+    expect(row("conf-root")).toMatchObject({ name: "pi-conf" });
+    expect(i.notices.filter(n => n.level !== "info")).toEqual([]);
+  } finally {
+    if (saved === undefined) delete process.env.BUS_IDENTITY; else process.env.BUS_IDENTITY = saved;
+  }
+});
+
+test("a BUS_IDENTITY the naming rule refuses is said, and the extension still loads and starts unbound (#543 audit 1)", async () => {
+  const saved = process.env.BUS_IDENTITY;
+  process.env.BUS_IDENTITY = "no spaces";
+  try {
+    const i = instance();
+    await i.ext.start({ id: "conf-bad-root", reason: "startup" });
+    expect(i.notices).toContainEqual(expect.objectContaining({ level: "warning", message: expect.stringContaining('BUS_IDENTITY is ignored: invalid identity name "no spaces"') }));
+    await until(() => row("conf-bad-root") !== undefined, 10_000, "the root's session row");
+    expect(row("conf-bad-root")?.name ?? null).toBeNull();
+  } finally {
+    if (saved === undefined) delete process.env.BUS_IDENTITY; else process.env.BUS_IDENTITY = saved;
+  }
+});
+
 test("/new carries the outgoing root's name, bound with this checkout as its place; a carry refused because another live session holds the name leaves the new session unbound, says so once, and /grayboard resume takes it once the name is free", async () => {
   const sender = await root("carry-sender", "sender");
   const first = await root("carry-1", "carrier");

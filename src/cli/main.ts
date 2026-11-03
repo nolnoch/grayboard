@@ -791,9 +791,11 @@ program
       `\nDone. Start Claude Code with:\n  ${claudeLaunch(!!server)}\n` +
       (others ? `or ${others} as usual.\n\n` : `\n`) +
       `Each session starts unbound and binds a name with bind once it knows its task.` +
-      // The hosted adapters (Claude Code's plugin, pi's extension) neither
-      // send a suggested name nor read BUS_IDENTITY.
-      (server ? "" : ` The repo's name (in ~/code/api, "api") is suggested first; to bind a name at start, set BUS_IDENTITY in the launch command.`),
+      // The hosted adapters don't send the repo's name as a suggestion yet;
+      // Claude Code's plugin and pi/omp's extension read BUS_IDENTITY (#443),
+      // hosted OpenCode takes its start name from setup-opencode --name.
+      (server ? "" : ` The repo's name (in ~/code/api, "api") is suggested first.`) +
+      ` To bind a name at start, set BUS_IDENTITY in the launch command${server && opencode ? " (OpenCode: grayboard setup-opencode --name)" : ""}.`,
     );
   });
 

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { normalizeAliasName } from "../core/addresses.ts";
 
 const MAX_LEN = 32;
 
@@ -174,4 +175,18 @@ export function sessionIdentity(env = process.env, cwd = process.cwd()): string 
   // through to the pin and then the default, as it always did — with `??` it
   // skipped the pin and silently changed the handle.
   return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd) || defaultIdentity(cwd), cwd);
+}
+
+/**
+ * The name a hosted adapter binds at start (#443): an explicit BUS_IDENTITY,
+ * normalized as a server bind is (a bare name or `scope/name`). Nothing
+ * without one (a pin echo counts as none); an error for a value the naming
+ * rule refuses.
+ */
+export function configuredIdentity(env: Record<string, string | undefined> = process.env, cwd = process.cwd()): { name: string } | { error: string } | undefined {
+  try {
+    if (!isExplicitIdentity(env, cwd)) return undefined;
+    const n = normalizeAliasName(sessionIdentity(env, cwd));
+    return n.ok ? { name: n.name } : { error: n.error };
+  } catch (e) { return { error: (e as Error).message }; }
 }
