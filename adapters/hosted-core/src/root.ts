@@ -239,7 +239,7 @@ export class RootDelivery {
     const c = this.client.options, id = this.o.sessionID, wire = this.client.wireOptions("push");
     return {
       harness: c.harness, resumeHint: c.resumeHint, loginAction: c.loginAction, sessionKey: wire.sessionKey,
-      client: wire.client, delivery: wire.delivery!, ...(wire.launcher ? { launcher: true as const } : {}),
+      client: wire.client, delivery: wire.delivery!, ...(wire.launcher ? { launcher: true as const } : {}), ...(wire.facts ? { facts: wire.facts } : {}),
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
       ancestry: async sessionID => {

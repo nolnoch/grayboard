@@ -15,6 +15,7 @@ import { failureMessage } from "./diagnostics.js";
 import type { Login } from "./login.js";
 import { accessExpiry } from "./model.js";
 import { failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
+import type { SessionFacts } from "./port.js";
 import { SubscriberError, Wire, type WireOptions } from "./wire.js";
 import { GRAYBOARD_SESSION_META } from "../../../src/shared/session_meta.ts";
 
@@ -33,6 +34,7 @@ export type HostedClientOptions = {
   roots?: string[];         // ToolProxy attachment roots
   env?: Record<string, string | undefined>;
   launcher?: boolean;       // the harness can spawn subagents (BUS_LAUNCHER=1): every request declares it (#473)
+  facts?: (sessionID: string) => SessionFacts | undefined; // the session's current model and effort, sent on every request (#364)
   log(message: string, level: Level): void;
 };
 
@@ -71,8 +73,17 @@ export class HostedClient {
   get login(): Login { return this.options.login; }
 
   wireOptions(mode: "push" | "poll"): WireOptions {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...(this.options.launcher ? { launcher: true as const } : {}) };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...(this.options.launcher ? { launcher: true as const } : {}), ...(this.options.facts ? { facts: this.facts } : {}) };
   }
+  // The host's facts provider; a failure is said once per session and sends none.
+  private readonly factsFailed = new Set<string>();
+  private readonly facts = (sessionID: string): SessionFacts | undefined => {
+    try { return this.options.facts!(sessionID); }
+    catch (error) {
+      if (!this.factsFailed.has(sessionID)) { this.factsFailed.add(sessionID); this.options.log(`couldn't read session ${sessionID}'s model and effort; the server gets none: ${message(error)}`, "warning"); }
+      return undefined;
+    }
+  };
 
   // One short-lived poll wire under `sessionID` (a child's register and end, a session's end).
   temporary: Temporary = async (sessionID, run) => {

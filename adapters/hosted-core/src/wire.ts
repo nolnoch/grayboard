@@ -1,10 +1,14 @@
 import { Client, InsufficientScopeError, SdkError, SdkErrorCode, SdkHttpError, StreamableHTTPClientTransport, type AuthProvider, type CallToolResult, type Tool } from "@modelcontextprotocol/client";
-import type { Delivery } from "./port.js";
+import type { Delivery, SessionFacts } from "./port.js";
 import { setTimeout as sleep } from "node:timers/promises";
 
 export const DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 export const LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
-export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true };
+// The harness's current model and effort for a session (#364): the server keeps the latest each request reports.
+export const MODEL_META = "io.github.nolnoch.grayboard/model";
+export const EFFORT_META = "io.github.nolnoch.grayboard/effort";
+// `facts` is read per request, for the session that request names, so a change mid-session (a model switch) reaches the server on the next one.
+export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true; facts?: (sessionID: string) => SessionFacts | undefined };
 
 export class SubscriberError extends Error {
   constructor(readonly code: string, readonly known?: string[], readonly holder?: string) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}${holder ? `; held by ${holder}` : ""}`); }
@@ -141,6 +145,13 @@ abstract class Connection {
   protected declaration(): Record<string, unknown> {
     return { ...(this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}), ...(this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {}) };
   }
+  // The session's facts as `_meta`: only non-empty strings; a provider that throws sends none (absence never clears on the
+  // server). HostedClient's provider says its own failures; this guard keeps any other host's from failing the request.
+  protected facts(sessionID: string): Record<string, string> {
+    let f: SessionFacts | undefined;
+    try { f = this.wireOptions.facts?.(sessionID); } catch { return {}; }
+    return { ...(typeof f?.model === "string" && f.model ? { [MODEL_META]: f.model } : {}), ...(typeof f?.effort === "string" && f.effort ? { [EFFORT_META]: f.effort } : {}) };
+  }
   // An abort of this wire's own signal is the controller stopping, never an outage.
   protected async reachable<T>(pending: Promise<T>): Promise<T> {
     try { return await pending; }
@@ -163,7 +174,7 @@ export class Wire extends Connection {
     headers.set("X-Grayboard-Client", "subscriber");
     if (this.capability) headers.set("X-Grayboard-Lease", this.capability);
   }
-  protected meta() { return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration() }; }
+  protected meta() { return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) }; }
   async read(uri: string): Promise<unknown> {
     const value = await this.reachable(this.client.readResource({ uri, _meta: this.meta() }, this.options())).catch(error => {
       // The SDK reconstructs JSON-RPC errors with numeric code and domain data.code.
@@ -202,7 +213,7 @@ export class NativeWire extends Connection {
     super(options, authProvider, signal, beforeRetry);
   }
   protected decorate() {}
-  protected meta() { return { ...(this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID }), ...this.declaration() }; }
+  protected meta() { return { ...(this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID, ...this.facts(this.sessionID) }), ...this.declaration() }; }
   instructions(): string | undefined { return this.client.getInstructions(); }
   async listTools(): Promise<Tool[]> {
     const tools: Tool[] = [];
@@ -216,6 +227,6 @@ export class NativeWire extends Connection {
   }
   // The server's result untouched: content, structuredContent, isError, _meta.
   async callTool(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration() } }, this.options()));
+    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options()));
   }
 }
