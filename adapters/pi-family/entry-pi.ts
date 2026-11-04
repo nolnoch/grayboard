@@ -47,6 +47,8 @@ export default function grayboard(pi: ExtensionAPI) {
       else console.error(message);
     },
     record: data => pi.appendEntry("grayboard-delivery", data),
+    // tui and rpc outlive a sign-in's browser round trip; print and json exit after one run.
+    interactive: () => ctx?.mode === "tui" || ctx?.mode === "rpc",
     facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? { model: ctx.model ? modelName(ctx.model) : null, effort: pi.getThinkingLevel() } : undefined,
   });
 
