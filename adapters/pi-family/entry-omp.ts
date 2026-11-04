@@ -102,6 +102,8 @@ export default function grayboard(pi: ExtensionAPI) {
     deliver: (content, wake) => pi.sendMessage({ customType: "grayboard", content, display: true },
       wake ? { deliverAs: "aside", triggerTurn: true } : { deliverAs: "nextTurn" }),
     notify,
+    // tui and rpc outlive a sign-in's browser round trip; print and json exit after one run.
+    interactive: () => ctx?.mode === "tui" || ctx?.mode === "rpc",
     // omp points its session manager at the next session before it emits
     // session_switch, so a receipt landing in between would go into that
     // session's file: only the session the record names gets it.
