@@ -108,14 +108,14 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - Local (all four): n/a. Local mode has no accounts; every process on the machine is trusted (README §Limitations of local mode).
 - pi H, omp H: `/grayboard login` opens the browser to the server's consent page; every pi (or omp) on the machine shares that sign-in under its built-in client (README §Other harnesses). Proof: `tests/integration/pi.test.ts` piHostedScenario, `tests/integration/omp.test.ts` omp hosted.
-- CC H: URL elicitation from the process holding hosted-core's login lock, interactive only (boards.md §9 Hosted Claude Code). Proof: `tests/integration/claude_plugin.test.ts` ("sign-in by URL elicitation…").
+- CC H: from the process holding hosted-core's login lock, interactive only, the link reaches the user two ways: URL elicitation, and the post-tool-use hook's line under every grayboard call while the flow runs, which never enters the model's context (#500; boards.md §9 Hosted Claude Code). Proof: `tests/integration/claude_plugin.test.ts` ("sign-in by URL elicitation…", "a client without URL elicitation: the hook shows the link…").
 - OC V2: OpenCode's native MCP OAuth (`/mcps`, sign in through OpenCode); native OpenCode owns credential storage and refresh, and the package never reads a refresh token (README §OpenCode V2, `adapters/opencode-v2/README.md`). Proof: `adapters/opencode-v2` `test:host` (native CIMD OAuth discovery).
 
 ### 10. Sign-in offer in a signed-out tool result
 
 - Local (all four): n/a (row 9).
 - pi H, omp H: an interactive or RPC session's signed-out call starts the process's one sign-in flow (no browser) and shows its URL on the notice line; the result tells the model to ask the user to open it and never carries the URL (#500). `/grayboard login` joins that flow and opens the browser; `-p` and json mode never offer (#499). Proof: `tests/support/pi.ts` `expectSignInOffer`, run by `tests/integration/pi.test.ts` ("pi hosted: two processes with an expired token…") and `tests/integration/omp.test.ts` ("omp hosted: two processes on one agent dir…").
-- CC H: every signed-out result carries the live flow's authorization URL (#497). Proof: `tests/integration/claude_plugin.test.ts` ("a prompt left unanswered (#497)…", "a client without URL elicitation gets the sign-in URL…"), e2e `claude-hosted` ("with no grant, the first tool call's result carries the sign-in link").
+- CC H: a signed-out result says a sign-in is waiting on the user, never its URL; the plugin's PostToolUse/PostToolUseFailure hook shows the live flow's authorization URL under every grayboard call as a `systemMessage`, which reaches the user and not the model (#497, #500). Proof: `tests/integration/claude_plugin.test.ts` ("a prompt left unanswered (#497, #500)…", "a client without URL elicitation…", "a sign-in prompt that fails with the link…"), `src/shared/claude_agents.test.ts` ("sign-in link (#500)"), e2e `claude-hosted` ("with no grant, the first tool call shows the sign-in link under the call, never in a request").
 - OC V2: n/a. Native OpenCode owns OAuth and the server tools' calls, so the package has no sign-in flow whose URL it could offer; its attachment tools (row 11) ride the native grant.
 
 ### 11. Attachments
@@ -158,7 +158,6 @@ The baseline every later change is measured against. A cell says what a user of 
 - #559 items 2–6: omp L robustness edges (no abort or timeout while a call waits for the process, wrapper scripts not recognised, ACP with on-disk MCP config, advisor calls, Windows).
 - #566: hosted child rows are never idle-swept, so an OC V2 launcher root degrades after about 128 subagents (`MAX_CHILDREN`) in one ownership. A capacity limit; pi H and omp H end each child with its run (`tests/integration/pi_family.test.ts`, `tests/integration/omp.test.ts` 130-subagent cases).
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
-- #500: CC H's sign-in URL in tool results opens a prompt-injection login CSRF. pi H and omp H keep the URL out of results (#499), since their notice line reaches the user; CC H has no such line, so its fix is #500's own.
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
 - #474: on a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus.
 - #427: pi's `pi update --extensions` doesn't refresh the loose-file adapter; only `grayboard update` does.

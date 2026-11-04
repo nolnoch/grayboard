@@ -11,11 +11,12 @@
 //
 // The session binds through the plugin's tool, a DM from a peer reaches the
 // model as a channel message, the model's dm_send reaches the peer, and no
-// grayboard CLI process runs under Claude Code. A session with no grant gets
-// a sign-in link from its first tool call, and opening it signs the session in
-// (#497: Claude Code never received the prompt the plugin sent at startup).
+// grayboard CLI process runs under Claude Code. A session with no grant is
+// shown a sign-in link under its first tool call, and opening it signs the
+// session in (#497: Claude Code never received the prompt the plugin sent at
+// startup); the link reaches the user, never the model (#500).
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pinMarketplace } from "../../scripts/pin_claude_plugin.ts";
@@ -184,30 +185,44 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort 
   }
 }, 240_000);
 
-test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call's result carries the sign-in link, and opening it signs the session in`, async () => {
+test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call shows the sign-in link under the call, never in a request (also after --resume), and opening it signs the session in`, async () => {
   const srv = hostedServer();
   const model = startFakeAnthropic([
     onUserText("WHOAMI-FIRST", SOURCE, TOOL("whoami"), {}),
   ]);
   const signedOut = join(dir, "signed-out");
   const h = claudeHome(signedOut, model.url, ["mcp__plugin_grayboard_grayboard"]);
+  const args = ["--permission-mode", "default", "--dangerously-load-development-channels", `plugin:${CLAUDE_PLUGIN}`];
   let tty: ReturnType<typeof claudeTty> | undefined;
   try {
     const from = install(h, srv, join(signedOut, "mp"));
-    tty = claudeTty(bin, h, ["--permission-mode", "default", "--dangerously-load-development-channels", `plugin:${CLAUDE_PLUGIN}`]);
+    tty = claudeTty(bin, h, args);
     await until(() => tty!.screen().includes(`v${CLAUDE_CODE_VERSION}`), 60_000, "Claude Code's main screen");
     await tty.submit("WHOAMI-FIRST");
     const first = "toolu_WHOAMI_FIRST";
     await until(() => toolResults(model, first).length > 0, 60_000, `the first whoami result (plugin from ${from})`);
     const result = toolResults(model, first).join("\n");
-    const link = new RegExp(`open (${RegExp.escape(srv.issuer)}/\\S+?) to sign in to grayboard`).exec(result);
-    expect(link, result).not.toBeNull();
+    // The result says a sign-in waits on the user; the link is not in it (#500).
+    expect(result).toContain("sign-in started: ask the user to open the sign-in link Claude Code shows under this call");
+    expect(result).not.toContain("authorize?");
+    // The hook's systemMessage: in the transcript as Claude Code's own record of what it showed, and on screen under the call.
+    const projects = join(h.config, "projects", h.work.replace(/[^A-Za-z0-9]/g, "-"));
+    const session = () => existsSync(projects) ? readdirSync(projects).find((f) => f.endsWith(".jsonl"))?.slice(0, -".jsonl".length) : undefined;
+    const shownLink = () => {
+      const id = session();
+      return id ? new RegExp(`grayboard: open (${RegExp.escape(srv.issuer)}/[^\\s"\\\\]+) to sign in`).exec(transcript(h, id))?.[1] : undefined;
+    };
+    const url = await until(shownLink, 20_000, "the hook's sign-in line in the transcript");
+    await until(() => tty!.screen().includes(`PostToolUseFailure:${TOOL("whoami")} says: grayboard: open ${srv.issuer}/`), 10_000, "the sign-in line on screen under the call");
+    const requests = () => JSON.stringify(model.requests);
+    expect(requests()).not.toContain(url);
+    expect(requests()).not.toContain(new URL(url).searchParams.get("state")!);
     // A prompt that reached Claude Code while it was still wiring the
     // connection was cancelled unshown, and the plugin sends it again: the
     // user sees a prompt either way before opening the link.
     const debug = () => readFileSync(join(signedOut, "debug.log"), "utf8");
     await until(() => debug().includes("Received elicitation request: "), 10_000, "Claude Code to show the sign-in prompt");
-    expect(await browse(srv.issuer, link![1]!, "Claude Code")).toContain("Signed in to grayboard");
+    expect(await browse(srv.issuer, url, "Claude Code")).toContain("Signed in to grayboard");
     const hosted = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n;
     await until(() => hosted() > 0, 30_000, "the signed-in plugin to open its hosted session");
     // The plugin completes the prompt at the flow's end. 2.1.316 keeps the URL
@@ -215,10 +230,23 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call's r
     // past it in a pty is not asserted here: keys were lost on CI (#497).
     await until(() => debug().includes("Received elicitation completion notification"), 10_000, "the plugin to complete the sign-in prompt");
     expect(model.unhandled).toEqual([]);
+
+    // --resume replays the transcript, the hook's line included: still none of it reaches the model.
+    const id = session()!;
+    await tty.stop();
+    const before = model.requests.length;
+    tty = claudeTty(bin, h, [...args, "--resume", id]);
+    await until(() => tty!.screen().includes(`v${CLAUDE_CODE_VERSION}`), 60_000, "the resumed main screen");
+    await tty.submit("AFTER-RESUME");
+    await until(() => model.requests.slice(before).some((r) => JSON.stringify(r.body).includes("AFTER-RESUME")), 60_000, "the resumed session's request");
+    const resumed = model.requests.slice(before).find((r) => JSON.stringify(r.body).includes("AFTER-RESUME"))!;
+    // The resumed request carries the earlier call (it is a replay), and not the link.
+    expect(JSON.stringify(resumed.body)).toContain("sign-in started");
+    expect(requests()).not.toContain(url);
   } finally {
     await tty?.stop();
     model.stop();
     writeFileSync(join(signedOut, "model.jsonl"), model.requests.map((r) => JSON.stringify(r)).join("\n"));
     await srv.stop();
   }
-}, 240_000);
+}, 300_000);
