@@ -37,20 +37,21 @@ export function adapterChildren(pid: number, bin?: string): string[] {
     .map((m) => m[4]!);
 }
 
-// Every process under pid, including fixture wrappers that exec sleep and
-// no longer have grayboard in their command line.
-export function processDescendants(pid: number): { pid: number; command: string }[] {
+export type ProcessDescendant = { pid: number; ppid: number; command: string };
+
+// Includes a failed stdio child's exec'd sleeper, which has no CLI marker.
+export function processDescendants(pid: number): ProcessDescendant[] {
   const r = Bun.spawnSync(["ps", "-A", "-o", "pid=,ppid=,command="]);
   const rows = r.stdout.toString().split("\n")
     .map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
     .filter((m): m is RegExpMatchArray => !!m)
     .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), command: m[3]! }));
-  const found: { pid: number; command: string }[] = [];
+  const found: ProcessDescendant[] = [];
   for (let queue = [pid]; queue.length;) {
     const parent = queue.shift()!;
     for (const row of rows.filter((x) => x.ppid === parent)) {
       queue.push(row.pid);
-      found.push({ pid: row.pid, command: row.command });
+      found.push(row);
     }
   }
   return found;

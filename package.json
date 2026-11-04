@@ -35,6 +35,7 @@
     "@oh-my-pi/pi-coding-agent": "18.14.0",
     "@opencode-ai/plugin": "1.19.4",
     "@types/bun": "latest",
+    "opencode-ai": "1.19.4",
     "typescript": "^5.0.0"
   }
 }
