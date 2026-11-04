@@ -36,7 +36,7 @@ test("the stable hosted aggregator runs even when matrix dependencies fail, canc
   expect(job.name).toBe("Hosted required"); expect(job.needs).toBe("hosted");
   expect(job.if).toBe("${{ always() }}"); expect(job.steps).toHaveLength(1);
   expect(job.steps[0].env.RESULT).toBe("${{ needs.hosted.result }}");
-  // The matrix skips only when the caller asks: a pin-only PR (#507).
+  // The matrix skips only when the caller asks: a pin-only (#507) or docs-only (#601) PR.
   expect(workflow.jobs.hosted.if).toBe("${{ !inputs.skip }}");
   expect(job.steps[0].env.SKIP).toBe("${{ inputs.skip }}");
   expect(workflow.jobs.hosted.strategy["fail-fast"]).toBe(false);
@@ -46,7 +46,7 @@ test("the stable hosted aggregator runs even when matrix dependencies fail, canc
   expect(caller.jobs.hosted.name).toBeUndefined();
   expect(caller.jobs.hosted.uses).toBe("./.github/workflows/hosted.yml");
   expect(caller.jobs.hosted.if).toBe("${{ !cancelled() }}");
-  expect(caller.jobs.hosted.with).toEqual({ skip: "${{ needs.scope.outputs.pin-only == 'true' }}" });
+  expect(caller.jobs.hosted.with).toEqual({ skip: "${{ needs.scope.outputs.pin-only == 'true' || needs.scope.outputs.docs-only == 'true' }}" });
   for (const skip of ["true", "false", ""]) {
     for (const result of ["success", "failure", "cancelled", "skipped", ""]) {
       const process = Bun.spawnSync(["bash", "-c", job.steps[0].run], { env: { ...Bun.env, RESULT: result, SKIP: skip } });
@@ -72,18 +72,23 @@ test("PR runs cancel superseded ones, and the required test check fails closed o
     const process = Bun.spawnSync(["bash", "-c", test.steps[0].run], { env: { ...Bun.env, SCOPE: result } });
     expect(process.exitCode === 0).toBe(result === "success");
   }
+  expect(test.env.SUITES).toBe("${{ needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true' }}");
   const suites = test.steps.filter((step: any) => step.name === "Typecheck" || step.name === "Test");
-  expect(suites.map((step: any) => step.if)).toEqual(["env.PIN_ONLY != 'true'", "env.PIN_ONLY != 'true'"]);
+  expect(suites.map((step: any) => step.if)).toEqual(["env.SUITES == 'true'", "env.SUITES == 'true'"]);
+  const docs = test.steps.filter((step: any) => step.if === "needs.scope.outputs.docs-only == 'true'");
+  expect(docs.map((step: any) => step.run)).toEqual(["bun test tests/integration/doc_links.test.ts"]);
+  expect(workflow.jobs["deploy-lint"].if).toBe("needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true'");
   const pinSteps = test.steps.filter((step: any) => step.if === "env.PIN_ONLY == 'true'");
   expect(pinSteps.map((step: any) => step.name)).toEqual(["Marketplace tests", "The file only moves the pin forward", "The pin names an immutable release at its commit"]);
   expect(pinSteps[1].env.BASE).toBe("${{ github.event.pull_request.base.sha }}");
   expect(pinSteps[1].run).toContain('bun scripts/pin_claude_plugin.ts verify "$RUNNER_TEMP/base-marketplace.json"');
 });
 
-// #507: scope's routing decides which PRs skip the suites, so it runs here
-// against a real repo: only a lone marketplace.json change is pin-only, and
+// #507, #601: scope's routing decides which PRs skip the suites, so it runs
+// here against a real repo: only a lone marketplace.json change is pin-only,
+// only docs (docs/, markdown outside adapters/ and plugins/) is docs-only, and
 // fork-chosen file names print with workflow commands stopped.
-test("scope marks a PR pin-only exactly when its one changed file is the marketplace", () => {
+test("scope marks a PR pin-only or docs-only exactly when its files allow it", () => {
   const step = (Bun.YAML.parse(read(".github/workflows/test.yml")) as any).jobs.scope.steps.find((s: any) => s.id === "files");
   const dir = mkdtempSync(resolve(tmpdir(), "gb-scope-"));
   const repo = resolve(dir, "repo");
@@ -127,7 +132,8 @@ test("scope marks a PR pin-only exactly when its one changed file is the marketp
       const r = Bun.spawnSync(["bash", "-e", "-c", step.run], { cwd: repo, env: { ...env, GITHUB_OUTPUT: output, ...vars }, stdout: "pipe", stderr: "pipe" });
       expect(r.stderr.toString()).toBe("");
       expect(r.exitCode).toBe(0);
-      return { pin: readFileSync(output, "utf8"), stdout: r.stdout.toString() };
+      const out = readFileSync(output, "utf8");
+      return { pin: out.split("\n")[0] + "\n", docs: out.split("\n")[1], stdout: r.stdout.toString() };
     };
     mkdirSync(repo);
     git("init", "-q");
@@ -137,6 +143,17 @@ test("scope marks a PR pin-only exactly when its one changed file is the marketp
     expect(scope({ BASE: base, HEAD: commit({ "README.md": "y\n" }, base) }).pin).toBe("pin-only=false\n");
     expect(scope({ BASE: base, HEAD: base }).pin).toBe("pin-only=false\n");
     expect(scope({ BASE: "", HEAD: "" }).pin).toBe("pin-only=false\n"); // a push: no PR head
+    const docsOnly = (files: Record<string, string>) => scope({ BASE: base, HEAD: commit(files, base) }).docs;
+    expect(docsOnly({ "README.md": "z\n" })).toBe("docs-only=true");
+    expect(docsOnly({ "docs/guide/x.md": "x\n", "docs/a.png": "x", "CONTRIBUTING.md": "x\n", ".github/PULL_REQUEST_TEMPLATE.md": "x\n", ".claude/commands/c.md": "x\n", "tests/e2e/README.md": "x\n" })).toBe("docs-only=true");
+    expect(docsOnly({ "docs/y.md": "y\n", "src/y.ts": "y\n" })).toBe("docs-only=false");
+    expect(docsOnly({ "adapters/opencode-v2/README.md": "y\n" })).toBe("docs-only=false"); // ships in the package
+    expect(docsOnly({ "plugins/claude-code/skills/logout/SKILL.md": "y\n" })).toBe("docs-only=false"); // ships in the plugin
+    expect(docsOnly({ "src/notes.md": "y\n" })).toBe("docs-only=false");
+    expect(docsOnly({ ".github/workflows/test.yml": "y\n" })).toBe("docs-only=false");
+    expect(docsOnly({ ".claude-plugin/marketplace.json": '{"pin":3}\n' })).toBe("docs-only=false");
+    expect(scope({ BASE: base, HEAD: base }).docs).toBe("docs-only=false");
+    expect(scope({ BASE: "", HEAD: "" }).docs).toBe("docs-only=false"); // a push runs everything
     // A file named like a workflow command prints between stop-commands and its resume token.
     const { pin, stdout } = scope({ BASE: base, HEAD: commit({ "::error::injected": "x\n" }, base) });
     expect(pin).toBe("pin-only=false\n");
