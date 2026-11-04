@@ -360,6 +360,8 @@ export default function grayboard(pi: ExtensionAPI) {
     const selection = shared.selected!;
     const env = { ...own.env, BUS_HARNESS_SESSION: selection.id, BUS_ADAPTER_OWNER: own.protocol ? owner : undefined };
     const proc = spawn(own.cmd, own.args, { cwd: own.cwd ?? selection.ctx.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    const exited = Promise.withResolvers<void>();
+    proc.once("exit", () => exited.resolve());
     const pending = new Map<number, PromiseWithResolvers<unknown>>();
     let next = 1;
     let gone: Error | undefined;
@@ -391,7 +393,14 @@ export default function grayboard(pi: ExtensionAPI) {
       shared.child = undefined;
       shared.transition = undefined;
       shared.instructions = undefined;
-      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
+      // EPIPE can happen while the child is still alive. Kill it and wait for
+      // its exit (SIGKILL after EXIT_WAIT_MS) before a replacement, so it
+      // can't linger as a second delivery owner or keep its names (#580).
+      const ending = proc.exitCode !== null || proc.signalCode !== null || !proc.pid ? Promise.resolve() : (async () => {
+        proc.kill();
+        const force = setTimeout(() => proc.kill("SIGKILL"), EXIT_WAIT_MS);
+        try { await exited.promise; } finally { clearTimeout(force); }
+      })();
       if (Date.now() - startedAt >= STABLE_MS) shared.restarts = 0;
       const attempt = shared.restarts ?? 0;
       if (shared.owner !== pi || attempt >= RESTART_DELAYS_MS.length) {
@@ -402,7 +411,7 @@ export default function grayboard(pi: ExtensionAPI) {
       shared.restarts = attempt + 1;
       shared.exitReason = `${reason}; restarting it`;
       pi.logger.warn(`${reason}; restarting it (${attempt + 1} of ${RESTART_DELAYS_MS.length})`);
-      shared.restart = Bun.sleep(RESTART_DELAYS_MS[attempt]!).then(() => {
+      shared.restart = Promise.all([Bun.sleep(RESTART_DELAYS_MS[attempt]!), ending]).then(() => {
         shared.restart = undefined;
         if (shared.owner === pi && shared.ownerToken === owner && !shared.child && shared.selected) shared.child = start(shared.selected.ctx);
       });

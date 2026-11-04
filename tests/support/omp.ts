@@ -19,7 +19,9 @@ import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
-import { grayboardChildPids, grayboardDescendants, sigkill } from "./procs.ts";
+import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill } from "./procs.ts";
+// The line tests/support/stops_reading.ts stops reading after (its STOP_READING).
+const STOP_READING = "stop-reading-580";
 import { CLI, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
 
@@ -355,12 +357,14 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 // omp's own MCP client runs no grayboard (#523). The entry's BUS_DB_PATH is a
 // `${VAR}` placeholder the adapter expands as omp's loader does: unexpanded,
 // grayboard would open another bus and every row a scenario reads would be missing.
-export function installLocal(dir: string, modelPort: number): void {
+// `wrap`: a command the entry runs grayboard behind (its args get grayboard's command appended).
+export function installLocal(dir: string, modelPort: number, wrap: string[] = []): void {
   const agentDir = agentDirOf(dir);
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
   writeFileSync(join(agentDir, "extensions", "grayboard.ts"), LOCAL_BUNDLE);
+  const [command, ...prefix] = [...wrap, process.execPath];
   writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({
-    mcpServers: { grayboard: { command: process.execPath, args: [CLI, "mcp", "--mode", "local"], env: { BUS_PUSH: "off", BUS_DB_PATH: "${OMP_TEST_BUS}" }, enabled: false } },
+    mcpServers: { grayboard: { command, args: [...prefix, CLI, "mcp", "--mode", "local"], env: { BUS_PUSH: "off", BUS_DB_PATH: "${OMP_TEST_BUS}" }, enabled: false } },
   }));
   writeConfig(agentDir, modelPort, {});
 }
@@ -738,6 +742,73 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
       expect(model.unhandled).toEqual([]);
       await omp.quit();
     } finally {
+      await stopAll(procs);
+      if (peer) await stopSession(peer.c);
+      model.stop();
+    }
+  });
+}
+
+// A grayboard that stops reading while it still runs and holds the name
+// (tests/support/stops_reading.ts): the adapter's next write fails with EPIPE,
+// and it kills that process before the replacement starts, so the replacement
+// takes the name back and no stale delivery owner remains (#580).
+export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-580", create: true } }]),
+      scripted("stop", [{ tool: `${PREFIX}dm_send`, args: { to: "peer", body: STOP_READING } }]),
+      // Bun accepts a small write to a closed pipe; a large one raises EPIPE.
+      scripted("big", [{ tool: `${PREFIX}dm_send`, args: { to: "peer", body: "x".repeat(128_000) } }]),
+      scripted("who", [{ tool: `${PREFIX}whoami`, args: {} }]),
+    ]);
+    let peer: Session | undefined;
+    // Every relay and grayboard pid seen, SIGKILLed at the end: on a regression
+    // the stale pair outlives omp, which only stops the child it still owns.
+    const seen = new Set<number>();
+    const grayboards = (pid: number) => {
+      const pids = processDescendants(pid).filter((p) => p.command.includes(CLI)).map((p) => p.pid);
+      for (const p of pids) seen.add(p);
+      return pids;
+    };
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      installLocal(dir, model.port, [process.execPath, join(ROOT, "tests/support/stops_reading.ts")]);
+      peer = await localSession(dir, "peer");
+      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING });
+      await omp.command({ type: "get_state" }, 30_000);
+      const holder = () => localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-580'")[0]?.id;
+      await omp.command({ type: "prompt", message: "bind" });
+      await idle(omp);
+      const first = holder()!;
+      expect(first).toBeDefined();
+
+      await omp.command({ type: "prompt", message: "stop" });
+      await idle(omp);
+      expect(resultText(await toolResult(omp, "dm_send"))).not.toContain("error");
+      // The relay and the one grayboard behind it.
+      const stale = grayboards(omp.pid);
+      expect(stale).toHaveLength(2);
+
+      await omp.command({ type: "prompt", message: "big" });
+      await idle(omp);
+      expect(resultText(await toolResult(omp, "dm_send", 1))).toContain("grayboard process stopped reading");
+      await until(() => !stale.some(alive), 10_000, "the process that stopped reading killed");
+      await until(() => holder() !== undefined && holder() !== first, 15_000, "omp-580 held by the replacement");
+      const replacement = grayboards(omp.pid);
+      expect(replacement).toHaveLength(2);
+      expect(localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id = ?", first)[0]?.ended_at).not.toBeNull();
+
+      await omp.command({ type: "prompt", message: "who" });
+      await idle(omp);
+      expect(resultText(await toolResult(omp, "whoami"))).toContain("omp-580");
+      expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      expect(model.unhandled).toEqual([]);
+      await omp.quit();
+      await until(() => !replacement.some(alive), 5_000, "the replacement ended with omp");
+    } finally {
+      for (const p of seen) { try { process.kill(p, "SIGKILL"); } catch {} }
       await stopAll(procs);
       if (peer) await stopSession(peer.c);
       model.stop();
