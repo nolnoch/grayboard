@@ -28,8 +28,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { render, wakes, type ChannelParams } from "../hosted-core/src/channel.ts";
-import { modelName } from "../pi-family/extension.ts";
-import { plan, replaceText } from "../pi-family/omp-instructions.ts";
+import { instructionHooks } from "../pi-family/omp-instructions.ts";
 
 type McpEntry = { command?: string; args?: string[]; env?: Record<string, string>; cwd?: string };
 type Tool = { name: string; description?: string; inputSchema: { type?: string; properties?: Record<string, unknown> }; _meta?: Record<string, unknown> };
@@ -63,7 +62,8 @@ const NOT_OWNERS = "grayboard: this subagent's top-level session doesn't run gra
 // Each runtime's agent as omp reports it (`ctx.agent`), by agent id: entries
 // are never removed, since omp keeps a finished subagent revivable for its idle
 // TTL and a nested one revived after its parent's run ended must still reach
-// its root (as adapters/pi-family/omp-ancestry.ts).
+// its root. Unlike hosted omp's ancestry walk, this one checks the owning
+// runtime and ambiguous ACP main ids, not just the root's session id.
 type Agent = { main: boolean; parent?: string; runtime: ExtensionAPI };
 
 // What every runtime in this omp process shares: each subagent's runtime
@@ -263,12 +263,14 @@ export default function grayboard(pi: ExtensionAPI) {
   const own = (shared.config ??= config(getAgentDir()));
   const tools = (shared.tools ??= loadTools(own));
   let registered = false;
-  // The instructions this runtime's before_agent_start last appended.
-  let injected: string | undefined;
-  const warned = new Set<string>();
-  // Advisors skip context but share main's payload hook: only main warns
-  // when its payload couldn't be rewritten, as the hosted entry does (#441).
-  let mainRequest = false;
+  const hooks = instructionHooks<ExtensionContext>({
+    instructions: () => shared.instructions,
+    logger: pi.logger,
+    show: (message, ctx) => {
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else console.error(message);
+    },
+  });
 
   // On screen when there is one, else on stderr; always into omp's log.
   const report = (ctx: ExtensionContext, text: string) => {
@@ -479,8 +481,7 @@ export default function grayboard(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
     await shared.child?.ready.catch(() => {});
-    injected = shared.instructions;
-    return injected ? { systemPrompt: [...event.systemPrompt, injected] } : undefined;
+    return hooks.beforeAgentStart(event);
   });
 
   // Share hosted omp's per-request plan and payload rewrite (#441): a
@@ -488,32 +489,11 @@ export default function grayboard(pi: ExtensionAPI) {
   // prompt gets them as a hidden message, last for Anthropic's cache boundary.
   pi.on("context", async (event, ctx) => {
     if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
-    mainRequest = true;
-    const next = plan(ctx.getSystemPrompt(), injected, shared.instructions);
-    pi.logger.debug(`grayboard: instructions plan for a main request: ${next.kind}`);
-    if (next.kind !== "inject") return undefined;
-    const message = { role: "custom", customType: "grayboard-instructions", content: next.text, display: false, attribution: "agent", timestamp: Date.now() } as const;
-    return { messages: [...event.messages, message] };
+    return hooks.context(event, ctx);
   });
   pi.on("before_provider_request", async (event, ctx) => {
     if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
-    const main = mainRequest;
-    mainRequest = false;
-    const systemPrompt = ctx.getSystemPrompt();
-    const next = plan(systemPrompt, injected, shared.instructions);
-    if (next.kind !== "replace") return undefined;
-    const rewritten = replaceText(event.payload, systemPrompt, next.from, next.to);
-    pi.logger.debug(`grayboard: rewrote ${rewritten} payload strings to the current instructions`);
-    if (rewritten > 0 || !main) return undefined;
-    const model = ctx.model ? modelName(ctx.model) : "an unknown model";
-    pi.logger.warn(`grayboard: couldn't refresh the instructions in a request to ${model}; it carries the ones from the last prompt`);
-    if (!warned.has(next.from)) {
-      warned.add(next.from);
-      const message = `grayboard: this turn's model (${model}) may still see the instructions from before the last bind; send a prompt to refresh them`;
-      if (ctx.hasUI) ctx.ui.notify(message, "warning");
-      else console.error(message);
-    }
-    return undefined;
+    return hooks.beforeProviderRequest(event, ctx);
   });
 
   // omp keeps the main runtime across /new, /resume and /fork, so this runs

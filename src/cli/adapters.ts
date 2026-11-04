@@ -18,6 +18,8 @@ export function adapterSource(harness: "opencode" | "pi"): string {
  * and a build from a throwaway cwd would embed the builder's absolute paths.
  * A failed build throws, failing the build that imports this.
  */
+export function adapterBundle(harness: "pi" | "omp", mode?: "hosted"): string;
+export function adapterBundle(harness: "omp", mode: "local"): string;
 export function adapterBundle(harness: "pi" | "omp", mode: "hosted" | "local" = "hosted"): string {
   const root = fileURLToPath(new URL("../../", import.meta.url));
   const external = harness === "omp" ? ["--external", "@oh-my-pi/pi-coding-agent"] : [];

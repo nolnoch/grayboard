@@ -6,6 +6,67 @@
 // provider payload or, when the system prompt holds no grayboard element,
 // adds the current text as a hidden message.
 
+// A harness model as the bus names it: `provider/id`. Keep this leaf free of
+// hosted runtime imports: local omp bundles it without the hosted MCP client.
+export const modelName = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
+
+type InstructionContext = {
+  getSystemPrompt(): readonly string[];
+  model?: { provider: string; id: string };
+};
+
+// Both omp entries use these hooks. The caller admits only main's runtime;
+// advisors skip context but share its provider hook, so only a request with
+// a context fetch warns when a stale-text rewrite misses (#441).
+export function instructionHooks<Context extends InstructionContext>({ instructions, logger, show }: {
+  instructions(): string | undefined | Promise<string | undefined>;
+  logger: { debug(message: string): void; warn(message: string): void };
+  show(message: string, context: Context): void;
+}) {
+  // Outlives a session switch: compare against the element the last user
+  // prompt appended, even after omp rebuilt its base prompt without it.
+  let injected: string | undefined;
+  let fetched: Promise<string | undefined> | undefined;
+  const warned = new Set<string>();
+
+  return {
+    async beforeAgentStart(event: { systemPrompt: readonly string[] }) {
+      const text = await instructions();
+      injected = text || undefined;
+      return text ? { systemPrompt: [...event.systemPrompt, text] } : undefined;
+    },
+    async context<Message>(event: { messages: Message[] }, context: Context) {
+      const fetching = Promise.resolve(instructions());
+      fetched = fetching;
+      const next = plan(context.getSystemPrompt(), injected, await fetching);
+      logger.debug(`grayboard: instructions plan for a main request: ${next.kind}`);
+      if (next.kind !== "inject") return undefined;
+      // Last: Anthropic's cache boundary precedes context-added messages.
+      const message = { role: "custom", customType: "grayboard-instructions", content: next.text, display: false, attribution: "agent", timestamp: Date.now() } as const;
+      return { messages: [...event.messages, message] };
+    },
+    async beforeProviderRequest(event: { payload: unknown }, context: Context) {
+      const main = fetched !== undefined;
+      const fetching = fetched ?? Promise.resolve(instructions());
+      fetched = undefined;
+      const systemPrompt = context.getSystemPrompt();
+      const next = plan(systemPrompt, injected, await fetching);
+      if (next.kind !== "replace") return undefined;
+      const rewritten = replaceText(event.payload, systemPrompt, next.from, next.to);
+      logger.debug(`grayboard: rewrote ${rewritten} payload strings to the current instructions`);
+      if (rewritten > 0 || !main) return undefined;
+      // Cursor's encoded prompt or credential redaction can hide the text.
+      const model = context.model ? modelName(context.model) : "an unknown model";
+      logger.warn(`grayboard: couldn't refresh the instructions in a request to ${model}; it carries the ones from the last prompt`);
+      if (!warned.has(next.from)) {
+        warned.add(next.from);
+        show(`grayboard: this turn's model (${model}) may still see the instructions from before the last bind; send a prompt to refresh them`, context);
+      }
+      return undefined;
+    },
+  };
+}
+
 export type Plan =
   | { kind: "none" }
   | { kind: "replace"; from: string; to: string }

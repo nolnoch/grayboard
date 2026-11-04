@@ -571,9 +571,10 @@ export function ompLocalPinScenario(dir: string): Promise<void> {
   });
 }
 
-// A local omp session keeps its grayboard and its name (#523). A grayboard
-// process that dies is restarted, as omp's MCP manager restarted a stdio
-// server, and binds the name back from its name record. /new keeps the
+// A local omp session keeps its grayboard and its name (#523). A push-started
+// bind changes the next request's instructions without a new user prompt (#552).
+// A grayboard process that dies is restarted, as omp's MCP manager restarted
+// a stdio server, and binds the name back from its name record. /new keeps the
 // process, session and name, and a push-started turn after it gets the
 // instructions as a hidden message, since omp rebuilt the system prompt
 // without them. A file-backed omp URL in an argument (local://) reaches
