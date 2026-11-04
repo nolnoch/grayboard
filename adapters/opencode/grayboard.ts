@@ -22,6 +22,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -45,6 +46,7 @@ const CONFIG = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "
 // The same harness-asserted subagent key used by the local omp adapter.
 const AGENT_META = "io.github.nolnoch.grayboard/agent";
 const z = tool.schema;
+const AssociationSchema = z.object({ id: z.string(), session: z.string(), epoch: z.number(), instructions: z.array(z.string()) });
 // Match pi and omp's local restart policy. Setup embeds this raw file, so
 // the lifecycle stays here rather than importing a runtime helper.
 const RESTART_DELAYS_MS = [0, 1_000, 5_000];
@@ -57,6 +59,7 @@ function esc(s: string): string {
 // Same shape Claude Code shows the model, so the MCP server's instructions apply.
 function render({ content, meta = {} }: ChannelParams): string {
   const attrs = Object.entries(meta)
+    .filter(([key]) => !["grayboard_session", "grayboard_epoch", "grayboard_delivery"].includes(key))
     .map(([k, v]) => ` ${k}="${esc(v)}"`)
     .join("");
   // A body's `<channel` or `</channel` keeps its `<` escaped, so it can't close
@@ -134,6 +137,17 @@ function commandOf(entry: McpEntry | undefined): { cmd: string; args: string[]; 
   return { cmd: cmd!, args, env };
 }
 
+// This V1 entry runs the local CLI even on a signed-in machine. Only
+// ordinary roots use association; runners/keyed/human entries retain their
+// established lifecycle, and legacy server commands retain their refusal.
+function localEntry(entry: McpEntry | undefined): boolean {
+  const { args, env } = commandOf(entry);
+  const at = args.indexOf("--mode");
+  const mode = args.find((arg) => arg.startsWith("--mode="))?.slice(7) ?? (at >= 0 ? args[at + 1] : undefined);
+  return mode !== "server" && !args.some((arg) => arg === "--server" || arg.startsWith("--server="))
+    && env.BUS_PARENT_SESSION === undefined && env.BUS_SESSION_KEY === undefined && env.BUS_HUMAN !== "1";
+}
+
 // The tool list `grayboard mcp` serves in the entry's mode, from the installed
 // binary on every start so this file and the binary can't drift. Plugin init
 // gets no config, so this reads the user-level entry setup writes; a failure
@@ -168,6 +182,7 @@ type Child = {
   proc: ChildProcess;
   ready: Promise<void>;
   call(method: string, params: object, signal?: AbortSignal): Promise<any>;
+  associate(session: string): Promise<void>;
   stop(): Promise<void>;
 };
 
@@ -196,6 +211,17 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
   let refused: string | undefined;
   // The root session to deliver into: the one the user last wrote in.
   let target: string | undefined;
+  let requestedTarget: string | undefined;
+  let transition = Promise.resolve();
+  let transitionError: Error | undefined;
+  const activeCalls = new Set<Promise<CallResult>>();
+  const owner = randomUUID();
+  const deliveryMarker = owner.replace(/-/g, "");
+  let deliverySequence = 0;
+  const local = localEntry(entry);
+  let epoch = 0;
+  let rootEvent = 0;
+  let selectedEvent = 0;
   // Events cover newly created sessions; lookup also covers resumed children
   // and calls that beat the asynchronous session.created event.
   const parents = new Map<string, string | undefined>();
@@ -209,20 +235,23 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     client.tui.showToast({ body: { message, variant } }).catch(() => {});
   };
 
-  const deliver = (params: ChannelParams) => {
+  const deliver = (params: ChannelParams, recipient: string | undefined, receipt: (accepted: boolean) => Promise<void>) => {
     queue = queue.then(async () => {
-      if (!target || closed) return;
+      if (!recipient || closed) { await receipt(false); return; }
       const contextOnly = params.meta?.kind === "digest" || params.meta?.deferred === "true";
-      // Direct messages, mentions, thread replies: act on them (starts a turn,
-      // or joins a running one at its next step). Digests and deferred thread
-      // replies: context only. The instructions this plugin adds to the
-      // system prompt tell the model what a <channel> message is.
-      const r = await client.session.promptAsync({
-        path: { id: target },
-        body: { parts: [{ type: "text", text: render(params) }], ...(contextOnly ? { noReply: true } : {}) },
-      });
-      if (r.error) log("error", `delivery failed: ${JSON.stringify(r.error)}`);
-    });
+      // Capture the outgoing root when stdout arrives, not when this queued
+      // SDK request eventually runs after a root selection.
+      let accepted = false;
+      try {
+        const messageID = `msg_${Date.now().toString(16).padStart(12, "0")}${deliveryMarker}${(++deliverySequence).toString(16).padStart(8, "0")}`;
+        const r = await client.session.promptAsync({
+          path: { id: recipient },
+          body: { messageID, parts: [{ type: "text", text: render(params) }], ...(contextOnly ? { noReply: true } : {}) },
+        });
+        accepted = !r.error;
+        if (r.error) report(`grayboard: delivery failed: ${JSON.stringify(r.error)}`);
+      } finally { await receipt(accepted); }
+    }).catch((error) => { report(`grayboard: delivery failed: ${String(error)}`); });
   };
 
   // Started on the first root session, not at load: until something can
@@ -230,6 +259,13 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
   const start = (): Child => {
     const startedAt = Date.now();
     const { cmd, args, env } = commandOf(entry);
+    let recipient = target;
+    let childEpoch = 0;
+    delete env.BUS_ADAPTER_OWNER;
+    if (local) {
+      env.BUS_ADAPTER_OWNER = owner;
+      env.BUS_HARNESS_SESSION = recipient;
+    }
     const proc = spawn(cmd, args, { cwd: directory, env, stdio: ["pipe", "pipe", "inherit"] });
     const exited = Promise.withResolvers<void>();
     let stopped: Promise<void> | undefined;
@@ -287,6 +323,7 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       let cancelled = false;
       const timer = setTimeout(async () => {
         await ending;
+        await transition;
         if (cancelled || closed) return;
         restart = undefined;
         exitReason = undefined;
@@ -319,9 +356,20 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
           continue;
         }
         if (msg.method === "notifications/claude/channel") {
-          // stdout may drain after exit; grayboard already advanced its
-          // delivery cursors for these notifications, so don't discard them.
-          if (!closed) deliver(msg.params as ChannelParams);
+          // Final stdout after exit belongs to this child's committed root.
+          const params = msg.params as ChannelParams;
+          const receipt = async (accepted: boolean) => {
+            const token = params.meta?.grayboard_delivery;
+            if (token && !gone) await call("grayboard/delivery", { owner, token, accepted });
+          };
+          if (local && ((params.meta?.grayboard_session !== undefined && params.meta.grayboard_session !== recipient)
+            || (params.meta?.grayboard_epoch !== undefined && params.meta.grayboard_epoch !== String(childEpoch)))) {
+            void receipt(false).catch((error) => report(`grayboard: delivery receipt failed: ${String(error)}`));
+            continue;
+          }
+          // Receipts bypass the transition barrier: the child's exclusive
+          // transition waits for them before retiring outgoing delivery.
+          deliver(params, recipient, receipt);
         } else if (msg.id !== undefined && pending.has(msg.id)) {
           const p = pending.get(msg.id)!;
           pending.delete(msg.id);
@@ -340,39 +388,78 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     });
     // A write after grayboard closed its end (EPIPE); unhandled, the error event would crash the host.
     proc.stdin!.on("error", (e) => fail(`grayboard process stopped reading: ${e.message}`));
+    const associate = async (session: string) => {
+      if (!local) { await queue; recipient = session; return; }
+      const nextEpoch = ++epoch;
+      const result = AssociationSchema.parse(await call("grayboard/session", { owner, epoch: nextEpoch, session }));
+      if (gone || closed || child?.proc !== proc) throw new Error("grayboard: stale root association response");
+      if (result.session !== session || result.epoch !== nextEpoch) throw new Error("grayboard: mismatched root association response");
+      await queue;
+      if (gone || closed || child?.proc !== proc) throw new Error("grayboard: root association owner changed");
+      recipient = session;
+      childEpoch = nextEpoch;
+      instructions = result.instructions.join(" ");
+      await call("grayboard/session/ready", { owner, epoch: nextEpoch });
+    };
     // stdin stays open: grayboard exits when it closes, releasing the name.
     const ready = call("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
       clientInfo: { name: "opencode-grayboard", version: "1" },
     }).then(async (result: { instructions?: string }) => {
+      if (closed || child?.proc !== proc) throw new Error("grayboard: stale initialize response");
       instructions = result.instructions;
       send({ method: "notifications/initialized" });
       const served = ((await call("tools/list", {})) as { tools: Tool[] }).tools;
       const diff = toolDiff(tools, served);
       if (diff.length) report(`grayboard: the running grayboard serves different tools than \`grayboard tools\` listed at load: ${diff.join(", ")}`);
+      if (local && recipient) await associate(recipient);
     });
     // A call that awaits ready gets the failure; this only keeps an unawaited
     // rejection from surfacing when no call is waiting.
     ready.catch(() => {});
-    return { proc, ready, call, stop };
+    return { proc, ready, call, associate, stop };
   };
 
-  // Root sessions still share one live child. Switching roots cancels only
-  // an outgoing restart, not a working child's existing tools or holds.
-  const selectTarget = async (session: string) => {
-    if (session === target || closed) return;
-    target = session;
+  // Exclude new tools while outgoing calls and delivery settle, then rotate
+  // the child's bus root without replacing the child process.
+  const selectTarget = (session: string, event = ++rootEvent): Promise<void> => {
+    if (closed || event < selectedEvent) return transition;
+    selectedEvent = event;
+    if (session === requestedTarget) return transition;
+    requestedTarget = session;
     generation++;
     restart?.cancel();
     restarts = 0;
     exitReason = undefined;
-    await Promise.all(stopping);
+    const outgoing = [...activeCalls];
+    transition = transition.then(async () => {
+      await Promise.allSettled(outgoing);
+      await queue;
+      await Promise.all(stopping);
+      if (closed) return;
+      target = session;
+      const c = child;
+      if (c) {
+        await c.ready;
+        await c.associate(session);
+      }
+      transitionError = undefined;
+    }).catch((error) => {
+      // A process failure already schedules current-root recovery. Don't
+      // poison its future calls with the outgoing transport's rejection.
+      if (!child && (restart || exitReason)) return;
+      transitionError = error instanceof Error ? error : new Error(String(error));
+      report(`grayboard: root session transition failed: ${transitionError.message}`);
+    });
+    return transition;
   };
 
   const running = async (signal?: AbortSignal): Promise<Child> => {
     const current = generation;
     if (refused) throw new Error(refused);
+    await waitReady(transition, signal);
+    if (transitionError) throw transitionError;
     if (!child && restart) await waitReady(restart.ready, signal);
     if (closed) throw new Error("grayboard: opencode plugin shut down");
     if (current !== generation) throw new Error("grayboard: root session changed while reconnecting");
@@ -391,8 +478,18 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     return parents.get(sessionID);
   };
   const isSubagent = async (sessionID: string) => !!(await sessionParent(sessionID));
+  const callTool = (c: Child, params: object, signal?: AbortSignal, root = false): Promise<CallResult> => {
+    const result = (c.call("tools/call", params, signal) as Promise<CallResult>).then((value) => {
+      if (root && child === c && value.structuredContent?.instructions) instructions = value.structuredContent.instructions.join(" ");
+      return value;
+    });
+    activeCalls.add(result);
+    void result.finally(() => activeCalls.delete(result)).catch(() => {});
+    return result;
+  };
   const firstTarget = async (sessionID: string) => {
-    if (target) return;
+    if (requestedTarget) return transition;
+    const event = ++rootEvent;
     let root = sessionID;
     const seen = new Set<string>();
     let parent: string | undefined;
@@ -401,7 +498,8 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       seen.add(root);
       root = parent;
     }
-    await selectTarget(root);
+    if (!requestedTarget) await selectTarget(root, event);
+    else await transition;
   };
 
   // opencode's MCP naming, so prompts and skills that name these keep working.
@@ -415,13 +513,13 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
         async execute(args, ctx) {
           const sub = await isSubagent(ctx.sessionID);
           await firstTarget(ctx.sessionID);
+          const current = generation;
           const c = await running(ctx.abort);
           await waitReady(c.ready, ctx.abort);
-          const result = (await c.call("tools/call", { name: t.name, arguments: args, ...(sub ? { _meta: { [AGENT_META]: ctx.sessionID } } : {}) }, ctx.abort)) as CallResult;
-          // A result carries the instructions when the name changed (#182
-          // decision 13): bind's, or the next one after a bind whose result
-          // was lost (cancelled, timed out) or a lost name. Errors included.
-          if (!sub && result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
+          await waitReady(transition, ctx.abort);
+          if (current !== generation || (!sub && ctx.sessionID !== target)) throw new Error("grayboard: root session changed while waiting for the tool");
+          if (transitionError) throw transitionError;
+          const result = await callTool(c, { name: t.name, arguments: args, ...(sub ? { _meta: { [AGENT_META]: ctx.sessionID } } : {}) }, ctx.abort, !sub);
           // A thrown error is opencode's tool error.
           return resultText(result, t.name);
         },
@@ -458,17 +556,20 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (event.type === "session.created" || event.type === "session.updated") {
         const s = event.properties.info;
         parents.set(s.id, s.parentID);
-        if (!s.parentID && event.type === "session.created" && !target) await selectTarget(s.id);
+        if (!s.parentID && event.type === "session.created" && !requestedTarget) await selectTarget(s.id);
       } else if (event.type === "message.updated") {
         const m = event.properties.info;
         // Events are fire-and-forget in OpenCode. A message can outlive its
         // deleted session: an unknown session must never steal delivery.
-        if (m.role === "user" && !(await isSubagent(m.sessionID).catch(() => true))) await selectTarget(m.sessionID);
+        const order = ++rootEvent;
+        const ownDelivery = m.id.startsWith("msg_") && m.id.slice(16, 48) === deliveryMarker;
+        if (m.role === "user" && !ownDelivery && !(await isSubagent(m.sessionID).catch(() => true))) await selectTarget(m.sessionID, order);
       } else if (event.type === "session.deleted") {
         parents.delete(event.properties.info.id);
       }
       if (target && !closed && !refused && !exitReason && !restart) {
         await Promise.all(stopping);
+        await transition;
         if (!closed) child ??= start();
       }
     },
@@ -480,11 +581,15 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       const sub = input.sessionID ? await isSubagent(input.sessionID).catch(() => undefined) : false;
       if (sub === undefined) return;
       try { if (input.sessionID) await firstTarget(input.sessionID); } catch { return; }
+      await transition;
+      if (transitionError || closed) return;
       if (target && !child && !exitReason && !closed) {
         await Promise.all(stopping);
         if (!closed) child ??= start();
       }
       await child?.ready.catch(() => {});
+      await transition;
+      if (transitionError || closed || (!sub && input.sessionID && input.sessionID !== target)) return;
       if (sub && input.sessionID) {
         // V1's system hook has no abort signal. Instructions are optional:
         // never enter running()'s uncancellable restart/backoff wait here.
@@ -492,7 +597,7 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
         const c = child;
         if (!c) return;
         try {
-          const result = await c.call("tools/call", { name: "whoami", arguments: {}, _meta: { [AGENT_META]: input.sessionID } }) as CallResult;
+          const result = await callTool(c, { name: "whoami", arguments: {}, _meta: { [AGENT_META]: input.sessionID } });
           output.system.push(childInstructions(result));
         } catch {
           // An outage or failed lookup must not fail a child's model turn,

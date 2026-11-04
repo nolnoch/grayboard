@@ -49,16 +49,18 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, childFallback, detachSession, endLocalSession, keyedHarness, liveSessions, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
-import { MISSING_TEXT, TOOL_USE_META, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
+import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
+import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
+import { z } from "zod";
 import { hooksDisabledBy, recordHookInstalled } from "../cli/claude_hooks.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { isAlive, launcherName, procStart } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { LateCancels } from "../shared/latecancel.ts";
-import { testPause } from "../shared/testpause.ts";
+import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { BindGate } from "../shared/bindgate.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, localBusDir, readAttachmentFiles, saveAttachment, saveTarget } from "../shared/attachments.ts";
@@ -157,7 +159,7 @@ const harnessId = (key: string): string | undefined => {
   }
   return v;
 };
-const HARNESS_SESSION = harnessId("BUS_HARNESS_SESSION");
+let HARNESS_SESSION = harnessId("BUS_HARNESS_SESSION") ?? (process.env.CLAUDECODE === "1" ? harnessId("CLAUDE_CODE_SESSION_ID") : undefined);
 const PARENT_SESSION = harnessId("BUS_PARENT_SESSION");
 // A runner child stands in for a session that would own its delivery, so
 // it falls back to (or is promoted to) one.
@@ -216,6 +218,11 @@ if (CHANNELS_OFF) console.error(`[grayboard] Claude Code channels are off (${CHA
 // Notifications such a session drops would still count as delivered, so it
 // runs tools-only, as BUS_PUSH=off does, and what's pending waits (#71).
 const DELIVER = PUSH && !CHANNELS_OFF;
+const ORDINARY = DELIVER && !HUMAN && !KEYED && PARENT_SESSION === undefined;
+ROOT_KIND.localResume = ORDINARY;
+const ADAPTER_OWNER = ORDINARY ? harnessId("BUS_ADAPTER_OWNER") : undefined;
+let adapterEpoch = 0;
+let adapterPaused = ADAPTER_OWNER !== undefined;
 
 // The live root this process is a runner child of (#523 step 5), while it
 // is one; null for a root. A runner child acts under its root's addresses,
@@ -256,9 +263,17 @@ const UNDER_CLAUDE = process.env.CLAUDECODE === "1";
 const CLAUDE_HARNESS = UNDER_CLAUDE && recordHookInstalled()
   ? { pid: HARNESS?.pid ?? process.ppid, start: HARNESS ? HARNESS.proc_start : procStart(process.ppid) ?? null }
   : null;
+// CLAUDECODE is inherited by harnesses Claude launches; an adapter's own ID
+// and owner must never wait for Claude hooks under that harness's PID.
+const CLAUDE_CURRENT = CLAUDE_HARNESS !== null && ORDINARY && ADAPTER_OWNER === undefined && process.env.BUS_HARNESS_SESSION === undefined;
 const ATTRIBUTION_OFF = UNDER_CLAUDE && CLAUDE_HARNESS === null;
 const ATTRIBUTION_OFF_NOTE = "Claude Code subagent attribution is off: grayboard's hooks aren't in Claude Code's user settings, so subagents' calls act as this session. Run `grayboard update` (or `grayboard setup`) and restart Claude Code.";
 let attributionOffAudited = false;
+if (CLAUDE_CURRENT) {
+  const current = readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start);
+  if (current) HARNESS_SESSION = current.session;
+  ROOT_KIND.harnessSession = HARNESS_SESSION;
+}
 
 // The names this session holds, oldest first (#284 S1): the first is its
 // primary, which it sends as. bind() and unbind() change it, only between
@@ -286,6 +301,7 @@ function bindHint(child: string | undefined): { bind_hint?: string } {
 // Notes on how this session started: why it has no name, or a name its
 // restart couldn't take back. For its instructions.
 const startNotes: string[] = [];
+let claudeGuidancePending = false;
 // The name came back from the name record and the name's history shows the
 // recorded session (#211): the same harness session, so its peer status stays.
 let restored = false;
@@ -306,6 +322,23 @@ const writeNames = () => {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
   }
 };
+
+async function restoreNames(rec: { names: string[]; session_id: string }, sibling = false): Promise<void> {
+  const missed = rec.names.slice(MAX_HOLDS).map(name => ({ name, why: `a session holds at most ${MAX_HOLDS} names` }));
+  const deadline = Date.now() + SIBLING_WAIT_MS;
+  for (const name of rec.names.slice(0, MAX_HOLDS)) {
+    const n = normalizeIdentityName(name);
+    if (sibling && n.ok) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
+    const r = n.ok
+      ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id })
+      : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
+    await deliverEnded(db, r.ended);
+    if (!r.ok) { missed.push({ name, why: r.error }); continue; }
+    held.push(r.name);
+    if (r.restored && !restored) { restored = true; restoredFrom = rec.session_id; }
+  }
+  for (const m of missed) startNotes.push(restoreNote(m.name, m.why, held.length > 0));
+}
 if (WRITES_AS) {
   ensureAlias(db, WRITES_AS, WRITES_AS);
   // Its liveness is its own process, keyed or not: it ends on exit, and a
@@ -354,36 +387,13 @@ if (WRITES_AS) {
     writeCoreAudit(db, "id.child_fallback", SESSION_ID, SESSION_ID, { parent_session: PARENT_SESSION, why: ownWhy, pid: process.pid });
   }
   if (RECORDS) sweepRecords(RECORD_DIR);
-  // A restart under the same harness takes back its predecessor's names, in
-  // their order, ahead of BUS_IDENTITY: it's the same session, mid-task
-  // (#284 S10). Each is judged on its own; the first taken is the primary.
-  const rec = RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
-  if (rec?.names.length) {
-    // A record is this machine's file, not proof: past MAX_HOLDS its names
-    // are reported, not tried.
-    const missed = rec.names.slice(MAX_HOLDS).map((name) => ({ name, why: `a session holds at most ${MAX_HOLDS} names` }));
-    // The process it replaces may not have exited yet: one wait for all of
-    // its names, not one per name.
-    const deadline = Date.now() + SIBLING_WAIT_MS;
-    for (const name of rec.names.slice(0, MAX_HOLDS)) {
-      const n = normalizeIdentityName(name);
-      if (n.ok) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
-      const r = n.ok
-        ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id })
-        : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
-      await deliverEnded(db, r.ended);
-      if (!r.ok) {
-        missed.push({ name, why: r.error });
-        continue;
-      }
-      held.push(r.name);
-      // The status carries over once, from the first name that verifies.
-      if (r.restored && !restored) {
-        restored = true;
-        restoredFrom = rec.session_id;
-      }
-    }
-    for (const m of missed) startNotes.push(restoreNote(m.name, m.why, held.length > 0));
+  // Existence controls precedence: an empty selected snapshot is an explicit
+  // unbind, never an invitation to take PID carry or configured identity.
+  const snapshot = ORDINARY && HARNESS_SESSION ? conversationSnapshot(db, HARNESS_SESSION) : null;
+  claudeGuidancePending = CLAUDE_CURRENT && snapshot !== null;
+  const rec = snapshot ?? (RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null);
+  if (snapshot !== null || rec?.names.length) {
+    await restoreNames(rec!, snapshot === null);
   } else if (EXPLICIT && !attached) {
     const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, allowHuman: HUMAN });
     await deliverEnded(db, r.ended);
@@ -536,9 +546,137 @@ function recordMissing(tool: string, toolUseId: unknown, cause: MissingCause) {
 // a root. Their IDs are minted over this process's key, which only it holds.
 // A runner child's becoming its own session starts anew (becomeRoot).
 let children = new ChildSessions(db, rootId(), SESSION_KEY);
+
+let resumeBarrier: PromiseWithResolvers<void> | null = ADAPTER_OWNER ? Promise.withResolvers<void>() : null;
+let claudePaused = false;
+// Pinned Claude registers channels after tools/list, not at initialized.
+// A ping acknowledged after its list response is the measured activation seam.
+const claudeReady = CLAUDE_CURRENT && DELIVER ? Promise.withResolvers<boolean>() : null;
+let claudeActivationStarted = false;
+let claudeActivationError = "";
+let claudePublication: string | null = null;
+let connected = false;
+let deliveryStarted = false;
+const receipts = new Map<string, PromiseWithResolvers<boolean>>();
+function pauseRoot(): void {
+  adapterPaused = true;
+  resumeBarrier ??= Promise.withResolvers<void>();
+}
+function resumeRoot(): void {
+  adapterPaused = false;
+  resumeBarrier?.resolve();
+  resumeBarrier = null;
+  if (connected && !shuttingDown && liveParent === null) { startDelivery(); onWake(); }
+}
+
+/** Runs behind BindGate; endSession is the only snapshot writer. */
+async function rotateRoot(session: string): Promise<void> {
+  if (shuttingDown || !ORDINARY || liveParent !== null) throw new Error("this process cannot associate an ordinary local conversation");
+  if (session === HARNESS_SESSION) return;
+  swapping = true;
+  try {
+    await inflight;
+    const outgoing = { names: [...held], session_id: SESSION_ID };
+    for (const alias of [...listeners.keys()]) stopListening(alias);
+    stopIdListening();
+    deliveryStarted = false;
+    const ended = endLocalSession(db, SESSION_ID);
+    SESSION_KEY = mintSessionKey();
+    SESSION_ID = idAddress(SESSION_KEY);
+    HARNESS_SESSION = session;
+    held = [];
+    restored = false;
+    restoredFrom = null;
+    startNotes.length = 0;
+    bindHinted = false;
+    missedBindNotice = null;
+    requeued.length = 0;
+    ROOT_KIND.harnessSession = session;
+    registerSession(db, thisSession(SESSION_ID), ROOT_KIND);
+    children = new ChildSessions(db, SESSION_ID, SESSION_KEY);
+    await deliverEnded(db, ended);
+    await restoreNames(conversationSnapshot(db, session) ?? outgoing);
+    claudeGuidancePending = CLAUDE_CURRENT;
+    if (restoredFrom) inheritStatus(db, SESSION_ID, restoredFrom);
+    unboundCandidates = held.length ? [] : await candidateNames(db, SUGGESTED);
+    writeNames();
+    firstDrain = true;
+    instructionsStale = true;
+    writeCoreAudit(db, "id.conversation_selected", SESSION_ID, outgoing.session_id, { harness_session: session, owner: ADAPTER_OWNER ?? "claude-hook" });
+  } finally { swapping = false; }
+}
+
+const OwnerSchema = z.object({ owner: z.string(), epoch: z.number().int().nonnegative(), _meta: z.record(z.string(), z.unknown()).optional() });
+const SessionSchema = z.object({ method: z.literal("grayboard/session"), params: OwnerSchema.extend({ session: z.string().refine(validSourceId) }) });
+const ReadySchema = z.object({ method: z.literal("grayboard/session/ready"), params: OwnerSchema });
+const ReceiptSchema = z.object({ method: z.literal("grayboard/delivery"), params: z.object({ owner: z.string(), token: z.string(), accepted: z.boolean() }) });
+function checkOwner(owner: string, meta?: Record<string, unknown>): void {
+  if (!ORDINARY || !ADAPTER_OWNER || owner !== ADAPTER_OWNER || meta?.[GRAYBOARD_AGENT_META] !== undefined || meta?.[TOOL_USE_META] !== undefined) throw new Error("not this ordinary root's adapter owner");
+}
+mcp.setRequestHandler(SessionSchema, async ({ params }) => {
+  checkOwner(params.owner, params._meta);
+  if (params.epoch <= adapterEpoch) throw new Error("stale conversation epoch");
+  pauseRoot();
+  return gate.bind(async () => {
+    if (params.epoch <= adapterEpoch) throw new Error("stale conversation epoch");
+    await inflight;
+    await rotateRoot(params.session);
+    adapterEpoch = params.epoch;
+    return { id: SESSION_ID, session: HARNESS_SESSION, epoch: adapterEpoch, instructions: localInstructions(true, startNotes) };
+  });
+});
+mcp.setRequestHandler(ReadySchema, async ({ params }) => {
+  checkOwner(params.owner, params._meta);
+  if (params.epoch !== adapterEpoch) throw new Error("stale conversation readiness");
+  resumeRoot();
+  return {};
+});
+mcp.setRequestHandler(ReceiptSchema, async ({ params }) => {
+  checkOwner(params.owner);
+  const receipt = receipts.get(params.token);
+  if (!receipt) throw new Error("unknown delivery receipt");
+  receipt.resolve(params.accepted);
+  return {};
+});
+
+async function currentClaude(request?: IdentityRequest): Promise<{ instructions?: string[] }> {
+  if (!CLAUDE_CURRENT) return {};
+  if (request?.action === "pause") {
+    claudePaused = true;
+    pauseRoot();
+    await gate.bind(async () => { await inflight; });
+    return {};
+  }
+  let current = readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start);
+  if (!current) return {};
+  if (request?.current && request.current.token !== current.token) throw new Error("stale Claude conversation record");
+  const wasPaused = claudePaused;
+  if (current.session !== HARNESS_SESSION) {
+    pauseRoot();
+    await gate.bind(async () => {
+      const latest = readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start);
+      if (!latest || (request?.current && request.current.token !== latest.token)) throw new Error("stale Claude conversation record");
+      await rotateRoot(latest.session);
+      current = latest;
+    });
+  }
+  const published = current.token !== claudePublication;
+  claudePublication = current.token;
+  if (published || claudePaused || adapterPaused) {
+    claudePaused = false;
+    resumeRoot();
+  }
+  return request && (published || wasPaused) ? { instructions: localInstructions(true, startNotes) } : {};
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
   if (shuttingDown) return { ...text("error: this session is ending"), isError: true };
+  if (CLAUDE_CURRENT && !claudePaused) await currentClaude();
+  if (resumeBarrier) await resumeBarrier.promise;
+  if (claudeReady && !await claudeReady.promise) return { ...text(`error: Claude channel activation failed; queued mail remains pending: ${claudeActivationError}`), isError: true };
+  const callSession = SESSION_ID;
+  const callEpoch = adapterEpoch;
   // A harness subagent's call (#523): harness-asserted, it makes the call the
   // subagent's child session, acting under this session's addresses. Claude
   // Code names the agent only through its hook's record (#551): a root marker
@@ -550,12 +688,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
       const taken = takeRecord(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start, meta[TOOL_USE_META]);
       if ("missing" in taken) return recordMissing(name, meta[TOOL_USE_META], taken.missing);
       if (taken.agent !== null) agent = taken.agent;
+      if (taken.session !== undefined && taken.session !== HARNESS_SESSION) return recordMissing(name, meta[TOOL_USE_META], "bad_record");
     } else if (ATTRIBUTION_OFF && !attributionOffAudited) {
       attributionOffAudited = true;
       writeCoreAudit(db, "claude.attribution_off", SESSION_ID, null, { tool: name });
     }
   }
   const run = async () => {
+    if (shuttingDown || callSession !== SESSION_ID || callEpoch !== adapterEpoch) return { ...text("error: conversation changed before this call ran"), isError: true };
+    await testPauseAsync("local:tool:in-gate");
     // A runner child whose root isn't live (its parent harness exited while
     // this runner lives on) is its own session from here (#523 step 5).
     if (liveParent !== null && !runnerRootLive(db, SESSION_ID, liveParent)) await rootGone();
@@ -585,7 +726,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   expiry.arm();
   // A cancelled call's result is dropped: its notices wait for the next one.
   // Notices and fresh instructions are the root's: they never go to a child.
-  if (signal.aborted || agent !== undefined) return r;
+  if (signal.aborted || agent !== undefined || (ORDINARY && (callSession !== SESSION_ID || callEpoch !== adapterEpoch))) return r;
   const extra = notices();
   let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
   if (instructionsStale && !out.structuredContent) {
@@ -909,7 +1050,12 @@ mcp.oninitialized = () => markInitialized();
 // A wakeup during a drain joins it: the loop re-queries until empty. A
 // runner child never drains: its root's mail is its root's.
 function drainToClaude(): Promise<void> {
-  if (swapping || shuttingDown || liveParent !== null) return Promise.resolve();
+  if (swapping || shuttingDown || liveParent !== null || adapterPaused || claudePaused) return Promise.resolve();
+  if (CLAUDE_CURRENT) {
+    const current = readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start);
+    if (!current) return Promise.resolve();
+    if (current.session !== HARNESS_SESSION) return currentClaude().then(() => drainToClaude());
+  }
   inflight ??= drainLoop().finally(() => {
     inflight = null;
   });
@@ -920,6 +1066,11 @@ function drainToClaude(): Promise<void> {
 // and outbox rows: mail to the ID and to the alias are separate streams.
 async function drainLoop(): Promise<void> {
   await initialized;
+  if (claudeReady && !await claudeReady.promise) return;
+  if (CLAUDE_CURRENT && claudeGuidancePending) {
+    if (!await pushChannel({ content: `Current grayboard instructions supersede this conversation's earlier bus guidance. Current bus session: ${SESSION_ID}.\n${localInstructions(true, startNotes).join("\n")}`, meta: { kind: "guidance" } })) return;
+    claudeGuidancePending = false;
+  }
   // Read once: a cursor written under one name must never get another's ids.
   const readers = addresses();
   while (!shuttingDown) {
@@ -933,7 +1084,7 @@ async function drainLoop(): Promise<void> {
         if (shuttingDown) return;
         const params = dmNotification(msg, primary());
         if (isHuman(db, msg.sender)) params.meta.human = "true";
-        await mcp.notification({ method: "notifications/claude/channel", params });
+        if (!await pushChannel(params)) return;
         if (sessionEnded) return;
         deliveredTo(reader, msg.id);
       }
@@ -956,15 +1107,29 @@ async function drainLoop(): Promise<void> {
       if (shuttingDown) return;
       const params = boardNotification(item);
       if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params,
-      });
+      if (!await pushChannel(params)) return;
       if (sessionEnded) return;
       for (const reader of pendingTo) markDelivered(db, reader, item);
     }
     if (!any) break;
   }
+}
+
+async function pushChannel(params: { content: string; meta: Record<string, string> }): Promise<boolean> {
+  if (adapterPaused || claudePaused || shuttingDown) return false;
+  if (CLAUDE_CURRENT && readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start)?.session !== HARNESS_SESSION) return false;
+  if (!ADAPTER_OWNER) {
+    await mcp.notification({ method: "notifications/claude/channel", params });
+    return true;
+  }
+  const token = `${adapterEpoch}-${crypto.randomUUID()}`;
+  const receipt = Promise.withResolvers<boolean>();
+  receipts.set(token, receipt);
+  const timeout = setTimeout(() => receipt.resolve(false), 8_000);
+  try {
+    await mcp.notification({ method: "notifications/claude/channel", params: { ...params, meta: { ...params.meta, grayboard_session: HARNESS_SESSION ?? "", grayboard_epoch: String(adapterEpoch), grayboard_delivery: token } } });
+    return await receipt.promise;
+  } finally { clearTimeout(timeout); receipts.delete(token); }
 }
 
 const onWake = () => {
@@ -994,7 +1159,8 @@ function stopListening(alias: string): void {
 // names' sockets, and a first drain. A runner child has none until it
 // becomes its own session.
 function startDelivery(): void {
-  if (!DELIVER) return;
+  if (!DELIVER || deliveryStarted || !connected) return;
+  deliveryStarted = true;
   stopIdListening = listenForWakeup(SESSION_ID, onWake);
   for (const h of held) listen(h);
   drainToClaude().catch((err) => {
@@ -1163,7 +1329,30 @@ for (const h of held) touchAlias(db, h);
 // startup starts it is read before the first call can arrive.
 const rootAtStart = liveParent === null;
 const transport = new StdioServerTransport();
+let stopIdentity = () => {};
+if (CLAUDE_CURRENT) {
+  stopIdentity = await listenIdentity(sockDir(), CLAUDE_HARNESS.pid, currentClaude);
+  await currentClaude();
+}
+const sendTransport = transport.send.bind(transport);
+transport.send = async message => {
+  // Keep the SDK's negotiation and capabilities; only initialize's guidance is live.
+  if ("result" in message && "serverInfo" in message.result) message = { ...message, result: { ...message.result, instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" ") } };
+  await sendTransport(message);
+  if (claudeReady && !claudeActivationStarted && "result" in message && "tools" in message.result) {
+    claudeActivationStarted = true;
+    void mcp.ping().then(() => {
+      claudeReady.resolve(true);
+      onWake();
+    }, error => {
+      claudeActivationError = (error as Error).message;
+      console.error(`grayboard Claude channel activation failed; queued mail remains pending: ${claudeActivationError}`);
+      claudeReady.resolve(false);
+    });
+  }
+};
 await mcp.connect(transport);
+connected = true;
 late.watch(transport);
 // Prunes the bus at most once a day across the sessions that share it.
 startLocalRetention(db, blobs, RETENTION_DAYS);
@@ -1175,6 +1364,9 @@ const SHUTDOWN_WAKE_MS = 2000;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopIdentity();
+  resumeBarrier?.resolve();
+  for (const receipt of receipts.values()) receipt.resolve(false);
   try {
     for (const h of held) touchAlias(db, h);
   } catch (err) {

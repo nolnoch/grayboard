@@ -133,6 +133,8 @@ function runHook(event, stdin, o) {
       mkdirSync(dir, { recursive: true, mode: 448 });
       const start = procStart(pid);
       put(join(dir, "start"), start ?? "");
+      if (!o.hosted && validSourceId(input.session_id))
+        put(join(dir, "current"), JSON.stringify({ session: input.session_id, start: start ?? "", token: `${now}-${process.pid}-${Math.random().toString(36).slice(2)}` }));
       if (o.hosted) {
         if (input.source !== "clear")
           for (const fact of FACTS)
@@ -149,7 +151,7 @@ function runHook(event, stdin, o) {
       if (content === undefined)
         return;
       mkdirSync(dir, { recursive: true, mode: 448 });
-      put(join(dir, id), content);
+      put(join(dir, id), JSON.stringify({ agent: content === ROOT ? null : content, ...!o.hosted && validSourceId(input.session_id) ? { session: input.session_id } : {} }));
       pruneRecords(dir, now);
       if (o.hosted && content === ROOT) {
         const level = input.effort?.level;

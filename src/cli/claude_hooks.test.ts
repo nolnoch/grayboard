@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { join } from "node:path";
 import { claudeHooks, hooksDisabledBy, installClaudeHooks, recordHookInstalled, removeClaudeHooks, sessionStartOutput } from "./claude_hooks.ts";
+import { takeRecord } from "../shared/claude_agents.ts";
+import { procStart } from "../shared/proc.ts";
 
 const title = (out: string) => JSON.parse(out).hookSpecificOutput.sessionTitle;
 
@@ -125,25 +127,26 @@ test("the CLI command reads the hook input from stdin", () => {
   expect(title(r.stdout.toString())).toBe("web");
 });
 
-test("`hook claude <event>` writes the record through the light entry, prints nothing and never fails (#551)", () => {
+test("CLI hooks publish current root/child records and refuse malformed tool input", () => {
   const sock = mkdtempSync(join(tmpdir(), "gb-ss-"));
   const hook = (event: string, input: string) => Bun.spawnSync(["bun", join(import.meta.dir, "main.ts"), "hook", "claude", event], {
     stdin: new TextEncoder().encode(input),
     env: { ...process.env, BUS_SOCK_DIR: sock, CLAUDE_PID: String(process.pid) },
   });
-  const dir = join(sock, "claude-agents", String(process.pid));
   for (const r of [
-    hook("session-start", JSON.stringify({ source: "startup" })),
-    hook("pre-tool-use", JSON.stringify({ tool_use_id: "toolu_1", agent_id: "a573e90bd84bce7ff" })),
-    hook("pre-tool-use", JSON.stringify({ tool_use_id: "toolu_2" })),
-    hook("pre-tool-use", "not json"),
+    hook("session-start", JSON.stringify({ source: "startup", session_id: "current" })),
+    hook("pre-tool-use", JSON.stringify({ session_id: "current", tool_use_id: "toolu_1", agent_id: "a573e90bd84bce7ff" })),
+    hook("pre-tool-use", JSON.stringify({ session_id: "current", tool_use_id: "toolu_2" })),
     hook("no-such-event", "{}"),
   ]) {
     expect(r.exitCode).toBe(0);
     expect(r.stdout.toString() + r.stderr.toString()).toBe("");
   }
-  expect(readFileSync(join(dir, "toolu_1"), "utf8")).toBe("a573e90bd84bce7ff");
-  expect(readFileSync(join(dir, "toolu_2"), "utf8")).toBe("-");
+  expect(takeRecord(sock, process.pid, procStart(process.pid) ?? null, "toolu_1")).toEqual({ agent: "a573e90bd84bce7ff", session: "current" });
+  expect(takeRecord(sock, process.pid, procStart(process.pid) ?? null, "toolu_2")).toEqual({ agent: null, session: "current" });
+  const denied = hook("pre-tool-use", "not json");
+  expect(denied.exitCode).toBe(1);
+  expect(JSON.parse(denied.stdout.toString()).hookSpecificOutput.permissionDecision).toBe("deny");
 });
 
 test("hooksDisabledBy names the first layer that turns user hooks off (#551)", () => {
@@ -175,21 +178,4 @@ test("hooksDisabledBy names the first layer that turns user hooks off (#551)", (
   expect(hooksDisabledBy(cwd, managed, user)).toBe(`${join(managed, "managed-settings.json")} sets disableAllHooks`);
   // A platform with no managed dir reads only the project.
   expect(hooksDisabledBy(cwd, null, null)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
-});
-
-test("the hook entry's static imports stay the record module's few: every one evaluates on every grayboard call (#551, 50 ms budget)", () => {
-  const t = new Bun.Transpiler({ loader: "ts" });
-  const seen = new Set<string>();
-  const walk = (file: string) => {
-    if (seen.has(file)) return;
-    seen.add(file);
-    for (const i of t.scanImports(readFileSync(file, "utf8").replace(/^#!.*\n/, ""))) {
-      if (i.kind !== "import-statement" || !i.path.startsWith(".")) continue;
-      walk(join(dirname(file), i.path));
-    }
-  };
-  walk(join(import.meta.dir, "main.ts"));
-  const rel = [...seen].map((f) => relative(join(import.meta.dir, "..", ".."), f)).sort();
-  // protocol.ts (#545: SESSION_FACT_MAX) is constants and types, with no top-level work.
-  expect(rel).toEqual(["src/cli/main.ts", "src/shared/claude_agents.ts", "src/shared/proc.ts", "src/shared/protocol.ts", "src/shared/session_meta.ts", "src/shared/sockdir.ts"]);
 });

@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localEnv } from "../support/env.ts";
-import { closeSessions, localSession } from "../support/mcp.ts";
+import { closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { CLI, ROOT } from "../support/paths.ts";
 import { grayboardChildren, grayboardChildPids, processDescendants, sigkill } from "../support/procs.ts";
 import { localOpenCode, opencodeTool, type LocalOpenCode, type OpenCodeMessage } from "../support/opencode.ts";
@@ -143,6 +143,125 @@ test("opencode: an unbound session acts as its ID; bind and rebind move the one 
   await oc.send("dispose");
 }, 60_000);
 
+test("opencode: startup restores the actual selected root instead of configured identity or inherited association", async () => {
+  const saved = await localSession(dir, undefined, { extra: { BUS_HARNESS_SESSION: "s1" } });
+  await saved.call("bind", { name: "saved-first", create: true });
+  await saved.call("bind", { name: "saved-second", create: true });
+  await stopSession(saved.c);
+  const oc = driver("configured", entry({ environment: { BUS_PUSH: "off", BUS_HARNESS_SESSION: "wrong-root", BUS_ADAPTER_OWNER: "wrong-owner" } }));
+  await oc.send("init");
+  const guidance = (await oc.send("system", { sessionID: "s1" })).join("\n");
+  const who = JSON.parse(await oc.send("call", { tool: "grayboard_whoami", args: {} }));
+  expect(who.aliases).toEqual(["saved-first", "saved-second"]);
+  expect(who.primary).toBe("saved-first");
+  expect(guidance).not.toContain('identity "configured"');
+  const db = new Database(join(dir, "bus.db"), { readonly: true });
+  try { expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(who.id)).toEqual({ harness_session: "s1" }); }
+  finally { db.close(); }
+  await oc.send("dispose");
+});
+
+test("opencode: a refused newest snapshot never falls back to older holds or explicit identity", async () => {
+  const older = await localSession(dir, undefined, { extra: { BUS_HARNESS_SESSION: "s1" } });
+  await older.call("bind", { name: "older", create: true });
+  await stopSession(older.c);
+  const newest = await localSession(dir, undefined, { extra: { BUS_HARNESS_SESSION: "s1" } });
+  await newest.call("unbind", { name: "older" });
+  await newest.call("bind", { name: "occupied", create: true });
+  await stopSession(newest.c);
+  const holder = await localSession(dir, "occupied");
+  const holderId = (await holder.call("whoami")).id;
+  const oc = driver("configured", entry());
+  await oc.send("init");
+  const guidance = (await oc.send("system", { sessionID: "s1" })).join("\n");
+  const who = JSON.parse(await oc.send("call", { tool: "grayboard_whoami", args: {} }));
+  expect(who.aliases).toEqual([]);
+  expect(guidance).toContain("This session has no bus name yet");
+  expect(guidance).not.toContain('identity "configured"');
+  expect(guidance).toContain("occupied");
+  expect((await holder.call("whoami")).id).toBe(holderId);
+  expect((await holder.call("whoami")).aliases).toEqual(["occupied"]);
+  await oc.send("dispose");
+});
+
+test("opencode: root rotation settles outgoing delivery, restores ordered snapshots including empty, and keeps the child", async () => {
+  const saved = await localSession(dir, undefined, { extra: { BUS_HARNESS_SESSION: "s2" } });
+  await saved.call("bind", { name: "incoming-first", create: true });
+  await saved.call("bind", { name: "incoming-second", create: true });
+  await stopSession(saved.c);
+  const empty = await localSession(dir, undefined, { extra: { BUS_HARNESS_SESSION: "s3" } });
+  await stopSession(empty.c);
+  const peer = await localSession(dir, "peer");
+  const oc = driver("outgoing", entry());
+  await oc.send("init");
+  await oc.send("system", { sessionID: "s1" });
+  await oc.send("call", { tool: "grayboard_bind", args: { name: "outgoing-second", create: true } });
+  const first = JSON.parse(await oc.send("call", { tool: "grayboard_whoami", args: {} }));
+  await oc.send("session", { sessionID: "child", parentID: "s1" });
+  const firstChild = JSON.parse(await oc.send("call", { sessionID: "child", tool: "grayboard_whoami", args: {} }));
+  expect(firstChild).toMatchObject({ child: true, root: first.id });
+  const [pid] = grayboardChildPids(oc.pid);
+  const db = new Database(join(dir, "bus.db"), { readonly: true });
+  try {
+    await oc.send("holdPrompt", { key: "outgoing-delivery" });
+    const sent = await peer.call("dm_send", { to: "outgoing", body: "before rotation" });
+    await until(async () => (await oc.send("state")).pendingPrompts.includes("s1"), 15_000, "outgoing SDK admission held");
+    const selection = oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
+    void selection.catch(() => {});
+    const waiting = oc.send("call", { sessionID: "s2", tool: "grayboard_whoami", args: {}, key: "incoming-tool" });
+    void waiting.catch(() => {});
+    await until(async () => (await oc.send("state")).calls.includes("incoming-tool"), 1_000, "incoming tool waits on rotation");
+    expect(db.query("SELECT ended_at, harness_session FROM ids WHERE id = ?").get(first.id)).toEqual({ ended_at: null, harness_session: "s1" });
+    await oc.send("releasePrompt", { key: "outgoing-delivery" });
+    await selection;
+    const second = JSON.parse(await waiting);
+    expect(second.id).not.toBe(first.id);
+    expect(second.aliases).toEqual(["incoming-first", "incoming-second"]);
+    expect(grayboardChildPids(oc.pid)).toEqual([pid!]);
+    const ended = db.query<{ ended_at: number | null; held_aliases_json: string; harness_session: string }, [string]>("SELECT ended_at, held_aliases_json, harness_session FROM ids WHERE id = ?").get(first.id)!;
+    expect(ended.ended_at).not.toBeNull();
+    expect(JSON.parse(ended.held_aliases_json)).toEqual(["outgoing", "outgoing-second"]);
+    const delivered = (await oc.send("state")).prompts.filter((p: { text: string }) => p.text.includes(`message_id="${sent.message_id}"`));
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].session).toBe("s1");
+    expect(delivered[0].text).not.toContain("grayboard_delivery");
+    // SDK-generated channel user updates never select the outgoing root.
+    await oc.send("event", { event: { type: "message.updated", properties: { info: { id: delivered[0].messageID, role: "user", sessionID: "s1" } } } });
+    expect(JSON.parse(await oc.send("call", { sessionID: "s2", tool: "grayboard_whoami", args: {} })).id).toBe(second.id);
+    const guidance = (await oc.send("system", { sessionID: "s2" })).join("\n");
+    for (const alias of second.aliases) expect(guidance).toContain(alias);
+    expect(guidance).not.toContain("outgoing-second");
+    await expect(oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).rejects.toThrow("root session changed");
+    const child = JSON.parse(await oc.send("call", { sessionID: "child", tool: "grayboard_whoami", args: {} }));
+    expect(child).toMatchObject({ child: true, root: second.id, primary: "incoming-first" });
+    expect(JSON.parse(await oc.send("call", { sessionID: "s2", tool: "grayboard_whoami", args: {} })).id).toBe(second.id);
+    expect((await oc.send("system", { sessionID: "child" })).join("\n")).toContain(`You are a subagent of session ${second.id}`);
+    await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
+    expect(JSON.parse(await oc.send("call", { sessionID: "s2", tool: "grayboard_whoami", args: {} })).id).toBe(second.id);
+    await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s3" } } } });
+    const third = JSON.parse(await oc.send("call", { sessionID: "s3", tool: "grayboard_whoami", args: {} }));
+    expect(third.aliases).toEqual([]);
+    expect((await oc.send("system", { sessionID: "s3" })).join("\n")).toContain("This session has no bus name yet");
+    expect(grayboardChildPids(oc.pid)).toEqual([pid!]);
+    await sigkill(pid!);
+    const restarted = JSON.parse(await oc.send("call", { sessionID: "s3", tool: "grayboard_whoami", args: {} }));
+    expect(restarted.aliases).toEqual([]);
+    expect(restarted.id).not.toBe(third.id);
+    expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(restarted.id)).toEqual({ harness_session: "s3" });
+    await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s1" } } } });
+    expect(JSON.parse(await oc.send("call", { tool: "grayboard_whoami", args: {} })).aliases).toEqual(["outgoing", "outgoing-second"]);
+    const now = await peer.call("dm_send", { to: "outgoing", body: "after resume" });
+    const resumed = await until(async () => (await oc.send("state")).prompts.find((p: { text: string }) => p.text.includes(`message_id="${now.message_id}"`)), 15_000, "restored root receives delivery");
+    expect(resumed.session).toBe("s1");
+    const currentPid = grayboardChildPids(oc.pid)[0];
+    await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "new-root" } } } });
+    const fresh = JSON.parse(await oc.send("call", { sessionID: "new-root", tool: "grayboard_whoami", args: {} }));
+    expect(fresh.aliases).toEqual(["outgoing", "outgoing-second"]);
+    expect(grayboardChildPids(oc.pid)).toEqual([currentPid!]);
+    expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(fresh.id)).toEqual({ harness_session: "new-root" });
+  } finally { db.close(); await oc.send("dispose"); }
+}, 60_000);
+
 test("opencode: a project config's grayboard command never runs; the user-level entry's does", async () => {
   // A cloned repo's opencode.json, merged into the config hook's entry.
   const marker = join(dir, "project-command-ran");
@@ -217,6 +336,8 @@ test("opencode: a child's user message and a deleted-session race never retarget
 });
 
 test("opencode: child instructions skip restart backoff and degrade to none after exhaustion", async () => {
+  // The real retry sequence waits 0 + 1 + 5 seconds; retain the driver's
+  // shorter per-call deadline so an actual reconnect hang fails there.
   const oc = driver("oc", entry());
   await oc.send("init");
   await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
@@ -241,7 +362,7 @@ test("opencode: child instructions skip restart backoff and degrade to none afte
   expect(await oc.send("system", { sessionID: "child" })).toEqual([]);
   await expect(oc.send("call", { sessionID: "child", tool: "grayboard_whoami", args: {} })).rejects.toThrow("after 3 restarts");
   await oc.send("dispose");
-});
+}, 20_000);
 
 const scriptedTool = (prompt: string, tool: string, args: Record<string, unknown>): Rule => req => {
   const at = req.messages.findLastIndex(m => m.role === "user" && promptText(m) === prompt);
@@ -511,6 +632,7 @@ test("opencode: aborting a tool during backoff releases its wait promptly; shutd
 });
 
 test("opencode: a child stable for 60 seconds resets the consecutive restart count", async () => {
+  // The three retries alone wait six seconds before the stable-clock seam.
   const oc = driver("oc", entry());
   await oc.send("init");
   await oc.send("system", { sessionID: "s1" });
@@ -526,11 +648,13 @@ test("opencode: a child stable for 60 seconds resets the consecutive restart cou
   expect(notices.at(-1)).toContain("restarting it (1 of 3)");
   expect(notices.some(n => n.includes("after 3 restarts"))).toBe(false);
   await oc.send("dispose");
-});
+}, 20_000);
 
 test("opencode: Bun EPIPE waits for the still-live owner to die before retrying and exhaustion leaves none", async () => {
   // Bun 1.4.4 silently accepts small writes to closed stdin, but a large
   // tools/call argument reliably raises EPIPE in the real Bun-run driver.
+  // Four owners each linger until the 1.5s force-kill; retries add six
+  // seconds of backoff. Keep per-call waits bounded at the driver's 15s.
   const oc = driver("oc", entry({
     command: [join(ROOT, "tests/support/stdin_closed.sh"), process.execPath, CLI, "mcp", "--mode", "local"],
     environment: { BUS_PUSH: "off", BUS_TEST_OPENCODE_STDIO: "epipe" },
@@ -557,7 +681,7 @@ test("opencode: Bun EPIPE waits for the still-live owner to die before retrying 
   expect(processDescendants(oc.pid)).toEqual([]);
   await expect(oc.send("call", { tool: "grayboard_whoami", args: {} })).rejects.toThrow("after 3 restarts");
   await oc.send("dispose");
-});
+}, 30_000);
 
 test("opencode: aborting a tool blocked in initialize does not wait for the child's paused bind", async () => {
   const oc = driver("oc", entry({ environment: { BUS_PUSH: "off", BUS_TEST_PAUSE: "bind:before-txn", BUS_TEST_PAUSE_FILE: join(dir, "release-bind") } }));

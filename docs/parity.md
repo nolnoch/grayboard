@@ -31,7 +31,7 @@ The baseline every later change is measured against. A cell says what a user of 
 | 3 | Current instructions on push-started turns | yes | yes | yes | yes | yes | yes | yes | yes |
 | 4 | Bind, unbind, several holds, configured start name | yes | yes | yes | yes | yes | yes | yes | yes |
 | 5 | Names across an in-process session switch or MCP reconnect | yes | yes | yes | yes | yes | n/a | yes | yes |
-| 6 | Names when a new harness process resumes a conversation | gap #195 | yes | gap #195 | yes | gap #195 | yes | gap #195 | yes |
+| 6 | Names when a new harness process resumes a conversation | yes | yes | yes | yes | yes | yes | yes | yes |
 | 7 | Automatic restart after the grayboard process exits | yes | n/a | yes | n/a | yes | n/a | n/a | n/a |
 | 8 | Subagents as child sessions, writes attributed (`via`) | yes | yes | yes | yes | yes | yes | yes | yes |
 | 9 | Sign-in flow | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
@@ -63,7 +63,7 @@ The baseline every later change is measured against. A cell says what a user of 
 - omp L, omp H: one shared plan (`adapters/pi-family/omp-instructions.ts`, #441, #552): `before_provider_request` rewrites stale instructions per request, `context` adds them as a hidden message after a prompt rebuild, and both warn once for main only when the stale text can't be found. omp L reads the current text from its child's last initialize; omp H fetches it. Proof: `tests/integration/omp_instructions.test.ts` (plan, rewrite and the warning), `tests/integration/omp.test.ts` omp local ("a push-started bind reaches the next request's instructions without a user prompt") and omp hosted `/fork`, `/new`, `/resume`.
 - OC V1: `experimental.chat.system.transform` adds the latest instructions to every request (`adapters/opencode/grayboard.ts`). Proof: `tests/integration/opencode.test.ts` ("… the system prompt follows in full").
 - OC V2: the plugin's `context` hook carries the root's (or a subagent's child) server instructions per request (#531, #535). Proof: `adapters/opencode-v2/tests/host.ts` (REAL_INSTRUCTIONS cases), `adapters/opencode-v2/tests/instructions.test.ts`.
-- CC L, CC H: Claude Code reads MCP instructions only at initialize (`plugins/claude-code/src/plugin.ts` instructions comment), so a name change reaches the model as the rebuilt instructions in `bind`/`unbind`'s result, or the next result after a lost one (`instructionsStale`, `src/local/mcp.ts`); the system prompt keeps the connect-time text. Proof: —.
+- CC L, CC H: Claude Code retains connect-time MCP text in its system/transcript context; bind/unbind results carry rebuilt instructions, or the next result after a lost one (`instructionsStale`, `src/local/mcp.ts`). CC L also publishes current root ID/holds as native guidance before pending delivery after restored/changed conversation identity, superseding the saved transcript's stale bus instructions. Proof for CC L fresh resume: `tests/e2e/local_resume.e2e.ts` checks the actual pushed model request's current root and ordered holds; CC H: —.
 
 ### 4. Bind, unbind, several holds, configured start name
 
@@ -73,16 +73,14 @@ The baseline every later change is measured against. A cell says what a user of 
 
 ### 5. Names across an in-process session switch or MCP reconnect
 
-- pi L, CC L: a respawned `grayboard mcp` under the same harness pid (pi `/new`, `/resume`, fork; Claude Code `/mcp reconnect`) binds its names back from the name record (boards.md §3, §9). Proof: `tests/integration/binding.test.ts` (restarts from the name record under `tests/support/harness.ts`, whose SIGUSR1 stands in for `/mcp` reconnect).
-- omp L: the main runtime, its process and its names carry across `/new`, `/resume`, `/fork` (boards.md §9 omp). Proof: `tests/integration/omp.test.ts` omp local (`/new` keeps the process and name).
-- OC V1: one grayboard per opencode process, shared by every session, so a session switch doesn't touch it (README §Other harnesses).
+- pi L, omp L, OC V1, CC L: selected-conversation state wins, including an authoritative empty hold set. Only absent remembered state permits outgoing carry for `/new`, fork or switch; a same-ID MCP reconnect restores that conversation rather than another conversation's PID names (boards.md §3, §9; #195). pi restarts its child; omp, OC V1 and Claude Code retain it while rotating the bus root. Owner/epoch or authoritative hook barriers settle delivery and apply incoming instructions before tools/pushes resume. Proof: `tests/integration/local_resume.test.ts` plus each real harness's lifecycle coverage.
 - pi H, omp H: `/new` and fork carry the outgoing root's holds; pi `/reload` keeps the lease (boards.md §9 Hosted pi, Hosted omp). Proof: `tests/integration/pi.test.ts` piHostedCarryScenario, `tests/integration/pi_family.test.ts` (`/new` carry, reload detach), `tests/integration/omp.test.ts` omp hosted `/fork`, `/new`, `/resume`.
 - CC H: the lease is keyed by `CLAUDE_CODE_SESSION_ID`, which survives `/clear` (boards.md §9). Proof: e2e `claude-hosted` (the facts test's root continues across `/clear`).
 - OC V2: n/a. Each OpenCode session is its own root that a human enrolls (#226); nothing carries between roots by design, and the `name` option binds each new root.
 
 ### 6. Names when a new harness process resumes a conversation
 
-- pi L, omp L, OC V1, CC L: **gap #195.** The name record is keyed by harness pid, so a new process (`claude --resume`, a reopened pi or omp session) starts unbound.
+- pi L, omp L, OC V1, CC L: the latest ended ordinary root snapshot for the selected conversation restores ordered holds with `create:false`, before PID carry or configured identity. `[]` is authoritative; refusal never falls through to older state or steals a live name. Existing open/reap handles a crash before selection. Proof: `tests/integration/local_resume.test.ts` and actual pinned `tests/e2e/local_resume.e2e.ts` (`scripts/e2e.sh local-resume`): all four launch genuinely new processes on their saved session/store, restore renamed multiholds, receive queued pushes with current guidance, and remain unbound after final unbind and another fresh resume. Claude Code's measured post-tools-list-response ping barrier precedes native guidance/mail; it is activation evidence, not a native delivery receipt.
 - pi H, omp H, CC H: a root's start takes back its `rememberedHeld` holds with `create:false` before `BUS_IDENTITY` (`RootDelivery.begin`, `adapters/hosted-core/src/root.ts`; `claude --resume <id>`, boards.md §9). Proof: `tests/integration/hosted_core_root.test.ts` ("a resumed session takes back what it held"), `tests/integration/pi_family.test.ts` ("… a later resume rebinds the remembered name").
 - OC V2: the plugin persists the bound name and rebinds it on resume (#251). Proof: `adapters/opencode-v2` `test:host` (crosses a host process reload, `adapters/opencode-v2/README.md`).
 

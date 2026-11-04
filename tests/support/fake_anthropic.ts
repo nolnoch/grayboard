@@ -12,7 +12,7 @@
 
 export type Block = { type: string; text?: string; id?: string; name?: string; input?: unknown; content?: unknown; tool_use_id?: string };
 export type Message = { role: string; content: string | Block[] };
-export type MessagesRequest = { model: string; stream?: boolean; messages: Message[]; tools?: { name: string }[] };
+export type MessagesRequest = { model: string; stream?: boolean; system?: string | Block[]; messages: Message[]; tools?: { name: string }[] };
 export type Recorded<B> = { method: string; path: string; body: B };
 /** A text reply ends the turn; a tool reply calls `tool` under the tool-use id `id`. */
 export type Reply = { text: string } | { tool: string; id: string; input: Record<string, unknown> };
@@ -22,6 +22,8 @@ const blocks = (m: Message): Block[] => (typeof m.content === "string" ? [{ type
 /** The text blocks of every user message, newest last. */
 export const userTexts = (req: MessagesRequest): string[] =>
   req.messages.filter((m) => m.role === "user").flatMap((m) => blocks(m).filter((b) => b.type === "text").map((b) => b.text ?? ""));
+/** The actual system guidance sent to Anthropic, independent of persisted transcript text. */
+export const systemText = (req: MessagesRequest): string => typeof req.system === "string" ? req.system : (req.system ?? []).map(block => block.text ?? "").join("\n");
 const toolNames = (req: MessagesRequest): string[] => (req.tools ?? []).map((t) => t.name);
 /** Whether an earlier assistant turn already made the tool call `id`. */
 export const called = (req: MessagesRequest, id: string): boolean =>

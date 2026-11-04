@@ -89,7 +89,7 @@ console.log(JSON.stringify(out));`);
     utimesSync(join(dir, `${id("x")}.taken.1`), old, old);
     writeFileSync(join(dir, `${id("y")}.taken.2`), "a");
     for (let i = 0; i < RECORD_CAP + 5; i++) {
-      writeFileSync(join(dir, id(`r${i}`)), ROOT);
+      writeFileSync(join(dir, id(`r${i}`)), JSON.stringify({ agent: null }));
       const t = (Date.now() - (RECORD_CAP + 5 - i) * 1000) / 1000;
       utimesSync(join(dir, id(`r${i}`)), t, t);
     }

@@ -37515,12 +37515,14 @@ function takeRecord(base, claudePid, harnessStart, toolUseId) {
     return { missing: "absent" };
   }
   try {
-    const content = readFileSync4(taken, "utf8");
-    if (content === ROOT)
-      return { agent: null };
-    return validSourceId(content) ? { agent: content } : { missing: "bad_record" };
+    const content = JSON.parse(readFileSync4(taken, "utf8"));
+    if (content.agent !== null && (!validSourceId(content.agent) || content.agent === ROOT))
+      return { missing: "bad_record" };
+    if (content.session !== undefined && !validSourceId(content.session))
+      return { missing: "bad_record" };
+    return { agent: content.agent, ...content.session === undefined ? {} : { session: content.session } };
   } catch {
-    return { missing: "absent" };
+    return { missing: "bad_record" };
   } finally {
     try {
       unlinkSync(taken);

@@ -124,7 +124,16 @@ export function keyedHarness(env: Record<string, string | undefined> = process.e
 /** What kind of session a registration is, beyond its row: see IdFacts. */
 // model, effort: what the session reports running on (BUS_MODEL, BUS_EFFORT; #284 S12).
 // harnessSession: the harness's own id for it (BUS_HARNESS_SESSION, #523 step 5).
-export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean; keyed?: boolean; model?: string; effort?: string; harnessSession?: string };
+export type SessionKind = { launcher?: boolean; writesAs?: string; viewer?: boolean; keyed?: boolean; model?: string; effort?: string; harnessSession?: string; localResume?: boolean };
+
+/** Latest ended ordinary conversation, including an authoritative empty hold set. */
+export function conversationSnapshot(db: Database, session: string): { session_id: string; names: string[] } | null {
+  const row = db.prepare(`SELECT id, held_aliases_json FROM ids
+    WHERE harness_session = ? AND ended_at IS NOT NULL AND root_id IS NULL
+      AND local_resume = 1 AND keyed = 0 AND viewer = 0 AND delivery = 'push' AND held_aliases_json IS NOT NULL
+    ORDER BY started_at DESC, rowid DESC LIMIT 1`).get(session) as { id: string; held_aliases_json: string } | null;
+  return row ? { session_id: row.id, names: JSON.parse(row.held_aliases_json) as string[] } : null;
+}
 
 /**
  * Write this session's rows, unbound: its liveness and its ids row, which
@@ -141,8 +150,8 @@ export function registerSession(db: Database, s: SessionRow, kind: SessionKind =
 // registerSession's rows, in the caller's transaction.
 function registerRows(db: Database, s: SessionRow, kind: SessionKind): void {
   // A keyed tools-only process has no harness row: its key is passed explicitly.
-  const { launcher = false, writesAs, viewer, keyed = s.harness_rule !== null, model, effort, harnessSession } = kind;
-  const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed, model, effort, harnessSession }, s.started_at);
+  const { launcher = false, writesAs, viewer, keyed = s.harness_rule !== null, model, effort, harnessSession, localResume } = kind;
+  const reused = registerId(db, { id: s.session_id, principal: null, harness: s.harness, cwd: s.cwd, launcher, writesAs, viewer, keyed, model, effort, harnessSession, localResume }, s.started_at);
   // A key whose ended session retention pruned (#284 S10): a new session on an old ID.
   if (reused) writeCoreAudit(db, "id.reused", s.session_id, s.session_id, { ended_at: reused.ended_at, pruned_at: reused.pruned_at, pid: s.attached_pid ?? s.pid });
   db.prepare(

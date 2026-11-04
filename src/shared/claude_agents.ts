@@ -3,14 +3,16 @@
 // Claude Code tells a third-party MCP server only `_meta["claudecode/toolUseId"]`
 // on a tool call; which agent made it reaches only hooks. So a PreToolUse hook
 // writes one record per grayboard call, named by the call's tool_use_id, holding
-// the subagent's agent_id or ROOT for a main-agent call, and the MCP side (local
+// the subagent's agent_id or null for a main-agent call, and the MCP side (local
 // `grayboard mcp`, the hosted plugin) takes the record that names its call.
 //
 // Layout, under a base directory (the local socket dir, or the plugin's
 // CLAUDE_PLUGIN_DATA): `claude-agents/<CLAUDE_PID>/`
 //   start                 procStart(CLAUDE_PID), written by SessionStart: a reader
 //                         whose harness started at another time sees a recycled pid
-//   <tool_use_id>         a record: the agent id, or ROOT
+//   <tool_use_id>         JSON {agent, session?}; session is local conversation identity
+//   current               local only: atomic {session, start, token} from SessionStart
+//   connections/<pid>     local only: retained MCP control endpoint (claude_identity.ts)
 //   <id>.taken.<pid>      a record a reader claimed (rename is the atomic take)
 //   ended/<name>          hosted only: an agent id whose SubagentStop ran
 //   model, effort         hosted only: the root session's latest model and
@@ -94,10 +96,9 @@ function ageMs(path: string, now: number): number | undefined {
 }
 
 /**
- * One hook event. Never throws and prints nothing: a hook must never block or
- * alter a call; a record it failed to write surfaces as the reader's
- * missing-record error. `hosted` (the plugin's hook) also writes SubagentStop's
- * marker and the root's facts, which only the hosted plugin reads.
+ * One hook event. Recording never throws or prints: a failed record surfaces
+ * as the reader's missing-record error. The local CLI then awaits the identity
+ * barrier separately. `hosted` also writes SubagentStop markers and root facts.
  */
 export function runHook(event: string, stdin: string, o: { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number }): void {
   try {
@@ -112,6 +113,7 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       // An unreadable start time is recorded empty: the reader then can't tell a
       // recycled pid, and treats the dir as its harness's (proc.ts's rule).
       put(join(dir, "start"), start ?? "");
+      if (!o.hosted && validSourceId(input.session_id)) put(join(dir, "current"), JSON.stringify({ session: input.session_id, start: start ?? "", token: `${now}-${process.pid}-${Math.random().toString(36).slice(2)}` }));
       if (o.hosted) {
         // A new process starts with no facts, even in a dir an earlier holder of
         // this pid left; a /clear keeps its process's effort.
@@ -126,7 +128,7 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       const content = agent === undefined ? ROOT : validSourceId(agent) && agent !== ROOT ? agent : undefined;
       if (content === undefined) return;
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      put(join(dir, id), content);
+      put(join(dir, id), JSON.stringify({ agent: content === ROOT ? null : content, ...(!o.hosted && validSourceId(input.session_id) ? { session: input.session_id } : {}) }));
       pruneRecords(dir, now);
       // The root's effort, which the call this record names carries. None means
       // the model has no effort level: an empty file, which the reader sends as
@@ -208,7 +210,7 @@ function pruneSessions(base: string, self: number) {
 
 /** Why a call has no usable record. */
 export type MissingCause = "bad_tool_use_id" | "no_session" | "recycled_pid" | "absent" | "bad_record";
-export type Taken = { agent: string | null } | { missing: MissingCause };
+export type Taken = { agent: string | null; session?: string } | { missing: MissingCause };
 
 export const MISSING_TEXT: Record<MissingCause, string> = {
   bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
@@ -233,11 +235,12 @@ export function takeRecord(base: string, claudePid: number, harnessStart: string
   const taken = join(dir, `${toolUseId}.taken.${process.pid}`);
   try { renameSync(join(dir, toolUseId), taken); } catch { return { missing: "absent" }; }
   try {
-    const content = readFileSync(taken, "utf8");
-    if (content === ROOT) return { agent: null };
-    return validSourceId(content) ? { agent: content } : { missing: "bad_record" };
+    const content = JSON.parse(readFileSync(taken, "utf8")) as { agent?: unknown; session?: unknown };
+    if (content.agent !== null && (!validSourceId(content.agent) || content.agent === ROOT)) return { missing: "bad_record" };
+    if (content.session !== undefined && !validSourceId(content.session)) return { missing: "bad_record" };
+    return { agent: content.agent as string | null, ...(content.session === undefined ? {} : { session: content.session as string }) };
   } catch {
-    return { missing: "absent" };
+    return { missing: "bad_record" };
   } finally {
     try { unlinkSync(taken); } catch { /* pruned by the hook's next write */ }
   }
@@ -253,6 +256,17 @@ function readSmall(path: string, max: number): string {
     const buf = Buffer.alloc(max);
     return buf.toString("utf8", 0, readSync(fd, buf, 0, max, 0));
   } finally { closeSync(fd); }
+}
+
+export type CurrentConversation = { session: string; start: string; token: string };
+/** SessionStart's authoritative current ID; the retained MCP environment may name an older ID. */
+export function readCurrent(base: string, pid: number, harnessStart: string | null): CurrentConversation | null {
+  try {
+    const value = JSON.parse(readSmall(join(sessionDir(base, pid), "current"), 4096)) as CurrentConversation;
+    if (!validSourceId(value.session) || typeof value.start !== "string" || !validSourceId(value.token)) return null;
+    if (harnessStart !== null && value.start !== "" && value.start !== harnessStart) return null;
+    return value;
+  } catch { return null; }
 }
 
 /**
