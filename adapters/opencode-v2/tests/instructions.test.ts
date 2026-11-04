@@ -206,7 +206,7 @@ test("setup's context hook leaves unenrolled sessions as built, never rejects, a
       hook: async (name: string, callback: (request: unknown) => Promise<void>) => { expect(name).toBe("context"); hook = callback; return { dispose: async () => { order.push("context"); } }; },
     },
     rpc: { register: async () => ({ dispose: async () => { order.push("rpc"); } }) },
-    tool: { list: async () => [], hook: async (name: string) => ({ dispose: async () => { order.push(name); } }) },
+    tool: { list: async () => [], hook: async (name: string) => ({ dispose: async () => { order.push(name); } }), transform: async () => ({ dispose: async () => {} }) },
     event: { async *subscribe({ signal }: { signal: AbortSignal }) { if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); } },
   } as unknown as Context;
   const close = spyOn(RootInstructions.prototype, "close").mockImplementation(function(this: RootInstructions) { order.push("instructions"); close.mockRestore(); this.close(); });
@@ -300,7 +300,7 @@ test("setup prefetches a subagent's text when it's created, its context hook rew
       hook: async (_name: string, callback: (request: unknown) => Promise<void>) => { hook = callback; return { dispose: async () => {} }; },
     },
     rpc: { register: async () => ({ dispose: async () => {} }) },
-    tool: { list: async () => [], hook: async () => ({ dispose: async () => {} }) },
+    tool: { list: async () => [], hook: async () => ({ dispose: async () => {} }), transform: async () => ({ dispose: async () => {} }) },
     event: {
       async *subscribe({ signal }: { signal: AbortSignal }) {
         yield { type: "session.created", data: { sessionID: "C" } };
