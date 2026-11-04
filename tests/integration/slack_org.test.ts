@@ -53,8 +53,10 @@ async function link(token: string): Promise<void> {
   const r = await api(token, "POST", "/api/slack/link");
   expect(r.status).toBe(200);
   expect(r.body).toMatchObject({ expires_in_s: 600, linked: false });
+  // Only a confirmation after this command: a relink would otherwise match the first link's (#466).
+  const seen = slack.posts().length;
   slack.say(`link ${r.body.code}`);
-  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
+  await until(() => slack.posts().slice(seen).find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 }
 
 test("link, then a hosted agent's DM to human is a Slack thread whose reply comes back from the human", async () => {

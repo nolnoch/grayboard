@@ -18,6 +18,7 @@ import type { Pending } from "../../src/shared/notifications.ts";
 import { board, direct } from "../support/events.ts";
 import { HostedToolError, type HostedSession } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -461,7 +462,8 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   expect(queued.delivered_now).toBe(false);
   await a.call("dm_retract", { message_id: queued.message_id });
   expect((await download(alice, "be", note.body.id)).status).toBe(404);
-  expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM attachment_blobs WHERE sha256 = ?`).get(note.body.sha256)).toEqual({ n: 0 });
+  // The retract sweeps the freed blob after its commit, not before its reply.
+  await until(() => !srv.app.db.prepare(`SELECT 1 FROM attachment_blobs WHERE sha256 = ?`).get(note.body.sha256), 5000, "the retracted DM's blob swept");
 
   const big = new Uint8Array(10 * 1024 * 1024).fill(0x61);
   expect((await upload(alice, "be", "big.txt", new Uint8Array(big.length + 1).fill(0x61))).status).toBe(413);
