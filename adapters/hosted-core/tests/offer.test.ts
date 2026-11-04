@@ -2,6 +2,7 @@
 // call's result says for each way the flow goes, the state scrub, and the
 // latest outcome's record.
 import { expect, test } from "bun:test";
+import { until } from "../../../tests/support/until.ts";
 import { AccessExpired } from "../src/model.ts";
 import { describeLast, LINK_MS, notify, offer, present, SCRUBBED, start, type Flow, type Outcome, type SignInState, type Signer } from "../src/offer.ts";
 
@@ -12,7 +13,7 @@ const URL_ = "https://gb.example/oauth/authorize?state=s3cret&code_challenge=c";
 // settled by the test.
 function signer(signedIn = false) {
   const calls: { signal?: AbortSignal; ifSignedOut?: boolean }[] = [];
-  const settle = Promise.withResolvers<void>();
+  const settle = Promise.withResolvers<"signed in" | "current">();
   const s: Signer = {
     token: async () => { if (signedIn) return "tok"; throw new AccessExpired("pi", "run /grayboard login"); },
     login: (signal, ifSignedOut) => {
@@ -21,7 +22,7 @@ function signer(signedIn = false) {
       return settle.promise;
     },
   };
-  return { s, calls, ok: () => settle.resolve(), fail: (e: unknown) => settle.reject(e) };
+  return { s, calls, ok: () => settle.resolve("signed in"), current: () => settle.resolve("current"), fail: (e: unknown) => settle.reject(e) };
 }
 function run(state: SignInState, s: Signer, ended: (f: Flow, o: Outcome) => void = () => {}) {
   return start(state, s, { origin: "offer", browser: false, ifSignedOut: true, ended });
@@ -57,7 +58,7 @@ test("signed in, not interactive, or a transient failure: no offer and no flow",
 test("a URL within the wait: the started note, never the URL", async () => {
   const state: SignInState = {}, f = signer();
   const pending = call(state, f.s, 5_000);
-  await Promise.resolve();
+  await until(() => !!state.flow, 1_000, "the flow");
   present(state, URL_);
   const text = await pending;
   expect(text).toBe("STARTED");
@@ -68,15 +69,31 @@ test("a URL within the wait: the started note, never the URL", async () => {
 test("the flow ends signed in before a URL (a waiter shares the holder's grant): no note", async () => {
   const state: SignInState = {}, f = signer();
   const pending = call(state, f.s, 5_000);
-  await Promise.resolve();
+  await until(() => !!state.flow, 1_000, "the flow");
   f.ok();
   expect(await pending).toBeUndefined();
+});
+
+test("an automatic flow that finds the store signed in: no note, no Last, no ended", async () => {
+  const state: SignInState = {}, f = signer();
+  const ends: Outcome[] = [];
+  state.last = { origin: "startup", outcome: "signed in", at: 1, said: true };
+  const pending = offer(state, f.s, { interactive: true, begin: () => run(state, f.s, (_, o) => { ends.push(o); }), notes, linkMs: 5_000 });
+  await until(() => !!state.flow, 1_000, "the flow");
+  const flow = state.flow!;
+  f.current();
+  expect(await pending).toBeUndefined();
+  await flow.done;
+  expect(flow.outcome).toBe("current");
+  expect(ends).toEqual([]);
+  expect(state.flow).toBeUndefined();
+  expect(state.last).toEqual({ origin: "startup", outcome: "signed in", at: 1, said: true });
 });
 
 test("the flow fails: its reason, with a reason quoting the flow's state replaced", async () => {
   let state: SignInState = {}, f = signer();
   let pending = call(state, f.s, 5_000);
-  await Promise.resolve();
+  await until(() => !!state.flow, 1_000, "the flow");
   f.fail(new Error("sign-in was denied"));
   expect(await pending).toBe("sign-in failed: sign-in was denied");
   expect(state.last!.outcome).toBe("failed: sign-in was denied");
@@ -93,7 +110,7 @@ test("the flow fails: its reason, with a reason quoting the flow's state replace
 test("the flow is aborted (closing): no note, recorded cancelled", async () => {
   const state: SignInState = {}, f = signer();
   const pending = call(state, f.s, 5_000);
-  await Promise.resolve();
+  await until(() => !!state.flow, 1_000, "the flow");
   state.flow!.abort.abort();
   expect(await pending).toBeUndefined();
   expect(state.last!.outcome).toBe("cancelled");
@@ -105,7 +122,7 @@ test("another process holds the flow: the elsewhere text only when no URL came b
   notify(state, "sign-in in progress in another pi session");
   // notify leaves the link open: a waiter's present still reaches the race.
   const pending = call(state, f.s, 5_000);
-  await Promise.resolve();
+  await until(() => !!state.flow, 1_000, "the flow");
   present(state, URL_);
   expect(await pending).toBe("STARTED");
   // A record with no URL yet: the wait runs out, then the elsewhere text.

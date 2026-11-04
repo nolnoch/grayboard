@@ -1,10 +1,10 @@
 // #430 adapter storage: atomic 0600 files in 0700 dirs, the per-root
 // KeyValueStorage, and the per-root delivery lock.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { deliveryPath, FileStorage, rootKey, sessionPath, tryDelivery, waitDelivery, writeJsonAtomic } from "../src/storage.ts";
+import { deliveryPath, FileRefused, FileStorage, readSmallJson, rootKey, sessionPath, tryDelivery, waitDelivery, writeJsonAtomic } from "../src/storage.ts";
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "gb-storage-")); });
@@ -57,4 +57,21 @@ test("the delivery lock admits one holder; a waiter wins once it is released and
   const won = await waiting;
   expect(tryDelivery(path)).toBeUndefined();
   won.release();
+});
+
+test("readSmallJson: a missing file is undefined; a FIFO, a directory and a file over the cap are refused without blocking; a small file parses (#592)", async () => {
+  const at = (name: string) => join(dir, name);
+  expect(await readSmallJson(at("missing"), 64)).toBeUndefined();
+  writeFileSync(at("small"), JSON.stringify({ url: "u" }));
+  expect(await readSmallJson(at("small"), 64)).toEqual({ url: "u" });
+  writeFileSync(at("big"), JSON.stringify({ url: "u".repeat(64) }));
+  await expect(readSmallJson(at("big"), 64)).rejects.toThrow(new FileRefused("is over 64 bytes"));
+  mkdirSync(at("dir"));
+  await expect(readSmallJson(at("dir"), 64)).rejects.toThrow(new FileRefused("isn't a regular file"));
+  writeFileSync(at("text"), "{not json");
+  await expect(readSmallJson(at("text"), 64)).rejects.toBeInstanceOf(SyntaxError);
+  if (process.platform === "win32") return;
+  // No writer ever opens it: a blocking open would hang here.
+  expect(Bun.spawnSync(["mkfifo", at("fifo")]).exitCode).toBe(0);
+  await expect(readSmallJson(at("fifo"), 64)).rejects.toThrow(new FileRefused("isn't a regular file"));
 });
