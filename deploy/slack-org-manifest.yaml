@@ -2,7 +2,7 @@
 # server; each user talks to it in their own DM). The local bridge
 # (`grayboard bridge slack`) uses slack-manifest.yaml instead.
 # api.slack.com/apps → Create New App → From a manifest → paste this (YAML tab).
-# Setup steps: https://github.com/nolnoch/grayboard#slack-for-a-team-server-optional
+# Setup steps: https://github.com/nolnoch/grayboard/blob/master/docs/guide/slack.md#slack-for-a-team-server-optional
 display_information:
   name: grayboard
 features:

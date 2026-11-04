@@ -55,7 +55,7 @@ The baseline every later change is measured against. A cell says what a user of 
 - pi L, omp L, OC V1: DMs, mentions and thread replies start a turn; digests and deferred pushes are context only (boards.md §9). Proof: `tests/integration/pi.test.ts` piScenario, `tests/integration/omp.test.ts` omp local task run (a peer's DM reaches main once), `tests/integration/opencode.test.ts` ("an unbound session acts as its ID…": the DM arrives as a prompt).
 - CC L: channel notifications, only while Claude Code's channel gate registers the server; gate off → tools-only, reason in instructions and first result (`claudeChannels`, boards.md §9). Proof: `tests/integration/local.test.ts` (pushes at the MCP level; "a Claude Code session whose channels are off runs tools-only and is warned why").
 - pi H, omp H, CC H: hosted-core lease and `RootDelivery` (boards.md §9 Hosted core). Proof: `tests/integration/pi.test.ts` "pi hosted: …", `tests/integration/omp.test.ts` "omp hosted: …", `tests/integration/claude_plugin.test.ts` ("a flagged interactive session: … a DM arrives as one channel push"), e2e `claude-hosted` (`tests/e2e/claude_hosted.e2e.ts`).
-- OC V2: delivery opens only on a human-enrolled, bound root (#226; README §OpenCode V2). Proof: `adapters/opencode-v2` `test:host` (`adapters/opencode-v2/tests/host.ts`).
+- OC V2: delivery opens only on a human-enrolled, bound root (#226; `docs/guide/harnesses.md` §OpenCode V2). Proof: `adapters/opencode-v2` `test:host` (`adapters/opencode-v2/tests/host.ts`).
 
 ### 3. Current instructions on push-started turns
 
@@ -69,7 +69,7 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - Local (all four): one local surface (boards.md §3); an explicit `BUS_IDENTITY` in the entry's env binds at start. Proof: `tests/integration/binding.test.ts`, `tests/integration/pi.test.ts` piUnboundScenario (two binds and an unbind), `tests/integration/opencode.test.ts` (bind and rebind), `tests/integration/omp.test.ts` omp local pin.
 - pi H, omp H, CC H: `bind`/`unbind` and up to `MAX_HOLDS` holds (#451); an explicit `BUS_IDENTITY` binds at a root's first start (#443, #543). Proof: `tests/integration/pi_family.test.ts` ("an explicit BUS_IDENTITY binds at a new root's start"), `tests/integration/claude_plugin.test.ts` ("an explicit BUS_IDENTITY binds at start"), `tests/integration/hosted_core_root.test.ts` (configured name precedence).
-- OC V2: native `bind`/`unbind`; the configured name is the plugin option `name` (`create:false` unless `create`), which binds each new root without enrolling it (README §OpenCode V2). Proof: `adapters/opencode-v2/tests/host.ts` (bind before enroll; configured launcher root).
+- OC V2: native `bind`/`unbind`; the configured name is the plugin option `name` (`create:false` unless `create`), which binds each new root without enrolling it (`docs/guide/harnesses.md` §OpenCode V2). Proof: `adapters/opencode-v2/tests/host.ts` (bind before enroll; configured launcher root).
 
 ### 5. Names across an in-process session switch or MCP reconnect
 
@@ -104,10 +104,10 @@ The baseline every later change is measured against. A cell says what a user of 
 
 ### 9. Sign-in flow
 
-- Local (all four): n/a. Local mode has no accounts; every process on the machine is trusted (README §Limitations of local mode).
-- pi H, omp H: `/grayboard login` opens the browser to the server's consent page; every pi (or omp) on the machine shares that sign-in under its built-in client (README §Other harnesses). Proof: `tests/integration/pi.test.ts` piHostedScenario, `tests/integration/omp.test.ts` omp hosted.
+- Local (all four): n/a. Local mode has no accounts; every process on the machine is trusted (`docs/guide/local.md` §Limitations of local mode).
+- pi H, omp H: `/grayboard login` opens the browser to the server's consent page; every pi (or omp) on the machine shares that sign-in under its built-in client (`docs/guide/harnesses.md`). Proof: `tests/integration/pi.test.ts` piHostedScenario, `tests/integration/omp.test.ts` omp hosted.
 - CC H: from the process holding hosted-core's login lock and from each process waiting on it (the holder's URL, #581), interactive only, the link reaches the user two ways: URL elicitation, and the post-tool-use hook's line under every grayboard call while the flow runs, which never enters the model's context (#500; boards.md §9 Hosted Claude Code). Proof: `tests/integration/claude_plugin.test.ts` ("sign-in by URL elicitation…", "a client without URL elicitation: the hook shows the link…").
-- OC V2: OpenCode's native MCP OAuth (`/mcps`, sign in through OpenCode); native OpenCode owns credential storage and refresh, and the package never reads a refresh token (README §OpenCode V2, `adapters/opencode-v2/README.md`). Proof: `adapters/opencode-v2` `test:host` (native CIMD OAuth discovery).
+- OC V2: OpenCode's native MCP OAuth (`/mcps`, sign in through OpenCode); native OpenCode owns credential storage and refresh, and the package never reads a refresh token (`docs/guide/harnesses.md` §OpenCode V2, `adapters/opencode-v2/README.md`). Proof: `adapters/opencode-v2` `test:host` (native CIMD OAuth discovery).
 
 ### 10. Sign-in offer in a signed-out tool result
 
@@ -137,7 +137,7 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - Local (all four): `grayboard setup --local` registers Claude Code and installs the pi, omp and opencode adapters with disabled entries (boards.md §9). Proof: `tests/integration/upgrade_install.test.ts` ("… setup --local registers it with every harness").
 - pi H, omp H, CC H: `grayboard setup --server <url>` installs the hosted bundles and the Claude Code plugin, removing the local entries. Proof: `tests/integration/upgrade_install.test.ts` ("setup --server …"), `src/cli/pi-family-setup.test.ts`, `src/cli/claude-setup.test.ts`.
-- OC V2: explicit `grayboard setup-opencode` with a URL, config and full Git revision, or manual config; ordinary setup preserves the registration and prints the `setup-opencode` hint (README §OpenCode V2). Proof: `src/cli/opencode-setup.test.ts`.
+- OC V2: explicit `grayboard setup-opencode` with a URL, config and full Git revision, or manual config; ordinary setup preserves the registration and prints the `setup-opencode` hint (`docs/guide/harnesses.md` §OpenCode V2). Proof: `src/cli/opencode-setup.test.ts`.
 
 ### 15. Delegation launcher declaration
 
@@ -147,9 +147,9 @@ The baseline every later change is measured against. A cell says what a user of 
 
 ### 16. Update
 
-- Local (all four), pi H, omp H: `grayboard update` replaces the binary and runs `refresh-adapters`, which rewrites each installed adapter for the current mode and the Claude Code hooks (README §Other harnesses). Proof: `tests/integration/upgrade_install.test.ts` ("update from … refreshes its adapters", "refresh-adapters disables the grayboard entry…"), `src/cli/pi-family-setup.test.ts` ("refresh-adapters installs the current mode's … adapter").
+- Local (all four), pi H, omp H: `grayboard update` replaces the binary and runs `refresh-adapters`, which rewrites each installed adapter for the current mode and the Claude Code hooks (`docs/guide/harnesses.md`). Proof: `tests/integration/upgrade_install.test.ts` ("update from … refreshes its adapters", "refresh-adapters disables the grayboard entry…"), `src/cli/pi-family-setup.test.ts` ("refresh-adapters installs the current mode's … adapter").
 - CC H: `update` runs `claude plugin update` even when the CLI is current, then compares pin, plugin and CLI (#511). Proof: `tests/integration/upgrade_install.test.ts` ("update with the CLI already current still updates an enabled Claude Code plugin…"), `src/cli/claude-setup.test.ts`.
-- OC V2: n/a. The package is pinned to a reviewed full Git revision; `update` preserves the registration, and moving the pin is `setup-opencode --revision` (README §OpenCode V2).
+- OC V2: n/a. The package is pinned to a reviewed full Git revision; `update` preserves the registration, and moving the pin is `setup-opencode --revision` (`docs/guide/harnesses.md` §OpenCode V2).
 
 ## Notes (known limits, not cells)
 

@@ -154,7 +154,7 @@ export function pinnedIdentity(cwd = process.cwd(), env: Record<string, string |
 
 /**
  * Whether BUS_IDENTITY is a true explicit override, not a harness re-
- * delivering one of the repo's pins as env (README: harnesses load pins
+ * delivering one of the repo's pins as env (docs/guide/local.md: harnesses load pins
  * into BUS_IDENTITY). Literal — no worktree suffix — only when it differs
  * from every pin source. When it equals any pin the identity is derived like
  * the pin itself, so existing worktree identities (`be-stream`) keep their

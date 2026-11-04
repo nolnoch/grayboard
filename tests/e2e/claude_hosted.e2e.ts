@@ -227,7 +227,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call sho
     const hosted = () => hostedRowCount(srv.app.db);
     await until(() => hosted() > 0, 30_000, "the signed-in plugin to open its hosted session");
     // The plugin completes the prompt at the flow's end. 2.1.316 keeps the URL
-    // prompt up after that (the user dismisses it with Esc, README); typing
+    // prompt up after that (the user dismisses it with Esc, docs/guide/team.md); typing
     // past it in a pty is not asserted here: keys were lost on CI (#497).
     await until(() => debug().includes("Received elicitation completion notification"), 10_000, "the plugin to complete the sign-in prompt");
     expect(model.unhandled).toEqual([]);
