@@ -436,7 +436,7 @@ elif [ "$unit_new" = "1" ]; then
   esac
   echo "Create /etc/grayboard/env (GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL, GRAYBOARD_ORG_DOMAIN,"
   echo "GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET), then \`systemctl enable --now grayboard\`."
-  echo "For nightly backups, schedule ${backup_dest} (README §7, Backups)."
+  echo "For nightly backups, schedule ${backup_dest} (docs/guide/server.md §7, Backups)."
 elif [ "$INSTALL_SERVER" = "1" ]; then
   echo "Server binary installed; systemd runs no grayboard unit from it. A server already running"
   echo "from this binary keeps the old version until you restart it."

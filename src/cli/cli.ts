@@ -527,7 +527,7 @@ const bridgeCmd = program
 
 bridgeCmd
   .command("slack")
-  .description("Relay your handle to a private Slack channel (config: ~/.grayboard/slack.json; setup: https://github.com/nolnoch/grayboard#slack-bridge-setup)")
+  .description("Relay your handle to a private Slack channel (config: ~/.grayboard/slack.json; setup: https://github.com/nolnoch/grayboard/blob/master/docs/guide/slack.md#slack-bridge-setup)")
   .option("--mode <mode>", "local: relay the local bus on a machine signed in to a server")
   .action(async (opts: { mode?: string }) => {
     if (opts.mode !== undefined && opts.mode !== "local") {

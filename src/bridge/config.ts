@@ -45,7 +45,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     const v = (envKey && env[envKey]) || file[key];
     if (typeof v !== "string" || !v.trim()) {
       throw new ConfigError(
-        `missing "${key}" in ${path}${envKey ? ` (or ${envKey})` : ""}; see https://github.com/nolnoch/grayboard#slack-bridge-setup`,
+        `missing "${key}" in ${path}${envKey ? ` (or ${envKey})` : ""}; see https://github.com/nolnoch/grayboard/blob/master/docs/guide/slack.md#slack-bridge-setup`,
       );
     }
     return v.trim();
