@@ -1,0 +1,10 @@
+import type { CallToolResult } from "@modelcontextprotocol/client";
+
+// The tool's parsed result for host output and afterCall: structuredContent,
+// else the single text content parsed as JSON (or as is when it isn't JSON).
+export function outputOf(result: CallToolResult): unknown {
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  const only = result.content.length === 1 ? result.content[0] : undefined;
+  if (only?.type !== "text") return undefined;
+  try { return JSON.parse(only.text); } catch { return only.text; }
+}

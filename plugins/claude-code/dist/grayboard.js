@@ -34612,11 +34612,11 @@ function checkAttachmentId(id) {
     throw new CoreError("id must be an attachment id");
   return id;
 }
-async function saveTarget(dir, roots, bus, env = process.env) {
+async function saveTarget(dir, roots, bus, env = process.env, cwd = process.cwd()) {
   if (dir !== undefined && typeof dir !== "string")
     throw new CoreError("dir must be a string");
   if (dir !== undefined)
-    return checkSaveDir(dir, roots);
+    return checkSaveDir(dir, roots, cwd);
   const target = join4(attachmentsDir(env), bus);
   await mkdir3(target, { recursive: true, mode: 448 });
   return target;
@@ -35593,6 +35593,148 @@ function describeFetchError(e, ms) {
   return e instanceof Error && e.name === "TimeoutError" ? `no answer within ${Math.round(ms / 1000)}s` : e.message;
 }
 
+// adapters/hosted-core/src/attachments.ts
+class AttachmentRefused extends Error {
+  status;
+  code;
+  constructor(status, code, message) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+class HostedAttachments {
+  options;
+  constructor(options) {
+    this.options = options;
+  }
+  async send(paths, sessionID, send) {
+    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(), cwd: this.options.cwd });
+    return sendWithUploads(files, this.transport(sessionID), send);
+  }
+  async get(args, sessionID) {
+    const id = checkAttachmentId(args.id);
+    const target = await saveTarget(args.dir, this.options.roots, serverBusDir(this.options.resource.href), this.options.env, this.options.cwd);
+    return downloadAttachment(id, target, (await this.options.limits()).file, this.transport(sessionID));
+  }
+  transport(sessionID) {
+    const base = `${this.options.resource.href.replace(/\/$/, "")}/attachments`;
+    return {
+      upload: async (file) => {
+        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data);
+        const stored = object({ id: number2().int().positive() }).safeParse(await response.json().catch(() => {
+          return;
+        }));
+        if (!stored.success)
+          throw new Error("Invalid attachment upload response");
+        return stored.data.id;
+      },
+      release: async (id) => {
+        try {
+          const response = await this.http("DELETE", `${base}/${id}`, sessionID, HTTP_TIMEOUT_MS);
+          await response.body?.cancel();
+          return true;
+        } catch (error) {
+          if (error instanceof AttachmentRefused && error.status === 404)
+            return false;
+          throw error;
+        }
+      },
+      download: async (id, maxBytes) => {
+        const ms = transferTimeoutMs(maxBytes);
+        const response = await this.http("GET", `${base}/${id}`, sessionID, ms);
+        const reader = response.body?.getReader();
+        if (!reader)
+          throw new Error(`attachment ${id}: empty download`);
+        const chunks = [];
+        let size = 0;
+        try {
+          for (;; ) {
+            const chunk = await reader.read();
+            if (chunk.done)
+              break;
+            size += chunk.value.length;
+            if (size > maxBytes)
+              throw new Error(`attachment ${id}: exceeds the ${formatSize(maxBytes)} limit per file`);
+            chunks.push(chunk.value);
+          }
+          const data = new Uint8Array(size);
+          let offset = 0;
+          for (const chunk of chunks) {
+            data.set(chunk, offset);
+            offset += chunk.length;
+          }
+          return { headers: response.headers, data };
+        } catch (error) {
+          throw this.fetchFailure(error, ms);
+        } finally {
+          await reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+      },
+      unreleased: this.options.unreleased
+    };
+  }
+  async http(method, url, sessionID, ms, body) {
+    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.options.signal]);
+    for (let attempt = 0;; attempt++) {
+      const token = await this.options.auth.token();
+      if (!token)
+        throw new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
+      const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(sessionID) });
+      if (body) {
+        headers.set("Content-Type", "application/octet-stream");
+        headers.set("Content-Length", String(body.length));
+      }
+      let response;
+      try {
+        response = await fetch(url, { method, headers, body: body ? new Uint8Array(body) : undefined, redirect: "error", signal });
+      } catch (error) {
+        throw this.fetchFailure(error, ms);
+      }
+      if (response.ok)
+        return response;
+      if (response.status === 401 && attempt === 0 && this.options.auth.onUnauthorized) {
+        await response.body?.cancel();
+        await this.options.auth.onUnauthorized({ response, serverUrl: this.options.resource, fetchFn: fetch });
+        continue;
+      }
+      if (response.status === 401 || response.status === 403 && /insufficient_scope/.test(response.headers.get("www-authenticate") ?? "")) {
+        await response.body?.cancel();
+        throw new AccessExpired(this.options.harness, this.options.loginAction, response.status === 401 ? "expired" : "login_required");
+      }
+      const refusal = object({ code: string2(), message: string2() }).safeParse(await response.json().catch(() => {
+        return;
+      }));
+      if (refusal.success)
+        throw new AttachmentRefused(response.status, refusal.data.code, refusal.data.message);
+      if ([502, 503, 504].includes(response.status))
+        throw new ServerUnreachable(new Error(`HTTP ${response.status}`));
+      throw new Error(`grayboard server at ${this.options.resource.origin}: HTTP ${response.status}`);
+    }
+  }
+  fetchFailure(error, ms) {
+    if (!this.options.signal.aborted && unreachable(error))
+      return new ServerUnreachable(error);
+    return new Error(`grayboard server at ${this.options.resource.origin}: ${describeFetchError(error, ms)}`, { cause: error });
+  }
+}
+
+// adapters/hosted-core/src/results.ts
+function outputOf(result) {
+  if (result.structuredContent !== undefined)
+    return result.structuredContent;
+  const only = result.content.length === 1 ? result.content[0] : undefined;
+  if (only?.type !== "text")
+    return;
+  try {
+    return JSON.parse(only.text);
+  } catch {
+    return only.text;
+  }
+}
+
 // src/shared/session_meta.ts
 var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
 var GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost";
@@ -35620,30 +35762,8 @@ function withPaths(tool) {
   const description = tool.description?.replace("attachment_ids?", "attachments?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.");
   return { ...tool, ...description === undefined ? {} : { description }, inputSchema: { ...tool.inputSchema, properties } };
 }
-function outputOf(result) {
-  if (result.structuredContent !== undefined)
-    return result.structuredContent;
-  const only = result.content.length === 1 ? result.content[0] : undefined;
-  if (only?.type !== "text")
-    return;
-  try {
-    return JSON.parse(only.text);
-  } catch {
-    return only.text;
-  }
-}
 var text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 var failure2 = (message) => ({ ...text(`error: ${message}`), isError: true });
-
-class AttachmentRefused extends Error {
-  status;
-  code;
-  constructor(status, code, message) {
-    super(message);
-    this.status = status;
-    this.code = code;
-  }
-}
 
 class Refused extends Error {
   result;
@@ -35669,16 +35789,24 @@ class ToolProxy {
   instructionsBySession = new Map;
   inflight = new Set;
   closing = new AbortController;
-  roots;
-  resource;
+  attachments;
   constructor(options) {
     this.options = options;
     const resource = canonicalEndpoint(options.wire.url);
     if (!resource)
       throw new Error("Grayboard MCP URL must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     this.current = hostTools(snapshotTools());
-    this.roots = options.roots ?? attachRoots();
-    this.resource = resource;
+    this.attachments = new HostedAttachments({
+      resource,
+      auth: options.auth,
+      harness: options.harness,
+      loginAction: options.loginAction,
+      signal: this.closing.signal,
+      roots: options.roots ?? attachRoots(),
+      env: options.env,
+      limits: () => this.limits(),
+      unreleased: (id, error) => options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error }))
+    });
   }
   tools() {
     return this.current;
@@ -35808,8 +35936,7 @@ class ToolProxy {
   async withUploads(name, args, sessionID) {
     const { attachments, ...rest } = args;
     try {
-      const files = await readAttachmentFiles(attachments, this.roots, { limits: await this.limits() });
-      return await sendWithUploads(files, this.transport(sessionID), async (ids) => {
+      return await this.attachments.send(attachments, sessionID, async (ids) => {
         const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID);
         if (result.isError)
           throw new Refused(result);
@@ -35827,90 +35954,12 @@ class ToolProxy {
   }
   async attachmentGet(args, sessionID) {
     try {
-      const id = checkAttachmentId(args.id);
-      const target = await saveTarget(args.dir, this.roots, serverBusDir(this.resource.href), this.options.env);
-      return text(await downloadAttachment(id, target, (await this.limits()).file, this.transport(sessionID)));
+      return text(await this.attachments.get(args, sessionID));
     } catch (error) {
       if (this.transportFailure(error))
         throw error;
       return failure2(error.message);
     }
-  }
-  transport(sessionID) {
-    const base = `${this.resource.href.replace(/\/$/, "")}/attachments`;
-    return {
-      upload: async (file) => {
-        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data);
-        const stored = object({ id: number2().int().positive() }).safeParse(await response.json().catch(() => {
-          return;
-        }));
-        if (!stored.success)
-          throw new Error("Invalid attachment upload response");
-        return stored.data.id;
-      },
-      release: async (id) => {
-        try {
-          const response = await this.http("DELETE", `${base}/${id}`, sessionID, HTTP_TIMEOUT_MS);
-          await response.body?.cancel();
-          return true;
-        } catch (error) {
-          if (error instanceof AttachmentRefused && error.status === 404)
-            return false;
-          throw error;
-        }
-      },
-      download: async (id, maxBytes) => {
-        const ms = transferTimeoutMs(maxBytes);
-        const response = await this.http("GET", `${base}/${id}`, sessionID, ms);
-        try {
-          return { headers: response.headers, data: new Uint8Array(await response.arrayBuffer()) };
-        } catch (error) {
-          throw this.fetchFailure(error, ms);
-        }
-      },
-      unreleased: (id, error) => this.options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error }))
-    };
-  }
-  async http(method, url, sessionID, ms, body) {
-    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.closing.signal]);
-    for (let attempt = 0;; attempt++) {
-      const token = await this.options.auth.token();
-      if (!token)
-        throw new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(sessionID) });
-      if (body)
-        headers.set("Content-Type", "application/octet-stream");
-      let response;
-      try {
-        response = await fetch(url, { method, headers, body: body ? new Uint8Array(body) : undefined, redirect: "error", signal });
-      } catch (error) {
-        throw this.fetchFailure(error, ms);
-      }
-      if (response.ok)
-        return response;
-      if (response.status === 401 && attempt === 0 && this.options.auth.onUnauthorized) {
-        await response.body?.cancel();
-        await this.options.auth.onUnauthorized({ response, serverUrl: this.resource, fetchFn: fetch });
-        continue;
-      }
-      if (response.status === 401 || response.status === 403 && /insufficient_scope/.test(response.headers.get("www-authenticate") ?? "")) {
-        await response.body?.cancel();
-        throw new AccessExpired(this.options.harness, this.options.loginAction, response.status === 401 ? "expired" : "login_required");
-      }
-      const refusal = object({ code: string2(), message: string2() }).safeParse(await response.json().catch(() => {
-        return;
-      }));
-      if (refusal.success)
-        throw new AttachmentRefused(response.status, refusal.data.code, refusal.data.message);
-      if ([502, 503, 504].includes(response.status))
-        throw new ServerUnreachable(new Error(`HTTP ${response.status}`));
-      throw new Error(`grayboard server at ${this.resource.origin}: HTTP ${response.status}`);
-    }
-  }
-  fetchFailure(error, ms) {
-    if (!this.closing.signal.aborted && unreachable(error))
-      return new ServerUnreachable(error);
-    return new Error(`grayboard server at ${this.resource.origin}: ${describeFetchError(error, ms)}`, { cause: error });
   }
   open() {
     const native = { ready: this.listed(new NativeWire(this.options.wire, this.options.auth, this.closing.signal), () => this.native === native), users: 0, retired: false, closed: false };

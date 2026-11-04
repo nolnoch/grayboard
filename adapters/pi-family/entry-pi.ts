@@ -6,7 +6,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { version } from "../../package.json" with { type: "json" };
 import { piAgentDir } from "../../src/shared/pi.ts";
 import type { Level } from "../hosted-core/src/client.ts";
-import { COMMAND, createGrayboard, modelName, toolArgs, toolResult } from "./extension.ts";
+import { COMMAND, createGrayboard, toolArgs, toolResult } from "./extension.ts";
+import { modelName } from "./omp-instructions.ts";
 
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
 // MCP call renderer treat these as they treat any MCP server's tools.

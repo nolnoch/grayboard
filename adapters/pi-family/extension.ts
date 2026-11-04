@@ -24,7 +24,8 @@ import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
 import { Login } from "../hosted-core/src/login.ts";
 import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
-import { failure, hostTools, outputOf, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { failure, hostTools, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { outputOf } from "../hosted-core/src/results.ts";
 import { RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
 import { configuredIdentity, describeLocation } from "../../src/shared/identity.ts";
@@ -62,9 +63,6 @@ export interface Harness {
   // model is the current session's.
   facts?(sessionID: string): SessionFacts | undefined;
 }
-
-// A harness model as the bus names it: `provider/id`.
-export const modelName = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
 
 export const LOGIN_ACTION = "run /grayboard login";
 export const RESUME_HINT = "run /grayboard resume";

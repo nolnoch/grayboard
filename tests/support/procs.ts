@@ -66,6 +66,14 @@ export function processDescendants(pid: number): ProcessDescendant[] {
   return found;
 }
 
+// Every grayboard descendant: this checkout's CLI, or a grayboard binary.
+// A server-mode hosted extension runs none.
+export function grayboardDescendants(pid: number): string[] {
+  return processDescendants(pid)
+    .filter((p) => p.command.includes(CLI) || /(^|\/)grayboard(\s|$)/.test(p.command))
+    .map((p) => p.command);
+}
+
 // SIGKILL `pid` and wait until it's gone: the signal is asynchronous, and a
 // test that starts the next process at once races the dying one.
 export async function sigkill(pid: number): Promise<void> {

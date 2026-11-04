@@ -69,7 +69,8 @@ const OC_PLUGIN = { path: join(OC_DIR, "plugin", "grayboard.ts"), source: adapte
 // extension (`.js`, a bundle of adapters/pi-family) talks to the server's
 // /mcp itself, holds the delivery lease, and reads only
 // `<agentDir>/grayboard/config.json {url}`; it needs no entry. Local: the
-// adapter (`.ts`) runs a push-mode `grayboard mcp`, serves its tools and
+// adapter (pi's raw `.ts`, omp's bundle in the same `.ts` slot) runs a
+// push-mode `grayboard mcp`, serves its tools and
 // delivers its pushes, reading its command from the disabled user entry; omp's
 // also runs each in-process subagent's calls as a child session (#523).
 // Installing one variant removes the other. In omp the disabled user entry
@@ -94,7 +95,7 @@ const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | 
   source: f.source, bundle: f.bundle,
 });
 const PI = piFamily("pi", PI_DIR, { source: adapterSource("pi"), bundle: adapterBundle("pi") });
-const OMP = piFamily("omp", OMP_DIR, { source: adapterSource("omp"), bundle: adapterBundle("omp") });
+const OMP = piFamily("omp", OMP_DIR, { source: adapterBundle("omp", "local"), bundle: adapterBundle("omp") });
 
 /** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
 const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
@@ -737,9 +738,8 @@ program
       console.log(`Installed ${r.adapter}`);
       if (server) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
     };
-    // 3. omp. Local: omp's MCP client keeps notifications, so omp serves the
-    // entry's tools and the relay only wakes the session. Server: the hosted
-    // extension against the server's /mcp.
+    // 3. omp. Local: the bundled adapter runs grayboard, serves its tools and
+    // delivers pushes to main. Server: the hosted extension against /mcp.
     const omp = !!Bun.which("omp");
     if (opts.register && omp && (await confirm("Make grayboard available in every omp project?", true))) await installHarness(OMP);
 

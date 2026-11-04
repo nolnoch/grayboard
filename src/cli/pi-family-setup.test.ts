@@ -11,11 +11,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
+import { adapterBundle } from "./adapters.ts" with { type: "macro" };
 
 type Harness = "pi" | "omp";
 const HARNESSES: Harness[] = ["pi", "omp"];
 const cli = join(import.meta.dir, "main.ts");
-const localSource = (h: Harness) => readFileSync(new URL(`../../adapters/${h}/grayboard.ts`, import.meta.url), "utf8");
+const OMP_LOCAL_BUNDLE = adapterBundle("omp", "local");
+const localSource = (h: Harness) => h === "omp" ? OMP_LOCAL_BUNDLE : readFileSync(new URL("../../adapters/pi/grayboard.ts", import.meta.url), "utf8");
 // Refused connections: setup's sign-out call and pi's grant revoke fail fast.
 const SERVER = "http://127.0.0.1:9";
 const CANONICAL_RULE = "canonical HTTPS (or loopback HTTP) server URL, without credentials, query or fragment";
@@ -64,6 +66,14 @@ const localEntry = { command: "bun", args: [cli, "mcp"], enabled: false, env: { 
 
 function expectLocal(f: ReturnType<typeof fixture>) {
   expect(readFileSync(f.paths.local, "utf8")).toBe(localSource(f.h));
+  if (f.h === "omp") {
+    const bundle = readFileSync(f.paths.local, "utf8");
+    expect(bundle).toContain("adapters/omp/grayboard.ts");
+    expect(bundle).toContain("adapters/hosted-core/src/channel.ts");
+    expect(bundle).toContain("adapters/pi-family/omp-instructions.ts");
+    expect(bundle).toMatch(/from ["']@oh-my-pi\/pi-coding-agent["']/);
+    expect(bundle).not.toMatch(/from ["']\.\.?\//);
+  }
   expect(existsSync(f.paths.hosted)).toBe(false);
   expect(f.entry()).toEqual(localEntry);
 }
@@ -210,4 +220,13 @@ test("refresh-adapters migrates an omp local install's enabled entry to the disa
   expect(JSON.parse(readFileSync(f.paths.mcp, "utf8")).mcpServers.other).toEqual({ command: "x" });
   // A second refresh changes nothing.
   expect(f.run("refresh-adapters")).not.toContain("Disabled the grayboard entry");
+}, 60_000);
+
+test("setup upgrades an existing raw local omp adapter in place to the bundle", () => {
+  const f = fixture("omp");
+  mkdirSync(join(f.paths.local, ".."), { recursive: true });
+  writeFileSync(f.paths.local, readFileSync(new URL("../../adapters/omp/grayboard.ts", import.meta.url), "utf8"));
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry } }));
+  f.run("setup", "--local", "-y");
+  expectLocal(f);
 }, 60_000);

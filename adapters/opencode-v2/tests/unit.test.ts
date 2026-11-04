@@ -6,8 +6,85 @@ import { Wire, SubscriberError, LeaseUnavailable, ServerUnreachable, subscriberE
 import { failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
 import { METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { admitPrefix, identityOf, itemsOf, leaseOf, render, stableID } from "../src/core/model.js";
+import { attachmentTools } from "../src/transfer-tools.js";
+import type { Info } from "@opencode/plugin/promise/tool";
+import { z } from "zod";
+import { readFileSync } from "node:fs";
+import { NativeWire } from "../src/core/wire.js";
+import type { ToolContext } from "@opencode/plugin/promise/tool";
+const nativeDescriptions = JSON.parse(readFileSync(new URL("../../hosted-core/src/native-tools.json", import.meta.url), "utf8")) as { name: string; description: string }[];
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
 const wireOptions = (url: string) => ({ url, sessionKey: "ai.opencode/sessionID", client: { name: "grayboard-opencode", version: "1.10.0" } });
+test("attachment tools extend only the configured native namespace and declare saved output", async () => {
+  const invoke = async () => ({ content: "native result" });
+  const tools = ["bus", "other"].flatMap(namespace => ["dm_send", "board_post"].map(name => ({
+    id: `${namespace}_${name}`, name, description: nativeDescriptions.find(t => t.name === name)!.description, options: { namespace, codemode: true as const },
+    input: { type: "object", properties: { attachment_ids: { type: "array", items: { type: "integer" } } }, required: ["body"] }, execute: invoke,
+  }))) as (Info & { id: string })[];
+  const permissionActions: string[] = [];
+  const ctx = { permission: { assert: async ({ action }: { action: string }) => { permissionActions.push(action); throw new Error("Permission denied"); } }, tool: { transform: async (apply: (editor: unknown) => void) => {
+    apply({ list: () => tools, update: (id: string, mutate: (tool: Info) => void) => mutate(tools.find(t => t.id === id)!), add: (tool: Info) => tools.push({ ...tool, id: `${tool.options!.namespace}_${tool.name}` }) });
+    return { dispose: async () => {} };
+  } } } as unknown as Context;
+  await attachmentTools(ctx, { options: { mcpName: "bus" } } as Controller);
+  for (const name of ["dm_send", "board_post"]) {
+    const tool = tools.find(t => t.id === `bus_${name}`)!;
+    expect(tool.input).toMatchObject({ required: ["body"], properties: { attachment_ids: { type: "array" }, attachments: { type: "array", items: { type: "string" } } } });
+    expect(tool.description).not.toContain("uploaded IDs, not paths");
+    expect(tool.description).toContain("attachments takes local file paths");
+    expect(tools.find(t => t.id === `other_${name}`)!.execute).toBe(invoke);
+    await expect(tool.execute({ attachment_ids: [1] }, {} as never)).resolves.toEqual({ content: "native result" });
+    await expect(tool.execute({ attachments: [], attachment_ids: [] }, {} as never)).rejects.toThrow("not both");
+    await expect(tool.execute({ attachments: ["report.txt"] }, {} as never)).rejects.toThrow("Permission denied");
+  }
+  const get = tools.find(t => t.id === "bus_attachment_get")!;
+  expect(get.options).toEqual({ namespace: "bus", codemode: true });
+  expect(get.input).toMatchObject({ required: ["id"] });
+  expect((get.output as z.ZodType).safeParse({ path: "/work/1-file.txt", filename: "file.txt", type: "text/plain", size: 2, sha256: "hash" }).success).toBe(true);
+  await expect(get.execute({ id: 1 }, {} as never)).rejects.toThrow("Permission denied");
+  expect(permissionActions).toEqual(["bus_dm_send", "bus_board_post", "bus_attachment_get"]);
+  expect(nativeDescriptions.find(t => t.name === "dm_send")!.description).toEndWith(" Attachments are uploaded IDs, not paths.");
+  expect(nativeDescriptions.find(t => t.name === "board_post")!.description).toContain("attachment_ids?");
+  expect(tools.find(t => t.id === "bus_dm_send")!.description).toContain("Attachments are local file paths.");
+});
+
+test("V2 transfers reuse the native connection and published limits, check permission once and retain each caller's source", async () => {
+  let connected = 0, permissionChecks = 0, originalExecutions = 0;
+  const calls: { name: string; args: Record<string, unknown>; sessionID: string }[] = [];
+  const tools = [{ id: "grayboard_dm_send", name: "dm_send", description: nativeDescriptions.find(t => t.name === "dm_send")!.description,
+    options: { namespace: "grayboard" }, input: { type: "object", properties: {} }, output: {},
+    execute: async () => { originalExecutions++; return { content: "native execute" }; },
+  }] as (Info & { id: string })[];
+  class Connection {
+    client = { getServerCapabilities: () => ({ experimental: { "io.github.nolnoch.grayboard/attachments": { file: 16, total: 32 } } }) };
+    async connect() { connected++; }
+    async close() {}
+    async callTool(name: string, args: Record<string, unknown>, sessionID: string) {
+      calls.push({ name, args, sessionID });
+      return { content: [{ type: "text", text: JSON.stringify({ message_id: calls.length }) }] };
+    }
+  }
+  const ctx = { location: { directory: "/worktree" }, permission: { assert: async () => { permissionChecks++; } },
+    tool: { transform: async (apply: (editor: unknown) => void) => {
+      apply({ list: () => tools, update: (id: string, mutate: (tool: Info) => void) => mutate(tools.find(t => t.id === id)!), add: (tool: Info) => tools.push({ ...tool, id: `${tool.options!.namespace}_${tool.name}` }) });
+      return { dispose: async () => {} };
+    } },
+  } as unknown as Context;
+  const controller = { options: { mcpName: "grayboard" }, port: { sessionKey: "ai.opencode/sessionID", client: { name: "test", version: "1" } },
+    childRoot: async () => undefined, enrollment: () => enrollment, binding: { token: async () => "access" }, backgroundFailure: () => {},
+  } as unknown as Controller;
+  const registration = await attachmentTools(ctx, controller, Connection as unknown as typeof NativeWire);
+  try {
+    for (const sessionID of ["root-a", "root-b"]) {
+      const result = await tools[0]!.execute({ to: "fe", body: sessionID, attachments: [] }, { sessionID, signal: new AbortController().signal } as ToolContext);
+      expect(result.output).toEqual({ message_id: calls.length });
+    }
+    expect(connected).toBe(1);
+    expect(permissionChecks).toBe(2);
+    expect(originalExecutions).toBe(0);
+    expect(calls).toEqual(["root-a", "root-b"].map(sessionID => ({ name: "dm_send", args: { to: "fe", body: sessionID }, sessionID })));
+  } finally { await registration.dispose(); }
+});
 test("typed unknown-name suggestions are bounded validated account names, not arbitrary error data", () => {
   expect(subscriberError({ code: "identity_unknown", known: ["be", "fe", "be"] }, false).known).toEqual(["be", "fe"]);
   expect(subscriberError({ code: "identity_unknown", known: ["_task", "-task", ...Array(254).fill("be")] }, false).known).toEqual(["_task", "-task", "be"]);

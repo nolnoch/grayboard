@@ -126,7 +126,7 @@ function expectRegistered(server?: string): void {
   } else {
     // Disabled: the opencode and local omp and pi adapters serve the tools and read their command here.
     expect(json(".config", "opencode", "opencode.json").mcp.grayboard).toEqual({ type: "local", command: [exe, "mcp"], enabled: false, environment: { BUS_PUSH: "off" } });
-    for (const harness of ["omp", "opencode", "pi"] as const) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(adapterSource(harness));
+    for (const harness of ["omp", "opencode", "pi"] as const) expect(readFileSync(join(home, ...ADAPTERS[harness]), "utf8"), harness).toBe(harness === "omp" ? adapterBundle("omp", "local") : adapterSource(harness));
   }
   if (server) {
     for (const [harness, dot] of [["omp", ".omp"], ["pi", ".pi"]] as const) {
@@ -304,7 +304,7 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   expect(out).toContain(`Refreshed ${omp}`);
   expect(releases.requests).toEqual(expect.arrayContaining([`GET /repos/${REPO}/releases/latest`, `GET /${REPO}/releases/download/${TAG}/${ASSET}`]));
   expect((await expectOk(grayboard("--version"))).trim()).toBe(pkg.version);
-  expect(readFileSync(omp, "utf8")).toBe(adapterSource("omp"));
+  expect(readFileSync(omp, "utf8")).toBe(adapterBundle("omp", "local"));
   expect(lstatSync(opencode).isSymbolicLink()).toBe(true);
   expect(readlinkSync(opencode)).toBe(join(dir, "checkout.ts"));
   expect(existsSync(join(home, ...ADAPTERS.pi))).toBe(false);

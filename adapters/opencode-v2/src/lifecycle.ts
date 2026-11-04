@@ -10,6 +10,7 @@ import { Approval, type OpenCodeEnrollment } from "./approval.js";
 import { Binding, SIGN_IN } from "./binding.js";
 import { Grayboard } from "./rpc.js";
 import { RootInstructions, rewrite, type Fetcher, type Plan } from "./instructions.js";
+import { attachmentTools } from "./transfer-tools.js";
 
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean };
 type Invocation = { tool: string; sessionID: string; id: string };
@@ -205,6 +206,7 @@ export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = (
   });
   const before = await ctx.tool.hook("execute.before", event => controller.before(event));
   const after = await ctx.tool.hook("execute.after", event => controller.after(event).catch(() => controller.backgroundFailure("after")));
+  const transfers = await attachmentTools(ctx, controller);
   const events = new AbortController();
   const listening = observeEvents(
     () => ctx.event.subscribe({ signal: events.signal }),
@@ -232,6 +234,7 @@ export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = (
     await listening;
     await before.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
     await after.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
+    await transfers.dispose().catch(() => controller.backgroundFailure("hook_dispose"));
     await rpc.dispose().catch(() => controller.backgroundFailure("rpc_dispose"));
     await controller.flushDiagnostics();
   };

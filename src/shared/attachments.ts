@@ -311,9 +311,10 @@ export async function saveTarget(
   roots: string[],
   bus: string,
   env: Record<string, string | undefined> = process.env,
+  cwd = process.cwd(),
 ): Promise<string> {
   if (dir !== undefined && typeof dir !== "string") throw new CoreError("dir must be a string");
-  if (dir !== undefined) return checkSaveDir(dir, roots);
+  if (dir !== undefined) return checkSaveDir(dir, roots, cwd);
   const target = join(attachmentsDir(env), bus);
   await mkdir(target, { recursive: true, mode: 0o700 });
   return target;

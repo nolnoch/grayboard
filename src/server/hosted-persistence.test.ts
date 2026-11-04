@@ -180,7 +180,9 @@ test("successful new and idempotent registration refresh activity but refusals d
   const active = now;
   now += 1_001;
   hosted.sweep();
-  expect(database.repo.hosted.all()).toHaveLength(3);
+  // The root and "second" stay active; "first", idle since its registration, is parked (#566).
+  expect(database.repo.hosted.all()).toHaveLength(2);
+  expect(database.repo.hosted.children(id)).toHaveLength(2);
   await hosted.bind(p, context(p, "blocked"), { name: "blocked", create: true });
   await expect(hosted.register(second.principal, context(second.principal), "blocked")).rejects.toMatchObject({ code: "child_bound" });
   expect(database.repo.hosted.get(id)?.last_seen_at).toBe(active);
