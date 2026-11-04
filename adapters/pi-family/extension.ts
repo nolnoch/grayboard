@@ -101,7 +101,7 @@ export const COMMAND = {
 // /fork carries, the live session files (file → root id), and per root
 // session the stable ids of items it admitted, which a /reload keeps (the
 // lease stays) while the Controller's own admission set doesn't outlive it.
-type Shared = { carried?: string[]; live: Map<string, string>; admitted: Map<string, Set<string>>; signIn?: Flow; voice?: Voice };
+type Shared = { carried?: string[]; live: Map<string, string>; admitted: Map<string, Set<string>>; signIn?: Flow; voice?: Voice; interactive?: boolean };
 // A runtime's notice line and delivery restart. The slot's `voice` is the
 // latest root runtime started in this process (pi's one session, omp's main
 // session): a flow outlives the runtime that started it (a /new, /fork,
@@ -238,7 +238,8 @@ export function createGrayboard(h: Harness): Grayboard {
         const current = speaker();
         flow.saidBy = current;
         current.log("signed in");
-        await Promise.all([...new Set([voice, current])].map(v => v.restart()));
+        // A restart that fails is said; the credential watch tries again.
+        await Promise.all([...new Set([voice, current])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
       },
       error => {
         flow.failed = abort.signal.aborted ? "sign-in cancelled" : message(error);
@@ -253,13 +254,18 @@ export function createGrayboard(h: Harness): Grayboard {
     });
     return flow;
   };
+  // Whether this process outlives a browser round trip. A root's own mode;
+  // any other runtime takes its process's root's, since omp starts in-process
+  // task subagents without a mode (so they read "print"). A pi subagent is its
+  // own process with no root: its own mode (print) decides.
+  const interactive = () => role.kind === "root" ? h.interactive() : state.interactive ?? h.interactive();
   // A signed-out call's notice: the URL to open (waiting up to LINK_MS for
   // the flow to reach one), else why there is none. Only an expired or
   // missing grant offers; a transient failure goes to the call. Never where
   // the process exits before the browser could answer (print or json mode).
   const offer = async (): Promise<string | undefined> => {
     try { await login!.token(); return undefined; }
-    catch (error) { if (!accessExpiry(error) || !h.interactive()) return undefined; }
+    catch (error) { if (!accessExpiry(error) || !interactive()) return undefined; }
     const flow = signIn(false);
     if (!flow) return undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -274,7 +280,7 @@ export function createGrayboard(h: Harness): Grayboard {
 
   // ---- tools ----
 
-  const call =(tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+  const call = (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
     const running = dispatch(tool, args);
     inflight.add(running);
     const settled = () => { inflight.delete(running); };
@@ -387,6 +393,7 @@ export function createGrayboard(h: Harness): Grayboard {
     }
     state.live.set(s.file ?? `id:${s.id}`, s.id);
     state.voice = voice;
+    state.interactive = h.interactive();
     const carried = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
     state.carried = undefined;
     const id = s.id;
@@ -417,7 +424,9 @@ export function createGrayboard(h: Harness): Grayboard {
     if (closed) return;
     closed = true;
     // A pending sign-in's loopback listener must not hold the exiting process open.
-    if (reason === "quit") state.signIn?.abort.abort();
+    // Only the current root's quit is the process's: omp quits each in-process
+    // subagent runtime when it parks, and that must not end the user's sign-in.
+    if (reason === "quit" && state.voice === voice) state.signIn?.abort.abort();
     if (state.voice === voice) state.voice = undefined;
     const id = session?.id;
     if (session) state.live.delete(session.file ?? `id:${session.id}`);
@@ -503,6 +512,8 @@ export function createGrayboard(h: Harness): Grayboard {
         if (flow === pending) {
           flow.browser = true;
           if (flow.url) { log(`sign in at ${flow.url}`); browse(flow.url); }
+          // Waiting behind another process's flow: say so again, not silence.
+          else if (flow.elsewhere) log(`${flow.elsewhere}; finish it there`);
         }
         await flow.done;
         // The flow said its outcome here and restarted this runtime already.
