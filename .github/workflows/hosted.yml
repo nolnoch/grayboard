@@ -8,7 +8,7 @@ on:
         type: string
         default: ""
       skip:
-        description: "true: run no suite, and Hosted required passes (a pin-only PR, test.yml)"
+        description: "true: run no suite, and Hosted required passes (a pin-only or docs-only PR, test.yml)"
         type: boolean
         default: false
 
@@ -68,7 +68,7 @@ jobs:
           if [ "$RESULT" = success ]; then
             echo "Every hosted matrix leg passed."
           elif [ "$SKIP" = true ] && [ "$RESULT" = skipped ]; then
-            echo "The caller skipped the hosted matrix (a pin-only PR, #507); nothing to require."
+            echo "The caller skipped the hosted matrix (a pin-only or docs-only PR, #507, #601); nothing to require."
           else
             echo "::error::The hosted matrix result is '$RESULT', not success."
             exit 1

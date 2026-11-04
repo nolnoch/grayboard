@@ -20,7 +20,7 @@ Every harness (Claude Code, omp, opencode, pi) gets the same capabilities in eac
 
 ## Documentation
 
-[`docs/CONTRACT.md`](docs/CONTRACT.md) says which doc owns which concept and how docs stay current. `README.md` and [`docs/guide/`](docs/guide/) are for people using grayboard; the rest of `docs/` is design reference written for agents. When behavior changes, update the guide page that owns it, not the README.
+[`docs/CONTRACT.md`](docs/CONTRACT.md) says which doc owns which concept and how docs stay current. `README.md` and [`docs/guide/`](docs/guide/) are for people using grayboard; the rest of `docs/` is design reference written for agents. When behavior changes, update the guide page that owns it, not the README. A PR that changes only docs skips the test suites in CI and runs a link check instead, so every relative link and `#anchor` must resolve.
 
 ## Build and test
 

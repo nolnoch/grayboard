@@ -16,13 +16,17 @@ concurrency:
 
 jobs:
   # A PR whose only change is .claude-plugin/marketplace.json (the release's
-  # plugin-pin PR) runs the pin check below instead of the suites (#507). The
-  # diff is of the run's own head commit against its base.
+  # plugin-pin PR) runs the pin check below instead of the suites (#507). A PR
+  # that changes only docs (files under docs/, or markdown outside adapters/
+  # and plugins/, whose markdown ships in packages) runs the doc link check
+  # instead (#601). The diff is of the run's own head commit against its base;
+  # pushes and tags always run everything.
   scope:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       pin-only: ${{ steps.files.outputs.pin-only }}
+      docs-only: ${{ steps.files.outputs.docs-only }}
     steps:
       - if: github.event_name == 'pull_request'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,7 +41,7 @@ jobs:
         # A fork PR names its files, so they're printed with workflow
         # commands off: a name can't be read as one.
         run: |
-          pin=false
+          pin=false docs=false
           if [ -n "$HEAD" ]; then
             files="$(git diff --name-only "$BASE...$HEAD")"
             token="$(openssl rand -hex 16)"
@@ -45,10 +49,13 @@ jobs:
             printf '%s\n' "$files"
             echo "::$token::"
             [ "$files" = ".claude-plugin/marketplace.json" ] && pin=true
+            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '^docs/|^[^/]*\.md$|^(\.github|\.claude|tests)/.*\.md$'; then docs=true; fi
           fi
           echo "pin-only=$pin" | tee -a "$GITHUB_OUTPUT"
+          echo "docs-only=$docs" | tee -a "$GITHUB_OUTPUT"
 
-  # The required "test" check. On a pin-only PR it checks the pin instead:
+  # The required "test" check. On a docs-only PR it runs the doc link check.
+  # On a pin-only PR it checks the pin instead:
   # the marketplace tests, that the file is exactly the base's re-pinned to a
   # newer release (nothing else changed), and that the pinned tag is a
   # published, immutable release whose commit is the pinned sha.
@@ -61,6 +68,7 @@ jobs:
     timeout-minutes: 20
     env:
       PIN_ONLY: ${{ needs.scope.outputs.pin-only }}
+      SUITES: ${{ needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true' }}
     steps:
       - name: Scope decided
         env:
@@ -73,19 +81,23 @@ jobs:
 
       - uses: ./.github/actions/setup
         with:
-          node: ${{ env.PIN_ONLY != 'true' }}
-          release-cache: ${{ env.PIN_ONLY != 'true' }}
+          node: ${{ env.SUITES == 'true' }}
+          release-cache: ${{ env.SUITES == 'true' }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Typecheck
-        if: env.PIN_ONLY != 'true'
+        if: env.SUITES == 'true'
         run: bun run typecheck
 
       - name: Test
-        if: env.PIN_ONLY != 'true'
+        if: env.SUITES == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
         run: bun run test
+
+      - name: Doc links
+        if: needs.scope.outputs.docs-only == 'true'
+        run: bun test tests/integration/doc_links.test.ts
 
       - name: Marketplace tests
         if: env.PIN_ONLY == 'true'
@@ -118,7 +130,7 @@ jobs:
     if: ${{ !cancelled() }}
     uses: ./.github/workflows/hosted.yml
     with:
-      skip: ${{ needs.scope.outputs.pin-only == 'true' }}
+      skip: ${{ needs.scope.outputs.pin-only == 'true' || needs.scope.outputs.docs-only == 'true' }}
 
   # deploy/grayboard.service as systemd reads it. verify also checks that the
   # user, env file and binary it names exist, so stand-ins go in first. It
@@ -127,7 +139,7 @@ jobs:
   # A copy with an unknown key must fail, so the lint can't go quiet.
   deploy-lint:
     needs: scope
-    if: needs.scope.outputs.pin-only != 'true'
+    if: needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
