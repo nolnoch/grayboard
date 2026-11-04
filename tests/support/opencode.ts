@@ -1,6 +1,6 @@
 // Real local/V1 OpenCode, isolated from the user's config and talking to fake_model.ts.
 import { spawn } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { localEnv } from "./env.ts";
 import { CLI, ROOT } from "./paths.ts";
@@ -29,12 +29,13 @@ export type LocalOpenCode = {
   stop(): Promise<void>;
 };
 
-export async function localOpenCode(dir: string, modelPort: number): Promise<LocalOpenCode> {
+export async function localOpenCode(dir: string, modelPort: number, options: { identity?: string } = {}): Promise<LocalOpenCode> {
   const config = join(dir, "config"), oc = join(config, "opencode");
   mkdirSync(join(oc, "plugin"), { recursive: true });
   // No network-dependent package installation by the plugin loader.
   mkdirSync(join(oc, "node_modules/@opencode-ai"), { recursive: true });
-  symlinkSync(join(ROOT, "node_modules/@opencode-ai/plugin"), join(oc, "node_modules/@opencode-ai/plugin"), "dir");
+  const plugin = join(oc, "node_modules/@opencode-ai/plugin");
+  if (!existsSync(plugin)) symlinkSync(join(ROOT, "node_modules/@opencode-ai/plugin"), plugin, "dir");
   copyFileSync(join(ROOT, "adapters/opencode/grayboard.ts"), join(oc, "plugin/grayboard.ts"));
   writeFileSync(join(oc, "package.json"), JSON.stringify({ dependencies: { "@opencode-ai/plugin": VERSION } }));
   writeFileSync(join(oc, "opencode.json"), JSON.stringify({
@@ -45,7 +46,7 @@ export async function localOpenCode(dir: string, modelPort: number): Promise<Loc
   }));
   const proc = spawn(OPENCODE_CLI, ["serve", "--port", "0", "--hostname", "127.0.0.1"], {
     cwd: dir,
-    env: localEnv(dir, undefined, { XDG_CONFIG_HOME: config, XDG_DATA_HOME: join(dir, "data"), XDG_CACHE_HOME: join(dir, "cache"), XDG_STATE_HOME: join(dir, "state"), OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_AUTOUPDATE: "true" }),
+    env: localEnv(dir, options.identity, { XDG_CONFIG_HOME: config, XDG_DATA_HOME: join(dir, "data"), XDG_CACHE_HOME: join(dir, "cache"), XDG_STATE_HOME: join(dir, "state"), OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_AUTOUPDATE: "true" }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";

@@ -7,9 +7,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeSessions } from "../support/mcp.ts";
+import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
+import { startPi } from "../support/pi.ts";
 import {
   piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
-  piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piUnboundScenario,
+  piLocalCarryScenario, piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piUnboundScenario,
 } from "../support/pi.ts";
 
 let dir: string;
@@ -28,6 +30,12 @@ test("pi unbound: the session acts as its ID; two binds and an unbind through th
 test("pi local: a killed grayboard restarts with its bound name; calls wait through all three backoffs, delivery resumes, another exit gives up, and /new resets the count (#559)", () => piLocalRestartScenario(dir), 90_000);
 test("pi local: /new during a pending 5 s restart cancels the outgoing timer without a tool call and leaves only the new child's name hold (#559)", () => piLocalRestartShutdownScenario(dir), 60_000);
 test("pi local: /new aborts a tool awaiting the pending restart instead of waiting out the backoff (#559)", () => piLocalRestartShutdownScenario(dir, true), 60_000);
+test("pi local: /new and /fork use actual minted IDs; /resume restores the selected ordered holds rather than outgoing carry, including a remembered empty snapshot (#195)", () => piLocalCarryScenario(dir), 120_000);
+for (const kind of ["keyed", "human", "runner"] as const) {
+  test(`pi excluded local ${kind}: tools and /new retain excluded provenance (#195 audit 2)`, () =>
+    localAdapterExcludedScenario(dir, kind, "mcp__grayboard__", (port, procs, identity, env) =>
+      startPi(dir, port, procs, { identity, entry: { env: { BUS_PUSH: "off", ...env } } })), 90_000);
+}
 test("pi detached runner (#523 step 5): with no live parent it is its own session; with one it acts as the parent's child, writing as the parent's name with via, until a bind promotes it to its own session that receives, or the parent exits while it runs on", () => piRunnerScenario(dir), 180_000);
 test("pi: an enabled grayboard MCP entry makes the extension register nothing and say why", () => piReenabledScenario(dir), 60_000);
 test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);

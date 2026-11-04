@@ -37688,8 +37688,8 @@ ${record.message}`;
 }
 
 // src/shared/claude_agents.ts
-import { closeSync, constants as constants3, fstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
-import { join as join5 } from "path";
+import { closeSync, constants as constants3, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { join as join5, resolve as resolve3 } from "path";
 
 // src/shared/protocol.ts
 var SESSION_FACT_MAX = 64;
@@ -37764,12 +37764,14 @@ function takeRecord(base, claudePid, harnessStart, toolUseId) {
     return { missing: "absent" };
   }
   try {
-    const content = readFileSync4(taken, "utf8");
-    if (content === ROOT)
-      return { agent: null };
-    return validSourceId(content) ? { agent: content } : { missing: "bad_record" };
+    const content = JSON.parse(readFileSync4(taken, "utf8"));
+    if (content.agent !== null && (!validSourceId(content.agent) || content.agent === ROOT))
+      return { missing: "bad_record" };
+    if (content.session !== undefined && !validSourceId(content.session))
+      return { missing: "bad_record" };
+    return { agent: content.agent, ...content.session === undefined ? {} : { session: content.session } };
   } catch {
-    return { missing: "absent" };
+    return { missing: "bad_record" };
   } finally {
     try {
       unlinkSync(taken);
@@ -37779,10 +37781,16 @@ function takeRecord(base, claudePid, harnessStart, toolUseId) {
 function readSmall(path, max) {
   const fd = openSync(path, constants3.O_RDONLY | constants3.O_NOFOLLOW | constants3.O_NONBLOCK);
   try {
-    if (!fstatSync(fd).isFile())
+    const stat = fstatSync(fd);
+    if (!stat.isFile())
       throw new Error("not a regular file");
-    const buf = Buffer.alloc(max);
-    return buf.toString("utf8", 0, readSync(fd, buf, 0, max, 0));
+    if (stat.size > max)
+      throw new Error(`record exceeds ${max} bytes`);
+    const buf = Buffer.alloc(max + 1);
+    const count = readSync(fd, buf, 0, buf.length, 0);
+    if (count > max)
+      throw new Error(`record exceeds ${max} bytes`);
+    return buf.toString("utf8", 0, count);
   } finally {
     closeSync(fd);
   }
@@ -37865,7 +37873,7 @@ async function testPauseAsync(point, env = process.env) {
 
 // src/shared/identity.ts
 import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
-import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve3 } from "path";
+import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve4 } from "path";
 
 // src/core/session_id.ts
 var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -37908,7 +37916,7 @@ function gitLocation(cwd) {
       if (statSync3(dotGit).isDirectory())
         return { repo: dir, worktree: null };
       const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
-      const gitdir = m ? resolve3(dir, m[1].trim()) : "";
+      const gitdir = m ? resolve4(dir, m[1].trim()) : "";
       if (!/[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitdir))
         return { repo: dir, worktree: null };
       const common = dirname4(dirname4(gitdir));
@@ -37928,7 +37936,7 @@ function gitBranch(cwd) {
         const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
         if (!m)
           return null;
-        gitdir = resolve3(dir, m[1].trim());
+        gitdir = resolve4(dir, m[1].trim());
       }
       const head = readFileSync5(join6(gitdir, "HEAD"), "utf8").trim();
       return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);

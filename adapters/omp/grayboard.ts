@@ -25,6 +25,7 @@ import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/route
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { cfgMcpEnableProjectConfig } from "@oh-my-pi/pi-coding-agent/mcp/settings";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { render, wakes, type ChannelParams } from "../hosted-core/src/channel.ts";
@@ -33,10 +34,11 @@ import { instructionHooks } from "../pi-family/omp-instructions.ts";
 type McpEntry = { command?: string; args?: string[]; env?: Record<string, string>; cwd?: string };
 type Tool = { name: string; description?: string; inputSchema: { type?: string; properties?: Record<string, unknown> }; _meta?: Record<string, unknown> };
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
-type Config = { cmd: string; args: string[]; env: Record<string, string | undefined>; cwd?: string; entryPath: string };
+type Config = { cmd: string; args: string[]; env: Record<string, string | undefined>; cwd?: string; entryPath: string; protocol: boolean };
 type Child = {
   proc: ChildProcess;
   ready: Promise<void>;
+  epoch: number;
   call(method: string, params: object, signal?: AbortSignal): Promise<unknown>;
 };
 
@@ -79,6 +81,11 @@ type Shared = {
   // Every live top-level runtime, and its agent id.
   mains?: Map<ExtensionAPI, string>;
   child?: Child;
+  ownerToken?: string;
+  selected?: { id: string; epoch: number; ctx: ExtensionContext };
+  epoch?: number;
+  transition?: Promise<void>;
+  calls?: Set<Promise<unknown>>;
   // Consecutive restarts, and the one waiting to start.
   restarts?: number;
   restart?: Promise<void>;
@@ -128,7 +135,13 @@ function config(agentDir: string): Config {
   const env: Record<string, string | undefined> = { ...process.env, ...entry?.env };
   delete env.BUS_PUSH;
   env.BUS_HARNESS = "omp";
-  return { cmd: cmd!, args, env, ...(typeof entry?.cwd === "string" ? { cwd: entry.cwd } : {}), entryPath };
+  // Modern mcp always runs locally, including on a signed-in machine;
+  // hosted extensions have a separate entry. Never send this protocol to an
+  // explicitly hosted command retained in a user's old entry.
+  const mode = args.findIndex(arg => arg === "--mode");
+  const local = !args.some(arg => arg === "--server" || arg.startsWith("--server=") || (arg.startsWith("--mode=") && arg !== "--mode=local")) && (mode < 0 || args[mode + 1] === "local");
+  const protocol = local && env.BUS_PARENT_SESSION === undefined && env.BUS_SESSION_KEY === undefined && env.BUS_HUMAN !== "1";
+  return { cmd: cmd!, args, env, ...(typeof entry?.cwd === "string" ? { cwd: entry.cwd } : {}), entryPath, protocol };
 }
 
 // The tool list `grayboard mcp` serves in the entry's mode, from the installed
@@ -291,11 +304,62 @@ export default function grayboard(pi: ExtensionAPI) {
     );
   };
 
+  const associate = async (call: Child["call"], selection: NonNullable<Shared["selected"]>, owner: string) => {
+    const result = await call("grayboard/session", { owner, epoch: selection.epoch, session: selection.id });
+    if (!isRecord(result) || typeof result.id !== "string" || result.session !== selection.id || result.epoch !== selection.epoch || !Array.isArray(result.instructions) || !result.instructions.every(value => typeof value === "string")) {
+      throw new Error("grayboard: invalid session transition acknowledgement");
+    }
+    if (shared.owner !== pi || shared.ownerToken !== owner || shared.selected !== selection) return;
+    shared.instructions = result.instructions.join(" ");
+    await call("grayboard/session/ready", { owner, epoch: selection.epoch });
+  };
+
+  // Calls stay concurrent; a selection closes admission synchronously, waits
+  // outgoing calls, then rotates the root in the retained MCP process.
+  const select = (ctx: ExtensionContext): Promise<void> => {
+    if (ctx.agent.kind !== "main" || shared.owner !== pi || !registered) return Promise.resolve();
+    const id = ctx.sessionManager.getSessionId();
+    if (shared.selected?.id === id) { shared.selected.ctx = ctx; return shared.transition ?? Promise.resolve(); }
+    const selection = { id, epoch: shared.epoch = (shared.epoch ?? 0) + 1, ctx };
+    shared.selected = selection;
+    const owner = shared.ownerToken!;
+    const previous = shared.transition;
+    const outgoing = [...(shared.calls ?? [])];
+    const transition = (previous ?? Promise.resolve()).catch(() => {}).then(async () => {
+      await Promise.allSettled(outgoing);
+      if (shared.owner !== pi || shared.ownerToken !== owner || shared.selected !== selection) return;
+      if (!shared.child && shared.restart) await shared.restart;
+      const c = shared.child;
+      if (!c) throw new Error(shared.exitReason ?? "grayboard: no grayboard process runs in this omp process");
+      await c.ready;
+      if (shared.owner !== pi || shared.ownerToken !== owner || shared.selected !== selection || shared.child !== c) return;
+      if (own.protocol && c.epoch !== selection.epoch) await associate(c.call, selection, owner);
+    });
+    shared.transition = transition;
+    transition.catch(() => {});
+    return transition;
+  };
+
+  const currentChild = async (): Promise<Child> => {
+    for (;;) {
+      const transition = shared.transition;
+      try { await transition; } catch (error) { if (transition === shared.transition) throw error; }
+      if (!shared.child && shared.restart) await shared.restart;
+      const c = shared.child;
+      if (!c) throw new Error(shared.exitReason ?? "grayboard: no grayboard process runs in this omp process");
+      await c.ready;
+      if (c === shared.child && transition === shared.transition) return c;
+    }
+  };
+
   // Started by the main session, not at load: until something can receive
   // them, messages wait in grayboard rather than in this process.
   const start = (ctx: ExtensionContext): Child => {
     const startedAt = Date.now();
-    const proc = spawn(own.cmd, own.args, { cwd: own.cwd ?? ctx.cwd, env: own.env, stdio: ["pipe", "pipe", "pipe"] });
+    const owner = shared.ownerToken!;
+    const selection = shared.selected!;
+    const env = { ...own.env, BUS_HARNESS_SESSION: selection.id, BUS_ADAPTER_OWNER: own.protocol ? owner : undefined };
+    const proc = spawn(own.cmd, own.args, { cwd: own.cwd ?? selection.ctx.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     const pending = new Map<number, PromiseWithResolvers<unknown>>();
     let next = 1;
     let gone: Error | undefined;
@@ -319,11 +383,15 @@ export default function grayboard(pi: ExtensionAPI) {
     // restarts the process (RESTART_DELAYS_MS); it takes its names back from
     // its name record, as a restart under the same harness does.
     const fail = (reason: string) => {
+      if (gone) return;
       gone = new Error(reason);
       for (const p of pending.values()) p.reject(gone);
       pending.clear();
       if (shared.child?.proc !== proc) return;
       shared.child = undefined;
+      shared.transition = undefined;
+      shared.instructions = undefined;
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
       if (Date.now() - startedAt >= STABLE_MS) shared.restarts = 0;
       const attempt = shared.restarts ?? 0;
       if (shared.owner !== pi || attempt >= RESTART_DELAYS_MS.length) {
@@ -336,7 +404,7 @@ export default function grayboard(pi: ExtensionAPI) {
       pi.logger.warn(`${reason}; restarting it (${attempt + 1} of ${RESTART_DELAYS_MS.length})`);
       shared.restart = Bun.sleep(RESTART_DELAYS_MS[attempt]!).then(() => {
         shared.restart = undefined;
-        if (shared.owner === pi && !shared.child) shared.child = start(ctx);
+        if (shared.owner === pi && shared.ownerToken === owner && !shared.child && shared.selected) shared.child = start(shared.selected.ctx);
       });
     };
     // JSON-RPC over stdio is LF-delimited; split on "\n" only (readline would
@@ -358,7 +426,16 @@ export default function grayboard(pi: ExtensionAPI) {
         const { id, params } = msg;
         if (msg.method === "notifications/claude/channel" && isRecord(params) && typeof params.content === "string") {
           const meta = isRecord(params.meta) ? Object.fromEntries(Object.entries(params.meta).filter((e): e is [string, string] => typeof e[1] === "string")) : {};
-          deliver({ content: params.content, meta });
+          const selected = shared.selected;
+          let accepted = shared.owner === pi && shared.ownerToken === owner && shared.child?.proc === proc && !!selected &&
+            selected.ctx.sessionManager.getSessionId() === selected.id &&
+            (!meta.grayboard_session || meta.grayboard_session === selected.id) &&
+            (!meta.grayboard_epoch || meta.grayboard_epoch === String(selected.epoch));
+          // Receipts bypass the transition barrier: MCP waits for them before
+          // ending the outgoing root. A rejected delivery remains durable.
+          try { if (accepted) deliver({ content: params.content, meta }); }
+          catch (error) { accepted = false; report(shared.selected?.ctx ?? ctx, `grayboard: couldn't deliver a channel notification: ${String(error)}`); }
+          if (meta.grayboard_delivery) void call("grayboard/delivery", { owner, token: meta.grayboard_delivery, accepted }).catch(error => pi.logger.error(String(error)));
         } else if (typeof id === "number" && pending.has(id)) {
           const p = pending.get(id)!;
           pending.delete(id);
@@ -389,17 +466,18 @@ export default function grayboard(pi: ExtensionAPI) {
       capabilities: {},
       clientInfo: { name: "omp-grayboard", version: "1" },
     }).then(async (init) => {
-      if (isRecord(init) && typeof init.instructions === "string") shared.instructions = init.instructions;
+      if (shared.owner === pi && shared.ownerToken === owner && shared.selected === selection && isRecord(init) && typeof init.instructions === "string") shared.instructions = init.instructions;
       send({ method: "notifications/initialized" });
       const listed = await call("tools/list", {});
       const served = isRecord(listed) && Array.isArray(listed.tools) ? listed.tools : [];
       const diff = toolDiff(tools, served);
       if (diff.length) report(ctx, `grayboard: the running grayboard serves different tools than \`grayboard tools\` listed at load: ${diff.join(", ")}`);
+      if (own.protocol && shared.owner === pi && shared.ownerToken === owner && shared.selected === selection) await associate(call, selection, owner);
     });
     // A call that awaits ready gets the failure; this only keeps an unawaited
     // rejection from crashing omp when no call is waiting.
     ready.catch(() => {});
-    return { proc, ready, call };
+    return { proc, ready, call, epoch: selection.epoch };
   };
 
   // In every runtime: the main session's calls go out as its own; a
@@ -422,22 +500,31 @@ export default function grayboard(pi: ExtensionAPI) {
           const sub = ctx.agent.kind !== "main";
           // Checked per call too: a top-level session sharing the owner's agent id may have started since.
           if (sub && !ownersSubagent(ctx.agent.parentId)) throw new Error(NOT_OWNERS);
-          if (!shared.child && shared.restart) await shared.restart;
-          const c = shared.child;
-          if (!c) throw new Error(shared.exitReason ?? "grayboard: no grayboard process runs in this omp process");
-          await c.ready;
-          const result = callResult(await c.call("tools/call", {
+          const args = await resolveUrls(isRecord(params) ? params : {}, ctx);
+          let c: Child;
+          let selection: Shared["selected"];
+          let transition: Shared["transition"];
+          do {
+            selection = shared.selected;
+            transition = shared.transition;
+            c = await currentChild();
+          } while (selection !== shared.selected || transition !== shared.transition || c !== shared.child);
+          if ((!sub && shared.owner !== pi) || (sub && !ownersSubagent(ctx.agent.parentId))) throw new Error(NOT_OWNERS);
+          if (!sub && selection?.id !== ctx.sessionManager.getSessionId()) throw new Error("grayboard: the selected omp conversation changed before this call");
+          const call = c.call("tools/call", {
             name: tool.name,
-            arguments: await resolveUrls(isRecord(params) ? params : {}, ctx),
+            arguments: args,
             ...(sub ? { _meta: { [AGENT_META]: ctx.sessionManager.getSessionId() } } : {}),
-          }, signal));
+          }, signal);
+          (shared.calls ??= new Set()).add(call);
+          const result = callResult(await call.finally(() => shared.calls!.delete(call)));
           if (result.isError && !result.content.some((b) => b.type === "text" && b.text)) {
             result.content.push({ type: "text", text: `MCP tool ${SERVER}/${tool.name} returned an error` });
           }
           // A main session's result carries the instructions when its names
           // changed (#182 decision 13): bind's, the next one's after a bind
           // whose result was lost, or a lost name's. A child's never does.
-          if (!sub && result.instructions) shared.instructions = result.instructions.join(" ");
+          if (!sub && shared.owner === pi && shared.child === c && shared.selected === selection && result.instructions) shared.instructions = result.instructions.join(" ");
           return { content: result.content, details: { server: SERVER, tool: tool.name }, ...(result.isError ? { isError: true as const } : {}) };
         },
       });
@@ -466,21 +553,29 @@ export default function grayboard(pi: ExtensionAPI) {
         : "grayboard: another top-level session in this omp process runs grayboard; this one and its subagents register no grayboard tools and receive nothing");
     }
     shared.owner = pi;
+    shared.ownerToken = randomUUID();
     shared.verdict = secondGrayboard(ctx.cwd, own);
     const refused = await shared.verdict;
     if (refused) return report(ctx, refused);
     register();
     shared.exitReason = undefined;
     shared.restarts = 0;
+    shared.selected = { id: ctx.sessionManager.getSessionId(), epoch: shared.epoch = (shared.epoch ?? 0) + 1, ctx };
+    shared.transition = undefined;
     shared.child = start(ctx);
+  });
+
+  pi.on("session_switch", async (_event, ctx) => { await select(ctx); });
+  pi.on("session_branch", async (_event, ctx) => {
+    if (shared.selected?.id !== ctx.sessionManager.getSessionId()) await select(ctx);
   });
 
   // The instructions tell the model what a <channel> message is; only the
   // main session receives any, so a subagent gets none. A prompt sent as omp
   // starts can beat the grayboard process's initialize; the first turn waits.
   pi.on("before_agent_start", async (event, ctx) => {
-    if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
-    await shared.child?.ready.catch(() => {});
+    if (!registered || ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    await currentChild();
     return hooks.beforeAgentStart(event);
   });
 
@@ -488,11 +583,13 @@ export default function grayboard(pi: ExtensionAPI) {
   // push-started turn after bind sees the current names, and a rebuilt base
   // prompt gets them as a hidden message, last for Anthropic's cache boundary.
   pi.on("context", async (event, ctx) => {
-    if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    if (!registered || ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    await currentChild();
     return hooks.context(event, ctx);
   });
   pi.on("before_provider_request", async (event, ctx) => {
-    if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    if (!registered || ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    await currentChild();
     return hooks.beforeProviderRequest(event, ctx);
   });
 
@@ -503,6 +600,10 @@ export default function grayboard(pi: ExtensionAPI) {
     if (shared.owner !== pi) return;
     const c = shared.child;
     shared.owner = undefined;
+    shared.ownerToken = undefined;
+    shared.selected = undefined;
+    shared.transition = undefined;
+    shared.instructions = undefined;
     shared.verdict = undefined;
     shared.child = undefined;
     shared.restart = undefined;

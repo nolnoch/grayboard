@@ -5,7 +5,10 @@ import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalTaskScenario } from "../support/omp.ts";
+import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalTaskScenario } from "../support/omp.ts";
+import { installLocal, startLocalOmp } from "../support/omp.ts";
+import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
+import { closeSessions } from "../support/mcp.ts";
 
 let dir: string;
 
@@ -13,7 +16,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-omp-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await closeSessions();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -35,6 +39,15 @@ test("omp local: an enabled MCP server omp would run beside the adapter's graybo
 
 test("omp local: a repo's disabled .omp/mcp.json grayboard entry pins the name an omp session with no BUS_IDENTITY suggests and binds (#523)", () => ompLocalPinScenario(dir), 120_000);
 
-test("omp local: a push-started bind reaches the next request's instructions without a user prompt; a killed grayboard process restarts and takes its names back; /new keeps the process and names, injecting instructions in a push-started turn; a local:// attachment resolves and the user entry's ${VAR} expands (#523, #552)", () => ompLocalCarryScenario(dir), 120_000);
+test("omp local: a push-started bind refreshes instructions; a killed child restarts with its names; /new retains the child but rotates the bus root under its actual conversation ID; a local:// attachment resolves (#523, #552, #195)", () => ompLocalCarryScenario(dir), 120_000);
+
+test("omp local: /new, /fork and /resume rotate actual conversation roots without restarting the child; selected ordered holds and empty snapshots beat outgoing carry; crash restart uses the selected ID (#195)", () => ompLocalResumeScenario(dir), 120_000);
+for (const kind of ["keyed", "human", "runner"] as const) {
+  test(`omp excluded local ${kind}: tools and /new retain excluded provenance (#195 audit 2)`, () =>
+    localAdapterExcludedScenario(dir, kind, "mcp__grayboard_", (port, procs, identity, env) => {
+      installLocal(dir, port);
+      return startLocalOmp(dir, dir, procs, identity, env);
+    }), 90_000);
+}
 
 test("omp local, ACP: of two top-level sessions in one omp process, the first runs grayboard and the second is refused; while both live, no subagent of either gets grayboard tools, so none acts as the first session's names (#523, #470)", () => ompLocalAcpScenario(dir), 120_000);

@@ -25,6 +25,7 @@
 // client doesn't serve a second set of the same tools.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -82,7 +83,7 @@ delete ENV.BUS_PUSH;
 // child this one is: that session's adapter gives its own child the same id
 // (BUS_HARNESS_SESSION, below). The hosted entry reads the same marker
 // (adapters/pi-family/entry-pi.ts).
-const PARENT_SESSION = process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_SUBAGENT_PARENT_SESSION || undefined : undefined;
+const PARENT_SESSION = (process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_SUBAGENT_PARENT_SESSION || undefined : undefined) ?? (ENV.BUS_PARENT_SESSION || undefined);
 
 // The file whose entry pi's own MCP client would run, if one does: its tools
 // would collide with these by name (pi warns, and the last registration wins),
@@ -159,6 +160,12 @@ export default function grayboard(pi: ExtensionAPI) {
   let instructions: string | undefined;
   let registered = false;
   let refused: string | undefined;
+  const owner = randomUUID();
+  const mode = ARGS.indexOf("--mode");
+  const local = !ARGS.some(arg => arg === "--server" || arg.startsWith("--server=") || (arg.startsWith("--mode=") && arg !== "--mode=local")) && (mode < 0 || ARGS[mode + 1] === "local");
+  const protocol = local && PARENT_SESSION === undefined && ENV.BUS_SESSION_KEY === undefined && ENV.BUS_HUMAN !== "1";
+  let epoch = 0;
+  let selected: { id: string; epoch: number; ctx: ExtensionContext } | undefined;
 
   const deliver = (params: ChannelParams) => {
     // Direct messages, mentions, thread replies: act on them (starts a turn
@@ -180,10 +187,11 @@ export default function grayboard(pi: ExtensionAPI) {
   // messages wait in grayboard rather than in this process.
   const start = (ctx: ExtensionContext): Child => {
     const startedAt = Date.now();
+    const selection = selected!;
     // The session's own id, which its subagent runners' children find it by,
     // and the launching session's id in a runner; set (or cleared) per start,
     // since /new, /resume and fork change the id.
-    const env = { ...ENV, BUS_HARNESS_SESSION: ctx.sessionManager.getSessionId(), BUS_PARENT_SESSION: PARENT_SESSION };
+    const env = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: PARENT_SESSION, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
     const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "inherit"] });
     const pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
     let next = 1;
@@ -233,7 +241,7 @@ export default function grayboard(pi: ExtensionAPI) {
       const waiter = Promise.withResolvers<void>();
       const timer = setTimeout(() => {
         restart = undefined;
-        child = start(ctx);
+        if (selected === selection) child = start(selection.ctx);
         waiter.resolve();
       }, RESTART_DELAYS_MS[attempt]);
       restart = {
@@ -261,7 +269,14 @@ export default function grayboard(pi: ExtensionAPI) {
           continue;
         }
         if (msg.method === "notifications/claude/channel") {
-          deliver(msg.params as ChannelParams);
+          const params = msg.params as ChannelParams;
+          const meta = params.meta ?? {};
+          let accepted = child?.proc === proc && selected === selection && selection.ctx.sessionManager.getSessionId() === selection.id &&
+            (!meta.grayboard_session || meta.grayboard_session === selection.id) &&
+            (!meta.grayboard_epoch || meta.grayboard_epoch === String(selection.epoch));
+          try { if (accepted) deliver(params); }
+          catch (error) { accepted = false; report(ctx, `grayboard: couldn't deliver a channel notification: ${String(error)}`); }
+          if (meta.grayboard_delivery) void call("grayboard/delivery", { owner, token: meta.grayboard_delivery, accepted }).catch(error => report(ctx, String(error)));
         } else if (msg.id !== undefined && pending.has(msg.id)) {
           const p = pending.get(msg.id)!;
           pending.delete(msg.id);
@@ -281,11 +296,18 @@ export default function grayboard(pi: ExtensionAPI) {
       capabilities: {},
       clientInfo: { name: "pi-grayboard", version: "1" },
     }).then(async (result: { instructions?: string }) => {
-      instructions = result.instructions;
+      if (selected === selection) instructions = result.instructions;
       send({ method: "notifications/initialized" });
       const served = ((await call("tools/list", {})) as { tools: Tool[] }).tools;
       const diff = toolDiff(tools, served);
       if (diff.length) report(ctx, `grayboard: the running grayboard serves different tools than \`grayboard tools\` listed at load: ${diff.join(", ")}`);
+      if (protocol && selected === selection) {
+        const result = await call("grayboard/session", { owner, epoch: selection.epoch, session: selection.id });
+        if (result?.session !== selection.id || result?.epoch !== selection.epoch || typeof result?.id !== "string" || !Array.isArray(result?.instructions) || !result.instructions.every((value: unknown) => typeof value === "string")) throw new Error("grayboard: invalid session transition acknowledgement");
+        if (selected !== selection) return;
+        instructions = result.instructions.join(" ");
+        await call("grayboard/session/ready", { owner, epoch: selection.epoch });
+      }
     });
     // A call that awaits ready gets the failure; this only keeps an unawaited
     // rejection from crashing pi when no call is waiting.
@@ -307,7 +329,9 @@ export default function grayboard(pi: ExtensionAPI) {
           if (!child && exitReason) throw new Error(exitReason);
           child ??= start(ctx);
           const c = child;
+          const selection = selected;
           await waitReady(c.ready, signal);
+          if (child !== c || selected !== selection) throw new Error("grayboard: the selected pi conversation changed before this call");
           const result = (await c.call("tools/call", { name: tool.name, arguments: params ?? {} }, signal)) as CallResult;
           const content = (result.content ?? []).filter((b) => b.type === "text" || b.type === "image");
           if (result.isError && !content.some((b) => b.type === "text" && b.text)) {
@@ -316,16 +340,21 @@ export default function grayboard(pi: ExtensionAPI) {
           // A result carries the instructions when the name changed (#182
           // decision 13): bind's, or the next one after a bind whose result
           // was lost (cancelled, timed out) or a lost name. Errors included.
-          if (result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
+          if (child === c && selected === selection && result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
           return { content, details: { server: SERVER, tool: tool.name }, ...(result.isError ? { isError: true } : {}) };
         },
       });
     }
   };
 
-  pi.on("session_start", async (_event, ctx) => {
-    // Registered once per session's extension instance; pi reloads it for
-    // /new, /resume and fork.
+  pi.on("session_start", async (event, ctx) => {
+    // pi restarted this extension and its child before new/resume/fork.
+    // The selected conversation's actual ID, not its outgoing process, owns
+    // restoration; the MCP startup chooses its snapshot before PID carry.
+    if (["new", "resume", "fork"].includes(event.reason)) restarts = 0;
+    const id = ctx.sessionManager.getSessionId();
+    if (selected?.id === id) selected.ctx = ctx;
+    else selected = { id, epoch: ++epoch, ctx };
     if (!registered && !refused) {
       const path = enabledEntry(ctx);
       if (path) {
@@ -344,6 +373,7 @@ export default function grayboard(pi: ExtensionAPI) {
   // they're what tells the model what a <channel> message is. A prompt sent
   // as pi starts can beat the child's initialize; the first turn waits for it.
   pi.on("before_agent_start", async (event) => {
+    await restart?.ready;
     await child?.ready.catch(() => {});
     if (instructions) event.systemPromptOptions.sections.grayboard = instructions;
   });
@@ -354,6 +384,8 @@ export default function grayboard(pi: ExtensionAPI) {
     // /new, /resume, fork and quit must not leave a backoff that can spawn
     // a child for the outgoing session after the next session starts.
     restart?.cancel();
+    selected = undefined;
+    instructions = undefined;
     const c = child;
     if (!c) return;
     child = undefined;

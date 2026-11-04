@@ -75,8 +75,9 @@ function parse(text: string): NameRecord | null {
  * The record for `harnessPid` on `bus`, if its harness is still the process
  * that wrote it. A stale or unreadable record is deleted; one for another bus,
  * or one whose harness start time can't be read now, is kept and ignored.
+ * `prune:false` is a read-only lookup (the transcript-title hook must not reap records).
  */
-export function freshRecord(dir: string, harnessPid: number, bus: string): NameRecord | null {
+export function freshRecord(dir: string, harnessPid: number, bus: string, o: { prune?: boolean } = {}): NameRecord | null {
   const path = recordPath(dir, harnessPid);
   let text: string;
   try {
@@ -88,7 +89,7 @@ export function freshRecord(dir: string, harnessPid: number, bus: string): NameR
   const start = procStart(harnessPid);
   if (start === null) return null;
   if (!r || r.harness_pid !== harnessPid || start !== r.harness_start) {
-    rm(path);
+    if (o.prune !== false) rm(path);
     return null;
   }
   return r.bus === bus ? { ...r, session_id: asSessionId(r.session_id) } : null;

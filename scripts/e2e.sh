@@ -26,9 +26,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 case "${1:-}" in
-  upgrade-matrix | binaries | claude-hosted | claude-local | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
+  upgrade-matrix | binaries | claude-hosted | claude-local | local-resume | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
   *)
-    echo "usage: $0 upgrade-matrix|binaries|claude-hosted|claude-local|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
+    echo "usage: $0 upgrade-matrix|binaries|claude-hosted|claude-local|local-resume|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
     exit 2
     ;;
 esac
@@ -104,5 +104,8 @@ case "$suite" in
     ;;
   claude-local)
     if suite_run claude-local ./tests/e2e/claude_local.e2e.ts; then verdict "passed"; else verdict "failed (claude-local.log in the run dir)"; fi
+    ;;
+  local-resume)
+    if suite_run local-resume ./tests/e2e/local_resume.e2e.ts; then verdict "passed"; else verdict "failed (local-resume.log in the run dir)"; fi
     ;;
 esac

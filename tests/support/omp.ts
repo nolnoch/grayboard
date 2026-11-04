@@ -355,7 +355,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 // omp's own MCP client runs no grayboard (#523). The entry's BUS_DB_PATH is a
 // `${VAR}` placeholder the adapter expands as omp's loader does: unexpanded,
 // grayboard would open another bus and every row a scenario reads would be missing.
-function installLocal(dir: string, modelPort: number): void {
+export function installLocal(dir: string, modelPort: number): void {
   const agentDir = agentDirOf(dir);
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
   writeFileSync(join(agentDir, "extensions", "grayboard.ts"), LOCAL_BUNDLE);
@@ -366,8 +366,8 @@ function installLocal(dir: string, modelPort: number): void {
 }
 
 // `identity`: the BUS_IDENTITY it runs with; null runs without one.
-function startLocalOmp(dir: string, cwd: string, procs: ChildProcess[], identity: string | null = "omp-local", extra: Record<string, string> = {}): Pi {
-  const proc = spawn(process.execPath, [OMP_CLI, ...OMP_ARGS, "--no-session"], {
+export function startLocalOmp(dir: string, cwd: string, procs: ChildProcess[], identity: string | null = "omp-local", extra: Record<string, string> = {}, { persist = false, session }: { persist?: boolean; session?: string } = {}): Pi {
+  const proc = spawn(process.execPath, [OMP_CLI, ...OMP_ARGS, ...(persist ? [] : ["--no-session"]), ...(session ? ["--resume", session] : [])], {
     cwd, env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDirOf(dir), OMP_TEST_BUS: join(dir, "bus.db"), ...extra }), stdio: ["pipe", "pipe", "pipe"],
   });
   procs.push(proc);
@@ -377,6 +377,83 @@ function startLocalOmp(dir: string, cwd: string, procs: ChildProcess[], identity
 function localRows<T>(dir: string, sql: string, ...args: string[]): T[] {
   using db = new Database(join(dir, "bus.db"), { readonly: true });
   return db.query<T, string[]>(sql).all(...args);
+}
+
+// /resume restores its own ordered holds; /new and /fork only seed absent
+// snapshots, and a remembered [] stays unbound under the retained child.
+export function ompLocalResumeScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("bind", [
+        { tool: PREFIX + "bind", args: { name: "omp-one", create: true } },
+        { tool: PREFIX + "bind", args: { name: "omp-two", create: true } },
+      ]),
+      scripted("empty", [
+        { tool: PREFIX + "unbind", args: { name: "omp-one" } },
+        { tool: PREFIX + "unbind", args: { name: "omp-two" } },
+      ]),
+      scripted("change", [
+        { tool: PREFIX + "bind", args: { name: "omp-three", create: true } },
+        { tool: PREFIX + "unbind", args: { name: "omp-one" } },
+      ]),
+      scripted("who", [{ tool: PREFIX + "whoami", args: {} }]),
+    ]);
+    try {
+      installLocal(dir, model.port);
+      const omp = startLocalOmp(dir, dir, procs, null, {}, { persist: true });
+      const original = await omp.command({ type: "get_state" }, 30_000);
+      await omp.command({ type: "prompt", message: "bind" });
+      await idle(omp);
+      const [child] = grayboardChildPids(omp.pid);
+      expect(child).toBeDefined();
+      const inspect = async (aliases: string[], expectedChild = child) => {
+        const nth = (await omp.messages()).filter(m => m.role === "toolResult" && m.toolName === PREFIX + "whoami").length;
+        await omp.command({ type: "prompt", message: "who" });
+        const result = await toolResult(omp, "whoami", nth);
+        expect(!!result.isError).toBe(false);
+        await idle(omp);
+        const who = JSON.parse(resultText(result));
+        expect(who.aliases).toEqual(aliases);
+        const state = await omp.command({ type: "get_state" });
+        expect(localRows<{ harness_session: string }>(dir, "SELECT harness_session FROM ids WHERE id = ?", who.id)[0]?.harness_session).toBe(state.sessionId);
+        expect(grayboardChildPids(omp.pid)).toEqual([expectedChild!]);
+        return who.id as string;
+      };
+      const firstRoot = await inspect(["omp-one", "omp-two"]);
+      await omp.command({ type: "new_session" });
+      const empty = await omp.command({ type: "get_state" });
+      expect(empty.sessionId).not.toBe(original.sessionId);
+      expect(await inspect(["omp-one", "omp-two"])).not.toBe(firstRoot);
+      expect(localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id = ?", firstRoot)[0]?.ended_at).not.toBeNull();
+      await omp.command({ type: "prompt", message: "empty" });
+      await idle(omp);
+      await inspect([]);
+      await omp.command({ type: "switch_session", sessionPath: original.sessionFile });
+      await inspect(["omp-one", "omp-two"]);
+      expect((await omp.command({ type: "fork" })).cancelled).toBe(false);
+      const fork = await omp.command({ type: "get_state" });
+      expect([original.sessionId, empty.sessionId]).not.toContain(fork.sessionId);
+      await inspect(["omp-one", "omp-two"]);
+      await omp.command({ type: "prompt", message: "change" });
+      await idle(omp);
+      await inspect(["omp-two", "omp-three"]);
+      await omp.command({ type: "switch_session", sessionPath: original.sessionFile });
+      await inspect(["omp-one", "omp-two"]);
+      await omp.command({ type: "switch_session", sessionPath: empty.sessionFile });
+      await inspect([]);
+      // A crash after switching restarts under the selected, not startup, ID.
+      await sigkill(child!);
+      const replacement = await until(() => grayboardChildPids(omp.pid).find(pid => pid !== child), 15_000, "grayboard restarted under the selected conversation");
+      await inspect([], replacement);
+      expect(model.unhandled).toEqual([]);
+      expect(omp.events.filter(e => e.type === "extension_error")).toEqual([]);
+      await omp.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
 }
 
 // A local task run (#523, #526). omp runs task subagents in-process, each
@@ -574,11 +651,11 @@ export function ompLocalPinScenario(dir: string): Promise<void> {
 // A local omp session keeps its grayboard and its name (#523). A push-started
 // bind changes the next request's instructions without a new user prompt (#552).
 // A grayboard process that dies is restarted, as omp's MCP manager restarted
-// a stdio server, and binds the name back from its name record. /new keeps the
-// process, session and name, and a push-started turn after it gets the
-// instructions as a hidden message, since omp rebuilt the system prompt
-// without them. A file-backed omp URL in an argument (local://) reaches
-// grayboard as the path behind it, as omp's MCP client sent it.
+// a stdio server, and binds the names back. /new keeps the process, rotates
+// its bus root under the actual conversation ID, and carries names only when
+// the selected conversation has no snapshot. A push-started turn receives
+// refreshed instructions even after omp rebuilds its prompt. A local:// URL
+// reaches grayboard as its underlying file path.
 export function ompLocalCarryScenario(dir: string): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
@@ -601,12 +678,13 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
       installLocal(dir, model.port);
       peer = await localSession(dir, "peer");
       const omp = startLocalOmp(dir, dir, procs, null, { TMPDIR: tmp, BUS_ATTACH_ROOTS: tmp });
-      await omp.command({ type: "get_state" }, 30_000);
+      const initial = await omp.command({ type: "get_state" }, 30_000);
       const holder = () => localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-carry'")[0]?.id;
       await omp.command({ type: "prompt", message: "bind" });
       await idle(omp);
       const first = holder()!;
       expect(first).toBeDefined();
+      expect(localRows<{ harness_session: string }>(dir, "SELECT harness_session FROM ids WHERE id = ?", first)[0]?.harness_session).toBe(initial.sessionId);
 
       await omp.command({ type: "prompt", message: "attach" });
       await idle(omp);
@@ -636,14 +714,18 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
       expect(who).not.toContain("error");
       expect(who).toContain("omp-carry");
 
-      // /new: the same process, session and name; a DM's push-started turn carries the instructions once, as a hidden message.
+      // /new retains the process, not its old bus root; a push-started turn carries the refreshed instructions.
       const [live] = grayboardChildPids(omp.pid);
       await omp.command({ type: "new_session" });
+      const fresh = await omp.command({ type: "get_state" });
+      expect(fresh.sessionId).not.toBe(initial.sessionId);
       const ping = (await peer.call("dm_send", { to: "omp-carry", body: "ping" })).message_id as number;
       await until(() => peer!.pushes.some((p) => p.content === "pong"), 60_000, "pong at peer");
       await idle(omp);
       expect(grayboardChildPids(omp.pid)).toEqual([live!]);
-      expect(holder()).toBe(restarted);
+      expect(holder()).not.toBe(restarted);
+      expect(localRows<{ harness_session: string }>(dir, "SELECT harness_session FROM ids WHERE id = ?", holder()!)[0]?.harness_session).toBe(fresh.sessionId);
+      expect(localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id = ?", restarted)[0]?.ended_at).not.toBeNull();
       const instructions = `You are identity "omp-carry" on the grayboard bus`;
       const carrying = model.requests.filter((r) => r.body.messages.some((m) => messageText(m).includes(`message_id="${ping}"`)));
       expect(carrying.length).toBeGreaterThan(0);

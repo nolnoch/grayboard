@@ -232,6 +232,8 @@ export function initCoreSchema(db: Database): void {
   // audited id.reused rather than registering silently. Unkeyed IDs are
   // random and never come back, so they leave none.
   if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
+  // Local conversation restore is opt-in; runner promotion never changes provenance.
+  if (!idCols.has("local_resume")) db.exec(`ALTER TABLE ids ADD COLUMN local_resume INTEGER NOT NULL DEFAULT 0`);
   // Metadata (#284 S12). An ID's model and effort are what it reported:
   // at launch in local mode (BUS_MODEL, BUS_EFFORT), the latest on its requests
   // when hosted (#364), display facts that end with the session. An alias's task, owner, source_board, spec_hash and

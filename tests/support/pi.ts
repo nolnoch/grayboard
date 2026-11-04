@@ -100,9 +100,12 @@ type PiOpts = {
   identity?: string | null;
   // Merged over the grayboard entry setup writes.
   entry?: Record<string, unknown>;
+  // Match the hosted launcher's persisted-session options.
+  persist?: boolean;
+  session?: string;
 };
 
-function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {} }: PiOpts = {}): Pi {
+export function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {}, persist = false, session }: PiOpts = {}): Pi {
   const agentDir = join(dir, "pi-agent");
   const extension = join(agentDir, "extensions", "grayboard.ts");
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
@@ -121,13 +124,85 @@ function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, i
     mcpServers: { grayboard: { ...command, env: { BUS_PUSH: "off" }, enabled: false, ...entry } },
   }));
   writeModels(agentDir, modelPort);
-  const proc = spawn("node", [PI_CLI, ...PI_ARGS, "--no-session"], {
+  const proc = spawn("node", [PI_CLI, ...PI_ARGS, ...(persist ? [] : ["--no-session"]), ...(session ? ["--session", session] : [])], {
     cwd: dir,
     env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   procs.push(proc);
   return new Pi(proc);
+}
+
+// Selected snapshots beat outgoing carry, including an explicitly empty one.
+export function piLocalCarryScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const prefix = "mcp__grayboard__";
+    const model = startFakeModel([
+      scripted("bind", [
+        { tool: prefix + "bind", args: { name: "pi-one", create: true } },
+        { tool: prefix + "bind", args: { name: "pi-two", create: true } },
+      ]),
+      scripted("empty", [
+        { tool: prefix + "unbind", args: { name: "pi-one" } },
+        { tool: prefix + "unbind", args: { name: "pi-two" } },
+      ]),
+      scripted("change", [
+        { tool: prefix + "bind", args: { name: "pi-three", create: true } },
+        { tool: prefix + "unbind", args: { name: "pi-one" } },
+      ]),
+      scripted("who", [{ tool: prefix + "whoami", args: {} }]),
+    ]);
+    let db: Database | undefined;
+    try {
+      const pi = startPi(dir, model.port, procs, { identity: null, persist: true });
+      const original = await pi.command({ type: "get_state" });
+      await pi.command({ type: "prompt", message: "bind" });
+      await idle(pi);
+      db = new Database(join(dir, "bus.db"), { readonly: true });
+      const inspect = async (aliases: string[]) => {
+        const nth = (await pi.messages()).filter(m => m.role === "toolResult" && m.toolName === prefix + "whoami").length;
+        await pi.command({ type: "prompt", message: "who" });
+        const result = await toolResult(pi, "whoami", nth);
+        expect(!!result.isError).toBe(false);
+        await idle(pi);
+        const who = JSON.parse(resultText(result));
+        expect(who.aliases).toEqual(aliases);
+        const state = await pi.command({ type: "get_state" });
+        expect(db!.query<{ harness_session: string }, [string]>("SELECT harness_session FROM ids WHERE id = ?").get(who.id)?.harness_session).toBe(state.sessionId);
+        return who.id as string;
+      };
+      const firstRoot = await inspect(["pi-one", "pi-two"]);
+      await pi.command({ type: "new_session" });
+      const empty = await pi.command({ type: "get_state" });
+      expect(empty.sessionId).not.toBe(original.sessionId);
+      expect(await inspect(["pi-one", "pi-two"])).not.toBe(firstRoot);
+      await pi.command({ type: "prompt", message: "empty" });
+      await idle(pi);
+      await inspect([]);
+      await pi.command({ type: "switch_session", sessionPath: original.sessionFile });
+      await inspect(["pi-one", "pi-two"]);
+      const { messages } = await pi.command({ type: "get_fork_messages" });
+      await pi.command({ type: "fork", entryId: messages[0].entryId });
+      const fork = await pi.command({ type: "get_state" });
+      expect([original.sessionId, empty.sessionId]).not.toContain(fork.sessionId);
+      await inspect(["pi-one", "pi-two"]);
+      await pi.command({ type: "prompt", message: "change" });
+      await idle(pi);
+      await inspect(["pi-two", "pi-three"]);
+      await pi.command({ type: "switch_session", sessionPath: original.sessionFile });
+      await inspect(["pi-one", "pi-two"]);
+      await pi.command({ type: "switch_session", sessionPath: empty.sessionFile });
+      await inspect([]);
+      expect(model.unhandled).toEqual([]);
+      expect(pi.events.filter(e => e.type === "extension_error")).toEqual([]);
+      await pi.quit();
+    } finally {
+      await stopAll(procs);
+      db?.close();
+      model.stop();
+    }
+  });
 }
 
 // The tools `grayboard tools` lists, as the extension names them in pi.

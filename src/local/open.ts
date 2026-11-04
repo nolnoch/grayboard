@@ -1,18 +1,39 @@
 // Opens (and creates or upgrades) a local-mode bus database. Separate from
 // db.ts, which opens this process's bus on import, so the Slack bridge can open
 // the bus its child will use.
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 
 import { ANNOUNCE_BOARD, ensureBoard } from "../core/boards.ts";
+import { holdsOf } from "../core/bindings.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { openSqlite } from "../core/sqlite.ts";
-import { liveSessions, type Ended, type SessionRow } from "./binding.ts";
+import { conversationSnapshot, liveSessions, type Ended, type SessionRow } from "./binding.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
   return env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`;
+}
+
+/** Title-only lookup: undefined means absent, null suppresses an unacknowledged/empty selection. */
+export function readConversationTitle(session: string, env: Record<string, string | undefined> = process.env): string | null | undefined {
+  const path = localDbPath(env);
+  if (!existsSync(path)) return undefined;
+  const db = new Database(path, { readonly: true });
+  try {
+    // A read transaction makes snapshot precedence and acquired holds one view;
+    // never create, migrate or reap a bus just to name a transcript.
+    return db.transaction(() => {
+      if (conversationSnapshot(db, session) !== null) return null;
+      const rows = db.prepare(`SELECT id FROM ids
+        WHERE harness_session = ? AND ended_at IS NULL AND root_id IS NULL
+          AND local_resume = 1 AND keyed = 0 AND viewer = 0 AND delivery = 'push'
+        LIMIT 2`).all(session) as { id: string }[];
+      if (!rows.length) return undefined;
+      return rows.length === 1 ? holdsOf(db, rows[0]!.id)[0] ?? null : null;
+    })();
+  } finally { db.close(); }
 }
 
 /**

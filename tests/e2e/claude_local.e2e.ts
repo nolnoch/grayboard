@@ -11,7 +11,7 @@
 // subagent is a child session of its own.
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { installClaudeHooks } from "../../src/cli/claude_hooks.ts";
@@ -68,7 +68,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: a subagent's grayboard calls act as a 
     expect(installClaudeHooks(CLI, join(h.config, "settings.json"))).toBe(true);
     const peer = await localSession(bus, "peer");
 
-    tty = claudeTty(bin, h, ["--permission-mode", "default"]);
+    tty = claudeTty(bin, h, ["--dangerously-load-development-channels", "server:grayboard", "--permission-mode", "default"]);
     await until(() => tty!.screen().includes(`v${CLAUDE_CODE_VERSION}`), 60_000, "Claude Code's main screen");
     const db = new Database(busEnv.BUS_DB_PATH!, { readonly: true });
     const dms = () => db.query<{ body: string; via: string | null; sender_id: string }, []>("SELECT body, via, sender_id FROM messages WHERE body LIKE 'from-%' ORDER BY id").all();
@@ -76,11 +76,10 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: a subagent's grayboard calls act as a 
 
     await tty.submit("ROOT-GO-1");
     await until(() => body("from-child-1") !== undefined && toolResults(model, "toolu_SUBTASK_1_1").length > 0, 120_000, "the first subagent's DM and bind");
+    const firstRoot = body("from-root-1")!.sender_id;
+    const firstPid = db.query<{ pid: number }, [string]>("SELECT pid FROM bindings WHERE session_id=?").get(firstRoot)!.pid;
     await tty.submit("/clear");
-    const debug = () => readFileSync(join(dir, "debug.log"), "utf8");
-    await until(() => /Hooks: SessionStart:clear \[[^\]]*hook claude session-start\] finished with status 0/.test(debug()), 30_000, "the record hook's SessionStart(clear)");
-    // SessionEnd(clear) ran first and kept the session's record dir.
-    expect(debug()).toMatch(/SessionEnd:clear \[[^\]]*hook claude session-end\] completed with status 0/);
+    await until(() => db.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id=?").get(firstRoot)?.ended_at != null, 30_000, "the outgoing conversation's acknowledged end");
     expect(readdirSync(agentsRoot(busEnv.BUS_SOCK_DIR!))).toEqual([String(tty.proc.pid)]);
     await tty.submit("ROOT-GO-2");
     await until(() => body("from-child-2") !== undefined && toolResults(model, "toolu_SUBTASK_2_1").length > 0, 120_000, "the second subagent's DM and bind");
@@ -93,13 +92,12 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: a subagent's grayboard calls act as a 
     expect(c2.via).not.toBe(c1.via);
     // A child's DM is from its own session; the root's from the root's.
     expect([c1.sender_id, c2.sender_id]).toEqual([c1.via!, c2.via!]);
-    expect(r2.sender_id).toBe(r1.sender_id);
-    // Both children act under the one root session (its ID survives /clear: one grayboard mcp process).
-    const rows = db.query<{ id: string; root_id: string | null }, [string, string]>("SELECT id, root_id FROM ids WHERE id IN (?, ?)").all(c1.via!, c2.via!);
-    expect(rows.length).toBe(2);
-    expect(rows[0]!.root_id).toBeTruthy();
-    expect(rows.every((r) => r.root_id === rows[0]!.root_id)).toBe(true);
-    expect(rows[0]!.root_id).toBe(r1.sender_id);
+    expect(r2.sender_id).not.toBe(r1.sender_id);
+    // The retained MCP process rotates its bus root; old children end with A.
+    expect(db.query<{ pid: number }, [string]>("SELECT pid FROM bindings WHERE session_id=?").get(r2.sender_id)?.pid).toBe(firstPid);
+    const rows = db.query<{ id: string; root_id: string | null; ended_at: number | null }, [string, string]>("SELECT id, root_id, ended_at FROM ids WHERE id IN (?, ?)").all(c1.via!, c2.via!);
+    expect(rows.find(r => r.id === c1.via)).toMatchObject({ root_id: r1.sender_id, ended_at: expect.any(Number) });
+    expect(rows.find(r => r.id === c2.via)).toMatchObject({ root_id: r2.sender_id, ended_at: null });
     // One id.child_seen per subagent; the root's calls (a root marker) make none.
     expect(db.query<{ target: string }, []>("SELECT target FROM audit_log WHERE action = 'id.child_seen' ORDER BY at").all().map((r) => r.target)).toEqual([c1.via!, c2.via!]);
     expect(db.query<{ n: number }, []>("SELECT count(*) AS n FROM audit_log WHERE action LIKE 'claude.%'").get()!.n).toBe(0);

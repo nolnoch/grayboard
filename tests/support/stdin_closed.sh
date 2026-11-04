@@ -13,13 +13,18 @@ if [ "$BUS_TEST_OPENCODE_STDIO" = epipe ] || [ "$BUS_TEST_OPENCODE_STDIO" = chan
   printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}\n'
   read -r _
   read -r _
+  printf '{"jsonrpc":"2.0","id":2,"result":{"tools":%s}}\n' "$tools"
+  read -r association
+  "$1" -e 'const r = JSON.parse(process.argv[1]); console.log(JSON.stringify({ jsonrpc: "2.0", id: r.id, result: { id: "id:stdio-fixture", session: r.params.session, epoch: r.params.epoch, instructions: [] } }));' "$association" || exit 1
+  read -r ready
+  reply=$("$1" -e 'const r = JSON.parse(process.argv[1]); console.log(JSON.stringify({ jsonrpc: "2.0", id: r.id, result: {} }));' "$ready") || exit 1
   if [ "$BUS_TEST_OPENCODE_STDIO" = epipe ]; then
     trap '' TERM
     exec 0<&-
-    printf '{"jsonrpc":"2.0","id":2,"result":{"tools":%s}}\n' "$tools"
+    printf '%s\n' "$reply"
     exec sleep 15
   fi
-  printf '{"jsonrpc":"2.0","id":2,"result":{"tools":%s}}\n' "$tools"
+  printf '%s\n' "$reply"
   read -r _
   printf '{"jsonrpc":"2.0","method":"notifications/claude/channel","params":{"content":"buffered before exit","meta":{"kind":"direct"}}}\n'
   exit 0

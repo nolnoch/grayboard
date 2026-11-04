@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
 import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionRow } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
 import { openLocalDb } from "./open.ts";
 
@@ -317,4 +317,72 @@ test("reading live sessions keeps a live root's children and ends those whose ro
   expect(db.prepare(`SELECT session_id FROM bindings ORDER BY session_id`).all()).toEqual([{ session_id: live }, { session_id: childOf(live) }]);
   // A second read finds nothing more to end.
   expect(liveSessions(db)).toMatchObject({ alive: [{ session_id: live }], ended: [] });
+});
+
+test("conversation snapshots select the latest start, then rowid, matching the exact ended conversation", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  try {
+    const snapshot = (id: string, started_at: number, session: string, names: string[], ended = true) => {
+      registerSession(db, { ...thisSession(id), started_at }, { harnessSession: session, localResume: true });
+      for (const [i, name] of names.entries()) holdAlias(db, name, id, 10 + i);
+      if (ended) endLocalSession(db, id);
+    };
+    const older = "id:0123456789abc", newer = "id:0123456789abd", tie = "id:0123456789abe";
+    snapshot(older, 100, "selected", ["old"]);
+    snapshot(newer, 200, "selected", ["zed", "alpha"]);
+    // Inserted later and ended later, but its start is earlier.
+    snapshot("id:0123456789abf", 150, "selected", ["late-end"]);
+    expect(conversationSnapshot(db, "selected")).toEqual({ session_id: newer, names: ["zed", "alpha"] });
+    snapshot(tie, 200, "selected", ["tie-winner"]);
+    expect(conversationSnapshot(db, "selected")).toEqual({ session_id: tie, names: ["tie-winner"] });
+    snapshot("id:0123456789ab0", 300, "selected", ["still-live"], false);
+    snapshot("id:0123456789ab1", 400, "selected-extra", ["other-conversation"]);
+    expect(conversationSnapshot(db, "selected")).toEqual({ session_id: tie, names: ["tie-winner"] });
+    expect(conversationSnapshot(db, "select")).toBeNull();
+    expect(conversationSnapshot(db, "missing")).toBeNull();
+  } finally { db.close(); }
+});
+
+test("an ended conversation's latest empty snapshot is authoritative, including a rowid tie", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  try {
+    const old = "id:0123456789abc", empty = "id:0123456789abd";
+    for (const id of [old, empty]) registerSession(db, { ...thisSession(id), started_at: 100 }, { harnessSession: "unbound", localResume: true });
+    holdAlias(db, "previous", old);
+    endLocalSession(db, old);
+    endLocalSession(db, empty);
+    expect(conversationSnapshot(db, "unbound")).toEqual({ session_id: empty, names: [] });
+  } finally { db.close(); }
+});
+
+test("local resume is explicit opt-in without changing harness-session discovery; ineligible facts are excluded", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  try {
+    const ordinary = "id:0123456789abc", discovery = "id:0123456789abd";
+    registerSession(db, { ...thisSession(ordinary), started_at: 1 }, { harnessSession: "conversation", localResume: true });
+    holdAlias(db, "ordinary", ordinary);
+    endLocalSession(db, ordinary);
+    registerSession(db, { ...thisSession(discovery), harness_pid: process.pid, started_at: 2 }, { harnessSession: "conversation" });
+    expect(db.prepare(`SELECT harness_session, local_resume FROM ids WHERE id = ?`).get(discovery)).toEqual({ harness_session: "conversation", local_resume: 0 });
+    expect(runnerRoot(db, "conversation", [process.pid])).toEqual({ root: discovery });
+    endLocalSession(db, discovery);
+    const excluded: [string, SessionKind][] = [
+      ["id:0123456789abe", { keyed: true, localResume: true }],
+      ["id:0123456789abf", { viewer: true, localResume: true }],
+      ["id:0123456789ab0", { writesAs: "tools", localResume: true }],
+      ["id:0123456789ab1", { localResume: false }],
+    ];
+    for (const [id, kind] of excluded) {
+      registerSession(db, { ...thisSession(id), started_at: 3 }, { ...kind, harnessSession: "conversation" });
+      endLocalSession(db, id);
+    }
+    const root = "id:0123456789ab2", child = "id:0123456789ab3";
+    registerSession(db, thisSession(root), { harnessSession: "root-conversation", localResume: true });
+    registerChild(db, root, child, "worker", 4, { harness: "runner", cwd: process.cwd(), harnessSession: "conversation" });
+    expect(db.prepare(`SELECT harness_session, local_resume FROM ids WHERE id = ?`).get(child)).toEqual({ harness_session: "conversation", local_resume: 0 });
+    // Root provenance independently excludes a malformed eligible push row.
+    db.prepare(`UPDATE ids SET local_resume = 1, delivery = 'push' WHERE id = ?`).run(child);
+    endLocalSession(db, root);
+    expect(conversationSnapshot(db, "conversation")).toEqual({ session_id: ordinary, names: ["ordinary"] });
+  } finally { db.close(); }
 });

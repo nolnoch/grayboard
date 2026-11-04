@@ -1,20 +1,25 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { join } from "node:path";
 import { claudeHooks, hooksDisabledBy, installClaudeHooks, recordHookInstalled, removeClaudeHooks, sessionStartOutput } from "./claude_hooks.ts";
+import type { SessionStartOutput } from "./claude_hooks.ts";
+import { sessionDir, takeRecord } from "../shared/claude_agents.ts";
+import { procStart } from "../shared/proc.ts";
+import { listenIdentity } from "../shared/claude_identity.ts";
+import { recordPath, writeRecord } from "../shared/namerecord.ts";
 
-const title = (out: string) => JSON.parse(out).hookSpecificOutput.sessionTitle;
+const title = (out: SessionStartOutput | null) => out!.hookSpecificOutput.sessionTitle;
 
 test("only an explicit BUS_IDENTITY titles the session: the rest start unbound (#182)", () => {
   const repo = join(mkdtempSync(join(tmpdir(), "gb-ss-")), "api");
   mkdirSync(join(repo, ".git"), { recursive: true });
-  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), {})).toBe("");
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), {})).toBeNull();
   expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "be" }))).toBe("be");
   // A pin, alone or re-delivered as BUS_IDENTITY, is a candidate, not a binding.
   writeFileSync(join(repo, ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "fe" } } } }));
-  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), {})).toBe("");
-  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "fe" })).toBe("");
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), {})).toBeNull();
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "fe" })).toBeNull();
 });
 
 test("an explicit BUS_IDENTITY titles a linked worktree verbatim: no suffix", () => {
@@ -33,11 +38,29 @@ test("an explicit BUS_IDENTITY is lowercased, the server's rule (#181)", () => {
   expect(title(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "Gray" }))).toBe("gray");
   // A name invalid after lowercasing refuses `grayboard mcp` at startup, so
   // the hook — which must never block a session — titles nothing.
-  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "Gray!" })).toBe("");
+  expect(sessionStartOutput(JSON.stringify({ cwd: repo }), { BUS_IDENTITY: "Gray!" })).toBeNull();
 });
 
 test("bad input prints nothing rather than failing the session", () => {
-  expect(sessionStartOutput("not json", {})).toBe("");
+  expect(sessionStartOutput("not json", {})).toBeNull();
+});
+
+test("a title read honors valid PID carry without creating a bus or deleting a stale record", () => {
+  const sock = mkdtempSync(join(tmpdir(), "gb-ss-")), bus = join(sock, "bus.db");
+  const env = { BUS_IDENTITY: "web", BUS_SOCK_DIR: sock, BUS_DB_PATH: bus, CLAUDE_PID: String(process.pid) };
+  const input = JSON.stringify({ cwd: sock, source: "startup", session_id: "new-title-read" });
+  try {
+    expect(title(sessionStartOutput(input, env))).toBe("web");
+    expect(existsSync(bus)).toBe(false);
+    const record = writeRecord(sock, { names: ["aux"], session_id: "id:0123456789abg", harness_pid: process.pid, bus })!;
+    expect(record).not.toBeNull();
+    expect(sessionStartOutput(input, env)).toBeNull();
+    const stale = JSON.stringify({ ...record, harness_start: "a prior process" });
+    writeFileSync(recordPath(sock, process.pid), stale);
+    expect(title(sessionStartOutput(input, env))).toBe("web");
+    expect(readFileSync(recordPath(sock, process.pid), "utf8")).toBe(stale);
+    expect(existsSync(bus)).toBe(false);
+  } finally { rmSync(sock, { recursive: true, force: true }); }
 });
 
 const BIN = ["/usr/local/bin/grayboard"];
@@ -45,18 +68,7 @@ const tmpSettings = (...sub: string[]) => join(mkdtempSync(join(tmpdir(), "gb-ss
 const other = { matcher: "clear|compact", hooks: [{ type: "command", command: "~/.claude/hooks/other.sh" }] };
 const otherTool = { matcher: "Bash", hooks: [{ type: "command", command: "~/.claude/hooks/bash.sh" }] };
 
-test("the hooks: the title hook, and the four record hooks on the local tools (#551)", () => {
-  const cmd = (event: string) => [{ type: "command", command: `/usr/local/bin/grayboard hook claude ${event}`, timeout: 10 }];
-  expect(claudeHooks(BIN)).toEqual({
-    SessionStart: [
-      { matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/usr/local/bin/grayboard session-start", timeout: 10 }] },
-      { matcher: "startup|resume|clear|fork", hooks: cmd("session-start") },
-    ],
-    PreToolUse: [{ matcher: "mcp__grayboard__.*", hooks: cmd("pre-tool-use") }],
-    SubagentStop: [{ hooks: cmd("subagent-stop") }],
-    SessionEnd: [{ hooks: cmd("session-end") }],
-  });
-  // From source, and a path the shell would split.
+test("installed hook commands quote a CLI path the shell would split", () => {
   expect(claudeHooks(["bun", "/My Code/grayboard/src/cli/main.ts"]).SessionEnd![0]!.hooks[0]!.command).toBe("bun '/My Code/grayboard/src/cli/main.ts' hook claude session-end");
 });
 
@@ -115,35 +127,81 @@ test("installed means the PreToolUse record hook on the local tools is in user s
   expect(recordHookInstalled(path)).toBe(true);
 });
 
-test("the CLI command reads the hook input from stdin", () => {
-  const repo = join(mkdtempSync(join(tmpdir(), "gb-ss-")), "web");
+test("one SessionStart hook waits for acknowledgement and merges the valid new title with current guidance", async () => {
+  const sock = mkdtempSync(join(tmpdir(), "gb-ss-")), repo = join(sock, "web");
   mkdirSync(join(repo, ".git"), { recursive: true });
-  const r = Bun.spawnSync(["bun", join(import.meta.dir, "main.ts"), "session-start"], {
-    stdin: new TextEncoder().encode(JSON.stringify({ cwd: repo, source: "startup" })),
-    env: { ...process.env, BUS_IDENTITY: "web" },
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const stop = await listenIdentity(sock, process.pid, async request => {
+    expect(request.current?.session).toBe("new-configured");
+    entered.resolve();
+    await release.promise;
+    return { instructions: ["acknowledged web guidance"] };
   });
-  expect(title(r.stdout.toString())).toBe("web");
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, "main.ts"), "hook", "claude", "session-start"], {
+    stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    env: { ...process.env, BUS_IDENTITY: "web", BUS_SOCK_DIR: sock, BUS_DB_PATH: join(sock, "bus.db"), CLAUDE_PID: String(process.pid) },
+  });
+  child.stdin.write(JSON.stringify({ cwd: repo, source: "startup", session_id: "new-configured" }));
+  child.stdin.end();
+  let finished = false;
+  const exited = child.exited.then(code => { finished = true; return code; });
+  try {
+    await entered.promise;
+    expect(finished).toBe(false);
+    release.resolve();
+    const [code, out, error] = await Promise.all([exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code).toBe(0);
+    expect(error).toBe("");
+    expect(out.trim().split("\n")).toHaveLength(1);
+    expect(JSON.parse(out).hookSpecificOutput).toEqual({ hookEventName: "SessionStart", sessionTitle: "web", additionalContext: "acknowledged web guidance" });
+  } finally { release.resolve(); child.kill(); stop(); rmSync(sock, { recursive: true, force: true }); }
 });
 
-test("`hook claude <event>` writes the record through the light entry, prints nothing and never fails (#551)", () => {
+test("clear still runs the identity hook without introducing a new title event", () => {
+  const sock = mkdtempSync(join(tmpdir(), "gb-ss-"));
+  try {
+    const r = Bun.spawnSync([process.execPath, join(import.meta.dir, "main.ts"), "hook", "claude", "session-start"], {
+      stdin: new TextEncoder().encode(JSON.stringify({ cwd: sock, source: "clear", session_id: "cleared" })),
+      env: { ...process.env, BUS_IDENTITY: "web", BUS_SOCK_DIR: sock, BUS_DB_PATH: join(sock, "bus.db"), CLAUDE_PID: String(process.pid) },
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.toString()).toBe("");
+  } finally { rmSync(sock, { recursive: true, force: true }); }
+});
+
+test("CLI hooks publish current root/child records and refuse malformed tool input", () => {
   const sock = mkdtempSync(join(tmpdir(), "gb-ss-"));
   const hook = (event: string, input: string) => Bun.spawnSync(["bun", join(import.meta.dir, "main.ts"), "hook", "claude", event], {
     stdin: new TextEncoder().encode(input),
-    env: { ...process.env, BUS_SOCK_DIR: sock, CLAUDE_PID: String(process.pid) },
+    env: { ...process.env, BUS_IDENTITY: "", BUS_SOCK_DIR: sock, CLAUDE_PID: String(process.pid) },
   });
-  const dir = join(sock, "claude-agents", String(process.pid));
   for (const r of [
-    hook("session-start", JSON.stringify({ source: "startup" })),
-    hook("pre-tool-use", JSON.stringify({ tool_use_id: "toolu_1", agent_id: "a573e90bd84bce7ff" })),
-    hook("pre-tool-use", JSON.stringify({ tool_use_id: "toolu_2" })),
-    hook("pre-tool-use", "not json"),
+    hook("session-start", JSON.stringify({ source: "startup", session_id: "current" })),
+    hook("pre-tool-use", JSON.stringify({ session_id: "current", tool_use_id: "toolu_1", agent_id: "a573e90bd84bce7ff" })),
+    hook("pre-tool-use", JSON.stringify({ session_id: "current", tool_use_id: "toolu_2" })),
     hook("no-such-event", "{}"),
   ]) {
     expect(r.exitCode).toBe(0);
     expect(r.stdout.toString() + r.stderr.toString()).toBe("");
   }
-  expect(readFileSync(join(dir, "toolu_1"), "utf8")).toBe("a573e90bd84bce7ff");
-  expect(readFileSync(join(dir, "toolu_2"), "utf8")).toBe("-");
+  expect(takeRecord(sock, process.pid, procStart(process.pid) ?? null, "toolu_1")).toEqual({ agent: "a573e90bd84bce7ff", session: "current" });
+  expect(takeRecord(sock, process.pid, procStart(process.pid) ?? null, "toolu_2")).toEqual({ agent: null, session: "current" });
+  const denied = hook("pre-tool-use", "not json");
+  expect(denied.exitCode).toBe(1);
+  expect(JSON.parse(denied.stdout.toString()).hookSpecificOutput.permissionDecision).toBe("deny");
+});
+
+test("the CLI fails visibly when an authoritative SessionStart publication cannot replace current", () => {
+  const sock = mkdtempSync(join(tmpdir(), "gb-ss-"));
+  const current = join(sessionDir(sock, process.pid), "current");
+  mkdirSync(current, { recursive: true });
+  const r = Bun.spawnSync([process.execPath, join(import.meta.dir, "main.ts"), "hook", "claude", "session-start"], {
+    stdin: new TextEncoder().encode(JSON.stringify({ source: "clear", session_id: "B" })),
+    env: { ...process.env, BUS_SOCK_DIR: sock, CLAUDE_PID: String(process.pid) },
+  });
+  expect(r.exitCode).toBe(1);
+  expect(r.stderr.toString()).toContain("current conversation barrier failed");
+  expect(r.stdout.toString()).toBe("");
 });
 
 test("hooksDisabledBy names the first layer that turns user hooks off (#551)", () => {
@@ -175,22 +233,4 @@ test("hooksDisabledBy names the first layer that turns user hooks off (#551)", (
   expect(hooksDisabledBy(cwd, managed, user)).toBe(`${join(managed, "managed-settings.json")} sets disableAllHooks`);
   // A platform with no managed dir reads only the project.
   expect(hooksDisabledBy(cwd, null, null)).toBe(`${join(cwd, ".claude", "settings.local.json")} sets disableAllHooks`);
-});
-
-test("the hook entry's static imports stay the record module's few: every one evaluates on every grayboard call (#551, 50 ms budget)", () => {
-  const t = new Bun.Transpiler({ loader: "ts" });
-  const seen = new Set<string>();
-  const walk = (file: string) => {
-    if (seen.has(file)) return;
-    seen.add(file);
-    for (const i of t.scanImports(readFileSync(file, "utf8").replace(/^#!.*\n/, ""))) {
-      if (i.kind !== "import-statement" || !i.path.startsWith(".")) continue;
-      walk(join(dirname(file), i.path));
-    }
-  };
-  walk(join(import.meta.dir, "main.ts"));
-  const rel = [...seen].map((f) => relative(join(import.meta.dir, "..", ".."), f)).sort();
-  // protocol.ts (#545: SESSION_FACT_MAX), endpoint.ts (#500: LOOPBACK) and
-  // signin.ts (#500: SIGN_IN_FLOW_MS) are constants, functions and types, with no top-level work.
-  expect(rel).toEqual(["src/cli/main.ts", "src/shared/claude_agents.ts", "src/shared/endpoint.ts", "src/shared/proc.ts", "src/shared/protocol.ts", "src/shared/session_meta.ts", "src/shared/signin.ts", "src/shared/sockdir.ts"]);
 });

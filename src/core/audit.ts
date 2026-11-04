@@ -26,7 +26,7 @@ export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.r
  * whose settings predate the hook. The hosted plugin refuses a missing record
  * itself, so the server never sees either.
  */
-export type LocalAuditAction = CoreAuditAction | "claude.agent_record_missing" | "claude.attribution_off";
+export type LocalAuditAction = CoreAuditAction | "claude.agent_record_missing" | "claude.attribution_off" | "id.conversation_selected";
 
 /**
  * Where a core function shared by both modes writes its audit row: local
