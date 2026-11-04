@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -17,11 +18,14 @@ import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 import { channelInstructions, DEFAULT_CHANNEL_SOURCE } from "../../../src/core/tools.ts";
 import { launcherInstruction } from "../../../src/core/delegation.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
+import { spawnRealServer } from "./real-server.ts";
+import { transactionRace, transactionScenarios, type SeenMethod, type SeenRead } from "./real-transactions.ts";
 import { observeSubscriberWork } from "./subscriber-work.ts";
 import { FailedContinuation } from "./failed-continuation.js";
 import { savedClientMetadata } from "./cimd-fixture.js";
 import { rootRetrying, rootStatus, SubscriberAdmission } from "./causal.ts";
 import { assertStable, barrier, bounded, drainSessions, sessionStates, savedInput } from "./reload-state.ts";
+import { assertWrote, audits, hostedRow } from "./server-db.ts";
 
 const codeMode = process.env.GRAYBOARD_TEST_CODEMODE === "1";
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
@@ -39,9 +43,17 @@ let admissionNow: number | undefined;
 let admissionGate: SubscriberAdmission | undefined;
 const start = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
 let app = start();
+// The transaction races run the server as its own process (#383), so a pause inside one of its
+// transactions holds the server alone; this process's in-process server stops before anything uses it.
+const transactionCase = transactionScenarios.includes(process.env.GRAYBOARD_TEST_REAL_RACE ?? "");
+if (transactionCase) await app.stop();
+const realServer = transactionCase ? await spawnRealServer(config, join(root, "pauses")) : undefined;
 let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
 let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined, subscriberOutage = false;
 const admissions: NativeInput[] = [];
+// The plugin's MCP requests as forwarded, by method, and its inbox reads, each answer filled in when it lands (#383).
+const methods: SeenMethod[] = [];
+const reads: SeenRead[] = [];
 const admitted: typeof admissions = [];
 const suspendedModel = { target: "", entered: barrier(), released: barrier() };
 let pendingAdmissions = 0;
@@ -80,8 +92,12 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     console.log("SUBCALL", b.params.name, session);
     if (b.params.name === "delivery_receipt") { receiptAttempts++; if (dropReceipt) throw new Error("Receipt transport deliberately lost before commit"); }
   }
-  const forward = () => fetch0(new Request(`http://127.0.0.1:${app.server.port}` + url.pathname + url.search, req));
+  methods.push({ method: typeof b?.method === "string" ? b.method : req.method, subscriber: req.headers.get("X-Grayboard-Client") === "subscriber" });
+  const read: SeenRead | undefined = b?.method === "resources/read" ? { uri: String(b.params?.uri), lease: req.headers.get("X-Grayboard-Lease") } : undefined;
+  if (read) reads.push(read);
+  const forward = () => fetch0(new Request(`http://127.0.0.1:${realServer?.port ?? app.server.port}` + url.pathname + url.search, req));
   const res = admissionGate ? await admissionGate.forward(req, b, forward) : await forward();
+  if (read) void res.clone().text().then(text => { read.text = text; });
   if (res.status === 429 && req.headers.get("X-Grayboard-Client") === "subscriber") subscriberThrottles++;
   if (b?.method === "tools/call" && req.headers.get("X-Grayboard-Client") === "subscriber") { const text = await res.clone().text(); if (text.includes('"isError":true')) console.log("SUBSCRIBER_ERROR", b.params.name, text); }
   if (b?.params?.name === "delivery_open" && res.ok) {
@@ -153,12 +169,8 @@ async function invoke(sessionID: string, tool: string, args: Record<string, unkn
   await host!.session.switchModel({ sessionID, model: { providerID: "fixture", id: "fixture" } });
   await host!.session.prompt({ sessionID, text: "Invoke " + tool }); await host!.session.wait({ sessionID }); target = undefined;
 }
-// A hosted root's holds are alias_holds rows (#451): `held` the short names oldest first, `name` the primary.
-const holds = (id: string) => (app.db.prepare("SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").all(id) as { address: string }[]).map(h => h.address.slice(h.address.lastIndexOf("/") + 1));
-function row(raw: string) {
-  const r = app.db.prepare("SELECT * FROM hosted_sessions WHERE source_session_id = ?").get(raw) as { session_id: string; root_session_id: string | null; ownership_id: number; bind_gen: number; grant_id: string; lease_deadline: number | null } | null;
-  return r && { ...r, held: holds(r.session_id), name: holds(r.session_id)[0] ?? null };
-}
+const row = (raw: string) => hostedRow(app.db, raw);
+const wrote = (tool: string, sessionID: string, rootID: string) => assertWrote(app.db, tool, row(sessionID)!, row(rootID)!, OPENCODE_CLIENT);
 const makeRoot = (title: string) => host!.session.create({ location, title, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
 try {
   host = await createHost(); await host.agent.list({ location }); await wait(() => ctx, Boolean, "fixture setup");
@@ -363,6 +375,17 @@ try {
     assert(!text.includes(launcher), "A root that isn't a launcher gets no launcher lines");
     if (codeMode) assert(text.includes('Use tools from this server through `execute` under `tools["grayboard"]`.'), "The rebuilt entry keeps OpenCode's codemode line");
     console.log("REAL_INSTRUCTIONS_PLAIN_OK", { requests: modelRequests.length });
+  } else if (realServer) {
+    const db = new Database(config.dbPath); db.run("PRAGMA busy_timeout = 5000");
+    try {
+      await transactionRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE!, boundary: raceGate.boundary, host, location, server: realServer, db, dbPath: config.dbPath, blobDir: config.blobDir, pauses: join(root, "pauses"), resource, calls, methods, reads, admissions, opens,
+        access: async () => { const grant = await ctx.integration.connection.resolve(selected); assert(grant?.type === "oauth"); return grant.access; },
+        invoke, enroll: (sessionID, name) => rpc.enroll({ sessionID, name, create: true }, { location }),
+        rootState: async sessionID => rootStatus(await rpc.status({}, { location }), sessionID)?.state,
+        signIn: async () => { assert((await signIn(native.integrationID!))?.type === "credential"); await host!.mcp.connect({ server: "grayboard", location }); },
+        outage: value => { subscriberOutage = value; } });
+    } finally { db.close(); }
+    console.log("REAL_TRANSACTION_RACE_OK");
   } else if (process.env.GRAYBOARD_TEST_REAL_RACE) {
     await realRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE, gate: raceGate, host, ctx, app, location, subscriberWork, expiryContinuation,
       enroll: (sessionID, name) => rpc.enroll({ sessionID, name, create: true }, { location }),
@@ -385,7 +408,8 @@ try {
   await wait(() => app.repo.cursors.directFor("you@example.com/be"), n => n > 0, "real receipt cursor A");
   const sent = app.db.prepare("SELECT sender, recipient FROM messages WHERE body LIKE 'Native sender isolation%'").all();
   assert.deepEqual(sent, [{ sender: "you@example.com/be", recipient: "you@example.com/fe" }, { sender: "you@example.com/fe", recipient: "you@example.com/be" }]);
-  console.log("REAL_ROOT_ISOLATION_OK", { opens: opens.length, cimd, codes });
+  wrote("dm_send", a.id, a.id); wrote("dm_send", b.id, b.id);
+  console.log("REAL_ROOT_ISOLATION_OK", { opens: opens.length, cimd, codes, writes: audits(app.db, "hosted.write").length });
   const child = await host.session.create({ location, parentID: a.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   const grandchild = await host.session.create({ location, parentID: child.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   await invoke(grandchild.id, "dm_send", { to: "fe", body: "Nested child inherits A" });
@@ -397,6 +421,7 @@ try {
   assert.match(row(a.id)!.session_id, SESSION_ID); assert.match(row(grandchild.id)!.session_id, SESSION_ID);
   assert.equal((app.db.prepare("SELECT sender_id FROM messages WHERE body = ?").get("Nested child inherits A") as { sender_id: string }).sender_id, row(grandchild.id)!.session_id);
   const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id); assert.deepEqual(registration?.args.via, [child.id]);
+  wrote("dm_send", grandchild.id, a.id);
   await invoke(grandchild.id, "bind", { name: "child-control", create: true }); assert.equal(row(grandchild.id)?.name, null); assert.equal(app.mcp.activeLeases, 2);
   const attachmentGrant = await ctx.integration.connection.resolve(selected); assert(attachmentGrant?.type === "oauth");
   const attachment = (method: string, path: string, raw?: string) => fetch(resource + "/attachments" + path, { method, headers: { Authorization: "Bearer " + attachmentGrant.access, ...(raw ? { "X-Grayboard-Session": encodeURIComponent(raw) } : {}), ...(method === "POST" ? { "Content-Length": String(new TextEncoder().encode("Native child attachment fixture").length) } : {}) }, ...(method === "POST" ? { body: "Native child attachment fixture" } : {}) });
@@ -549,7 +574,12 @@ try {
   const g1 = row(a.id)!.grant_id, second = await signIn(native.integrationID); assert(second?.type === "credential");
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "native new grant latches receiving approval"); await host.mcp.connect({ server: "grayboard", location });
   await invoke(a.id, "peer_list", {}); assert.equal(row(a.id)!.grant_id, g1, "Ordinary G2 tools cannot attach ownership");
+  assert.equal(app.mcp.activeLeases, 1, "G1's lease is still live before the owning G2 call");
   await invoke(a.id, "bind", { name: "final" }); assert.notEqual(row(a.id)!.grant_id, g1, "Only owning G2 success attaches grant");
+  const attached = row(a.id)!;
+  assert.deepEqual(audits(app.db, "hosted.grant_attached").map(({ id: _, ...r }) => r), [{ actor: "you@example.com", target: attached.session_id, detail: { from: g1, to: attached.grant_id, ownership: attached.ownership_id, client_id: OPENCODE_CLIENT } }], "The owning G2 call writes one hosted.grant_attached row");
+  assert.equal(audits(app.db, "hosted.lease_closed").filter(r => r.target === attached.session_id && r.detail.reason === "reattached").length, 1, "The attachment records closing G1's lease");
+  await wait(() => app.mcp.activeLeases, n => n === 0, "Attaching closes G1's lease");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "G2 attached lease");
   revokeFixtureGrant(g1);
   assert.ok(row(a.id)?.held.includes("final"), "Revoking old G1 does not release G2 owner");
@@ -570,4 +600,4 @@ try {
   assert.equal(codes, 3); assert.equal(google, 3); assert.equal(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? cimd === 0 : cimd >= 1, true); assert.equal(refreshes, 0);
   console.log("REAL_BACKEND_HOST_OK", { codes, refreshes, cimd, modelCalls, opens: opens.length, receiptAttempts });
   }
-} finally { suspendedModel.released.release(); release?.(); raceGate.holding = false; await host?.close(); subscriberWork.restore(); await app.stop(); globalThis.fetch = fetch0; }
+} finally { suspendedModel.released.release(); release?.(); raceGate.holding = false; await realServer?.stop(); await host?.close(); subscriberWork.restore(); await app.stop(); globalThis.fetch = fetch0; }

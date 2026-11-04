@@ -151,6 +151,22 @@ test("registration before bind/open preserves the graph and never extends a stic
   expect(database.repo.hosted.all()).toHaveLength(0);
 });
 
+test("a registration that arrives while its root rebinds waits for the bind and lands under the same ownership", async () => {
+  const { principal: p } = issue();
+  await hosted.bind(p, context(p), { name: "fe", create: true });
+  const id = (context(p) as { id: string }).id;
+  const before = database.repo.hosted.get(id)!;
+  let registering!: Promise<unknown>;
+  // The bind holds the root's gate; the registration starts (and reads the root) while it waits for it.
+  await hostedPause("hosted:owning:before-txn", () => hosted.bind(p, context(p), { name: "be", create: true }), async () => {
+    registering = hosted.register(p, context(p), "child");
+  });
+  await expect(registering).resolves.toMatchObject({ message: "registered" });
+  const root = database.repo.hosted.get(id)!;
+  expect(root).toMatchObject({ ownership_id: before.ownership_id, bind_gen: before.bind_gen + 1 });
+  expect(database.repo.hosted.all().find(row => row.source_session_id === "child")?.root_session_id).toBe(id);
+});
+
 test("successful new and idempotent registration refresh activity but refusals do not", async () => {
   const first = issue(), second = issue(), p = first.principal;
   await hosted.register(p, context(p), "first");

@@ -5,12 +5,12 @@ cd "$(dirname "$0")/.."
 base="$GRAYBOARD_PACKAGE_TEST_DIR"
 GRAYBOARD_PACKAGE_TEST_DIR="$base/prepared" sh tests/real-prepare.sh
 export GRAYBOARD_REAL_PREPARED="$base/prepared"
-for scenario in pause archive delete rebind enrollment account account-away-back config away-back revocation expiry; do
+for scenario in pause archive delete rebind enrollment account account-away-back config away-back revocation expiry register-txn attach-revoke; do
   for boundary in before after; do
     GRAYBOARD_PACKAGE_TEST_DIR="$base/$scenario-$boundary" GRAYBOARD_TEST_REAL_RACE="$scenario" GRAYBOARD_TEST_RACE_BOUNDARY="$boundary" sh tests/real-run.sh
   done
 done
-for scenario in outage digest-reload native-refresh admission admission-account instructions; do
+for scenario in outage digest-reload native-refresh admission admission-account instructions pending-gate bind-commit lease-expire; do
   GRAYBOARD_PACKAGE_TEST_DIR="$base/$scenario" GRAYBOARD_TEST_REAL_RACE="$scenario" sh tests/real-run.sh
 done
 for boundary in before after; do

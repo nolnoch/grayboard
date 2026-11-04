@@ -1,10 +1,10 @@
 import { appendFileSync, readFileSync } from "node:fs";
 
-export const matrixLoopSHA = "3e3095c6bbec393b4b19a72ccdae8cafd8e203708715680c07e55e09d5bcff4b";
+export const matrixLoopSHA = "c8620b9108f40b82f975db3637b6ce47458241465af002a552d61a8d2e03e384";
 
 export const matrixCases = [
-  ...["pause", "archive", "delete", "rebind", "enrollment", "account", "account-away-back", "config", "away-back", "revocation", "expiry"].flatMap(scenario => ["before", "after"].map(boundary => ({ scenario, boundary, crash: "" }))),
-  ...["outage", "digest-reload", "native-refresh", "admission", "admission-account", "instructions"].map(scenario => ({ scenario, boundary: "", crash: "" })),
+  ...["pause", "archive", "delete", "rebind", "enrollment", "account", "account-away-back", "config", "away-back", "revocation", "expiry", "register-txn", "attach-revoke"].flatMap(scenario => ["before", "after"].map(boundary => ({ scenario, boundary, crash: "" }))),
+  ...["outage", "digest-reload", "native-refresh", "admission", "admission-account", "instructions", "pending-gate", "bind-commit", "lease-expire"].map(scenario => ({ scenario, boundary: "", crash: "" })),
   ...["before", "after"].map(crash => ({ scenario: "", boundary: "", crash })),
 ];
 

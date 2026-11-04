@@ -9,6 +9,7 @@ import type { NativeInput, NativeAdmission } from "./effect-instrument.js";
 import type { startServer } from "../../../src/server/app.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
+import { audits, hostedRow } from "./server-db.ts";
 
 type Input = NativeInput;
 export type AdmissionGate = {
@@ -131,6 +132,15 @@ export async function realRace(f: {
       assert(g.models.includes(root), "Accepted old actionable write may wake only exact approved root");
     }
     for (const a of g.accepted) { assert.equal(a.sessionID, original.sessionID); assert.equal(a.id, original.id); assert.equal(a.payload.text, original.text); assert.deepEqual(a.payload.metadata, original.metadata); }
+    if (scenario === "rebind") {
+      // The plugin's late delivery call with the retired lease's capability is refused not_found and audited as
+      // hosted.stale_capability, naming the session and never the capability (#226 §7, #383).
+      const session = hostedRow(app.db, root)!.session_id;
+      const rebound = audits(app.db, "hosted.lease_closed").find(r => r.target === session && r.detail.reason === "rebound"); assert(rebound, "The out-of-band rebind closed the old lease");
+      await until(() => audits(app.db, "hosted.stale_capability").length > 0, "late old-capability call audited");
+      for (const r of audits(app.db, "hosted.stale_capability")) assert.deepEqual(r, { id: r.id, actor: "you@example.com", target: session, detail: { client_id: OPENCODE_CLIENT } });
+      assert(audits(app.db, "hosted.stale_capability")[0]!.id > rebound.id, "Refused only after the rebind closed the lease");
+    }
     console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: app.repo.cursors.directFor("you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
   } finally { g.holding = false; release(); f.expiryContinuation.release(); }
 }

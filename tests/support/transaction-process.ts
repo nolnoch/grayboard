@@ -15,10 +15,12 @@ export function transactionProcess(script: string, args: string[], pause: string
     }
   };
   const done = Promise.all([pump(proc.stdout, true), pump(proc.stderr, false)]);
-  const wait = (text: string) => new Promise<void>((resolve, reject) => {
-    const check = () => { if ((stdout + stderr).includes(text)) { waiters.delete(check); resolve(); } };
+  // `times`: wait for the text's nth occurrence, for a process that prints the same line more than once.
+  const seen = (text: string) => (stdout + stderr).split(text).length - 1;
+  const wait = (text: string, times = 1) => new Promise<void>((resolve, reject) => {
+    const check = () => { if (seen(text) >= times) { waiters.delete(check); resolve(); } };
     waiters.add(check); check();
-    void proc.exited.then(async () => { await done; if (!(stdout + stderr).includes(text)) reject(new Error(`worker exited before ${text}: ${stderr}`)); });
+    void proc.exited.then(async () => { await done; if (seen(text) < times) reject(new Error(`worker exited before ${text}: ${stderr}`)); });
   });
-  return { proc, wait, done, output: () => stdout };
+  return { proc, wait, done, output: () => stdout, errors: () => stderr };
 }
