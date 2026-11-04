@@ -3,32 +3,42 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isExplicitIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
+import { localDbPath, readConversationTitle } from "../local/open.ts";
+import { freshRecord } from "../shared/namerecord.ts";
+import { validSourceId } from "../shared/session_meta.ts";
+import { sockDir } from "../shared/sockdir.ts";
 
-// Claude Code's SessionStart hook: title the session with its grayboard
-// handle, so the name Claude Code shows (and its ListAgents lists) is the one
-// dm_send takes. Only an explicit BUS_IDENTITY binds at start (#182); any
-// other session starts unbound, so there's no name to title it with yet.
-// Any failure prints nothing: a hook must never block a session.
-export function sessionStartOutput(stdin: string, env = process.env): string {
+export type SessionStartOutput = { hookSpecificOutput: { hookEventName: "SessionStart"; sessionTitle: string } };
+
+// Called after the authoritative identity barrier, never as an independent hook.
+// Selected snapshots suppress configured fallback; an acquired live primary is
+// safe to title. No extra store and no bus/record mutations for a display name.
+export function sessionStartOutput(stdin: string, env = process.env): SessionStartOutput | null {
   try {
-    const input = JSON.parse(stdin) as { cwd?: unknown };
+    const input = JSON.parse(stdin) as { cwd?: unknown; session_id?: unknown };
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
-    if (!isExplicitIdentity(env, cwd)) return "";
+    if (!isExplicitIdentity(env, cwd)) return null;
     const id = normalizeIdentityName(env.BUS_IDENTITY!);
-    // An invalid explicit identity refuses `grayboard mcp` at startup; the
-    // hook prints nothing rather than block the session (#181).
-    if (!id.ok) return "";
-    return JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", sessionTitle: id.name } });
+    // Invalid configuration already refuses MCP startup; the title hook is silent.
+    if (!id.ok) return null;
+    const selected = validSourceId(input.session_id) ? readConversationTitle(input.session_id, env) : undefined;
+    if (selected === null) return null;
+    if (selected === undefined) {
+      const pid = Number(env.CLAUDE_PID);
+      const carry = Number.isSafeInteger(pid) && pid > 1 ? freshRecord(sockDir(env), pid, localDbPath(env), { prune: false }) : null;
+      if (carry?.names.length && carry.names[0] !== id.name) return null;
+    }
+    return { hookSpecificOutput: { hookEventName: "SessionStart", sessionTitle: selected ?? id.name } };
   } catch {
-    return "";
+    return null;
   }
 }
 
 type HookEntry = { matcher?: string; hooks: { type: string; command: string; timeout?: number }[] };
 type Settings = { hooks?: Record<string, HookEntry[]>; [k: string]: unknown };
 
-// Every hook command setup writes: the title hook and the subagent-record
-// hooks (`hook claude <event>`, #551).
+// Recognize current commands and the old title-only command when replacing
+// installed user settings; only the authoritative record hook is installed.
 const OURS = /grayboard.*\s(session-start|hook claude [a-z-]+)$/;
 // The PreToolUse entry, whose presence is what "installed" means to `grayboard mcp`.
 const RECORD = /grayboard.*\shook claude pre-tool-use$/;
@@ -44,22 +54,12 @@ export function claudeSettingsPath(env = process.env): string {
   return join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "settings.json");
 }
 
-/**
- * The hooks setup installs for `cli`, the argv that runs this grayboard (the
- * binary, or `bun <main.ts>` from source). The title hook isn't
- * on clear/compact: the title is already set, and a session that moved into a
- * worktree would be retitled with a handle its running server doesn't hold.
- * The record hooks' SessionStart is on clear: SessionEnd(clear) keeps the dir
- * and `start` is rewritten unchanged.
- */
+/** SessionStart handles rotation and title together; clear runs only its identity barrier. */
 export function claudeHooks(argv: string[]): Record<string, HookEntry[]> {
   const cli = argv.map(shellQuote).join(" ");
   const run = (event: string) => [{ type: "command", command: `${cli} hook claude ${event}`, timeout: 10 }];
   return {
-    SessionStart: [
-      { matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${cli} session-start`, timeout: 10 }] },
-      { matcher: "startup|resume|clear|fork", hooks: run("session-start") },
-    ],
+    SessionStart: [{ matcher: "startup|resume|clear|fork", hooks: run("session-start") }],
     PreToolUse: [{ matcher: LOCAL_TOOL_MATCHER, hooks: run("pre-tool-use") }],
     SubagentStop: [{ hooks: run("subagent-stop") }],
     SessionEnd: [{ hooks: run("session-end") }],

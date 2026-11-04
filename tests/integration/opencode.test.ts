@@ -183,6 +183,85 @@ test("opencode: a refused newest snapshot never falls back to older holds or exp
   expect((await holder.call("whoami")).aliases).toEqual(["occupied"]);
   await oc.send("dispose");
 });
+for (const phase of ["queued", "in-progress"] as const) {
+  test(`opencode superseded ${phase} selection: B never admits mail or stale instructions before C (#195 audit 4)`, async () => {
+    const peer = await localSession(dir, "peer");
+    for (const [session, names] of [["s1", ["alpha"]], ["s2", ["bravo", "bravo-second"]], ["s3", ["charlie", "charlie-second"]]] as const) {
+      const saved = await localSession(dir, undefined, { extra: { BUS_HARNESS_SESSION: session } });
+      for (const name of names) await saved.call("bind", { name, create: true });
+      await stopSession(saved.c);
+    }
+    const mail = [];
+    for (const to of ["bravo", "bravo-second", "charlie", "charlie-second"]) {
+      const sent = await peer.call("dm_send", { to, body: `pending ${to}` });
+      mail.push({ to, id: sent.message_id });
+    }
+    const releaseFile = join(dir, "release-outgoing-tool");
+    const oc = driver(undefined, entry({ environment: {
+      BUS_PUSH: "off", ...(phase === "queued" ? { BUS_TEST_PAUSE: "local:tool:in-gate", BUS_TEST_PAUSE_FILE: releaseFile } : {}),
+    } }));
+    await oc.send("init");
+    expect((await oc.send("system", { sessionID: "s1" })).join("\n")).toContain('identity "alpha"');
+    using db = new Database(join(dir, "bus.db"), { readonly: true });
+    let outgoing: Promise<unknown> | undefined;
+    if (phase === "queued") {
+      outgoing = oc.send("call", { tool: "grayboard_whoami", args: {}, sessionID: "s1", key: "outgoing" });
+      void outgoing.catch(() => {});
+      await until(() => oc.stderr.includes("test pause hit: local:tool:in-gate"), 15_000, "outgoing tool held");
+    } else await oc.send("holdAssociation", { sessionID: "s2" });
+    const select = (sessionID: string) => oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID } } } });
+    const b = select("s2");
+    void b.catch(() => {});
+    if (phase === "in-progress") await until(async () => (await oc.send("state")).heldAssociation === "s2", 15_000, "B association response held");
+    else await oc.send("state");
+    const c = select("s3");
+    void c.catch(() => {});
+    await oc.send("state");
+    if (phase === "queued") writeFileSync(releaseFile, "");
+    else {
+      await oc.send("holdReadiness", { sessionID: "s2" });
+      await oc.send("releaseAssociation", { nextSessionID: "s3" });
+      // In the buggy adapter, B reopens delivery while its real ready response
+      // is held. In the fixed adapter, C reaches its paused association instead.
+      // Neither outcome depends on waiting an arbitrary quiet window.
+      const admitted = await until(async () => {
+        const state = await oc.send("state");
+        return state.heldAssociation === "s3" || (state.heldReadiness === "s2" && state.prompts.some((p: { session: string }) => p.session === "s2")) ? state : undefined;
+      }, 15_000, "C paused or superseded B admits its pending mail");
+      expect(admitted.prompts.filter((p: { session: string }) => p.session === "s2")).toEqual([]);
+      for (const sent of mail.filter(m => m.to.startsWith("bravo"))) {
+        expect(db.query("SELECT delivered_at FROM messages WHERE id = ?").get(sent.id)).toEqual({ delivered_at: null });
+      }
+      await oc.send("releaseReadiness");
+      await oc.send("releaseAssociation");
+    }
+    await Promise.all([b, c, outgoing]);
+    const instructions = (await oc.send("system", { sessionID: "s3" })).join("\n");
+    expect(instructions).toContain('identity "charlie"');
+    expect(instructions).not.toContain("bravo");
+    const state = await oc.send("state");
+    if (phase === "queued") {
+      expect(db.query("SELECT count(*) AS n FROM ids WHERE harness_session = 's2'").get()).toEqual({ n: 1 });
+    }
+    expect(state.prompts.filter((p: { session: string }) => p.session === "s2")).toEqual([]);
+    for (const sent of mail.filter(m => m.to.startsWith("charlie"))) {
+      const prompt = await until(async () => (await oc.send("state")).prompts.find((p: { text: string }) => p.text.includes(`message_id="${sent.id}"`)), 15_000, "C alias mail delivered");
+      expect(prompt.session).toBe("s3");
+    }
+    // Superseding a selected root must not consume its durable alias mail.
+    await select("s2");
+    for (const sent of mail.filter(m => m.to.startsWith("bravo"))) {
+      const prompts = await until(async () => {
+        const found = (await oc.send("state")).prompts.filter((p: { text: string }) => p.text.includes(`message_id="${sent.id}"`));
+        return found.length ? found : undefined;
+      }, 15_000, "B alias mail retained for later selection");
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0].session).toBe("s2");
+    }
+    expect(JSON.parse(await oc.send("call", { sessionID: "s2", tool: "grayboard_whoami", args: {} })).aliases).toEqual(["bravo", "bravo-second"]);
+    await oc.send("dispose");
+  }, 60_000);
+}
 
 test("opencode: root rotation settles outgoing delivery, restores ordered snapshots including empty, and keeps the child", async () => {
   const saved = await localSession(dir, undefined, { extra: { BUS_HARNESS_SESSION: "s2" } });

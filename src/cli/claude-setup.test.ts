@@ -180,7 +180,7 @@ test("refresh-adapters in local mode installs the hooks on a pre-#551 setup, kee
   const own = { matcher: "Bash", hooks: [{ type: "command", command: "~/.claude/hooks/bash.sh" }] };
   // What setup wrote before #551: the title hook alone.
   const settings = join(f.root, ".claude", "settings.json");
-  writeFileSync(settings, JSON.stringify({ model: "x", hooks: { SessionStart: [HOOK.SessionStart![0]], PreToolUse: [own] } }));
+  writeFileSync(settings, JSON.stringify({ model: "x", hooks: { SessionStart: [{ matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/old/grayboard session-start", timeout: 10 }] }], PreToolUse: [own] } }));
   const out = f.run("refresh-adapters");
   expect(out).toContain(`Installed grayboard's hooks in ${settings}`);
   expect(f.argv()).toEqual([]);

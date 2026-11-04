@@ -12,7 +12,6 @@ import pkg from "../../package.json" with { type: "json" };
 import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro" };
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
-import { sessionStartOutput } from "./claude_hooks.ts";
 import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudeHooks, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { piAgentDir } from "../shared/pi.ts";
@@ -852,14 +851,6 @@ program
     // command; `setup` reinstalls adapters there.
     const refresh = Bun.spawnSync([process.execPath, "refresh-adapters"], { stdout: "inherit", stderr: "inherit" });
     if (refresh.exitCode !== 0) console.log("Some adapters weren't refreshed (above); after fixing that, run `grayboard setup`.");
-  });
-
-program
-  .command("session-start", { hidden: true })
-  .description("Claude Code SessionStart hook: title the session with its grayboard handle")
-  .action(async () => {
-    const out = sessionStartOutput(await Bun.stdin.text());
-    if (out) console.log(out);
   });
 
 program

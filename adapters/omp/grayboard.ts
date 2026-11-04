@@ -34,7 +34,7 @@ import { instructionHooks } from "../pi-family/omp-instructions.ts";
 type McpEntry = { command?: string; args?: string[]; env?: Record<string, string>; cwd?: string };
 type Tool = { name: string; description?: string; inputSchema: { type?: string; properties?: Record<string, unknown> }; _meta?: Record<string, unknown> };
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
-type Config = { cmd: string; args: string[]; env: Record<string, string | undefined>; cwd?: string; entryPath: string; local: boolean };
+type Config = { cmd: string; args: string[]; env: Record<string, string | undefined>; cwd?: string; entryPath: string; protocol: boolean };
 type Child = {
   proc: ChildProcess;
   ready: Promise<void>;
@@ -140,7 +140,8 @@ function config(agentDir: string): Config {
   // explicitly hosted command retained in a user's old entry.
   const mode = args.findIndex(arg => arg === "--mode");
   const local = !args.some(arg => arg === "--server" || arg.startsWith("--server=") || (arg.startsWith("--mode=") && arg !== "--mode=local")) && (mode < 0 || args[mode + 1] === "local");
-  return { cmd: cmd!, args, env, ...(typeof entry?.cwd === "string" ? { cwd: entry.cwd } : {}), entryPath, local };
+  const protocol = local && env.BUS_PARENT_SESSION === undefined && env.BUS_SESSION_KEY === undefined && env.BUS_HUMAN !== "1";
+  return { cmd: cmd!, args, env, ...(typeof entry?.cwd === "string" ? { cwd: entry.cwd } : {}), entryPath, protocol };
 }
 
 // The tool list `grayboard mcp` serves in the entry's mode, from the installed
@@ -332,7 +333,7 @@ export default function grayboard(pi: ExtensionAPI) {
       if (!c) throw new Error(shared.exitReason ?? "grayboard: no grayboard process runs in this omp process");
       await c.ready;
       if (shared.owner !== pi || shared.ownerToken !== owner || shared.selected !== selection || shared.child !== c) return;
-      if (own.local && c.epoch !== selection.epoch) await associate(c.call, selection, owner);
+      if (own.protocol && c.epoch !== selection.epoch) await associate(c.call, selection, owner);
     });
     shared.transition = transition;
     transition.catch(() => {});
@@ -357,7 +358,7 @@ export default function grayboard(pi: ExtensionAPI) {
     const startedAt = Date.now();
     const owner = shared.ownerToken!;
     const selection = shared.selected!;
-    const env = { ...own.env, BUS_HARNESS_SESSION: selection.id, ...(own.local ? { BUS_ADAPTER_OWNER: owner } : {}) };
+    const env = { ...own.env, BUS_HARNESS_SESSION: selection.id, BUS_ADAPTER_OWNER: own.protocol ? owner : undefined };
     const proc = spawn(own.cmd, own.args, { cwd: own.cwd ?? selection.ctx.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     const pending = new Map<number, PromiseWithResolvers<unknown>>();
     let next = 1;
@@ -471,7 +472,7 @@ export default function grayboard(pi: ExtensionAPI) {
       const served = isRecord(listed) && Array.isArray(listed.tools) ? listed.tools : [];
       const diff = toolDiff(tools, served);
       if (diff.length) report(ctx, `grayboard: the running grayboard serves different tools than \`grayboard tools\` listed at load: ${diff.join(", ")}`);
-      if (own.local && shared.owner === pi && shared.ownerToken === owner && shared.selected === selection) await associate(call, selection, owner);
+      if (own.protocol && shared.owner === pi && shared.ownerToken === owner && shared.selected === selection) await associate(call, selection, owner);
     });
     // A call that awaits ready gets the failure; this only keeps an unawaited
     // rejection from crashing omp when no call is waiting.

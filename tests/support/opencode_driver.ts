@@ -15,8 +15,13 @@
 //   session { sessionID, parentID? } seed the SDK lookup without a creation event
 //   holdPrompt { key }         hold SDK channel admission before its receipt
 //   releasePrompt { key }      release that admission
+//   holdAssociation { sessionID } hold the real grayboard/session response
+//   releaseAssociation            release that response unchanged
+//   holdReadiness { sessionID } hold that root's real ready response
+//   releaseReadiness           release that response unchanged
 import { createInterface } from "node:readline";
 import { ChildProcess } from "node:child_process";
+import { z } from "zod";
 import { tool } from "@opencode-ai/plugin";
 import { GrayboardPlugin } from "../../adapters/opencode/grayboard.ts";
 import { processDescendants } from "./procs.ts";
@@ -26,12 +31,53 @@ import { processDescendants } from "./procs.ts";
 const children: ChildProcess[] = [];
 const spawnOwners: number[][] = [];
 type HeldStdout = { child: ChildProcess; emit: ChildProcess["emit"]; chunks: unknown[][] };
+const RequestSchema = z.object({ id: z.number().optional(), method: z.string(), params: z.record(z.string(), z.unknown()).optional() }).passthrough();
+const ResponseSchema = z.object({ id: z.number().optional() }).passthrough();
+const rpcRequests: z.infer<typeof RequestSchema>[] = [];
+let associationGate: { sessionID: string; response?: string; release?: () => void } | undefined;
+let readinessGate: { sessionID: string; response?: string; release?: () => void } | undefined;
 const heldStdout = new Map<string, HeldStdout>();
 const emit = ChildProcess.prototype.emit;
 ChildProcess.prototype.emit = function (event: string | symbol, ...args: unknown[]) {
   if (event === "spawn") {
     children.push(this);
     spawnOwners.push(processDescendants(process.pid).filter(p => children.some(c => c.pid === p.pid)).map(p => p.pid));
+    const write = this.stdin!.write;
+    this.stdin!.write = function (...args: Parameters<typeof write>) {
+      for (const line of String(args[0]).split("\n").filter(Boolean)) {
+        const request = RequestSchema.parse(JSON.parse(line));
+        if (request.id !== undefined) rpcRequests.push(request);
+      }
+      return write.apply(this, args);
+    };
+    const stdout = this.stdout!;
+    const streamEmit = stdout.emit;
+    let buffered = "";
+    stdout.emit = function (event: string | symbol, ...payload: unknown[]) {
+      if (event !== "data") return streamEmit.call(this, event, ...payload);
+      if (!associationGate && !readinessGate && !buffered) return streamEmit.call(this, event, ...payload);
+      buffered += String(payload[0]);
+      let nl: number;
+      while ((nl = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, nl + 1);
+        buffered = buffered.slice(nl + 1);
+        const response = ResponseSchema.parse(JSON.parse(line));
+        const request = rpcRequests.findLast(r => r.id === response.id);
+        const gate = associationGate;
+        if (gate && request?.method === "grayboard/session" && request.params?.session === gate.sessionID) {
+          gate.response = line;
+          gate.release = () => { streamEmit.call(stdout, "data", line); };
+        } else {
+          const ready = readinessGate;
+          const selected = rpcRequests.findLast(r => r.method === "grayboard/session" && r.params?.epoch === request?.params?.epoch);
+          if (ready && request?.method === "grayboard/session/ready" && selected?.params?.session === ready.sessionID) {
+            ready.response = line;
+            ready.release = () => { streamEmit.call(stdout, "data", line); };
+          } else streamEmit.call(stdout, "data", line);
+        }
+      }
+      return true;
+    };
   }
   return emit.call(this, event, ...args);
 };
@@ -128,6 +174,27 @@ async function run(msg: any): Promise<unknown> {
       gate.resolve();
       return;
     }
+    case "holdAssociation":
+      if (associationGate) throw new Error("association response already held");
+      associationGate = { sessionID: msg.sessionID };
+      return;
+    case "releaseAssociation": {
+      const gate = associationGate;
+      if (!gate?.release) throw new Error("no association response held");
+      associationGate = msg.nextSessionID ? { sessionID: msg.nextSessionID } : undefined;
+      gate.release();
+      return;
+    }
+    case "holdReadiness":
+      if (readinessGate) throw new Error("readiness response already held");
+      readinessGate = { sessionID: msg.sessionID };
+      return;
+    case "releaseReadiness": {
+      const gate = readinessGate;
+      readinessGate = undefined;
+      gate?.release?.();
+      return;
+    }
     case "holdStdout": {
       const child = children.at(-1);
       if (!child?.stdout) throw new Error("no child stdout to hold");
@@ -158,7 +225,7 @@ async function run(msg: any): Promise<unknown> {
       return output.system;
     }
     case "state":
-      return { logs, toasts, prompts, calls: [...calls.keys()], restartOwners, spawnOwners, pendingPrompts: [...pendingPrompts] };
+      return { logs, toasts, prompts, calls: [...calls.keys()], restartOwners, spawnOwners, pendingPrompts: [...pendingPrompts], heldAssociation: associationGate?.response ? associationGate.sessionID : undefined, heldReadiness: readinessGate?.response ? readinessGate.sessionID : undefined };
     case "dispose":
       return hooks.dispose();
   }

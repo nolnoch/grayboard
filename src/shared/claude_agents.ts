@@ -36,10 +36,10 @@
 //
 // Imports nothing heavy: the local hook entry (src/cli/main.ts) loads this
 // module alone, so a hook costs a process start and a few file operations.
-import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { LOOPBACK } from "./endpoint.ts";
-import { procStart, procStarts } from "./proc.ts";
+import { isAlive, procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
 import { validSourceId } from "./session_meta.ts";
 import { SIGN_IN_FLOW_MS } from "./signin.ts";
@@ -149,9 +149,11 @@ function ageMs(path: string, now: number): number | undefined {
 }
 
 /**
- * One hook event. Recording never throws: a failed record surfaces as the
- * reader's missing-record error. The local CLI awaits the identity barrier
- * separately. `hosted` also writes SubagentStop markers and root facts, and
+ * One hook event. Attribution recording never throws: a failed record surfaces
+ * as the reader's missing-record error. Local lifecycle publication/revocation
+ * must throw on failure before a retained child can resume stale identity.
+ * The local CLI awaits the identity barrier separately.
+ * `hosted` also writes SubagentStop markers and root facts, and
  * answers post-tool-use with the sign-in link for the entry to print. That
  * link is only ever a `systemMessage` (the user's line): `additionalContext`,
  * a `reason` and exit-2 stderr all reach the model.
@@ -214,12 +216,21 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       put(join(ended, `${now}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`), agent);
       pruneEnded(ended);
     } else if (event === "session-end") {
-      // The MCP process outlives a /clear, and so do its records.
-      if (input.reason === "clear") return;
+      // Keep attribution and facts across clear, not the outgoing permission to resume.
+      if (input.reason === "clear") {
+        if (!o.hosted) rmSync(join(dir, "current"), { force: true });
+        return;
+      }
       rmSync(dir, { recursive: true, force: true });
     }
-  } catch {
-    // Said by the reader's missing-record error, never here.
+  } catch (error) {
+    if (!o.hosted && event === "session-start") {
+      try { rmSync(join(sessionDir(o.base, Number(o.env.CLAUDE_PID)), "current"), { force: true }); }
+      catch (invalidation) { throw new AggregateError([error, invalidation], "Claude current publication failed and previous identity could not be invalidated"); }
+      throw error;
+    }
+    if (!o.hosted && event === "session-end") throw error;
+    // Attribution failures are said by the reader's missing-record error.
   }
 }
 
@@ -265,7 +276,10 @@ function pruneSessions(base: string, self: number) {
     try { recorded = readFileSync(join(root, String(pid), "start"), "utf8"); } catch { recorded = undefined; }
     // Gone, or alive under another start time: a recycled pid. Unknown either way keeps it.
     const dead = !starts.has(pid) || (now !== null && now !== undefined && recorded !== undefined && recorded !== "" && recorded !== now);
-    if (dead) rmSync(join(root, String(pid)), { recursive: true, force: true });
+    if (dead) {
+      pruneIdentityConnections(base, pid);
+      rmSync(join(root, String(pid)), { recursive: true, force: true });
+    }
   }
 }
 
@@ -310,13 +324,56 @@ export function takeRecord(base: string, claudePid: number, harnessStart: string
 // At most `max` bytes of a regular file, never following a link or waiting on a
 // FIFO: a fact file is read on every hosted request, so a same-user process that
 // swaps one for `/dev/zero` or a pipe must not stall or flood the server.
-function readSmall(path: string, max: number): string {
+export function readSmall(path: string, max: number): string {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    if (!fstatSync(fd).isFile()) throw new Error("not a regular file");
-    const buf = Buffer.alloc(max);
-    return buf.toString("utf8", 0, readSync(fd, buf, 0, max, 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error("not a regular file");
+    if (stat.size > max) throw new Error(`record exceeds ${max} bytes`);
+    const buf = Buffer.alloc(max + 1);
+    const count = readSync(fd, buf, 0, buf.length, 0);
+    if (count > max) throw new Error(`record exceeds ${max} bytes`);
+    return buf.toString("utf8", 0, count);
   } finally { closeSync(fd); }
+}
+
+export type IdentityConnection = { socket: string; start: string | null };
+/** A retained child's bounded record, constrained to the socket name this writer owns. */
+export function readIdentityConnection(base: string, file: string, pid: number): IdentityConnection {
+  try {
+    if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error("invalid child pid");
+    const value = JSON.parse(readSmall(file, 4096)) as IdentityConnection;
+    if (!value || typeof value.socket !== "string" || !(value.start === null || (typeof value.start === "string" && value.start.length > 0 && value.start.length <= 128))) throw new Error("invalid fields");
+    const token = value.socket.slice(value.socket.lastIndexOf(".") + 1);
+    if (!/^[a-z0-9]{1,6}$/.test(token) || value.socket !== join(resolve(base), `.c${pid}.${token}`)) throw new Error("socket is not an owned generated path");
+    return value;
+  } catch (error) { throw new Error(`Claude identity connection record ${file}: ${(error as Error).message}`, { cause: error }); }
+}
+
+/** The validated path still names this user's socket, not a link or another file kind. */
+export function isOwnedIdentitySocket(path: string): boolean {
+  const stat = lstatSync(path);
+  return stat.isSocket() && stat.uid === process.getuid?.();
+}
+
+/** Unlink only a validated generated socket, never a regular file or symlink. */
+export function dropIdentitySocket(path: string): void {
+  try {
+    if (isOwnedIdentitySocket(path)) unlinkSync(path);
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+
+// A dead harness's children also left sockets outside its PID directory.
+function pruneIdentityConnections(base: string, pid: number): void {
+  const dir = join(sessionDir(base, pid), "connections");
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (!/^[1-9][0-9]*$/.test(name)) continue;
+    let record: IdentityConnection;
+    try { record = readIdentityConnection(base, join(dir, name), Number(name)); } catch { continue; }
+    if (!isAlive(Number(name), record.start)) dropIdentitySocket(record.socket);
+  }
 }
 
 export type CurrentConversation = { session: string; start: string; token: string };

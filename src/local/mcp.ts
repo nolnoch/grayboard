@@ -222,6 +222,9 @@ const ORDINARY = DELIVER && !HUMAN && !KEYED && PARENT_SESSION === undefined;
 ROOT_KIND.localResume = ORDINARY;
 const ADAPTER_OWNER = ORDINARY ? harnessId("BUS_ADAPTER_OWNER") : undefined;
 let adapterEpoch = 0;
+// Fence readiness as soon as selection arrives, before BindGate can drain
+// outgoing work; adapterEpoch advances only after that selection completes.
+let adapterSelectedEpoch = 0;
 let adapterPaused = ADAPTER_OWNER !== undefined;
 
 // The live root this process is a runner child of (#523 step 5), while it
@@ -615,19 +618,22 @@ function checkOwner(owner: string, meta?: Record<string, unknown>): void {
 }
 mcp.setRequestHandler(SessionSchema, async ({ params }) => {
   checkOwner(params.owner, params._meta);
-  if (params.epoch <= adapterEpoch) throw new Error("stale conversation epoch");
+  if (params.epoch <= adapterSelectedEpoch) throw new Error("stale conversation epoch");
+  adapterSelectedEpoch = params.epoch;
   pauseRoot();
   return gate.bind(async () => {
-    if (params.epoch <= adapterEpoch) throw new Error("stale conversation epoch");
+    if (params.epoch !== adapterSelectedEpoch) throw new Error("stale conversation epoch");
     await inflight;
+    if (params.epoch !== adapterSelectedEpoch) throw new Error("stale conversation epoch");
     await rotateRoot(params.session);
+    if (params.epoch !== adapterSelectedEpoch) throw new Error("stale conversation epoch");
     adapterEpoch = params.epoch;
     return { id: SESSION_ID, session: HARNESS_SESSION, epoch: adapterEpoch, instructions: localInstructions(true, startNotes) };
   });
 });
 mcp.setRequestHandler(ReadySchema, async ({ params }) => {
   checkOwner(params.owner, params._meta);
-  if (params.epoch !== adapterEpoch) throw new Error("stale conversation readiness");
+  if (params.epoch !== adapterSelectedEpoch || params.epoch !== adapterEpoch) throw new Error("stale conversation readiness");
   resumeRoot();
   return {};
 });

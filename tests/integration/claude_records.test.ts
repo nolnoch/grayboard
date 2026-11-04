@@ -9,7 +9,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installClaudeHooks } from "../../src/cli/claude_hooks.ts";
+import { installClaudeHooks, sessionStartOutput } from "../../src/cli/claude_hooks.ts";
 import { runHook, sessionDir, TOOL_USE_META } from "../../src/shared/claude_agents.ts";
 import { syncIdentity } from "../../src/shared/claude_identity.ts";
 import { localEnv } from "../support/env.ts";
@@ -134,7 +134,7 @@ test("Claude's acknowledged clear barrier selects remembered B before calls/push
   await stopSession(remembered.c);
   const env = { CLAUDE_PID: String(b.s.harnessPid) };
   hook(b, "session-start", { session_id: "A" });
-  await syncIdentity("session-start", "{}", b.dir, env);
+  await syncIdentity("session-start", JSON.stringify({ session_id: "A" }), b.dir, env);
   const a = await b.s.call("whoami");
   const oldCall = toolUse();
   hook(b, "pre-tool-use", { session_id: "A", tool_use_id: oldCall });
@@ -144,7 +144,7 @@ test("Claude's acknowledged clear barrier selects remembered B before calls/push
   const pending = await peer.call("dm_send", { to: "cc", body: "paused-A" });
   expect(b.db.query<{ delivered_at: number | null }, [number]>("SELECT delivered_at FROM messages WHERE id=?").get(pending.message_id)?.delivered_at).toBeNull();
   hook(b, "session-start", { source: "clear", session_id: "B" });
-  await syncIdentity("session-start", "{}", b.dir, env);
+  await syncIdentity("session-start", JSON.stringify({ session_id: "B" }), b.dir, env);
   const current = await b.s.call("whoami");
   expect(current.id).not.toBe(a.id);
   expect(current.aliases).toEqual(["selected"]);
@@ -156,6 +156,79 @@ test("Claude's acknowledged clear barrier selects remembered B before calls/push
   await peer.call("dm_send", { to: "selected", body: "push-selected-B" });
   await until(() => b.s.pushes.some(p => p.content === "push-selected-B"));
   expect(b.s.pushes.some(p => p.content === "paused-A")).toBe(false);
+});
+
+test("failed authoritative B publication does not reactivate A or deliver its queued mail", async () => {
+  const b = await claudeBus(true);
+  const env = { CLAUDE_PID: String(b.s.harnessPid) };
+  hook(b, "session-start", { session_id: "A" });
+  await syncIdentity("session-start", JSON.stringify({ session_id: "A" }), b.dir, env);
+  const a = await b.s.call("whoami");
+  await syncIdentity("session-end", JSON.stringify({ reason: "clear" }), b.dir, env);
+  const peer = await localSession(b.dir, "sender");
+  const mail = await peer.call("dm_send", { to: "cc", body: "must-stay-paused-A" });
+  mkdirSync(join(sessionDir(b.dir, b.s.harnessPid), `current.tmp.${process.pid}`));
+  let publicationError: unknown, barrierError: unknown;
+  try { hook(b, "session-start", { session_id: "B", source: "clear" }); } catch (error) { publicationError = error; }
+  try { await syncIdentity("session-start", JSON.stringify({ session_id: "B" }), b.dir, env); } catch (error) { barrierError = error; }
+  expect(publicationError).toBeInstanceOf(Error);
+  expect(barrierError).toBeInstanceOf(Error);
+  expect(b.db.query<{ harness_session: string }, [string]>("SELECT harness_session FROM ids WHERE id=?").get(a.id)?.harness_session).toBe("A");
+  expect(b.db.query<{ delivered_at: number | null }, [number]>("SELECT delivered_at FROM messages WHERE id=?").get(mail.message_id)?.delivered_at).toBeNull();
+  expect(b.s.pushes.some(push => push.content === "must-stay-paused-A")).toBe(false);
+});
+
+for (const empty of [false, true]) test(`a ${empty ? "remembered empty" : "remembered ordered"} conversation never titles itself as configured fallback, before or after selection`, async () => {
+  const b = await claudeBus(true);
+  const remembered = await localSession(b.dir, undefined, { extra: { BUS_HARNESS_SESSION: "remembered-title" } });
+  await remembered.call("bind", { name: "aux", create: true });
+  await remembered.call("bind", { name: "renamed", create: true });
+  if (empty) {
+    await remembered.call("unbind", { name: "aux" });
+    await remembered.call("unbind", { name: "renamed" });
+  }
+  await stopSession(remembered.c);
+  const env = { CLAUDE_PID: String(b.s.harnessPid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "configured-fallback" };
+  for (const source of ["startup", "resume", "fork"]) {
+    const input = JSON.stringify({ cwd: b.dir, source, session_id: "remembered-title" });
+    expect(sessionStartOutput(input, env)).toBeNull();
+    hook(b, "session-start", { source, session_id: "remembered-title" });
+    await syncIdentity("session-start", input, b.dir, env);
+    expect((await b.s.call("whoami")).aliases).toEqual(empty ? [] : ["aux", "renamed"]);
+    expect(sessionStartOutput(input, env)).toBeNull();
+  }
+});
+
+test("an absent selected snapshot still puts outgoing PID carry ahead of configured title", async () => {
+  const b = await claudeBus(true);
+  await b.s.call("bind", { name: "aux", create: true });
+  await b.s.call("unbind", { name: "cc" });
+  const env = { CLAUDE_PID: String(b.s.harnessPid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "configured-fallback" };
+  const input = JSON.stringify({ cwd: b.dir, source: "fork", session_id: "new-carried" });
+  expect(sessionStartOutput(input, env)).toBeNull();
+  hook(b, "session-start", { source: "fork", session_id: "new-carried" });
+  await syncIdentity("session-start", input, b.dir, env);
+  expect((await b.s.call("whoami")).aliases).toEqual(["aux"]);
+  expect(sessionStartOutput(input, env)!.hookSpecificOutput.sessionTitle).toBe("aux");
+});
+
+test("a genuinely new configured root has the same correct title before and after authoritative selection", async () => {
+  const b = await claudeBus(true);
+  const env = { CLAUDE_PID: String(b.s.harnessPid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "cc" };
+  const input = JSON.stringify({ cwd: b.dir, source: "startup", session_id: "genuinely-new-title" });
+  expect(sessionStartOutput(input, env)!.hookSpecificOutput.sessionTitle).toBe("cc");
+  hook(b, "session-start", { source: "startup", session_id: "genuinely-new-title" });
+  await syncIdentity("session-start", input, b.dir, env);
+  expect((await b.s.call("whoami")).aliases).toEqual(["cc"]);
+  expect(sessionStartOutput(input, env)!.hookSpecificOutput.sessionTitle).toBe("cc");
+  const child = Bun.spawn([process.execPath, CLI, "hook", "claude", "session-start"], { env: { ...process.env, ...env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  child.stdin.write(input);
+  child.stdin.end();
+  const [code, out, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect(code).toBe(0);
+  expect(error).toBe("");
+  expect(out.trim().split("\n")).toHaveLength(1);
+  expect(JSON.parse(out).hookSpecificOutput.sessionTitle).toBe("cc");
 });
 
 test("an adapter's selected identity ignores inherited Claude environment and needs no Claude hook record", async () => {
@@ -187,7 +260,7 @@ for (const fail of [false, true]) test(`native post-list activation ${fail ? "re
   }) });
   await entered.promise;
   hook(b, "session-start", { session_id: "activation" });
-  await syncIdentity("session-start", "{}", b.dir, { CLAUDE_PID: String(b.s.harnessPid) });
+  await syncIdentity("session-start", JSON.stringify({ session_id: "activation" }), b.dir, { CLAUDE_PID: String(b.s.harnessPid) });
   const peer = await localSession(b.dir, "sender");
   const mail = await peer.call("dm_send", { to: "cc", body: "queued-until-native-activation" });
   const delivery = () => b.db.query<{ delivered_at: number | null }, [number]>("SELECT delivered_at FROM messages WHERE id=?").get(mail.message_id)?.delivered_at;

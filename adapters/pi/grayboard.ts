@@ -83,7 +83,7 @@ delete ENV.BUS_PUSH;
 // child this one is: that session's adapter gives its own child the same id
 // (BUS_HARNESS_SESSION, below). The hosted entry reads the same marker
 // (adapters/pi-family/entry-pi.ts).
-const PARENT_SESSION = process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_SUBAGENT_PARENT_SESSION || undefined : undefined;
+const PARENT_SESSION = (process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_SUBAGENT_PARENT_SESSION || undefined : undefined) ?? (ENV.BUS_PARENT_SESSION || undefined);
 
 // The file whose entry pi's own MCP client would run, if one does: its tools
 // would collide with these by name (pi warns, and the last registration wins),
@@ -163,7 +163,7 @@ export default function grayboard(pi: ExtensionAPI) {
   const owner = randomUUID();
   const mode = ARGS.indexOf("--mode");
   const local = !ARGS.some(arg => arg === "--server" || arg.startsWith("--server=") || (arg.startsWith("--mode=") && arg !== "--mode=local")) && (mode < 0 || ARGS[mode + 1] === "local");
-  const protocol = local && !PARENT_SESSION;
+  const protocol = local && PARENT_SESSION === undefined && ENV.BUS_SESSION_KEY === undefined && ENV.BUS_HUMAN !== "1";
   let epoch = 0;
   let selected: { id: string; epoch: number; ctx: ExtensionContext } | undefined;
 

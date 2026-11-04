@@ -297,7 +297,7 @@ test(`update from ${FROM} replaces it with the build under test and refreshes it
   const own = { matcher: "Bash", hooks: [{ type: "command", command: "~/.claude/hooks/bash.sh" }] };
   writeFileSync(join(home, ".claude.json"), JSON.stringify({ mcpServers: { grayboard: { type: "stdio", command: exe, args: ["mcp"] } } }));
   mkdirSync(join(home, ".claude"), { recursive: true });
-  writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ hooks: { SessionStart: [claudeHooks([exe]).SessionStart![0]], PreToolUse: [own] } }));
+  writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ matcher: "startup|resume|fork", hooks: [{ type: "command", command: `${exe} session-start`, timeout: 10 }] }], PreToolUse: [own] } }));
 
   const out = await expectOk(grayboard("update"));
   expect(out).toContain(`Updated grayboard ${old.tag.slice(1)} → ${TAG} from ${releases.url}`);

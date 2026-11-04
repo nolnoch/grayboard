@@ -372,6 +372,98 @@ test("a held tool finishes as the outgoing root; selection fences later calls un
   await until(() => contents(peer).includes("held-before-switch") && contents(peer).includes("held-after-switch"));
 }, 30_000);
 
+test("stale readiness cannot reopen tools or delivery while a newer selection waits for an outgoing tool", async () => {
+  const rememberedB = await session("readiness-b", "b-name");
+  await stopSession(rememberedB.c);
+  const peer = await localSession(dir, "peer");
+  const s = await adapter("readiness-a", "a-name", pauseEnv("local:tool:in-gate"));
+  const a = await select(s, "readiness-a", 1);
+  await ready(s, 1);
+  const active = s.call("dm_send", { to: "peer", body: "readiness-outgoing" });
+  await until(() => s.stderr().includes("test pause hit: local:tool:in-gate"));
+  const selecting = select(s, "readiness-b", 2);
+  // This response is a wire barrier: selection two has paused the root but
+  // cannot commit while the outgoing tool owns BindGate.
+  await rpcRefused(ready(s, 1));
+  await rpcRefused(ready(s, 2));
+  expect(endedAt(a.id)).toBeNull();
+  expect(rows(`SELECT id FROM messages WHERE body = 'readiness-outgoing'`)).toEqual([]);
+  const queued = await peer.call("dm_send", { to: "b-name", body: "readiness-incoming" });
+  const later = s.call("dm_send", { to: "peer", body: "readiness-later" });
+  await rpcRefused(ready(s, 1));
+  expect(contents(s)).toEqual([]);
+  expect(rows(`SELECT id FROM messages WHERE body = 'readiness-later'`)).toEqual([]);
+  release("local:tool:in-gate");
+  await active;
+  const b = await selecting;
+  expect(b.instructions.join("\n")).toContain("b-name");
+  expect(rows(`SELECT sender, sender_id FROM messages WHERE body = 'readiness-outgoing'`)).toEqual([{ sender: "a-name", sender_id: a.id }]);
+  // The completed transition still needs acknowledgement of its own guidance;
+  // the old epoch must never release tools or advance B's delivery cursor.
+  await rpcRefused(ready(s, 1));
+  expect(rows(`SELECT id FROM messages WHERE body = 'readiness-later'`)).toEqual([]);
+  expect(contents(s)).toEqual([]);
+  expect(cursor("b-name")).toBe(0);
+  expect(delivered(queued.message_id)).toBeNull();
+  await ready(s, 2);
+  await later;
+  expect(rows(`SELECT sender, sender_id FROM messages WHERE body = 'readiness-later'`)).toEqual([{ sender: "b-name", sender_id: b.id }]);
+  await until(() => s.pushes.length === 1);
+  const incoming = s.pushes[0]!;
+  expect(incoming.content).toBe("readiness-incoming");
+  expect(incoming.meta).toMatchObject({ grayboard_session: "readiness-b", grayboard_epoch: "2", message_id: String(queued.message_id) });
+  await receipt(s, incoming, true);
+  await until(() => cursor("b-name") === queued.message_id);
+  expect(delivered(queued.message_id)).not.toBeNull();
+}, 30_000);
+
+test("pending duplicate and superseded epochs cannot acknowledge or commit an obsolete selection", async () => {
+  const previousC = await session("superseded-c", "c-name");
+  await stopSession(previousC.c);
+  const peer = await localSession(dir, "peer");
+  const s = await adapter("superseded-a", "a-name");
+  const a = await select(s, "superseded-a", 1);
+  await ready(s, 1);
+  const sent = await peer.call("dm_send", { to: "a-name", body: "superseded-outgoing" });
+  await until(() => s.pushes.length === 1);
+  const outgoing = s.pushes[0]!;
+  expect(outgoing.meta.grayboard_epoch).toBe("1");
+  const superseded = rpcRefused(select(s, "superseded-b", 2));
+  // The invalid ready is a wire barrier while epoch two owns BindGate and
+  // waits for the outstanding receipt, rather than a tool-drain race.
+  await rpcRefused(ready(s, 99));
+  await rpcRefused(select(s, "duplicate-must-not-commit", 2));
+  const selecting = select(s, "superseded-c", 3);
+  await rpcRefused(ready(s, 1));
+  await rpcRefused(ready(s, 2));
+  await rpcRefused(ready(s, 3));
+  await rpcRefused(select(s, "older-must-not-commit", 2));
+  expect(endedAt(a.id)).toBeNull();
+  // Receipt control remains usable even with both selection and delivery
+  // paused, and releasing it must skip the superseded epoch entirely.
+  await receipt(s, outgoing, false);
+  await superseded;
+  const c = await selecting;
+  expect(c).toMatchObject({ session: "superseded-c", epoch: 3 });
+  expect(c.instructions.join("\n")).toContain("c-name");
+  expect(rows(`SELECT id FROM ids WHERE harness_session IN ('superseded-b', 'duplicate-must-not-commit', 'older-must-not-commit')`)).toEqual([]);
+  expect(cursor("a-name")).toBe(0);
+  expect(delivered(sent.message_id)).toBeNull();
+  const queued = await peer.call("dm_send", { to: "c-name", body: "superseded-incoming" });
+  const heldCall = s.call("whoami");
+  await rpcRefused(ready(s, 2));
+  expect(contents(s)).toEqual(["superseded-outgoing"]);
+  expect(cursor("c-name")).toBe(0);
+  await ready(s, 3);
+  expect((await heldCall).id).toBe(c.id);
+  await until(() => s.pushes.length === 2);
+  const incoming = s.pushes[1]!;
+  expect(incoming.content).toBe("superseded-incoming");
+  expect(incoming.meta).toMatchObject({ grayboard_session: "superseded-c", grayboard_epoch: "3", message_id: String(queued.message_id) });
+  await receipt(s, incoming, true);
+  await until(() => cursor("c-name") === queued.message_id);
+}, 30_000);
+
 test("an outstanding delivery receipt fences selection; a decline preserves mail until its conversation resumes", async () => {
   const previousB = await session("receipt-b", "b-name");
   await previousB.call("claim_take", { key: "b:guidance", ttl_minutes: 30 });
@@ -384,7 +476,7 @@ test("an outstanding delivery receipt fences selection; a decline preserves mail
   const declined = s.pushes[0]!;
   expect(declined.meta).toMatchObject({ grayboard_session: "receipt-a", grayboard_epoch: "0", message_id: String(sent.message_id) });
   const selecting = select(s, "receipt-b", 1);
-  // Both selections enter while epoch zero is current; only the first may commit.
+  // A duplicate pending epoch is refused before the first selection commits.
   const duplicate = rpcRefused(select(s, "must-not-be-selected", 1));
   await rpcRefused(ready(s, 99));
   expect(endedAt(a.id)).toBeNull();
