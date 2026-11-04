@@ -88,3 +88,16 @@ test("one connection per lock file per process; release is idempotent; abort sto
   expect(again).toBeDefined();
   again!.release();
 });
+
+test("onBusy runs after each attempt that found the lock held, never once it is taken; what it throws ends the wait", async () => {
+  const path = join(dir, "busy.lock");
+  const lock = tryAcquire(path)!;
+  let busy = 0;
+  const waiting = acquire(path, { deadlineMs: 10_000, onBusy: () => { if (++busy === 2) lock.release(); } });
+  const taken = await waiting;
+  expect(busy).toBe(2);
+  taken.release();
+  const again = tryAcquire(path)!;
+  await expect(acquire(path, { deadlineMs: 10_000, onBusy: () => { throw new Error("stop"); } })).rejects.toThrow("stop");
+  again.release();
+});

@@ -11,15 +11,19 @@
 // before a receipt, an item reaching a root mid-/new, and a child shut down
 // mid-registration. For omp (#280): an idle child re-registering under the
 // root its marker names now, an idle end behind a running call, and rootOf.
+// The process's sign-in (#581): a signed-out call's offer in each role, a
+// subagent taking its root's mode, /grayboard login joining a pending flow,
+// an outcome kept across a session switch, and status's last sign-in line.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
-import { createGrayboard, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { createGrayboard, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
+import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
@@ -28,7 +32,7 @@ import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
@@ -38,18 +42,39 @@ const HELD = "another pi process holds delivery for this session";
 
 let srv: HostedServer, agentDir: string, stateDir: string, user: number, stopped: boolean;
 const instances: Instance[] = [];
+const PATH = process.env.PATH;
+
+// The extension's per-harness globalThis slot (extension.ts `shared`): each
+// test starts with none, so no sign-in record, mode or voice leaks between tests.
+const SLOT = Symbol.for("io.github.nolnoch.grayboard/pi-sessions");
+const slots = globalThis as unknown as Record<symbol, { signins: SignInState } | undefined>;
+const signins = () => slots[SLOT]?.signins ?? {};
 
 beforeEach(async () => {
   srv = hostedServer();
   stopped = false;
+  delete slots[SLOT];
   agentDir = realpathSync(mkdtempSync(join(tmpdir(), "gb-pi-family-")));
   stateDir = join(agentDir, "grayboard");
   mkdirSync(stateDir, { recursive: true });
+  // The system browser's opener (`open`, `xdg-open`) records the URL instead.
+  const bin = join(agentDir, "bin");
+  mkdirSync(bin);
+  for (const name of ["open", "xdg-open"]) {
+    writeFileSync(join(bin, name), `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(join(agentDir, "opened"))}\n`);
+    chmodSync(join(bin, name), 0o755);
+  }
+  process.env.PATH = `${bin}:${PATH}`;
   writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url: srv.resource }));
   user = (await seedGrant(srv, stateDir, CLIENT, EMAIL)).authed.user_id;
 });
 afterEach(async () => {
   await Promise.all(instances.splice(0).map(i => i.ext.shutdown("quit")));
+  // A flow only a subagent or a switched-away root left: its loopback listener goes.
+  signins().flow?.abort.abort();
+  await signins().flow?.done;
+  delete slots[SLOT];
+  process.env.PATH = PATH;
   if (!stopped) await srv.stop();
   rmSync(agentDir, { recursive: true, force: true });
 });
@@ -66,7 +91,8 @@ type Instance = {
 };
 // `marker`, a function, is read live (omp's entry: the root as it is now).
 // `facts`: the harness's current model and effort (#364), read live.
-function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void, facts?: (sessionID: string) => SessionFacts | undefined): Instance {
+// `interactive`: the harness's mode outlives a browser round trip (tui, rpc).
+function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void, facts?: (sessionID: string) => SessionFacts | undefined, interactive = false): Instance {
   let tools: NativeTool[] = [];
   let run: ((tool: string, args: Record<string, unknown>) => Promise<CallToolResult>) | undefined;
   const self: Instance = {
@@ -78,8 +104,8 @@ function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?
       deliver: (content, wake) => { self.deliveries.push({ content, wake }); onDeliver?.(); },
       notify: (message, level) => { self.notices.push({ message, level }); },
       record: data => { self.records.push(data); },
-      // A headless fixture: a signed-out call fails at once instead of offering a sign-in (#499).
-      interactive: () => false,
+      // Headless by default: a signed-out call fails at once instead of offering a sign-in (#499).
+      interactive: () => interactive,
       ...(facts ? { facts } : {}),
     }),
     tools: () => tools,
@@ -628,6 +654,7 @@ test("with the server down, /grayboard logout signs out but warns that its revok
   await a.ext.command("login");
   expect(a.notices.at(-1)).toEqual({ level: "error", message: expect.stringMatching(/^grayboard: sign-in failed: .+; run \/grayboard login to try again$/) });
   expect(a.notices.some(n => n.message.includes("/grayboard resume"))).toBe(false);
+  expect(await a.ext.status()).toMatch(/\nlast sign-in: command at \d{4}-\d\d-\d\dT\S+Z: failed: .+/);
 }, 30_000);
 
 test("a /reload between an item's admission and its receipt doesn't deliver it twice: admission is idempotent per item across the reload", async () => {
@@ -965,3 +992,124 @@ test("an unreadable session state file before the first start is said, each fail
     "warning grayboard: delivery degraded: Diagnostic restore unavailable; approval is unchanged",
   ]);
 });
+
+// ---- sign-in (#581) ----
+
+const STARTED = "grayboard: sign-in started: ask the user to open the link pi shows (/grayboard login shows it again), then call a grayboard tool again";
+const SIGNED_IN = { level: "info", message: "grayboard: signed in" };
+// The URLs the fake system browser was asked to open.
+const opened = () => existsSync(join(agentDir, "opened")) ? readFileSync(join(agentDir, "opened"), "utf8").split("\n").filter(Boolean) : [];
+// The sign-in URL said on `i`'s notice line (the user's, never the model's).
+const linkSaid = (i: Instance) => until(() => i.notices.map(n => /^grayboard: sign in at (\S+)$/.exec(n.message)?.[1]).find(Boolean), 10_000, "the sign-in link on the notice line");
+const LAST = (origin: string, outcome: string) => new RegExp(`\\nlast sign-in: ${origin} at \\d{4}-\\d\\d-\\d\\dT\\S+Z: ${outcome}(\\n|$)`);
+// A signed-out call's result: the started note first, and the link nowhere in it.
+function offered(result: CallToolResult) {
+  expect(result.isError).toBe(true);
+  expect(texts(result)[0]).toBe(STARTED);
+  expect(texts(result).join("\n")).not.toContain(srv.issuer);
+}
+
+test("an unattributed subagent's signed-out call offers a sign-in: the link only on the notice line, no browser, and opening it signs the session in", async () => {
+  await logoutElsewhere();
+  const a = instance({ child: true }, undefined, undefined, true);
+  await a.ext.start({ id: "offer-loose", reason: "startup" });
+  offered(await a.call("whoami"));
+  const url = await linkSaid(a);
+  expect(url).toStartWith(`${srv.issuer}/`);
+  // An offer's flow never opens a window: a model's call did it.
+  expect(opened()).toEqual([]);
+  expect(await browse(srv.issuer, url, "pi")).toContain("Signed in to grayboard");
+  await until(() => a.notices.some(n => n.message === SIGNED_IN.message), 10_000, "signed in said");
+  expect((await a.call("whoami")).isError).toBeUndefined();
+  expect(await a.ext.status()).toMatch(LAST("offer", "signed in"));
+}, 30_000);
+
+test("a headless (print-mode) root's signed-out call makes no offer: it names the login and starts no flow", async () => {
+  await logoutElsewhere();
+  const a = instance();
+  await a.ext.start({ id: "offer-print", reason: "startup" });
+  const result = await a.call("whoami");
+  expect(result.isError).toBe(true);
+  expect(texts(result).join("\n")).toContain(LOGIN_ACTION);
+  expect(texts(result).join("\n")).not.toContain("sign-in started");
+  expect(signins().flow).toBeUndefined();
+  expect(a.notices.some(n => n.message.startsWith("grayboard: sign in at "))).toBe(false);
+});
+
+test("an in-process subagent (omp's task) takes its root's mode for an offer; its parked runtime's quit leaves the flow running, and the root says the outcome", async () => {
+  await logoutElsewhere();
+  const r = instance({ child: false }, undefined, undefined, true);
+  await r.ext.start({ id: "mode-root", reason: "startup" });
+  // omp starts a task subagent without a mode, so its own reads print.
+  const c = instance({ child: true, root: "mode-root" });
+  await c.ext.start({ id: "mode-child", reason: "startup" });
+  offered(await c.call("whoami"));
+  // The link speaks through the current root's line.
+  const url = await linkSaid(r);
+  expect(c.notices.some(n => n.message.startsWith("grayboard: sign in at "))).toBe(false);
+  // omp quits a subagent's runtime when it parks: the user's sign-in goes on.
+  await c.ext.shutdown("quit");
+  expect(signins().flow?.abort.signal.aborted).toBe(false);
+  expect(await browse(srv.issuer, url, "pi")).toContain("Signed in to grayboard");
+  await until(() => r.notices.some(n => n.message === SIGNED_IN.message), 10_000, "signed in said by the root");
+  await until(async () => (await r.ext.status()).includes("  mode-root: unbound, "), 10_000, "the root restarted signed in");
+  expect(await r.ext.status()).toMatch(LAST("offer", "signed in"));
+}, 30_000);
+
+test("/grayboard login joins an offer's pending flow: one flow, its link said again and opened in the browser, its outcome said once", async () => {
+  await logoutElsewhere();
+  const a = instance({ child: false }, undefined, undefined, true);
+  await a.ext.start({ id: "join-root", reason: "startup" });
+  offered(await a.call("whoami"));
+  const url = await linkSaid(a);
+  const flow = signins().flow;
+  expect(opened()).toEqual([]);
+  const login = a.ext.command("login");
+  await until(() => opened().length === 1, 10_000, "the browser opened");
+  expect(opened()).toEqual([url]);
+  expect(signins().flow).toBe(flow);
+  expect(a.notices.filter(n => n.message === `grayboard: sign in at ${url}`)).toHaveLength(2);
+  expect(await browse(srv.issuer, url, "pi")).toContain("Signed in to grayboard");
+  await login;
+  expect(a.notices.filter(n => n.message === SIGNED_IN.message)).toHaveLength(1);
+  // The joined flow is the offer's: status names its origin.
+  expect(await a.ext.status()).toMatch(LAST("offer", "signed in"));
+  await until(async () => (await a.ext.status()).includes("  join-root: unbound, "), 10_000, "restarted signed in");
+}, 30_000);
+
+test("a flow that ends while no root runtime is current (a session switch's gap) keeps its outcome, and the next root says it once and starts signed in", async () => {
+  await logoutElsewhere();
+  const a = instance({ child: false }, undefined, undefined, true);
+  await a.ext.start({ id: "gap-a", reason: "startup" });
+  offered(await a.call("whoami"));
+  const url = await linkSaid(a);
+  // The switch: the outgoing root finished, the next hasn't begun.
+  await a.ext.shutdown("new");
+  expect(await browse(srv.issuer, url, "pi")).toContain("Signed in to grayboard");
+  const last = await until(() => signins().last, 10_000, "the flow's end recorded");
+  expect(last).toMatchObject({ origin: "offer", outcome: "signed in" });
+  expect(last.said).toBeUndefined();
+  expect(a.notices.some(n => n.message === SIGNED_IN.message)).toBe(false);
+  const b = instance({ child: false }, undefined, undefined, true);
+  await b.ext.start({ id: "gap-b", reason: "new" });
+  expect(b.notices.filter(n => n.message === SIGNED_IN.message)).toHaveLength(1);
+  expect(signins().last?.said).toBe(true);
+  await until(async () => (await b.ext.status()).includes("  gap-b: unbound, "), 10_000, "the next root running signed in");
+}, 30_000);
+
+test("a /grayboard login pending across a session switch leaves an outcome that ends in the gap to the next root, which says it once", async () => {
+  await logoutElsewhere();
+  const a = instance({ child: false }, undefined, undefined, true);
+  await a.ext.start({ id: "gapcmd-a", reason: "startup" });
+  const login = a.ext.command("login");
+  const url = await linkSaid(a);
+  await a.ext.shutdown("new");
+  expect(await browse(srv.issuer, url, "pi")).toContain("Signed in to grayboard");
+  await login;
+  expect(signins().last).toMatchObject({ origin: "command", outcome: "signed in" });
+  expect(signins().last?.said).toBeUndefined();
+  const b = instance({ child: false }, undefined, undefined, true);
+  await b.ext.start({ id: "gapcmd-b", reason: "new" });
+  expect(b.notices.filter(n => n.message === SIGNED_IN.message)).toHaveLength(1);
+  expect(await b.ext.status()).toMatch(LAST("command", "signed in"));
+}, 30_000);

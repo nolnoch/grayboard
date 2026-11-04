@@ -28,6 +28,8 @@ import { channelParams } from "../../../adapters/hosted-core/src/channel.ts";
 import { HostedClient, message } from "../../../adapters/hosted-core/src/client.ts";
 import { Login, LoginFailed } from "../../../adapters/hosted-core/src/login.ts";
 import { accessExpiry } from "../../../adapters/hosted-core/src/model.ts";
+import * as signIns from "../../../adapters/hosted-core/src/offer.ts";
+import type { Flow, SignInState } from "../../../adapters/hosted-core/src/offer.ts";
 import { failure, hostTools, snapshotTools, type NativeTool } from "../../../adapters/hosted-core/src/proxy.ts";
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
@@ -49,10 +51,6 @@ export const RESUME_HINT = "call any grayboard tool to retry";
 export const LOGIN_INTERACTIVE = "open the sign-in link Claude Code shows under a grayboard tool call, or approve the sign-in prompt Claude Code shows";
 export const LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 const INSTRUCTIONS_MS = 5_000;
-// How long a signed-out call waits for its sign-in link: past discovery's
-// two 10 s request timeouts the server is likely down, and the result says
-// the sign-in is still starting rather than hold the call.
-const LINK_MS = 20_000;
 // Claude Code 2.1.316 answers an elicitation that lands while it is still
 // wiring the connection with an immediate cancel, never shown. A cancel this
 // fast came from that handler, not a person: the prompt is sent again, up to
@@ -114,14 +112,12 @@ export function createPlugin(o: PluginOptions): Plugin {
   let closed = false;
   let initialized = false;
   const { promise: ready, resolve: markInitialized } = Promise.withResolvers<void>();
-  // The sign-in in flight: `link` resolves with its authorization URL once
-  // the flow has one (`url`), or undefined if it ends first. `failed` is why the
-  // flow ended without signing in, for the result of a call waiting on it.
-  // `prompt` is its open elicitation, withdrawn once the browser answers.
-  // `elsewhere` says another process's sign-in is the one in flight.
-  type Flow = { abort: AbortController; done: Promise<void>; link: Promise<string | undefined>; show(url: string | undefined): void; url?: string; prompt?: { id: string; withdraw: AbortController }; elsewhere?: string };
-  let signingIn: Flow | undefined;
-  let failed: string | undefined;
+  // This process's sign-in record (hosted-core offer.ts), and each flow's
+  // open elicitation: one live prompt, withdrawn once the browser answers or
+  // the flow shows another URL (a waiter's next holder's).
+  type Prompt = { id: string; withdraw: AbortController };
+  const signins: SignInState = {};
+  const prompts = new WeakMap<Flow, Prompt>();
 
   // Made by connect(), once its initialize instructions are known: the 1.x
   // Server answers initialize from its constructor's options. Everything
@@ -140,19 +136,19 @@ export function createPlugin(o: PluginOptions): Plugin {
     // model's (#500), so it is written before the waiting call's result
     // returns. Where it can, Claude Code also asks the user to open it (MCP
     // URL elicitation); a decline ends the flow and the next call starts one.
+    // A session waiting on another process's flow gets that flow's URL too.
     present: async url => {
-      const flow = signingIn;
+      const flow = signins.flow;
       await testPauseAsync("claude-sign-in-present", o.env);
       try { putSignIn(config.dataDir, o.claude.pid, url); }
       catch (error) { say(`couldn't save the sign-in link for the hook to show: ${message(error)}; approve the sign-in prompt, or open the link in this log`); }
-      if (flow) flow.url = url;
-      flow?.show(url);
+      signIns.present(signins, url);
       say(`open ${url} to sign in to grayboard`);
       // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation): the link alone.
       if (!server!.getClientCapabilities()?.elicitation?.url) return;
       for (let sent = 0; ; sent++) {
-        const prompt = { id: randomUUID(), withdraw: new AbortController() };
-        if (flow) flow.prompt = prompt;
+        const prompt: Prompt = { id: randomUUID(), withdraw: new AbortController() };
+        if (flow) { prompts.get(flow)?.withdraw.abort(); prompts.set(flow, prompt); }
         say(`sign-in prompt sent (elicitation ${prompt.id})`);
         const start = Date.now();
         let result;
@@ -177,12 +173,14 @@ export function createPlugin(o: PluginOptions): Plugin {
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
         // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
-        if (signingIn !== flow || flow.abort.signal.aborted) { say("sign-in ended before the prompt was sent again"); return; }
+        if (signins.flow !== flow || flow.abort.signal.aborted) { say("sign-in ended before the prompt was sent again"); return; }
+        // A later URL's prompt replaced this one.
+        if (prompts.get(flow) !== prompt) return;
       }
     },
     notify: message => {
       say(message);
-      if (signingIn) { signingIn.elsewhere = message; signingIn.show(undefined); }
+      signIns.notify(signins, message);
     },
     diagnostic: record => {
       if (record.state !== "degraded" && record.state !== "paused") return;
@@ -231,63 +229,39 @@ export function createPlugin(o: PluginOptions): Plugin {
   if (badIdentity) say(badIdentity);
   const firstNotice = [offNotice, badIdentity].filter(Boolean).join(" ");
   if (firstNotice) root?.noticeOnce(firstNotice, "first");
-  // Another process's sign-in landed: this one's prompt is moot.
-  const changes = client?.onChange(signedIn => { if (signedIn) signingIn?.abort.abort(); });
-
   // At most one sign-in in this process; hosted-core's login lock keeps it to
-  // one across processes (a waiter shares the winner's grant). Never under
-  // -p or the SDK: the process may exit before the browser returns.
-  const signIn = () => {
-    if (!login || !root || !interactive || closed || signingIn || !initialized) return;
-    const abort = new AbortController();
-    const { promise: link, resolve: show } = Promise.withResolvers<string | undefined>();
-    failed = undefined;
-    const done = login.login(abort.signal, true).then(
-      async () => {
+  // one across processes (a waiter shares the winner's grant, and shows the
+  // winner's link meanwhile). Never under -p or the SDK: the process may exit
+  // before the browser returns.
+  const begin = (origin: "offer" | "startup"): Flow | undefined => {
+    if (signins.flow) return signins.flow;
+    if (!login || !root || !interactive || closed || !initialized) return undefined;
+    return signIns.start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
+      const prompt = prompts.get(flow);
+      try {
         // The prompt is done either way: completed if it was accepted, and
         // withdrawn if the link the hook showed was opened instead.
-        if (flow.prompt) await server!.createElicitationCompletionNotifier(flow.prompt.id)().catch(() => {});
-        say("signed in");
-        await root.credentialChanged();
-      },
-      error => {
-        if (abort.signal.aborted) return;
-        // A failure's text reaches the model in the next result: one that
-        // quotes the URL (an elicitation error is Claude Code's text, which
-        // may truncate or decode it) doesn't. The flow's `state` is the part a
-        // login-CSRF needs, so any text carrying it is replaced.
-        const why = message(error);
-        const secret = flow.url ? new URL(flow.url).searchParams.get("state") || flow.url : undefined;
-        failed = secret && why.includes(secret) ? "the sign-in prompt failed" : why;
-        say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
-      },
-    ).finally(() => {
-      // However the flow ended, its prompt and link point at a closed callback.
-      flow.prompt?.withdraw.abort();
-      show(undefined);
-      if (signingIn === flow) signingIn = undefined;
-      // Only this flow's link: a later flow may have written its own.
-      if (flow.url && !("error" in config)) {
-        try { dropSignIn(config.dataDir, o.claude.pid, flow.url); }
-        catch (error) { say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60_000} minutes after it was written`); }
+        if (outcome === "signed in") {
+          if (prompt) await server!.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
+          say(`signed in (${origin})`);
+          await root.credentialChanged();
+        } else if (outcome !== "cancelled") say(`sign-in failed (${[origin, ...(prompt ? [`elicitation ${prompt.id}`] : [])].join(", ")}): ${flow.failed}`);
+      } finally {
+        // However the flow ended, its prompt and link point at a closed callback.
+        prompt?.withdraw.abort();
+        // Only this flow's link: a later flow may have written its own.
+        if (flow.url && !("error" in config)) {
+          try { dropSignIn(config.dataDir, o.claude.pid, flow.url); }
+          catch (error) { say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60_000} minutes after it was written`); }
+        }
       }
-    });
-    const flow: Flow = { abort, done, link, show };
-    signingIn = flow;
+    } });
   };
-  // What a signed-out call's result says about its sign-in: that the user has
-  // the link (waiting up to LINK_MS for the flow to reach one), else why it
-  // failed. The link itself never enters a result (#500).
-  const offer = async (): Promise<string | undefined> => {
-    signIn();
-    const flow = signingIn;
-    if (!flow) return failed ? `sign-in failed: ${failed}` : undefined;
-    const url = await Promise.race([flow.link, after(LINK_MS).then(() => undefined)]);
-    if (url) return "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again";
-    // Aborted: another process signed in, or this one is closing.
-    if (flow.abort.signal.aborted) return undefined;
-    if (flow.elsewhere && signingIn === flow) return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
-    return failed ? `sign-in failed: ${failed}` : "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again";
+  // What a signed-out call's result says about its sign-in (hosted-core
+  // offer.ts). The link itself never enters a result (#500).
+  const notes = {
+    started: "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again",
+    starting: "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again",
   };
 
   // ---- tools ----
@@ -319,11 +293,8 @@ export function createPlugin(o: PluginOptions): Plugin {
   // Before each call: only a missing or expired sign-in offers one; a
   // transient failure (5xx, a refresh in progress) goes to the call, which
   // reports it.
-  const before = async (): Promise<string | undefined> => {
-    try { await login!.token(); }
-    catch (error) { if (accessExpiry(error)) return interactive ? offer() : undefined; }
-    return unpause();
-  };
+  const before = async (): Promise<string | undefined> =>
+    await signIns.offer(signins, login!, { interactive, begin: () => begin("offer"), notes }) ?? await unpause();
 
   // ---- subagents (#551) ----
 
@@ -382,7 +353,7 @@ export function createPlugin(o: PluginOptions): Plugin {
       initialized = true;
       markInitialized();
       // A session without a grant offers the sign-in at once.
-      if (login && interactive) void login.token().catch(error => { if (accessExpiry(error)) signIn(); });
+      if (login && interactive) void login.token().catch(error => { if (accessExpiry(error)) begin("startup"); });
     };
     return s;
   };
@@ -439,9 +410,8 @@ export function createPlugin(o: PluginOptions): Plugin {
   const shutdown = async () => {
     if (closed) return;
     closed = true;
-    changes?.dispose();
     endWatch?.close();
-    signingIn?.abort.abort();
+    signins.flow?.abort.abort();
     await root?.shutdown("release");
     await server?.close().catch(() => {});
   };

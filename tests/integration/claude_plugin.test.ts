@@ -419,7 +419,7 @@ test("sign-in by URL elicitation: offered at startup, re-offered by the next cal
   await until(() => s.elicits.length === 1, 10_000, "the startup sign-in prompt");
   expect(s.elicits[0]!.url).toStartWith(`${srv.issuer}/`);
   expect(s.elicits[0]!.message).toContain(srv.issuer);
-  await until(() => /sign-in failed \(elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the decline");
+  await until(() => /sign-in failed \((?:startup|offer), elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the decline");
   // The declined flow's link went with it (#500).
   await until(() => !linkFile(s), 5_000, "the declined flow's link removed");
   expect(shown(s)).toBeUndefined();
@@ -482,17 +482,32 @@ test("a prompt Claude Code cancels unshown (its connection-setup handler) is sen
 
 test("a sign-in that can't reach the server says why in the next result", async () => {
   const s = await plugin("sess-unreachable", { env: { GRAYBOARD_SERVER_URL: "http://127.0.0.1:1/mcp" } });
-  await until(() => s.stderr().includes("sign-in failed: "), 15_000, "the failed startup sign-in");
+  await until(() => s.stderr().includes("sign-in failed (startup): "), 15_000, "the failed startup sign-in");
   const r = await texts(s, "whoami");
   expect(r.error).toBe(true);
   expect(r.texts.join("\n")).toMatch(/^grayboard: sign-in failed: /m);
 }, 40_000);
 
-test("two signed-out processes share one sign-in: one prompt between them, and both come up signed in", async () => {
-  const [a, b] = await Promise.all([plugin("sess-x"), plugin("sess-y")]);
-  await until(() => a.elicits.length + b.elicits.length > 0, 10_000, "a sign-in prompt");
+test("two signed-out processes share one flow: the waiter shows the holder's link, only the holder's prompt is answered, and both say signed in (#581)", async () => {
+  // Neither answers until both have prompted: the holder's link is the one
+  // both show, and opening it completes the holder's flow.
+  const urls: string[] = [];
+  const answer = async (e: Elicit) => { urls.push(e.url); return new Promise<ElicitResult["action"]>(() => {}); };
+  const [a, b] = await Promise.all([plugin("sess-x", { answer }), plugin("sess-y", { answer })]);
+  await until(() => a.elicits.length === 1 && b.elicits.length === 1, 15_000, "both prompts");
+  expect(a.elicits[0]!.url).toBe(b.elicits[0]!.url);
+  const waiter = a.stderr().includes("sign-in in progress in another Claude Code session") ? a : b;
+  // Each shows it under its own calls; no result carries it.
+  const r = await texts(waiter, "whoami");
+  expect(r.texts[0]).toBe(STARTED);
+  expect(r.texts.join("\n")).not.toContain(srv.issuer);
+  expect(shown(waiter)).toBe(`grayboard: open ${waiter.elicits[0]!.url} to sign in`);
+  expect(await browse(srv.issuer, waiter.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
   await Promise.all([signedIn(a), signedIn(b)]);
-  expect(a.elicits.length + b.elicits.length).toBe(1);
+  // The waiter's flow ended signed in on the holder's grant, not aborted by
+  // the other process's sign-in (the deleted onChange abort).
+  await until(() => a.stderr().includes("signed in (startup)") && b.stderr().includes("signed in (startup)"), 10_000, "both signed-in lines");
+  expect(urls).toHaveLength(2);
 }, 40_000);
 
 test("a client without URL elicitation: the hook shows the link under its next call, and the result names only where it is (#500)", async () => {
@@ -510,10 +525,10 @@ test("a client without URL elicitation: the hook shows the link under its next c
 
 test("a sign-in prompt that fails with the link in its error text: the flow's failure, which a later result can carry, says the prompt failed, never the link (#500)", async () => {
   const s = await plugin("sess-elicit-error", { answer: async (e) => { throw new Error(`could not open ${e.url}`); } });
-  await until(() => /sign-in failed \(elicitation [^)]+\): /.test(s.stderr()), 10_000, "the failed prompt");
+  await until(() => /sign-in failed \((?:startup|offer), elicitation [^)]+\): /.test(s.stderr()), 10_000, "the failed prompt");
   // The prompt's own line keeps Claude Code's text (the log is the user's); the failure is scrubbed.
   expect(s.stderr()).toMatch(/ended without an answer: .*could not open /);
-  expect(s.stderr()).toMatch(/sign-in failed \(elicitation [^)]+\): the sign-in prompt failed\n/);
+  expect(s.stderr()).toMatch(/sign-in failed \((?:startup|offer), elicitation [^)]+\): the sign-in prompt failed\n/);
   await until(() => !linkFile(s), 5_000, "the failed flow's link removed");
 }, 30_000);
 
@@ -535,8 +550,8 @@ test("a sign-in prompt whose error carries a truncated copy of the link: still s
     const state = new URL(e.url).searchParams.get("state")!;
     throw new Error(`could not open ${e.url.slice(0, e.url.indexOf(state) + state.length)}`);
   } });
-  await until(() => /sign-in failed \(elicitation [^)]+\): /.test(s.stderr()), 10_000, "the failed prompt");
-  expect(s.stderr()).toMatch(/sign-in failed \(elicitation [^)]+\): the sign-in prompt failed\n/);
+  await until(() => /sign-in failed \((?:startup|offer), elicitation [^)]+\): /.test(s.stderr()), 10_000, "the failed prompt");
+  expect(s.stderr()).toMatch(/sign-in failed \((?:startup|offer), elicitation [^)]+\): the sign-in prompt failed\n/);
 }, 30_000);
 
 test("a link a killed predecessor left in this Claude Code process's dir is removed at connect (#500)", async () => {
@@ -596,7 +611,7 @@ test("a logout elsewhere is said once on stderr; the next tool result says it to
   expect(r.error).toBe(true);
   expect(r.texts.join("\n")).toContain(said);
   // The call offered a sign-in, declined: an event later than any sign-out line.
-  await until(() => /sign-in failed \(elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the declined sign-in");
+  await until(() => /sign-in failed \((?:startup|offer), elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the declined sign-in");
   expect(count(s.stderr(), said)).toBe(1);
 }, 30_000);
 

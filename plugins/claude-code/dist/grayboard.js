@@ -14199,7 +14199,7 @@ var package_default = {
 
 // adapters/hosted-core/src/login.ts
 import { createHash as createHash3, randomBytes as randomBytes2 } from "crypto";
-import { mkdir as mkdir2 } from "fs/promises";
+import { mkdir as mkdir2, rm as rm2 } from "fs/promises";
 import { createServer } from "http";
 import { dirname as dirname2, join as join2 } from "path";
 // adapters/hosted-core/src/lock.ts
@@ -14254,6 +14254,7 @@ async function acquire(path, options) {
     const lock = tryAcquire(path);
     if (lock)
       return lock;
+    await options.onBusy?.();
     const left = deadline - Date.now();
     if (left <= 0)
       throw new LockTimeout(resolve(path));
@@ -32077,6 +32078,22 @@ function canonicalEndpoint(raw) {
 
 // src/shared/signin.ts
 var SIGN_IN_FLOW_MS = 10 * 60000;
+var SIGN_IN_URL_MAX = 2048;
+function signInUrl(text) {
+  if (text.length > SIGN_IN_URL_MAX)
+    return { failed: `longer than ${SIGN_IN_URL_MAX}` };
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return { failed: "not a URL" };
+  }
+  if (url.username || url.password)
+    return { failed: "carries credentials" };
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname)))
+    return { failed: "neither HTTPS nor loopback HTTP" };
+  return { url };
+}
 
 // adapters/hosted-core/src/login.ts
 var SCOPES = "grayboard:tools grayboard:delivery";
@@ -32179,6 +32196,9 @@ ${config.clientId}`)}.json`);
   }
   get refreshLock() {
     return `${this.path}.refresh.lock`;
+  }
+  get linkPath() {
+    return `${this.path}.login.url`;
   }
   expired(reason = "login_required") {
     return new AccessExpired(this.config.harness, this.config.loginAction, reason);
@@ -32408,9 +32428,10 @@ ${config.clientId}`)}.json`);
     const waited = !lock;
     if (!lock) {
       this.config.notify(`sign-in in progress in another ${this.config.harness} session`);
-      lock = await acquire(lockPath, { deadlineMs: SIGN_IN_FLOW_MS + 60000, ...signal ? { signal } : {} });
+      lock = await this.waitFor(lockPath, signal);
     }
     try {
+      await this.unlink();
       const now = await this.read();
       if (waited) {
         if (live(now))
@@ -32421,7 +32442,70 @@ ${config.clientId}`)}.json`);
         return;
       await this.flow(signal);
     } finally {
+      await this.unlink();
       lock.release();
+    }
+  }
+  async waitFor(lockPath, signal) {
+    const origin = new URL(this.resource).origin;
+    const seen = new Set;
+    let refused = false, failure;
+    const stop = new AbortController;
+    const refuse = (why) => {
+      if (!refused)
+        this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login", code: "refused" });
+      refused = true;
+    };
+    const onBusy = async () => {
+      let raw;
+      try {
+        raw = await readJson(this.linkPath);
+      } catch (error) {
+        refuse(error instanceof SyntaxError ? "the link file isn't JSON" : `the link file is unreadable (${String(error.code ?? "error")})`);
+        return;
+      }
+      if (raw === undefined)
+        return;
+      const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
+      if (text === undefined) {
+        refuse("the link file holds no URL");
+        return;
+      }
+      if (seen.has(text))
+        return;
+      seen.add(text);
+      const checked = signInUrl(text);
+      const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
+      if (why || !("url" in checked)) {
+        refuse(why ?? "not a sign-in link");
+        return;
+      }
+      const presented = Promise.resolve().then(() => this.config.present(checked.url.href));
+      presented.catch((error) => {
+        failure ??= { error };
+        stop.abort();
+      });
+    };
+    try {
+      return await acquire(lockPath, { deadlineMs: SIGN_IN_FLOW_MS + 60000, signal: signal ? AbortSignal.any([signal, stop.signal]) : stop.signal, onBusy });
+    } catch (error) {
+      if (failure)
+        throw failure.error;
+      throw error;
+    }
+  }
+  async share(url) {
+    try {
+      await writeJsonAtomic(this.linkPath, { url, at: Date.now() });
+    } catch (error) {
+      this.config.diagnostic({ state: "degraded", message: `Couldn't share the sign-in link with other ${this.config.harness} sessions (${failureCause(error, 0)}); they say only that a sign-in is in progress`, operation: "login", code: "operation_failed" });
+    }
+  }
+  async unlink() {
+    try {
+      await rm2(this.linkPath, { force: true });
+    } catch (error) {
+      this.config.diagnostic({ state: "degraded", message: `Couldn't remove the shared sign-in link (${failureCause(error, 0)}); other ${this.config.harness} sessions may show a link whose sign-in ended`, operation: "login", code: "operation_failed" });
     }
   }
   async flow(outer) {
@@ -32443,6 +32527,7 @@ ${config.clientId}`)}.json`);
         code_challenge: createHash3("sha256").update(verifier).digest("base64url"),
         code_challenge_method: "S256"
       }).toString();
+      await this.share(url.href);
       const presented = Promise.resolve().then(() => this.config.present(url.href));
       presented.catch(() => {});
       params = await Promise.race([presented.then(() => callback.result), callback.result]);
@@ -34397,7 +34482,7 @@ class Server extends Protocol2 {
 // src/shared/attachments.ts
 import { createHash as createHash5, randomUUID } from "crypto";
 import { constants, realpathSync } from "fs";
-import { link, mkdir as mkdir3, open as open3, rm as rm2, writeFile } from "fs/promises";
+import { link, mkdir as mkdir3, open as open3, rm as rm3, writeFile } from "fs/promises";
 import { homedir as homedir2 } from "os";
 import { basename, delimiter, extname, isAbsolute, join as join4, parse as parse6, relative, resolve as resolve2, sep } from "path";
 
@@ -34726,7 +34811,7 @@ async function writeNew(dir, name, data) {
     }
     throw new CoreError(`can't save ${name} in ${dir}: ${MAX_NAME_TRIES} files by that name already exist`);
   } finally {
-    await rm2(tmp, { force: true });
+    await rm3(tmp, { force: true });
   }
 }
 async function isOwnCopy(path, data) {
@@ -36179,6 +36264,92 @@ class HostedClient {
   markAnnounced(announced = true) {
     this.outAnnounced = announced;
   }
+}
+
+// adapters/hosted-core/src/offer.ts
+var LINK_MS = 20000;
+var SCRUBBED = "the sign-in prompt failed";
+function present(state, url) {
+  const flow = state.flow;
+  if (flow) {
+    flow.url = url;
+    flow.show(url);
+  }
+  return flow;
+}
+function notify(state, message) {
+  const flow = state.flow;
+  if (flow)
+    flow.elsewhere = message;
+  return flow;
+}
+function start(state, login, o) {
+  if (state.flow)
+    return state.flow;
+  const abort = new AbortController;
+  let show;
+  const link = new Promise((resolve) => {
+    show = resolve;
+  });
+  const flow = { origin: o.origin, abort, link, show, browser: o.browser, done: Promise.resolve() };
+  state.flow = flow;
+  const settle = (outcome) => {
+    flow.outcome = outcome;
+    state.last = { origin: flow.origin, outcome, at: Date.now() };
+    show(undefined);
+    if (state.flow === flow)
+      state.flow = undefined;
+    return o.ended(flow, outcome);
+  };
+  flow.done = login.login(abort.signal, o.ifSignedOut).then(() => settle("signed in"), (error) => {
+    if (abort.signal.aborted)
+      return settle("cancelled");
+    flow.failed = scrub(flow, message(error));
+    return settle(`failed: ${flow.failed}`);
+  });
+  flow.done.catch(() => {});
+  return flow;
+}
+async function offer(state, login, o) {
+  try {
+    await login.token();
+    return;
+  } catch (error) {
+    if (!accessExpiry(error) || !o.interactive)
+      return;
+  }
+  const flow = o.begin();
+  if (!flow)
+    return;
+  let timer;
+  const late = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), o.linkMs ?? LINK_MS);
+    timer.unref?.();
+  });
+  const url = await Promise.race([flow.link, late]).finally(() => clearTimeout(timer));
+  return note(flow, url, o.notes);
+}
+function note(flow, url, notes) {
+  if (flow.outcome === "signed in" || flow.outcome === "cancelled")
+    return;
+  if (flow.outcome)
+    return `sign-in failed: ${flow.failed}`;
+  if (url)
+    return notes.started;
+  if (flow.elsewhere)
+    return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
+  return notes.starting;
+}
+function scrub(flow, why) {
+  if (!flow.url)
+    return why;
+  let secret;
+  try {
+    secret = new URL(flow.url).searchParams.get("state") || flow.url;
+  } catch {
+    secret = flow.url;
+  }
+  return why.includes(secret) ? SCRUBBED : why;
 }
 
 // adapters/hosted-core/src/controller.ts
@@ -37811,7 +37982,6 @@ var RESUME_HINT = "call any grayboard tool to retry";
 var LOGIN_INTERACTIVE = "open the sign-in link Claude Code shows under a grayboard tool call, or approve the sign-in prompt Claude Code shows";
 var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 var INSTRUCTIONS_MS = 5000;
-var LINK_MS = 20000;
 var UNSHOWN_MS = 1000;
 var RESEND_MS = 500;
 var RESENDS = 3;
@@ -37843,8 +38013,8 @@ function createPlugin(o) {
   let closed = false;
   let initialized = false;
   const { promise: ready, resolve: markInitialized } = Promise.withResolvers();
-  let signingIn;
-  let failed;
+  const signins = {};
+  const prompts = new WeakMap;
   let server;
   const listChanged = () => {
     if (initialized && !closed)
@@ -37857,23 +38027,23 @@ function createPlugin(o) {
     harness: HARNESS,
     loginAction,
     present: async (url) => {
-      const flow = signingIn;
+      const flow = signins.flow;
       await testPauseAsync("claude-sign-in-present", o.env);
       try {
         putSignIn(config.dataDir, o.claude.pid, url);
       } catch (error) {
         say(`couldn't save the sign-in link for the hook to show: ${message(error)}; approve the sign-in prompt, or open the link in this log`);
       }
-      if (flow)
-        flow.url = url;
-      flow?.show(url);
+      present(signins, url);
       say(`open ${url} to sign in to grayboard`);
       if (!server.getClientCapabilities()?.elicitation?.url)
         return;
       for (let sent = 0;; sent++) {
         const prompt = { id: randomUUID2(), withdraw: new AbortController };
-        if (flow)
-          flow.prompt = prompt;
+        if (flow) {
+          prompts.get(flow)?.withdraw.abort();
+          prompts.set(flow, prompt);
+        }
         say(`sign-in prompt sent (elicitation ${prompt.id})`);
         const start = Date.now();
         let result;
@@ -37897,18 +38067,17 @@ function createPlugin(o) {
         }
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
-        if (signingIn !== flow || flow.abort.signal.aborted) {
+        if (signins.flow !== flow || flow.abort.signal.aborted) {
           say("sign-in ended before the prompt was sent again");
           return;
         }
+        if (prompts.get(flow) !== prompt)
+          return;
       }
     },
     notify: (message) => {
       say(message);
-      if (signingIn) {
-        signingIn.elsewhere = message;
-        signingIn.show(undefined);
-      }
+      notify(signins, message);
     },
     diagnostic: (record) => {
       if (record.state !== "degraded" && record.state !== "paused")
@@ -37965,59 +38134,36 @@ function createPlugin(o) {
   const firstNotice = [offNotice, badIdentity].filter(Boolean).join(" ");
   if (firstNotice)
     root?.noticeOnce(firstNotice, "first");
-  const changes = client?.onChange((signedIn) => {
-    if (signedIn)
-      signingIn?.abort.abort();
-  });
-  const signIn = () => {
-    if (!login || !root || !interactive || closed || signingIn || !initialized)
+  const begin = (origin) => {
+    if (signins.flow)
+      return signins.flow;
+    if (!login || !root || !interactive || closed || !initialized)
       return;
-    const abort = new AbortController;
-    const { promise: link, resolve: show } = Promise.withResolvers();
-    failed = undefined;
-    const done = login.login(abort.signal, true).then(async () => {
-      if (flow.prompt)
-        await server.createElicitationCompletionNotifier(flow.prompt.id)().catch(() => {});
-      say("signed in");
-      await root.credentialChanged();
-    }, (error) => {
-      if (abort.signal.aborted)
-        return;
-      const why = message(error);
-      const secret = flow.url ? new URL(flow.url).searchParams.get("state") || flow.url : undefined;
-      failed = secret && why.includes(secret) ? "the sign-in prompt failed" : why;
-      say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
-    }).finally(() => {
-      flow.prompt?.withdraw.abort();
-      show(undefined);
-      if (signingIn === flow)
-        signingIn = undefined;
-      if (flow.url && !("error" in config)) {
-        try {
-          dropSignIn(config.dataDir, o.claude.pid, flow.url);
-        } catch (error) {
-          say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+    return start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
+      const prompt = prompts.get(flow);
+      try {
+        if (outcome === "signed in") {
+          if (prompt)
+            await server.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
+          say(`signed in (${origin})`);
+          await root.credentialChanged();
+        } else if (outcome !== "cancelled")
+          say(`sign-in failed (${[origin, ...prompt ? [`elicitation ${prompt.id}`] : []].join(", ")}): ${flow.failed}`);
+      } finally {
+        prompt?.withdraw.abort();
+        if (flow.url && !("error" in config)) {
+          try {
+            dropSignIn(config.dataDir, o.claude.pid, flow.url);
+          } catch (error) {
+            say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+          }
         }
       }
-    });
-    const flow = { abort, done, link, show };
-    signingIn = flow;
+    } });
   };
-  const offer = async () => {
-    signIn();
-    const flow = signingIn;
-    if (!flow)
-      return failed ? `sign-in failed: ${failed}` : undefined;
-    const url = await Promise.race([flow.link, after(LINK_MS).then(() => {
-      return;
-    })]);
-    if (url)
-      return "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again";
-    if (flow.abort.signal.aborted)
-      return;
-    if (flow.elsewhere && signingIn === flow)
-      return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
-    return failed ? `sign-in failed: ${failed}` : "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again";
+  const notes = {
+    started: "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again",
+    starting: "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again"
   };
   const unpause = async () => {
     if (!root || "error" in config)
@@ -38042,15 +38188,7 @@ function createPlugin(o) {
     await root.resume();
     return `delivery was paused (${paused.message}); restarted: ${state()}`;
   };
-  const before = async () => {
-    try {
-      await login.token();
-    } catch (error) {
-      if (accessExpiry(error))
-        return interactive ? offer() : undefined;
-    }
-    return unpause();
-  };
+  const before = async () => await offer(signins, login, { interactive, begin: () => begin("offer"), notes }) ?? await unpause();
   const childOf = (agent) => `${config.id}/agent/${agent}`;
   let endWatch;
   const drainEnded = () => {
@@ -38104,7 +38242,7 @@ function createPlugin(o) {
       if (login && interactive)
         login.token().catch((error) => {
           if (accessExpiry(error))
-            signIn();
+            begin("startup");
         });
     };
     return s;
@@ -38151,9 +38289,8 @@ function createPlugin(o) {
     if (closed)
       return;
     closed = true;
-    changes?.dispose();
     endWatch?.close();
-    signingIn?.abort.abort();
+    signins.flow?.abort.abort();
     await root?.shutdown("release");
     await server?.close().catch(() => {});
   };
