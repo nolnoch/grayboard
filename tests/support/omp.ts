@@ -764,10 +764,19 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       scripted("who", [{ tool: `${PREFIX}whoami`, args: {} }]),
     ]);
     let peer: Session | undefined;
+    // Every relay and grayboard pid seen, SIGKILLed at the end: on a regression
+    // the stale pair outlives omp, which only stops the child it still owns.
+    const seen = new Set<number>();
+    const grayboards = (pid: number) => {
+      const pids = processDescendants(pid).filter((p) => p.command.includes(CLI)).map((p) => p.pid);
+      for (const p of pids) seen.add(p);
+      return pids;
+    };
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
     try {
       installLocal(dir, model.port, [process.execPath, join(ROOT, "tests/support/stops_reading.ts")]);
       peer = await localSession(dir, "peer");
-      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_STOP_READING: join(dir, "stopped") });
+      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING });
       await omp.command({ type: "get_state" }, 30_000);
       const holder = () => localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-580'")[0]?.id;
       await omp.command({ type: "prompt", message: "bind" });
@@ -778,16 +787,17 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       await omp.command({ type: "prompt", message: "stop" });
       await idle(omp);
       expect(resultText(await toolResult(omp, "dm_send"))).not.toContain("error");
-      const stale = processDescendants(omp.pid).map((p) => p.pid);
-      expect(stale.length).toBeGreaterThan(0);
+      // The relay and the one grayboard behind it.
+      const stale = grayboards(omp.pid);
+      expect(stale).toHaveLength(2);
 
       await omp.command({ type: "prompt", message: "big" });
       await idle(omp);
       expect(resultText(await toolResult(omp, "dm_send", 1))).toContain("grayboard process stopped reading");
-      await until(() => !processDescendants(omp.pid).some((p) => stale.includes(p.pid)), 10_000, "the process that stopped reading killed");
+      await until(() => !stale.some(alive), 10_000, "the process that stopped reading killed");
       await until(() => holder() !== undefined && holder() !== first, 15_000, "omp-580 held by the replacement");
-      // One relay and the one grayboard behind it.
-      expect(grayboardDescendants(omp.pid)).toHaveLength(2);
+      const replacement = grayboards(omp.pid);
+      expect(replacement).toHaveLength(2);
       expect(localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id = ?", first)[0]?.ended_at).not.toBeNull();
 
       await omp.command({ type: "prompt", message: "who" });
@@ -796,8 +806,9 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
       expect(model.unhandled).toEqual([]);
       await omp.quit();
-      expect(processDescendants(omp.pid)).toEqual([]);
+      await until(() => !replacement.some(alive), 5_000, "the replacement ended with omp");
     } finally {
+      for (const p of seen) { try { process.kill(p, "SIGKILL"); } catch {} }
       await stopAll(procs);
       if (peer) await stopSession(peer.c);
       model.stop();
