@@ -1,7 +1,7 @@
 // grayboard's hosted extension for omp (server mode, #280). `grayboard setup
 // --server <url>` bundles this file and installs it as
-// <agentDir>/extensions/grayboard.js; local mode keeps adapters/omp/grayboard.ts
-// with an enabled mcp.json entry. `@oh-my-pi/pi-coding-agent` stays external:
+// <agentDir>/extensions/grayboard.js; local mode bundles adapters/omp/grayboard.ts
+// with a disabled mcp.json entry. `@oh-my-pi/pi-coding-agent` stays external:
 // omp resolves an extension's import of it to the running host, so the agent
 // directory is omp's own (profiles, PI_CODING_AGENT_DIR, XDG).
 //

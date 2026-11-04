@@ -1,4 +1,4 @@
-// The hosted omp entry's per-request instructions refresh (#441): which
+// Local and hosted omp's shared per-request instructions refresh (#441, #552): which
 // action a request gets, and the in-place payload rewrite on the shapes omp's
 // providers build (pi-ai providers: anthropic system blocks, openai-responses
 // `instructions` and openai-completions' system message joined with "\n\n",

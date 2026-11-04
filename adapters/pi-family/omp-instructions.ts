@@ -1,4 +1,4 @@
-// Keeps a hosted omp main session's model calls on grayboard's current
+// Keeps an omp main session's model calls on grayboard's current
 // instructions (#441). omp runs `before_agent_start` only for a user-authored
 // prompt, so a push-started turn keeps the instructions the last prompt
 // appended (stale after a bind), and a base rebuild (/resume, /new, /fork)
