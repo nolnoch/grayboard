@@ -31829,6 +31829,34 @@ class NativeWire extends Connection {
   }
 }
 
+// src/shared/addressing.ts
+var MAX_IDENTITY_LENGTH = 32;
+var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
+var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
+var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
+var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
+function isValidEmail(email) {
+  return DIRECT_RE.test(`${email.toLowerCase()}/x`);
+}
+function isValidIdentityName(name) {
+  return NAME_RE.test(name.toLowerCase());
+}
+var HUMAN_NAME = "human";
+var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
+
+// adapters/hosted-core/src/own-human.ts
+var InboxEvent = discriminatedUnion("kind", [
+  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
+  object({ kind: literal("board"), item: discriminatedUnion("kind", [
+    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
+    looseObject({ kind: literal("digest"), board: string2() })
+  ]) })
+]);
+function isOwnHuman(event, identity) {
+  const human = `${identity.user.email}/${HUMAN_NAME}`;
+  return event.kind === "direct" ? event.message.sender === human : event.item.kind === "push" && event.item.post.author === human;
+}
+
 // adapters/hosted-core/src/model.ts
 var ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
 var MAX_HELD = 64;
@@ -32047,9 +32075,11 @@ function canonicalEndpoint(raw) {
   return u;
 }
 
+// src/shared/signin.ts
+var SIGN_IN_FLOW_MS = 10 * 60000;
+
 // adapters/hosted-core/src/login.ts
 var SCOPES = "grayboard:tools grayboard:delivery";
-var FLOW_MS = 10 * 60000;
 var REFRESH_MARGIN_MS = 60000;
 var REFRESH_LOCK_MS = 15000;
 var WATCH_MS = 2000;
@@ -32378,7 +32408,7 @@ ${config.clientId}`)}.json`);
     const waited = !lock;
     if (!lock) {
       this.config.notify(`sign-in in progress in another ${this.config.harness} session`);
-      lock = await acquire(lockPath, { deadlineMs: FLOW_MS + 60000, ...signal ? { signal } : {} });
+      lock = await acquire(lockPath, { deadlineMs: SIGN_IN_FLOW_MS + 60000, ...signal ? { signal } : {} });
     }
     try {
       const now = await this.read();
@@ -32397,7 +32427,7 @@ ${config.clientId}`)}.json`);
   async flow(outer) {
     const meta = await this.discover();
     await this.drain(meta);
-    const signal = AbortSignal.any([AbortSignal.timeout(FLOW_MS), ...outer ? [outer] : []]);
+    const signal = AbortSignal.any([AbortSignal.timeout(SIGN_IN_FLOW_MS), ...outer ? [outer] : []]);
     const verifier = randomBytes2(32).toString("base64url"), state = randomBytes2(16).toString("base64url");
     const callback = await this.callback(state, signal);
     let params;
@@ -34801,40 +34831,17 @@ function boardNotification(item) {
   };
 }
 
-// src/shared/addressing.ts
-var MAX_IDENTITY_LENGTH = 32;
-var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
-var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
-var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
-var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
-function isValidEmail(email) {
-  return DIRECT_RE.test(`${email.toLowerCase()}/x`);
-}
-function isValidIdentityName(name) {
-  return NAME_RE.test(name.toLowerCase());
-}
-var HUMAN_NAME = "human";
-var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
-
 // adapters/hosted-core/src/channel.ts
-var InboxEvent = discriminatedUnion("kind", [
-  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
-  object({ kind: literal("board"), item: discriminatedUnion("kind", [
-    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
-    looseObject({ kind: literal("digest"), board: string2() })
-  ]) })
-]);
 function channelParams(item, identity) {
   const event = InboxEvent.parse(item.event);
-  const human = `${identity.user.email}/${HUMAN_NAME}`;
   if (event.kind === "direct") {
     const params = dmNotification(event.message, identity.identity_full);
-    if (event.message.sender === human)
+    if (isOwnHuman(event, identity))
       params.meta.human = "true";
     return params;
   }
   const params = boardNotification(event.item);
-  if (event.item.kind === "push" && event.item.post.author === human)
+  if (isOwnHuman(event, identity))
     params.meta.human = "true";
   return params;
 }
@@ -37479,6 +37486,7 @@ import { join as join5 } from "path";
 var SESSION_FACT_MAX = 64;
 
 // src/shared/claude_agents.ts
+var SIGN_IN = "signin";
 var ROOT = "-";
 var LEFTOVER_TTL_MS = 10 * 60000;
 var TOOL_USE_META = "claudecode/toolUseId";
@@ -37489,6 +37497,38 @@ var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid))
 var FACTS = ["model", "effort"];
 var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
 var validFact = (v) => typeof v === "string" && FACT.test(v);
+function put(path, text) {
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, text, { mode: 384 });
+  renameSync(tmp, path);
+}
+function putSignIn(base, claudePid, url, now = Date.now()) {
+  const dir = sessionDir(base, claudePid);
+  mkdirSync2(dir, { recursive: true, mode: 448 });
+  put(join5(dir, SIGN_IN), JSON.stringify({ url, at: now }));
+}
+function dropSignIn(base, claudePid, url) {
+  const path = join5(sessionDir(base, claudePid), SIGN_IN);
+  if (url !== undefined) {
+    let text;
+    try {
+      text = readFileSync4(path, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT")
+        return;
+      throw error;
+    }
+    let held;
+    try {
+      held = JSON.parse(text).url;
+    } catch {
+      return;
+    }
+    if (held !== url)
+      return;
+  }
+  rmSync(path, { force: true });
+}
 var MISSING_TEXT = {
   bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
   no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
@@ -37600,9 +37640,25 @@ function takeEnded(base, claudePid) {
   return out;
 }
 
+// src/shared/testpause.ts
+import { existsSync } from "fs";
+import { dirname as dirname3 } from "path";
+async function testPauseAsync(point, env = process.env) {
+  const file = env.BUS_TEST_PAUSE_FILE;
+  if (env.BUS_TEST_PAUSE !== point || !file)
+    return;
+  console.error(`[grayboard] test pause hit: ${point}`);
+  while (!existsSync(file)) {
+    if (!existsSync(dirname3(file)))
+      throw new Error(`test pause abandoned: ${point}`);
+    await Bun.sleep(10);
+  }
+  console.error(`[grayboard] test pause released: ${point}`);
+}
+
 // src/shared/identity.ts
-import { existsSync, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
-import { basename as basename2, dirname as dirname3, join as join6, resolve as resolve3 } from "path";
+import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve3 } from "path";
 
 // src/core/session_id.ts
 var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -37639,27 +37695,27 @@ function normalizeAliasName(raw) {
 // src/shared/identity.ts
 var MAX_LEN = 32;
 function gitLocation(cwd) {
-  for (let dir = cwd;; dir = dirname3(dir)) {
+  for (let dir = cwd;; dir = dirname4(dir)) {
     const dotGit = join6(dir, ".git");
-    if (existsSync(dotGit)) {
+    if (existsSync2(dotGit)) {
       if (statSync3(dotGit).isDirectory())
         return { repo: dir, worktree: null };
       const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
       const gitdir = m ? resolve3(dir, m[1].trim()) : "";
       if (!/[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitdir))
         return { repo: dir, worktree: null };
-      const common = dirname3(dirname3(gitdir));
-      const repo = basename2(common) === ".git" ? dirname3(common) : common.replace(/\.git$/, "");
+      const common = dirname4(dirname4(gitdir));
+      const repo = basename2(common) === ".git" ? dirname4(common) : common.replace(/\.git$/, "");
       return { repo, worktree: basename2(dir) };
     }
-    if (dirname3(dir) === dir)
+    if (dirname4(dir) === dir)
       return null;
   }
 }
 function gitBranch(cwd) {
-  for (let dir = cwd;; dir = dirname3(dir)) {
+  for (let dir = cwd;; dir = dirname4(dir)) {
     const dotGit = join6(dir, ".git");
-    if (existsSync(dotGit)) {
+    if (existsSync2(dotGit)) {
       let gitdir = dotGit;
       if (!statSync3(dotGit).isDirectory()) {
         const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
@@ -37670,7 +37726,7 @@ function gitBranch(cwd) {
       const head = readFileSync5(join6(gitdir, "HEAD"), "utf8").trim();
       return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
     }
-    if (dirname3(dir) === dir)
+    if (dirname4(dir) === dir)
       return null;
   }
 }
@@ -37754,10 +37810,9 @@ var CLIENT_ID = "grayboard-claude-code";
 var SOURCE = "plugin:grayboard:grayboard";
 var ENTRY = `plugin:${CLAUDE_PLUGIN}`;
 var RESUME_HINT = "call any grayboard tool to retry";
-var LOGIN_INTERACTIVE = "open the sign-in link a grayboard tool result carries, or approve the sign-in prompt Claude Code shows";
+var LOGIN_INTERACTIVE = "open the sign-in link Claude Code shows under a grayboard tool call, or approve the sign-in prompt Claude Code shows";
 var LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 var INSTRUCTIONS_MS = 5000;
-var FLOW_MS2 = 10 * 60000;
 var LINK_MS = 20000;
 var UNSHOWN_MS = 1000;
 var RESEND_MS = 500;
@@ -37805,6 +37860,14 @@ function createPlugin(o) {
     loginAction,
     present: async (url) => {
       const flow = signingIn;
+      await testPauseAsync("claude-sign-in-present", o.env);
+      try {
+        putSignIn(config.dataDir, o.claude.pid, url);
+      } catch (error) {
+        say(`couldn't save the sign-in link for the hook to show: ${message(error)}; approve the sign-in prompt, or open the link in this log`);
+      }
+      if (flow)
+        flow.url = url;
       flow?.show(url);
       say(`open ${url} to sign in to grayboard`);
       if (!server.getClientCapabilities()?.elicitation?.url)
@@ -37817,7 +37880,7 @@ function createPlugin(o) {
         const start = Date.now();
         let result;
         try {
-          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: FLOW_MS2, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
+          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
         } catch (error) {
           if (prompt.withdraw.signal.aborted)
             return;
@@ -37831,7 +37894,7 @@ function createPlugin(o) {
         if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow)
           return;
         if (sent >= RESENDS) {
-          say(`sign-in prompt cancelled unshown ${sent + 1} times; the link in tool results remains`);
+          say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`);
           return;
         }
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
@@ -37922,13 +37985,22 @@ function createPlugin(o) {
     }, (error) => {
       if (abort.signal.aborted)
         return;
-      failed = message(error);
+      const why = message(error);
+      const secret = flow.url ? new URL(flow.url).searchParams.get("state") || flow.url : undefined;
+      failed = secret && why.includes(secret) ? "the sign-in prompt failed" : why;
       say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
     }).finally(() => {
       flow.prompt?.withdraw.abort();
       show(undefined);
       if (signingIn === flow)
         signingIn = undefined;
+      if (flow.url && !("error" in config)) {
+        try {
+          dropSignIn(config.dataDir, o.claude.pid, flow.url);
+        } catch (error) {
+          say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+        }
+      }
     });
     const flow = { abort, done, link, show };
     signingIn = flow;
@@ -37942,12 +38014,12 @@ function createPlugin(o) {
       return;
     })]);
     if (url)
-      return `open ${url} to sign in to grayboard`;
+      return "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again";
     if (flow.abort.signal.aborted)
       return;
     if (flow.elsewhere && signingIn === flow)
       return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
-    return failed ? `sign-in failed: ${failed}` : "sign-in is starting; call a grayboard tool again for its link";
+    return failed ? `sign-in failed: ${failed}` : "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again";
   };
   const unpause = async () => {
     if (!root || "error" in config)
@@ -38064,6 +38136,13 @@ function createPlugin(o) {
 `);
   };
   const connectTransport = async (transport) => {
+    if (!("error" in config)) {
+      try {
+        dropSignIn(config.dataDir, o.claude.pid);
+      } catch (error) {
+        say(`couldn't remove a sign-in link a previous server left: ${message(error)}`);
+      }
+    }
     await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);
     server = serve(await instructions());
     if (offNotice)

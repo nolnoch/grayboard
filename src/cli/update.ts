@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { closeSync, constants, fchmodSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { LOOPBACK } from "../shared/endpoint.ts";
 import { sha256Hex } from "../shared/hash.ts";
 import { HTTP_TIMEOUT_MS, describeFetchError, transferTimeoutMs } from "../shared/http.ts";
 import { RELEASE_TAG, SIG, SUMS, verifySums } from "../shared/release_verify.ts";
@@ -10,8 +11,6 @@ export const REPO = process.env.GRAYBOARD_REPO || "nolnoch/grayboard";
 export const TARGET = `${process.platform}-${process.arch}`;
 // How long the downloaded binary gets to answer --version before it is refused.
 const VERSION_CHECK_MS = 30_000;
-
-const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 // GRAYBOARD_RELEASES_URL: one origin serving GitHub's paths for both its API
 // and its downloads (a mirror, or the upgrade tests' release server), without

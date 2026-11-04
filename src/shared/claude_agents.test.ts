@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LEFTOVER_TTL_MS, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, takeEnded, takeRecord } from "./claude_agents.ts";
+import { dropSignIn, LEFTOVER_TTL_MS, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeEnded, takeRecord } from "./claude_agents.ts";
+import { SIGN_IN_FLOW_MS } from "./signin.ts";
 import { procStart } from "./proc.ts";
 
 let base: string;
@@ -240,5 +241,82 @@ describe("facts (#545)", () => {
     writeFileSync(join(dir, "model"), "x".repeat(10_000));
     expect(facts()).toEqual({});
     expect(said.map(s => s.split(":")[0])).toEqual(["effort", "effort", "model", "effort"]);
+  });
+});
+
+describe("sign-in link (#500)", () => {
+  const post = (now?: number) => hook("post-tool-use", { hook_event_name: "PostToolUseFailure", tool_use_id: id(1) }, true, now);
+  const url = "https://gb.example.com/authorize?client_id=x&state=s";
+
+  test("a live link is the hook's systemMessage, the only output any event has", () => {
+    hook("session-start", {}, true);
+    expect(post()).toBeUndefined();
+    putSignIn(base, pid, url);
+    expect(JSON.parse(post()!)).toEqual({ systemMessage: `grayboard: open ${url} to sign in` });
+    // Other events still print nothing while it lives.
+    expect(hook("pre-tool-use", { tool_use_id: id(2) }, true)).toBeUndefined();
+    expect(hook("session-start", {}, true)).toBeUndefined();
+    dropSignIn(base, pid);
+    expect(post()).toBeUndefined();
+  });
+
+  test("loopback http is a link; other http, credentials, other schemes and junk are not", () => {
+    for (const ok of ["http://127.0.0.1:8080/authorize?x=1", "http://localhost:8080/authorize", "http://[::1]:8080/authorize"]) {
+      putSignIn(base, pid, ok);
+      expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${new URL(ok).href} to sign in`);
+    }
+    putSignIn(base, pid, `https://gb.example.com/authorize?state=${"s".repeat(2048)}`);
+    expect(post()).toBeUndefined();
+    for (const bad of ["http://gb.example.com/authorize", "https://u:p@gb.example.com/authorize", "javascript:alert(1)", "file:///etc/passwd", "not a url"]) {
+      putSignIn(base, pid, bad);
+      expect(post()).toBeUndefined();
+    }
+    const file = join(sessionDir(base, pid), SIGN_IN);
+    for (const junk of ["{", "null", "[]", JSON.stringify({ url }), JSON.stringify({ url: 7, at: Date.now() }), JSON.stringify({ url, at: "now" })]) {
+      writeFileSync(file, junk);
+      expect(post()).toBeUndefined();
+    }
+  });
+
+  test("a link older than a flow, or from the future, is a dead flow's", () => {
+    const now = Date.now();
+    putSignIn(base, pid, url, now - SIGN_IN_FLOW_MS);
+    expect(post(now)).toBeDefined();
+    putSignIn(base, pid, url, now - SIGN_IN_FLOW_MS - 1);
+    expect(post(now)).toBeUndefined();
+    putSignIn(base, pid, url, now + 1);
+    expect(post(now)).toBeUndefined();
+  });
+
+  test("another Claude Code process's link and the local hook show nothing", () => {
+    putSignIn(base, pid + 1, url);
+    expect(post()).toBeUndefined();
+    putSignIn(base, pid, url);
+    expect(hook("post-tool-use", { tool_use_id: id(1) }, false)).toBeUndefined();
+  });
+
+  test("an ended flow removes only its own link; a failed removal throws, a missing file doesn't", () => {
+    const newer = "https://gb.example.com/authorize?client_id=x&state=t";
+    putSignIn(base, pid, newer);
+    dropSignIn(base, pid, url);
+    expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${newer} to sign in`);
+    dropSignIn(base, pid, newer);
+    expect(post()).toBeUndefined();
+    dropSignIn(base, pid, url);
+    dropSignIn(base, pid);
+    const file = join(sessionDir(base, pid), SIGN_IN);
+    writeFileSync(file, "{");
+    dropSignIn(base, pid, url);
+    expect(existsSync(file)).toBe(true);
+    rmSync(file);
+    mkdirSync(join(file, "x"), { recursive: true });
+    expect(() => dropSignIn(base, pid, url)).toThrow();
+    expect(() => dropSignIn(base, pid)).toThrow();
+  });
+
+  test("the link file is private: 0600 in a 0700 dir", () => {
+    putSignIn(base, pid, url);
+    expect(statSync(sessionDir(base, pid)).mode & 0o777).toBe(0o700);
+    expect(statSync(join(sessionDir(base, pid), SIGN_IN)).mode & 0o777).toBe(0o600);
   });
 });

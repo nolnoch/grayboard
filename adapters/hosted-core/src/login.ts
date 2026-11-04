@@ -17,9 +17,9 @@ import type { Configuration, CredentialPort, Enrollment } from "./port.js";
 import { readJson, sha256, writeJsonAtomic } from "./storage.js";
 import { ServerUnreachable } from "./wire.js";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
+import { SIGN_IN_FLOW_MS as FLOW_MS } from "../../../src/shared/signin.ts";
 
 export const SCOPES = "grayboard:tools grayboard:delivery";
-const FLOW_MS = 10 * 60_000;       // the browser round trip's bound
 const REFRESH_MARGIN_MS = 60_000;  // refresh once the access token has less left
 const REFRESH_LOCK_MS = 15_000;    // waiters never take over; they give up
 const WATCH_MS = 2_000;
