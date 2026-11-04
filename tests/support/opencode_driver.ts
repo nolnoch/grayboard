@@ -10,6 +10,8 @@
 //   system  { sessionID }      experimental.chat.system.transform; value: output.system
 //   state                      value: { logs, toasts, prompts } the fake client saw
 //   dispose
+//   abort   { key }            abort an in-flight call tagged with that key
+//   advanceClock { ms }        advance the adapter's stability clock, not its timers
 import { createInterface } from "node:readline";
 import { tool } from "@opencode-ai/plugin";
 import { GrayboardPlugin } from "../../adapters/opencode/grayboard.ts";
@@ -29,7 +31,9 @@ const client = {
 };
 
 let hooks: any;
-const ctx = (sessionID = "s1") => ({ sessionID, messageID: "m1", agent: "build", directory: process.cwd(), worktree: process.cwd(), abort: new AbortController().signal, metadata() {}, ask: async () => {} });
+const calls = new Map<string, AbortController>();
+const now = Date.now;
+const ctx = (sessionID = "s1", abort = new AbortController().signal) => ({ sessionID, messageID: "m1", agent: "build", directory: process.cwd(), worktree: process.cwd(), abort, metadata() {}, ask: async () => {} });
 
 async function run(msg: any): Promise<unknown> {
   switch (msg.op) {
@@ -42,8 +46,19 @@ async function run(msg: any): Promise<unknown> {
       return hooks.config(msg.cfg);
     case "event":
       return hooks.event({ event: msg.event });
-    case "call":
-      return hooks.tool[msg.tool].execute(msg.args, ctx());
+    case "call": {
+      const controller = new AbortController();
+      const key = String(msg.key ?? msg.id);
+      calls.set(key, controller);
+      try { return await hooks.tool[msg.tool].execute(msg.args, ctx(msg.sessionID, controller.signal)); }
+      finally { calls.delete(key); }
+    }
+    case "abort":
+      calls.get(msg.key)?.abort();
+      return;
+    case "advanceClock":
+      Date.now = () => now() + msg.ms;
+      return;
     case "parse":
       // What opencode's runtime hands execute: the args through the tool's zod.
       return tool.schema.object(hooks.tool[msg.tool].args).parse(msg.args);
@@ -53,7 +68,7 @@ async function run(msg: any): Promise<unknown> {
       return output.system;
     }
     case "state":
-      return { logs, toasts, prompts };
+      return { logs, toasts, prompts, calls: [...calls.keys()] };
     case "dispose":
       return hooks.dispose();
   }

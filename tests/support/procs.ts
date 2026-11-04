@@ -41,17 +41,26 @@ export function adapterChildren(pid: number, bin?: string): string[] {
 // detached process it spawned): this checkout's CLI, or a `grayboard` binary.
 // A server-mode hosted extension runs none.
 export function grayboardDescendants(pid: number): string[] {
+  return processDescendants(pid)
+    .filter(row => row.command.includes(CLI) || /(^|\/)grayboard(\s|$)/.test(row.command))
+    .map(row => row.command);
+}
+
+export type ProcessDescendant = { pid: number; ppid: number; command: string };
+
+// Includes a failed stdio child's exec'd sleeper, which has no CLI marker.
+export function processDescendants(pid: number): ProcessDescendant[] {
   const r = Bun.spawnSync(["ps", "-A", "-o", "pid=,ppid=,command="]);
   const rows = r.stdout.toString().split("\n")
     .map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
     .filter((m): m is RegExpMatchArray => !!m)
     .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), command: m[3]! }));
-  const found: string[] = [];
+  const found: ProcessDescendant[] = [];
   for (let queue = [pid]; queue.length;) {
     const parent = queue.shift()!;
     for (const row of rows.filter((x) => x.ppid === parent)) {
       queue.push(row.pid);
-      if (row.command.includes(CLI) || /(^|\/)grayboard(\s|$)/.test(row.command)) found.push(row.command);
+      found.push(row);
     }
   }
   return found;
