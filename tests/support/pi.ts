@@ -709,9 +709,10 @@ export async function expectDeliveryRecords(file: string, root: string, pings: n
 }
 
 // After a sign-out, a signed-out tool call offers a sign-in (#499): the
-// result carries the flow's URL ahead of the unchanged refusal, a second
-// refused call while the flow is pending the same URL, the server's consent
-// page approves it, and the next call runs. `check` prompts the scripted
+// result says the user has the link ahead of the unchanged refusal, never
+// the URL itself (#500), and so does a second refused call while the flow
+// is pending; the URL is on the notice line only (once: the second call
+// joins the flow), the server's consent page approves it, and the next call runs. `check` prompts the scripted
 // whoami; `results` is how many whoami results the session already holds.
 export async function expectSignInOffer(srv: HostedServer, proc: Pi, harness: string, o: { results: number; whoami(nth: number): Promise<PiMessage>; idle(proc: Pi): Promise<unknown> }): Promise<void> {
   const check = async (nth: number) => {
@@ -723,15 +724,18 @@ export async function expectSignInOffer(srv: HostedServer, proc: Pi, harness: st
   const offered = async (nth: number) => {
     const result = await check(nth);
     expect(result.isError).toBe(true);
-    const offer = /^grayboard: open (\S+) to sign in to grayboard\n([^]*)$/.exec(resultText(result));
-    expect(offer?.[2]).toBe(`error: Signed out of grayboard in ${harness}; run /grayboard login`);
-    return offer![1]!;
+    const text = resultText(result);
+    expect(text).toBe(`grayboard: sign-in started: ask the user to open the link ${harness} shows (/grayboard login shows it again), then call a grayboard tool again\nerror: Signed out of grayboard in ${harness}; run /grayboard login`);
+    expect(text).not.toContain(srv.issuer);
   };
-  const url = await offered(o.results);
+  const seen = proc.notices().length;
+  await offered(o.results);
+  await offered(o.results + 1);
+  // The offer opened no browser: the URL went to the notice line alone, once.
+  const urls = proc.notices().slice(seen).map((n) => /^grayboard: sign in at (\S+)$/.exec(n)?.[1]).filter(Boolean);
+  expect(urls).toHaveLength(1);
+  const url = urls[0]!;
   expect(url).toStartWith(`${srv.issuer}/`);
-  expect(await offered(o.results + 1)).toBe(url);
-  // The offer opened no browser: the URL went to the tool result and the notice line.
-  expect(proc.notices()).toContain(`grayboard: sign in at ${url}`);
   expect(await browse(srv.issuer, url, harness)).toContain("Signed in to grayboard");
   await until(() => proc.notices().includes("grayboard: signed in"), 15_000, "the signed-in notice");
   const ran = await check(o.results + 2);

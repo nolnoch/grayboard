@@ -175,8 +175,10 @@ export function createGrayboard(h: Harness): Grayboard {
   const login = "url" in config ? new Login({
     resource: config.url, clientId: h.clientId, stateDir, harness: h.name, loginAction: LOGIN_ACTION,
     // Every login goes through signIn(), so the flow is the process's. An
-    // offer's flow opens no browser: a model's call never opens a window;
-    // its URL is in the tool result and this line.
+    // offer's flow opens no browser: a model's call never opens a window.
+    // The URL goes only to this line, which the user sees and the model
+    // doesn't: a URL in the model's context lets an injected instruction
+    // complete the flow with another account (#500).
     present: url => {
       const flow = state.signIn;
       if (flow) { flow.url = url; flow.show(url); }
@@ -259,8 +261,9 @@ export function createGrayboard(h: Harness): Grayboard {
   // task subagents without a mode (so they read "print"). A pi subagent is its
   // own process with no root: its own mode (print) decides.
   const interactive = () => role.kind === "root" ? h.interactive() : state.interactive ?? h.interactive();
-  // A signed-out call's notice: the URL to open (waiting up to LINK_MS for
-  // the flow to reach one), else why there is none. Only an expired or
+  // A signed-out call's notice: that the user has the link to open (waiting
+  // up to LINK_MS for the flow to reach one), else why there is none. The
+  // link itself never enters the result (#500). Only an expired or
   // missing grant offers; a transient failure goes to the call. Never where
   // the process exits before the browser could answer (print or json mode).
   const offer = async (): Promise<string | undefined> => {
@@ -271,11 +274,11 @@ export function createGrayboard(h: Harness): Grayboard {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), LINK_MS); });
     const url = await Promise.race([flow.link, late]).finally(() => clearTimeout(timer));
-    if (url) return `open ${url} to sign in to grayboard`;
+    if (url) return `sign-in started: ask the user to open the link ${h.name} shows (/grayboard login shows it again), then call a grayboard tool again`;
     if (flow.elsewhere && state.signIn === flow) return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
     if (flow.failed) return `sign-in failed: ${flow.failed}`;
     // Ended without a URL or a failure: another process's grant landed first.
-    return state.signIn === flow ? "sign-in is starting; call a grayboard tool again for its link" : undefined;
+    return state.signIn === flow ? `sign-in is starting; ${h.name} shows its link once it has one: ask the user to open it, then call a grayboard tool again` : undefined;
   };
 
   // ---- tools ----
