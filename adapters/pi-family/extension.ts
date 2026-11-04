@@ -22,6 +22,8 @@ import { failureText, HostedClient, message, type Disposable, type Level } from 
 import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
 import { Login } from "../hosted-core/src/login.ts";
+import * as signIns from "../hosted-core/src/offer.ts";
+import type { Flow, Last, Origin, Outcome, SignInState } from "../hosted-core/src/offer.ts";
 import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
 import { failure, hostTools, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
@@ -71,8 +73,6 @@ export const LOGIN_ACTION = "run /grayboard login";
 export const RESUME_HINT = "run /grayboard resume";
 // A tool call that failed: the call itself is what to retry.
 const RETRY_HINT = "call the tool again";
-// How long a signed-out tool call waits for its sign-in flow's URL.
-const LINK_MS = 20_000;
 const SOURCE = "grayboard";
 
 // A tool's arguments and MCP result as both entries' tools take and return
@@ -99,27 +99,23 @@ export const COMMAND = {
 // /fork carries, the live session files (file → root id), and per root
 // session the stable ids of items it admitted, which a /reload keeps (the
 // lease stays) while the Controller's own admission set doesn't outlive it.
-type Shared = { carried?: string[]; live: Map<string, string>; admitted: Map<string, Set<string>>; signIn?: Flow; voice?: Voice; interactive?: boolean };
+// `signins` is the process's sign-in record (hosted-core offer.ts); an older
+// bundle's `signIn` field is ignored.
+type Shared = { carried?: string[]; live: Map<string, string>; admitted: Map<string, Set<string>>; signins: SignInState; voice?: Voice; interactive?: boolean };
 // A runtime's notice line and delivery restart. The slot's `voice` is the
 // latest root runtime started in this process (pi's one session, omp's main
 // session): a flow outlives the runtime that started it (a /new, /fork,
 // /resume or /reload ends that one), so it speaks through the current one.
 type Voice = { log(message: string, level?: Level): void; restart(): Promise<void> };
-// The process's one sign-in flow (#499), whichever runtime started it, by
-// /grayboard login or a signed-out tool call's offer. `link` resolves with
-// its authorization URL once it has one, or undefined if it ends first;
-// `failed` is why it ended without signing in; `elsewhere` says another
-// process's flow holds the store's login lock. `saidBy` is the voice that
-// said its outcome.
-type Flow = { saidBy?: Voice; abort: AbortController; done: Promise<void>; link: Promise<string | undefined>; show(url: string | undefined): void; url?: string; browser: boolean; failed?: string; elsewhere?: string };
 const ADMITTED_LIMIT = 256;
 function shared(harness: string): Shared {
   const key = Symbol.for(`io.github.nolnoch.grayboard/${harness}-sessions`);
   // globalThis carries no symbol index; this slot is ours (Symbol.for, namespaced).
   const g = globalThis as unknown as Record<symbol, Shared | undefined>;
-  const slot = g[key] ??= { live: new Map(), admitted: new Map() };
+  const slot = g[key] ??= { live: new Map(), admitted: new Map(), signins: {} };
   // A /reload after `grayboard update` may find the slot an older bundle made.
   slot.admitted ??= new Map();
+  slot.signins ??= {};
   return slot;
 }
 
@@ -177,16 +173,15 @@ export function createGrayboard(h: Harness): Grayboard {
     // The URL goes only to this line, which the user sees and the model
     // doesn't: a URL in the model's context lets an injected instruction
     // complete the flow with another account (#500).
+    // A session waiting on another process's flow gets that flow's URL too.
     present: url => {
-      const flow = state.signIn;
-      if (flow) { flow.url = url; flow.show(url); }
+      const flow = signIns.present(state.signins, url);
       say(`sign in at ${url}`);
       if (!flow || flow.browser) browse(url);
     },
     notify: message => {
       say(message);
-      const flow = state.signIn;
-      if (flow) { flow.elsewhere = message; flow.show(undefined); }
+      signIns.notify(state.signins, message);
     },
     // A queued revoke or a refresh whose outcome is unknown leaves a grant live
     // on the server or this session signed out: said at once, not only in
@@ -221,63 +216,45 @@ export function createGrayboard(h: Harness): Grayboard {
   const speaker = () => state.voice ?? voice;
   const say = (message: string, level: Level = "info") => speaker().log(message, level);
   const browse = (url: string) => openBrowser(url, error => say(`couldn't open a browser (${error.message}); open the URL above`, "warning"));
-  // The process's pending flow, else a new one under this runtime's Login.
-  // `ifSignedOut` (an offer) returns at once if another process's grant has
-  // landed; /grayboard login always runs a flow. Success restarts this
-  // runtime's delivery and the current root's, at once; any other runtime's
-  // credential watch restarts its own.
-  const signIn = (browser: boolean): Flow | undefined => {
-    if (state.signIn) return state.signIn;
-    if (!login || closed) return undefined;
-    const abort = new AbortController();
-    const { promise: link, resolve: show } = Promise.withResolvers<string | undefined>();
-    const flow: Flow = { abort, link, show, browser, done: Promise.resolve() };
-    state.signIn = flow;
-    flow.done = login.login(abort.signal, !browser).then(
-      async () => {
-        const current = speaker();
-        flow.saidBy = current;
-        current.log("signed in");
-        // A restart that fails is said; the credential watch tries again.
-        await Promise.all([...new Set([voice, current])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
-      },
-      error => {
-        flow.failed = abort.signal.aborted ? "sign-in cancelled" : message(error);
-        // Aborted only by a quit, which has nothing left to say it to.
-        if (abort.signal.aborted) return;
-        flow.saidBy = speaker();
-        flow.saidBy.log(`sign-in failed: ${flow.failed}; ${LOGIN_ACTION} to try again`, "error");
-      },
-    ).finally(() => {
-      show(undefined);
-      if (state.signIn === flow) state.signIn = undefined;
-    });
-    return flow;
+  // A flow's outcome, as its runtime's line or the next root's says it.
+  const outcomeLine = (v: Voice, last: Last) => {
+    if (last.outcome === "signed in") v.log("signed in");
+    else v.log(`sign-in ${last.outcome}; ${LOGIN_ACTION} to try again`, "error");
   };
+  // Says a flow's outcome through the current root runtime, else this one
+  // while it runs. With neither (omp between a session's finish and the
+  // next one's begin), the outcome stays unsaid in the slot and the next root
+  // says it at its start, whose delivery then starts signed in. Success
+  // restarts this runtime's delivery and the current root's, at once; any
+  // other runtime's credential watch restarts its own.
+  const ended = async (_flow: Flow, outcome: Outcome) => {
+    const last = state.signins.last!;
+    // Cancelled only by a quit, which has nothing left to say it to.
+    if (outcome === "cancelled") { last.said = true; return; }
+    const current = state.voice ?? (done ? undefined : voice);
+    if (current) { outcomeLine(current, last); last.said = true; }
+    if (outcome !== "signed in") return;
+    // A restart that fails is said; the credential watch tries again.
+    await Promise.all([...new Set([voice, ...(current ? [current] : [])])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
+  };
+  // The process's pending flow, else a new one under this runtime's Login.
+  // An offer's returns at once if another process's grant has landed;
+  // /grayboard login always runs a flow.
+  const begin = (origin: Origin, browser: boolean): Flow | undefined =>
+    state.signins.flow ?? (!login || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended }));
   // Whether this process outlives a browser round trip. A root's own mode;
   // any other runtime takes its process's root's, since omp starts in-process
   // task subagents without a mode (so they read "print"). A pi subagent is its
   // own process with no root: its own mode (print) decides.
   const interactive = () => role.kind === "root" ? h.interactive() : state.interactive ?? h.interactive();
-  // A signed-out call's notice: that the user has the link to open (waiting
-  // up to LINK_MS for the flow to reach one), else why there is none. The
-  // link itself never enters the result (#500). Only an expired or
-  // missing grant offers; a transient failure goes to the call. Never where
+  // A signed-out call's notice (hosted-core offer.ts): the link goes only to
+  // the notice line, which the user sees and the model doesn't. Never where
   // the process exits before the browser could answer (print or json mode).
-  const offer = async (): Promise<string | undefined> => {
-    try { await login!.token(); return undefined; }
-    catch (error) { if (!accessExpiry(error) || !interactive()) return undefined; }
-    const flow = signIn(false);
-    if (!flow) return undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), LINK_MS); });
-    const url = await Promise.race([flow.link, late]).finally(() => clearTimeout(timer));
-    if (url) return `sign-in started: ask the user to open the link ${h.name} shows (/grayboard login shows it again), then call a grayboard tool again`;
-    if (flow.elsewhere && state.signIn === flow) return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
-    if (flow.failed) return `sign-in failed: ${flow.failed}`;
-    // Ended without a URL or a failure: another process's grant landed first.
-    return state.signIn === flow ? `sign-in is starting; ${h.name} shows its link once it has one: ask the user to open it, then call a grayboard tool again` : undefined;
+  const notes = {
+    started: `sign-in started: ask the user to open the link ${h.name} shows (/grayboard login shows it again), then call a grayboard tool again`,
+    starting: `sign-in is starting; ${h.name} shows its link once it has one: ask the user to open it, then call a grayboard tool again`,
   };
+  const offer = () => signIns.offer(state.signins, login!, { interactive: interactive(), begin: () => begin("offer", false), notes });
 
   // ---- tools ----
 
@@ -395,6 +372,10 @@ export function createGrayboard(h: Harness): Grayboard {
     state.live.set(s.file ?? `id:${s.id}`, s.id);
     state.voice = voice;
     state.interactive = h.interactive();
+    // A flow that ended while no root runtime was set: said once, here, and
+    // the delivery below starts with its grant.
+    const last = state.signins.last;
+    if (last && !last.said) { last.said = true; outcomeLine(voice, last); }
     const carried = s.reason === "new" || s.reason === "fork" ? state.carried : undefined;
     state.carried = undefined;
     const id = s.id;
@@ -427,7 +408,7 @@ export function createGrayboard(h: Harness): Grayboard {
     // A pending sign-in's loopback listener must not hold the exiting process open.
     // Only the current root's quit is the process's: omp quits each in-process
     // subagent runtime when it parks, and that must not end the user's sign-in.
-    if (reason === "quit" && state.voice === voice) state.signIn?.abort.abort();
+    if (reason === "quit" && state.voice === voice) state.signins.flow?.abort.abort();
     if (state.voice === voice) state.voice = undefined;
     const id = session?.id;
     if (session) state.live.delete(session.file ?? `id:${session.id}`);
@@ -496,6 +477,7 @@ export function createGrayboard(h: Harness): Grayboard {
     if (delivery?.held) lines.push(`delivery: ${delivery.held}`);
     if (delivery?.error) lines.push(`delivery: ${delivery.error}`);
     if (delivery?.controller) lines.push(describe(delivery.controller, signedIn));
+    if (state.signins.last) lines.push(signIns.describeLast(state.signins.last));
     if (loginNote) lines.push(`last sign-in event: ${loginNote}`);
     return lines.join("\n");
   };
@@ -507,8 +489,8 @@ export function createGrayboard(h: Harness): Grayboard {
       if (verb === "login") {
         // One flow per process: a pending one (an offer's) is joined, shown
         // again and opened in the browser, not replaced.
-        const pending = state.signIn;
-        const flow = signIn(true);
+        const pending = state.signins.flow;
+        const flow = begin("command", true);
         if (!flow) return;
         if (flow === pending) {
           flow.browser = true;
@@ -517,12 +499,13 @@ export function createGrayboard(h: Harness): Grayboard {
           else if (flow.elsewhere) log(`${flow.elsewhere}; finish it there`);
         }
         await flow.done;
-        // The flow said its outcome here and restarted this runtime already.
-        if (flow.saidBy === voice) return;
+        // The flow said its outcome and restarted this runtime already.
+        const last = state.signins.last;
+        if (!last || last.said) return;
+        last.said = true;
         // Its own failure line: resume can't mend a sign-in that didn't happen.
-        if (flow.failed) { log(`sign-in failed: ${flow.failed}; ${LOGIN_ACTION} to try again`, "error"); return; }
-        log("signed in");
-        await voice.restart();
+        outcomeLine(voice, last);
+        if (last.outcome === "signed in") await voice.restart();
       } else if (verb === "logout") {
         // Before the store changes: this session's own watch sees the new
         // epoch too, and the line below already says it.

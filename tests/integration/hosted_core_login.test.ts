@@ -187,19 +187,133 @@ test("the browser's answer ends the flow while present() is still pending; a pre
   await expect(declined.login()).rejects.toThrow("sign-in declined");
 });
 
-test("two concurrent login() calls in two processes create one grant", async () => {
+test("two concurrent login() calls in two processes create one grant; the waiter shows the holder's link (#581)", async () => {
   const a = spawn("login"), b = spawn("login");
-  const presented = await Promise.race([a.next(l => !!l.present), b.next(l => !!l.present)]);
-  const waiter = a.lines.some(l => l.present) ? b : a;
+  // The waiter is the one that found the lock held.
+  const waiter = await Promise.race([a.next(l => !!l.notify).then(() => a), b.next(l => !!l.notify).then(() => b)]);
+  const holder = waiter === a ? b : a;
   expect((await waiter.next(l => !!l.notify)).notify).toBe("sign-in in progress in another pi session");
-  await browse(presented.present!);
+  const url = (await holder.next(l => !!l.present)).present!;
+  expect((await waiter.next(l => !!l.present)).present).toBe(url);
+  const shared = `${login().path}.login.url`;
+  expect((await Bun.file(shared).stat()).mode & 0o777).toBe(0o600);
+  // Opened from the waiter's line: the holder's callback completes it.
+  await browse(url);
   const [ra, rb] = [outcomes(await a.finished()), outcomes(await b.finished())];
   expect(ra).toHaveLength(1); expect(rb).toHaveLength(1);
   expect(ra[0]!.ok).toBeString();
   expect(rb[0]!.ok).toBe(ra[0]!.ok!);
-  expect([...a.lines, ...b.lines].filter(l => l.present)).toHaveLength(1);
+  expect([...a.lines, ...b.lines].filter(l => l.present).map(l => l.present)).toEqual([url, url]);
+  expect(await Bun.file(shared).exists()).toBe(false);
   expect(grants()).toBe(1);
 }, 30_000);
+
+// ---- a waiter shows the holder's link (#581) ----
+
+// An authorization URL on the resource's origin that no flow made.
+const planted = (tag: string) => `${new URL(resource).origin}/oauth/authorize?state=${tag}`;
+const plant = (l: Login, url: string) => writeJsonAtomic(`${l.path}.login.url`, { url, at: Date.now() });
+
+test("in one process: a waiter presents the holder's link, and the link is gone once the flow ends", async () => {
+  let link: string | undefined;
+  const holder = login({ present: url => { link = url; return new Promise<void>(() => {}); } });
+  const waiter = login();
+  const held = holder.login();
+  await until(() => !!link, 10_000, "holder's link");
+  const waited = waiter.login();
+  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+  expect(waiter.seen.presented).toEqual([link!]);
+  expect(waiter.seen.notices).toEqual(["sign-in in progress in another pi session"]);
+  await browse(waiter.seen.presented[0]!);
+  await held; await waited;
+  expect(await Bun.file(`${holder.path}.login.url`).exists()).toBe(false);
+  expect(waiter.seen.presented).toEqual([link!]);
+  expect(grants()).toBe(1);
+});
+
+test("a leftover link from a crashed holder is removed by the next holder and never presented", async () => {
+  let link: string | undefined;
+  const holder = login({ present: url => { link = url; return new Promise<void>(() => {}); } });
+  await plant(holder, planted("leftover"));
+  const held = holder.login();
+  await until(() => !!link, 10_000, "holder's link");
+  const waiter = login();
+  const waited = waiter.login();
+  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+  expect(waiter.seen.presented).toEqual([link!]);
+  await browse(link!);
+  await held; await waited;
+  expect(waiter.seen.presented).toEqual([link!]);
+});
+
+test("threat boundary: a same-user writer of the 0700 store dir can show a same-origin link to a waiter while a holder is in discovery", async () => {
+  const waiter = login();
+  await plant(waiter, planted("same-user"));
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
+  const waited = waiter.login();
+  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+  expect(waiter.seen.presented).toEqual([planted("same-user")]);
+  held.release();
+  await expect(waited).rejects.toBeInstanceOf(LoginFailed);
+});
+
+test("a link of another origin, with credentials or over 2048 is never presented; each flow says the first refusal once, without the link", async () => {
+  const cases = [
+    { url: "https://elsewhere.example/oauth/authorize?state=x", check: "not on this server's origin" },
+    { url: `${new URL(resource).protocol}//user:pw@${new URL(resource).host}/oauth/authorize?state=x`, check: "carries credentials" },
+    { url: `${planted("long")}${"x".repeat(2048)}`, check: "longer than 2048" },
+  ];
+  for (const { url, check } of cases) {
+    const waiter = login();
+    await plant(waiter, url);
+    const held = tryAcquire(`${waiter.path}.login.lock`)!;
+    const waited = waiter.login();
+    await until(() => waiter.seen.diagnostics.length === 1, 10_000, "refusal said");
+    // A second refusal in the same flow isn't said again.
+    await plant(waiter, `${url}&again=1`);
+    await Bun.sleep(300);
+    held.release();
+    await expect(waited).rejects.toBeInstanceOf(LoginFailed);
+    expect(waiter.seen.presented).toEqual([]);
+    expect(waiter.seen.diagnostics).toHaveLength(1);
+    const said = waiter.seen.diagnostics[0]!;
+    expect(said).toMatchObject({ state: "degraded", operation: "login", code: "refused" });
+    expect(said.message).toContain(check);
+    expect(said.message).toContain(new URL(resource).origin);
+    expect(said.message).not.toContain("state=x");
+    expect(said.message).not.toContain("user:pw");
+  }
+});
+
+test("a waiter whose present rejects ends with that error, not at the lock deadline", async () => {
+  const waiter = login({ present: async () => { throw new LoginFailed("sign-in declined"); } });
+  await plant(waiter, planted("declined"));
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
+  try {
+    const at = Date.now();
+    await expect(waiter.login()).rejects.toThrow("sign-in declined");
+    expect(Date.now() - at).toBeLessThan(5_000);
+  } finally { held.release(); }
+});
+
+test("a waiter whose present resolves keeps waiting; once it holds the lock, its own flow presents its own link", async () => {
+  const waiter = login();
+  await plant(waiter, planted("first"));
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
+  const waited = waiter.login();
+  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+  held.release();
+  await expect(waited).rejects.toThrow("sign-in in another pi session ended without signing in");
+  expect(await Bun.file(`${waiter.path}.login.url`).exists()).toBe(false);
+  const own = waiter.login();
+  await until(() => waiter.seen.presented.length === 2, 10_000, "own link");
+  const link = waiter.seen.presented[1]!;
+  expect(link).not.toBe(planted("first"));
+  expect(new URL(link).searchParams.get("code_challenge_method")).toBe("S256");
+  await browse(link);
+  await own;
+  expect(grants()).toBe(1);
+});
 
 test("a server without the harness's built-in client is ServerOutdated, before any browser", async () => {
   const l = login({ clientId: "grayboard-future" });

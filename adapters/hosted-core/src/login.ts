@@ -6,7 +6,7 @@
 // rotateRefresh), so a refresh whose outcome is unknown is never retried:
 // its token is revoked and a new sign-in is required.
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -17,7 +17,7 @@ import type { Configuration, CredentialPort, Enrollment } from "./port.js";
 import { readJson, sha256, writeJsonAtomic } from "./storage.js";
 import { ServerUnreachable } from "./wire.js";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
-import { SIGN_IN_FLOW_MS as FLOW_MS } from "../../../src/shared/signin.ts";
+import { SIGN_IN_FLOW_MS as FLOW_MS, signInUrl } from "../../../src/shared/signin.ts";
 
 export const SCOPES = "grayboard:tools grayboard:delivery";
 const REFRESH_MARGIN_MS = 60_000;  // refresh once the access token has less left
@@ -32,6 +32,8 @@ export type LoginConfig = {
   loginAction: string; // how this harness signs in, e.g. "run /grayboard login", in AccessExpired
   // Open or show the authorization URL. The flow takes the browser's answer
   // whether or not this has settled; a rejection before that answer ends it.
+  // A session waiting on another's flow gets each distinct URL that flow
+  // shows; a rejection ends its wait the same way.
   present(url: string): void | Promise<void>;
   notify(message: string): void;              // a sign-in already running in another session of this harness
   diagnostic(record: Omit<RecordStatus, "time">): void;
@@ -135,6 +137,10 @@ export class Login {
     this.path = join(config.stateDir, "grants", `${sha256(`${this.resource}\n${config.clientId}`)}.json`);
   }
   private get refreshLock() { return `${this.path}.refresh.lock`; }
+  // The lock holder's authorization URL, `{ url, at }`, for the sessions
+  // waiting on its flow to show (#581). It lives only while the login lock is
+  // held: the holder removes it after taking the lock and before releasing it.
+  private get linkPath() { return `${this.path}.login.url`; }
   private expired(reason: AccessReason = "login_required") { return new AccessExpired(this.config.harness, this.config.loginAction, reason); }
 
   // The store as it is now; undefined before the first login. An unreadable
@@ -342,9 +348,11 @@ export class Login {
     const waited = !lock;
     if (!lock) {
       this.config.notify(`sign-in in progress in another ${this.config.harness} session`);
-      lock = await acquire(lockPath, { deadlineMs: FLOW_MS + 60_000, ...(signal ? { signal } : {}) });
+      lock = await this.waitFor(lockPath, signal);
     }
     try {
+      // A link a crashed holder left names a closed callback.
+      await this.unlink();
       const now = await this.read();
       // A waiter shares whatever grant the store holds once it gets the lock.
       if (waited) {
@@ -353,7 +361,54 @@ export class Login {
       }
       if (live(now) && (ifSignedOut || now.epoch !== before)) return;
       await this.flow(signal);
-    } finally { lock.release(); }
+    } finally {
+      await this.unlink();
+      lock.release();
+    }
+  }
+  // Waits for the login lock, presenting each distinct URL the holder shows
+  // that has an authorization URL's shape on this resource's origin. Read only
+  // while the lock is held, so a crashed holder's leftover can show only in
+  // the instant before the next holder removes it, and that holder's own URL
+  // then supersedes it. A presentation is started, never awaited: a prompt
+  // still open must not stall the retry; one that rejects ends the wait.
+  private async waitFor(lockPath: string, signal: AbortSignal | undefined): Promise<Lock> {
+    const origin = new URL(this.resource).origin;
+    const seen = new Set<string>();
+    let refused = false, failure: { error: unknown } | undefined;
+    const stop = new AbortController();
+    const onBusy = async () => {
+      let raw: unknown;
+      try { raw = await readJson(this.linkPath); } catch { return; }
+      const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
+      if (text === undefined || seen.has(text)) return;
+      seen.add(text);
+      const checked = signInUrl(text);
+      const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
+      if (why || !("url" in checked)) {
+        if (!refused) this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login", code: "refused" });
+        refused = true;
+        return;
+      }
+      const presented = Promise.resolve().then(() => this.config.present(checked.url.href));
+      presented.catch(error => { failure ??= { error }; stop.abort(); });
+    };
+    try {
+      return await acquire(lockPath, { deadlineMs: FLOW_MS + 60_000, signal: signal ? AbortSignal.any([signal, stop.signal]) : stop.signal, onBusy });
+    } catch (error) {
+      if (failure) throw failure.error;
+      throw error;
+    }
+  }
+  // Writes this flow's URL for the waiters; a write that fails is said and
+  // the flow goes on: waiters then say only that a sign-in is in progress.
+  private async share(url: string): Promise<void> {
+    try { await writeJsonAtomic(this.linkPath, { url, at: Date.now() }); }
+    catch (error) { this.config.diagnostic({ state: "degraded", message: `Couldn't share the sign-in link with other ${this.config.harness} sessions (${failureCause(error, 0)}); they say only that a sign-in is in progress`, operation: "login", code: "operation_failed" }); }
+  }
+  private async unlink(): Promise<void> {
+    try { await rm(this.linkPath, { force: true }); }
+    catch (error) { this.config.diagnostic({ state: "degraded", message: `Couldn't remove the shared sign-in link (${failureCause(error, 0)}); other ${this.config.harness} sessions may show a link whose sign-in ended`, operation: "login", code: "operation_failed" }); }
   }
   private async flow(outer: AbortSignal | undefined): Promise<void> {
     const meta = await this.discover();
@@ -366,6 +421,7 @@ export class Login {
       const url = new URL(meta.authorization_endpoint);
       url.search = new URLSearchParams({ response_type: "code", client_id: this.config.clientId, redirect_uri: callback.redirectUri, scope: SCOPES, resource: this.resource, state,
         code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }).toString();
+      await this.share(url.href);
       // A prompt the user never answers (or a host that shows it late) must
       // not hold a browser answer that already came back (#497).
       const presented = Promise.resolve().then(() => this.config.present(url.href));
