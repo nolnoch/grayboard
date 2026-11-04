@@ -38,11 +38,10 @@
 // module alone, so a hook costs a process start and a few file operations.
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { LOOPBACK } from "./endpoint.ts";
 import { isAlive, procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
 import { validSourceId } from "./session_meta.ts";
-import { SIGN_IN_FLOW_MS } from "./signin.ts";
+import { SIGN_IN_FLOW_MS, signInUrl } from "./signin.ts";
 
 /**
  * The live sign-in link (#500). The plugin's server writes it while its flow
@@ -127,8 +126,6 @@ export function dropSignIn(base: string, claudePid: number, url?: string): void 
   }
   rmSync(path, { force: true });
 }
-// The longest link shown: canonicalEndpoint's bound (endpoint.ts).
-const SIGN_IN_URL_MAX = 2048;
 /** The live sign-in link in `dir`, or undefined: none, malformed, too long, not an authorization URL's shape (HTTPS, or HTTP on loopback), or older than a flow. */
 export function readSignIn(dir: string, now = Date.now()): string | undefined {
   try {
@@ -136,11 +133,8 @@ export function readSignIn(dir: string, now = Date.now()): string | undefined {
     if (typeof value.url !== "string" || typeof value.at !== "number") return undefined;
     const age = now - value.at;
     if (!(age >= 0 && age <= SIGN_IN_FLOW_MS)) return undefined;
-    if (value.url.length > SIGN_IN_URL_MAX) return undefined;
-    const url = new URL(value.url);
-    if (url.username || url.password) return undefined;
-    if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname))) return undefined;
-    return url.href;
+    const checked = signInUrl(value.url);
+    return "url" in checked ? checked.url.href : undefined;
   } catch { return undefined; }
 }
 

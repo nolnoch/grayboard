@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { AppSession } from "../../tests/support/app_session.ts";
+import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +11,7 @@ import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
-import { aliasUser, boundInstructions } from "../core/bindings.ts";
+import { aliasUser, boundInstructions, childCapacity } from "../core/bindings.ts";
 import { COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
@@ -78,11 +79,11 @@ test("unbound row quota survives service restart, idle cleanup frees rows and ga
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
   now += 900_001; hosted.sweep();
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   await hosted.whoami(principal, context("overflow"));
   expect(hosted.gateCount).toBe(0);
   await hosted.end(principal, context("overflow"));
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
 });
 
 test("child quota refusal leaves grant, lease and graph unchanged; ending a child frees capacity", async () => {
@@ -386,7 +387,7 @@ test("durable lease deadline expires once without a contender", async () => {
   now += 30_001;
   hosted.sweep(); hosted.sweep();
   expect(delivery.activeLeaseCount).toBe(0);
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
 });
 
 async function paused<T>(point: string, start: () => Promise<T>, overlap: () => Promise<void>) {
@@ -497,7 +498,7 @@ test("ending a hosted root releases every hold in one transaction and audits eac
   expect(application.holdsByOwner().size).toBe(1);
   await hosted.end(principal, context("root"));
   expect(application.holdsByOwner().size).toBe(0);
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(database.db.query("SELECT count(*) AS n FROM alias_holds").get()).toEqual({ n: 0 });
   // Another session can take either name at once.
   await hosted.bind(principal, context("other"), { name: "be", create: false });
@@ -520,7 +521,7 @@ test("a refused writes_as declaration through the hosted gate keeps its refused 
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-human", [GRAYBOARD_WRITES_AS_META]: "human" });
   await expect(hosted.whoami(generic, ctx)).rejects.toHaveProperty("code", "forbidden");
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused' AND detail LIKE '%human%'").all()).toHaveLength(1);
 });
 
@@ -869,4 +870,108 @@ test("after an outage past the window the startup sweep parks children; each ret
   expect(await hosted.whoami(principal, context("child"))).toHaveProperty("child", true);
   expect(childAudits("hosted.child_unparked")).toHaveLength(1);
   expect(await hosted.whoami(principal, context("root"))).toHaveProperty("primary", "you@example.com/be");
+});
+
+// #584: the parked ceiling, one child-capacity refusal text, and no idle end or park while a call runs.
+test("past the parked ceiling the sweep evicts a root's oldest parked children, audited; an evicted one returns as a root (#584)", async () => {
+  hosted.limits.parked = 2;
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  for (const raw of ["first", "second"]) { await hosted.register(principal, context("root"), raw); now += 1000; }
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.children(hostedId("root")).filter(r => r.parked_at !== null)).toHaveLength(2);
+  await hosted.register(principal, context("root"), "third");
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.get(hostedId("first"))).toBeUndefined();
+  expect(database.repo.hosted.children(hostedId("root")).map(r => r.session_id).sort()).toEqual([hostedId("second"), hostedId("third")].sort());
+  expect(childAudits("hosted.child_parked").map(a => a.child)).toEqual([hostedId("first"), hostedId("second"), hostedId("third")]);
+  expect(childAudits("hosted.child_released")).toEqual([expect.objectContaining({ target: hostedId("root"), child: hostedId("first"), reason: "evicted" })]);
+  expect(await hosted.whoami(principal, context("first"))).toHaveProperty("unbound", true);
+  expect(database.repo.hosted.get(hostedId("first"))).toMatchObject({ root_session_id: null, parked_at: null });
+});
+
+test("children parked in one sweep past the ceiling are evicted by last activity, then ID (#584)", async () => {
+  hosted.limits.parked = 1;
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  for (const raw of ["c", "a", "b"]) await hosted.register(principal, context("root"), raw);
+  now += 1000; await hosted.whoami(principal, context("c"));
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.children(hostedId("root")).map(r => r.session_id)).toEqual([hostedId("c")]);
+  const evicted = childAudits("hosted.child_released").map(a => a.child);
+  expect(evicted).toEqual([hostedId("a"), hostedId("b")].sort());
+  // Parked and evicted in one sweep: both audits.
+  expect(childAudits("hosted.child_parked").map(a => a.child).sort()).toEqual([hostedId("a"), hostedId("b"), hostedId("c")].sort());
+});
+
+test("a refused unpark, new register and convert each say local mode's child-capacity text (#584)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "sleeper");
+  now += 900_001; hosted.sweep();
+  await hosted.whoami(principal, context("loose"));
+  for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
+  const text = childCapacity(hostedId("root"));
+  await expect(hosted.whoami(principal, context("sleeper"))).rejects.toMatchObject({ code: "bad_request", message: text });
+  await expect(hosted.register(principal, context("root"), "overflow")).rejects.toMatchObject({ code: "bad_request", message: text });
+  await expect(hosted.register(principal, context("root"), "loose")).rejects.toMatchObject({ code: "bad_request", message: text });
+});
+
+const toolsOnly = () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  return { generic, meta: (raw: string, as?: string) => sessionContext(generic, as ? { [GRAYBOARD_SESSION_META]: raw, [GRAYBOARD_WRITES_AS_META]: as } : { [GRAYBOARD_SESSION_META]: raw }) };
+};
+const rowOf = (c: ReturnType<typeof context>) => { if (!("id" in c)) throw new Error("fixture context"); return database.repo.hosted.get(c.id); };
+
+test("a child's call past the idle window neither parks it nor ends its unheld root; the window restarts at the call's end (#584)", async () => {
+  const { generic, meta } = toolsOnly();
+  await application.hostedWritesAs(generic.authed, "id:probe", "fe", true);
+  await hosted.whoami(generic, meta("root", "fe"));
+  await hosted.register(generic, meta("root", "fe"), "kid");
+  const during = await hosted.transfer(generic, meta("kid"), async () => {
+    now += 900_001; hosted.sweep();
+    return { kid: rowOf(meta("kid"))?.parked_at, root: rowOf(meta("root", "fe")) !== undefined };
+  });
+  expect(during).toEqual({ kid: null, root: true });
+  expect(rowOf(meta("kid"))?.last_seen_at).toBe(now);
+  expect(rowOf(meta("root", "fe"))?.last_seen_at).toBe(now);
+  now += 600_000; hosted.sweep();
+  expect(rowOf(meta("kid"))?.parked_at).toBeNull();
+  expect(childAudits("hosted.child_parked")).toHaveLength(0);
+  expect(hosted.inflightCount).toBe(0);
+});
+
+test("an unheld root's own call past the idle window doesn't end it (#584)", async () => {
+  const { generic, meta } = toolsOnly();
+  await application.hostedWritesAs(generic.authed, "id:probe", "fe", true);
+  await hosted.whoami(generic, meta("root", "fe"));
+  const alive = await hosted.transfer(generic, meta("root", "fe"), async () => { now += 900_001; hosted.sweep(); return rowOf(meta("root", "fe")) !== undefined; });
+  expect(alive).toBe(true);
+  expect(rowOf(meta("root", "fe"))?.last_seen_at).toBe(now);
+});
+
+test("a bind of a name whose holder is mid-call past the idle window doesn't end the holder (#584)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const taken = await hosted.transfer(principal, context("root"), async () => {
+    now += 900_001;
+    return hosted.bind(principal, context("other"), { name: "be", create: false }).then(() => "bound", (e: { code?: string }) => e.code ?? "error");
+  });
+  expect(taken).not.toBe("bound");
+  expect(rowOf(context("root"))).toBeDefined();
+  expect(database.db.query("SELECT id FROM alias_holds WHERE address = 'you@example.com/be'").get()).toEqual({ id: hostedId("root") });
+});
+
+test("a call whose root's ownership ended and restarted before it returns keeps its result and leaves the new ownership as it is (#584)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const before = rowOf(context("root"))!.ownership_id;
+  const value = await hosted.control(principal, context("root"), false, async () => {
+    database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+    hosted.sweep();
+    database.db.run("UPDATE users SET disabled_at = NULL WHERE id = ?", [principal.authed.user_id]);
+    now += 1000;
+    await hosted.whoami(principal, context("root"));
+    return "done";
+  });
+  expect(value).toBe("done");
+  const after = rowOf(context("root"))!;
+  expect(after.ownership_id).toBeGreaterThan(before);
+  expect(database.db.query("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(after.ownership_id)).toEqual({ ended_at: null });
+  expect(hosted.inflightCount).toBe(0);
 });

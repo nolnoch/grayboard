@@ -49,13 +49,15 @@ export function tryAcquire(path: string): Lock | undefined {
 }
 
 // Polls tryAcquire every 100 ms until `deadlineMs` passes (LockTimeout) or
-// `signal` aborts.
-export async function acquire(path: string, options: { deadlineMs: number; signal?: AbortSignal }): Promise<Lock> {
+// `signal` aborts. `onBusy` runs after each attempt that found the lock held,
+// so it sees only what a live holder left; what it throws ends the wait.
+export async function acquire(path: string, options: { deadlineMs: number; signal?: AbortSignal; onBusy?: () => void | Promise<void> }): Promise<Lock> {
   const deadline = Date.now() + options.deadlineMs;
   for (;;) {
     options.signal?.throwIfAborted();
     const lock = tryAcquire(path);
     if (lock) return lock;
+    await options.onBusy?.();
     const left = deadline - Date.now();
     if (left <= 0) throw new LockTimeout(resolve(path));
     await sleep(Math.min(100, left), undefined, options.signal ? { signal: options.signal } : undefined);
