@@ -139,6 +139,17 @@ type Child = {
   call(method: string, params: object, signal?: AbortSignal): Promise<any>;
 };
 
+// Teardown aborts the run before session_shutdown: neither a backoff nor
+// initialization may keep the tool alive until that shared wait finishes.
+function waitReady(ready: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return ready;
+  if (signal.aborted) return Promise.reject(new Error("aborted"));
+  const waiter = Promise.withResolvers<void>();
+  const onAbort = () => waiter.reject(new Error("aborted"));
+  signal.addEventListener("abort", onAbort, { once: true });
+  return Promise.race([ready, waiter.promise]).finally(() => signal.removeEventListener("abort", onAbort));
+}
+
 export default function grayboard(pi: ExtensionAPI) {
   const tools = loadTools();
   let child: Child | undefined;
@@ -207,6 +218,7 @@ export default function grayboard(pi: ExtensionAPI) {
       child = undefined;
       // EPIPE can happen while the child is still alive. Stop it before a
       // replacement, so it can't linger as a second delivery owner.
+      // Unlike omp's local adapter, pi also kills the live EPIPE child.
       if (proc.exitCode === null && proc.signalCode === null) proc.kill();
       if (Date.now() - startedAt >= STABLE_MS) restarts = 0;
       const attempt = restarts;
@@ -291,11 +303,11 @@ export default function grayboard(pi: ExtensionAPI) {
         parameters: { ...tool.inputSchema, type: tool.inputSchema.type ?? "object", properties: tool.inputSchema.properties ?? {} } as any,
         namespace: { name: `mcp__${SERVER.replace(/-/g, "_")}`, aliases: [SERVER] },
         async execute(_id, params, signal, _onUpdate, ctx) {
-          if (!child && restart) await restart.ready;
+          if (!child && restart) await waitReady(restart.ready, signal);
           if (!child && exitReason) throw new Error(exitReason);
           child ??= start(ctx);
           const c = child;
-          await c.ready;
+          await waitReady(c.ready, signal);
           const result = (await c.call("tools/call", { name: tool.name, arguments: params ?? {} }, signal)) as CallResult;
           const content = (result.content ?? []).filter((b) => b.type === "text" || b.type === "image");
           if (result.isError && !content.some((b) => b.type === "text" && b.text)) {
@@ -312,8 +324,8 @@ export default function grayboard(pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    // Registered once per pi process; /new, /resume and fork start the
-    // session again under the same tools.
+    // Registered once per session's extension instance; pi reloads it for
+    // /new, /resume and fork.
     if (!registered && !refused) {
       const path = enabledEntry(ctx);
       if (path) {
@@ -325,7 +337,6 @@ export default function grayboard(pi: ExtensionAPI) {
     }
     if (refused) return report(ctx, refused);
     exitReason = undefined;
-    restarts = 0;
     child ??= start(ctx);
   });
 

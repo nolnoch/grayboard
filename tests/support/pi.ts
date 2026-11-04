@@ -23,7 +23,7 @@ import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
-import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, sigkill } from "./procs.ts";
+import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill } from "./procs.ts";
 import { until } from "./until.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
@@ -321,6 +321,71 @@ export function piLocalRestartScenario(dir: string): Promise<void> {
   });
 }
 
+// /new during the longest backoff cancels the outgoing session's timer,
+// whether idle or blocked in a tool wait. Observe past the timer's deadline
+// to catch a late duplicate child, and verify the new child owns the name.
+export function piLocalRestartShutdownScenario(dir: string, waitingTool = false): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-shutdown", create: true } }]),
+      scripted("who", [{ tool: "mcp__grayboard__whoami", args: {} }]),
+    ]);
+    let pi: Pi | undefined;
+    let db: Database | undefined;
+    try {
+      pi = startPi(dir, model.port, procs, { identity: null });
+      const session = pi;
+      await session.command({ type: "get_state" });
+      await session.command({ type: "prompt", message: "bind" });
+      expect(!!(await toolResult(session, "bind")).isError).toBe(false);
+      await idle(session);
+      db = new Database(join(dir, "bus.db"), { readonly: true });
+      const holder = () => db!.query<{ id: string; pid: number; raw: string }, []>(
+        "SELECT h.id, b.pid, i.harness_session AS raw FROM alias_holds h JOIN ids i ON i.id = h.id JOIN bindings b ON b.session_id = h.id WHERE h.address = 'pi-shutdown'",
+      ).get();
+      let previous = holder()!.id;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const [dead] = grayboardChildPids(session.pid);
+        await sigkill(dead!);
+        await until(() => holder() && holder()!.id !== previous, 15_000, "the name restored before another kill");
+        previous = holder()!.id;
+      }
+
+      const [dead] = grayboardChildPids(session.pid);
+      await sigkill(dead!);
+      await until(() => session.notices().some((n) => n.includes("restarting it (3 of 3)")), 1_000, "5 s backoff scheduled");
+      if (waitingTool) {
+        await session.command({ type: "prompt", message: "who" });
+        await until(() => session.events.some((e) => e.type === "tool_execution_start" && e.toolName === "mcp__grayboard__whoami"), 1_000, "the tool waiting on the backoff");
+      }
+      // No tool call in the idle case. The busy case must abort its wait
+      // rather than making /new sit through the remaining 5 s backoff.
+      await session.command({ type: "new_session" }, 2_000);
+      const fresh = await session.command({ type: "get_state" });
+      await until(() => holder()?.raw === fresh.sessionId, 15_000, "the new session holds the name");
+      const live = grayboardChildPids(session.pid);
+      expect(live).toHaveLength(1);
+      expect(holder()!.pid).toBe(live[0]);
+      expect(holder()!.id).not.toBe(previous);
+      // A negative assertion needs the old timer's complete 5 s window.
+      await Bun.sleep(5_500);
+      expect(grayboardChildPids(session.pid)).toEqual(live);
+      expect(holder()).toMatchObject({ pid: live[0], raw: fresh.sessionId });
+      expect(model.unhandled).toEqual([]);
+      await session.quit();
+    } finally {
+      // Mutation runs may leave a duplicate child the adapter no longer owns.
+      for (const p of pi ? processDescendants(pi.pid) : []) {
+        try { process.kill(p.pid, "SIGKILL"); } catch {}
+      }
+      await stopAll(procs);
+      model.stop();
+      db?.close();
+    }
+  });
+}
+
 // Started without BUS_IDENTITY, the session is unbound: reads work, the rest
 // is refused. bind through the extension's tool binds the session's one
 // grayboard process, a DM to the new name triggers a turn, and that turn's
@@ -607,16 +672,24 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([]);
+    let pi: Pi | undefined;
     try {
       const stub = join(ROOT, "tests/support/stdin_closed.sh");
-      const pi = startPi(dir, model.port, procs, { entry: { command: stub, args: [process.execPath, CLI, "mcp", "--mode", "local"] } });
-      await pi.command({ type: "get_state" });
-      const notice = await until(() => pi.notices().find((n) => n.includes("stopped reading") && n.includes("after 3 restarts")), 15_000, "EPIPE restart exhaustion notice");
+      pi = startPi(dir, model.port, procs, { entry: { command: stub, args: [process.execPath, CLI, "mcp", "--mode", "local"] } });
+      const session = pi;
+      await session.command({ type: "get_state" });
+      const notice = await until(() => session.notices().find((n) => n.includes("stopped reading") && n.includes("after 3 restarts")), 15_000, "EPIPE restart exhaustion notice");
       expect(notice).toContain("grayboard process stopped reading: ");
       expect(notice).toContain("restart pi to reconnect");
-      await pi.command({ type: "get_state" });
-      await pi.quit();
+      // The stub execs sleep, so grayboard-only process filters miss it.
+      await until(() => processDescendants(session.pid).length === 0, 1_000, "no EPIPE stub descendants after give-up");
+      expect(processDescendants(session.pid)).toEqual([]);
+      await session.command({ type: "get_state" });
+      await session.quit();
     } finally {
+      for (const p of pi ? processDescendants(pi.pid) : []) {
+        try { process.kill(p.pid, "SIGKILL"); } catch {}
+      }
       await stopAll(procs);
       model.stop();
     }
