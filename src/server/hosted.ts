@@ -201,8 +201,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   // `later`: audit writes for a refusal, run by the caller after its transaction rolls back (the throw takes
   // a row written inside it, #452).
-  // `wake`: a parked child's request makes it active again; session_end's doesn't, so ending one is never refused
-  // for capacity.
+  // `wake`: a parked child's request makes it active again; an exchange's selection (`snapshot`) and session_end
+  // don't, so ending one is never refused for capacity.
   function rowFor(p: OAuthPrincipal, context: SessionContext, later: Array<() => void>, create = true, wake = true): HostedSession | undefined {
     if (!("id" in context)) return undefined;
     let row = store.get(context.id);
@@ -425,7 +425,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     reconcile,
     sweep,
     listen(fn: () => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
-    async snapshot(p: OAuthPrincipal, context: SessionContext) { return withGate(p, context, false, async row => snapshot(p, row)); },
+    // Every MCP exchange's selection, before its tool runs: it doesn't wake a parked child (#566). The tool's own
+    // gate does, except session_end's, so ending a parked child is never refused for capacity.
+    async snapshot(p: OAuthPrincipal, context: SessionContext) { return withGate(p, context, false, async row => snapshot(p, row), false); },
     // `told` (a native tool call): gets the alias_lost notice, if any, for the result.
     async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T, told?: (notice: string) => void): Promise<T> {
       return withGate(p, context, false, async row => {

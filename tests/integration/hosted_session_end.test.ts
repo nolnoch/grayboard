@@ -131,3 +131,23 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: idle children are
   expect(await value(returning, "whoami")).toMatchObject({ child: true, root: late.root });
   expect(app.db.query("SELECT target FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([{ target: late.root }]);
 });
+
+// #566 audit 1: an exchange's selection doesn't wake a parked child, so its session_end over HTTP ends it even
+// with the root at full child capacity, and writes no unpark row.
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's session_end over HTTP ends it at full child capacity`, async () => {
+  const grant = issue();
+  const root = await connect(version, grant.token, "full-root");
+  await bind(root, "be");
+  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const context = sessionContext(principal, { "ai.opencode/sessionID": "full-root" });
+  const { child } = await value(root, "session_register", { child: "sleeper" });
+  skew += 900_001;
+  await value(root, "whoami"); // its request sweeps, parking the sleeper
+  for (let i = 0; i < MAX_CHILDREN; i++) await app.mcp.sessions.register(principal, context, `busy-${i}`);
+  expect(app.repo.hosted.get(child)?.parked_at).not.toBeNull();
+  const sleeper = await connect(version, grant.token, "sleeper");
+  expect(await value(sleeper, "session_end")).toEqual({ ended: true });
+  expect(app.repo.hosted.get(child)).toBeUndefined();
+  expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
+});

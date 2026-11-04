@@ -856,3 +856,17 @@ test("a root that holds parked children can't become a child (#566)", async () =
   expect(database.repo.hosted.get(hostedId("leaf"))?.parked_at).not.toBeNull();
   await expect(hosted.register(principal, context("top"), "middle")).rejects.toHaveProperty("code", "has_children");
 });
+
+test("after an outage past the window the startup sweep parks children; each returning one unparks once (#566 audit 2)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  hosted.close();
+  now += 900_001;
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  expect(database.repo.hosted.get(hostedId("child"))?.parked_at).toBe(now);
+  expect(childAudits("hosted.child_parked")).toHaveLength(1);
+  expect(await hosted.whoami(principal, context("child"))).toHaveProperty("child", true);
+  expect(await hosted.whoami(principal, context("child"))).toHaveProperty("child", true);
+  expect(childAudits("hosted.child_unparked")).toHaveLength(1);
+  expect(await hosted.whoami(principal, context("root"))).toHaveProperty("primary", "you@example.com/be");
+});

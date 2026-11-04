@@ -259,6 +259,8 @@ function migrateHostedHolds(db: Database): void {
   if (!cols.has("suggested")) db.exec(`ALTER TABLE hosted_sessions ADD COLUMN suggested TEXT`);
   // When the sweep parked an idle child (#566); null while active.
   if (!cols.has("parked_at")) db.exec(`ALTER TABLE hosted_sessions ADD COLUMN parked_at INTEGER`);
+  // `all()` reads the active rows and `children()` a root's: a long ownership's parked backlog stays off both scans.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_hosted_parked ON hosted_sessions(parked_at); CREATE INDEX IF NOT EXISTS idx_hosted_root ON hosted_sessions(root_session_id)`);
   db.exec(`
     INSERT OR IGNORE INTO alias_holds(address, id, bound_at)
       SELECT u.email || '/' || h.name, h.session_id, h.last_seen_at FROM hosted_sessions h JOIN users u ON u.id = h.user_id WHERE h.name IS NOT NULL;
