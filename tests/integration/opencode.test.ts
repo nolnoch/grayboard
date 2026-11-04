@@ -15,7 +15,7 @@ import { closeSessions, localSession } from "../support/mcp.ts";
 import { CLI, ROOT } from "../support/paths.ts";
 import { grayboardChildren, grayboardChildPids, processDescendants, sigkill } from "../support/procs.ts";
 import { localOpenCode, opencodeTool, type LocalOpenCode, type OpenCodeMessage } from "../support/opencode.ts";
-import { onChannelDm, promptText, startFakeModel, type Rule } from "../support/fake_model.ts";
+import { messageText, onChannelDm, promptText, startFakeModel, type Rule } from "../support/fake_model.ts";
 import { until } from "../support/until.ts";
 
 let dir: string;
@@ -174,11 +174,197 @@ test("opencode: no grayboard at the entry's command fails the plugin's init with
   await expect(oc.send("init")).rejects.toThrow(`\`${missing} tools\` failed to run`);
 });
 
+test("opencode: a resumed nested child is identified by SDK lookup before any creation event", async () => {
+  const peer = await localSession(dir, "peer");
+  const oc = driver("oc", entry());
+  await oc.send("init");
+  await oc.send("session", { sessionID: "child", parentID: "middle" });
+  await oc.send("session", { sessionID: "middle", parentID: "root" });
+  const system = (await oc.send("system", { sessionID: "child" })).join("\n");
+  const who = JSON.parse(await oc.send("call", { sessionID: "child", tool: "grayboard_whoami", args: {} }));
+  expect(who).toMatchObject({ child: true, primary: "oc" });
+  expect(system).toContain(`You are a subagent of session ${who.root}`);
+  expect(system).toContain(who.id);
+  expect(system).not.toContain('You are identity "oc"');
+  await expect(oc.send("call", { sessionID: "child", tool: "grayboard_bind", args: { name: "child-name", create: true } })).rejects.toThrow("bind and unbind are the root's");
+  const sent = await peer.call("dm_send", { to: "oc", body: "root only" });
+  const prompt = await until(async () => (await oc.send("state")).prompts.find((p: { text: string }) => p.text.includes(`message_id="${sent.message_id}"`)), 15_000, "nested child's delivery reaches the root");
+  expect(prompt.session).toBe("root");
+  expect((await oc.send("system", { sessionID: "root" })).join("\n")).toContain('You are identity "oc"');
+  await oc.send("dispose");
+});
+
+test("opencode: a child's user message and a deleted-session race never retarget root delivery", async () => {
+  const peer = await localSession(dir, "peer");
+  const oc = driver("oc", entry());
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "root" } } } });
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "child", parentID: "root" } } } });
+  await oc.send("system", { sessionID: "root" });
+  await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "child" } } } });
+  const sent = await peer.call("dm_send", { to: "oc", body: "after child message" });
+  const prompt = await until(async () => (await oc.send("state")).prompts.find((p: { text: string }) => p.text.includes(`message_id="${sent.message_id}"`)), 15_000, "the child's message leaves delivery at the root");
+  expect(prompt.session).toBe("root");
+  await oc.send("event", { event: { type: "session.deleted", properties: { info: { id: "child", parentID: "root" } } } });
+  // The SDK now refuses this lookup. The fire-and-forget event must resolve,
+  // not reject or redirect subsequent delivery to the deleted session.
+  expect(await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "child" } } } })).toBeNull();
+  expect(await oc.send("system", { sessionID: "child" })).toEqual([]);
+  const raced = await peer.call("dm_send", { to: "oc", body: "after session deletion" });
+  const next = await until(async () => (await oc.send("state")).prompts.find((p: { text: string }) => p.text.includes(`message_id="${raced.message_id}"`)), 15_000, "the deleted child's message leaves delivery at the root");
+  expect(next.session).toBe("root");
+  await oc.send("dispose");
+});
+
+test("opencode: child instructions skip restart backoff and degrade to none after exhaustion", async () => {
+  const oc = driver("oc", entry());
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "child", parentID: "s1" } } } });
+  expect((await oc.send("system", { sessionID: "child" })).join("\n")).toContain("You are a subagent");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await sigkill(grayboardChildPids(oc.pid)[0]!);
+    await oc.send("call", { tool: "grayboard_whoami", args: {} });
+  }
+  await sigkill(grayboardChildPids(oc.pid)[0]!);
+  await until(async () => (await oc.send("state")).toasts.some((n: string) => n.includes("restarting it (3 of 3)")), 1_000, "the longest child backoff scheduled");
+  let result: string[] | undefined;
+  const turn = oc.send("system", { sessionID: "child" }).then(value => { result = value; });
+  void turn.catch(() => {});
+  await until(() => result, 1_000, "a child model turn does not wait through the five-second backoff");
+  await turn;
+  expect(result).toEqual([]);
+  expect(grayboardChildPids(oc.pid)).toEqual([]);
+  await oc.send("call", { tool: "grayboard_whoami", args: {} });
+  await sigkill(grayboardChildPids(oc.pid)[0]!);
+  await until(async () => (await oc.send("state")).toasts.some((n: string) => n.includes("after 3 restarts")), 1_000, "child recovery exhausted");
+  expect(await oc.send("system", { sessionID: "child" })).toEqual([]);
+  await expect(oc.send("call", { sessionID: "child", tool: "grayboard_whoami", args: {} })).rejects.toThrow("after 3 restarts");
+  await oc.send("dispose");
+});
+
 const scriptedTool = (prompt: string, tool: string, args: Record<string, unknown>): Rule => req => {
   const at = req.messages.findLastIndex(m => m.role === "user" && promptText(m) === prompt);
   if (at < 0 || req.messages.slice(at + 1).some(m => m.role === "assistant")) return undefined;
   return { tool: `grayboard_${tool}`, args };
 };
+
+test("opencode real: subagent writes via its root, cannot bind, and gets child instructions", async () => {
+  const childPrompt = "Exercise child grayboard attribution.";
+  const childCalls = [
+    { tool: "grayboard_whoami", args: {} },
+    { tool: "grayboard_dm_send", args: { to: "peer", body: "from the subagent" } },
+    { tool: "grayboard_bind", args: { name: "oc-child", create: true } },
+    { tool: "grayboard_whoami", args: {} },
+  ];
+  const model = startFakeModel([
+    req => {
+      if (!req.messages.some(m => m.role === "user" && promptText(m) === childPrompt)) return undefined;
+      return childCalls[req.messages.filter(m => m.role === "assistant").length] ?? { text: "child finished" };
+    },
+    scriptedTool("bind", "bind", { name: "oc-root", create: true }),
+    req => {
+      const at = req.messages.findLastIndex(m => m.role === "user" && promptText(m) === "spawn child");
+      if (at < 0 || req.messages.slice(at + 1).some(m => m.role === "assistant")) return undefined;
+      return { tool: "task", args: { description: "Check child attribution", prompt: childPrompt, subagent_type: "general" } };
+    },
+    scriptedTool("who", "whoami", {}),
+  ]);
+  let oc: LocalOpenCode | undefined;
+  let db: Database | undefined;
+  try {
+    const peer = await localSession(dir, "peer");
+    oc = await localOpenCode(dir, model.port);
+    const root = await oc.create();
+    expect(opencodeTool(await oc.prompt(root, "bind"), "bind").state.status).toBe("completed");
+    const spawned = await oc.prompt(root, "spawn child");
+    const task = spawned.parts.find(p => p.type === "tool" && "tool" in p && p.tool === "task");
+    expect(task && "state" in task ? task.state.status : undefined).toBe("completed");
+    const [session] = await oc.children(root);
+    expect(session?.parentID).toBe(root);
+    const parts = (await oc.messages(session!.id)).flatMap(m => m.parts);
+    const child = { info: { role: "assistant" }, parts };
+    const who = JSON.parse(opencodeTool(child, "whoami").state.output!);
+    expect(who).toMatchObject({ child: true, primary: "oc-root", aliases: ["oc-root"] });
+    expect(who.id).not.toBe(who.root);
+    expect(opencodeTool(child, "dm_send").state.status).toBe("completed");
+    const bind = opencodeTool(child, "bind");
+    expect(bind.state.status).toBe("error");
+    expect(bind.state.error).toContain("bind and unbind are the root's");
+    const sent = (await peer.call("dm_history", { peer: "oc-root" })).find((m: { body: string }) => m.body === "from the subagent");
+    expect(sent).toMatchObject({ sender: "oc-root", via: who.id });
+    const childRequests = model.requests.filter(r => r.body.messages.some(m => m.role === "user" && promptText(m) === childPrompt));
+    expect(childRequests.length).toBeGreaterThan(1);
+    for (const request of childRequests) {
+      const system = request.body.messages.filter(m => m.role === "system").map(messageText).join("\n");
+      expect(system).toContain("You are a subagent");
+      expect(system).toContain(who.id);
+      expect(system).toContain("bind and unbind are the root's");
+      expect(system).not.toContain('You are identity "oc-root"');
+      expect(system).not.toContain('Direct messages arrive as <channel source="grayboard"');
+    }
+    const rootWho = JSON.parse(opencodeTool(await oc.prompt(root, "who"), "whoami").state.output!);
+    expect(rootWho).toMatchObject({ id: who.root, primary: "oc-root", aliases: ["oc-root"] });
+    expect(rootWho.child).toBeUndefined();
+    const rootSystem = model.requests.at(-1)!.body.messages.filter(m => m.role === "system").map(messageText).join("\n");
+    expect(rootSystem).toContain('You are identity "oc-root"');
+    expect(rootSystem).not.toContain("You are a subagent");
+    db = new Database(join(dir, "bus.db"), { readonly: true });
+    expect(db.query("SELECT root_id, delivery FROM ids WHERE id = ?").get(who.id)).toEqual({ root_id: who.root, delivery: "none" });
+    expect(db.query("SELECT id FROM alias_holds WHERE address = 'oc-child'").get()).toBeNull();
+    expect(model.unhandled).toEqual([]);
+  } finally {
+    for (const pid of oc ? grayboardChildPids(oc.pid) : []) await sigkill(pid);
+    await oc?.stop();
+    db?.close();
+    model.stop();
+  }
+}, 120_000);
+
+test("opencode real: a subagent that never calls grayboard still runs during an outage", async () => {
+  const childPrompt = "Work without grayboard.";
+  const model = startFakeModel([
+    scriptedTool("who", "whoami", {}),
+    req => {
+      if (req.messages.some(m => m.role === "user" && promptText(m) === childPrompt)) return { text: "offline child finished" };
+      const at = req.messages.findLastIndex(m => m.role === "user" && promptText(m) === "spawn offline child");
+      if (at < 0 || req.messages.slice(at + 1).some(m => m.role === "assistant")) return undefined;
+      return { tool: "task", args: { description: "Work during outage", prompt: childPrompt, subagent_type: "general" } };
+    },
+  ]);
+  let oc: LocalOpenCode | undefined;
+  try {
+    oc = await localOpenCode(dir, model.port);
+    const current = oc;
+    const root = await oc.create();
+    expect(opencodeTool(await oc.prompt(root, "who"), "whoami").state.status).toBe("completed");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await sigkill(grayboardChildPids(oc.pid)[0]!);
+      expect(opencodeTool(await oc.prompt(root, "who"), "whoami").state.status).toBe("completed");
+    }
+    await sigkill(grayboardChildPids(oc.pid)[0]!);
+    await until(() => current.notices().some(n => n.includes("after 3 restarts")), 1_000, "grayboard remains unavailable");
+    const spawned = await oc.prompt(root, "spawn offline child");
+    const task = spawned.parts.find(p => p.type === "tool" && "tool" in p && p.tool === "task");
+    expect(task && "state" in task ? task.state.status : undefined).toBe("completed");
+    const [child] = await oc.children(root);
+    expect(child?.parentID).toBe(root);
+    const messages = await oc.messages(child!.id);
+    expect(messages.flatMap(m => m.parts).some(p => "text" in p && p.text?.includes("offline child finished"))).toBe(true);
+    expect(messages.flatMap(m => m.parts).filter(p => p.type === "tool")).toEqual([]);
+    const request = model.requests.find(r => r.body.messages.some(m => m.role === "user" && promptText(m) === childPrompt));
+    expect(request).toBeDefined();
+    const system = request!.body.messages.filter(m => m.role === "system").map(messageText).join("\n");
+    expect(system).not.toContain("You are a subagent of session");
+    expect(system).not.toContain('Direct messages arrive as <channel source="grayboard"');
+    expect(grayboardChildPids(oc.pid)).toEqual([]);
+    expect(model.unhandled).toEqual([]);
+  } finally {
+    for (const pid of oc ? grayboardChildPids(oc.pid) : []) await sigkill(pid);
+    await oc?.stop();
+    model.stop();
+  }
+}, 120_000);
 
 test("opencode real: child restarts restore held names, tool calls and delivery, then exhaust", async () => {
   const model = startFakeModel([

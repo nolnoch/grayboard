@@ -15,6 +15,7 @@ const OPENCODE_CLI = join(dirname(PACKAGE), OPENCODE.bin.opencode);
 const ToolPartSchema = z.object({ type: z.literal("tool"), tool: z.string(), state: z.object({ status: z.string(), output: z.string().optional(), error: z.string().optional() }) });
 const MessageSchema = z.object({ info: z.object({ role: z.string(), error: z.unknown().optional() }), parts: z.array(z.union([ToolPartSchema, z.object({ type: z.string(), text: z.string().optional() })])) });
 const ToastSchema = z.object({ type: z.literal("tui.toast.show"), properties: z.object({ message: z.string() }) });
+const SessionSchema = z.object({ id: z.string(), parentID: z.string().optional() });
 type ToolPart = z.infer<typeof ToolPartSchema>;
 export type OpenCodeMessage = z.infer<typeof MessageSchema>;
 export type LocalOpenCode = {
@@ -22,6 +23,7 @@ export type LocalOpenCode = {
   create(): Promise<string>;
   prompt(session: string, text: string): Promise<OpenCodeMessage>;
   messages(session: string): Promise<OpenCodeMessage[]>;
+  children(session: string): Promise<z.infer<typeof SessionSchema>[]>;
   request(path: string, method?: string, body?: object): Promise<unknown>;
   notices(): string[];
   stop(): Promise<void>;
@@ -99,7 +101,7 @@ export async function localOpenCode(dir: string, modelPort: number): Promise<Loc
     return {
       pid: proc.pid!, request, stop,
       notices: () => notices,
-      create: async () => z.object({ id: z.string() }).parse(await request("/session", "POST", { title: "Local restart regression" })).id,
+      create: async () => SessionSchema.parse(await request("/session", "POST", { title: "Local adapter regression" })).id,
       async prompt(session, text) {
         const final = MessageSchema.parse(await request(`/session/${session}/message`, "POST", { model: { providerID: "fake", modelID: "fake-1" }, parts: [{ type: "text", text }] }));
         const messages = z.array(MessageSchema).parse(await request(`/session/${session}/message`));
@@ -107,6 +109,7 @@ export async function localOpenCode(dir: string, modelPort: number): Promise<Loc
         return { info: final.info, parts: messages.slice(at + 1).flatMap(m => m.parts) };
       },
       messages: async session => z.array(MessageSchema).parse(await request(`/session/${session}/message`)),
+      children: async session => z.array(SessionSchema).parse(await request(`/session/${session}/children`)),
     };
   } catch (e) {
     await stop();
