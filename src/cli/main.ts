@@ -8,8 +8,9 @@ import { runHook } from "../shared/claude_agents.ts";
 import { sockDir } from "../shared/sockdir.ts";
 
 if (process.argv[2] === "hook" && process.argv[3] === "claude") {
-  // Locally a child ends with its root (#548), so SubagentStop writes no marker.
-  runHook(process.argv[4] ?? "", await Bun.stdin.text(), { base: sockDir(), env: process.env, ended: false });
+  // Locally a child ends with its root (#548), so SubagentStop writes no marker,
+  // and local mode stores no model or effort, so no facts (#545).
+  runHook(process.argv[4] ?? "", await Bun.stdin.text(), { base: sockDir(), env: process.env, hosted: false });
 } else {
   await import("./cli.ts");
 }

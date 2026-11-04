@@ -4,8 +4,8 @@ import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
 import { InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire, type WireOptions } from "./wire.js";
 import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type BindingState, type Lease } from "./model.js";
-import { SessionRoutes } from "./sessions.js";
-import { end, register } from "./children.js";
+import { AncestryError, SessionRoutes, type SessionPath } from "./sessions.js";
+import { end, register, type Temporary } from "./children.js";
 import { Diagnostics, DeliveryStopped, failureCode, failureMessage, type DiagnosticSink, type Operation, type Status } from "./diagnostics.js";
 export type { Status } from "./diagnostics.js";
 // Every root's pause message after a credential change (a login or logout in any process) starts with this.
@@ -37,6 +37,8 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // the item again.
 type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 const ADMITTED_LIMIT = 100;
+// Ancestry lookups `childRoot` keeps for sessions not (yet) routed.
+const LOOKUPS = 1024;
 // A host that rotates its own access token (OpenCode's native grant) stores
 // the refresh at or just after expiry: up to ~1.5 s after the server closed
 // the stream for it (#472). An `expired` token outside an outage is polled
@@ -69,6 +71,7 @@ const display = (address: string) => shortOf(address.slice(0, address.lastIndexO
 
 export class Controller<E extends Enrollment = Enrollment> {
   readonly routes = new SessionRoutes();
+  private readonly lookups = new Map<string, SessionPath>();
   readonly Transport: typeof Wire;
   protected roots = new Map<string, Root<E>>();
   private watches = new Map<string, { dispose(): Promise<void> }>();
@@ -126,6 +129,42 @@ export class Controller<E extends Enrollment = Enrollment> {
     for (const [index, id] of path.via.entries()) this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
     this.routes.remember(path);
     return path;
+  }
+  // The path of a descendant of an enrolled root that isn't paused, else undefined
+  // (a root, a descendant of an unenrolled or paused root, a session whose
+  // ancestry doesn't resolve). Ancestry resolves once per session; only a
+  // failure resolves again. A lookup isn't a route: `routes` holds only sessions
+  // the server knows (an `ended` one gets a `session_end`), so a lookup is kept
+  // apart, for the most recent LOOKUPS sessions (#535).
+  async childRoot(sessionID: string): Promise<SessionPath | undefined> {
+    let path = this.routes.get(sessionID) ?? this.lookups.get(sessionID);
+    if (!path) {
+      if (this.routes.isEnded(sessionID)) return;
+      try { path = await this.port.ancestry(sessionID); } catch { return; }
+      if (this.routes.isEnded(sessionID) || this.routes.isEnded(path.root)) return;
+      this.lookups.set(sessionID, path);
+      if (this.lookups.size > LOOKUPS) this.lookups.delete(this.lookups.keys().next().value!);
+    }
+    const r = this.roots.get(path.root);
+    return path.root !== sessionID && r && !r.paused ? path : undefined;
+  }
+  // A descendant registers under its root: before its first native call, and
+  // before a native wire names it, which unregistered would start an ownership
+  // of its own (#535). One that ended while registering may have sent its end
+  // before this registration landed, so it ends the row it made. A refusal is
+  // the root's `child_register` failure unless `report` is false: an
+  // instructions fetch reports its own, without degrading the root.
+  async enlist(path: SessionPath, report = true): Promise<void> {
+    const r = this.roots.get(path.root);
+    const e = r?.e ?? await this.port.credential.capture(path.root);
+    const call: Temporary = (sessionID, c) => this.temporary(e, c, sessionID);
+    await register(call, { root: path.root, via: path.via, child: path.sessionID })
+      .catch(error => { if (report) this.failure("child_register", error, r); throw error; });
+    if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
+      await end(call, { child: path.sessionID }).catch(error => this.failure("child_end", error, r));
+      throw new AncestryError("Grayboard session ended during registration");
+    }
+    this.routes.remember(path);
   }
   protected async activeRoot(sessionID: string) {
     const path = await this.path(sessionID);
@@ -608,13 +647,8 @@ export class Controller<E extends Enrollment = Enrollment> {
   // Before a native call: a descendant registers under its root first; a root's
   // own bind stops delivery until afterCall reconciles it.
   async beforeCall(event: { sessionID: string; tool: string }): Promise<void> {
-    const path = await this.path(event.sessionID), r = this.roots.get(path.root);
-    if (path.root !== event.sessionID) {
-      const e = r?.e ?? await this.port.credential.capture(path.root);
-      await register((sessionID, call) => this.temporary(e, call, sessionID), { root: path.root, via: path.via, child: event.sessionID })
-        .catch(error => { this.failure("child_register", error, r); throw error; });
-      this.routes.remember(path);
-    }
+    const path = await this.path(event.sessionID);
+    if (path.root !== event.sessionID) await this.enlist(path);
     if ((event.tool === "bind" || event.tool === "unbind") && path.root === event.sessionID) await this.serial(async () => {
       const current = this.roots.get(path.root);
       if (current) { this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind"); await this.stop(current); }
@@ -666,6 +700,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // ownership; a descendant ends its registration without ending its root.
   async ended(sessionID: string) {
     if (this.stopped) return;
+    this.lookups.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path) return;
     const r = this.roots.get(path.root);

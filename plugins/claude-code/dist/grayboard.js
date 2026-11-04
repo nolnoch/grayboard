@@ -31732,7 +31732,9 @@ class Connection {
     } catch {
       return {};
     }
-    return { ...typeof f?.model === "string" && f.model ? { [MODEL_META]: f.model } : {}, ...typeof f?.effort === "string" && f.effort ? { [EFFORT_META]: f.effort } : {} };
+    const wire = (v) => v === null ? "" : typeof v === "string" && v ? v : undefined;
+    const model = wire(f?.model), effort = wire(f?.effort);
+    return { ...model === undefined ? {} : { [MODEL_META]: model }, ...effort === undefined ? {} : { [EFFORT_META]: effort } };
   }
   async reachable(pending) {
     try {
@@ -36139,6 +36141,13 @@ class SessionRoutes {
       throw new AncestryError("Grayboard session ancestry changed");
     this.paths.set(path.sessionID, { ...path, via: [...path.via] });
   }
+  get(sessionID) {
+    const path = this.paths.get(sessionID);
+    return path ? { ...path, via: [...path.via] } : undefined;
+  }
+  isEnded(sessionID) {
+    return this.ended.has(sessionID);
+  }
   end(sessionID) {
     if (this.ended.has(sessionID))
       return;
@@ -36160,6 +36169,7 @@ async function end(temporary, path) {
 // adapters/hosted-core/src/controller.ts
 var DRIFTED = "Grayboard credential changed";
 var ADMITTED_LIMIT = 100;
+var LOOKUPS = 1024;
 var ROTATION_POLL_MS = 500;
 var ROTATION_GRACE_MS = 1e4;
 function sleep5(ms, signal) {
@@ -36190,6 +36200,7 @@ var display = (address) => shortOf(address.slice(0, address.lastIndexOf("/")), a
 class Controller {
   port;
   routes = new SessionRoutes;
+  lookups = new Map;
   Transport;
   roots = new Map;
   watches = new Map;
@@ -36257,6 +36268,40 @@ class Controller {
       this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
     this.routes.remember(path);
     return path;
+  }
+  async childRoot(sessionID) {
+    let path = this.routes.get(sessionID) ?? this.lookups.get(sessionID);
+    if (!path) {
+      if (this.routes.isEnded(sessionID))
+        return;
+      try {
+        path = await this.port.ancestry(sessionID);
+      } catch {
+        return;
+      }
+      if (this.routes.isEnded(sessionID) || this.routes.isEnded(path.root))
+        return;
+      this.lookups.set(sessionID, path);
+      if (this.lookups.size > LOOKUPS)
+        this.lookups.delete(this.lookups.keys().next().value);
+    }
+    const r = this.roots.get(path.root);
+    return path.root !== sessionID && r && !r.paused ? path : undefined;
+  }
+  async enlist(path, report = true) {
+    const r = this.roots.get(path.root);
+    const e = r?.e ?? await this.port.credential.capture(path.root);
+    const call = (sessionID, c) => this.temporary(e, c, sessionID);
+    await register2(call, { root: path.root, via: path.via, child: path.sessionID }).catch((error) => {
+      if (report)
+        this.failure("child_register", error, r);
+      throw error;
+    });
+    if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
+      await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
+      throw new AncestryError("Grayboard session ended during registration");
+    }
+    this.routes.remember(path);
   }
   async activeRoot(sessionID) {
     const path = await this.path(sessionID);
@@ -36832,15 +36877,9 @@ class Controller {
     }
   }
   async beforeCall(event) {
-    const path = await this.path(event.sessionID), r = this.roots.get(path.root);
-    if (path.root !== event.sessionID) {
-      const e = r?.e ?? await this.port.credential.capture(path.root);
-      await register2((sessionID, call) => this.temporary(e, call, sessionID), { root: path.root, via: path.via, child: event.sessionID }).catch((error) => {
-        this.failure("child_register", error, r);
-        throw error;
-      });
-      this.routes.remember(path);
-    }
+    const path = await this.path(event.sessionID);
+    if (path.root !== event.sessionID)
+      await this.enlist(path);
     if ((event.tool === "bind" || event.tool === "unbind") && path.root === event.sessionID)
       await this.serial(async () => {
         const current = this.roots.get(path.root);
@@ -36901,6 +36940,7 @@ class Controller {
   async ended(sessionID) {
     if (this.stopped)
       return;
+    this.lookups.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path)
       return;
@@ -37382,8 +37422,13 @@ ${record.message}`;
 }
 
 // src/shared/claude_agents.ts
-import { mkdirSync as mkdirSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { closeSync, constants as constants2, fstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
 import { join as join5 } from "path";
+
+// src/shared/protocol.ts
+var SESSION_FACT_MAX = 64;
+
+// src/shared/claude_agents.ts
 var ROOT = "-";
 var LEFTOVER_TTL_MS = 10 * 60000;
 var TOOL_USE_META = "claudecode/toolUseId";
@@ -37391,6 +37436,9 @@ var TOOL_USE_ID = /^toolu_[A-Za-z0-9_]{1,128}$/;
 var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
 var agentsRoot = (base) => join5(base, "claude-agents");
 var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid));
+var FACTS = ["model", "effort"];
+var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
+var validFact = (v) => typeof v === "string" && FACT.test(v);
 var MISSING_TEXT = {
   bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
   no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
@@ -37428,6 +37476,46 @@ function takeRecord(base, claudePid, harnessStart, toolUseId) {
       unlinkSync(taken);
     } catch {}
   }
+}
+function readSmall(path, max) {
+  const fd = openSync(path, constants2.O_RDONLY | constants2.O_NOFOLLOW | constants2.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile())
+      throw new Error("not a regular file");
+    const buf = Buffer.alloc(max);
+    return buf.toString("utf8", 0, readSync(fd, buf, 0, max, 0));
+  } finally {
+    closeSync(fd);
+  }
+}
+function readFacts(base, claudePid, harnessStart, bad) {
+  const dir = sessionDir(base, claudePid);
+  let start;
+  try {
+    start = readFileSync4(join5(dir, "start"), "utf8");
+  } catch {
+    return;
+  }
+  if (harnessStart !== null && start !== "" && start !== harnessStart)
+    return;
+  const out = {};
+  for (const fact of FACTS) {
+    let value;
+    try {
+      value = readSmall(join5(dir, fact), SESSION_FACT_MAX + 1);
+    } catch (e) {
+      if (e.code !== "ENOENT")
+        bad(fact, `couldn't read ${join5(dir, fact)}: ${e.message}`);
+      continue;
+    }
+    if (value === "")
+      out[fact] = null;
+    else if (validFact(value))
+      out[fact] = value;
+    else
+      bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);
+  }
+  return out;
 }
 function takeEnded(base, claudePid) {
   const dir = join5(sessionDir(base, claudePid), "ended");
@@ -37716,7 +37804,14 @@ function createPlugin(o) {
       say(record.message);
     }
   });
-  const client = login && new HostedClient({
+  const badFacts = new Set;
+  const badFact = (fact, error) => {
+    if (badFacts.has(fact))
+      return;
+    badFacts.add(fact);
+    say(`the server gets no ${fact} for this session: ${error}`);
+  };
+  const client = "error" in config || !login ? undefined : new HostedClient({
     harness: HARNESS,
     clientId: CLIENT_ID,
     version: o.version,
@@ -37728,7 +37823,8 @@ function createPlugin(o) {
     roots,
     env: o.env,
     launcher: o.env.BUS_LAUNCHER === "1",
-    log: (message) => say(message)
+    log: (message) => say(message),
+    facts: (sessionID) => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined
   });
   const initializedOr = (signal) => {
     signal.throwIfAborted();

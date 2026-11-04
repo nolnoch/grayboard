@@ -1,11 +1,12 @@
 // The plugin's hook entry (#551), bundled to dist/hook.js and run by bun from
 // hooks/hooks.json: `<event> --data <CLAUDE_PLUGIN_DATA>`, the hook's input on
 // stdin. It writes the record that tells the plugin's MCP server which agent
-// made a grayboard call (src/shared/claude_agents.ts). Exits 0 with no output
+// made a grayboard call, and the root's model and effort (#545)
+// (src/shared/claude_agents.ts). Exits 0 with no output
 // whatever happens: a hook never blocks or alters a call.
 import { runHook } from "../../../src/shared/claude_agents.ts";
 
 const [event, flag, data] = process.argv.slice(2);
 // An unexpanded `${CLAUDE_PLUGIN_DATA}` falls back to the environment's.
 const base = flag === "--data" && data && !data.startsWith("${") ? data : process.env.CLAUDE_PLUGIN_DATA;
-if (event && base) runHook(event, await Bun.stdin.text(), { base, env: process.env, ended: true });
+if (event && base) runHook(event, await Bun.stdin.text(), { base, env: process.env, hosted: true });

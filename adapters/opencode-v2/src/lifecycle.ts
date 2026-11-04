@@ -3,7 +3,7 @@ import { Controller, type Wait } from "./core/controller.js";
 import { failureCode, type DiagnosticSink } from "./core/diagnostics.js";
 import type { HostPort, SessionFacts } from "./core/port.js";
 import { Refusal, render } from "./core/model.js";
-import { resolveRoot } from "./core/sessions.js";
+import { resolveRoot, type SessionPath } from "./core/sessions.js";
 import { NativeWire, type Wire } from "./core/wire.js";
 import { observeEvents } from "./core/events.js";
 import { Approval, type OpenCodeEnrollment } from "./approval.js";
@@ -56,7 +56,8 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   noteModel(sessionID: string, model: { id: string; providerID: string; variant?: string | undefined } | undefined) {
     if (!model?.id || !model.providerID) return;
     this.facts.delete(sessionID);
-    this.facts.set(sessionID, { model: `${model.providerID}/${model.id}`, ...(model.variant ? { effort: model.variant } : {}) });
+    // No variant is the model's default: none, which clears the server's effort (#558).
+    this.facts.set(sessionID, { model: `${model.providerID}/${model.id}`, effort: model.variant || null });
     if (this.facts.size > FACTS_LIMIT) this.facts.delete(this.facts.keys().next().value!);
   }
   private namespace() { return this.options.mcpName.replace(/[^a-zA-Z0-9_-]/g, "_"); }
@@ -78,6 +79,11 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   }
   // A native bind or unbind ran for this session: its server instructions may have changed (#531).
   bindingChanged?: (sessionID: string) => void;
+  // A session was deleted or archived: its cached instructions go (#535).
+  sessionEnded?: (sessionID: string) => void;
+  // A subagent of an enrolled root was created: its instructions fetch starts
+  // now, so its first request needn't wait out registration and connect (#535).
+  childCreated?: (path: SessionPath) => void;
   // An enrolled root's enrollment while it isn't paused; children, unenrolled and
   // paused roots (a drift pauses every root) have none, so no fetch runs on a
   // stale enrollment or starts an ownership a pause ended.
@@ -96,7 +102,12 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     if (this.stopped) return;
     if (type === "session.created") {
       const id = (data as { sessionID?: string })?.sessionID;
-      if (id) await this.configuredBind(id);
+      // Routed now, so a subagent's first request finds its root without a lookup (#535).
+      if (id) {
+        const path = await this.childRoot(id);
+        if (path && this.enrollment(path.root)) this.childCreated?.(path);
+        await this.configuredBind(id);
+      }
     }
     if (type === "credential.switched") {
       const id = (data as { integrationID?: string })?.integrationID;
@@ -104,7 +115,7 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     }
     if (type === "session.deleted" || type === "session.archived") {
       const id = (data as { sessionID?: string })?.sessionID;
-      if (id) await this.ended(id);
+      if (id) { this.sessionEnded?.(id); await this.ended(id); }
     }
   }
   async enrollmentFailure(sessionID: string) {
@@ -115,18 +126,26 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   }
 }
 
-// A root's current server instructions over a native connection that names it,
-// as the root's own wires would (same URL, client and launcher declaration; no
-// delivery declaration, so no lease): one connect and close per fetch.
+// A session's current server instructions over a native connection that names
+// it, as the root's own wires would (same URL and client; no delivery
+// declaration, so no lease): one connect and close per fetch. A root's wire
+// declares a launcher as its own do. A subagent's runs under its root's
+// enrollment, registered first (an unregistered key would start an ownership of
+// its own), and never declares one: a child is never a launcher (#535).
 export function nativeFetcher(controller: OpenCodeController): Fetcher {
   return async (sessionID, signal) => {
-    const e = controller.enrollment(sessionID);
-    if (!e) return;
-    const port = controller.port;
+    let e = controller.enrollment(sessionID), launcher = !!e && !!controller.port.launcher;
+    if (!e) {
+      const path = await controller.childRoot(sessionID);
+      e = path && controller.enrollment(path.root);
+      if (!path || !e) return;
+      await controller.enlist(path, false);
+    }
+    const port = controller.port, enrollment = e;
     let current: string | undefined;
-    const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(port.launcher ? { launcher: true as const } : {}), ...(port.facts ? { facts: (id: string) => port.facts!(id) } : {}) }, {
-      token: async () => (current = await controller.binding.token(e)),
-      onUnauthorized: async () => controller.binding.unauthorized(e, current ?? ""),
+    const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(launcher ? { launcher: true as const } : {}), ...(port.facts ? { facts: (id: string) => port.facts!(id) } : {}) }, {
+      token: async () => (current = await controller.binding.token(enrollment)),
+      onUnauthorized: async () => controller.binding.unauthorized(enrollment, current ?? ""),
     }, signal, sessionID);
     try { await wire.connect(); return wire.instructions(); }
     finally { void wire.close().catch(() => {}); }
@@ -157,16 +176,22 @@ export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = (
   };
   let instructions: RootInstructions | undefined;
   const controller = new OpenCodeController(ctx, options, undefined, undefined, watchRoots(sink, id => instructions?.invalidate(id)));
-  instructions = new RootInstructions(fetcher ?? nativeFetcher(controller), (sessionID, error) => controller.instructionsFailure(sessionID, error));
+  // A subagent's failure lands on its root's record.
+  instructions = new RootInstructions(fetcher ?? nativeFetcher(controller), (sessionID, error, root) => controller.instructionsFailure(root ?? sessionID, error));
   controller.bindingChanged = id => instructions?.invalidate(id);
-  // Every primary request of an enrolled root carries its current instructions; other sessions' go as built.
+  controller.sessionEnded = id => instructions?.forget(id);
+  controller.childCreated = path => { void instructions?.current(path.sessionID, path.root); };
+  // Every primary request of an enrolled root, or of a subagent under one, carries
+  // its current instructions; other sessions' go as built.
   // A rejected hook fails OpenCode's step, so it never rejects.
   const context = await ctx.session.hook("context", async request => {
     try {
       controller.noteModel(request.sessionID, request.model);
-      if (!controller.enrollment(request.sessionID)) { instructions?.forget(request.sessionID); return; }
-      const plan: Plan = await rewrite(request, options.mcpName, id => instructions!.current(id));
-      debug("Grayboard instructions", { root: request.sessionID, plan, text: instructions!.state(request.sessionID) });
+      const enrolled = !!controller.enrollment(request.sessionID);
+      const root = enrolled ? undefined : (await controller.childRoot(request.sessionID))?.root;
+      if (!enrolled && !root) { instructions?.forget(request.sessionID); return; }
+      const plan: Plan = await rewrite(request, options.mcpName, id => instructions!.current(id, root));
+      debug("Grayboard instructions", { [root ? "child" : "root"]: request.sessionID, ...(root ? { root } : {}), plan, text: instructions!.state(request.sessionID) });
     } catch {}
   });
   let restoring: Promise<unknown> = Promise.resolve();

@@ -121,11 +121,11 @@ export default function grayboard(pi: ExtensionAPI) {
     },
     // Like `record`: between omp's switch and session_switch, ctx already
     // shows the next session's model, so only the session it names answers.
-    // omp's `inherit` names no level of its own: none is sent.
+    // omp's `inherit` names no level of its own: it's none, and clears the server's (#558).
     facts: sessionID => {
       if (ctx?.sessionManager.getSessionId() !== sessionID) return undefined;
       const effort = pi.getThinkingLevel();
-      return { ...(ctx.model ? { model: modelName(ctx.model) } : {}), ...(effort && effort !== "inherit" ? { effort } : {}) };
+      return { model: ctx.model ? modelName(ctx.model) : null, effort: effort && effort !== "inherit" ? effort : null };
     },
   });
 

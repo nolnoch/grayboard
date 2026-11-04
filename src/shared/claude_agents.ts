@@ -13,15 +13,29 @@
 //   <tool_use_id>         a record: the agent id, or ROOT
 //   <id>.taken.<pid>      a record a reader claimed (rename is the atomic take)
 //   ended/<name>          hosted only: an agent id whose SubagentStop ran
+//   model, effort         hosted only: the root session's latest model and
+//                         effort (#545), each written whole by one hook event
 //
-// Records are harness-asserted, in a same-user directory. A forged one can only
-// attribute a call to a child of the same root (docs/boards.md §3).
+// Records and facts are harness-asserted, in a same-user directory. A forged
+// record can only attribute a call to a child of the same root (docs/boards.md
+// §3). Any same-user process can write any session's facts, so a forged fact
+// misreports that session's display model or effort: facts grant nothing, and
+// it is the records' boundary and #229's.
+//
+// Facts (#545, measured on Claude Code 2.1.316): SessionStart's `model` and
+// PostModelSwitch's `to_model` (after the user confirms a switch; PreModelSwitch
+// runs before that dialog) are the model, a full ID (`claude-opus-5-5`;
+// `to_model` is the ID as given to /model); the root's grayboard PreToolUse
+// `effort.level` is the effort, absent on a model without one, so that call and
+// a model switch remove the effort file. SessionStart carries no effort. No
+// payload names a subagent's model, so a child session reports none.
 //
 // Imports nothing heavy: the local hook entry (src/cli/main.ts) loads this
 // module alone, so a hook costs a process start and a few file operations.
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { procStart, procStarts } from "./proc.ts";
+import { SESSION_FACT_MAX } from "./protocol.ts";
 import { validSourceId } from "./session_meta.ts";
 
 /** A main-agent call's record. */
@@ -44,8 +58,29 @@ export const validToolUseId = (id: unknown): id is string => typeof id === "stri
 export const agentsRoot = (base: string) => join(base, "claude-agents");
 export const sessionDir = (base: string, claudePid: number) => join(agentsRoot(base), String(claudePid));
 
-export type HookEvent = "session-start" | "pre-tool-use" | "subagent-stop" | "session-end";
-export const HOOK_EVENTS: readonly HookEvent[] = ["session-start", "pre-tool-use", "subagent-stop", "session-end"];
+/** The root's facts, one file each. */
+export const FACTS = ["model", "effort"] as const;
+export type Fact = (typeof FACTS)[number];
+// A model id or effort level: printable ASCII without spaces, as Claude Code's
+// are (`claude-opus-5-5`, `claude-opus-5-5[1m]`, `high`), no longer than the
+// server keeps, so what it shows is what the hook wrote.
+const FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
+export const validFact = (v: unknown): v is string => typeof v === "string" && FACT.test(v);
+
+// Writes a fact Claude Code reported; a malformed one writes nothing.
+function putFact(dir: string, fact: Fact, value: unknown) {
+  if (!validFact(value)) return;
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  put(join(dir, fact), value);
+}
+
+// Unknown: the reader sends nothing, so the server keeps its last value.
+const dropFact = (dir: string, fact: Fact) => rmSync(join(dir, fact), { force: true });
+// None (an empty file): the reader sends a clear (#558).
+function noFact(dir: string, fact: Fact) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  put(join(dir, fact), "");
+}
 
 // Write through a temporary name, so a reader never sees a partial file.
 function put(path: string, text: string) {
@@ -61,9 +96,10 @@ function ageMs(path: string, now: number): number | undefined {
 /**
  * One hook event. Never throws and prints nothing: a hook must never block or
  * alter a call; a record it failed to write surfaces as the reader's
- * missing-record error. `ended` (hosted only) writes SubagentStop's marker.
+ * missing-record error. `hosted` (the plugin's hook) also writes SubagentStop's
+ * marker and the root's facts, which only the hosted plugin reads.
  */
-export function runHook(event: string, stdin: string, o: { base: string; env: Record<string, string | undefined>; ended: boolean; now?: number }): void {
+export function runHook(event: string, stdin: string, o: { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number }): void {
   try {
     const pid = Number(o.env.CLAUDE_PID);
     if (!Number.isSafeInteger(pid) || pid <= 1) return;
@@ -76,6 +112,12 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       // An unreadable start time is recorded empty: the reader then can't tell a
       // recycled pid, and treats the dir as its harness's (proc.ts's rule).
       put(join(dir, "start"), start ?? "");
+      if (o.hosted) {
+        // A new process starts with no facts, even in a dir an earlier holder of
+        // this pid left; a /clear keeps its process's effort.
+        if (input.source !== "clear") for (const fact of FACTS) dropFact(dir, fact);
+        putFact(dir, "model", input.model);
+      }
       pruneSessions(o.base, pid);
     } else if (event === "pre-tool-use") {
       const id = input.tool_use_id;
@@ -86,8 +128,22 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       put(join(dir, id), content);
       pruneRecords(dir, now);
+      // The root's effort, which the call this record names carries. None means
+      // the model has no effort level: an empty file, which the reader sends as
+      // a clear (#558); a removed file is only "unknown" and keeps the server's.
+      if (o.hosted && content === ROOT) {
+        const level = (input.effort as { level?: unknown } | undefined)?.level;
+        if (level === undefined) noFact(dir, "effort");
+        else putFact(dir, "effort", level);
+      }
+    } else if (event === "model-switch") {
+      // The new model's effort shows at the root's next grayboard call.
+      if (o.hosted && validFact(input.to_model)) {
+        putFact(dir, "model", input.to_model);
+        dropFact(dir, "effort");
+      }
     } else if (event === "subagent-stop") {
-      if (!o.ended) return;
+      if (!o.hosted) return;
       const agent = input.agent_id;
       if (!validSourceId(agent) || agent === ROOT) return;
       const ended = join(dir, "ended");
@@ -185,6 +241,45 @@ export function takeRecord(base: string, claudePid: number, harnessStart: string
   } finally {
     try { unlinkSync(taken); } catch { /* pruned by the hook's next write */ }
   }
+}
+
+// At most `max` bytes of a regular file, never following a link or waiting on a
+// FIFO: a fact file is read on every hosted request, so a same-user process that
+// swaps one for `/dev/zero` or a pipe must not stall or flood the server.
+function readSmall(path: string, max: number): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error("not a regular file");
+    const buf = Buffer.alloc(max);
+    return buf.toString("utf8", 0, readSync(fd, buf, 0, max, 0));
+  } finally { closeSync(fd); }
+}
+
+/**
+ * The root's latest facts in `claudePid`'s dir, read whole per request: none
+ * without a SessionStart record or for a recycled pid's dir, and only the
+ * facts a hook wrote: an empty file is `null` (the host has none, #558), a
+ * missing one is left out (unknown). A fact file that can't be read or isn't
+ * one is left out and passed to `bad` (the caller says it), so the other fact
+ * still goes.
+ */
+export function readFacts(base: string, claudePid: number, harnessStart: string | null, bad: (fact: Fact, error: string) => void): { model?: string | null; effort?: string | null } | undefined {
+  const dir = sessionDir(base, claudePid);
+  let start: string;
+  try { start = readFileSync(join(dir, "start"), "utf8"); } catch { return undefined; }
+  if (harnessStart !== null && start !== "" && start !== harnessStart) return undefined;
+  const out: { model?: string | null; effort?: string | null } = {};
+  for (const fact of FACTS) {
+    let value: string;
+    try { value = readSmall(join(dir, fact), SESSION_FACT_MAX + 1); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") bad(fact, `couldn't read ${join(dir, fact)}: ${(e as Error).message}`);
+      continue;
+    }
+    if (value === "") out[fact] = null;
+    else if (validFact(value)) out[fact] = value;
+    else bad(fact, `${join(dir, fact)} isn't a Claude Code ${fact}`);
+  }
+  return out;
 }
 
 /** The agent ids whose SubagentStop ran since the last call, each consumed once. */

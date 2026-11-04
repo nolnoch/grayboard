@@ -12,14 +12,13 @@ import { METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
-import { fixture } from "./native-fixture.js";
+import { fixture, until } from "./native-fixture.js";
 import { FailedContinuation } from "./failed-continuation.js";
 import { observeRuns } from "./subscriber-work.js";
 import { barrier, bounded } from "./reload-state.js";
 import { afterProducers } from "./causal.js";
 
 type Row = { held: string[]; ownership: number; generation: number; capability?: string };
-async function until(check: () => boolean) { for (let i = 0; i < 200; i++) { if (check()) return; await Bun.sleep(5); } throw new Error("condition timed out"); }
 function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: number, signal: AbortSignal) => Promise<void>) {
   const f = fixture(), rows = new Map<string, Row>(), nodes = new Map<string, { id: string; parentID?: string; time: { archived?: number }; metadata: Record<string, unknown> }>();
   const storage = new Map<string, unknown>(), calls: { sessionID: string; name: string; args: Record<string, unknown> }[] = [], admissions: { sessionID: string; id: string; resume: boolean }[] = [];

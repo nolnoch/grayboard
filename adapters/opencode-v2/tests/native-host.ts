@@ -210,7 +210,9 @@ try {
   await invoke(grandchild.id, "ordinary-child");
   const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id);
   assert(registration); assert.equal(registration.session, a.id); assert.deepEqual(registration.args.via, [child.id]); assert.equal(children.get(grandchild.id), a.id);
-  assert.equal(children.has(child.id), false, "via ancestry never implicitly registers an intermediate");
+  // #535: the intermediate registers on its own, for its own instructions; via never registers it (server suite).
+  await wait(async () => children.get(child.id), root => root === a.id, "subagent registered for its instructions");
+  assert(calls.some(c => c.name === "session_register" && c.args.child === child.id), "the intermediate registered through its own session_register");
   await invoke(child.id, "ordinary-child"); assert.equal(children.get(child.id), a.id);
   await invoke(grandchild.id, "refused-child-control");
   assert.equal(state(grandchild.id).ownership, null, "child bind is refused, not inherited as a successful root bind");

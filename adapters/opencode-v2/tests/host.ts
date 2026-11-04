@@ -353,6 +353,17 @@ try {
     text = said(lead.id);
     assert(text.includes(boundAs("lead")) && text.includes(channel) && text.includes(launcher) && !text.includes(unbound), "Configured launcher root sees its bound and launcher text");
     console.log("REAL_INSTRUCTIONS_CONFIGURED_LAUNCHER_OK");
+    // #535: a subagent of the launcher root gets the server's child text from its first request: it writes
+    // as the root, and is neither unbound nor a launcher.
+    const sub = await host.session.create({ location, parentID: lead.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+    await invoke(sub.id, "whoami", {});
+    const first = modelRequests.find(r => r.sessionID === sub.id);
+    assert(first, "a model request for the subagent");
+    const subText = (() => { const strings: string[] = [], walk = (v: unknown): void => { if (typeof v === "string") strings.push(v); else if (v && typeof v === "object") Object.values(v).forEach(walk); }; walk(JSON.parse(first.body)); return strings.join("\n"); })();
+    assert(subText.includes(`You are a subagent acting as "you@example.com/lead" on grayboard`), "The subagent's first request carries the server's child text");
+    assert(!subText.includes(unbound) && !subText.includes(launcher) && !subText.includes(boundAs("lead")), "A subagent's request carries neither the unbound, the launcher nor the root's text");
+    assert.equal(row(sub.id)?.root_session_id, row(lead.id)?.session_id, "The subagent registered under its root");
+    console.log("REAL_INSTRUCTIONS_SUBAGENT_OK");
     // No launcher option: bound and pushed, no launcher lines.
     pluginOptions = {};
     await restart();
@@ -402,7 +413,11 @@ try {
   const child = await host.session.create({ location, parentID: a.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   const grandchild = await host.session.create({ location, parentID: child.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   await invoke(grandchild.id, "dm_send", { to: "fe", body: "Nested child inherits A" });
-  assert.equal(row(grandchild.id)?.root_session_id, row(a.id)?.session_id); assert.equal(row(child.id), null, "via ancestry is not registration authority");
+  assert.equal(row(grandchild.id)?.root_session_id, row(a.id)?.session_id); 
+  // #535: the intermediate registers on its own, for its own instructions, through its own session_register; via never
+  // registers it (the server suite's "via ancestry is not registration or attachment mapping authority").
+  await wait(() => row(child.id)?.root_session_id, id => id === row(a.id)?.session_id, "subagent registered for its instructions");
+  assert(calls.some(c => c.name === "session_register" && c.args.child === child.id), "the intermediate registered through its own session_register");
   assert.match(row(a.id)!.session_id, SESSION_ID); assert.match(row(grandchild.id)!.session_id, SESSION_ID);
   assert.equal((app.db.prepare("SELECT sender_id FROM messages WHERE body = ?").get("Nested child inherits A") as { sender_id: string }).sender_id, row(grandchild.id)!.session_id);
   const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id); assert.deepEqual(registration?.args.via, [child.id]);
@@ -411,7 +426,6 @@ try {
   const attachmentGrant = await ctx.integration.connection.resolve(selected); assert(attachmentGrant?.type === "oauth");
   const attachment = (method: string, path: string, raw?: string) => fetch(resource + "/attachments" + path, { method, headers: { Authorization: "Bearer " + attachmentGrant.access, ...(raw ? { "X-Grayboard-Session": encodeURIComponent(raw) } : {}), ...(method === "POST" ? { "Content-Length": String(new TextEncoder().encode("Native child attachment fixture").length) } : {}) }, ...(method === "POST" ? { body: "Native child attachment fixture" } : {}) });
   assert.equal((await attachment("POST", "?filename=fixture.txt")).status, 403);
-  assert.equal((await attachment("POST", "?filename=fixture.txt", child.id)).status, 403, "via is not attachment mapping authority");
   assert.equal((await attachment("POST", "?filename=fixture.txt&identity=fe", grandchild.id)).status, 403);
   const upload = await attachment("POST", "?filename=fixture.txt", grandchild.id); assert.equal(upload.status, 201);
   const file = await upload.json() as { id: number };
