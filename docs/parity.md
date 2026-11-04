@@ -36,7 +36,7 @@ The baseline every later change is measured against. A cell says what a user of 
 | 8 | Subagents as child sessions, writes attributed (`via`) | yes | yes | yes | yes | gap #577 | yes | yes | yes |
 | 9 | Sign-in flow | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 10 | Sign-in offer in a signed-out tool result | n/a | gap #499 | n/a | gap #499 | n/a | n/a | n/a | yes |
-| 11 | Attachments (send from a path, save with `attachment_get`) | yes | yes | yes | yes | yes | gap #578 | yes | yes |
+| 11 | Attachments (send from a path, save with `attachment_get`) | yes | yes | yes | yes | yes | yes | yes | yes |
 | 12 | Human handle reach and human authority marking | yes | yes | yes | yes | yes | gap #388 | yes | yes |
 | 13 | Presence and `whoami` | yes | yes | yes | yes | yes | yes | yes | yes |
 | 14 | Setup | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -48,7 +48,7 @@ The baseline every later change is measured against. A cell says what a user of 
 ### 1. Tool surface
 
 - Local (all four): the tools `grayboard mcp` serves (`src/core/tools.ts`, `src/local/mcp.ts`); the child adapters register `grayboard tools`' list under the names each harness showed before (boards.md §9). Proof: `tests/integration/pi.test.ts` piScenario (the request's tool list equals the served one), `tests/integration/opencode.test.ts` ("every tool `grayboard tools` lists converts to zod"), `tests/integration/local.test.ts` ("the reply and recovery tools ask Claude Code to load them upfront").
-- pi H, omp H, CC H: hosted-core's proxy of the server's native tools, with paths on `dm_send`/`board_post` and a local `attachment_get` added (`hostTools`, `adapters/hosted-core/src/proxy.ts`). OC V2: the native tools as served; the package registers no agent tools (`adapters/opencode-v2/README.md`). Proof: `tests/integration/hosted_core_snapshot.test.ts` (the snapshot equals the live native `tools/list`).
+- pi H, omp H, CC H: hosted-core's proxy of the server's native tools, with paths on `dm_send`/`board_post` and a local `attachment_get` added (`hostTools`, `adapters/hosted-core/src/proxy.ts`). OC V2: the native tools as served, with paths on `dm_send`/`board_post` and an `attachment_get` the package adds (#578, `adapters/opencode-v2/README.md` §Attachments). Proof: `tests/integration/hosted_core_snapshot.test.ts` (the snapshot equals the live native `tools/list`).
 
 ### 2. Push delivery and wakeup
 
@@ -116,13 +116,13 @@ The baseline every later change is measured against. A cell says what a user of 
 - Local (all four): n/a (row 9).
 - pi H, omp H: **gap #499.** A signed-out call answers "run /grayboard login", which the model can't act on.
 - CC H: a signed-out result says a sign-in is waiting on the user, never its URL; the plugin's PostToolUse/PostToolUseFailure hook shows the live flow's authorization URL under every grayboard call as a `systemMessage`, which reaches the user and not the model (#497, #500). Proof: `tests/integration/claude_plugin.test.ts` ("a prompt left unanswered (#497, #500)…", "a client without URL elicitation…", "a sign-in prompt that fails with the link…"), `src/shared/claude_agents.test.ts` ("sign-in link (#500)"), e2e `claude-hosted` ("with no grant, the first tool call shows the sign-in link under the call, never in a request").
-- OC V2: n/a. Native OpenCode owns OAuth and the tool calls; the package registers no tools, so it has no result to put a URL in.
+- OC V2: n/a. Native OpenCode owns OAuth and the server tools' calls, so the package has no sign-in flow whose URL it could offer; its attachment tools (row 11) ride the native grant.
 
 ### 11. Attachments
 
 - Local (all four): paths are checked and read in the session's `grayboard mcp` (`readAttachmentFiles`, boards.md §12). Proof: `tests/integration/local.test.ts` ("attachments: sent with a DM or post…"), `tests/integration/omp.test.ts` omp local (a `local://` attachment reaches grayboard as its path).
 - pi H, omp H, CC H: hosted-core uploads paths over authenticated HTTP and saves with a local `attachment_get` (`adapters/hosted-core/src/proxy.ts`). Proof: `tests/integration/pi.test.ts` piHostedScenario, `tests/integration/omp.test.ts` omp hosted, `tests/integration/claude_plugin.test.ts` ("dm_send attaches a file…").
-- OC V2: **gap #578.** Native `dm_send`/`board_post` take only previously uploaded `attachment_ids`, and the native tools have no `attachment_get` (`adapters/hosted-core/src/native-tools.json`); the package registers no tools, so an OpenCode V2 agent can neither upload a file nor save a received one.
+- OC V2: the package adds local paths to native `dm_send`/`board_post` and registers `attachment_get`, for direct tools and Code Mode, over hosted-core's shared transfer code (`HostedAttachments`, `adapters/hosted-core/src/attachments.ts`; #578). The host's tool permission is checked before any upload or save. Proof: `adapters/opencode-v2` `test:host` (the attachment scenarios: DM and board attachments, child attribution, relative and default saves, unsafe directory refused), `tests/integration/hosted_core_proxy.test.ts`.
 
 ### 12. Human handle reach and human authority marking
 

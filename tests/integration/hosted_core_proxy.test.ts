@@ -356,6 +356,29 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
   expect(sender.reports).toEqual([]);
 });
 
+test("attachment_get cancels an oversized download before saving it", async () => {
+  await srv.stop();
+  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
+  const alice = issue(), p = proxy({ token: async () => alice.token });
+  await p.call("bind", { name: "download-cap", create: true }, "pi-cap");
+  writeFileSync(join(dir, "small.txt"), "small file");
+  const sent = JSON.parse(textOf(await p.call("dm_send", { to: "download-cap", body: "file", attachments: [join(dir, "small.txt")] }, "pi-cap"))) as { attachments: { id: number }[] };
+  const id = sent.attachments[0]!.id, fetch0 = globalThis.fetch;
+  let cancelled = false;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await fetch0(input, init);
+    if (init?.method !== "GET" || !String(input).includes("/attachments/")) return response;
+    return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(17)); }, cancel() { cancelled = true; } }), { headers: response.headers });
+  }) as typeof fetch;
+  try {
+    const result = await p.call("attachment_get", { id, dir }, "pi-cap");
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("exceeds the 16B limit per file");
+    expect(cancelled).toBe(true);
+    expect(readdirSync(dir)).toEqual(["small.txt"]);
+  } finally { globalThis.fetch = fetch0; }
+});
+
 test("uploads are checked against the server's published caps; a server that publishes none gets the defaults", async () => {
   await srv.stop();
   srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
