@@ -35,7 +35,7 @@ The baseline every later change is measured against. A cell says what a user of 
 | 7 | Automatic restart after the grayboard process exits | yes | n/a | yes | n/a | gap #576 | n/a | n/a | n/a |
 | 8 | Subagents as child sessions, writes attributed (`via`) | yes | yes | yes | yes | gap #577 | yes | yes | yes |
 | 9 | Sign-in flow | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
-| 10 | Sign-in offer in a signed-out tool result | n/a | gap #499 | n/a | gap #499 | n/a | n/a | n/a | yes |
+| 10 | Sign-in offer in a signed-out tool result | n/a | yes | n/a | yes | n/a | n/a | n/a | yes |
 | 11 | Attachments (send from a path, save with `attachment_get`) | yes | yes | yes | yes | yes | yes | yes | yes |
 | 12 | Human handle reach and human authority marking | yes | yes | yes | yes | yes | gap #388 | yes | yes |
 | 13 | Presence and `whoami` | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -114,7 +114,7 @@ The baseline every later change is measured against. A cell says what a user of 
 ### 10. Sign-in offer in a signed-out tool result
 
 - Local (all four): n/a (row 9).
-- pi H, omp H: **gap #499.** A signed-out call answers "run /grayboard login", which the model can't act on.
+- pi H, omp H: an interactive or RPC session's signed-out call starts the process's one sign-in flow (no browser) and shows its URL on the notice line; the result tells the model to ask the user to open it and never carries the URL (#500). `/grayboard login` joins that flow and opens the browser; `-p` and json mode never offer (#499). Proof: `tests/support/pi.ts` `expectSignInOffer`, run by `tests/integration/pi.test.ts` ("pi hosted: two processes with an expired token…") and `tests/integration/omp.test.ts` ("omp hosted: two processes on one agent dir…").
 - CC H: every signed-out result carries the live flow's authorization URL (#497). Proof: `tests/integration/claude_plugin.test.ts` ("a prompt left unanswered (#497)…", "a client without URL elicitation gets the sign-in URL…"), e2e `claude-hosted` ("with no grant, the first tool call's result carries the sign-in link").
 - OC V2: n/a. Native OpenCode owns OAuth and the server tools' calls, so the package has no sign-in flow whose URL it could offer; its attachment tools (row 11) ride the native grant.
 
@@ -158,7 +158,7 @@ The baseline every later change is measured against. A cell says what a user of 
 - #559 items 2–6: omp L robustness edges (no abort or timeout while a call waits for the process, wrapper scripts not recognised, ACP with on-disk MCP config, advisor calls, Windows).
 - #566: hosted child rows are never idle-swept, so an OC V2 launcher root degrades after about 128 subagents (`MAX_CHILDREN`) in one ownership. A capacity limit; pi H and omp H end each child with its run (`tests/integration/pi_family.test.ts`, `tests/integration/omp.test.ts` 130-subagent cases).
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
-- #500: CC H's sign-in URL in tool results opens a prompt-injection login CSRF; #499 should land on #500's fix.
+- #500: CC H's sign-in URL in tool results opens a prompt-injection login CSRF. pi H and omp H keep the URL out of results (#499), since their notice line reaches the user; CC H has no such line, so its fix is #500's own.
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
 - #474: on a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus.
 - #427: pi's `pi update --extensions` doesn't refresh the loose-file adapter; only `grayboard update` does.
