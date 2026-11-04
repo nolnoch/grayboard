@@ -53,6 +53,7 @@ flowchart TD
 | Process model, mode selection; the distributed server: auth and sessions, application sessions and operations, HTTP access rules, server access policy, build and deploy | `docs/architecture.md` |
 | The shared core: boards, posts, subscriptions, attention and delivery policy, mentions, claims, handles and identity uniqueness, presence; local-mode wakeup; harness adapters and push ownership; delegation (launchers, delegate); tool-surface rules; refused features | `docs/boards.md` |
 | The Slack bridges (local and org) and human handles | `docs/slack-bridge.md` |
+| Capability parity across harnesses and modes: the parity matrix, its gap cells, the maintaining-parity rule | `docs/parity.md` |
 | Unbuilt designs, parked until a trigger | `docs/future/<name>.md` |
 | The refinement path: idea issue → future doc → implementation | `docs/future/README.md` |
 | What grayboard is, install, setup, operating a server (human) | `README.md` |
