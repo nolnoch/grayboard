@@ -11,6 +11,7 @@ import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
+import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";
 
 let dir: string, now: number;
@@ -70,7 +71,7 @@ for (const revokeFirst of [false, true]) test(`forced attachment/revoke transact
     expect(releases()).toEqual([]);
   } else {
     expect(results.every(result => result.ok)).toBe(true);
-    expect(database.repo.hosted.all()).toEqual([]);
+    expect(hostedRowCount(database.db)).toBe(0);
     expect(releases()).toEqual([{ detail: "revoked" }]);
   }
 }, 15_000);
@@ -80,7 +81,7 @@ test("forced root registration/end overlap cannot leave an orphan child", async 
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const results = await overlap({ operation: "register", principal, child: "child" }, { operation: "end", principal }, "hosted:register:in-txn");
   expect(results.every(result => result.ok)).toBe(true);
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toHaveLength(1);
 }, 15_000);
 
@@ -148,7 +149,7 @@ test("registration before bind/open preserves the graph and never extends a stic
   expect(database.repo.hosted.all()).toHaveLength(3);
   now = lease.expiresAt + 1;
   hosted.sweep();
-  expect(database.repo.hosted.all()).toHaveLength(0);
+  expect(hostedRowCount(database.db)).toBe(0);
 });
 
 test("a registration that arrives while its root rebinds waits for the bind and lands under the same ownership", async () => {
@@ -190,7 +191,7 @@ test("successful new and idempotent registration refresh activity but refusals d
   await hosted.end(p, context(p, "blocked"));
   now = active + 900_001;
   hosted.sweep();
-  expect(database.repo.hosted.all()).toHaveLength(0);
+  expect(hostedRowCount(database.db)).toBe(0);
 });
 
 for (const operation of ["revoke", "bind"] as const) {
@@ -252,7 +253,7 @@ test("two restarts retain ownership and deadline; downtime is credited; expiry r
   expect(database.repo.hosted.all()).toHaveLength(2);
   // ...but time while the server is up does.
   now += 31_000; hosted.sweep();
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "expired" }]);
   close(); open();
   expect(releases()).toEqual([{ detail: "expired" }]);
@@ -264,7 +265,7 @@ test("G2 ordinary writes do not attach, G1 revoke releases atomically including 
   await hosted.register(first.principal, context(first.principal), "child");
   await hosted.run(second.principal, context(second.principal), "peer_status", () => true);
   database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "revoked" }]);
   expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
   await hosted.bind(second.principal, context(second.principal), { name: "fe" });
@@ -285,7 +286,7 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("primary", "you@example.com/fe");
   expect(releases()).toEqual([]);
   database.repo.users.setDisabled(second.authed.user_id, true);
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "disabled" }]);
   expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
 });
@@ -299,7 +300,7 @@ test("opening a pre-hosted SQLite schema adds tables without changing users, mes
   expect(database.repo.aliases.listForScope("person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
   expect(database.repo.oauth.isGrantActive(first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
-  expect(database.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(database.db)).toBe(0);
   await hosted.bind(first.principal, context(first.principal), { name: "fe" });
   expect(await hosted.whoami(first.principal, context(first.principal))).toHaveProperty("primary", "you@example.com/fe");
 });

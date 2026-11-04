@@ -28,6 +28,7 @@ import { direct } from "../support/events.ts";
 import { ROOT } from "../support/paths.ts";
 import { keep } from "../support/run_dir.ts";
 import { until } from "../support/until.ts";
+import { hostedRowCount } from "../support/hosted_rows.ts";
 
 const SOURCE = "plugin:grayboard:grayboard";
 const TOOL = (name: string) => `mcp__plugin_grayboard_grayboard__${name}`;
@@ -223,7 +224,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call sho
     const debug = () => readFileSync(join(signedOut, "debug.log"), "utf8");
     await until(() => debug().includes("Received elicitation request: "), 10_000, "Claude Code to show the sign-in prompt");
     expect(await browse(srv.issuer, url, "Claude Code")).toContain("Signed in to grayboard");
-    const hosted = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n;
+    const hosted = () => hostedRowCount(srv.app.db);
     await until(() => hosted() > 0, 30_000, "the signed-in plugin to open its hosted session");
     // The plugin completes the prompt at the flow's end. 2.1.316 keeps the URL
     // prompt up after that (the user dismisses it with Esc, README); typing

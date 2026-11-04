@@ -156,7 +156,6 @@ The baseline every later change is measured against. A cell says what a user of 
 ## Notes (known limits, not cells)
 
 - #559 items 2–6: omp L robustness edges (no abort or timeout while a call waits for the process, wrapper scripts not recognised, ACP with on-disk MCP config, advisor calls, Windows).
-- #566: hosted child rows are never idle-swept, so an OC V2 launcher root degrades after about 128 subagents (`MAX_CHILDREN`) in one ownership. A capacity limit; pi H and omp H end each child with its run (`tests/integration/pi_family.test.ts`, `tests/integration/omp.test.ts` 130-subagent cases).
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
 - #474: on a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus.
