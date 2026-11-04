@@ -22,14 +22,16 @@ export const transactionScenarios = ["pending-gate", "bind-commit", "register-tx
 // A plugin request host.ts's fetch shim forwarded: its JSON-RPC method (a new connection's `server/discover`
 // included; the HTTP method for one without a body), a tool call, or an inbox read with its answer.
 export type SeenMethod = { method: string; subscriber: boolean };
-export type SeenCall = { name: string; session: string; subscriber: boolean; args: Record<string, unknown> };
+export type SeenCall = { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null };
+// A delivery lease the plugin opened, from delivery_open's answer.
+export type SeenOpen = { capability: string; ownership: number; bind_gen: number };
 export type SeenRead = { uri: string; lease: string | null; text?: string };
 
 export interface TransactionRace {
   scenario: string; boundary: "before" | "after";
   host: FixtureHost; location: { directory: string };
   server: RealServer; db: Database; dbPath: string; blobDir: string; pauses: string; resource: string;
-  calls: SeenCall[]; methods: SeenMethod[]; reads: SeenRead[]; admissions: NativeInput[];
+  calls: SeenCall[]; methods: SeenMethod[]; reads: SeenRead[]; admissions: NativeInput[]; opens: SeenOpen[];
   access(): Promise<string>;
   invoke(sessionID: string, tool: string, args: Record<string, unknown>): Promise<void>;
   enroll(sessionID: string, name: string): Promise<unknown>;
@@ -106,8 +108,9 @@ export async function transactionRace(f: TransactionRace) {
       case "bind-commit": {
         // A DM sent while the binder is at hosted:bind:after-commit (§7): the new hold is published, the old
         // hold is kept (#451), so the DM is queued for the old name and reaches the root once, under the lease
-        // the plugin reopens after the bind; nothing consumes it in the window.
-        const before = row(root)!;
+        // the plugin reopens after the bind: every receipt sent since the bind began carries that lease's
+        // capability, so nothing consumed it in the window under the old one.
+        const before = row(root)!, mark = f.calls.length;
         const held = await server.pause("hosted:bind:after-commit");
         const binding = f.invoke(root, "bind", { name: "be", create: true });
         await held.hit();
@@ -115,38 +118,50 @@ export async function transactionRace(f: TransactionRace) {
         await oob.ok(sender, "dm_send", { to: "race", body: "Transaction race after commit" });
         const dm = message("Transaction race after commit")!;
         assert.equal(dm.recipient, RACE, "Queued for the old name");
-        assert.equal(cursor(RACE), 0, "Nothing consumes it while the binder holds the gate");
         held.release();
         await bounded(binding, 30_000, "The native bind completes");
         await until(() => cursor(RACE) === dm.id, "The DM reaches the root under the reopened lease", 30_000);
         const admitted = f.admissions.filter(a => a.sessionID === root && a.text.includes("Transaction race after commit"));
         assert(admitted.length >= 1 && admitted.every(a => a.id === admitted[0]!.id), "Admitted to the root under one stable id");
         assert.equal(row(root)!.bind_gen, before.bind_gen + 1);
+        const reopened = new Set(f.opens.filter(o => o.bind_gen === before.bind_gen + 1).map(o => o.capability));
+        const receipts = f.calls.slice(mark).filter(c => c.name === "delivery_receipt" && c.session === root);
+        assert(receipts.length >= 1 && receipts.every(c => c.cap !== null && reopened.has(c.cap)), "Every receipt since the bind is under the reopened lease: " + JSON.stringify(receipts.map(c => c.cap)));
         console.log("REAL_TXN_BIND_COMMIT_OK", JSON.stringify({ message: dm.id, admissions: admitted.length }));
         break;
       }
       case "register-txn": {
-        // A registration held at hosted:register:in-txn while the root binds, and the reverse (§7): the second
-        // waits for the first, and both land, in that order. Held in its transaction, the first holds the whole
-        // server, so the second is sent and waits. The plugin registers a child over a new connection, so in the
-        // reverse the registration's first request is that connection's `server/discover`.
+        // A registration and the root's bind, each arriving while the other holds the root's gate (§7): the
+        // second waits at the gate (the bindgate:wait trace; every hosted request first snapshots its root as a
+        // gate reader, so it waits there) and both land, in that order. The first is held at its async boundary
+        // just inside the gate, so the server keeps serving and only the gate can make the second wait.
         const child = await create("Transaction race child", root);
         const body = "Transaction race child write";
         let first: { hit(ms?: number): Promise<void>; release(): void }, binding: Promise<ToolResult>, childCall: Promise<void>;
+        const { bind_gen: gen, ownership_id: ownership } = row(root)!;
         if (f.boundary === "before") {
-          first = await server.pause("hosted:register:in-txn");
+          first = await server.pause("hosted:register:before-txn");
           childCall = f.invoke(child, "dm_send", { to: "sender", body });
           await first.hit();
-          const mark = f.calls.length;
+          const waiting = await server.trace("bindgate:wait");
+          let settled = false;
           binding = oob.ok(root, "bind", { name: "be", create: true });
-          await until(() => f.calls.slice(mark).some(c => c.name === "bind" && c.session === root), "The root's bind is sent while the registration is held");
+          binding.then(() => { settled = true; }, () => { settled = true; });
+          await waiting.hit();
+          assert(!settled, "The root's bind is waiting at the gate");
+          assert.equal(row(root)!.bind_gen, gen, "The waiting bind moves no bind_gen");
         } else {
-          first = await server.pause("hosted:bind:in-txn");
+          const mark = f.calls.length;
+          first = await server.pause("hosted:owning:before-txn");
           binding = oob.ok(root, "bind", { name: "be", create: true });
           await first.hit();
-          const mark = f.methods.length;
+          assert(!f.calls.slice(mark).some(c => c.name === "delivery_open"), "The held owning call is the root's bind, not a plugin open");
+          const waiting = await server.trace("bindgate:wait");
           childCall = f.invoke(child, "dm_send", { to: "sender", body });
-          await until(() => f.methods.slice(mark).some(m => m.method === "server/discover"), "The child's registration connects while the bind is held");
+          // The plugin registers a new child as soon as it sees it, so the registration may already be on its
+          // way when the child's call is made; either way it is sent after the held bind.
+          await until(() => f.calls.slice(mark).some(c => c.name === "session_register" && c.session === root), "The child's registration is sent while the bind is held");
+          await waiting.hit();
         }
         assert.equal(row(child), null, "Nothing registered while the first is held");
         first.release();
@@ -154,6 +169,7 @@ export async function transactionRace(f: TransactionRace) {
         const r = row(root)!, c = row(child)!;
         assert.equal(c.root_session_id, r.session_id, "The child is registered directly under the root");
         assert.deepEqual(r.held, ["race", "be"]);
+        assert.deepEqual([r.ownership_id, r.bind_gen], [ownership, gen + 1], "One rebind of the same ownership; the registration was not refused by it");
         const registered = auditOf("hosted.child_registered", r.session_id, d => d.source_session_id === child), rebound = auditOf("hosted.lease_closed", r.session_id, d => d.reason === "rebound");
         assert.equal(registered.length, 1); assert.equal(rebound.length, 1);
         if (f.boundary === "before") assert(registered[0]!.id < rebound[0]!.id, "The bind committed after the registration it waited for");

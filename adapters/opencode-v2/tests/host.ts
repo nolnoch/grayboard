@@ -378,7 +378,7 @@ try {
   } else if (realServer) {
     const db = new Database(config.dbPath); db.run("PRAGMA busy_timeout = 5000");
     try {
-      await transactionRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE!, boundary: raceGate.boundary, host, location, server: realServer, db, dbPath: config.dbPath, blobDir: config.blobDir, pauses: join(root, "pauses"), resource, calls, methods, reads, admissions,
+      await transactionRace({ scenario: process.env.GRAYBOARD_TEST_REAL_RACE!, boundary: raceGate.boundary, host, location, server: realServer, db, dbPath: config.dbPath, blobDir: config.blobDir, pauses: join(root, "pauses"), resource, calls, methods, reads, admissions, opens,
         access: async () => { const grant = await ctx.integration.connection.resolve(selected); assert(grant?.type === "oauth"); return grant.access; },
         invoke, enroll: (sessionID, name) => rpc.enroll({ sessionID, name, create: true }, { location }),
         rootState: async sessionID => rootStatus(await rpc.status({}, { location }), sessionID)?.state,
@@ -574,10 +574,12 @@ try {
   const g1 = row(a.id)!.grant_id, second = await signIn(native.integrationID); assert(second?.type === "credential");
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "native new grant latches receiving approval"); await host.mcp.connect({ server: "grayboard", location });
   await invoke(a.id, "peer_list", {}); assert.equal(row(a.id)!.grant_id, g1, "Ordinary G2 tools cannot attach ownership");
+  assert.equal(app.mcp.activeLeases, 1, "G1's lease is still live before the owning G2 call");
   await invoke(a.id, "bind", { name: "final" }); assert.notEqual(row(a.id)!.grant_id, g1, "Only owning G2 success attaches grant");
   const attached = row(a.id)!;
   assert.deepEqual(audits(app.db, "hosted.grant_attached").map(({ id: _, ...r }) => r), [{ actor: "you@example.com", target: attached.session_id, detail: { from: g1, to: attached.grant_id, ownership: attached.ownership_id, client_id: OPENCODE_CLIENT } }], "The owning G2 call writes one hosted.grant_attached row");
-  assert.equal(audits(app.db, "hosted.lease_closed").filter(r => r.target === attached.session_id && r.detail.reason === "reattached").length, 1, "Attaching closes G1's lease");
+  assert.equal(audits(app.db, "hosted.lease_closed").filter(r => r.target === attached.session_id && r.detail.reason === "reattached").length, 1, "The attachment records closing G1's lease");
+  await wait(() => app.mcp.activeLeases, n => n === 0, "Attaching closes G1's lease");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "G2 attached lease");
   revokeFixtureGrant(g1);
   assert.ok(row(a.id)?.held.includes("final"), "Revoking old G1 does not release G2 owner");

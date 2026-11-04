@@ -11,7 +11,9 @@ export class BindGate {
 
   /** Run a tool call once no bind is waiting or running. */
   async call<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.closed) await this.closed;
+    // A call or bind waiting behind a bind: a trace point for the hosted races' real-OpenCode test (#383),
+    // synchronous like bindgate:bind:drain below.
+    while (this.closed) { testPause("bindgate:wait"); await this.closed; }
     this.active++;
     try {
       return await fn();
@@ -22,7 +24,7 @@ export class BindGate {
 
   /** Run a bind or unbind alone: after the calls in flight finish, and before any that arrive meanwhile. */
   async bind<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.closed) await this.closed;
+    while (this.closed) { testPause("bindgate:wait"); await this.closed; }
     let open!: () => void;
     const closed = new Promise<void>((r) => { open = r; });
     this.closed = closed;

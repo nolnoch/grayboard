@@ -583,7 +583,9 @@ export function createHostedSessions(application: Application, options: { now?: 
           testPause("hosted:register:in-txn");
           const root = rowFor(p, context, later)!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
-          if (before) fence(p, before, before);
+          // An external end/recreate of the root while this waited refuses it (a convert is root_is_child above);
+          // a rebind of the same ownership (bind_gen) is what the gate made it wait for, not a change.
+          if (before && root.ownership_id !== before.ownership_id) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
           const existing = store.get(childId);
           if (existing && (existing.user_id !== p.authed.user_id || existing.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
           const childHolds = existing ? application.hostedHolds(childId) : [];
