@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -717,13 +717,16 @@ for (const fail of [false, true]) {
       timer.arm();
       if (fail) throw new Error("stopped wake callback");
     }, () => { changed++; });
+    // The throwing case's sweep failure is the product's own report: assert it rather than let it reach the log.
+    const reported = spyOn(console, "error").mockImplementation(() => {});
     try {
       await Bun.sleep(fail ? 5_400 : 400);
+      expect(reported.mock.calls).toEqual(fail ? [["[grayboard] claim expiry sweep failed:", new Error("stopped wake callback")]] : []);
       expect(changed).toBe(1);
       expect(woken).toBe(1);
       expect(db.query("SELECT key FROM claims").all()).toEqual([{ key: "second" }]);
       expect(snapshot(db, "sim", "e2e").posts.filter(p => p.body.startsWith("[expired]"))).toHaveLength(1);
-    } finally { timer.stop(); }
+    } finally { timer.stop(); reported.mockRestore(); }
   }, 8_000);
 }
 

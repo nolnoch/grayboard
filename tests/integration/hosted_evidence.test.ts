@@ -18,8 +18,10 @@ function fixtureGit(root: string, env: Record<string, string>, ...args: string[]
   if (result.exitCode !== 0) throw new Error("Owned fixture Git setup failed; subprocess diagnostics withheld");
   return result.stdout.toString().trim();
 }
-const metadata = (directory: string): string => new Bun.CryptoHasher("sha256").update(readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).map(entry => entry.name + ":" + (entry.isDirectory() ? metadata(join(directory, entry.name)) : new Bun.CryptoHasher("sha256").update(readFileSync(join(directory, entry.name))).digest("hex"))).join("\n")).digest("hex");
-const identity = ["-c", "user.name=Fixture", "-c", "user.email=you@example.com", "-c", "commit.gpgsign=false"];
+// Each file under `directory` by relative path → content digest, so a failed comparison names what changed.
+const metadata = (directory: string, prefix = ""): Record<string, string> => Object.fromEntries(readdirSync(directory, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? Object.entries(metadata(join(directory, entry.name), prefix + entry.name + "/")) : [[prefix + entry.name, new Bun.CryptoHasher("sha256").update(readFileSync(join(directory, entry.name))).digest("hex")]]));
+// maintenance.auto=false: a commit otherwise detaches `git maintenance run --auto`, whose lock under .git/objects can land in or miss the parent metadata digest (#466).
+const identity = ["-c", "user.name=Fixture", "-c", "user.email=you@example.com", "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false"];
 
 const document = (body = '<testcase name="fixture"/>', root = 'tests="1" failures="0" skipped="0"', suite = "") => `<testsuites ${root}><testsuite ${suite}>${body}</testsuite></testsuites>`;
 const invalidXML: Record<string, string> = {
@@ -141,7 +143,7 @@ esac
   git(...identity, "commit", "-qm", "fixture");
   expect(git("rev-parse", "--absolute-git-dir") === realpathSync(join(root, ".git"))).toBe(true);
   const result = Bun.spawnSync(["bash", "scripts/e2e.sh", matrixMode ? "hosted-matrix" : "hosted-strict"], { cwd: root, env: { ...inherited, PATH: join(root, "bin") + ":" + env.PATH, TMPDIR: join(root, "private"), GRAYBOARD_E2E_RUN_DIR: output, GITHUB_SHA: secrets[1]!, GITHUB_SERVER_URL: "https://ci.example.com", GITHUB_REPOSITORY: "example/fixture", GITHUB_RUN_ID: secrets[0]!, PROBE_ROOT: root, PROBE_MODE: mode } });
-  expect(metadata(join(parent, ".git"))).toBe(before);
+  expect(metadata(join(parent, ".git"))).toEqual(before);
   expect(existsSync(join(root, "fixture-hook-ran"))).toBe(false);
   const terminal = result.stdout.toString() + result.stderr.toString(), published = texts(output);
   expect(result.exitCode).toBe(success ? 0 : 1);

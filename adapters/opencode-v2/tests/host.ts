@@ -244,10 +244,12 @@ try {
     await rpc.enroll({ sessionID: action.id, name: "action", create: true }, { location });
     await wait(() => app.mcp.activeLeases, n => n === 2, "digest and action real leases");
     const board = createBoard(app.db, "you@example.com/digest", "reload", "Reload digest"); subscribe(app.db, "you@example.com/digest", board.name, "digest");
-    dropReceipt = true; const receipts = receiptAttempts;
+    dropReceipt = true; const since = calls.length;
     post(app.db, "you@example.com/sim", board.name, "Process reload immutable digest"); app.application.boardsChanged([board.name]);
     const lost = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/action", "Process reload immutable action", null, false); app.application.wake(["you@example.com/action"]);
-    await wait(() => receiptAttempts, n => n >= receipts + 2, "both receipts lost after real acceptance");
+    // One lost receipt from each root: a total count lets one root's redelivery retries pass alone (#466).
+    const lostBy = () => new Set(calls.slice(since).filter(c => c.subscriber && c.name === "delivery_receipt").map(c => c.session));
+    await wait(lostBy, sessions => sessions.has(digest.id) && sessions.has(action.id), "a lost receipt from each of the digest and action roots");
     await host.session.wait({ sessionID: action.id });
     assert(!raceGate.models.includes(digest.id)); assert(raceGate.models.includes(action.id));
     // The digest's durable idle admission lands independently of the receipts, so wait for it as the durable-idle scenario does (line ~362).
