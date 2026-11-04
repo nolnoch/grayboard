@@ -201,17 +201,20 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   // `later`: audit writes for a refusal, run by the caller after its transaction rolls back (the throw takes
   // a row written inside it, #452).
-  function rowFor(p: OAuthPrincipal, context: SessionContext, later: Array<() => void>, create = true): HostedSession | undefined {
+  // `wake`: a parked child's request makes it active again; session_end's doesn't, so ending one is never refused
+  // for capacity.
+  function rowFor(p: OAuthPrincipal, context: SessionContext, later: Array<() => void>, create = true, wake = true): HostedSession | undefined {
     if (!("id" in context)) return undefined;
     let row = store.get(context.id);
     if (row && (row.user_id !== p.authed.user_id || row.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
+    if (row && row.parked_at !== null && wake) row = unpark(p, row);
     if (!row && create) {
       admit(p.authed.user_id);
       const t = now();
       const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later.push(() => application.hostedRefused(context.id, address, detail)));
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
-        root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null };
+        root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
       application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
       // An ID that was a child (its source row ended) starts as a root: an address again (#523).
       application.hostedRoot(row.session_id, null);
@@ -242,6 +245,15 @@ export function createHostedSessions(application: Application, options: { now?: 
     const root = rootOf(row), t = now();
     store.update({ ...root, last_seen_at: t });
     if (row.session_id !== root.session_id) store.update({ ...row, last_seen_at: t });
+  }
+  // A parked child acts again (#566): admitted against its root's child capacity and the user's and global rows,
+  // as a registration is (a refusal leaves it parked), under the root's grant, which `attach` moved past it.
+  function unpark(p: OAuthPrincipal, row: HostedSession): HostedSession {
+    const root = rootOf(row), t = now();
+    admit(p.authed.user_id, root.session_id);
+    store.unpark(row.session_id, root.grant_id, t);
+    audit(root.session_id, "hosted.child_unparked", { child: row.session_id, ownership: row.ownership_id, parked_ms: t - row.parked_at! }, p);
+    return { ...row, parked_at: null, grant_id: root.grant_id, last_seen_at: t };
   }
   // Whether the root holds a name or writes as one; a root with neither reads and nothing else.
   const named = (root: HostedSession, held = application.hostedHolds(root.session_id)) => held.length > 0 || root.writes_as !== null;
@@ -283,6 +295,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         else if (row.lease_deadline !== null && row.lease_deadline <= now()) store.end(row.session_id, "expired", now(), row.lease_deadline);
         else if (!held.has(row.session_id) && row.lease_deadline === null && row.last_seen_at < now() - idle) store.end(row.session_id, "idle", now());
       }
+      // A child idle past the window is parked (#566): it stops counting against its root's capacity and the
+      // user's rows, and its next request makes it active again. Roots ended above took their children with them.
+      for (const row of store.all()) if (row.root_session_id && row.last_seen_at < now() - idle) {
+        store.park(row.session_id, now());
+        audit(row.root_session_id, "hosted.child_parked", { child: row.session_id, ownership: row.ownership_id, idle_ms: now() - row.last_seen_at });
+      }
     });
     reconcile();
   }
@@ -321,7 +339,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       store.heartbeat(t);
     });
   }
-  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>): Promise<T> {
+  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true): Promise<T> {
     authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
@@ -332,7 +350,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         authorized(p);
         sweep();
         const later: Array<() => void> = [];
-        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later)!; touch(r); return r; }); } catch (e) { for (const w of later) w(); throw e; } })();
+        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later, true, wake)!; touch(r); return r; }); } catch (e) { for (const w of later) w(); throw e; } })();
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         return fn(row);
       });
@@ -591,18 +609,23 @@ export function createHostedSessions(application: Application, options: { now?: 
           const childHolds = existing ? application.hostedHolds(childId) : [];
           if (existing && (childHolds.length || existing.writes_as)) throw new ApplicationError("child_bound", `session ${childId} holds ${childHolds.length ? childHolds.map(h => `"${h}"`).join(", ") : `nothing, writing as "${existing.writes_as}",`} as its own root (bound ${existing.created_at}, in ${existing.place}); end it with session_end from that session, or leave it as its own root.`);
           if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
-          const descendants = store.all().filter(r => r.root_session_id === childId);
+          const descendants = store.children(childId);
           if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);
           if (!existing) admit(p.authed.user_id, root.session_id);
           else if (!existing.root_session_id && store.all().filter(r => r.root_session_id === root.session_id).length >= limits.children) throw new ApplicationError("bad_request", "hosted child capacity reached");
           const attached = attach(p, root);
           touch(attached);
-          if (existing?.root_session_id === root.session_id) return { message: "already registered" };
+          // A registration is the child's activity too (#566): the call that follows never meets it parked.
+          if (existing?.root_session_id === root.session_id) {
+            const current = store.get(childId)!;
+            if (current.parked_at !== null) unpark(p, current); else store.update({ ...current, last_seen_at: now() });
+            return { message: "already registered" };
+          }
           if (existing) store.end(existing.session_id, "closed", now());
           application.hostedRegister(p.authed, childId, harnessFor(p.clientId));
           application.hostedRoot(childId, root.session_id);
           store.insert({ session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
-            source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null });
+            source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
           return { message: "registered", child: childId, root: root.session_id };
         }); } catch (e) { for (const w of later) w(); throw e; }
@@ -626,7 +649,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         });
         reconcile();
         return { ended: true };
-      });
+      }, false);
     },
     release(id: string, reason: HostedEnd, deadline?: number) {
       store.atomic(() => store.end(id, reason, now(), deadline));

@@ -4,6 +4,8 @@ export type HostedSession = {
   place: string | null; lease_deadline: number | null; created_at: number; last_seen_at: number;
   // The name the root's first request suggested (#443), fixed for its life; a child's is null.
   suggested: string | null;
+  // When the sweep parked this child for idleness (#566); null while active, and always null for a root.
+  parked_at: number | null;
 };
 export type HostedEnd = "idle" | "closed" | "revoked" | "disabled" | "expired";
 // A hold the server took from a hosted root (#453): its address, why, and whether it was the root's primary.
@@ -18,7 +20,13 @@ export interface HostedStore {
   // Whether the session ID is a hosted session's: a root's ownership row
   // stays after it ends; a child's row only while it is registered.
   owned(id: string): boolean;
+  // Every row but parked children (#566): what the limits count and the sweeps scan. `get` still returns a
+  // parked row, and `children` lists a root's children, parked or not.
   all(): HostedSession[];
+  children(root: string): HostedSession[];
+  // Park an idle child, or make a parked one active again under its root's current grant (#566).
+  park(session: string, now: number): void;
+  unpark(session: string, grant: string, now: number): void;
   insert(row: HostedSession): void;
   update(row: HostedSession): void;
   start(session: string, user: number, client: string, now: number): number;

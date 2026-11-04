@@ -8,19 +8,23 @@ import { startServer } from "../../src/server/app.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
+import { MAX_CHILDREN } from "../../src/core/bindings.ts";
 import { sessionContext } from "../../src/server/hosted.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { withMeta } from "../helpers/hosted.ts";
 
 let app: ReturnType<typeof startServer>, dir: string, base: string;
+// The hosted clock runs `skew` ahead of the wall clock, so a test can pass the idle window (#566).
+let skew = 0;
 const clients: Client[] = [];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-hosted-end-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, now: () => Date.now() + skew });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
+  skew = 0;
   await Promise.all(clients.splice(0).map(client => client.close()));
   await app.stop();
   expect(app.mcp.activeContexts).toBe(0);
@@ -105,4 +109,25 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child e
   expect(replacement.child).toMatch(SESSION_ID);
   expect(count()).toBe(128);
   expect(app.application.hostedHolds(first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+});
+
+// #566: a root past MAX_CHILDREN registrations keeps registering once its earlier children idle past the window,
+// and a parked child's next call runs as that root's child again.
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: idle children are parked, so registration MAX_CHILDREN + 1 succeeds and a parked child acts again`, async () => {
+  const grant = issue();
+  const root = await connect(version, grant.token, "busy-root");
+  await bind(root, "be");
+  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const context = sessionContext(principal, { "ai.opencode/sessionID": "busy-root" });
+  for (let i = 0; i < MAX_CHILDREN; i++) await app.mcp.sessions.register(principal, context, `sub-${i}`);
+  expect((await root.callTool({ name: "session_register", arguments: { child: "late" } })).isError).toBe(true);
+  skew += 900_001;
+  const late = await value(root, "session_register", { child: "late" });
+  expect(late.child).toMatch(SESSION_ID);
+  const parked = app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.child_parked'").get()!.n;
+  expect(parked).toBe(MAX_CHILDREN);
+  const returning = await connect(version, grant.token, "sub-0");
+  expect(await value(returning, "whoami")).toMatchObject({ child: true, root: late.root });
+  expect(app.db.query("SELECT target FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([{ target: late.root }]);
 });

@@ -770,3 +770,89 @@ test("a bound session with no delivery declaration (OpenCode) gets initialize te
   expect(poll).not.toContain("delivery_open");
   expect(hostedBoundInstruction(info, { mode: "push", source: "pi" }, false, false)).toContain(`<channel source="pi"`);
 });
+
+// #566: hosted child rows are parked once idle past the window, so a long-lived root's finished subagents stop
+// counting against its child capacity, and a parked child's next request makes it active under the same root.
+const childAudits = (action: string) => database.db.query<{ target: string; detail: string }, [string]>("SELECT target, detail FROM access_log WHERE action = ? ORDER BY id").all(action).map(r => ({ target: r.target, ...JSON.parse(r.detail) }));
+const hostedId = (raw: string) => { const c = context(raw); if (!("id" in c)) throw new Error("fixture context"); return c.id; };
+
+test("the sweep parks children idle past the window, audited; parked children free the root's capacity (#566)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
+  await expect(hosted.register(principal, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
+  now += 900_001; hosted.sweep();
+  const parked = childAudits("hosted.child_parked");
+  expect(parked).toHaveLength(hosted.limits.children);
+  expect(parked.every(a => a.target === hostedId("root") && a.idle_ms > 900_000)).toBe(true);
+  expect(database.repo.hosted.all().filter(r => r.root_session_id)).toHaveLength(0);
+  expect(database.repo.hosted.children(hostedId("root"))).toHaveLength(hosted.limits.children);
+  await hosted.register(principal, context("root"), "overflow");
+  expect(database.repo.hosted.get(hostedId("overflow"))?.parked_at).toBeNull();
+  expect(await hosted.whoami(principal, context("root"))).toHaveProperty("primary", "you@example.com/be");
+});
+
+test("a parked child's next call runs as its root's child under the same ownership, audited (#566)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  const ownerships = () => database.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_ownerships").get()!.n;
+  const before = ownerships();
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.get(hostedId("child"))?.parked_at).not.toBeNull();
+  await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", "after parking"));
+  expect(database.db.query("SELECT sender_id FROM messages WHERE body='after parking'").get()).toEqual({ sender_id: hostedId("child") });
+  const row = database.repo.hosted.get(hostedId("child"))!;
+  expect(row).toMatchObject({ parked_at: null, root_session_id: hostedId("root"), last_seen_at: now });
+  expect(ownerships()).toBe(before);
+  expect(childAudits("hosted.child_unparked")).toEqual([expect.objectContaining({ target: hostedId("root"), child: hostedId("child"), parked_ms: 0 })]);
+  expect(await hosted.whoami(principal, context("child"))).toHaveProperty("child", true);
+});
+
+test("register of an existing child moves the child's last_seen_at; of a parked one unparks it (#566)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  now += 600_000;
+  expect(await hosted.register(principal, context("root"), "child")).toEqual({ message: "already registered" });
+  expect(database.repo.hosted.get(hostedId("child"))?.last_seen_at).toBe(now);
+  now += 600_000; hosted.sweep();
+  expect(database.repo.hosted.get(hostedId("child"))?.parked_at).toBeNull();
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.get(hostedId("child"))?.parked_at).not.toBeNull();
+  expect(await hosted.register(principal, context("root"), "child")).toEqual({ message: "already registered" });
+  expect(database.repo.hosted.get(hostedId("child"))).toMatchObject({ parked_at: null, last_seen_at: now });
+  expect(childAudits("hosted.child_unparked")).toHaveLength(1);
+});
+
+test("an unpark at full child capacity is refused and leaves the child parked; its session_end still ends it (#566)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "sleeper");
+  now += 900_001; hosted.sweep();
+  for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
+  await expect(hosted.whoami(principal, context("sleeper"))).rejects.toHaveProperty("code", "bad_request");
+  expect(database.repo.hosted.get(hostedId("sleeper"))?.parked_at).not.toBeNull();
+  expect(childAudits("hosted.child_unparked")).toHaveLength(0);
+  expect(await hosted.end(principal, context("sleeper"))).toEqual({ ended: true });
+  expect(database.repo.hosted.get(hostedId("sleeper"))).toBeUndefined();
+  expect(database.repo.hosted.children(hostedId("root"))).toHaveLength(hosted.limits.children);
+});
+
+test("a parked child goes with its root's ownership; it and an ended child start as roots when they call again (#566)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "parked");
+  await hosted.register(principal, context("root"), "ended");
+  await hosted.end(principal, context("ended"));
+  now += 900_001; hosted.sweep();
+  await hosted.end(principal, context("root"));
+  expect(database.repo.hosted.get(hostedId("parked"))).toBeUndefined();
+  for (const raw of ["parked", "ended"]) {
+    expect(await hosted.whoami(principal, context(raw))).toHaveProperty("unbound", true);
+    expect(database.repo.hosted.get(hostedId(raw))).toMatchObject({ root_session_id: null, parked_at: null });
+  }
+});
+
+test("a root that holds parked children can't become a child (#566)", async () => {
+  await hosted.register(principal, context("middle"), "leaf");
+  now += 600_000; await hosted.whoami(principal, context("middle"));
+  now += 300_001; hosted.sweep();
+  expect(database.repo.hosted.get(hostedId("leaf"))?.parked_at).not.toBeNull();
+  await expect(hosted.register(principal, context("top"), "middle")).rejects.toHaveProperty("code", "has_children");
+});
