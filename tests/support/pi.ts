@@ -708,6 +708,37 @@ export async function expectDeliveryRecords(file: string, root: string, pings: n
   expect(JSON.stringify(entries)).not.toContain(`ping ${name}`);
 }
 
+// After a sign-out, a signed-out tool call offers a sign-in (#499): the
+// result carries the flow's URL ahead of the unchanged refusal, a second
+// refused call while the flow is pending the same URL, the server's consent
+// page approves it, and the next call runs. `check` prompts the scripted
+// whoami; `results` is how many whoami results the session already holds.
+export async function expectSignInOffer(srv: HostedServer, proc: Pi, harness: string, o: { results: number; whoami(nth: number): Promise<PiMessage>; idle(proc: Pi): Promise<unknown> }): Promise<void> {
+  const check = async (nth: number) => {
+    await proc.command({ type: "prompt", message: "check" });
+    const result = await o.whoami(nth);
+    await o.idle(proc);
+    return result;
+  };
+  const offered = async (nth: number) => {
+    const result = await check(nth);
+    expect(result.isError).toBe(true);
+    const offer = /^grayboard: open (\S+) to sign in to grayboard\n([^]*)$/.exec(resultText(result));
+    expect(offer?.[2]).toBe(`error: Signed out of grayboard in ${harness}; run /grayboard login`);
+    return offer![1]!;
+  };
+  const url = await offered(o.results);
+  expect(url).toStartWith(`${srv.issuer}/`);
+  expect(await offered(o.results + 1)).toBe(url);
+  // The offer opened no browser: the URL went to the tool result and the notice line.
+  expect(proc.notices()).toContain(`grayboard: sign in at ${url}`);
+  expect(await browse(srv.issuer, url, harness)).toContain("Signed in to grayboard");
+  await until(() => proc.notices().includes("grayboard: signed in"), 15_000, "the signed-in notice");
+  const ran = await check(o.results + 2);
+  expect(ran.isError).toBeFalsy();
+  expect(resultText(ran)).not.toContain("Signed out");
+}
+
 type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: { persist?: boolean; session?: string }): Pi };
 
 // A server, the fake model (answerPeer first, then `rules`), the peer and the
@@ -946,11 +977,13 @@ export function piHostedRefreshLogoutScenario(dir: string): Promise<void> {
       expect(status).toContain("\nsign-in: signed out (logged_out); run /grayboard login\n");
       expect(status).toMatch(/: paused, /);
     }
-    // The other process's next tool call says to sign in.
-    await b.command({ type: "prompt", message: "check" });
-    const checked = await toolResult(b, "whoami");
-    expect(checked.isError).toBe(true);
-    expect(resultText(checked)).toBe("error: Signed out of grayboard in pi; run /grayboard login");
+    // The other process's next tool call offers a sign-in; once it lands,
+    // both processes' roots restart (unbound: the logout's revoke ended their sessions).
+    await expectSignInOffer(srv, b, "pi", { results: 0, whoami: (nth) => toolResult(b, "whoami", nth), idle });
+    for (const proc of [a, b]) await until(async () => {
+      const status = await statusOf(proc);
+      return status.includes("\nsign-in: signed in\n") && !status.includes("paused") ? status : undefined;
+    }, 20_000, "both roots restarted signed in");
     await Promise.all([a.quit(), b.quit()]);
   });
 }

@@ -17,7 +17,7 @@ import { sha256Hex } from "../../src/shared/hash.ts";
 import { cleanEnv, localEnv } from "./env.ts";
 import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
-import { answerPeer, expectDeliveryRecords, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
+import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
 import { grayboardChildPids, grayboardDescendants, sigkill } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
@@ -886,11 +886,13 @@ export function ompHostedRefreshLogoutScenario(dir: string): Promise<void> {
       expect(status).toContain("\nsign-in: signed out (logged_out); run /grayboard login\n");
       expect(status).toMatch(/: paused, /);
     }
-    // The other process's next tool call says to sign in.
-    await b.command({ type: "prompt", message: "check" });
-    const checked = await toolResult(b, "whoami");
-    expect(checked.isError).toBe(true);
-    expect(resultText(checked)).toBe("error: Signed out of grayboard in omp; run /grayboard login");
+    // The other process's next tool call offers a sign-in; once it lands,
+    // both processes' roots restart (unbound: the logout's revoke ended their sessions).
+    await expectSignInOffer(srv, b, "omp", { results: 0, whoami: (nth) => toolResult(b, "whoami", nth), idle: (p) => idle(p) });
+    for (const proc of [a, b]) await until(async () => {
+      const status = await statusOf(proc);
+      return status.includes("\nsign-in: signed in\n") && !status.includes("paused") ? status : undefined;
+    }, 20_000, "both roots restarted signed in");
     await Promise.all([a.quit(), b.quit()]);
   });
 }
