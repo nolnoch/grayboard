@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 const root = resolve(import.meta.dir, "..");
 export const SOURCE = join(root, "adapters/hosted-core/src");
 export const TARGET = join(root, "adapters/opencode-v2/src/core");
-export const VENDORED = ["port", "wire", "model", "sessions", "events", "diagnostics", "controller", "children", "attachments"] as const;
+export const VENDORED = ["port", "wire", "model", "sessions", "events", "diagnostics", "controller", "children", "attachments", "results"] as const;
 const SHARED = {
   "../../../src/shared/attachments.ts": ["attachment-files", "src/shared/attachments.ts"],
   "../../../src/shared/http.ts": ["http", "src/shared/http.ts"],

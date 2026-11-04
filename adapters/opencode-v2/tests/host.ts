@@ -65,6 +65,10 @@ const calls: { name: string; session: string; subscriber: boolean; args: Record<
 const opens: { capability: string; ownership: number; bind_gen: number }[] = [];
 const nativeCompleted: string[] = [], wrappers: string[] = [];
 let subscriberThrottles = 0;
+const byteRequests: { method: string; path: string; session: string | null }[] = [];
+const completedTransfers: { sessionID: string; output: unknown }[] = [];
+const permissionEvaluations: { sessionID: string; action: string }[] = [];
+let lostAttachmentAnswers = 0;
 const expiryContinuation = new FailedContinuation();
 const fetch0 = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -80,6 +84,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   assert(!url.pathname.endsWith("/register"), "CIMD must not use DCR");
   if (url.pathname.endsWith("/oauth/token")) { const form = new URLSearchParams(await req.clone().text()); if (form.get("grant_type") === "authorization_code") codes++; else refreshes++; assert.equal(form.get("client_id"), OPENCODE_CLIENT); }
   const b = req.method === "POST" && url.pathname.endsWith("/mcp") ? await req.clone().json() as any : undefined;
+  if (url.pathname.startsWith(new URL(resource).pathname + "/attachments")) byteRequests.push({ method: req.method, path: url.pathname, session: req.headers.get("X-Grayboard-Session") });
   if (subscriberOutage && req.headers.get("X-Grayboard-Client") === "subscriber") {
     const fail = async () => { throw new Error("Real backend subscriber network deliberately unavailable"); };
     if (b?.method === "tools/call" && b.params?.name === "delivery_renew") return expiryContinuation.observe(fail);
@@ -97,6 +102,10 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (read) reads.push(read);
   const forward = () => fetch0(new Request(`http://127.0.0.1:${realServer?.port ?? app.server.port}` + url.pathname + url.search, req));
   const res = admissionGate ? await admissionGate.forward(req, b, forward) : await forward();
+  if (b?.method === "tools/call" && b.params.name === "dm_send" && b.params.arguments?.body === "Lost attachment answer" && lostAttachmentAnswers === 0) {
+    lostAttachmentAnswers++;
+    throw Object.assign(new Error("Native attachment answer deliberately lost after the real server committed"), { code: "ECONNRESET" });
+  }
   if (read) void res.clone().text().then(text => { read.text = text; });
   if (res.status === 429 && req.headers.get("X-Grayboard-Client") === "subscriber") subscriberThrottles++;
   if (b?.method === "tools/call" && req.headers.get("X-Grayboard-Client") === "subscriber") { const text = await res.clone().text(); if (text.includes('"isError":true')) console.log("SUBSCRIBER_ERROR", b.params.name, text); }
@@ -118,7 +127,8 @@ const fixture = Plugin.define({ id: "grayboard.real.fixture", async setup(c) {
     raceGate.models.push(e.sessionID); modelRequests.push({ sessionID: e.sessionID, body: await e.request.clone().text() });
     if (e.sessionID === suspendedModel.target) { suspendedModel.entered.release(); await suspendedModel.released.promise; }
   });
-  await c.tool.hook("execute.after", e => { if (e.status === "completed") { if (e.tool === "grayboard_bind") nativeCompleted.push(e.sessionID); if (e.tool === "execute") wrappers.push(e.sessionID); } });
+  await c.tool.hook("execute.after", e => { if (e.status === "completed") { if (e.tool === "grayboard_dm_send") completedTransfers.push({ sessionID: e.sessionID, output: e.result.output }); if (e.tool === "grayboard_bind") nativeCompleted.push(e.sessionID); if (e.tool === "execute") wrappers.push(e.sessionID); } });
+  await c.permission.hook("evaluate", e => { permissionEvaluations.push({ sessionID: e.sessionID, action: e.action }); });
 } });
 const instrumented = instrument(plugin, async (input, forward) => {
     admissions.push(structuredClone(input)); raceGate.inputs.push(structuredClone(input));
@@ -210,13 +220,56 @@ try {
     assert.equal(audits(app.db, "attachment.downloaded").length, downloads, "An unsafe save path is refused before download");
     await rpc.enroll({ sessionID: sender.id }, { location });
     const child = await host.session.create({ location, parentID: sender.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+    const childBytesBefore = byteRequests.length;
     await invoke(child.id, "dm_send", { to: "fe", body: "Child path attachment", attachments: ["roundtrip.png"] });
     assert.equal(row(child.id)?.root_session_id, row(sender.id)?.session_id);
     const childFile = app.db.query<{ id: number }, []>("SELECT a.id FROM attachments a JOIN messages m ON a.message_id = m.id WHERE m.body = 'Child path attachment'").get();
     assert(childFile, "Child upload is attributed to its registered source");
+    assert.deepEqual(byteRequests.slice(childBytesBefore).filter(r => r.method === "POST").map(r => r.session), [encodeURIComponent(child.id)], "The child upload carries the child's own raw source header, not its root's");
     await host.session.wait({ sessionID: receiver.id });
     await invoke(child.id, "attachment_get", { id: childFile.id, dir: "received" });
     assert.deepEqual(readFileSync(join(location.directory, "received", `${childFile.id}-roundtrip.png`)), bytes);
+    assert(byteRequests.some(r => r.method === "GET" && r.path.endsWith(`/${childFile.id}`) && r.session === encodeURIComponent(child.id)), "The child download carries the child's raw source header");
+    const blockedUploadsBefore = byteRequests.filter(r => r.method === "POST").length;
+    const blockedModelsBefore = modelRequests.length;
+    writeFileSync(join(location.directory, "private-report.txt"), "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n");
+    await invoke(sender.id, "dm_send", { to: "fe", body: "Refused secret attachment", attachments: ["private-report.txt"] });
+    assert(modelRequests.slice(blockedModelsBefore).some(r => r.sessionID === sender.id && r.body.includes("holds private key or secret key material")), "The V2 surface reports the shared secret-file refusal");
+    writeFileSync(join(root, "outside.txt"), "outside the host working directory\n");
+    await invoke(sender.id, "dm_send", { to: "fe", body: "Refused outside attachment", attachments: [join(root, "outside.txt")] });
+    assert(modelRequests.slice(blockedModelsBefore).some(r => r.sessionID === sender.id && r.body.includes("outside the directories this session may attach from")), "The V2 surface reports the shared outside-root refusal");
+    assert.equal(byteRequests.filter(r => r.method === "POST").length, blockedUploadsBefore, "Refused local files never leave the host");
+    const sequence = () => app.db.query<{ seq: number }, []>("SELECT seq FROM sqlite_sequence WHERE name = 'attachments'").get()!.seq;
+    const beforeRefusal = sequence();
+    await invoke(sender.id, "dm_send", { to: "missing@example.com/absent", body: "Refused attachment send", attachments: ["roundtrip.png"] });
+    assert.equal(sequence(), beforeRefusal + 1, "The native refusal follows an actual upload");
+    assert(byteRequests.some(r => r.method === "DELETE" && r.path.endsWith(`/${beforeRefusal + 1}`) && r.session === encodeURIComponent(sender.id)), "The refused native send releases its upload as the same source");
+    assert.equal(app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM attachments WHERE message_id IS NULL AND post_id IS NULL").get()!.n, 0);
+    await invoke(sender.id, "dm_send", { to: "fe", body: "Lost attachment answer", attachments: ["roundtrip.png"] });
+    await host.session.wait({ sessionID: receiver.id });
+    const lostFile = app.db.query<{ id: number }, []>("SELECT a.id FROM attachments a JOIN messages m ON a.message_id = m.id WHERE m.body = 'Lost attachment answer'").get();
+    assert(lostFile); assert.equal(lostAttachmentAnswers, 1);
+    assert.equal(calls.filter(c => c.name === "dm_send" && c.args.body === "Lost attachment answer").length, 1, "A lost successful answer does not resend the message");
+    const landed = completedTransfers.find(r => r.sessionID === sender.id && typeof r.output === "object" && r.output !== null && "sent" in r.output && r.output.sent === true)?.output as { sent: boolean; attachment_ids: number[]; note: string } | undefined;
+    assert(landed, "V2 returns the known-landed result when the native answer is lost");
+    assert.deepEqual({ sent: landed.sent, attachment_ids: landed.attachment_ids }, { sent: true, attachment_ids: [lostFile.id] });
+    assert.match(landed.note, /server's answer was lost/);
+    const ask = await host.session.create({ location, permissions: [
+      { action: "*", resource: "*", effect: "allow" }, { action: "grayboard_dm_send", resource: "*", effect: "ask" },
+      { action: "read", resource: "*", effect: "deny" }, { action: "edit", resource: "*", effect: "deny" },
+    ] });
+    await invoke(ask.id, "bind", { name: "ask-sender", create: true });
+    const asking = invoke(ask.id, "dm_send", { to: "fe", body: "One permission answer", attachments: ["roundtrip.png"] });
+    const permission = await wait(() => host!.permission.list({ sessionID: ask.id }), requests => requests.some(r => r.action === "grayboard_dm_send"), "Real namespaced ask request");
+    const request = permission.find(r => r.action === "grayboard_dm_send")!;
+    await host.permission.reply({ sessionID: ask.id, requestID: request.id, decision: "once" });
+    await bounded(asking, 20_000, "One once-answer completes the path-based send without a second permission prompt");
+    assert.equal(permissionEvaluations.filter(p => p.sessionID === ask.id && p.action === "grayboard_dm_send").length, 1);
+    assert.equal((await host.permission.list({ sessionID: ask.id })).length, 0);
+    const askedFile = app.db.query<{ id: number }, []>("SELECT a.id FROM attachments a JOIN messages m ON a.message_id = m.id WHERE m.body = 'One permission answer'").get();
+    assert(askedFile, "Namespaced permission authorizes attachments independently of the read permission");
+    await invoke(ask.id, "attachment_get", { id: askedFile.id, dir: "received" });
+    assert.deepEqual(readFileSync(join(location.directory, "received", `${askedFile.id}-roundtrip.png`)), bytes, "Namespaced saving is independent of the edit permission");
     console.log("REAL_NATIVE_ATTACHMENT_ROUNDTRIP_OK", { codeMode, dm: file.id, board: boardFile.id, child: childFile.id });
   } else if (process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission")) {
     const s = await makeRoot("Default admission recovery");

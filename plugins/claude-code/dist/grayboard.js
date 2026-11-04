@@ -35721,6 +35721,20 @@ class HostedAttachments {
   }
 }
 
+// adapters/hosted-core/src/results.ts
+function outputOf(result) {
+  if (result.structuredContent !== undefined)
+    return result.structuredContent;
+  const only = result.content.length === 1 ? result.content[0] : undefined;
+  if (only?.type !== "text")
+    return;
+  try {
+    return JSON.parse(only.text);
+  } catch {
+    return only.text;
+  }
+}
+
 // src/shared/session_meta.ts
 var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
 var GRAYBOARD_ALIAS_LOST_META = "io.github.nolnoch.grayboard/alias_lost";
@@ -35747,18 +35761,6 @@ function withPaths(tool) {
   const properties = Object.fromEntries(Object.entries(tool.inputSchema.properties ?? {}).map(([key, value]) => key === "attachment_ids" ? ["attachments", ATTACHMENTS_PARAM] : [key, value]));
   const description = tool.description?.replace("attachment_ids?", "attachments?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.");
   return { ...tool, ...description === undefined ? {} : { description }, inputSchema: { ...tool.inputSchema, properties } };
-}
-function outputOf(result) {
-  if (result.structuredContent !== undefined)
-    return result.structuredContent;
-  const only = result.content.length === 1 ? result.content[0] : undefined;
-  if (only?.type !== "text")
-    return;
-  try {
-    return JSON.parse(only.text);
-  } catch {
-    return only.text;
-  }
 }
 var text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 var failure2 = (message) => ({ ...text(`error: ${message}`), isError: true });

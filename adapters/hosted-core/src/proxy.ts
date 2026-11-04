@@ -12,6 +12,7 @@ import type { Operation } from "./diagnostics.js";
 import { AccessExpired, accessExpiry, same } from "./model.js";
 import { InsufficientScope, NativeWire, ServerUnreachable, type WireOptions } from "./wire.js";
 import { HostedAttachments } from "./attachments.js";
+import { outputOf } from "./results.js";
 import {
   ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, publishedLimits,
   SendLanded, type AttachmentLimits,
@@ -76,14 +77,6 @@ function withPaths(tool: NativeTool): NativeTool {
   return { ...tool, ...(description === undefined ? {} : { description }), inputSchema: { ...tool.inputSchema, properties } };
 }
 
-// The tool's parsed result for afterCall: structuredContent, else the single
-// text content parsed as JSON (or as is when it isn't JSON).
-export function outputOf(result: CallToolResult): unknown {
-  if (result.structuredContent !== undefined) return result.structuredContent;
-  const only = result.content.length === 1 ? result.content[0] : undefined;
-  if (only?.type !== "text") return undefined;
-  try { return JSON.parse(only.text); } catch { return only.text; }
-}
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 // A tool result that reports `message` as an error, in every hosted adapter.
 export const failure = (message: string): CallToolResult => ({ ...text(`error: ${message}`), isError: true });

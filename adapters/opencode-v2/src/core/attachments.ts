@@ -39,6 +39,8 @@ export class HostedAttachments {
     const target = await saveTarget(args.dir, this.options.roots, serverBusDir(this.options.resource.href), this.options.env, this.options.cwd);
     return downloadAttachment(id, target, (await this.options.limits()).file, this.transport(sessionID));
   }
+  // The hosted attachment routes act as the bound session whose raw source ID
+  // rides in X-Grayboard-Session (the canonical encodeURIComponent form).
   private transport(sessionID: string): AttachmentTransport {
     const base = `${this.options.resource.href.replace(/\/$/, "")}/attachments`;
     return {
@@ -84,6 +86,8 @@ export class HostedAttachments {
       unreleased: this.options.unreleased,
     };
   }
+  // One authorized byte request, retried once after onUnauthorized as the
+  // MCP transport does; the host remains the only credential refresher.
   private async http(method: "POST" | "GET" | "DELETE", url: string, sessionID: string, ms: number, body?: Uint8Array): Promise<Response> {
     const signal = AbortSignal.any([AbortSignal.timeout(ms), this.options.signal]);
     for (let attempt = 0; ; attempt++) {
