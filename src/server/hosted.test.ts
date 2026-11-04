@@ -898,6 +898,8 @@ test("children parked in one sweep past the ceiling are evicted by last activity
   expect(database.repo.hosted.children(hostedId("root")).map(r => r.session_id)).toEqual([hostedId("c")]);
   const evicted = childAudits("hosted.child_released").map(a => a.child);
   expect(evicted).toEqual([hostedId("a"), hostedId("b")].sort());
+  // Parked and evicted in one sweep: both audits.
+  expect(childAudits("hosted.child_parked").map(a => a.child).sort()).toEqual([hostedId("a"), hostedId("b"), hostedId("c")].sort());
 });
 
 test("a refused unpark, new register and convert each say local mode's child-capacity text (#584)", async () => {
@@ -933,6 +935,7 @@ test("a child's call past the idle window neither parks it nor ends its unheld r
   now += 600_000; hosted.sweep();
   expect(rowOf(meta("kid"))?.parked_at).toBeNull();
   expect(childAudits("hosted.child_parked")).toHaveLength(0);
+  expect(hosted.inflightCount).toBe(0);
 });
 
 test("an unheld root's own call past the idle window doesn't end it (#584)", async () => {
@@ -955,14 +958,20 @@ test("a bind of a name whose holder is mid-call past the idle window doesn't end
   expect(database.db.query("SELECT id FROM alias_holds WHERE address = 'you@example.com/be'").get()).toEqual({ id: hostedId("root") });
 });
 
-test("a child's call whose root's ownership ends meanwhile leaves no row behind (#584)", async () => {
+test("a call whose root's ownership ended and restarted before it returns keeps its result and leaves the new ownership as it is (#584)", async () => {
   await hosted.bind(principal, context("root"), { name: "be", create: true });
-  await hosted.register(principal, context("root"), "child");
-  const call = hosted.transfer(principal, context("child"), async () => {
+  const before = rowOf(context("root"))!.ownership_id;
+  const value = await hosted.control(principal, context("root"), false, async () => {
     database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
     hosted.sweep();
+    database.db.run("UPDATE users SET disabled_at = NULL WHERE id = ?", [principal.authed.user_id]);
+    now += 1000;
+    await hosted.whoami(principal, context("root"));
     return "done";
   });
-  await expect(call).rejects.toHaveProperty("code", "unbound");
-  expect(hostedRowCount(database.db)).toBe(0);
+  expect(value).toBe("done");
+  const after = rowOf(context("root"))!;
+  expect(after.ownership_id).toBeGreaterThan(before);
+  expect(database.db.query("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(after.ownership_id)).toEqual({ ended_at: null });
+  expect(hosted.inflightCount).toBe(0);
 });

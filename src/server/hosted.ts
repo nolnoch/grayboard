@@ -302,7 +302,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           sweep();
           const current = store.get(row.session_id);
           if (!current || current.ownership_id !== row.ownership_id || current.bind_gen !== row.bind_gen) return false;
-          if (current.lease_deadline === null && idleAt(current)) {
+          if (current.lease_deadline === null && current.last_seen_at < now() - idle) {
             store.atomic(() => store.end(current.session_id, "idle", now()));
             return false;
           }
@@ -447,6 +447,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     application,
     limits,
     get gateCount() { return gates.size; },
+    get inflightCount() { return inflight.size; },
     now,
     leaseTtl,
     gate,
