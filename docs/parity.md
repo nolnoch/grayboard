@@ -28,7 +28,7 @@ The baseline every later change is measured against. A cell says what a user of 
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | Tool surface | yes | yes | yes | yes | yes | yes | yes | yes |
 | 2 | Push delivery and wakeup | yes | yes | yes | yes | yes | yes | yes | yes |
-| 3 | Current instructions on push-started turns | yes | yes | gap #552 | yes | yes | yes | yes | yes |
+| 3 | Current instructions on push-started turns | yes | yes | yes | yes | yes | yes | yes | yes |
 | 4 | Bind, unbind, several holds, configured start name | yes | yes | yes | yes | yes | yes | yes | yes |
 | 5 | Names across an in-process session switch or MCP reconnect | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 6 | Names when a new harness process resumes a conversation | gap #195 | yes | gap #195 | yes | gap #195 | yes | gap #195 | yes |
@@ -60,8 +60,7 @@ The baseline every later change is measured against. A cell says what a user of 
 ### 3. Current instructions on push-started turns
 
 - pi L, pi H: pi runs `before_agent_start` for a push-started turn, so its `<grayboard>` section is current (`adapters/pi/grayboard.ts`, `adapters/pi-family/entry-pi.ts`). Proof: `tests/integration/pi.test.ts` piUnboundScenario (a woken turn's system prompt is the bound name's), piHostedScenario.
-- omp L: **gap #552.** Instructions are appended only in main's `before_agent_start`, which omp runs only for a user prompt, so a push-started turn after a `bind` carries the last prompt's instructions (boards.md §9 omp).
-- omp H: `before_provider_request` rewrites stale instructions per request; `context` adds them as a hidden message after a prompt rebuild (#441, `adapters/pi-family/omp-instructions.ts`). Proof: `tests/integration/omp_instructions.test.ts`, `tests/integration/omp.test.ts` omp hosted `/fork`, `/new`, `/resume`.
+- omp L, omp H: one shared plan (`adapters/pi-family/omp-instructions.ts`, #441, #552): `before_provider_request` rewrites stale instructions per request, `context` adds them as a hidden message after a prompt rebuild, and both warn once for main only when the stale text can't be found. omp L reads the current text from its child's last initialize; omp H fetches it. Proof: `tests/integration/omp_instructions.test.ts` (plan, rewrite and the warning), `tests/integration/omp.test.ts` omp local ("a push-started bind reaches the next request's instructions without a user prompt") and omp hosted `/fork`, `/new`, `/resume`.
 - OC V1: `experimental.chat.system.transform` adds the latest instructions to every request (`adapters/opencode/grayboard.ts`). Proof: `tests/integration/opencode.test.ts` ("… the system prompt follows in full").
 - OC V2: the plugin's `context` hook carries the root's (or a subagent's child) server instructions per request (#531, #535). Proof: `adapters/opencode-v2/tests/host.ts` (REAL_INSTRUCTIONS cases), `adapters/opencode-v2/tests/instructions.test.ts`.
 - CC L, CC H: Claude Code reads MCP instructions only at initialize (`plugins/claude-code/src/plugin.ts` instructions comment), so a name change reaches the model as the rebuilt instructions in `bind`/`unbind`'s result, or the next result after a lost one (`instructionsStale`, `src/local/mcp.ts`); the system prompt keeps the connect-time text. Proof: —.
