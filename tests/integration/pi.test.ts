@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { closeSessions } from "../support/mcp.ts";
 import {
   piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
-  piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piUnboundScenario,
+  piLocalRestartScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piUnboundScenario,
 } from "../support/pi.ts";
 
 let dir: string;
@@ -25,6 +25,7 @@ afterEach(async () => {
 
 test("pi: a DM wakes the session, which replies with dm_send; a digest rides along as context", () => piScenario(dir), 90_000);
 test("pi unbound: the session acts as its ID; two binds and an unbind through the extension's tools move the session's one grayboard onto its second name", () => piUnboundScenario(dir), 90_000);
+test("pi local: a killed grayboard restarts with its bound name; calls wait through all three backoffs, delivery resumes, another exit gives up, and /new resets the count (#559)", () => piLocalRestartScenario(dir), 90_000);
 test("pi detached runner (#523 step 5): with no live parent it is its own session; with one it acts as the parent's child, writing as the parent's name with via, until a bind promotes it to its own session that receives, or the parent exits while it runs on", () => piRunnerScenario(dir), 180_000);
 test("pi: an enabled grayboard MCP entry makes the extension register nothing and say why", () => piReenabledScenario(dir), 60_000);
 test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);

@@ -41,6 +41,11 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "age
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
 // MCP call renderer treat these as they treat any MCP server's tools.
 const PREFIX = `mcp__${SERVER}__`.replace(/[^A-Za-z0-9_]/g, "_");
+// Keep the local omp adapter's restart policy: each unexpected exit uses
+// the next delay; a process that ran STABLE_MS starts the count over.
+// Both adapters install as one raw file, so neither can import a helper.
+const RESTART_DELAYS_MS = [0, 1_000, 5_000];
+const STABLE_MS = 60_000;
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -138,6 +143,8 @@ export default function grayboard(pi: ExtensionAPI) {
   const tools = loadTools();
   let child: Child | undefined;
   let exitReason: string | undefined;
+  let restarts = 0;
+  let restart: { ready: Promise<void>; cancel(): void } | undefined;
   let instructions: string | undefined;
   let registered = false;
   let refused: string | undefined;
@@ -153,14 +160,15 @@ export default function grayboard(pi: ExtensionAPI) {
     );
   };
 
-  const report = (ctx: ExtensionContext, text: string) => {
-    if (ctx.hasUI) ctx.ui.notify(text, "error");
+  const report = (ctx: ExtensionContext, text: string, type: "error" | "warning" = "error") => {
+    if (ctx.hasUI) ctx.ui.notify(text, type);
     else console.error(text);
   };
 
   // Started per session, not at load: until something can receive them,
   // messages wait in grayboard rather than in this process.
   const start = (ctx: ExtensionContext): Child => {
+    const startedAt = Date.now();
     // The session's own id, which its subagent runners' children find it by,
     // and the launching session's id in a runner; set (or cleared) per start,
     // since /new, /resume and fork change the id.
@@ -188,14 +196,42 @@ export default function grayboard(pi: ExtensionAPI) {
         pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
         send({ id, method, params });
       });
+    // Fail the calls in flight, then take the names back from the name
+    // record through a new child under the same pi process.
     const fail = (reason: string) => {
+      if (gone) return;
       gone = new Error(reason);
       for (const p of pending.values()) p.reject(gone);
       pending.clear();
       if (child?.proc !== proc) return;
       child = undefined;
-      exitReason = reason;
-      report(ctx, `${reason}; restart pi to reconnect`);
+      // EPIPE can happen while the child is still alive. Stop it before a
+      // replacement, so it can't linger as a second delivery owner.
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
+      if (Date.now() - startedAt >= STABLE_MS) restarts = 0;
+      const attempt = restarts;
+      if (attempt >= RESTART_DELAYS_MS.length) {
+        exitReason = reason;
+        report(ctx, `${reason} after ${attempt} restarts; restart pi to reconnect`);
+        return;
+      }
+      restarts = attempt + 1;
+      exitReason = `${reason}; restarting it`;
+      report(ctx, `${reason}; restarting it (${attempt + 1} of ${RESTART_DELAYS_MS.length})`, "warning");
+      const waiter = Promise.withResolvers<void>();
+      const timer = setTimeout(() => {
+        restart = undefined;
+        child = start(ctx);
+        waiter.resolve();
+      }, RESTART_DELAYS_MS[attempt]);
+      restart = {
+        ready: waiter.promise,
+        cancel() {
+          clearTimeout(timer);
+          restart = undefined;
+          waiter.resolve();
+        },
+      };
     };
     // JSON-RPC over stdio is LF-delimited; split on "\n" only (readline would
     // also split on U+2028/2029, which are valid inside JSON strings).
@@ -255,7 +291,8 @@ export default function grayboard(pi: ExtensionAPI) {
         parameters: { ...tool.inputSchema, type: tool.inputSchema.type ?? "object", properties: tool.inputSchema.properties ?? {} } as any,
         namespace: { name: `mcp__${SERVER.replace(/-/g, "_")}`, aliases: [SERVER] },
         async execute(_id, params, signal, _onUpdate, ctx) {
-          if (exitReason) throw new Error(exitReason);
+          if (!child && restart) await restart.ready;
+          if (!child && exitReason) throw new Error(exitReason);
           child ??= start(ctx);
           const c = child;
           await c.ready;
@@ -288,6 +325,7 @@ export default function grayboard(pi: ExtensionAPI) {
     }
     if (refused) return report(ctx, refused);
     exitReason = undefined;
+    restarts = 0;
     child ??= start(ctx);
   });
 
@@ -302,6 +340,9 @@ export default function grayboard(pi: ExtensionAPI) {
   // Also fires before /new, /resume, and fork, which start the session again:
   // wait for the child to exit so the next one can take the name.
   pi.on("session_shutdown", async () => {
+    // /new, /resume, fork and quit must not leave a backoff that can spawn
+    // a child for the outgoing session after the next session starts.
+    restart?.cancel();
     const c = child;
     if (!c) return;
     child = undefined;
