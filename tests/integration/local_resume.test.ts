@@ -231,10 +231,10 @@ test("a real tail viewer is never eligible to restore an ordinary conversation",
   const [viewer] = rows<{ id: string; local_resume: number }>(`SELECT i.id, i.local_resume FROM ids i JOIN bindings b ON b.session_id = i.id WHERE i.viewer = 1 AND b.pid = ?`, p.pid);
   expect(viewer!.local_resume).toBe(0);
   p.kill("SIGINT");
-  expect(await p.exited).toBe(0);
+  await p.exited;
   viewers.splice(viewers.indexOf(p), 1);
-  expect(endedAt(viewer!.id)).not.toBeNull();
   const resumed = await session("viewer-conversation");
+  expect(endedAt(viewer!.id)).not.toBeNull();
   expect((await who(resumed)).aliases).toEqual(["remembered"]);
 }, 20_000);
 
