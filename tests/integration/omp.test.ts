@@ -35,6 +35,6 @@ test("omp local: an enabled MCP server omp would run beside the adapter's graybo
 
 test("omp local: a repo's disabled .omp/mcp.json grayboard entry pins the name an omp session with no BUS_IDENTITY suggests and binds (#523)", () => ompLocalPinScenario(dir), 120_000);
 
-test("omp local: a killed grayboard process is restarted and takes its name back; /new keeps the process and name, and a push-started turn after it carries the instructions as a hidden message; a local:// attachment reaches grayboard as its path; the user entry's ${VAR} expands (#523)", () => ompLocalCarryScenario(dir), 120_000);
+test("omp local: a push-started bind reaches the next request's instructions without a user prompt; a killed grayboard process restarts and takes its names back; /new keeps the process and names, injecting instructions in a push-started turn; a local:// attachment resolves and the user entry's ${VAR} expands (#523, #552)", () => ompLocalCarryScenario(dir), 120_000);
 
 test("omp local, ACP: of two top-level sessions in one omp process, the first runs grayboard and the second is refused; while both live, no subagent of either gets grayboard tools, so none acts as the first session's names (#523, #470)", () => ompLocalAcpScenario(dir), 120_000);

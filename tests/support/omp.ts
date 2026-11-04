@@ -12,12 +12,12 @@ import { delimiter, dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { hostTools, snapshotTools } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
-import { adapterBundle, adapterSource } from "../../src/cli/adapters.ts" with { type: "macro" };
+import { adapterBundle } from "../../src/cli/adapters.ts" with { type: "macro" };
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { cleanEnv, localEnv } from "./env.ts";
 import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
-import { answerPeer, expectDeliveryRecords, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
+import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
 import { grayboardChildPids, grayboardDescendants, sigkill } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
@@ -30,7 +30,7 @@ const OMP_CLI = join(dirname(OMP_PKG), OMP.bin.omp);
 const OMP_ARGS = ["--mode", "rpc", "--provider", "fake", "--model", "fake-1", "--no-lsp", "--no-skills", "--no-rules", "--no-context-files", "--no-title"];
 
 const BUNDLE = adapterBundle("omp");
-const SOURCE = adapterSource("omp");
+const LOCAL_BUNDLE = adapterBundle("omp", "local");
 const OMP_CLIENT = "grayboard-omp";
 export const PREFIX = "mcp__grayboard_";
 const LOGIN_NOTICE = "grayboard: Signed out of grayboard in omp; run /grayboard login";
@@ -350,7 +350,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 }
 
 // Local mode, as `grayboard setup` leaves omp: the adapter
-// (adapterSource("omp")) at <agentDir>/extensions/grayboard.ts and the
+// (adapterBundle("omp", "local")) at <agentDir>/extensions/grayboard.ts and the
 // disabled grayboard entry in <agentDir>/mcp.json it reads its command from;
 // omp's own MCP client runs no grayboard (#523). The entry's BUS_DB_PATH is a
 // `${VAR}` placeholder the adapter expands as omp's loader does: unexpanded,
@@ -358,7 +358,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 function installLocal(dir: string, modelPort: number): void {
   const agentDir = agentDirOf(dir);
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
-  writeFileSync(join(agentDir, "extensions", "grayboard.ts"), SOURCE);
+  writeFileSync(join(agentDir, "extensions", "grayboard.ts"), LOCAL_BUNDLE);
   writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({
     mcpServers: { grayboard: { command: process.execPath, args: [CLI, "mcp", "--mode", "local"], env: { BUS_PUSH: "off", BUS_DB_PATH: "${OMP_TEST_BUS}" }, enabled: false } },
   }));
@@ -571,9 +571,10 @@ export function ompLocalPinScenario(dir: string): Promise<void> {
   });
 }
 
-// A local omp session keeps its grayboard and its name (#523). A grayboard
-// process that dies is restarted, as omp's MCP manager restarted a stdio
-// server, and binds the name back from its name record. /new keeps the
+// A local omp session keeps its grayboard and its name (#523). A push-started
+// bind changes the next request's instructions without a new user prompt (#552).
+// A grayboard process that dies is restarted, as omp's MCP manager restarted
+// a stdio server, and binds the name back from its name record. /new keeps the
 // process, session and name, and a push-started turn after it gets the
 // instructions as a hidden message, since omp rebuilt the system prompt
 // without them. A file-backed omp URL in an argument (local://) reaches
@@ -591,7 +592,9 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
         { tool: `${PREFIX}dm_send`, args: { to: "peer", body: "note attached", attachments: ["local://note.md"] } },
       ]),
       scripted("who", [{ tool: `${PREFIX}whoami`, args: {} }]),
-      onChannelDm("peer", (id) => ({ tool: `${PREFIX}dm_send`, args: { to: "peer", body: "pong", parent_id: id } })),
+      onChannelDm("peer", (id, text) => text.includes("bind from push")
+        ? { tool: `${PREFIX}bind`, args: { name: "omp-push", create: true } }
+        : { tool: `${PREFIX}dm_send`, args: { to: "peer", body: "pong", parent_id: id } }),
     ]);
     let peer: Session | undefined;
     try {
@@ -610,6 +613,16 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
       expect(resultText(await toolResult(omp, "dm_send"))).not.toContain("error");
       const note = localRows<{ filename: string; size: number }>(dir, "SELECT a.filename, a.size FROM attachments a JOIN messages m ON m.id = a.message_id WHERE m.body = 'note attached'");
       expect(note).toEqual([{ filename: "note.md", size: "note body\n".length }]);
+
+      // No new user prompt: this DM starts a turn that binds another name.
+      // The request after bind must already carry its updated instructions (#552).
+      const pushedBind = (await peer.call("dm_send", { to: "omp-carry", body: "bind from push" })).message_id as number;
+      const afterBind = await until(() => model.requests.find((r) =>
+        r.body.messages.some((m) => messageText(m).includes(`message_id="${pushedBind}"`)) &&
+        r.body.messages.some((m) => m.role === "tool" && messageText(m).includes("omp-push"))), 30_000, "the request after the push-started bind");
+      expect(systemText(afterBind.body)).toContain("omp-push");
+      expect(systemText(afterBind.body).split(`You are identity "omp-carry" on the grayboard bus`)).toHaveLength(2);
+      await idle(omp);
 
       // The grayboard process dies: the adapter starts another, which takes the name back.
       const [dead] = grayboardChildPids(omp.pid);
@@ -886,11 +899,13 @@ export function ompHostedRefreshLogoutScenario(dir: string): Promise<void> {
       expect(status).toContain("\nsign-in: signed out (logged_out); run /grayboard login\n");
       expect(status).toMatch(/: paused, /);
     }
-    // The other process's next tool call says to sign in.
-    await b.command({ type: "prompt", message: "check" });
-    const checked = await toolResult(b, "whoami");
-    expect(checked.isError).toBe(true);
-    expect(resultText(checked)).toBe("error: Signed out of grayboard in omp; run /grayboard login");
+    // The other process's next tool call offers a sign-in; once it lands,
+    // both processes' roots restart (unbound: the logout's revoke ended their sessions).
+    await expectSignInOffer(srv, b, "omp", { results: 0, whoami: (nth) => toolResult(b, "whoami", nth), idle: (p) => idle(p) });
+    for (const proc of [a, b]) await until(async () => {
+      const status = await statusOf(proc);
+      return status.includes("\nsign-in: signed in\n") && !status.includes("paused") ? status : undefined;
+    }, 20_000, "both roots restarted signed in");
     await Promise.all([a.quit(), b.quit()]);
   });
 }

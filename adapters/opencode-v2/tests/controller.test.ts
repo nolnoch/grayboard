@@ -899,7 +899,7 @@ test.each([true, false, undefined, "true", "false", 1, {}, null])("Promise lifec
   try {
     cleanup = await setup({ ...r.ctx, options: { name: "fe", create },
       rpc: { register: async () => ({ dispose: async () => {} }) },
-      tool: { ...r.ctx.tool, hook: async () => ({ dispose: async () => {} }) },
+      tool: { ...r.ctx.tool, hook: async () => ({ dispose: async () => {} }), transform: async () => ({ dispose: async () => {} }) },
       event: { async *subscribe({ signal }: { signal: AbortSignal }) {
         yield { type: "session.created", data: { sessionID: "R" } };
         if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -931,7 +931,7 @@ test.each([[true, true], ["true", false], [1, false], [undefined, false]])("plug
   try {
     cleanup = await setup({ ...r.ctx, options: { name: "fe", launcher },
       rpc: { register: async () => ({ dispose: async () => {} }) },
-      tool: { ...r.ctx.tool, hook: async () => ({ dispose: async () => {} }) },
+      tool: { ...r.ctx.tool, hook: async () => ({ dispose: async () => {} }), transform: async () => ({ dispose: async () => {} }) },
       event: { async *subscribe({ signal }: { signal: AbortSignal }) {
         yield { type: "session.created", data: { sessionID: "R" } };
         if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));

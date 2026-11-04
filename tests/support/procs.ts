@@ -37,15 +37,6 @@ export function adapterChildren(pid: number, bin?: string): string[] {
     .map((m) => m[4]!);
 }
 
-// Every grayboard process anywhere under `pid` (children, grandchildren, a
-// detached process it spawned): this checkout's CLI, or a `grayboard` binary.
-// A server-mode hosted extension runs none.
-export function grayboardDescendants(pid: number): string[] {
-  return processDescendants(pid)
-    .filter(row => row.command.includes(CLI) || /(^|\/)grayboard(\s|$)/.test(row.command))
-    .map(row => row.command);
-}
-
 export type ProcessDescendant = { pid: number; ppid: number; command: string };
 
 // Includes a failed stdio child's exec'd sleeper, which has no CLI marker.
@@ -64,6 +55,14 @@ export function processDescendants(pid: number): ProcessDescendant[] {
     }
   }
   return found;
+}
+
+// Every grayboard descendant: this checkout's CLI, or a grayboard binary.
+// A server-mode hosted extension runs none.
+export function grayboardDescendants(pid: number): string[] {
+  return processDescendants(pid)
+    .filter((p) => p.command.includes(CLI) || /(^|\/)grayboard(\s|$)/.test(p.command))
+    .map((p) => p.command);
 }
 
 // SIGKILL `pid` and wait until it's gone: the signal is asynchronous, and a

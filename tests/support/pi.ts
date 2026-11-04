@@ -23,7 +23,7 @@ import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
-import { adapterChildren, grayboardChildren, grayboardDescendants } from "./procs.ts";
+import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill } from "./procs.ts";
 import { until } from "./until.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
@@ -238,6 +238,152 @@ async function scenario(dir: string, bin?: string): Promise<void> {
     await stopAll(procs);
     model?.stop();
   }
+}
+
+// Unexpected child exits recover the bound name from the name record, even
+// without BUS_IDENTITY. Calls made while the restart is pending wait for it;
+// after three restarts, another exit leaves pi alive with a reconnect notice.
+export function piLocalRestartScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-carry", create: true } }]),
+      scripted("who", [{ tool: "mcp__grayboard__whoami", args: {} }]),
+      onChannelDm("peer", (id) => ({ tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "pong", parent_id: id } })),
+    ]);
+    let db: Database | undefined;
+    try {
+      const peer = await localSession(dir, "peer");
+      const pi = startPi(dir, model.port, procs, { identity: null });
+      await pi.command({ type: "get_state" });
+      await pi.command({ type: "prompt", message: "bind" });
+      const bound = await toolResult(pi, "bind");
+      expect(!!bound.isError).toBe(false);
+      await idle(pi);
+      db = new Database(join(dir, "bus.db"), { readonly: true });
+      const holder = () => db!.query<{ id: string }, []>("SELECT id FROM alias_holds WHERE address = 'pi-carry'").get()?.id;
+      let previous = holder()!;
+      expect(previous).toBeDefined();
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const [dead] = grayboardChildPids(pi.pid);
+        expect(dead).toBeDefined();
+        await sigkill(dead!);
+        // Do not wait for a replacement: the 1 s and 5 s backoffs are still
+        // pending when this call reaches the adapter.
+        await pi.command({ type: "prompt", message: "who" });
+        const result = await toolResult(pi, "whoami", attempt);
+        expect(!!result.isError).toBe(false);
+        const who = JSON.parse(resultText(result));
+        expect(who.primary).toBe("pi-carry");
+        expect(who.aliases).toEqual(["pi-carry"]);
+        expect(who.id).not.toBe(previous);
+        expect(holder()).toBe(who.id);
+        previous = who.id;
+        const [live] = grayboardChildPids(pi.pid);
+        expect(grayboardChildPids(pi.pid)).toHaveLength(1);
+        expect(live).not.toBe(dead);
+        await idle(pi);
+      }
+
+      // The new child still owns delivery, not just the tool transport.
+      const sent = await peer.call("dm_send", { to: "pi-carry", body: "ping" });
+      await until(() => peer.pushes.find((p) => p.content.includes("pong")), 15_000, "pong after restart");
+      expect((await peer.call("dm_thread", { thread: sent.message_id })).map((m: { sender: string; body: string }) => [m.sender, m.body])).toEqual([["peer", "ping"], ["pi-carry", "pong"]]);
+      await idle(pi);
+
+      const [last] = grayboardChildPids(pi.pid);
+      await sigkill(last!);
+      const notice = await until(() => pi.notices().find((n) => n.includes("after 3 restarts; restart pi to reconnect")), 15_000, "restart exhaustion notice");
+      expect(notice).toContain("grayboard process exited (SIGKILL)");
+      await pi.command({ type: "prompt", message: "who" });
+      const failed = await toolResult(pi, "whoami", 3);
+      expect(failed.isError).toBe(true);
+      expect(resultText(failed)).toContain("grayboard process exited (SIGKILL)");
+      expect(grayboardChildPids(pi.pid)).toEqual([]);
+      await idle(pi);
+
+      // A new pi session clears the exhausted restart count.
+      await pi.command({ type: "new_session" });
+      await pi.command({ type: "prompt", message: "who" });
+      const reset = await toolResult(pi, "whoami");
+      expect(!!reset.isError).toBe(false);
+      expect(JSON.parse(resultText(reset)).primary).toBe("pi-carry");
+      await idle(pi);
+      expect(model.unhandled).toEqual([]);
+      await pi.quit();
+      expect(grayboardChildPids(pi.pid)).toEqual([]);
+    } finally {
+      await stopAll(procs);
+      model.stop();
+      db?.close();
+    }
+  });
+}
+
+// /new during the longest backoff cancels the outgoing session's timer,
+// whether idle or blocked in a tool wait. Observe past the timer's deadline
+// to catch a late duplicate child, and verify the new child owns the name.
+export function piLocalRestartShutdownScenario(dir: string, waitingTool = false): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-shutdown", create: true } }]),
+      scripted("who", [{ tool: "mcp__grayboard__whoami", args: {} }]),
+    ]);
+    let pi: Pi | undefined;
+    let db: Database | undefined;
+    try {
+      pi = startPi(dir, model.port, procs, { identity: null });
+      const session = pi;
+      await session.command({ type: "get_state" });
+      await session.command({ type: "prompt", message: "bind" });
+      expect(!!(await toolResult(session, "bind")).isError).toBe(false);
+      await idle(session);
+      db = new Database(join(dir, "bus.db"), { readonly: true });
+      const holder = () => db!.query<{ id: string; pid: number; raw: string }, []>(
+        "SELECT h.id, b.pid, i.harness_session AS raw FROM alias_holds h JOIN ids i ON i.id = h.id JOIN bindings b ON b.session_id = h.id WHERE h.address = 'pi-shutdown'",
+      ).get();
+      let previous = holder()!.id;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const [dead] = grayboardChildPids(session.pid);
+        await sigkill(dead!);
+        await until(() => holder() && holder()!.id !== previous, 15_000, "the name restored before another kill");
+        previous = holder()!.id;
+      }
+
+      const [dead] = grayboardChildPids(session.pid);
+      await sigkill(dead!);
+      await until(() => session.notices().some((n) => n.includes("restarting it (3 of 3)")), 1_000, "5 s backoff scheduled");
+      if (waitingTool) {
+        await session.command({ type: "prompt", message: "who" });
+        await until(() => session.events.some((e) => e.type === "tool_execution_start" && e.toolName === "mcp__grayboard__whoami"), 1_000, "the tool waiting on the backoff");
+      }
+      // No tool call in the idle case. The busy case must abort its wait
+      // rather than making /new sit through the remaining 5 s backoff.
+      await session.command({ type: "new_session" }, 2_000);
+      const fresh = await session.command({ type: "get_state" });
+      await until(() => holder()?.raw === fresh.sessionId, 15_000, "the new session holds the name");
+      const live = grayboardChildPids(session.pid);
+      expect(live).toHaveLength(1);
+      expect(holder()!.pid).toBe(live[0]);
+      expect(holder()!.id).not.toBe(previous);
+      // A negative assertion needs the old timer's complete 5 s window.
+      await Bun.sleep(5_500);
+      expect(grayboardChildPids(session.pid)).toEqual(live);
+      expect(holder()).toMatchObject({ pid: live[0], raw: fresh.sessionId });
+      expect(model.unhandled).toEqual([]);
+      await session.quit();
+    } finally {
+      // Mutation runs may leave a duplicate child the adapter no longer owns.
+      for (const p of pi ? processDescendants(pi.pid) : []) {
+        try { process.kill(p.pid, "SIGKILL"); } catch {}
+      }
+      await stopAll(procs);
+      model.stop();
+      db?.close();
+    }
+  });
 }
 
 // Started without BUS_IDENTITY, the session is unbound: reads work, the rest
@@ -521,21 +667,29 @@ export function piMissingBinaryScenario(dir: string): Promise<void> {
 }
 
 // A grayboard that stops reading while it still runs (tests/support/stdin_closed.sh):
-// the extension's next write fails with EPIPE, which pi survives and reports.
+// pi survives EPIPE, retries, and reports exhaustion without leaving children.
 export function piStdinClosedScenario(dir: string): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([]);
+    let pi: Pi | undefined;
     try {
       const stub = join(ROOT, "tests/support/stdin_closed.sh");
-      const pi = startPi(dir, model.port, procs, { entry: { command: stub, args: [process.execPath, CLI, "mcp", "--mode", "local"] } });
-      await pi.command({ type: "get_state" });
-      const notice = await until(() => pi.notices().find((n) => n.includes("stopped reading")), 15_000, "EPIPE notice");
+      pi = startPi(dir, model.port, procs, { entry: { command: stub, args: [process.execPath, CLI, "mcp", "--mode", "local"] } });
+      const session = pi;
+      await session.command({ type: "get_state" });
+      const notice = await until(() => session.notices().find((n) => n.includes("stopped reading") && n.includes("after 3 restarts")), 15_000, "EPIPE restart exhaustion notice");
       expect(notice).toContain("grayboard process stopped reading: ");
       expect(notice).toContain("restart pi to reconnect");
-      await pi.command({ type: "get_state" });
-      await pi.quit();
+      // The stub execs sleep, so grayboard-only process filters miss it.
+      await until(() => processDescendants(session.pid).length === 0, 1_000, "no EPIPE stub descendants after give-up");
+      expect(processDescendants(session.pid)).toEqual([]);
+      await session.command({ type: "get_state" });
+      await session.quit();
     } finally {
+      for (const p of pi ? processDescendants(pi.pid) : []) {
+        try { process.kill(p.pid, "SIGKILL"); } catch {}
+      }
       await stopAll(procs);
       model.stop();
     }
@@ -706,6 +860,41 @@ export async function expectDeliveryRecords(file: string, root: string, pings: n
     expect(entries.findIndex((e) => e.event === "receipted" && e.itemIds.includes(id))).toBeGreaterThan(at);
   }
   expect(JSON.stringify(entries)).not.toContain(`ping ${name}`);
+}
+
+// After a sign-out, a signed-out tool call offers a sign-in (#499): the
+// result says the user has the link ahead of the unchanged refusal, never
+// the URL itself (#500), and so does a second refused call while the flow
+// is pending; the URL is on the notice line only (once: the second call
+// joins the flow), the server's consent page approves it, and the next call runs. `check` prompts the scripted
+// whoami; `results` is how many whoami results the session already holds.
+export async function expectSignInOffer(srv: HostedServer, proc: Pi, harness: string, o: { results: number; whoami(nth: number): Promise<PiMessage>; idle(proc: Pi): Promise<unknown> }): Promise<void> {
+  const check = async (nth: number) => {
+    await proc.command({ type: "prompt", message: "check" });
+    const result = await o.whoami(nth);
+    await o.idle(proc);
+    return result;
+  };
+  const offered = async (nth: number) => {
+    const result = await check(nth);
+    expect(result.isError).toBe(true);
+    const text = resultText(result);
+    expect(text).toBe(`grayboard: sign-in started: ask the user to open the link ${harness} shows (/grayboard login shows it again), then call a grayboard tool again\nerror: Signed out of grayboard in ${harness}; run /grayboard login`);
+    expect(text).not.toContain(srv.issuer);
+  };
+  const seen = proc.notices().length;
+  await offered(o.results);
+  await offered(o.results + 1);
+  // The offer opened no browser: the URL went to the notice line alone, once.
+  const urls = proc.notices().slice(seen).map((n) => /^grayboard: sign in at (\S+)$/.exec(n)?.[1]).filter(Boolean);
+  expect(urls).toHaveLength(1);
+  const url = urls[0]!;
+  expect(url).toStartWith(`${srv.issuer}/`);
+  expect(await browse(srv.issuer, url, harness)).toContain("Signed in to grayboard");
+  await until(() => proc.notices().includes("grayboard: signed in"), 15_000, "the signed-in notice");
+  const ran = await check(o.results + 2);
+  expect(ran.isError).toBeFalsy();
+  expect(resultText(ran)).not.toContain("Signed out");
 }
 
 type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: { persist?: boolean; session?: string }): Pi };
@@ -946,11 +1135,13 @@ export function piHostedRefreshLogoutScenario(dir: string): Promise<void> {
       expect(status).toContain("\nsign-in: signed out (logged_out); run /grayboard login\n");
       expect(status).toMatch(/: paused, /);
     }
-    // The other process's next tool call says to sign in.
-    await b.command({ type: "prompt", message: "check" });
-    const checked = await toolResult(b, "whoami");
-    expect(checked.isError).toBe(true);
-    expect(resultText(checked)).toBe("error: Signed out of grayboard in pi; run /grayboard login");
+    // The other process's next tool call offers a sign-in; once it lands,
+    // both processes' roots restart (unbound: the logout's revoke ended their sessions).
+    await expectSignInOffer(srv, b, "pi", { results: 0, whoami: (nth) => toolResult(b, "whoami", nth), idle });
+    for (const proc of [a, b]) await until(async () => {
+      const status = await statusOf(proc);
+      return status.includes("\nsign-in: signed in\n") && !status.includes("paused") ? status : undefined;
+    }, 20_000, "both roots restarted signed in");
     await Promise.all([a.quit(), b.quit()]);
   });
 }

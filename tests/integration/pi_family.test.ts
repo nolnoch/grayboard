@@ -78,6 +78,8 @@ function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?
       deliver: (content, wake) => { self.deliveries.push({ content, wake }); onDeliver?.(); },
       notify: (message, level) => { self.notices.push({ message, level }); },
       record: data => { self.records.push(data); },
+      // A headless fixture: a signed-out call fails at once instead of offering a sign-in (#499).
+      interactive: () => false,
       ...(facts ? { facts } : {}),
     }),
     tools: () => tools,
