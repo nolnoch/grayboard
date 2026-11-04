@@ -79,10 +79,10 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   const root = mkdtempSync(join(tmpdir(), "gb-evidence-test-")); roots.push(root);
   const output = mode === "cross-filesystem" ? mkdtempSync("/dev/shm/gb-evidence-public-") : join(root, "public");
   if (mode === "cross-filesystem") { roots.push(output); expect(statSync(root).dev === statSync(output).dev).toBe(false); }
-  for (const dir of ["scripts", "src", "tests/e2e", "tests/integration", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "adapters/hosted-core", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
+  for (const dir of ["scripts", "src", "tests/e2e", "tests/integration", "tests/support", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "adapters/hosted-core", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
   for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts", "hosted-matrix.ts", "hosted-matrix-shell.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
-  writeFileSync(join(root, "tests/e2e/opencode-config.ts"), "export {};\n");
+  for (const file of ["tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts"]) writeFileSync(join(root, file), "export {};\n");
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
   writeFileSync(join(root, "adapters/hosted-core/package.json"), '{"name":"fixture-core","version":"1.0.0"}');
   writeFileSync(join(root, "tests/integration/hosted_core_sync.test.ts"), 'import { test } from "bun:test"; test("sync", () => {});\n');

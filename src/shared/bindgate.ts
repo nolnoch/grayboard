@@ -2,6 +2,8 @@
 // audit 11): a call picks the address it acts as from the session's holds
 // when it starts (#284 S3, S4, S14), so a change to them mid-call would let
 // it act as an alias the session no longer holds. Both modes use it.
+import { testPause } from "./testpause.ts";
+
 export class BindGate {
   private active = 0;
   private drained: (() => void) | null = null;
@@ -25,7 +27,12 @@ export class BindGate {
     const closed = new Promise<void>((r) => { open = r; });
     this.closed = closed;
     try {
-      if (this.active) await new Promise<void>((r) => { this.drained = r; });
+      if (this.active) {
+        // A bind now waiting for the calls in flight: a trace point for the hosted races' real-OpenCode test
+        // (#383), synchronous so it adds no turn to the wait.
+        testPause("bindgate:bind:drain");
+        await new Promise<void>((r) => { this.drained = r; });
+      }
       this.drained = null;
       return await fn();
     } finally {
