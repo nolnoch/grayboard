@@ -1,6 +1,6 @@
 # grayboard-opencode
 
-Standalone hosted Grayboard integration targeting the published OpenCode **2.1.4** API and official MCP client **2.4.0**. Native HTTP MCP remains the only agent-tool, OAuth, credential-storage and refresh owner. This package adds session ancestry registration and human-approved durable delivery; it registers no agent tools, runs no CLI/proxy and never reads a refresh token or private credential file.
+Standalone hosted Grayboard integration targeting the published OpenCode **2.1.4** API and official MCP client **2.4.0**. Native HTTP MCP owns server tools, OAuth, credential storage and refresh. This package adds session ancestry registration, human-approved durable delivery and local attachment transfers; it runs no CLI/proxy and never reads a refresh token or private credential file.
 
 ## Install from Git
 
@@ -40,6 +40,14 @@ The plugin observes exact native configured tool IDs, including the inner native
 Subscriber calls carry `_meta["ai.opencode/sessionID"]` from the approved root, using the same current native access. The server's client mapping selects the context source. Roots and children never share delivery targets. Retained routes permit idempotent archive/delete cleanup after host records disappear; child-self `session_end` closes only that child, and root release/end closes the ownership. Host shutdown closes transport without proactively ending ownership, allowing a restart within the server deadline; explicit pause ends ownership immediately when authorized cleanup succeeds.
 
 Native account/configuration drift latches delivery rather than retargeting it. Restoring a saved approval requires both root metadata and the protected plugin-storage fingerprint. No `rootSessionID` startup option manufactures approval. Cleanup requires fresh current access and unchanged binding; when that is unavailable, server expiry remains the backstop.
+
+## Attachments
+
+Native `dm_send` and `board_post` accept `attachments` containing local paths, while preserving already-uploaded `attachment_ids`; a call must choose one. The package registers `attachment_get` in the selected MCP namespace for both direct tools and CodeMode. It returns the saved path and descriptor, not an HTTP URL requiring credentials to be supplied by the model.
+
+Transfers reuse hosted-core's byte transport and the same shared path, secret-file, size and digest checks as pi/omp. Paths resolve relative to the OpenCode host's working directory, not the plugin process's launch directory. Explicit save directories must already exist under the working directory or `BUS_ATTACH_ROOTS`; the default is this bus's subdirectory of `GRAYBOARD_ATTACHMENTS_DIR`. Native grant projection is captured for each transfer, then rechecked on each byte request; native OAuth remains the only refresher. Child hooks await registration before uploading or fetching as the child. Refused sends release their unsent uploads.
+
+The host's normal namespaced tool permission must allow a transfer before any upload or save. Send transforms perform this check before reading files because the original native MCP execute checks too late for the added upload step; the original native send still performs its own authorization.
 
 ## Delivery safety
 

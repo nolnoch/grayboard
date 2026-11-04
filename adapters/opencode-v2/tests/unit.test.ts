@@ -6,8 +6,38 @@ import { Wire, SubscriberError, LeaseUnavailable, ServerUnreachable, subscriberE
 import { failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
 import { METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { admitPrefix, identityOf, itemsOf, leaseOf, render, stableID } from "../src/core/model.js";
+import { attachmentTools } from "../src/transfer-tools.js";
+import type { Info } from "@opencode/plugin/promise/tool";
+import { z } from "zod";
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
 const wireOptions = (url: string) => ({ url, sessionKey: "ai.opencode/sessionID", client: { name: "grayboard-opencode", version: "1.10.0" } });
+test("attachment tools extend only the configured native namespace and declare saved output", async () => {
+  const invoke = async () => ({ content: "native result" });
+  const tools = ["bus", "other"].flatMap(namespace => ["dm_send", "board_post"].map(name => ({
+    id: `${namespace}_${name}`, name, description: "attachment_ids?", options: { namespace, codemode: true as const },
+    input: { type: "object", properties: { attachment_ids: { type: "array", items: { type: "integer" } } }, required: ["body"] }, execute: invoke,
+  }))) as (Info & { id: string })[];
+  const permissionActions: string[] = [];
+  const ctx = { permission: { assert: async ({ action }: { action: string }) => { permissionActions.push(action); throw new Error("Permission denied"); } }, tool: { transform: async (apply: (editor: unknown) => void) => {
+    apply({ list: () => tools, update: (id: string, mutate: (tool: Info) => void) => mutate(tools.find(t => t.id === id)!), add: (tool: Info) => tools.push({ ...tool, id: `${tool.options!.namespace}_${tool.name}` }) });
+    return { dispose: async () => {} };
+  } } } as unknown as Context;
+  await attachmentTools(ctx, { options: { mcpName: "bus" } } as Controller);
+  for (const name of ["dm_send", "board_post"]) {
+    const tool = tools.find(t => t.id === `bus_${name}`)!;
+    expect(tool.input).toMatchObject({ required: ["body"], properties: { attachment_ids: { type: "array" }, attachments: { type: "array", items: { type: "string" } } } });
+    expect(tools.find(t => t.id === `other_${name}`)!.execute).toBe(invoke);
+    await expect(tool.execute({ attachment_ids: [1] }, {} as never)).resolves.toEqual({ content: "native result" });
+    await expect(tool.execute({ attachments: [], attachment_ids: [] }, {} as never)).rejects.toThrow("not both");
+    await expect(tool.execute({ attachments: ["report.txt"] }, {} as never)).rejects.toThrow("Permission denied");
+  }
+  const get = tools.find(t => t.id === "bus_attachment_get")!;
+  expect(get.options).toEqual({ namespace: "bus", codemode: true });
+  expect(get.input).toMatchObject({ required: ["id"] });
+  expect((get.output as z.ZodType).safeParse({ path: "/work/1-file.txt", filename: "file.txt", type: "text/plain", size: 2, sha256: "hash" }).success).toBe(true);
+  await expect(get.execute({ id: 1 }, {} as never)).rejects.toThrow("Permission denied");
+  expect(permissionActions).toEqual(["bus_dm_send", "bus_board_post", "bus_attachment_get"]);
+});
 test("typed unknown-name suggestions are bounded validated account names, not arbitrary error data", () => {
   expect(subscriberError({ code: "identity_unknown", known: ["be", "fe", "be"] }, false).known).toEqual(["be", "fe"]);
   expect(subscriberError({ code: "identity_unknown", known: ["_task", "-task", ...Array(254).fill("be")] }, false).known).toEqual(["_task", "-task", "be"]);

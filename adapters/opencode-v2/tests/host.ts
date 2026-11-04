@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Database } from "bun:sqlite";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createFixtureHost } from "./effect-host.js";
@@ -181,7 +181,44 @@ try {
   const projected = await ctx.integration.connection.resolve(selected); if (projected?.type === "oauth") console.log("NATIVE_GRANT_METADATA", JSON.stringify({ issuer: projected.metadata?.issuer, scope: projected.metadata?.scope, serverUrl: projected.metadata?.serverUrl, clientID: (projected.metadata?.client as { client_id?: string })?.client_id }));
   await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tools");
   let rpc = host.rpc(Grayboard);
-  if (process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission")) {
+  if (process.env.GRAYBOARD_TEST_REAL_RACE === "attachments") {
+    const sender = await makeRoot("Attachment sender"), receiver = await makeRoot("Attachment receiver");
+    await rpc.enroll({ sessionID: receiver.id, name: "fe", create: true }, { location });
+    await invoke(sender.id, "bind", { name: "be", create: true });
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 255]);
+    writeFileSync(join(location.directory, "roundtrip.png"), bytes);
+    mkdirSync(join(location.directory, "received"));
+    await invoke(sender.id, "dm_send", { to: "fe", body: "Native path attachment", attachments: ["roundtrip.png"] });
+    const file = app.db.query<{ id: number; filename: string; size: number }, []>("SELECT a.id, a.filename, a.size FROM attachments a JOIN messages m ON a.message_id = m.id WHERE m.body = 'Native path attachment'").get();
+    assert(file, "Agent dm_send uploads its local path and binds the upload to the DM");
+    assert.equal(file.filename, "roundtrip.png"); assert.equal(file.size, bytes.length);
+    await wait(() => admissions.some(x => x.sessionID === receiver.id && x.text.includes("roundtrip.png")), Boolean, "Receiver sees the delivered attachment metadata");
+    await host.session.wait({ sessionID: receiver.id });
+    await invoke(receiver.id, "attachment_get", { id: file.id, dir: "received" });
+    const saved = join(location.directory, "received", `${file.id}-roundtrip.png`);
+    assert.deepEqual(readFileSync(saved), bytes, "The received file is saved byte-for-byte in the host working directory");
+    assert(modelRequests.some(r => r.sessionID === receiver.id && r.body.includes(saved)), "attachment_get returns the saved path in the agent's next model request");
+    await invoke(sender.id, "board_create", { name: "files", purpose: "Attachment roundtrip" });
+    await invoke(sender.id, "board_post", { board: "files", body: "Native board file", attachments: ["roundtrip.png"] });
+    const boardFile = app.db.query<{ id: number }, []>("SELECT a.id FROM attachments a JOIN posts p ON a.post_id = p.id WHERE p.body = 'Native board file'").get();
+    assert(boardFile, "Agent board_post accepts the same local-path parameter");
+    await invoke(receiver.id, "attachment_get", { id: boardFile.id });
+    const defaultSaved = join(process.env.HOME!, ".grayboard/attachments/grayboard.example.com", `${boardFile.id}-roundtrip.png`);
+    assert.deepEqual(readFileSync(defaultSaved), bytes);
+    const downloads = audits(app.db, "attachment.downloaded").length;
+    await invoke(receiver.id, "attachment_get", { id: file.id, dir: "/" });
+    assert.equal(audits(app.db, "attachment.downloaded").length, downloads, "An unsafe save path is refused before download");
+    await rpc.enroll({ sessionID: sender.id }, { location });
+    const child = await host.session.create({ location, parentID: sender.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
+    await invoke(child.id, "dm_send", { to: "fe", body: "Child path attachment", attachments: ["roundtrip.png"] });
+    assert.equal(row(child.id)?.root_session_id, row(sender.id)?.session_id);
+    const childFile = app.db.query<{ id: number }, []>("SELECT a.id FROM attachments a JOIN messages m ON a.message_id = m.id WHERE m.body = 'Child path attachment'").get();
+    assert(childFile, "Child upload is attributed to its registered source");
+    await host.session.wait({ sessionID: receiver.id });
+    await invoke(child.id, "attachment_get", { id: childFile.id, dir: "received" });
+    assert.deepEqual(readFileSync(join(location.directory, "received", `${childFile.id}-roundtrip.png`)), bytes);
+    console.log("REAL_NATIVE_ATTACHMENT_ROUNDTRIP_OK", { codeMode, dm: file.id, board: boardFile.id, child: childFile.id });
+  } else if (process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission")) {
     const s = await makeRoot("Default admission recovery");
     await rpc.enroll({ sessionID: s.id, name: "admission", create: true }, { location });
     await wait(() => app.mcp.activeLeases, n => n === 1, "default-limit initial lease");
