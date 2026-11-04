@@ -7,7 +7,7 @@ code-pointers: adapters/pi/, adapters/omp/, adapters/opencode/, adapters/pi-fami
 companions: boards.md §9 (adapter and push mechanics), boards.md §3 (handles, child sessions, name record), architecture.md §Hosted MCP (hosted wire and login), slack-bridge.md (human handles)
 ```
 
-The baseline every later change is measured against. A cell says what a user of that harness in that mode gets; how it works is in the owner doc the evidence links. "Proof" names a test or e2e suite only where one exercises that cell; `—` means none does.
+The baseline every later change is measured against: as of v2.4.0, every cell is supported or n/a, with no open gap. A cell says what a user of that harness in that mode gets; how it works is in the owner doc the evidence links. "Proof" names a test or e2e suite only where one exercises that cell; `—` means none does.
 
 ## Columns
 
