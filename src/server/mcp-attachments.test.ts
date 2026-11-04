@@ -123,6 +123,18 @@ test("registered child attachments resolve the root; query name is only an asser
   expect((await send(mismatch)).status).toBe(403);
 });
 
+// A registration's `via` names the ancestry for routing only: it never maps the intermediate. (The OpenCode
+// host suites can't show this since #535: there every subagent of an enrolled root registers on its own.)
+test("via ancestry is not registration or attachment mapping authority", async () => {
+  const p = principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
+  await hosted.register(p, root, "attachment-grandchild", ["attachment-mid"]);
+  expect(store.db.query("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get("attachment-mid")).toBeNull();
+  const upload = request("POST", "/mcp/attachments?filename=mid.txt"); upload.headers.set("X-Grayboard-Session", "attachment-mid");
+  expect((await send(upload)).status).toBe(403);
+  const own = request("POST", "/mcp/attachments?filename=grandchild.txt"); own.headers.set("X-Grayboard-Session", "attachment-grandchild");
+  expect((await send(own)).status).toBe(201);
+});
+
 for (const boundary of ["body", "store", "download"] as const) for (const operation of ["bind", "end"] as const) test(`external ${operation} during attachment ${boundary} fences root and child snapshots`, async () => {
   const p = principal();
   await hosted.register(p, sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" }), "attachment-child");
