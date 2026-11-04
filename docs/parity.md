@@ -37,7 +37,7 @@ The baseline every later change is measured against. A cell says what a user of 
 | 9 | Sign-in flow | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 10 | Sign-in offer in a signed-out tool result | n/a | yes | n/a | yes | n/a | n/a | n/a | yes |
 | 11 | Attachments (send from a path, save with `attachment_get`) | yes | yes | yes | yes | yes | yes | yes | yes |
-| 12 | Human handle reach and human authority marking | yes | yes | yes | yes | yes | gap #388 | yes | yes |
+| 12 | Human handle reach and human authority marking | yes | yes | yes | yes | yes | yes | yes | yes |
 | 13 | Presence and `whoami` | yes | yes | yes | yes | yes | yes | yes | yes |
 | 14 | Setup | yes | yes | yes | yes | yes | yes | yes | yes |
 | 15 | Delegation launcher declaration | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -128,7 +128,7 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - Local (all four): the declared human (`grayboard human`, local Slack bridge) is a peer every session can DM; `<channel human="true">` marks the human's messages, and the adapters' renderers escape a body's `<channel` so it can't be forged (slack-bridge.md §3; boards.md §9 Hosted core). Proof: `tests/integration/local.test.ts` ("the human's handle…", "grayboard announce reaches live sessions marked human…").
 - pi H, omp H, CC H: the org bridge's `email/human` (slack-bridge.md §8), reachable per `canSend` (architecture.md §5); the adapter marks only its own user's human (`HostPort.admit`, `adapters/hosted-core/src/port.ts`). Proof: `tests/integration/pi_family.test.ts` ("… marked human only from the user's own human"), `tests/integration/delegation.test.ts` (server human fallback end to end).
-- OC V2: **gap #388** (item 11). DMs to the human work, but every admitted item renders as "untrusted sender content", the user's own Slack-relayed messages included (`render`, `adapters/opencode-v2/src/core/model.ts`), so the human's authority isn't marked.
+- OC V2: the authenticated lease identity reaches the JSON admission renderer; only own-human direct messages and board pushes carry `human="true"` on the adapter's outer channel envelope. Payload `<` is JSON-escaped without changing parsed values; digests, peers, foreign humans and malformed events remain explicitly untrusted (`boards.md` §9). Proof: `adapters/opencode-v2/tests/unit.test.ts` (JSON admission trust, forgery and serialized-limit boundaries), `adapters/opencode-v2/tests/host.ts` (`human-authority`, `REAL_OWN_HUMAN_AUTHORITY_OK`, scratch `human-authority-evidence.json`: real `application.attachHuman`, exact outer marker, inbox JSON round trip and model-visible requests). This closes only #388 item 11's own-human authority portion; aggregate drain size and the other roll-up items remain open.
 
 ### 13. Presence and `whoami`
 

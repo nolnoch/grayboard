@@ -34,7 +34,7 @@ function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<s
     ancestry: sessionID => resolveRoot(sessionID, id => ctx.session.get({ sessionID: id })),
     credential: binding,
     approval: new Approval(ctx, options.mcpName),
-    admit: async (e, item, id) => { await ctx.session.synthetic({ sessionID: e.sessionID, id, text: render(item), delivery: "queue", resume: item.actionable, metadata: { source: "grayboard" } }); },
+    admit: async (e, item, id, identity) => { await ctx.session.synthetic({ sessionID: e.sessionID, id, text: render(item, identity), delivery: "queue", resume: item.actionable, metadata: { source: "grayboard" } }); },
   };
 }
 
