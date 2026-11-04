@@ -31828,6 +31828,34 @@ class NativeWire extends Connection {
   }
 }
 
+// src/shared/addressing.ts
+var MAX_IDENTITY_LENGTH = 32;
+var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
+var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
+var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
+var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
+function isValidEmail(email) {
+  return DIRECT_RE.test(`${email.toLowerCase()}/x`);
+}
+function isValidIdentityName(name) {
+  return NAME_RE.test(name.toLowerCase());
+}
+var HUMAN_NAME = "human";
+var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
+
+// adapters/hosted-core/src/own-human.ts
+var InboxEvent = discriminatedUnion("kind", [
+  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
+  object({ kind: literal("board"), item: discriminatedUnion("kind", [
+    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
+    looseObject({ kind: literal("digest"), board: string2() })
+  ]) })
+]);
+function isOwnHuman(event, identity) {
+  const human = `${identity.user.email}/${HUMAN_NAME}`;
+  return event.kind === "direct" ? event.message.sender === human : event.item.kind === "push" && event.item.post.author === human;
+}
+
 // adapters/hosted-core/src/model.ts
 var ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
 var MAX_HELD = 64;
@@ -34800,40 +34828,17 @@ function boardNotification(item) {
   };
 }
 
-// src/shared/addressing.ts
-var MAX_IDENTITY_LENGTH = 32;
-var NAME_CHARS = `[a-z0-9_-]{1,${MAX_IDENTITY_LENGTH}}`;
-var DIRECT_RE = new RegExp(`^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\/${NAME_CHARS}$`);
-var TEAM_RE = new RegExp(`^team:${NAME_CHARS}$`);
-var NAME_RE = new RegExp(`^${NAME_CHARS}$`);
-function isValidEmail(email) {
-  return DIRECT_RE.test(`${email.toLowerCase()}/x`);
-}
-function isValidIdentityName(name) {
-  return NAME_RE.test(name.toLowerCase());
-}
-var HUMAN_NAME = "human";
-var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
-
 // adapters/hosted-core/src/channel.ts
-var InboxEvent = discriminatedUnion("kind", [
-  object({ kind: literal("direct"), message: looseObject({ id: number2(), sender: string2(), body: string2() }) }),
-  object({ kind: literal("board"), item: discriminatedUnion("kind", [
-    looseObject({ kind: literal("push"), post: looseObject({ author: string2(), body: string2() }) }),
-    looseObject({ kind: literal("digest"), board: string2() })
-  ]) })
-]);
 function channelParams(item, identity) {
   const event = InboxEvent.parse(item.event);
-  const human = `${identity.user.email}/${HUMAN_NAME}`;
   if (event.kind === "direct") {
     const params = dmNotification(event.message, identity.identity_full);
-    if (event.message.sender === human)
+    if (isOwnHuman(event, identity))
       params.meta.human = "true";
     return params;
   }
   const params = boardNotification(event.item);
-  if (event.item.kind === "push" && event.item.post.author === human)
+  if (isOwnHuman(event, identity))
     params.meta.human = "true";
   return params;
 }
