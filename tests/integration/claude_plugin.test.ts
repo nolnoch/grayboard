@@ -26,6 +26,7 @@ import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
+import { putSignIn, sessionDir, SIGN_IN } from "../../src/shared/claude_agents.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
@@ -163,8 +164,20 @@ const runHook = (s: Session, event: string, input: Record<string, unknown>) => {
   const r = Bun.spawnSync([process.execPath, HOOK, event, "--data", data], {
     stdin: new TextEncoder().encode(JSON.stringify(input)), env: { PATH: process.env.PATH!, CLAUDE_PID: String(claudePid(s)) }, stdout: "pipe", stderr: "pipe",
   });
-  expect({ exit: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() }).toEqual({ exit: 0, out: "", err: "" });
+  expect({ exit: r.exitCode, err: r.stderr.toString() }).toEqual({ exit: 0, err: "" });
+  // Only post-tool-use ever prints, and only the sign-in link (#500).
+  if (event !== "post-tool-use") expect(r.stdout.toString()).toBe("");
+  return r.stdout.toString();
 };
+// What the hook after a grayboard call shows the user: the live sign-in link's line, or nothing (#500).
+const shown = (s: Session) => {
+  const out = runHook(s, "post-tool-use", { hook_event_name: "PostToolUseFailure", tool_name: "mcp__plugin_grayboard_grayboard__whoami", tool_use_id: `toolu_01Shown${++uses}` });
+  return out ? (JSON.parse(out) as { systemMessage: string }).systemMessage : undefined;
+};
+// The sign-in link file the plugin's server wrote for this session (#500).
+const linkFile = (s: Session) => existsSync(join(sessionDir(data, claudePid(s)), SIGN_IN));
+// A sign-in result's note: it names where the link is, never the link (#500).
+const STARTED = "grayboard: sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again";
 let uses = 0;
 // One model call as Claude Code makes it: PreToolUse's record (an `agent` for a subagent's), then the call with its tool_use_id.
 const modelCall = async (s: Session, name: string, args: Record<string, unknown>, o: { agent?: string; hook?: boolean; effort?: string } = {}) => {
@@ -406,6 +419,9 @@ test("sign-in by URL elicitation: offered at startup, re-offered by the next cal
   expect(s.elicits[0]!.url).toStartWith(`${srv.issuer}/`);
   expect(s.elicits[0]!.message).toContain(srv.issuer);
   await until(() => /sign-in failed \(elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the decline");
+  // The declined flow's link went with it (#500).
+  await until(() => !linkFile(s), 5_000, "the declined flow's link removed");
+  expect(shown(s)).toBeUndefined();
 
   // Two calls while signed out: one prompt between them.
   const calls = await Promise.all([texts(s, "whoami"), texts(s, "peer_list")]);
@@ -415,15 +431,23 @@ test("sign-in by URL elicitation: offered at startup, re-offered by the next cal
   await until(() => s.completed.length === 1, 10_000, "the elicitation's completion notice");
 }, 40_000);
 
-test("a prompt left unanswered (#497): every signed-out result carries the link, opening it signs in, and the prompt is completed and withdrawn", async () => {
+test("a prompt left unanswered (#497, #500): every signed-out call shows the user the link, no result carries it, opening it signs in, and the prompt is completed and withdrawn", async () => {
   const s = await plugin("sess-unanswered", { answer: () => new Promise(() => {}) });
   await until(() => s.elicits.length === 1, 10_000, "the startup sign-in prompt");
-  const link = new RegExp(`^grayboard: open (${RegExp.escape(srv.issuer)}/\\S+) to sign in to grayboard$`);
   const calls = await Promise.all([texts(s, "whoami"), texts(s, "peer_list")]);
-  for (const c of calls) expect(c.texts[0]).toMatch(link);
-  expect(link.exec(calls[0]!.texts[0]!)![1]).toBe(s.elicits[0]!.url);
+  for (const c of calls) {
+    expect(c.error).toBe(true);
+    expect(c.texts[0]).toBe(STARTED);
+    expect(c.texts.join("\n")).not.toContain(srv.issuer);
+  }
+  // The hook after each call shows the elicited URL, the user's line and not the model's.
+  expect(shown(s)).toBe(`grayboard: open ${s.elicits[0]!.url} to sign in`);
+  expect(s.c.getInstructions()).not.toContain(s.elicits[0]!.url);
   expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
   await signedIn(s);
+  // A finished flow's link is gone: no later call shows it.
+  expect(linkFile(s)).toBe(false);
+  expect(shown(s)).toBeUndefined();
   await until(() => s.completed.length === 1, 10_000, "the elicitation's completion notice");
   expect(s.elicits).toHaveLength(1);
   const said = s.stderr();
@@ -448,7 +472,8 @@ test("a prompt Claude Code cancels unshown (its connection-setup handler) is sen
   await until(() => /answered: cancel after \d{4,} ms/.test(s.stderr()), 10_000, "the shown prompt's Esc");
   // Esc keeps the flow and its link, and asks no more.
   const call = await texts(s, "whoami");
-  expect(call.texts[0]).toContain(`open ${s.elicits[0]!.url} to sign in to grayboard`);
+  expect(call.texts[0]).toBe(STARTED);
+  expect(shown(s)).toBe(`grayboard: open ${s.elicits[0]!.url} to sign in`);
   expect(s.elicits).toHaveLength(2);
   expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
   await signedIn(s);
@@ -469,11 +494,44 @@ test("two signed-out processes share one sign-in: one prompt between them, and b
   expect(a.elicits.length + b.elicits.length).toBe(1);
 }, 40_000);
 
-test("a client without URL elicitation gets the sign-in URL in its next tool result", async () => {
+test("a client without URL elicitation: the hook shows the link under its next call, and the result names only where it is (#500)", async () => {
   const s = await plugin("sess-nourl", { elicit: false });
   await until(() => s.stderr().includes("to sign in to grayboard"), 10_000, "the sign-in URL");
+  const url = new RegExp(`open (${RegExp.escape(srv.issuer)}/\\S+) to sign in to grayboard`).exec(s.stderr())![1]!;
   const r = await texts(s, "whoami");
-  expect(r.texts[0]).toMatch(new RegExp(`^grayboard: open ${srv.issuer.replace(/[.]/g, "\\.")}/\\S+ to sign in to grayboard$`));
+  expect(r.texts[0]).toBe(STARTED);
+  expect(r.texts.join("\n")).not.toContain(srv.issuer);
+  expect(shown(s)).toBe(`grayboard: open ${url} to sign in`);
+  expect(await browse(srv.issuer, url, "Claude Code")).toContain("Signed in to grayboard");
+  await signedIn(s);
+  expect(shown(s)).toBeUndefined();
+}, 30_000);
+
+test("a sign-in prompt that fails with the link in its error text: the flow's failure, which a later result can carry, says the prompt failed, never the link (#500)", async () => {
+  const s = await plugin("sess-elicit-error", { answer: async (e) => { throw new Error(`could not open ${e.url}`); } });
+  await until(() => /sign-in failed \(elicitation [^)]+\): /.test(s.stderr()), 10_000, "the failed prompt");
+  // The prompt's own line keeps Claude Code's text (the log is the user's); the failure is scrubbed.
+  expect(s.stderr()).toMatch(/ended without an answer: .*could not open /);
+  expect(s.stderr()).toMatch(/sign-in failed \(elicitation [^)]+\): the sign-in prompt failed\n/);
+  await until(() => !linkFile(s), 5_000, "the failed flow's link removed");
+}, 30_000);
+
+test("a link a killed predecessor left in this Claude Code process's dir is removed at connect (#500)", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const pid = 4242;
+  putSignIn(data, pid, `${srv.issuer}/authorize?state=dead`);
+  const p = createPlugin({
+    env: { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ID: "sess-leftover", CLAUDE_PLUGIN_DATA: data, GRAYBOARD_SERVER_URL: srv.resource, HOME: join(dir, "home") },
+    parentCmd: `claude ${FLAG.join(" ")}`,
+    files: { platform: "linux", home: join(dir, "home"), user: "test", read: () => null, list: () => [], plist: () => null },
+    version: "1.0.0", cwd: join(dir, "work"), claude: { pid, start: null }, log: () => {},
+  });
+  try {
+    await p.connect(InMemoryTransport.createLinkedPair()[1]);
+    expect(existsSync(join(sessionDir(data, pid), SIGN_IN))).toBe(false);
+  } finally {
+    await p.shutdown();
+  }
 }, 30_000);
 
 // #444: the drift between the pi/omp and Claude Code copies of the hosted

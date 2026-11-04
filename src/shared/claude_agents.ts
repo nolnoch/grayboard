@@ -15,6 +15,8 @@
 //   ended/<name>          hosted only: an agent id whose SubagentStop ran
 //   model, effort         hosted only: the root session's latest model and
 //                         effort (#545), each written whole by one hook event
+//   signin                hosted only: the live sign-in link (#500), which the
+//                         plugin's server writes and its post-tool-use hook shows
 //
 // Records and facts are harness-asserted, in a same-user directory. A forged
 // record can only attribute a call to a child of the same root (docs/boards.md
@@ -37,6 +39,17 @@ import { join } from "node:path";
 import { procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
 import { validSourceId } from "./session_meta.ts";
+
+/**
+ * The live sign-in link (#500). The plugin's server writes it while its flow
+ * has an authorization URL and removes it when the flow ends; the hook after
+ * each grayboard call shows it as a `systemMessage`, which Claude Code renders
+ * for the user and keeps out of the model's requests (measured on 2.1.316), so
+ * an instruction injected into the model's context never sees the URL.
+ */
+export const SIGN_IN = "signin";
+/** A sign-in flow's bound: hosted-core's FLOW_MS (login.ts), past which a link is a dead flow's. */
+export const SIGN_IN_MS = 10 * 60_000;
 
 /** A main-agent call's record. */
 export const ROOT = "-";
@@ -89,17 +102,45 @@ function put(path: string, text: string) {
   renameSync(tmp, path);
 }
 
+/** Writes the live sign-in link for Claude Code process `claudePid`'s session; throws on a write that fails. */
+export function putSignIn(base: string, claudePid: number, url: string, now = Date.now()): void {
+  const dir = sessionDir(base, claudePid);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  put(join(dir, SIGN_IN), JSON.stringify({ url, at: now }));
+}
+export function dropSignIn(base: string, claudePid: number): void {
+  rmSync(join(sessionDir(base, claudePid), SIGN_IN), { force: true });
+}
+// HTTPS, or HTTP on loopback: the shapes an authorization endpoint may take.
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
+/** The live sign-in link in `dir`, or undefined: none, malformed, not an authorization URL's shape, or older than a flow. */
+export function readSignIn(dir: string, now = Date.now()): string | undefined {
+  try {
+    const value = JSON.parse(readFileSync(join(dir, SIGN_IN), "utf8")) as { url?: unknown; at?: unknown };
+    if (typeof value.url !== "string" || typeof value.at !== "number") return undefined;
+    const age = now - value.at;
+    if (!(age >= 0 && age <= SIGN_IN_MS)) return undefined;
+    const url = new URL(value.url);
+    if (url.username || url.password) return undefined;
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname))) return undefined;
+    return url.href;
+  } catch { return undefined; }
+}
+
 function ageMs(path: string, now: number): number | undefined {
   try { return now - statSync(path).mtimeMs; } catch { return undefined; }
 }
 
 /**
- * One hook event. Never throws and prints nothing: a hook must never block or
- * alter a call; a record it failed to write surfaces as the reader's
- * missing-record error. `hosted` (the plugin's hook) also writes SubagentStop's
- * marker and the root's facts, which only the hosted plugin reads.
+ * One hook event. Never throws: a hook must never block or alter a call; a
+ * record it failed to write surfaces as the reader's missing-record error.
+ * `hosted` (the plugin's hook) also writes SubagentStop's marker and the
+ * root's facts, which only the hosted plugin reads, and answers post-tool-use
+ * with the sign-in link: the only output any event has, which the entry
+ * prints to stdout. It is only ever a `systemMessage` (the user's line):
+ * `additionalContext`, a `reason` and exit-2 stderr all reach the model.
  */
-export function runHook(event: string, stdin: string, o: { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number }): void {
+export function runHook(event: string, stdin: string, o: { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number }): string | undefined {
   try {
     const pid = Number(o.env.CLAUDE_PID);
     if (!Number.isSafeInteger(pid) || pid <= 1) return;
@@ -136,6 +177,11 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
         if (level === undefined) noFact(dir, "effort");
         else putFact(dir, "effort", level);
       }
+    } else if (event === "post-tool-use") {
+      // PostToolUse and PostToolUseFailure (a signed-out call's result is an error).
+      if (!o.hosted) return;
+      const url = readSignIn(dir, now);
+      if (url) return JSON.stringify({ systemMessage: `grayboard: open ${url} to sign in` });
     } else if (event === "model-switch") {
       // The new model's effort shows at the root's next grayboard call.
       if (o.hosted && validFact(input.to_model)) {

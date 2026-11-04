@@ -115,7 +115,7 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - Local (all four): n/a (row 9).
 - pi H, omp H: **gap #499.** A signed-out call answers "run /grayboard login", which the model can't act on.
-- CC H: every signed-out result carries the live flow's authorization URL (#497). Proof: `tests/integration/claude_plugin.test.ts` ("a prompt left unanswered (#497)…", "a client without URL elicitation gets the sign-in URL…"), e2e `claude-hosted` ("with no grant, the first tool call's result carries the sign-in link").
+- CC H: a signed-out result says a sign-in is waiting on the user, never its URL; the plugin's PostToolUse/PostToolUseFailure hook shows the live flow's authorization URL under every grayboard call as a `systemMessage`, which reaches the user and not the model (#497, #500). Proof: `tests/integration/claude_plugin.test.ts` ("a prompt left unanswered (#497, #500)…", "a client without URL elicitation…", "a sign-in prompt that fails with the link…"), `src/shared/claude_agents.test.ts` ("sign-in link (#500)"), e2e `claude-hosted` ("with no grant, the first tool call shows the sign-in link under the call, never in a request").
 - OC V2: n/a. Native OpenCode owns OAuth and the tool calls; the package registers no tools, so it has no result to put a URL in.
 
 ### 11. Attachments
@@ -158,7 +158,6 @@ The baseline every later change is measured against. A cell says what a user of 
 - #559 items 2–6: omp L robustness edges (no abort or timeout while a call waits for the process, wrapper scripts not recognised, ACP with on-disk MCP config, advisor calls, Windows).
 - #566: hosted child rows are never idle-swept, so an OC V2 launcher root degrades after about 128 subagents (`MAX_CHILDREN`) in one ownership. A capacity limit; pi H and omp H end each child with its run (`tests/integration/pi_family.test.ts`, `tests/integration/omp.test.ts` 130-subagent cases).
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
-- #500: CC H's sign-in URL in tool results opens a prompt-injection login CSRF; #499 should land on #500's fix.
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
 - #474: on a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus.
 - #427: pi's `pi update --extensions` doesn't refresh the loose-file adapter; only `grayboard update` does.

@@ -32,7 +32,7 @@ import { failure, hostTools, snapshotTools, type NativeTool } from "../../../ada
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
-import { MISSING_TEXT, readFacts, sessionDir, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
+import { dropSignIn, MISSING_TEXT, putSignIn, readFacts, sessionDir, SIGN_IN_MS, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { configuredIdentity, describeLocation } from "../../../src/shared/identity.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
@@ -44,10 +44,9 @@ export const SOURCE = "plugin:grayboard:grayboard";
 export const ENTRY = `plugin:${CLAUDE_PLUGIN}` as const;
 export const RESUME_HINT = "call any grayboard tool to retry";
 // How each kind of session signs in, for AccessExpired and the instructions.
-export const LOGIN_INTERACTIVE = "open the sign-in link a grayboard tool result carries, or approve the sign-in prompt Claude Code shows";
+export const LOGIN_INTERACTIVE = "open the sign-in link Claude Code shows under a grayboard tool call, or approve the sign-in prompt Claude Code shows";
 export const LOGIN_ELSEWHERE = "sign in from an interactive Claude Code session (call any grayboard tool there)";
 const INSTRUCTIONS_MS = 5_000;
-const FLOW_MS = 10 * 60_000;
 // How long a signed-out call waits for its sign-in link: past discovery's
 // two 10 s request timeouts the server is likely down, and the result says
 // the sign-in is still starting rather than hold the call.
@@ -114,11 +113,11 @@ export function createPlugin(o: PluginOptions): Plugin {
   let initialized = false;
   const { promise: ready, resolve: markInitialized } = Promise.withResolvers<void>();
   // The sign-in in flight: `link` resolves with its authorization URL once
-  // the flow has one, or undefined if it ends first. `failed` is why the
+  // the flow has one (`url`), or undefined if it ends first. `failed` is why the
   // flow ended without signing in, for the result of a call waiting on it.
   // `prompt` is its open elicitation, withdrawn once the browser answers.
   // `elsewhere` says another process's sign-in is the one in flight.
-  type Flow = { abort: AbortController; done: Promise<void>; link: Promise<string | undefined>; show(url: string | undefined): void; prompt?: { id: string; withdraw: AbortController }; elsewhere?: string };
+  type Flow = { abort: AbortController; done: Promise<void>; link: Promise<string | undefined>; show(url: string | undefined): void; url?: string; prompt?: { id: string; withdraw: AbortController }; elsewhere?: string };
   let signingIn: Flow | undefined;
   let failed: string | undefined;
 
@@ -133,12 +132,17 @@ export function createPlugin(o: PluginOptions): Plugin {
 
   const login = "error" in config ? undefined : new Login({
     resource: config.url, clientId: CLIENT_ID, stateDir: config.dataDir, harness: HARNESS, loginAction,
-    // Every signed-out tool result carries the URL while the flow runs (#497:
-    // Claude Code may never show the prompt, or show it only after the
-    // result). Where it can, Claude Code also asks the user to open it (MCP
+    // Every grayboard call while the flow runs shows the URL under the call
+    // (#497: Claude Code may never show the prompt, or show it only after the
+    // result): the hook after the call prints it as the user's line, never the
+    // model's (#500), so it is written before the waiting call's result
+    // returns. Where it can, Claude Code also asks the user to open it (MCP
     // URL elicitation); a decline ends the flow and the next call starts one.
     present: async url => {
       const flow = signingIn;
+      try { putSignIn(config.dataDir, o.claude.pid, url); }
+      catch (error) { say(`couldn't save the sign-in link for the hook to show: ${message(error)}; approve the sign-in prompt, or open the link in this log`); }
+      if (flow) flow.url = url;
       flow?.show(url);
       say(`open ${url} to sign in to grayboard`);
       // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation): the link alone.
@@ -152,7 +156,7 @@ export function createPlugin(o: PluginOptions): Plugin {
         try {
           result = await server!.elicitInput(
             { mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
-            { timeout: FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
+            { timeout: SIGN_IN_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
           );
         } catch (error) {
           // Withdrawn: the browser answered first, and the flow went on without it.
@@ -166,7 +170,7 @@ export function createPlugin(o: PluginOptions): Plugin {
         // from a prompt Claude Code keeps up while the user finishes the link.
         if (result.action === "decline") throw new LoginFailed("sign-in declined");
         if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow) return;
-        if (sent >= RESENDS) { say(`sign-in prompt cancelled unshown ${sent + 1} times; the link in tool results remains`); return; }
+        if (sent >= RESENDS) { say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`); return; }
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
         // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
@@ -245,30 +249,35 @@ export function createPlugin(o: PluginOptions): Plugin {
       },
       error => {
         if (abort.signal.aborted) return;
-        failed = message(error);
+        // A failure's text reaches the model in the next result: one that
+        // quotes the URL (an elicitation error is Claude Code's text) doesn't.
+        const why = message(error);
+        failed = flow.url && why.includes(flow.url) ? "the sign-in prompt failed" : why;
         say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
       },
     ).finally(() => {
-      // However the flow ended, its prompt points at a closed callback.
+      // However the flow ended, its prompt and link point at a closed callback.
       flow.prompt?.withdraw.abort();
+      if (flow.url && !("error" in config)) dropSignIn(config.dataDir, o.claude.pid);
       show(undefined);
       if (signingIn === flow) signingIn = undefined;
     });
     const flow: Flow = { abort, done, link, show };
     signingIn = flow;
   };
-  // What a signed-out call's result says about its sign-in: the link to open
-  // (waiting up to LINK_MS for the flow to reach one), else why it failed.
+  // What a signed-out call's result says about its sign-in: that the user has
+  // the link (waiting up to LINK_MS for the flow to reach one), else why it
+  // failed. The link itself never enters a result (#500).
   const offer = async (): Promise<string | undefined> => {
     signIn();
     const flow = signingIn;
     if (!flow) return failed ? `sign-in failed: ${failed}` : undefined;
     const url = await Promise.race([flow.link, after(LINK_MS).then(() => undefined)]);
-    if (url) return `open ${url} to sign in to grayboard`;
+    if (url) return "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again";
     // Aborted: another process signed in, or this one is closing.
     if (flow.abort.signal.aborted) return undefined;
     if (flow.elsewhere && signingIn === flow) return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;
-    return failed ? `sign-in failed: ${failed}` : "sign-in is starting; call a grayboard tool again for its link";
+    return failed ? `sign-in failed: ${failed}` : "sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again";
   };
 
   // ---- tools ----
@@ -401,6 +410,9 @@ export function createPlugin(o: PluginOptions): Plugin {
   };
 
   const connectTransport = async (transport: Transport) => {
+    // A link a killed predecessor left (Claude Code kills a stdio server 500 ms
+    // after stop, and a /mcp reconnect replaces it) names a closed callback.
+    if (!("error" in config)) dropSignIn(config.dataDir, o.claude.pid);
     // Delivery starts (and rebinds) first, so the instructions say the bound
     // name; start() never rejects, so the race is safe.
     await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);
