@@ -389,7 +389,11 @@ try {
   const child = await host.session.create({ location, parentID: a.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   const grandchild = await host.session.create({ location, parentID: child.id, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
   await invoke(grandchild.id, "dm_send", { to: "fe", body: "Nested child inherits A" });
-  assert.equal(row(grandchild.id)?.root_session_id, row(a.id)?.session_id); assert.equal(row(child.id), null, "via ancestry is not registration authority");
+  assert.equal(row(grandchild.id)?.root_session_id, row(a.id)?.session_id); 
+  // #535: the intermediate registers on its own, for its own instructions, through its own session_register; via never
+  // registers it (the server suite's "via ancestry is not registration or attachment mapping authority").
+  await wait(() => row(child.id)?.root_session_id, id => id === row(a.id)?.session_id, "subagent registered for its instructions");
+  assert(calls.some(c => c.name === "session_register" && c.args.child === child.id), "the intermediate registered through its own session_register");
   assert.match(row(a.id)!.session_id, SESSION_ID); assert.match(row(grandchild.id)!.session_id, SESSION_ID);
   assert.equal((app.db.prepare("SELECT sender_id FROM messages WHERE body = ?").get("Nested child inherits A") as { sender_id: string }).sender_id, row(grandchild.id)!.session_id);
   const registration = calls.find(c => c.name === "session_register" && c.args.child === grandchild.id); assert.deepEqual(registration?.args.via, [child.id]);
@@ -397,7 +401,6 @@ try {
   const attachmentGrant = await ctx.integration.connection.resolve(selected); assert(attachmentGrant?.type === "oauth");
   const attachment = (method: string, path: string, raw?: string) => fetch(resource + "/attachments" + path, { method, headers: { Authorization: "Bearer " + attachmentGrant.access, ...(raw ? { "X-Grayboard-Session": encodeURIComponent(raw) } : {}), ...(method === "POST" ? { "Content-Length": String(new TextEncoder().encode("Native child attachment fixture").length) } : {}) }, ...(method === "POST" ? { body: "Native child attachment fixture" } : {}) });
   assert.equal((await attachment("POST", "?filename=fixture.txt")).status, 403);
-  assert.equal((await attachment("POST", "?filename=fixture.txt", child.id)).status, 403, "via is not attachment mapping authority");
   assert.equal((await attachment("POST", "?filename=fixture.txt&identity=fe", grandchild.id)).status, 403);
   const upload = await attachment("POST", "?filename=fixture.txt", grandchild.id); assert.equal(upload.status, 201);
   const file = await upload.json() as { id: number };
