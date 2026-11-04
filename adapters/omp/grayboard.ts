@@ -13,8 +13,8 @@
 // session's runtime starts and stops it, delivers its channel notifications
 // and gives its instructions to the model, so no push reaches a subagent (#526).
 //
-// Install: grayboard setup copies this into <agentDir>/extensions/. The
-// command and env come from the mcpServers.grayboard entry in the user-level
+// Install: grayboard setup bundles this into <agentDir>/extensions/grayboard.ts.
+// The command and env come from the mcpServers.grayboard entry in the user-level
 // <agentDir>/mcp.json, which setup writes with "enabled": false: omp's own
 // client then runs none, and the disabled entry still shadows a same-named
 // entry omp ranks lower (Claude Code's user config, a repo's .mcp.json).
@@ -27,8 +27,9 @@ import { cfgMcpEnableProjectConfig } from "@oh-my-pi/pi-coding-agent/mcp/setting
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { render, wakes, type ChannelParams } from "../hosted-core/src/channel.ts";
+import { instructionHooks } from "../pi-family/omp-instructions.ts";
 
-type ChannelParams = { content: string; meta?: Record<string, string> };
 type McpEntry = { command?: string; args?: string[]; env?: Record<string, string>; cwd?: string };
 type Tool = { name: string; description?: string; inputSchema: { type?: string; properties?: Record<string, unknown> }; _meta?: Record<string, unknown> };
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -61,7 +62,8 @@ const NOT_OWNERS = "grayboard: this subagent's top-level session doesn't run gra
 // Each runtime's agent as omp reports it (`ctx.agent`), by agent id: entries
 // are never removed, since omp keeps a finished subagent revivable for its idle
 // TTL and a nested one revived after its parent's run ended must still reach
-// its root (as adapters/pi-family/omp-ancestry.ts, which this raw file can't import).
+// its root. Unlike hosted omp's ancestry walk, this one checks the owning
+// runtime and ambiguous ACP main ids, not just the root's session id.
 type Agent = { main: boolean; parent?: string; runtime: ExtensionAPI };
 
 // What every runtime in this omp process shares: each subagent's runtime
@@ -99,21 +101,6 @@ function ownersSubagent(parent: string | undefined): boolean {
     id = agent.parent;
   }
   return false;
-}
-
-function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-}
-
-// Same shape Claude Code shows the model, so the MCP server's instructions
-// apply, and the one hosted-core renders (adapters/hosted-core/src/channel.ts):
-// a body's `<channel` or `</channel` keeps its `<` escaped, so it can't close
-// the element or forge another one (#433).
-export function render({ content, meta = {} }: ChannelParams): string {
-  const attrs = Object.entries(meta)
-    .map(([k, v]) => ` ${k}="${esc(v)}"`)
-    .join("");
-  return `<channel source="grayboard"${attrs}>\n${content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;")}\n</channel>`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -276,8 +263,14 @@ export default function grayboard(pi: ExtensionAPI) {
   const own = (shared.config ??= config(getAgentDir()));
   const tools = (shared.tools ??= loadTools(own));
   let registered = false;
-  // The instructions this runtime's before_agent_start last appended.
-  let injected: string | undefined;
+  const hooks = instructionHooks<ExtensionContext>({
+    instructions: () => shared.instructions,
+    logger: pi.logger,
+    show: (message, ctx) => {
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else console.error(message);
+    },
+  });
 
   // On screen when there is one, else on stderr; always into omp's log.
   const report = (ctx: ExtensionContext, text: string) => {
@@ -291,10 +284,10 @@ export default function grayboard(pi: ExtensionAPI) {
   // thread replies: context only. Bound to the main runtime's `pi`, so a
   // push lands in the main session only.
   const deliver = (params: ChannelParams) => {
-    const contextOnly = params.meta?.kind === "digest" || params.meta?.deferred === "true";
+    const wake = wakes(true, params.meta);
     pi.sendMessage(
-      { customType: "grayboard", content: render(params), display: true, attribution: "agent" },
-      contextOnly ? { deliverAs: "nextTurn" } : { deliverAs: "aside", triggerTurn: true },
+      { customType: "grayboard", content: render(params, "grayboard"), display: true, attribution: "agent" },
+      wake ? { deliverAs: "aside", triggerTurn: true } : { deliverAs: "nextTurn" },
     );
   };
 
@@ -488,18 +481,19 @@ export default function grayboard(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
     await shared.child?.ready.catch(() => {});
-    injected = shared.instructions;
-    return injected ? { systemPrompt: [...event.systemPrompt, injected] } : undefined;
+    return hooks.beforeAgentStart(event);
   });
 
-  // omp runs before_agent_start only for a user's prompt, and rebuilds the
-  // system prompt without what it appended on /new, /resume and /fork: a
-  // push-started turn after one gets the instructions as a hidden message.
+  // Share hosted omp's per-request plan and payload rewrite (#441): a
+  // push-started turn after bind sees the current names, and a rebuilt base
+  // prompt gets them as a hidden message, last for Anthropic's cache boundary.
   pi.on("context", async (event, ctx) => {
-    if (ctx.agent.kind !== "main" || shared.owner !== pi || !shared.instructions) return undefined;
-    if (injected !== undefined && ctx.getSystemPrompt().includes(injected)) return undefined;
-    const message = { role: "custom", customType: "grayboard-instructions", content: shared.instructions, display: false, attribution: "agent", timestamp: Date.now() } as const;
-    return { messages: [...event.messages, message] };
+    if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    return hooks.context(event, ctx);
+  });
+  pi.on("before_provider_request", async (event, ctx) => {
+    if (ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    return hooks.beforeProviderRequest(event, ctx);
   });
 
   // omp keeps the main runtime across /new, /resume and /fork, so this runs

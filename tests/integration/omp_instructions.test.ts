@@ -1,10 +1,10 @@
-// The hosted omp entry's per-request instructions refresh (#441): which
+// Local and hosted omp's shared per-request instructions refresh (#441, #552): which
 // action a request gets, and the in-place payload rewrite on the shapes omp's
 // providers build (pi-ai providers: anthropic system blocks, openai-responses
 // `instructions` and openai-completions' system message joined with "\n\n",
 // google's systemInstruction parts, Cursor's prompt encoded in blobs).
 import { describe, expect, test } from "bun:test";
-import { plan, replaceText } from "../../adapters/pi-family/omp-instructions.ts";
+import { instructionHooks, modelName, plan, replaceText } from "../../adapters/pi-family/omp-instructions.ts";
 
 // Newlines and quotes, as the server's instructions have.
 const STALE = 'You have no bus name yet.\nCall "bind" first.';
@@ -97,5 +97,94 @@ describe("replaceText", () => {
     expect(replaceText(payload, [STALE], STALE, FRESH)).toBe(1);
     expect(payload.system).toBe(FRESH);
     expect(payload.bytes).toEqual(new Uint8Array([1, 2, 3]));
+  });
+});
+
+describe("local and hosted omp instruction hooks", () => {
+  test("a missing stale payload warns once on screen for main only, while logging every main miss", async () => {
+    let fresh = STALE;
+    let systemPrompt = [BASE];
+    const context = { getSystemPrompt: () => systemPrompt, model: { provider: "cursor", id: "encoded" } };
+    const warnings: string[] = [];
+    const notices: string[] = [];
+    const hooks = instructionHooks({
+      instructions: () => fresh,
+      logger: { debug: () => {}, warn: message => { warnings.push(message); } },
+      show: (message, shownContext) => { expect(shownContext).toBe(context); notices.push(message); },
+    });
+    systemPrompt = (await hooks.beforeAgentStart({ systemPrompt }))!.systemPrompt;
+    fresh = FRESH;
+    const blob = new TextEncoder().encode(JSON.stringify({ system: systemPrompt }));
+    const encoded = { payload: { blobs: [blob] } };
+
+    // Advisors invoke the provider hook without context: a miss never warns.
+    await hooks.beforeProviderRequest(encoded, context);
+    expect(warnings).toEqual([]);
+    expect(notices).toEqual([]);
+
+    // Main invokes context on each request. A repeated stale prompt logs
+    // every miss but shows the warning only once for that stale text.
+    for (let request = 0; request < 2; request++) {
+      expect(await hooks.context({ messages: [] }, context)).toBeUndefined();
+      await hooks.beforeProviderRequest(encoded, context);
+    }
+    expect(warnings).toEqual(Array(2).fill("grayboard: couldn't refresh the instructions in a request to cursor/encoded; it carries the ones from the last prompt"));
+    expect(notices).toEqual(["grayboard: this turn's model (cursor/encoded) may still see the instructions from before the last bind; send a prompt to refresh them"]);
+    expect(encoded.payload.blobs[0]).toBe(blob);
+
+    // The main/advisor marker must be consumed, not left set by the miss.
+    await hooks.beforeProviderRequest(encoded, context);
+    expect(warnings).toHaveLength(2);
+    expect(notices).toHaveLength(1);
+
+    // Advisors still get the same rewrite when their payload is accessible.
+    const plain = { payload: { instructions: systemPrompt.join("\n\n") } };
+    await hooks.beforeProviderRequest(plain, context);
+    expect(plain.payload.instructions).toBe(`${BASE}\n\n${FRESH}`);
+    expect(warnings).toHaveLength(2);
+    expect(notices).toHaveLength(1);
+  });
+
+  test("main reuses its context fetch and rewrites in place without a warning", async () => {
+    let fresh = STALE;
+    let fetched = 0;
+    let systemPrompt = [BASE];
+    const context = { getSystemPrompt: () => systemPrompt };
+    const warnings: string[] = [];
+    const hooks = instructionHooks({
+      instructions: async () => { fetched++; return fresh; },
+      logger: { debug: () => {}, warn: message => { warnings.push(message); } },
+      show: message => { warnings.push(message); },
+    });
+    systemPrompt = (await hooks.beforeAgentStart({ systemPrompt }))!.systemPrompt;
+    fresh = FRESH;
+    await hooks.context({ messages: [] }, context);
+    expect(fetched).toBe(2);
+    // Instructions changing after context must not change this request's snapshot.
+    fresh = "the next request's instructions";
+    const event = { payload: { instructions: systemPrompt.join("\n\n") } };
+    await hooks.beforeProviderRequest(event, context);
+    expect(fetched).toBe(2);
+    expect(event.payload.instructions).toBe(`${BASE}\n\n${FRESH}`);
+    expect(warnings).toEqual([]);
+  });
+
+  test("a rebuilt prompt gets fresh instructions last as a hidden per-call message", async () => {
+    const hooks = instructionHooks({
+      instructions: () => FRESH,
+      logger: { debug: () => {}, warn: () => {} },
+      show: () => {},
+    });
+    await hooks.beforeAgentStart({ systemPrompt: [BASE] });
+    const message = { role: "user", content: "hi" };
+    const messages = [message];
+    const result = await hooks.context({ messages }, { getSystemPrompt: () => [BASE] });
+    expect(messages).toEqual([message]);
+    expect(result!.messages[0]).toBe(message);
+    expect(result!.messages[1]).toMatchObject({ role: "custom", customType: "grayboard-instructions", content: FRESH, display: false, attribution: "agent" });
+  });
+
+  test("model names retain the provider/id contract", () => {
+    expect(modelName({ provider: "openai", id: "gpt-6" })).toBe("openai/gpt-6");
   });
 });

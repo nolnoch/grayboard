@@ -64,9 +64,6 @@ export interface Harness {
   facts?(sessionID: string): SessionFacts | undefined;
 }
 
-// A harness model as the bus names it: `provider/id`.
-export const modelName = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
-
 export const LOGIN_ACTION = "run /grayboard login";
 export const RESUME_HINT = "run /grayboard resume";
 // A tool call that failed: the call itself is what to retry.
