@@ -299,7 +299,9 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
           continue;
         }
         if (msg.method === "notifications/claude/channel") {
-          if (!gone && child?.proc === proc) deliver(msg.params as ChannelParams);
+          // stdout may drain after exit; grayboard already advanced its
+          // delivery cursors for these notifications, so don't discard them.
+          if (!closed) deliver(msg.params as ChannelParams);
         } else if (msg.id !== undefined && pending.has(msg.id)) {
           const p = pending.get(msg.id)!;
           pending.delete(msg.id);
@@ -418,8 +420,6 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       } else if (event.type === "message.updated") {
         const m = event.properties.info;
         if (m.role === "user" && !subagents.has(m.sessionID)) await selectTarget(m.sessionID);
-      } else if (event.type === "server.instance.disposed") {
-        await shutdown();
       }
       if (target && !closed && !refused && !exitReason && !restart) {
         await Promise.all(stopping);

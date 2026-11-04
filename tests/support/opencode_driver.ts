@@ -13,15 +13,41 @@
 //   abort   { key }            abort an in-flight call tagged with that key
 //   advanceClock { ms }        advance the adapter's stability clock, not its timers
 import { createInterface } from "node:readline";
+import { ChildProcess } from "node:child_process";
 import { tool } from "@opencode-ai/plugin";
 import { GrayboardPlugin } from "../../adapters/opencode/grayboard.ts";
+import { processDescendants } from "./procs.ts";
+
+// Hold actual stdout data events, then release their original payloads only
+// after exit: Bun's node:child_process stdout ignores Readable.pause().
+const children: ChildProcess[] = [];
+const spawnOwners: number[][] = [];
+type HeldStdout = { child: ChildProcess; emit: ChildProcess["emit"]; chunks: unknown[][] };
+const heldStdout = new Map<string, HeldStdout>();
+const emit = ChildProcess.prototype.emit;
+ChildProcess.prototype.emit = function (event: string | symbol, ...args: unknown[]) {
+  if (event === "spawn") {
+    children.push(this);
+    spawnOwners.push(processDescendants(process.pid).filter(p => children.some(c => c.pid === p.pid)).map(p => p.pid));
+  }
+  return emit.call(this, event, ...args);
+};
 
 const logs: { level: string; message: string }[] = [];
 const toasts: string[] = [];
 const prompts: { session: string; text: string; noReply: boolean }[] = [];
+const restartOwners: { message: string; pids: number[] }[] = [];
 const client = {
   app: { log: async ({ body }: any) => (logs.push({ level: body.level, message: body.message }), {}) },
-  tui: { showToast: async ({ body }: any) => (toasts.push(body.message), {}) },
+  tui: { showToast: async ({ body }: { body: { message: string } }) => {
+    toasts.push(body.message);
+    if (body.message.includes("restarting it (") || body.message.includes("after 3 restarts")) {
+      // Ignore the observing ps process; these are the actual MCP children,
+      // including a shell stub that exec'd sleep under the same pid.
+      restartOwners.push({ message: body.message, pids: processDescendants(process.pid).filter(p => children.some(c => c.pid === p.pid)).map(p => p.pid) });
+    }
+    return {};
+  } },
   session: {
     promptAsync: async ({ path, body }: any) => {
       prompts.push({ session: path.id, text: body.parts.map((p: any) => p.text).join(""), noReply: !!body.noReply });
@@ -59,6 +85,27 @@ async function run(msg: any): Promise<unknown> {
     case "advanceClock":
       Date.now = () => now() + msg.ms;
       return;
+    case "holdStdout": {
+      const child = children.at(-1);
+      if (!child?.stdout) throw new Error("no child stdout to hold");
+      const streamEmit = child.stdout.emit;
+      const chunks: unknown[][] = [];
+      child.stdout.emit = function (event: string | symbol, ...args: unknown[]) {
+        if (event === "data") { chunks.push(args); return true; }
+        return streamEmit.call(this, event, ...args);
+      };
+      heldStdout.set(msg.key, { child, emit: streamEmit, chunks });
+      return;
+    }
+    case "releaseStdout": {
+      const held = heldStdout.get(msg.key);
+      if (!held?.child.stdout) throw new Error("no held child stdout");
+      heldStdout.delete(msg.key);
+      const stdout = held.child.stdout;
+      stdout.emit = held.emit;
+      for (const chunk of held.chunks) held.emit.call(stdout, "data", ...chunk);
+      return;
+    }
     case "parse":
       // What opencode's runtime hands execute: the args through the tool's zod.
       return tool.schema.object(hooks.tool[msg.tool].args).parse(msg.args);
@@ -68,7 +115,7 @@ async function run(msg: any): Promise<unknown> {
       return output.system;
     }
     case "state":
-      return { logs, toasts, prompts, calls: [...calls.keys()] };
+      return { logs, toasts, prompts, calls: [...calls.keys()], restartOwners, spawnOwners };
     case "dispose":
       return hooks.dispose();
   }

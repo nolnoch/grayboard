@@ -5,6 +5,7 @@
 // seams; tests/support/opencode.ts runs real local/V1 OpenCode for lifecycle regressions.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { z } from "zod";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -42,11 +43,11 @@ function entry(over: Record<string, unknown> = {}) {
   return { type: "local", command: [process.execPath, CLI, "mcp", "--mode", "local"], environment: { BUS_PUSH: "off" }, enabled: false, ...over };
 }
 
-function driver(identity: string | undefined, e: Record<string, unknown>, runtime = process.execPath): Driver {
+function driver(identity: string | undefined, e: Record<string, unknown>): Driver {
   const config = join(dir, "config");
   mkdirSync(join(config, "opencode"), { recursive: true });
   writeFileSync(join(config, "opencode", "opencode.json"), JSON.stringify({ mcp: { grayboard: e } }));
-  const proc = spawn(runtime, [join(ROOT, "tests/support/opencode_driver.ts")], {
+  const proc = spawn(process.execPath, [join(ROOT, "tests/support/opencode_driver.ts")], {
     cwd: dir,
     env: localEnv(dir, identity, { XDG_CONFIG_HOME: config }),
     stdio: ["pipe", "pipe", "pipe"],
@@ -299,7 +300,7 @@ for (const mode of ["switch", "shutdown"] as const) {
   }, 120_000);
 }
 
-test("opencode: aborting a tool waiting during backoff returns without spawning a replacement; shutdown also releases waiting calls", async () => {
+test("opencode: aborting a tool during backoff releases its wait promptly; shutdown also releases waiting calls", async () => {
   const oc = driver("oc", entry());
   await oc.send("init");
   await oc.send("system", { sessionID: "s1" });
@@ -341,15 +342,32 @@ test("opencode: a child stable for 60 seconds resets the consecutive restart cou
   await oc.send("dispose");
 });
 
-test("opencode: EPIPE kills a still-live child before retrying and exhaustion leaves no delivery owner", async () => {
-  // Bun 1.4.4's node:child_process stdin silently accepts writes after its
-  // peer closes; Node emits the real EPIPE event this lifecycle must handle.
-  const oc = driver("oc", entry({ command: [join(ROOT, "tests/support/stdin_closed.sh"), process.execPath, CLI, "mcp", "--mode", "local"] }), "node");
+test("opencode: Bun EPIPE waits for the still-live owner to die before retrying and exhaustion leaves none", async () => {
+  // Bun 1.4.4 silently accepts small writes to closed stdin, but a large
+  // tools/call argument reliably raises EPIPE in the real Bun-run driver.
+  const oc = driver("oc", entry({
+    command: [join(ROOT, "tests/support/stdin_closed.sh"), process.execPath, CLI, "mcp", "--mode", "local"],
+    environment: { BUS_PUSH: "off", BUS_TEST_OPENCODE_STDIO: "epipe" },
+  }));
   await oc.send("init");
-  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
-  const notice = await until(async () => (await oc.send("state")).toasts.find((n: string) => n.includes("stopped reading") && n.includes("after 3 restarts")), 15_000, "EPIPE restart exhaustion");
-  expect(notice).toContain("restart opencode to reconnect");
-  await until(() => processDescendants(oc.pid).length === 0, 1_000, "the EPIPE owner killed on give-up");
+  await oc.send("system", { sessionID: "s1" });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await expect(oc.send("call", { tool: "grayboard_dm_send", args: { to: "peer", body: "x".repeat(128_000) } })).rejects.toThrow("stopped reading");
+    const state = await oc.send("state");
+    const owners = z.array(z.object({ message: z.string(), pids: z.array(z.number()) })).parse(state.restartOwners);
+    expect(owners).toHaveLength(attempt + 1);
+    for (const owner of owners) {
+      expect(owner.pids).toHaveLength(1);
+    }
+    // A waiting tool also awaits retiring owners. Observe spawn itself,
+    // not just the following tool failure, to catch overlap inside backoff.
+    for (const pids of z.array(z.array(z.number())).parse(state.spawnOwners)) {
+      expect(pids).toHaveLength(1);
+    }
+  }
+  const notice: string = (await oc.send("state")).toasts.at(-1);
+  expect(notice).toContain("after 3 restarts; restart opencode to reconnect");
+  await until(() => processDescendants(oc.pid).length === 0, 2_000, "the EPIPE owner force-killed on give-up");
   expect(processDescendants(oc.pid)).toEqual([]);
   await expect(oc.send("call", { tool: "grayboard_whoami", args: {} })).rejects.toThrow("after 3 restarts");
   await oc.send("dispose");
@@ -368,3 +386,26 @@ test("opencode: aborting a tool blocked in initialize does not wait for the chil
   await oc.send("dispose");
   expect(processDescendants(oc.pid)).toEqual([]);
 });
+
+for (const closed of [false, true]) {
+  test(`opencode: a final channel line draining after child exit is ${closed ? "discarded only after shutdown" : "still delivered"}`, async () => {
+    const oc = driver("oc", entry({
+      command: [join(ROOT, "tests/support/stdin_closed.sh"), process.execPath, CLI, "mcp", "--mode", "local"],
+      environment: { BUS_PUSH: "off", BUS_TEST_OPENCODE_STDIO: "channel" },
+    }));
+    await oc.send("init");
+    await oc.send("system", { sessionID: "s1" });
+    await oc.send("holdStdout", { key: "final-channel" });
+    const result = oc.send("call", { tool: "grayboard_whoami", args: {} }).then(() => "resolved", (e: unknown) => e instanceof Error ? e.message : String(e));
+    await until(async () => (await oc.send("state")).toasts.some((n: string) => n.includes("process exited")), 2_000, "exit processed before the buffered stdout");
+    expect(await result).toContain("process exited");
+    expect((await oc.send("state")).prompts).toEqual([]);
+    if (closed) await oc.send("dispose");
+    await oc.send("releaseStdout", { key: "final-channel" });
+    const state = await oc.send("state");
+    const delivered = state.prompts.filter((p: { text: string }) => p.text.includes("buffered before exit"));
+    expect(delivered).toHaveLength(closed ? 0 : 1);
+    if (!closed) expect(delivered[0].session).toBe("s1");
+    await oc.send("dispose");
+  });
+}

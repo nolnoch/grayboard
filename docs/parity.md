@@ -32,7 +32,7 @@ The baseline every later change is measured against. A cell says what a user of 
 | 4 | Bind, unbind, several holds, configured start name | yes | yes | yes | yes | yes | yes | yes | yes |
 | 5 | Names across an in-process session switch or MCP reconnect | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 6 | Names when a new harness process resumes a conversation | gap #195 | yes | gap #195 | yes | gap #195 | yes | gap #195 | yes |
-| 7 | Automatic restart after the grayboard process exits | gap #559 | n/a | yes | n/a | gap #576 | n/a | n/a | n/a |
+| 7 | Automatic restart after the grayboard process exits | gap #559 | n/a | yes | n/a | yes | n/a | n/a | n/a |
 | 8 | Subagents as child sessions, writes attributed (`via`) | yes | yes | yes | yes | gap #577 | yes | yes | yes |
 | 9 | Sign-in flow | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 10 | Sign-in offer in a signed-out tool result | n/a | gap #499 | n/a | gap #499 | n/a | n/a | n/a | yes |
@@ -91,7 +91,7 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - omp L: an unexpected exit restarts the process after 0, 1 and 5 s (a run of 60 s resets the count); names come back from the name record (`RESTART_DELAYS_MS`, `adapters/omp/grayboard.ts`). Proof: `tests/integration/omp.test.ts` omp local ("a killed grayboard process is restarted and takes its name back").
 - pi L: **gap #559** (item 1). After an exit every tool call fails with the exit reason and pi notifies "restart pi to reconnect"; only the next `session_start` (a pi restart, `/new`, `/resume`) starts a new process (`adapters/pi/grayboard.ts` `fail`, `execute`).
-- OC V1: **gap #576.** After an exit every call fails with the exit reason and the plugin reports "restart opencode to reconnect"; nothing starts a new process before opencode restarts (`adapters/opencode/grayboard.ts` `fail`, `running`).
+- OC V1: the same policy as omp L (0, 1 and 5 s; a 60 s run resets the count; one more exit gives up and says so); calls during a pending restart wait for it and honor their abort, a session switch or shutdown cancels it, and a live child that hit EPIPE is killed before its replacement (`adapters/opencode/grayboard.ts`, #576). Proof: `tests/integration/opencode.test.ts` against real pinned OpenCode ("opencode real: child restarts restore held names, tool calls and delivery, then exhaust"; the switch, shutdown and abort cases) plus a Bun-run EPIPE case (a child that stops reading is restarted, never two owners at once).
 - CC L: n/a. Claude Code's own MCP client runs `grayboard mcp`; no grayboard component exists to restart it. Recovery is `/mcp reconnect`, which takes the names back (row 5).
 - pi H, omp H, OC V2: n/a. No grayboard process: the extension or package runs inside the harness and talks to the server over HTTP.
 - CC H: n/a. The plugin is Claude Code's stdio MCP server, so its process lifecycle is Claude Code's; a restarted plugin takes back the session's remembered holds (row 6).

@@ -1,27 +1,16 @@
 // Real local/V1 OpenCode, isolated from the user's config and talking to fake_model.ts.
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { cleanEnv, localEnv } from "./env.ts";
+import { copyFileSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { localEnv } from "./env.ts";
 import { CLI, ROOT } from "./paths.ts";
-import { CACHE } from "./releases.ts";
 import { z } from "zod";
 import { until } from "./until.ts";
 
-const VERSION = "1.19.4";
-let binary: string | undefined;
-function opencodeBin(): string {
-  if (binary) return binary;
-  const dir = join(CACHE, "opencode", VERSION), bin = join(dir, "node_modules/.bin/opencode");
-  if (!existsSync(bin)) {
-    mkdirSync(dir, { recursive: true });
-    const r = Bun.spawnSync(["npm", "install", "--prefix", dir, "--no-save", "--no-package-lock", "--no-audit", "--no-fund", `opencode-ai@${VERSION}`], { env: cleanEnv() });
-    if (r.exitCode !== 0) throw new Error(`install opencode ${VERSION}: ${r.stderr}`);
-  }
-  const r = Bun.spawnSync([bin, "--version"], { env: cleanEnv() });
-  if (r.exitCode !== 0 || r.stdout.toString().trim() !== VERSION) throw new Error(`opencode ${VERSION}: unexpected --version: ${r.stdout} ${r.stderr}`);
-  return binary = bin;
-}
+const PACKAGE = join(ROOT, "node_modules/opencode-ai/package.json");
+const OPENCODE = z.object({ version: z.string(), bin: z.object({ opencode: z.string() }) }).parse(JSON.parse(readFileSync(PACKAGE, "utf8")));
+const VERSION = OPENCODE.version;
+const OPENCODE_CLI = join(dirname(PACKAGE), OPENCODE.bin.opencode);
 
 const ToolPartSchema = z.object({ type: z.literal("tool"), tool: z.string(), state: z.object({ status: z.string(), output: z.string().optional(), error: z.string().optional() }) });
 const MessageSchema = z.object({ info: z.object({ role: z.string(), error: z.unknown().optional() }), parts: z.array(z.union([ToolPartSchema, z.object({ type: z.string(), text: z.string().optional() })])) });
@@ -52,7 +41,7 @@ export async function localOpenCode(dir: string, modelPort: number): Promise<Loc
     mcp: { grayboard: { type: "local", command: [process.execPath, CLI, "mcp", "--mode", "local"], environment: { BUS_PUSH: "off" }, enabled: false } },
     permission: "allow",
   }));
-  const proc = spawn(opencodeBin(), ["serve", "--port", "0", "--hostname", "127.0.0.1"], {
+  const proc = spawn(OPENCODE_CLI, ["serve", "--port", "0", "--hostname", "127.0.0.1"], {
     cwd: dir,
     env: localEnv(dir, undefined, { XDG_CONFIG_HOME: config, XDG_DATA_HOME: join(dir, "data"), XDG_CACHE_HOME: join(dir, "cache"), XDG_STATE_HOME: join(dir, "state"), OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_AUTOUPDATE: "true" }),
     stdio: ["ignore", "pipe", "pipe"],
