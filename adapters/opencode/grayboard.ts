@@ -64,16 +64,16 @@ function render({ content, meta = {} }: ChannelParams): string {
   return `<channel source="grayboard"${attrs}>\n${content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;")}\n</channel>`;
 }
 
-function resultText(result: CallResult): string {
+function resultText(result: CallResult, toolName: string): string {
   const text = (result.content ?? []).flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n");
-  if (result.isError) throw new Error(text || `MCP tool ${SERVER} returned an error`);
+  if (result.isError) throw new Error(text || `MCP tool ${SERVER}/${toolName} returned an error`);
   return text;
 }
 
 // Local MCP's existing child whoami supplies the live root and primary. A
 // child gets none of initialize's root-only inbox, holds or channel guidance.
 function childInstructions(result: CallResult): string {
-  const who: unknown = JSON.parse(resultText(result));
+  const who: unknown = JSON.parse(resultText(result, "whoami"));
   if (!who || typeof who !== "object" || !("child" in who) || who.child !== true || !("id" in who) || typeof who.id !== "string" || !("root" in who) || typeof who.root !== "string" || !("primary" in who) || typeof who.primary !== "string") {
     throw new Error("grayboard: child whoami returned no child identity");
   }
@@ -423,7 +423,7 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
           // was lost (cancelled, timed out) or a lost name. Errors included.
           if (!sub && result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
           // A thrown error is opencode's tool error.
-          return resultText(result);
+          return resultText(result, t.name);
         },
       }),
     ]),
@@ -461,7 +461,9 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
         if (!s.parentID && event.type === "session.created" && !target) await selectTarget(s.id);
       } else if (event.type === "message.updated") {
         const m = event.properties.info;
-        if (m.role === "user" && !(await isSubagent(m.sessionID))) await selectTarget(m.sessionID);
+        // Events are fire-and-forget in OpenCode. A message can outlive its
+        // deleted session: an unknown session must never steal delivery.
+        if (m.role === "user" && !(await isSubagent(m.sessionID).catch(() => true))) await selectTarget(m.sessionID);
       } else if (event.type === "session.deleted") {
         parents.delete(event.properties.info.id);
       }
@@ -475,18 +477,27 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     // starts before the child's initialize waits for it.
     "experimental.chat.system.transform": async (input, output) => {
       if (refused || closed) return;
-      const sub = input.sessionID ? await isSubagent(input.sessionID) : false;
-      if (input.sessionID) await firstTarget(input.sessionID);
+      const sub = input.sessionID ? await isSubagent(input.sessionID).catch(() => undefined) : false;
+      if (sub === undefined) return;
+      try { if (input.sessionID) await firstTarget(input.sessionID); } catch { return; }
       if (target && !child && !exitReason && !closed) {
         await Promise.all(stopping);
         if (!closed) child ??= start();
       }
       await child?.ready.catch(() => {});
       if (sub && input.sessionID) {
-        const c = await running();
-        await c.ready;
-        const result = await c.call("tools/call", { name: "whoami", arguments: {}, _meta: { [AGENT_META]: input.sessionID } }) as CallResult;
-        output.system.push(childInstructions(result));
+        // V1's system hook has no abort signal. Instructions are optional:
+        // never enter running()'s uncancellable restart/backoff wait here.
+        // Actual tool calls still wait and forward their ctx.abort.
+        const c = child;
+        if (!c) return;
+        try {
+          const result = await c.call("tools/call", { name: "whoami", arguments: {}, _meta: { [AGENT_META]: input.sessionID } }) as CallResult;
+          output.system.push(childInstructions(result));
+        } catch {
+          // An outage or failed lookup must not fail a child's model turn,
+          // including a child that never calls grayboard in that turn.
+        }
       } else if (instructions) output.system.push(instructions);
     },
 

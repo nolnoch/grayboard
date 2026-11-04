@@ -39,6 +39,7 @@ const toasts: string[] = [];
 const prompts: { session: string; text: string; noReply: boolean }[] = [];
 const restartOwners: { message: string; pids: number[] }[] = [];
 const sessions = new Map<string, { id: string; parentID?: string }>();
+const deletedSessions = new Set<string>();
 const client = {
   app: { log: async ({ body }: any) => (logs.push({ level: body.level, message: body.message }), {}) },
   tui: { showToast: async ({ body }: { body: { message: string } }) => {
@@ -51,7 +52,9 @@ const client = {
     return {};
   } },
   session: {
-    get: async ({ path }: { path: { id: string } }) => ({ data: sessions.get(path.id) ?? { id: path.id } }),
+    get: async ({ path }: { path: { id: string } }) => deletedSessions.has(path.id)
+      ? { error: { name: "NotFoundError" } }
+      : { data: sessions.get(path.id) ?? { id: path.id } },
     promptAsync: async ({ path, body }: any) => {
       prompts.push({ session: path.id, text: body.parts.map((p: any) => p.text).join(""), noReply: !!body.noReply });
       return {};
@@ -77,6 +80,11 @@ async function run(msg: any): Promise<unknown> {
       if (msg.event.type === "session.created" || msg.event.type === "session.updated") {
         const s = msg.event.properties.info;
         sessions.set(s.id, s);
+        deletedSessions.delete(s.id);
+      } else if (msg.event.type === "session.deleted") {
+        const id = msg.event.properties.info.id;
+        sessions.delete(id);
+        deletedSessions.add(id);
       }
       return hooks.event({ event: msg.event });
     }
