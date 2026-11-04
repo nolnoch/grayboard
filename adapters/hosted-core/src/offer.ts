@@ -71,20 +71,18 @@ export function start(state: SignInState, login: Signer, o: { origin: Origin; br
   const link = new Promise<string | undefined>(resolve => { show = resolve; });
   const flow: Flow = { origin: o.origin, abort, link, show, browser: o.browser, done: Promise.resolve() };
   state.flow = flow;
-  const settle = (outcome: Outcome) => {
+  const finish = (outcome: Outcome | "current") => {
     flow.outcome = outcome;
-    state.last = { origin: flow.origin, outcome, at: Date.now() };
     show(undefined);
     if (state.flow === flow) state.flow = undefined;
+  };
+  const settle = (outcome: Outcome) => {
+    state.last = { origin: flow.origin, outcome, at: Date.now() };
+    finish(outcome);
     return o.ended(flow, outcome);
   };
   flow.done = login.login(abort.signal, o.ifSignedOut).then(
-    result => {
-      if (result === "signed in") return settle("signed in");
-      flow.outcome = "current";
-      show(undefined);
-      if (state.flow === flow) state.flow = undefined;
-    },
+    result => result === "signed in" ? settle("signed in") : finish("current"),
     error => {
       if (abort.signal.aborted) return settle("cancelled");
       flow.failed = scrub(flow, message(error));

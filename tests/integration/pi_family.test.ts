@@ -1077,6 +1077,27 @@ test("/grayboard login joins an offer's pending flow: one flow, its link said ag
   await until(async () => (await a.ext.status()).includes("  join-root: unbound, "), 10_000, "restarted signed in");
 }, 30_000);
 
+test("/grayboard login joining an offer's flow that finds the store already signed in says so, and records no outcome (#592)", async () => {
+  await logoutElsewhere();
+  const a = instance({ child: false }, undefined, undefined, true);
+  await a.ext.start({ id: "current-root", reason: "startup" });
+  // A pending offer flow that will end "current" (Login found a live grant
+  // without a flow); its start-to-lock window is too short to hit from here.
+  const { promise: done, resolve } = Promise.withResolvers<void>();
+  const state = slots[SLOT]!.signins;
+  const flow = { origin: "offer" as const, abort: new AbortController(), done, link: Promise.resolve(undefined), show: () => {}, browser: false };
+  state.flow = flow;
+  const login = a.ext.command("login");
+  await until(() => flow.browser, 10_000, "the command joined the flow");
+  Object.assign(flow, { outcome: "current" });
+  state.flow = undefined;
+  resolve();
+  await login;
+  expect(a.notices.filter(n => n.message === "grayboard: already signed in")).toHaveLength(1);
+  expect(a.notices.some(n => n.message === SIGNED_IN.message)).toBe(false);
+  expect(state.last).toBeUndefined();
+}, 30_000);
+
 test("a flow that ends while no root runtime is current (a session switch's gap) keeps its outcome, and the next root says it once and starts signed in", async () => {
   await logoutElsewhere();
   const a = instance({ child: false }, undefined, undefined, true);

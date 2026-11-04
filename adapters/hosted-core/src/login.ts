@@ -450,8 +450,8 @@ export class Login {
       presented.catch(() => {});
       params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally {
-      // Before the callback closes: a waiter must never show a link whose
-      // callback is gone.
+      // Before the callback closes: only a waiter's read already in flight
+      // can still show a link whose callback is gone.
       await this.unlink();
       callback.close();
     }

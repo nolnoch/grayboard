@@ -36328,22 +36328,18 @@ function start(state, login, o) {
   });
   const flow = { origin: o.origin, abort, link, show, browser: o.browser, done: Promise.resolve() };
   state.flow = flow;
-  const settle = (outcome) => {
+  const finish = (outcome) => {
     flow.outcome = outcome;
-    state.last = { origin: flow.origin, outcome, at: Date.now() };
     show(undefined);
     if (state.flow === flow)
       state.flow = undefined;
+  };
+  const settle = (outcome) => {
+    state.last = { origin: flow.origin, outcome, at: Date.now() };
+    finish(outcome);
     return o.ended(flow, outcome);
   };
-  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => {
-    if (result === "signed in")
-      return settle("signed in");
-    flow.outcome = "current";
-    show(undefined);
-    if (state.flow === flow)
-      state.flow = undefined;
-  }, (error) => {
+  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => result === "signed in" ? settle("signed in") : finish("current"), (error) => {
     if (abort.signal.aborted)
       return settle("cancelled");
     flow.failed = scrub(flow, message(error));
@@ -38182,7 +38178,7 @@ function createPlugin(o) {
       return signins.flow;
     if (!login || !root || !interactive || closed || !initialized)
       return;
-    return start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
+    const flow = start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
       const prompt = prompts.get(flow);
       try {
         if (outcome === "signed in") {
@@ -38203,6 +38199,11 @@ function createPlugin(o) {
         }
       }
     } });
+    flow.done.then(() => {
+      if (flow.outcome === "current")
+        say(`sign-in not needed (${origin}): already signed in`);
+    }, () => {});
+    return flow;
   };
   const notes = {
     started: "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again",
