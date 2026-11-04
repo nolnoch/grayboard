@@ -20,7 +20,8 @@ export type Last = { origin: Origin; outcome: Outcome; at: number; said?: true }
 // A flow. `link` resolves with the first authorization URL it shows (`url` is
 // the latest), or undefined once it ends without one. `elsewhere` says
 // another process's flow holds the store's login lock. `outcome` is set once
-// it ended.
+// it ended: "current" when an automatic one found the store already signed
+// in, which records no Last and runs no `ended` (nothing happened to say).
 export type Flow = {
   origin: Origin;
   abort: AbortController;
@@ -31,11 +32,11 @@ export type Flow = {
   browser: boolean;
   elsewhere?: string;
   failed?: string;
-  outcome?: Outcome;
+  outcome?: Outcome | "current";
 };
 export type SignInState = { flow?: Flow; last?: Last };
 // What `start` drives: hosted-core's Login, or a fake in tests.
-export type Signer = { login(signal?: AbortSignal, ifSignedOut?: boolean): Promise<void>; token(): Promise<string> };
+export type Signer = { login(signal?: AbortSignal, ifSignedOut?: boolean): Promise<"signed in" | "current">; token(): Promise<string> };
 
 // How long a signed-out call waits for its flow's link: past discovery's two
 // 10 s request timeouts the server is likely down, and the result says the
@@ -78,7 +79,12 @@ export function start(state: SignInState, login: Signer, o: { origin: Origin; br
     return o.ended(flow, outcome);
   };
   flow.done = login.login(abort.signal, o.ifSignedOut).then(
-    () => settle("signed in"),
+    result => {
+      if (result === "signed in") return settle("signed in");
+      flow.outcome = "current";
+      show(undefined);
+      if (state.flow === flow) state.flow = undefined;
+    },
     error => {
       if (abort.signal.aborted) return settle("cancelled");
       flow.failed = scrub(flow, message(error));
@@ -112,7 +118,7 @@ export async function offer(state: SignInState, login: Signer, o: { interactive:
 }
 
 export function note(flow: Flow, url: string | undefined, notes: Notes): string | undefined {
-  if (flow.outcome === "signed in" || flow.outcome === "cancelled") return undefined;
+  if (flow.outcome === "signed in" || flow.outcome === "current" || flow.outcome === "cancelled") return undefined;
   if (flow.outcome) return `sign-in failed: ${flow.failed}`;
   if (url) return notes.started;
   if (flow.elsewhere) return `${flow.elsewhere}; finish it there, then call a grayboard tool again`;

@@ -3,7 +3,7 @@
 // its host's storage instead.
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
-import { mkdirSync } from "node:fs";
+import { constants, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
@@ -18,6 +18,26 @@ export async function readJson(path: string): Promise<unknown> {
   try { text = await readFile(path, "utf8"); }
   catch (error) { if ((error as { code?: unknown }).code === "ENOENT") return undefined; throw error; }
   return JSON.parse(text);
+}
+
+// A file readSmallJson won't read; the message says why, never its content.
+export class FileRefused extends Error {}
+// readJson for a file another process may have planted: opened without
+// blocking (a FIFO's open would wait for a writer), refused unless it is a
+// regular file of at most `maxBytes`, and read with one bounded read, so the
+// caller never stalls on what it finds. Undefined when the file doesn't
+// exist; a file that isn't JSON throws SyntaxError.
+export async function readSmallJson(path: string, maxBytes: number): Promise<unknown> {
+  let file;
+  try { file = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)); }
+  catch (error) { if ((error as { code?: unknown }).code === "ENOENT") return undefined; throw error; }
+  try {
+    if (!(await file.stat()).isFile()) throw new FileRefused("isn't a regular file");
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > maxBytes) throw new FileRefused(`is over ${maxBytes} bytes`);
+    return JSON.parse(buffer.toString("utf8", 0, bytesRead));
+  } finally { await file.close(); }
 }
 
 // Temp file (0600, exclusive create), fsync, rename, fsync the directory

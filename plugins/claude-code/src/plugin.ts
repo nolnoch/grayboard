@@ -182,9 +182,11 @@ export function createPlugin(o: PluginOptions): Plugin {
       say(message);
       signIns.notify(signins, message);
     },
+    // The link file's records (refused, unshared) only to the user's log:
+    // the model can't act on them (#592).
     diagnostic: record => {
       if (record.state !== "degraded" && record.state !== "paused") return;
-      root?.noticeOnce(record.message, "last");
+      if (record.operation !== "login_link") root?.noticeOnce(record.message, "last");
       say(record.message);
     },
   });

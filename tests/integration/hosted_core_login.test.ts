@@ -232,6 +232,17 @@ test("in one process: a waiter presents the holder's link, and the link is gone 
   expect(grants()).toBe(1);
 });
 
+test("the link file is gone once the browser answers, before the code exchange (#592)", async () => {
+  const l = login({ present: async url => { await browse(url); } });
+  let linked: boolean | undefined;
+  await withFetch(async (_url, form) => {
+    if (form?.get("grant_type") === "authorization_code") linked = await Bun.file(`${l.path}.login.url`).exists();
+    return undefined;
+  }, () => l.login());
+  expect(linked).toBe(false);
+  expect(grants()).toBe(1);
+});
+
 test("a leftover link from a crashed holder is removed by the next holder before its discovery, so a waiter polling then never presents it", async () => {
   let link: string | undefined;
   const holder = login({ present: url => { link = url; return new Promise<void>(() => {}); } });
@@ -289,20 +300,23 @@ test("a link of another origin, with credentials or over 2048 is never presented
     { url: `${planted("long")}${"x".repeat(2048)}`, check: "longer than 2048" },
   ];
   for (const { url, check } of cases) {
-    const waiter = login();
+    let polls = 0;
+    const waiter = login({ polled: () => { polls++; } });
     await plant(waiter, url);
     const held = tryAcquire(`${waiter.path}.login.lock`)!;
     const waited = waiter.login();
     await until(() => waiter.seen.diagnostics.length === 1, 10_000, "refusal said");
-    // A second refusal in the same flow isn't said again.
+    // A second refusal in the same flow isn't said again: two more polls
+    // finish after the plant, so at least one read it.
     await plant(waiter, `${url}&again=1`);
-    await Bun.sleep(300);
+    const planted = polls;
+    await until(() => polls >= planted + 2, 10_000, "a poll of the second link");
     held.release();
     await expect(waited).rejects.toBeInstanceOf(LoginFailed);
     expect(waiter.seen.presented).toEqual([]);
     expect(waiter.seen.diagnostics).toHaveLength(1);
     const said = waiter.seen.diagnostics[0]!;
-    expect(said).toMatchObject({ state: "degraded", operation: "login", code: "refused" });
+    expect(said).toMatchObject({ state: "degraded", operation: "login_link", code: "refused" });
     expect(said.message).toContain(check);
     expect(said.message).toContain(new URL(resource).origin);
     expect(said.message).not.toContain("state=x");
@@ -357,7 +371,7 @@ test("a sign-in waiter succeeds whenever the store is live once it holds the loc
   const shared = l.login();
   await until(() => l.seen.notices.length === 1, 10_000, "waiter notice");
   held.release();
-  await shared;
+  expect(await shared).toBe("signed in");
   expect((await l.read())!.epoch).toBe(store.epoch);
   await writeJsonAtomic(l.path, { version: 1, resource, clientId: CLIENT, epoch: store.epoch, loginRequired: { reason: "logged_out" } } satisfies GrantStore);
   held = tryAcquire(`${l.path}.login.lock`)!;
@@ -376,11 +390,11 @@ test("an automatic sign-in that finds a live grant under the lock runs no flow; 
   const { store } = await seed({ expiresIn: 3_600_000 });
   let flows = 0;
   const l = login({ present: async url => { flows++; await browse(url); } });
-  await l.login(undefined, true);
+  expect(await l.login(undefined, true)).toBe("current");
   expect(flows).toBe(0);
   expect((await l.read())!.epoch).toBe(store.epoch);
   expect(grants()).toBe(1);
-  await l.login();
+  expect(await l.login()).toBe("signed in");
   expect(flows).toBe(1);
   expect(grants()).toBe(2);
 });
