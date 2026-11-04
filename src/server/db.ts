@@ -257,6 +257,10 @@ function migrateHostedHolds(db: Database): void {
   if (!cols.has("writes_as")) db.exec(`ALTER TABLE hosted_sessions ADD COLUMN writes_as TEXT`);
   // The name a root's first request suggested (#443): written at insert, never updated.
   if (!cols.has("suggested")) db.exec(`ALTER TABLE hosted_sessions ADD COLUMN suggested TEXT`);
+  // When the sweep parked an idle child (#566); null while active.
+  if (!cols.has("parked_at")) db.exec(`ALTER TABLE hosted_sessions ADD COLUMN parked_at INTEGER`);
+  // `all()` reads the active rows and `children()` a root's: a long ownership's parked backlog stays off both scans.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_hosted_parked ON hosted_sessions(parked_at); CREATE INDEX IF NOT EXISTS idx_hosted_root ON hosted_sessions(root_session_id)`);
   db.exec(`
     INSERT OR IGNORE INTO alias_holds(address, id, bound_at)
       SELECT u.email || '/' || h.name, h.session_id, h.last_seen_at FROM hosted_sessions h JOIN users u ON u.id = h.user_id WHERE h.name IS NOT NULL;
@@ -1314,7 +1318,14 @@ function makeHostedStore(db: Database): HostedStore {
     owned: (id) => db.query<{ n: number }, [string, string]>(
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
     ).get(id, id) !== null,
-    all: () => db.query<HostedSession, []>("SELECT * FROM hosted_sessions").all(),
+    all: () => db.query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all(),
+    children: (root) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
+    park(session, now) {
+      db.run("UPDATE hosted_sessions SET parked_at = ? WHERE session_id = ? AND root_session_id IS NOT NULL AND parked_at IS NULL", [now, session]);
+    },
+    unpark(session, grant, now) {
+      db.run("UPDATE hosted_sessions SET parked_at = NULL, grant_id = ?, last_seen_at = ? WHERE session_id = ?", [grant, now, session]);
+    },
     start(session, user, client, now) {
       const r = db.run("INSERT INTO hosted_ownerships(session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?)", [session, user, client, now]);
       const id = Number(r.lastInsertRowid);
