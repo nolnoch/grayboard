@@ -1096,3 +1096,20 @@ test("a flow that ends while no root runtime is current (a session switch's gap)
   expect(signins().last?.said).toBe(true);
   await until(async () => (await b.ext.status()).includes("  gap-b: unbound, "), 10_000, "the next root running signed in");
 }, 30_000);
+
+test("a /grayboard login pending across a session switch leaves an outcome that ends in the gap to the next root, which says it once", async () => {
+  await logoutElsewhere();
+  const a = instance({ child: false }, undefined, undefined, true);
+  await a.ext.start({ id: "gapcmd-a", reason: "startup" });
+  const login = a.ext.command("login");
+  const url = await linkSaid(a);
+  await a.ext.shutdown("new");
+  expect(await browse(srv.issuer, url, "pi")).toContain("Signed in to grayboard");
+  await login;
+  expect(signins().last).toMatchObject({ origin: "command", outcome: "signed in" });
+  expect(signins().last?.said).toBeUndefined();
+  const b = instance({ child: false }, undefined, undefined, true);
+  await b.ext.start({ id: "gapcmd-b", reason: "new" });
+  expect(b.notices.filter(n => n.message === SIGNED_IN.message)).toHaveLength(1);
+  expect(await b.ext.status()).toMatch(LAST("command", "signed in"));
+}, 30_000);

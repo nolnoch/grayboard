@@ -377,19 +377,25 @@ export class Login {
     const seen = new Set<string>();
     let refused = false, failure: { error: unknown } | undefined;
     const stop = new AbortController();
+    // Said once per flow, naming the failed check, never the file's text.
+    const refuse = (why: string) => {
+      if (!refused) this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login", code: "refused" });
+      refused = true;
+    };
     const onBusy = async () => {
       let raw: unknown;
-      try { raw = await readJson(this.linkPath); } catch { return; }
+      // A parse error's message may quote the file, so only its kind is said.
+      try { raw = await readJson(this.linkPath); }
+      catch (error) { refuse(error instanceof SyntaxError ? "the link file isn't JSON" : `the link file is unreadable (${String((error as { code?: unknown }).code ?? "error")})`); return; }
+      // No file: the holder hasn't reached its URL yet.
+      if (raw === undefined) return;
       const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
-      if (text === undefined || seen.has(text)) return;
+      if (text === undefined) { refuse("the link file holds no URL"); return; }
+      if (seen.has(text)) return;
       seen.add(text);
       const checked = signInUrl(text);
       const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
-      if (why || !("url" in checked)) {
-        if (!refused) this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login", code: "refused" });
-        refused = true;
-        return;
-      }
+      if (why || !("url" in checked)) { refuse(why ?? "not a sign-in link"); return; }
       const presented = Promise.resolve().then(() => this.config.present(checked.url.href));
       presented.catch(error => { failure ??= { error }; stop.abort(); });
     };

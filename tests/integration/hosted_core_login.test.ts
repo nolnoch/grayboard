@@ -113,10 +113,11 @@ const grants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n
 const liveGrants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ? AND revoked_at IS NULL").get(CLIENT)!.n;
 // The client's fetch, with the requests `answer` picks answered here: a
 // Response to return or an Error to throw; undefined sends the request.
-async function withFetch<T>(answer: (url: string, form: URLSearchParams | undefined) => Response | Error | undefined, run: () => Promise<T>): Promise<T> {
+type Answer = Response | Error | undefined;
+async function withFetch<T>(answer: (url: string, form: URLSearchParams | undefined) => Answer | Promise<Answer>, run: () => Promise<T>): Promise<T> {
   const fetch0 = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const outcome = answer(input instanceof Request ? input.url : String(input), init?.body instanceof URLSearchParams ? init.body : undefined);
+    const outcome = await answer(input instanceof Request ? input.url : String(input), init?.body instanceof URLSearchParams ? init.body : undefined);
     if (outcome instanceof Error) throw outcome;
     return outcome ?? fetch0(input, init);
   }) as typeof fetch;
@@ -231,19 +232,43 @@ test("in one process: a waiter presents the holder's link, and the link is gone 
   expect(grants()).toBe(1);
 });
 
-test("a leftover link from a crashed holder is removed by the next holder and never presented", async () => {
+test("a leftover link from a crashed holder is removed by the next holder before its discovery, so a waiter polling then never presents it", async () => {
   let link: string | undefined;
   const holder = login({ present: url => { link = url; return new Promise<void>(() => {}); } });
   await plant(holder, planted("leftover"));
-  const held = holder.login();
-  await until(() => !!link, 10_000, "holder's link");
+  // The holder's discovery waits until released: it holds the lock with no URL of its own yet.
+  const { promise: discovered, resolve: discover } = Promise.withResolvers<void>();
+  await withFetch(async url => { if (url.includes("/.well-known/oauth-protected-resource")) await discovered; return undefined; }, async () => {
+    const held = holder.login();
+    await until(async () => !(await Bun.file(`${holder.path}.login.url`).exists()), 10_000, "the leftover removed under the lock");
+    const waiter = login();
+    const waited = waiter.login();
+    await until(() => waiter.seen.notices.length === 1, 10_000, "waiter notice");
+    discover();
+    await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
+    expect(waiter.seen.presented).toEqual([link!]);
+    await browse(link!);
+    await held; await waited;
+    expect(waiter.seen.presented).toEqual([link!]);
+  });
+});
+
+test("a link file that isn't JSON is said once as such, never quoted, and a later valid link is still presented", async () => {
   const waiter = login();
+  await Bun.write(`${waiter.path}.login.url`, "{not json state=secret");
+  const held = tryAcquire(`${waiter.path}.login.lock`)!;
   const waited = waiter.login();
-  await until(() => waiter.seen.presented.length === 1, 10_000, "waiter's present");
-  expect(waiter.seen.presented).toEqual([link!]);
-  await browse(link!);
-  await held; await waited;
-  expect(waiter.seen.presented).toEqual([link!]);
+  await until(() => waiter.seen.diagnostics.some(d => d.code === "refused"), 10_000, "the refusal");
+  const refusals = waiter.seen.diagnostics.filter(d => d.code === "refused");
+  expect(refusals).toHaveLength(1);
+  expect(refusals[0]!.message).toContain("the link file isn't JSON");
+  expect(refusals[0]!.message).not.toContain("secret");
+  await plant(waiter, planted("valid"));
+  await until(() => waiter.seen.presented.length === 1, 10_000, "the valid link presented");
+  expect(waiter.seen.presented).toEqual([planted("valid")]);
+  expect(waiter.seen.diagnostics.filter(d => d.code === "refused")).toHaveLength(1);
+  held.release();
+  await expect(waited).rejects.toBeInstanceOf(LoginFailed);
 });
 
 test("threat boundary: a same-user writer of the 0700 store dir can show a same-origin link to a waiter while a holder is in discovery", async () => {

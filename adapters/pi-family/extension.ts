@@ -499,9 +499,11 @@ export function createGrayboard(h: Harness): Grayboard {
           else if (flow.elsewhere) log(`${flow.elsewhere}; finish it there`);
         }
         await flow.done;
-        // The flow said its outcome and restarted this runtime already.
+        // The flow said its outcome and restarted this runtime already. A
+        // runtime that shut down meanwhile (a /new) says nothing: an outcome
+        // still unsaid stays for the next root's start.
         const last = state.signins.last;
-        if (!last || last.said) return;
+        if (!last || last.said || closed) return;
         last.said = true;
         // Its own failure line: resume can't mend a sign-in that didn't happen.
         outcomeLine(voice, last);

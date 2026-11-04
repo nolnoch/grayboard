@@ -32451,23 +32451,33 @@ ${config.clientId}`)}.json`);
     const seen = new Set;
     let refused = false, failure;
     const stop = new AbortController;
+    const refuse = (why) => {
+      if (!refused)
+        this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login", code: "refused" });
+      refused = true;
+    };
     const onBusy = async () => {
       let raw;
       try {
         raw = await readJson(this.linkPath);
-      } catch {
+      } catch (error) {
+        refuse(error instanceof SyntaxError ? "the link file isn't JSON" : `the link file is unreadable (${String(error.code ?? "error")})`);
         return;
       }
+      if (raw === undefined)
+        return;
       const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
-      if (text === undefined || seen.has(text))
+      if (text === undefined) {
+        refuse("the link file holds no URL");
+        return;
+      }
+      if (seen.has(text))
         return;
       seen.add(text);
       const checked = signInUrl(text);
       const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
       if (why || !("url" in checked)) {
-        if (!refused)
-          this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login", code: "refused" });
-        refused = true;
+        refuse(why ?? "not a sign-in link");
         return;
       }
       const presented = Promise.resolve().then(() => this.config.present(checked.url.href));

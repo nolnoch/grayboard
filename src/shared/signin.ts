@@ -8,7 +8,7 @@ import { LOOPBACK } from "./endpoint.ts";
 // shows no link older than it.
 export const SIGN_IN_FLOW_MS = 10 * 60_000;
 // The longest link shown: canonicalEndpoint's bound (endpoint.ts).
-export const SIGN_IN_URL_MAX = 2048;
+const SIGN_IN_URL_MAX = 2048;
 
 /**
  * Whether `text` has an authorization URL's shape: at most SIGN_IN_URL_MAX
