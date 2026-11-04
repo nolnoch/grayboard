@@ -42,6 +42,8 @@ type Rpc = { id?: number; method?: string; params?: unknown; result?: any; error
 
 const SERVER = process.env.GRAYBOARD_MCP_NAME ?? "grayboard";
 const CONFIG = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode", "opencode.json");
+// The same harness-asserted subagent key used by the local omp adapter.
+const AGENT_META = "io.github.nolnoch.grayboard/agent";
 const z = tool.schema;
 // Match pi and omp's local restart policy. Setup embeds this raw file, so
 // the lifecycle stays here rather than importing a runtime helper.
@@ -60,6 +62,22 @@ function render({ content, meta = {} }: ChannelParams): string {
   // A body's `<channel` or `</channel` keeps its `<` escaped, so it can't close
   // the element or forge another one (#433, #435).
   return `<channel source="grayboard"${attrs}>\n${content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;")}\n</channel>`;
+}
+
+function resultText(result: CallResult): string {
+  const text = (result.content ?? []).flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n");
+  if (result.isError) throw new Error(text || `MCP tool ${SERVER} returned an error`);
+  return text;
+}
+
+// Local MCP's existing child whoami supplies the live root and primary. A
+// child gets none of initialize's root-only inbox, holds or channel guidance.
+function childInstructions(result: CallResult): string {
+  const who: unknown = JSON.parse(resultText(result));
+  if (!who || typeof who !== "object" || !("child" in who) || who.child !== true || !("id" in who) || typeof who.id !== "string" || !("root" in who) || typeof who.root !== "string" || !("primary" in who) || typeof who.primary !== "string") {
+    throw new Error("grayboard: child whoami returned no child identity");
+  }
+  return `You are a subagent of session ${who.root} on the grayboard bus. You send, post and claim under your root's addresses (currently ${JSON.stringify(who.primary)}), and your writes show your child ID ${who.id} as via. bind and unbind are the root's; call them from the root session. Mail and board pushes never reach you. dm_thread reads a thread you wrote; board_read reads without marking anything read. Your root owns dm_inbox, dm_ack and board_subscribe, so those calls are refused. Your child session ends with its root.`;
 }
 
 // JSON Schema to zod, for the shapes grayboard's tools use. Anything else
@@ -178,7 +196,9 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
   let refused: string | undefined;
   // The root session to deliver into: the one the user last wrote in.
   let target: string | undefined;
-  const subagents = new Set<string>();
+  // Events cover newly created sessions; lookup also covers resumed children
+  // and calls that beat the asynchronous session.created event.
+  const parents = new Map<string, string | undefined>();
   // One delivery at a time, in order.
   let queue = Promise.resolve();
 
@@ -362,6 +382,28 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     return (child ??= start());
   };
 
+  const sessionParent = async (sessionID: string): Promise<string | undefined> => {
+    if (!parents.has(sessionID)) {
+      const session = await client.session.get({ path: { id: sessionID } });
+      if (session.error || !session.data) throw new Error(`grayboard: can't identify opencode session ${sessionID}: ${JSON.stringify(session.error)}`);
+      parents.set(sessionID, session.data.parentID);
+    }
+    return parents.get(sessionID);
+  };
+  const isSubagent = async (sessionID: string) => !!(await sessionParent(sessionID));
+  const firstTarget = async (sessionID: string) => {
+    if (target) return;
+    let root = sessionID;
+    const seen = new Set<string>();
+    let parent: string | undefined;
+    while ((parent = await sessionParent(root))) {
+      if (seen.has(root)) throw new Error("grayboard: opencode session ancestry contains a cycle");
+      seen.add(root);
+      root = parent;
+    }
+    await selectTarget(root);
+  };
+
   // opencode's MCP naming, so prompts and skills that name these keep working.
   const name = (t: string) => `${SERVER}_${t}`.replace(/[^a-zA-Z0-9_-]/g, "_");
   const record = Object.fromEntries(
@@ -371,17 +413,17 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
         description: t.description ?? `MCP tool ${t.name} from server ${SERVER}`,
         args: toShape(t.inputSchema, t.name),
         async execute(args, ctx) {
+          const sub = await isSubagent(ctx.sessionID);
+          await firstTarget(ctx.sessionID);
           const c = await running(ctx.abort);
           await waitReady(c.ready, ctx.abort);
-          const result = (await c.call("tools/call", { name: t.name, arguments: args }, ctx.abort)) as CallResult;
-          const text = (result.content ?? []).flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n");
+          const result = (await c.call("tools/call", { name: t.name, arguments: args, ...(sub ? { _meta: { [AGENT_META]: ctx.sessionID } } : {}) }, ctx.abort)) as CallResult;
           // A result carries the instructions when the name changed (#182
           // decision 13): bind's, or the next one after a bind whose result
           // was lost (cancelled, timed out) or a lost name. Errors included.
-          if (result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
+          if (!sub && result.structuredContent?.instructions) instructions = result.structuredContent.instructions.join(" ");
           // A thrown error is opencode's tool error.
-          if (result.isError) throw new Error(text || `MCP tool ${SERVER}/${t.name} returned an error`);
-          return text;
+          return resultText(result);
         },
       }),
     ]),
@@ -415,11 +457,13 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (closed) return;
       if (event.type === "session.created" || event.type === "session.updated") {
         const s = event.properties.info;
-        if (s.parentID) subagents.add(s.id);
-        else if (event.type === "session.created" && !target) await selectTarget(s.id);
+        parents.set(s.id, s.parentID);
+        if (!s.parentID && event.type === "session.created" && !target) await selectTarget(s.id);
       } else if (event.type === "message.updated") {
         const m = event.properties.info;
-        if (m.role === "user" && !subagents.has(m.sessionID)) await selectTarget(m.sessionID);
+        if (m.role === "user" && !(await isSubagent(m.sessionID))) await selectTarget(m.sessionID);
+      } else if (event.type === "session.deleted") {
+        parents.delete(event.properties.info.id);
       }
       if (target && !closed && !refused && !exitReason && !restart) {
         await Promise.all(stopping);
@@ -431,13 +475,19 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     // starts before the child's initialize waits for it.
     "experimental.chat.system.transform": async (input, output) => {
       if (refused || closed) return;
-      if (!target && input.sessionID && !subagents.has(input.sessionID)) await selectTarget(input.sessionID);
+      const sub = input.sessionID ? await isSubagent(input.sessionID) : false;
+      if (input.sessionID) await firstTarget(input.sessionID);
       if (target && !child && !exitReason && !closed) {
         await Promise.all(stopping);
         if (!closed) child ??= start();
       }
       await child?.ready.catch(() => {});
-      if (instructions) output.system.push(instructions);
+      if (sub && input.sessionID) {
+        const c = await running();
+        await c.ready;
+        const result = await c.call("tools/call", { name: "whoami", arguments: {}, _meta: { [AGENT_META]: input.sessionID } }) as CallResult;
+        output.system.push(childInstructions(result));
+      } else if (instructions) output.system.push(instructions);
     },
 
     dispose: shutdown,

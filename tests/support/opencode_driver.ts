@@ -12,6 +12,7 @@
 //   dispose
 //   abort   { key }            abort an in-flight call tagged with that key
 //   advanceClock { ms }        advance the adapter's stability clock, not its timers
+//   session { sessionID, parentID? } seed the SDK lookup without a creation event
 import { createInterface } from "node:readline";
 import { ChildProcess } from "node:child_process";
 import { tool } from "@opencode-ai/plugin";
@@ -37,6 +38,7 @@ const logs: { level: string; message: string }[] = [];
 const toasts: string[] = [];
 const prompts: { session: string; text: string; noReply: boolean }[] = [];
 const restartOwners: { message: string; pids: number[] }[] = [];
+const sessions = new Map<string, { id: string; parentID?: string }>();
 const client = {
   app: { log: async ({ body }: any) => (logs.push({ level: body.level, message: body.message }), {}) },
   tui: { showToast: async ({ body }: { body: { message: string } }) => {
@@ -49,6 +51,7 @@ const client = {
     return {};
   } },
   session: {
+    get: async ({ path }: { path: { id: string } }) => ({ data: sessions.get(path.id) ?? { id: path.id } }),
     promptAsync: async ({ path, body }: any) => {
       prompts.push({ session: path.id, text: body.parts.map((p: any) => p.text).join(""), noReply: !!body.noReply });
       return {};
@@ -70,8 +73,16 @@ async function run(msg: any): Promise<unknown> {
     }
     case "config":
       return hooks.config(msg.cfg);
-    case "event":
+    case "event": {
+      if (msg.event.type === "session.created" || msg.event.type === "session.updated") {
+        const s = msg.event.properties.info;
+        sessions.set(s.id, s);
+      }
       return hooks.event({ event: msg.event });
+    }
+    case "session":
+      sessions.set(msg.sessionID, { id: msg.sessionID, ...(msg.parentID ? { parentID: msg.parentID } : {}) });
+      return;
     case "call": {
       const controller = new AbortController();
       const key = String(msg.key ?? msg.id);

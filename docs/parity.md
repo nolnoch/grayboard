@@ -33,7 +33,7 @@ The baseline every later change is measured against. A cell says what a user of 
 | 5 | Names across an in-process session switch or MCP reconnect | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 6 | Names when a new harness process resumes a conversation | gap #195 | yes | gap #195 | yes | gap #195 | yes | gap #195 | yes |
 | 7 | Automatic restart after the grayboard process exits | gap #559 | n/a | yes | n/a | yes | n/a | n/a | n/a |
-| 8 | Subagents as child sessions, writes attributed (`via`) | yes | yes | yes | yes | gap #577 | yes | yes | yes |
+| 8 | Subagents as child sessions, writes attributed (`via`) | yes | yes | yes | yes | yes | yes | yes | yes |
 | 9 | Sign-in flow | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 10 | Sign-in offer in a signed-out tool result | n/a | gap #499 | n/a | gap #499 | n/a | n/a | n/a | yes |
 | 11 | Attachments (send from a path, save with `attachment_get`) | yes | yes | yes | yes | yes | gap #578 | yes | yes |
@@ -100,7 +100,7 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - pi L: pi-subagents' detached runner is a child of its parent session and can promote itself by binding (boards.md §3 Local runner children). In-process foreground children load no extensions, so they make no bus calls (#523 step 5). Proof: `tests/integration/pi.test.ts` piRunnerScenario.
 - omp L: a `kind: "sub"` runtime's call carries its agent id under `GRAYBOARD_AGENT_META`; subagents get no pushes and no instructions (#523, #526). Proof: `tests/integration/omp.test.ts` omp local task run.
-- OC V1: **gap #577.** `execute` sends no `_meta` agent key (`adapters/opencode/grayboard.ts` tool record), so a subagent session's (`parentID`) write reads as its root's, and `experimental.chat.system.transform` gives subagent sessions the root's instructions. #523 left the V1 adapter out.
+- OC V1: sessions with `parentID` send their session id under `GRAYBOARD_AGENT_META`, using local MCP's existing `ChildSessions` path; bind and unbind remain the root's. The system transform renders child-only instructions from a child-scoped `whoami`, never the root's instructions (#577). Children get no pushes and end with the local root, as omp's do. Proof: `tests/integration/opencode.test.ts` against pinned OpenCode 1.19.4 ("opencode real: subagent writes via its root, cannot bind, and gets child instructions"), plus SDK lookup coverage for resumed nested children before a creation event.
 - pi H, omp H: a child registers under its root before its first call (boards.md §9 Hosted pi, Hosted omp). Proof: `tests/integration/pi_family.test.ts` ("a marked child registers under its root…"), `tests/integration/omp.test.ts` omp hosted task run.
 - OC V2: every subagent of an enrolled root registers as a child and gets the server's child instructions (#535). Proof: `adapters/opencode-v2/tests/host.ts` (REAL_INSTRUCTIONS_SUBAGENT_OK), `adapters/opencode-v2/tests/instructions.test.ts`.
 - CC L, CC H: hooks write a per-call agent record that the MCP side takes; a call with no record is refused, never run as the root (#551; boards.md §3 Claude Code children). CC H's child is `<session id>/agent/<agent id>`, ended by `SubagentStop` (`plugins/claude-code/src/plugin.ts`). Proof: e2e `claude-local` (`tests/e2e/claude_local.e2e.ts`), `tests/integration/claude_records.test.ts`, `tests/integration/claude_plugin.test.ts` ("a subagent's call runs as a child of the root, with via").
