@@ -30,13 +30,16 @@ test("the committed bundles are fresh builds of plugins/claude-code/src (run `bu
 
 // The hooks that make a subagent's calls its own child session (#551): every
 // grayboard tool's PreToolUse, and the session's start, end and subagent stops;
-// and a confirmed model switch, for the root's model (#545).
+// a confirmed model switch, for the root's model (#545); and every grayboard
+// tool's PostToolUse and PostToolUseFailure, which show the sign-in link (#500).
 test("the plugin's hooks run the hook bundle with bun for each event", () => {
   const hooks = JSON.parse(readFileSync(join(PLUGIN, "hooks/hooks.json"), "utf8")).hooks;
   const run = (event: string) => [{ type: "command", command: `bun "\${CLAUDE_PLUGIN_ROOT}/dist/hook.js" ${event} --data "\${CLAUDE_PLUGIN_DATA}"`, timeout: 10 }];
   expect(hooks).toEqual({
     SessionStart: [{ matcher: "startup|resume|clear|fork", hooks: run("session-start") }],
     PreToolUse: [{ matcher: "mcp__plugin_grayboard_grayboard__.*", hooks: run("pre-tool-use") }],
+    PostToolUse: [{ matcher: "mcp__plugin_grayboard_grayboard__.*", hooks: run("post-tool-use") }],
+    PostToolUseFailure: [{ matcher: "mcp__plugin_grayboard_grayboard__.*", hooks: run("post-tool-use") }],
     PostModelSwitch: [{ hooks: run("model-switch") }],
     SubagentStop: [{ hooks: run("subagent-stop") }],
     SessionEnd: [{ hooks: run("session-end") }],
