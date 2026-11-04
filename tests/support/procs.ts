@@ -1,6 +1,10 @@
 import { CLI } from "./paths.ts";
 import { until } from "./until.ts";
 
+// The line tests/support/stops_reading.ts stops reading after (its
+// $BUS_TEST_STOP_READING_ON), for the omp and pi scenarios that use it.
+export const STOP_READING = "stop-reading-580";
+
 // The grayboard processes whose parent is `pid` (this checkout's CLI, or
 // `bin`): an adapter's session runs exactly one, as its own child (#182
 // decision 13).

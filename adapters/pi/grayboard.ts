@@ -47,6 +47,8 @@ const PREFIX = `mcp__${SERVER}__`.replace(/[^A-Za-z0-9_]/g, "_");
 // Both adapters install as one raw file, so neither can import a helper.
 const RESTART_DELAYS_MS = [0, 1_000, 5_000];
 const STABLE_MS = 60_000;
+// How long a killed child gets to exit before SIGKILL, as in the omp adapter.
+const EXIT_WAIT_MS = 1_500;
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -157,6 +159,8 @@ export default function grayboard(pi: ExtensionAPI) {
   let exitReason: string | undefined;
   let restarts = 0;
   let restart: { ready: Promise<void>; cancel(): void } | undefined;
+  // The exit of the last child fail() killed; no replacement starts before it.
+  let stopping: Promise<void> | undefined;
   let instructions: string | undefined;
   let registered = false;
   let refused: string | undefined;
@@ -193,6 +197,8 @@ export default function grayboard(pi: ExtensionAPI) {
     // since /new, /resume and fork change the id.
     const env = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: PARENT_SESSION, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
     const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "inherit"] });
+    const exited = Promise.withResolvers<void>();
+    proc.once("exit", () => exited.resolve());
     const pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
     let next = 1;
     let gone: Error | undefined;
@@ -224,9 +230,15 @@ export default function grayboard(pi: ExtensionAPI) {
       pending.clear();
       if (child?.proc !== proc) return;
       child = undefined;
-      // EPIPE can happen while the child is still alive. Stop it before a
-      // replacement, so it can't linger as a second delivery owner.
-      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
+      // EPIPE can happen while the child is still alive. Kill it and wait for
+      // its exit (SIGKILL after EXIT_WAIT_MS) before a replacement, so it
+      // can't linger as a second delivery owner or keep its names (#599).
+      const ending = proc.exitCode !== null || proc.signalCode !== null || !proc.pid ? Promise.resolve() : (async () => {
+        proc.kill();
+        const force = setTimeout(() => proc.kill("SIGKILL"), EXIT_WAIT_MS);
+        try { await exited.promise; } finally { clearTimeout(force); }
+      })();
+      stopping = ending;
       if (Date.now() - startedAt >= STABLE_MS) restarts = 0;
       const attempt = restarts;
       if (attempt >= RESTART_DELAYS_MS.length) {
@@ -237,18 +249,22 @@ export default function grayboard(pi: ExtensionAPI) {
       restarts = attempt + 1;
       exitReason = `${reason}; restarting it`;
       report(ctx, `${reason}; restarting it (${attempt + 1} of ${RESTART_DELAYS_MS.length})`, "warning");
-      const waiter = Promise.withResolvers<void>();
-      const timer = setTimeout(() => {
+      // The replacement waits for both the backoff and the old child's exit.
+      const delay = Promise.withResolvers<void>();
+      const timer = setTimeout(delay.resolve, RESTART_DELAYS_MS[attempt]);
+      let cancelled = false;
+      const ready = Promise.all([delay.promise, ending]).then(() => {
+        if (cancelled) return;
         restart = undefined;
         if (selected === selection) child = start(selection.ctx);
-        waiter.resolve();
-      }, RESTART_DELAYS_MS[attempt]);
+      });
       restart = {
-        ready: waiter.promise,
+        ready,
         cancel() {
+          cancelled = true;
           clearTimeout(timer);
           restart = undefined;
-          waiter.resolve();
+          delay.resolve();
         },
       };
     };
@@ -385,6 +401,8 @@ export default function grayboard(pi: ExtensionAPI) {
     restart?.cancel();
     selected = undefined;
     instructions = undefined;
+    // A child fail() killed must be gone before the next session's starts.
+    await stopping;
     const c = child;
     if (!c) return;
     child = undefined;

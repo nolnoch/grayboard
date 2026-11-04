@@ -23,7 +23,7 @@ import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
-import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill } from "./procs.ts";
+import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
@@ -766,6 +766,87 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
       }
       await stopAll(procs);
       model.stop();
+    }
+  });
+}
+
+// A grayboard that stops reading while it still runs and holds the name
+// (tests/support/stops_reading.ts, whose SIGTERM ends it a second late): the
+// adapter's next write fails with EPIPE, and it waits for that process to
+// exit before the replacement starts, so the replacement takes the name back
+// and no stale delivery owner remains (#599, omp's #580).
+export function piLocalStopsReadingScenario(dir: string): Promise<void> {
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-599", create: true } }]),
+      scripted("stop", [{ tool: "mcp__grayboard__dm_send", args: { to: "peer", body: STOP_READING } }]),
+      // A small write to a closed pipe can succeed; a large one raises EPIPE.
+      scripted("big", [{ tool: "mcp__grayboard__dm_send", args: { to: "peer", body: "x".repeat(128_000) } }]),
+      scripted("who", [{ tool: "mcp__grayboard__whoami", args: {} }]),
+    ]);
+    let pi: Pi | undefined;
+    let db: Database | undefined;
+    // Every relay and grayboard pid seen, SIGKILLed at the end: on a regression
+    // the stale pair outlives pi, which only stops the child it still owns.
+    const seen = new Set<number>();
+    const grayboards = (pid: number) => {
+      const pids = grayboardChildPids(pid).flatMap((relay) => [relay, ...processDescendants(relay).filter((p) => p.command.includes(CLI)).map((p) => p.pid)]);
+      for (const p of pids) seen.add(p);
+      return pids;
+    };
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      await localSession(dir, "peer");
+      pi = startPi(dir, model.port, procs, {
+        identity: null,
+        entry: {
+          command: process.execPath,
+          args: [join(ROOT, "tests/support/stops_reading.ts"), process.execPath, CLI, "mcp", "--mode", "local"],
+          env: { BUS_PUSH: "off", BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING },
+        },
+      });
+      const session = pi;
+      await session.command({ type: "get_state" });
+      await session.command({ type: "prompt", message: "bind" });
+      expect(!!(await toolResult(session, "bind")).isError).toBe(false);
+      await idle(session);
+      db = new Database(join(dir, "bus.db"), { readonly: true });
+      const holder = () => db!.query<{ id: string }, []>("SELECT id FROM alias_holds WHERE address = 'pi-599'").get()?.id;
+      const first = holder()!;
+      expect(first).toBeDefined();
+
+      await session.command({ type: "prompt", message: "stop" });
+      expect(!!(await toolResult(session, "dm_send")).isError).toBe(false);
+      await idle(session);
+      // The relay and the one grayboard behind it.
+      const stale = grayboards(session.pid);
+      expect(stale).toHaveLength(2);
+
+      await session.command({ type: "prompt", message: "big" });
+      expect(resultText(await toolResult(session, "dm_send", 1))).toContain("grayboard process stopped reading");
+      await idle(session);
+      await until(() => !stale.some(alive), 10_000, "the process that stopped reading killed");
+      await until(() => { const h = holder(); return h !== undefined && h !== first; }, 15_000, "pi-599 held by the replacement");
+      const replacement = grayboards(session.pid);
+      expect(replacement).toHaveLength(2);
+      expect(db.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(first)?.ended_at).not.toBeNull();
+
+      await session.command({ type: "prompt", message: "who" });
+      const who = await toolResult(session, "whoami");
+      expect(!!who.isError).toBe(false);
+      expect(JSON.parse(resultText(who)).primary).toBe("pi-599");
+      await idle(session);
+      expect(model.unhandled).toEqual([]);
+      await session.quit();
+      await until(() => !replacement.some(alive), 5_000, "the replacement ended with pi");
+    } finally {
+      for (const p of seen) {
+        try { process.kill(p, "SIGKILL"); } catch {}
+      }
+      await stopAll(procs);
+      model.stop();
+      db?.close();
     }
   });
 }
