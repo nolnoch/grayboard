@@ -423,8 +423,7 @@ export function piLocalRestartShutdownScenario(dir: string, waitingTool = false)
       for (let attempt = 0; attempt < 2; attempt++) {
         const [dead] = grayboardChildPids(session.pid);
         await sigkill(dead!);
-        await until(() => holder() && holder()!.id !== previous, 15_000, "the name restored before another kill");
-        previous = holder()!.id;
+        previous = (await until(() => { const h = holder(); return h && h.id !== previous ? h : undefined; }, 15_000, "the name restored before another kill")).id;
       }
 
       const [dead] = grayboardChildPids(session.pid);
