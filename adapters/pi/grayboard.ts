@@ -226,7 +226,6 @@ export default function grayboard(pi: ExtensionAPI) {
       child = undefined;
       // EPIPE can happen while the child is still alive. Stop it before a
       // replacement, so it can't linger as a second delivery owner.
-      // Unlike omp's local adapter, pi also kills the live EPIPE child.
       if (proc.exitCode === null && proc.signalCode === null) proc.kill();
       if (Date.now() - startedAt >= STABLE_MS) restarts = 0;
       const attempt = restarts;

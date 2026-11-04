@@ -391,6 +391,8 @@ export default function grayboard(pi: ExtensionAPI) {
       shared.child = undefined;
       shared.transition = undefined;
       shared.instructions = undefined;
+      // EPIPE can happen while the child is still alive. Stop it before a
+      // replacement, so it can't linger as a second delivery owner (#580).
       if (proc.exitCode === null && proc.signalCode === null) proc.kill();
       if (Date.now() - startedAt >= STABLE_MS) shared.restarts = 0;
       const attempt = shared.restarts ?? 0;
