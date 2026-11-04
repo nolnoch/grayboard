@@ -280,6 +280,7 @@ describe("reading files to attach", () => {
     await expect(saveTarget(join(root, ".claude/rules"), [root], "b")).rejects.toThrow("dot directories");
     expect(() => checkSaveDir(join(root, ".claude"), [root], root)).toThrow("dot directories");
     expect(checkSaveDir("docs", [root], root)).toBe(join(root, "docs"));
+    expect(await saveTarget("docs", [root], "b", {}, root)).toBe(join(root, "docs"));
     expect(readdirSync(join(root, ".claude", "rules"))).toEqual([]);
   });
 

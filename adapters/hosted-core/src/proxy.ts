@@ -10,12 +10,13 @@ import snapshot from "./native-tools.json" with { type: "json" };
 import type { CallOutcome, Controller } from "./controller.js";
 import type { Operation } from "./diagnostics.js";
 import { AccessExpired, accessExpiry, same } from "./model.js";
-import { InsufficientScope, NativeWire, ServerUnreachable, unreachable, type WireOptions } from "./wire.js";
+import { InsufficientScope, NativeWire, ServerUnreachable, type WireOptions } from "./wire.js";
+import { HostedAttachments } from "./attachments.js";
+import { outputOf } from "./results.js";
 import {
-  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, checkAttachmentId, downloadAttachment, publishedLimits, readAttachmentFiles, saveTarget,
-  sendWithUploads, SendLanded, serverBusDir, type AttachmentLimits, type AttachmentTransport,
+  ATTACHMENTS_PARAM, ATTACHMENT_GET_TOOL, DEFAULT_ATTACHMENT_LIMITS, attachRoots, publishedLimits,
+  SendLanded, type AttachmentLimits,
 } from "../../../src/shared/attachments.ts";
-import { describeFetchError, HTTP_TIMEOUT_MS, transferTimeoutMs } from "../../../src/shared/http.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { GRAYBOARD_ALIAS_LOST_META } from "../../../src/shared/session_meta.ts";
 
@@ -76,22 +77,10 @@ function withPaths(tool: NativeTool): NativeTool {
   return { ...tool, ...(description === undefined ? {} : { description }), inputSchema: { ...tool.inputSchema, properties } };
 }
 
-// The tool's parsed result for afterCall: structuredContent, else the single
-// text content parsed as JSON (or as is when it isn't JSON).
-export function outputOf(result: CallToolResult): unknown {
-  if (result.structuredContent !== undefined) return result.structuredContent;
-  const only = result.content.length === 1 ? result.content[0] : undefined;
-  if (only?.type !== "text") return undefined;
-  try { return JSON.parse(only.text); } catch { return only.text; }
-}
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 // A tool result that reports `message` as an error, in every hosted adapter.
 export const failure = (message: string): CallToolResult => ({ ...text(`error: ${message}`), isError: true });
 
-// The attachment routes refused a request with the server's own code and message.
-export class AttachmentRefused extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) { super(message); }
-}
 // A forwarded call the server answered with isError: its uploads are released
 // and its result returned as is.
 class Refused extends Error {
@@ -121,14 +110,16 @@ export class ToolProxy {
   // Every call and instructions fetch not yet settled, for retire().
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly closing = new AbortController();
-  private readonly roots: string[];
-  private readonly resource: URL;
+  private readonly attachments: HostedAttachments;
   constructor(readonly options: ProxyOptions) {
     const resource = canonicalEndpoint(options.wire.url);
     if (!resource) throw new Error("Grayboard MCP URL must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     this.current = hostTools(snapshotTools());
-    this.roots = options.roots ?? attachRoots();
-    this.resource = resource;
+    this.attachments = new HostedAttachments({
+      resource, auth: options.auth, harness: options.harness, loginAction: options.loginAction,
+      signal: this.closing.signal, roots: options.roots ?? attachRoots(), env: options.env, limits: () => this.limits(),
+      unreleased: (id, error) => options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error })),
+    });
   }
 
   tools(): NativeTool[] { return this.current; }
@@ -271,8 +262,7 @@ export class ToolProxy {
   private async withUploads(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
     const { attachments, ...rest } = args;
     try {
-      const files = await readAttachmentFiles(attachments, this.roots, { limits: await this.limits() });
-      return await sendWithUploads(files, this.transport(sessionID), async ids => {
+      return await this.attachments.send(attachments, sessionID, async ids => {
         const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID);
         if (result.isError) throw new Refused(result);
         return result;
@@ -289,79 +279,13 @@ export class ToolProxy {
   // directory as server mode, after checking the server's sha256.
   private async attachmentGet(args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
     try {
-      const id = checkAttachmentId(args.id);
-      const target = await saveTarget(args.dir, this.roots, serverBusDir(this.resource.href), this.options.env);
-      return text(await downloadAttachment(id, target, (await this.limits()).file, this.transport(sessionID)));
+      return text(await this.attachments.get(args, sessionID));
     } catch (error) {
       if (this.transportFailure(error)) throw error;
       return failure((error as Error).message);
     }
   }
 
-  // The hosted endpoint's attachment routes (src/server/mcp-attachments.ts):
-  // the session rides in X-Grayboard-Session; the server acts as its bound name.
-  private transport(sessionID: string): AttachmentTransport {
-    const base = `${this.resource.href.replace(/\/$/, "")}/attachments`;
-    return {
-      upload: async file => {
-        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data);
-        const stored = z.object({ id: z.number().int().positive() }).safeParse(await response.json().catch(() => undefined));
-        if (!stored.success) throw new Error("Invalid attachment upload response");
-        return stored.data.id;
-      },
-      release: async id => {
-        try {
-          const response = await this.http("DELETE", `${base}/${id}`, sessionID, HTTP_TIMEOUT_MS);
-          await response.body?.cancel();
-          return true;
-        } catch (error) {
-          if (error instanceof AttachmentRefused && error.status === 404) return false;
-          throw error;
-        }
-      },
-      download: async (id, maxBytes) => {
-        const ms = transferTimeoutMs(maxBytes);
-        const response = await this.http("GET", `${base}/${id}`, sessionID, ms);
-        try { return { headers: response.headers, data: new Uint8Array(await response.arrayBuffer()) }; }
-        catch (error) { throw this.fetchFailure(error, ms); }
-      },
-      unreleased: (id, error) => this.options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error })),
-    };
-  }
-
-  // One authorized request to an attachment route, retried once after the
-  // credential's onUnauthorized, as the MCP transport does.
-  private async http(method: "POST" | "GET" | "DELETE", url: string, sessionID: string, ms: number, body?: Uint8Array): Promise<Response> {
-    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.closing.signal]);
-    for (let attempt = 0; ; attempt++) {
-      const token = await this.options.auth.token();
-      if (!token) throw new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(sessionID) });
-      if (body) headers.set("Content-Type", "application/octet-stream");
-      let response: Response;
-      try { response = await fetch(url, { method, headers, body: body ? new Uint8Array(body) : undefined, redirect: "error", signal }); }
-      catch (error) { throw this.fetchFailure(error, ms); }
-      if (response.ok) return response;
-      if (response.status === 401 && attempt === 0 && this.options.auth.onUnauthorized) {
-        await response.body?.cancel();
-        await this.options.auth.onUnauthorized({ response, serverUrl: this.resource, fetchFn: fetch });
-        continue;
-      }
-      if (response.status === 401 || response.status === 403 && /insufficient_scope/.test(response.headers.get("www-authenticate") ?? "")) {
-        await response.body?.cancel();
-        throw new AccessExpired(this.options.harness, this.options.loginAction, response.status === 401 ? "expired" : "login_required");
-      }
-      const refusal = z.object({ code: z.string(), message: z.string() }).safeParse(await response.json().catch(() => undefined));
-      if (refusal.success) throw new AttachmentRefused(response.status, refusal.data.code, refusal.data.message);
-      if ([502, 503, 504].includes(response.status)) throw new ServerUnreachable(new Error(`HTTP ${response.status}`));
-      throw new Error(`grayboard server at ${this.resource.origin}: HTTP ${response.status}`);
-    }
-  }
-
-  private fetchFailure(error: unknown, ms: number): Error {
-    if (!this.closing.signal.aborted && unreachable(error)) return new ServerUnreachable(error);
-    return new Error(`grayboard server at ${this.resource.origin}: ${describeFetchError(error, ms)}`, { cause: error });
-  }
 
   private open(): Native {
     const native: Native = { ready: this.listed(new NativeWire(this.options.wire, this.options.auth, this.closing.signal), () => this.native === native), users: 0, retired: false, closed: false };
