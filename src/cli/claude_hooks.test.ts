@@ -190,6 +190,7 @@ test("the hook entry's static imports stay the record module's few: every one ev
   };
   walk(join(import.meta.dir, "main.ts"));
   const rel = [...seen].map((f) => relative(join(import.meta.dir, "..", ".."), f)).sort();
-  // protocol.ts (#545: SESSION_FACT_MAX) is constants and types, with no top-level work.
-  expect(rel).toEqual(["src/cli/main.ts", "src/shared/claude_agents.ts", "src/shared/proc.ts", "src/shared/protocol.ts", "src/shared/session_meta.ts", "src/shared/sockdir.ts"]);
+  // protocol.ts (#545: SESSION_FACT_MAX), endpoint.ts (#500: LOOPBACK) and
+  // signin.ts (#500: SIGN_IN_FLOW_MS) are constants, functions and types, with no top-level work.
+  expect(rel).toEqual(["src/cli/main.ts", "src/shared/claude_agents.ts", "src/shared/endpoint.ts", "src/shared/proc.ts", "src/shared/protocol.ts", "src/shared/session_meta.ts", "src/shared/signin.ts", "src/shared/sockdir.ts"]);
 });
