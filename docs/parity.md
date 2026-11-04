@@ -28,15 +28,15 @@ The baseline every later change is measured against. A cell says what a user of 
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | Tool surface | yes | yes | yes | yes | yes | yes | yes | yes |
 | 2 | Push delivery and wakeup | yes | yes | yes | yes | yes | yes | yes | yes |
-| 3 | Current instructions on push-started turns | yes | yes | gap #552 | yes | yes | yes | yes | yes |
+| 3 | Current instructions on push-started turns | yes | yes | yes | yes | yes | yes | yes | yes |
 | 4 | Bind, unbind, several holds, configured start name | yes | yes | yes | yes | yes | yes | yes | yes |
 | 5 | Names across an in-process session switch or MCP reconnect | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 6 | Names when a new harness process resumes a conversation | gap #195 | yes | gap #195 | yes | gap #195 | yes | gap #195 | yes |
-| 7 | Automatic restart after the grayboard process exits | gap #559 | n/a | yes | n/a | yes | n/a | n/a | n/a |
+| 7 | Automatic restart after the grayboard process exits | yes | n/a | yes | n/a | yes | n/a | n/a | n/a |
 | 8 | Subagents as child sessions, writes attributed (`via`) | yes | yes | yes | yes | gap #577 | yes | yes | yes |
 | 9 | Sign-in flow | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 10 | Sign-in offer in a signed-out tool result | n/a | gap #499 | n/a | gap #499 | n/a | n/a | n/a | yes |
-| 11 | Attachments (send from a path, save with `attachment_get`) | yes | yes | yes | yes | yes | gap #578 | yes | yes |
+| 11 | Attachments (send from a path, save with `attachment_get`) | yes | yes | yes | yes | yes | yes | yes | yes |
 | 12 | Human handle reach and human authority marking | yes | yes | yes | yes | yes | gap #388 | yes | yes |
 | 13 | Presence and `whoami` | yes | yes | yes | yes | yes | yes | yes | yes |
 | 14 | Setup | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -48,7 +48,7 @@ The baseline every later change is measured against. A cell says what a user of 
 ### 1. Tool surface
 
 - Local (all four): the tools `grayboard mcp` serves (`src/core/tools.ts`, `src/local/mcp.ts`); the child adapters register `grayboard tools`' list under the names each harness showed before (boards.md §9). Proof: `tests/integration/pi.test.ts` piScenario (the request's tool list equals the served one), `tests/integration/opencode.test.ts` ("every tool `grayboard tools` lists converts to zod"), `tests/integration/local.test.ts` ("the reply and recovery tools ask Claude Code to load them upfront").
-- pi H, omp H, CC H: hosted-core's proxy of the server's native tools, with paths on `dm_send`/`board_post` and a local `attachment_get` added (`hostTools`, `adapters/hosted-core/src/proxy.ts`). OC V2: the native tools as served; the package registers no agent tools (`adapters/opencode-v2/README.md`). Proof: `tests/integration/hosted_core_snapshot.test.ts` (the snapshot equals the live native `tools/list`).
+- pi H, omp H, CC H: hosted-core's proxy of the server's native tools, with paths on `dm_send`/`board_post` and a local `attachment_get` added (`hostTools`, `adapters/hosted-core/src/proxy.ts`). OC V2: the native tools as served, with paths on `dm_send`/`board_post` and an `attachment_get` the package adds (#578, `adapters/opencode-v2/README.md` §Attachments). Proof: `tests/integration/hosted_core_snapshot.test.ts` (the snapshot equals the live native `tools/list`).
 
 ### 2. Push delivery and wakeup
 
@@ -60,8 +60,7 @@ The baseline every later change is measured against. A cell says what a user of 
 ### 3. Current instructions on push-started turns
 
 - pi L, pi H: pi runs `before_agent_start` for a push-started turn, so its `<grayboard>` section is current (`adapters/pi/grayboard.ts`, `adapters/pi-family/entry-pi.ts`). Proof: `tests/integration/pi.test.ts` piUnboundScenario (a woken turn's system prompt is the bound name's), piHostedScenario.
-- omp L: **gap #552.** Instructions are appended only in main's `before_agent_start`, which omp runs only for a user prompt, so a push-started turn after a `bind` carries the last prompt's instructions (boards.md §9 omp).
-- omp H: `before_provider_request` rewrites stale instructions per request; `context` adds them as a hidden message after a prompt rebuild (#441, `adapters/pi-family/omp-instructions.ts`). Proof: `tests/integration/omp_instructions.test.ts`, `tests/integration/omp.test.ts` omp hosted `/fork`, `/new`, `/resume`.
+- omp L, omp H: one shared plan (`adapters/pi-family/omp-instructions.ts`, #441, #552): `before_provider_request` rewrites stale instructions per request, `context` adds them as a hidden message after a prompt rebuild, and both warn once for main only when the stale text can't be found. omp L reads the current text from its child's last initialize; omp H fetches it. Proof: `tests/integration/omp_instructions.test.ts` (plan, rewrite and the warning), `tests/integration/omp.test.ts` omp local ("a push-started bind reaches the next request's instructions without a user prompt") and omp hosted `/fork`, `/new`, `/resume`.
 - OC V1: `experimental.chat.system.transform` adds the latest instructions to every request (`adapters/opencode/grayboard.ts`). Proof: `tests/integration/opencode.test.ts` ("… the system prompt follows in full").
 - OC V2: the plugin's `context` hook carries the root's (or a subagent's child) server instructions per request (#531, #535). Proof: `adapters/opencode-v2/tests/host.ts` (REAL_INSTRUCTIONS cases), `adapters/opencode-v2/tests/instructions.test.ts`.
 - CC L, CC H: Claude Code reads MCP instructions only at initialize (`plugins/claude-code/src/plugin.ts` instructions comment), so a name change reaches the model as the rebuilt instructions in `bind`/`unbind`'s result, or the next result after a lost one (`instructionsStale`, `src/local/mcp.ts`); the system prompt keeps the connect-time text. Proof: —.
@@ -90,8 +89,8 @@ The baseline every later change is measured against. A cell says what a user of 
 ### 7. Automatic restart after the grayboard process exits
 
 - omp L: an unexpected exit restarts the process after 0, 1 and 5 s (a run of 60 s resets the count); names come back from the name record (`RESTART_DELAYS_MS`, `adapters/omp/grayboard.ts`). Proof: `tests/integration/omp.test.ts` omp local ("a killed grayboard process is restarted and takes its name back").
-- pi L: **gap #559** (item 1). After an exit every tool call fails with the exit reason and pi notifies "restart pi to reconnect"; only the next `session_start` (a pi restart, `/new`, `/resume`) starts a new process (`adapters/pi/grayboard.ts` `fail`, `execute`).
-- OC V1: the same policy as omp L (0, 1 and 5 s; a 60 s run resets the count; one more exit gives up and says so); calls during a pending restart wait for it and honor their abort, a session switch or shutdown cancels it, and a live child that hit EPIPE is killed before its replacement (`adapters/opencode/grayboard.ts`, #576). Proof: `tests/integration/opencode.test.ts` against real pinned OpenCode ("opencode real: child restarts restore held names, tool calls and delivery, then exhaust"; the switch, shutdown and abort cases) plus a Bun-run EPIPE case (a child that stops reading is restarted, never two owners at once).
+- pi L: the same policy as omp L (0, 1 and 5 s; a 60 s run resets the count; one more exit gives up and says so); calls during a pending restart wait for it and honor their abort, `/new` and shutdown cancel it, and a live child that hit EPIPE is killed before its replacement (`adapters/pi/grayboard.ts`, #559). Proof: `tests/integration/pi.test.ts` ("pi local: a killed grayboard restarts with its bound name…", "/new during a pending 5 s restart…", "/new aborts a tool awaiting the pending restart…").
+- OC V1: the same policy as omp L (0, 1 and 5 s; a 60 s run resets the count; one more exit gives up and says so); calls during a pending restart or initialization wait for it and honor their abort, a session switch or shutdown cancels a pending restart, and a live child that hit EPIPE is killed before its replacement (`adapters/opencode/grayboard.ts`, #576). Bun 1.4.4 silently accepts small writes to closed stdin, so those calls can wait until cancellation or child exit; the EPIPE proof uses a large write. Proof: `tests/integration/opencode.test.ts` ("opencode real: child restarts restore held names, tool calls and delivery, then exhaust", "opencode real: switch during backoff cancels the outgoing restart without an orphan", "opencode real: shutdown during backoff cancels the outgoing restart without an orphan", "opencode: aborting a tool during backoff releases its wait promptly; shutdown also releases waiting calls", "opencode: a child stable for 60 seconds resets the consecutive restart count", "opencode: Bun EPIPE waits for the still-live owner to die before retrying and exhaustion leaves none", "opencode: aborting a tool blocked in initialize does not wait for the child's paused bind").
 - CC L: n/a. Claude Code's own MCP client runs `grayboard mcp`; no grayboard component exists to restart it. Recovery is `/mcp reconnect`, which takes the names back (row 5).
 - pi H, omp H, OC V2: n/a. No grayboard process: the extension or package runs inside the harness and talks to the server over HTTP.
 - CC H: n/a. The plugin is Claude Code's stdio MCP server, so its process lifecycle is Claude Code's; a restarted plugin takes back the session's remembered holds (row 6).
@@ -117,13 +116,13 @@ The baseline every later change is measured against. A cell says what a user of 
 - Local (all four): n/a (row 9).
 - pi H, omp H: **gap #499.** A signed-out call answers "run /grayboard login", which the model can't act on.
 - CC H: every signed-out result carries the live flow's authorization URL (#497). Proof: `tests/integration/claude_plugin.test.ts` ("a prompt left unanswered (#497)…", "a client without URL elicitation gets the sign-in URL…"), e2e `claude-hosted` ("with no grant, the first tool call's result carries the sign-in link").
-- OC V2: n/a. Native OpenCode owns OAuth and the tool calls; the package registers no tools, so it has no result to put a URL in.
+- OC V2: n/a. Native OpenCode owns OAuth and the server tools' calls, so the package has no sign-in flow whose URL it could offer; its attachment tools (row 11) ride the native grant.
 
 ### 11. Attachments
 
 - Local (all four): paths are checked and read in the session's `grayboard mcp` (`readAttachmentFiles`, boards.md §12). Proof: `tests/integration/local.test.ts` ("attachments: sent with a DM or post…"), `tests/integration/omp.test.ts` omp local (a `local://` attachment reaches grayboard as its path).
 - pi H, omp H, CC H: hosted-core uploads paths over authenticated HTTP and saves with a local `attachment_get` (`adapters/hosted-core/src/proxy.ts`). Proof: `tests/integration/pi.test.ts` piHostedScenario, `tests/integration/omp.test.ts` omp hosted, `tests/integration/claude_plugin.test.ts` ("dm_send attaches a file…").
-- OC V2: **gap #578.** Native `dm_send`/`board_post` take only previously uploaded `attachment_ids`, and the native tools have no `attachment_get` (`adapters/hosted-core/src/native-tools.json`); the package registers no tools, so an OpenCode V2 agent can neither upload a file nor save a received one.
+- OC V2: the package adds local paths to native `dm_send`/`board_post` and registers `attachment_get`, for direct tools and Code Mode, over hosted-core's shared transfer code (`HostedAttachments`, `adapters/hosted-core/src/attachments.ts`; #578). The host's tool permission is checked before any upload or save. Proof: `adapters/opencode-v2` `test:host` (the attachment scenarios: DM and board attachments, child attribution, relative and default saves, unsafe directory refused), `tests/integration/hosted_core_proxy.test.ts`.
 
 ### 12. Human handle reach and human authority marking
 
