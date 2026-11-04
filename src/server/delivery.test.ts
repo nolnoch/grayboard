@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { AppSession } from "../../tests/support/app_session.ts";
+import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,7 +115,7 @@ test("successful reuse fences older creator cancellation; canceled reuse does no
   expect(delivery.activeLeaseCount).toBe(1);
   await delivery.cancel(canceledReuse);
   expect(delivery.activeLeaseCount).toBe(0);
-  expect(store.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(store.db)).toBe(0);
 });
 
 test("old attempt cancellation cannot end a replacement generation or ownership", async () => {
@@ -182,7 +183,7 @@ test("renew is fenced and extends sticky deadline, reopening is idempotent", asy
   expect(delivery.activeLeaseCount).toBe(1);
   now += 1; hosted.sweep();
   expect(delivery.activeLeaseCount).toBe(0);
-  expect(store.repo.hosted.all()).toHaveLength(0);
+  expect(hostedRowCount(store.db)).toBe(0);
 });
 
 test("shutdown leaves ownership and deadline durable; reopen retains ownership", async () => {
@@ -202,7 +203,7 @@ test("explicit release ends ownership and closes all children", async () => {
   await hosted.register(bob, context(bob), "child");
   const lease = await delivery.open(bob, context(bob));
   await delivery.release(bob, context(bob), lease.capability);
-  expect(store.repo.hosted.all()).toEqual([]);
+  expect(hostedRowCount(store.db)).toBe(0);
   await expect(delivery.renew(bob, context(bob), lease.capability)).rejects.toHaveProperty("code", "not_found");
   await hosted.bind(bob, context(bob), { name: "fe" });
   expect(await hosted.whoami(bob, context(bob))).not.toHaveProperty("ownership", lease.ownership);
@@ -222,7 +223,7 @@ test("cross application-level/hosted holders share one exclusion path", async ()
 test("disable immediately closes held ownership and invalidates capability", async () => {
   const lease = await delivery.open(bob, context(bob));
   store.repo.users.setDisabled(bob.authed.user_id, true);
-  expect(store.repo.hosted.all()).toHaveLength(0);
+  expect(hostedRowCount(store.db)).toBe(0);
   expect(delivery.activeLeaseCount).toBe(0);
   expect(() => delivery.describe(bob, context(bob), lease.capability)).toThrow();
 });

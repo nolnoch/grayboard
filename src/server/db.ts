@@ -1340,11 +1340,11 @@ function makeHostedStore(db: Database): HostedStore {
       db.run("UPDATE hosted_sessions SET grant_id = ?, bind_gen = ?, root_session_id = ?, ownership_id = ?, place = ?, lease_deadline = ?, last_seen_at = ? WHERE session_id = ?",
         [row.grant_id, row.bind_gen, row.root_session_id, row.ownership_id, row.place, row.lease_deadline, row.last_seen_at, row.session_id]);
     },
-    childEnd(session, now) {
+    childEnd(session, now, reason) {
       const row = get(session);
       if (!row?.root_session_id) return;
       db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
-      audit(row.root_session_id, "hosted.child_released", { child: session, reason: "closed" }, now);
+      audit(row.root_session_id, "hosted.child_released", { child: session, reason }, now);
     },
     end(session, reason, now, deadline) {
       const row = get(session);

@@ -3,6 +3,7 @@ import { Client, StreamableHTTPClientTransport, PROTOCOL_VERSION_META_KEY, CLIEN
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { hostedRowCount } from "../support/hosted_rows.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 
@@ -90,7 +91,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(last!.body).not.toContain(user.email);
     expect(srv.app.mcp.activeContexts).toBe(srv.app.mcp.activeGetStreams);
     expect(() => srv.app.application.admitHosted(authed, null)).toThrow(expect.objectContaining({ code: "rate_limited" }));
-    expect(srv.app.repo.hosted.all()).toEqual([]);
+    expect(hostedRowCount(srv.app.db)).toBe(0);
     const before = srv.app.db.query("SELECT * FROM boards").all();
     await expect(client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "must not dispatch" } })).rejects.toThrow();
     expect(last!.status).toBe(429);
@@ -140,7 +141,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
     const second = await call("bee", 2);
     expect(second.response.status).toBe(200);
     expect(second.text).toContain('"tools"');
-    expect(srv.app.repo.hosted.all()).toEqual([]);
+    expect(hostedRowCount(srv.app.db)).toBe(0);
     expect(srv.app.repo.aliases.listForScope("person", "alice@example.com").map(alias => alias.name)).toEqual(["be"]);
     const before = [finds, lists];
     expect(finds).toBe(0);

@@ -8,6 +8,8 @@ export type HostedSession = {
   parked_at: number | null;
 };
 export type HostedEnd = "idle" | "closed" | "revoked" | "disabled" | "expired";
+// Why a child row ended (#584): its own session_end, or the parked ceiling evicting it.
+export type ChildEnd = "closed" | "evicted";
 // A hold the server took from a hosted root (#453): its address, why, and whether it was the root's primary.
 export type HostedLost = { alias: string; reason: string; primary: boolean };
 // Who reads a lost hold: the agent (the notice, taken once) and the root's Controller (reported by every
@@ -31,7 +33,7 @@ export interface HostedStore {
   update(row: HostedSession): void;
   start(session: string, user: number, client: string, now: number): number;
   end(session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
-  childEnd(session: string, now: number): void;
+  childEnd(session: string, now: number, reason: ChildEnd): void;
   // A root's lost holds `reader` hasn't taken, oldest first (#453). `lose` records one in the revocation's
   // transaction (restating an alias already pending, for both readers); `lost` reads them; `tellLost` takes the
   // agent's; `reportLost` returns the Controller's, marking them reported; `seeLost` takes the reported ones (its
