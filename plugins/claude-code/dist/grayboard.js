@@ -31968,7 +31968,7 @@ async function admitPrefix(items, admit, receipt) {
 // adapters/hosted-core/src/storage.ts
 import { createHash as createHash2, randomBytes } from "crypto";
 import { chmod, mkdir, open as open2, readFile, rename, rm } from "fs/promises";
-import { mkdirSync } from "fs";
+import { constants, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { setTimeout as sleep4 } from "timers/promises";
 var sha256 = (text) => createHash2("sha256").update(text).digest("hex");
@@ -31982,6 +31982,30 @@ async function readJson(path) {
     throw error;
   }
   return JSON.parse(text);
+}
+
+class FileRefused extends Error {
+}
+async function readSmallJson(path, maxBytes) {
+  let file;
+  try {
+    file = await open2(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw error;
+  }
+  try {
+    if (!(await file.stat()).isFile())
+      throw new FileRefused("isn't a regular file");
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > maxBytes)
+      throw new FileRefused(`is over ${maxBytes} bytes`);
+    return JSON.parse(buffer.toString("utf8", 0, bytesRead));
+  } finally {
+    await file.close();
+  }
 }
 async function writeJsonAtomic(path, value) {
   const dir = dirname(path);
@@ -32100,6 +32124,7 @@ var SCOPES = "grayboard:tools grayboard:delivery";
 var REFRESH_MARGIN_MS = 60000;
 var REFRESH_LOCK_MS = 15000;
 var WATCH_MS = 2000;
+var LINK_BYTES = 8192;
 
 class LoginFailed extends Error {
 }
@@ -32435,14 +32460,16 @@ ${config.clientId}`)}.json`);
       const now = await this.read();
       if (waited) {
         if (live(now))
-          return;
+          return "signed in";
         throw new LoginFailed(`sign-in in another ${this.config.harness} session ended without signing in`);
       }
-      if (live(now) && (ifSignedOut || now.epoch !== before))
-        return;
+      if (live(now) && ifSignedOut)
+        return "current";
+      if (live(now) && now.epoch !== before)
+        return "signed in";
       await this.flow(signal);
+      return "signed in";
     } finally {
-      await this.unlink();
       lock.release();
     }
   }
@@ -32453,38 +32480,18 @@ ${config.clientId}`)}.json`);
     const stop = new AbortController;
     const refuse = (why) => {
       if (!refused)
-        this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login", code: "refused" });
+        this.config.diagnostic({ state: "degraded", message: `Another ${this.config.harness} session's sign-in link isn't shown here: ${why} (expected ${origin})`, operation: "login_link", code: "refused" });
       refused = true;
     };
     const onBusy = async () => {
-      let raw;
       try {
-        raw = await readJson(this.linkPath);
-      } catch (error) {
-        refuse(error instanceof SyntaxError ? "the link file isn't JSON" : `the link file is unreadable (${String(error.code ?? "error")})`);
-        return;
+        await this.poll(seen, origin, refuse, (error) => {
+          failure ??= { error };
+          stop.abort();
+        });
+      } finally {
+        this.config.polled?.();
       }
-      if (raw === undefined)
-        return;
-      const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
-      if (text === undefined) {
-        refuse("the link file holds no URL");
-        return;
-      }
-      if (seen.has(text))
-        return;
-      seen.add(text);
-      const checked = signInUrl(text);
-      const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
-      if (why || !("url" in checked)) {
-        refuse(why ?? "not a sign-in link");
-        return;
-      }
-      const presented = Promise.resolve().then(() => this.config.present(checked.url.href));
-      presented.catch((error) => {
-        failure ??= { error };
-        stop.abort();
-      });
     };
     try {
       return await acquire(lockPath, { deadlineMs: SIGN_IN_FLOW_MS + 60000, signal: signal ? AbortSignal.any([signal, stop.signal]) : stop.signal, onBusy });
@@ -32494,18 +32501,45 @@ ${config.clientId}`)}.json`);
       throw error;
     }
   }
+  async poll(seen, origin, refuse, failed) {
+    let raw;
+    try {
+      raw = await readSmallJson(this.linkPath, LINK_BYTES);
+    } catch (error) {
+      refuse(error instanceof SyntaxError ? "the link file isn't JSON" : error instanceof FileRefused ? `the link file ${error.message}` : `the link file is unreadable (${String(error.code ?? "error")})`);
+      return;
+    }
+    if (raw === undefined)
+      return;
+    const text = raw && typeof raw === "object" && "url" in raw && typeof raw.url === "string" ? raw.url : undefined;
+    if (text === undefined) {
+      refuse("the link file holds no URL");
+      return;
+    }
+    if (seen.has(text))
+      return;
+    seen.add(text);
+    const checked = signInUrl(text);
+    const why = "failed" in checked ? checked.failed : checked.url.origin !== origin ? "not on this server's origin" : undefined;
+    if (why || !("url" in checked)) {
+      refuse(why ?? "not a sign-in link");
+      return;
+    }
+    const presented = Promise.resolve().then(() => this.config.present(checked.url.href));
+    presented.catch(failed);
+  }
   async share(url) {
     try {
       await writeJsonAtomic(this.linkPath, { url, at: Date.now() });
     } catch (error) {
-      this.config.diagnostic({ state: "degraded", message: `Couldn't share the sign-in link with other ${this.config.harness} sessions (${failureCause(error, 0)}); they say only that a sign-in is in progress`, operation: "login", code: "operation_failed" });
+      this.config.diagnostic({ state: "degraded", message: `Couldn't share the sign-in link with other ${this.config.harness} sessions (${failureCause(error, 0)}); they say only that a sign-in is in progress`, operation: "login_link", code: "operation_failed" });
     }
   }
   async unlink() {
     try {
       await rm2(this.linkPath, { force: true });
     } catch (error) {
-      this.config.diagnostic({ state: "degraded", message: `Couldn't remove the shared sign-in link (${failureCause(error, 0)}); other ${this.config.harness} sessions may show a link whose sign-in ended`, operation: "login", code: "operation_failed" });
+      this.config.diagnostic({ state: "degraded", message: `Couldn't remove the shared sign-in link (${failureCause(error, 0)}); other ${this.config.harness} sessions may show a link whose sign-in ended`, operation: "login_link", code: "operation_failed" });
     }
   }
   async flow(outer) {
@@ -32532,6 +32566,7 @@ ${config.clientId}`)}.json`);
       presented.catch(() => {});
       params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally {
+      await this.unlink();
       callback.close();
     }
     const iss = params.get("iss");
@@ -34481,7 +34516,7 @@ class Server extends Protocol2 {
 
 // src/shared/attachments.ts
 import { createHash as createHash5, randomUUID } from "crypto";
-import { constants, realpathSync } from "fs";
+import { constants as constants2, realpathSync } from "fs";
 import { link, mkdir as mkdir3, open as open3, rm as rm3, writeFile } from "fs/promises";
 import { homedir as homedir2 } from "os";
 import { basename, delimiter, extname, isAbsolute, join as join4, parse as parse6, relative, resolve as resolve2, sep } from "path";
@@ -34687,7 +34722,7 @@ async function readAttachmentFiles(paths, roots, opts = {}) {
 async function readChecked(real, label, tally) {
   let fh;
   try {
-    fh = await open3(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    fh = await open3(real, constants2.O_RDONLY | (constants2.O_NOFOLLOW ?? 0) | (constants2.O_NONBLOCK ?? 0));
   } catch (e) {
     throw new CoreError(`${label}: can't be opened (${e.code ?? "error"})`);
   }
@@ -34817,7 +34852,7 @@ async function writeNew(dir, name, data) {
 async function isOwnCopy(path, data) {
   let fh;
   try {
-    fh = await open3(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fh = await open3(path, constants2.O_RDONLY | constants2.O_NOFOLLOW);
   } catch {
     return false;
   }
@@ -36293,15 +36328,18 @@ function start(state, login, o) {
   });
   const flow = { origin: o.origin, abort, link, show, browser: o.browser, done: Promise.resolve() };
   state.flow = flow;
-  const settle = (outcome) => {
+  const finish = (outcome) => {
     flow.outcome = outcome;
-    state.last = { origin: flow.origin, outcome, at: Date.now() };
     show(undefined);
     if (state.flow === flow)
       state.flow = undefined;
+  };
+  const settle = (outcome) => {
+    state.last = { origin: flow.origin, outcome, at: Date.now() };
+    finish(outcome);
     return o.ended(flow, outcome);
   };
-  flow.done = login.login(abort.signal, o.ifSignedOut).then(() => settle("signed in"), (error) => {
+  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => result === "signed in" ? settle("signed in") : finish("current"), (error) => {
     if (abort.signal.aborted)
       return settle("cancelled");
     flow.failed = scrub(flow, message(error));
@@ -36330,7 +36368,7 @@ async function offer(state, login, o) {
   return note(flow, url, o.notes);
 }
 function note(flow, url, notes) {
-  if (flow.outcome === "signed in" || flow.outcome === "cancelled")
+  if (flow.outcome === "signed in" || flow.outcome === "current" || flow.outcome === "cancelled")
     return;
   if (flow.outcome)
     return `sign-in failed: ${flow.failed}`;
@@ -37650,7 +37688,7 @@ ${record.message}`;
 }
 
 // src/shared/claude_agents.ts
-import { closeSync, constants as constants2, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { closeSync, constants as constants3, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
 import { join as join5, resolve as resolve3 } from "path";
 
 // src/shared/protocol.ts
@@ -37741,7 +37779,7 @@ function takeRecord(base, claudePid, harnessStart, toolUseId) {
   }
 }
 function readSmall(path, max) {
-  const fd = openSync(path, constants2.O_RDONLY | constants2.O_NOFOLLOW | constants2.O_NONBLOCK);
+  const fd = openSync(path, constants3.O_RDONLY | constants3.O_NOFOLLOW | constants3.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile())
@@ -38090,7 +38128,8 @@ function createPlugin(o) {
     diagnostic: (record) => {
       if (record.state !== "degraded" && record.state !== "paused")
         return;
-      root?.noticeOnce(record.message, "last");
+      if (record.operation !== "login_link")
+        root?.noticeOnce(record.message, "last");
       say(record.message);
     }
   });
@@ -38147,7 +38186,7 @@ function createPlugin(o) {
       return signins.flow;
     if (!login || !root || !interactive || closed || !initialized)
       return;
-    return start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
+    const flow = start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
       const prompt = prompts.get(flow);
       try {
         if (outcome === "signed in") {
@@ -38168,6 +38207,11 @@ function createPlugin(o) {
         }
       }
     } });
+    flow.done.then(() => {
+      if (flow.outcome === "current")
+        say(`sign-in not needed (${origin}): already signed in`);
+    }, () => {});
+    return flow;
   };
   const notes = {
     started: "sign-in started: ask the user to open the sign-in link Claude Code shows under this call (or approve its sign-in prompt), then call a grayboard tool again",

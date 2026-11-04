@@ -17,12 +17,13 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitationCompleteNotificationSchema, ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Diagnostics } from "../../adapters/hosted-core/src/diagnostics.ts";
+import { tryAcquire } from "../../adapters/hosted-core/src/lock.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
@@ -508,6 +509,24 @@ test("two signed-out processes share one flow: the waiter shows the holder's lin
   // the other process's sign-in (the deleted onChange abort).
   await until(() => a.stderr().includes("signed in (startup)") && b.stderr().includes("signed in (startup)"), 10_000, "both signed-in lines");
   expect(urls).toHaveLength(2);
+}, 40_000);
+
+test("a refused link file of another session's sign-in is said in the log only, never in a tool result (#592)", async () => {
+  // This plugin's store, as another session's sign-in holds it with a link of another origin.
+  const store = new Login({ resource: srv.resource, clientId: CLIENT_ID, stateDir: data, harness: "Claude Code", loginAction: "x", present: () => {}, notify: () => {}, diagnostic: () => {} });
+  mkdirSync(dirname(store.path), { recursive: true, mode: 0o700 });
+  writeFileSync(`${store.path}.login.url`, JSON.stringify({ url: "https://elsewhere.example/oauth/authorize?state=x", at: Date.now() }));
+  const held = tryAcquire(`${store.path}.login.lock`)!;
+  let s: Plugin;
+  try {
+    s = await plugin("sess-refused", { answer: () => new Promise<ElicitResult["action"]>(() => {}) });
+    await until(() => s.stderr().includes("sign-in link isn't shown here: not on this server's origin"), 15_000, "the refusal in the log");
+  } finally { held.release(); }
+  // The waited-on sign-in ended without a grant; the next call starts this session's own.
+  await until(() => s.stderr().includes("sign-in failed (startup): "), 15_000, "the startup flow's end");
+  const r = await texts(s, "whoami");
+  expect(r.texts[0]).toBe(STARTED);
+  expect(r.texts.join("\n")).not.toContain("isn't shown here");
 }, 40_000);
 
 test("a client without URL elicitation: the hook shows the link under its next call, and the result names only where it is (#500)", async () => {

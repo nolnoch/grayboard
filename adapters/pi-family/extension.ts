@@ -499,6 +499,9 @@ export function createGrayboard(h: Harness): Grayboard {
           else if (flow.elsewhere) log(`${flow.elsewhere}; finish it there`);
         }
         await flow.done;
+        // A joined offer's flow that found the store already signed in says
+        // nothing itself (#592).
+        if (flow.outcome === "current") { if (!closed) log("already signed in"); return; }
         // The flow said its outcome and restarted this runtime already. A
         // runtime that shut down meanwhile (a /new) says nothing: an outcome
         // still unsaid stays for the next root's start.

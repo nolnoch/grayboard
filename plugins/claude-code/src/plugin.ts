@@ -182,9 +182,11 @@ export function createPlugin(o: PluginOptions): Plugin {
       say(message);
       signIns.notify(signins, message);
     },
+    // The link file's records (refused, unshared) only to the user's log:
+    // the model can't act on them (#592).
     diagnostic: record => {
       if (record.state !== "degraded" && record.state !== "paused") return;
-      root?.noticeOnce(record.message, "last");
+      if (record.operation !== "login_link") root?.noticeOnce(record.message, "last");
       say(record.message);
     },
   });
@@ -236,7 +238,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   const begin = (origin: "offer" | "startup"): Flow | undefined => {
     if (signins.flow) return signins.flow;
     if (!login || !root || !interactive || closed || !initialized) return undefined;
-    return signIns.start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
+    const flow = signIns.start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
       const prompt = prompts.get(flow);
       try {
         // The prompt is done either way: completed if it was accepted, and
@@ -256,6 +258,9 @@ export function createPlugin(o: PluginOptions): Plugin {
         }
       }
     } });
+    // Ends without `ended` when the store was already signed in (#592).
+    void flow.done.then(() => { if (flow.outcome === "current") say(`sign-in not needed (${origin}): already signed in`); }, () => {});
+    return flow;
   };
   // What a signed-out call's result says about its sign-in (hosted-core
   // offer.ts). The link itself never enters a result (#500).
