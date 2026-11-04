@@ -108,7 +108,7 @@ The baseline every later change is measured against. A cell says what a user of 
 
 - Local (all four): n/a. Local mode has no accounts; every process on the machine is trusted (README §Limitations of local mode).
 - pi H, omp H: `/grayboard login` opens the browser to the server's consent page; every pi (or omp) on the machine shares that sign-in under its built-in client (README §Other harnesses). Proof: `tests/integration/pi.test.ts` piHostedScenario, `tests/integration/omp.test.ts` omp hosted.
-- CC H: URL elicitation from the process holding hosted-core's login lock, interactive only (boards.md §9 Hosted Claude Code). Proof: `tests/integration/claude_plugin.test.ts` ("sign-in by URL elicitation…").
+- CC H: from the process holding hosted-core's login lock, interactive only, the link reaches the user two ways: URL elicitation, and the post-tool-use hook's line under every grayboard call while the flow runs, which never enters the model's context (#500; boards.md §9 Hosted Claude Code). Proof: `tests/integration/claude_plugin.test.ts` ("sign-in by URL elicitation…", "a client without URL elicitation: the hook shows the link…").
 - OC V2: OpenCode's native MCP OAuth (`/mcps`, sign in through OpenCode); native OpenCode owns credential storage and refresh, and the package never reads a refresh token (README §OpenCode V2, `adapters/opencode-v2/README.md`). Proof: `adapters/opencode-v2` `test:host` (native CIMD OAuth discovery).
 
 ### 10. Sign-in offer in a signed-out tool result

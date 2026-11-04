@@ -32,7 +32,9 @@ import { failure, hostTools, snapshotTools, type NativeTool } from "../../../ada
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
-import { dropSignIn, MISSING_TEXT, putSignIn, readFacts, sessionDir, SIGN_IN_MS, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
+import { dropSignIn, MISSING_TEXT, putSignIn, readFacts, sessionDir, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
+import { SIGN_IN_FLOW_MS } from "../../../src/shared/signin.ts";
+import { testPauseAsync } from "../../../src/shared/testpause.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { configuredIdentity, describeLocation } from "../../../src/shared/identity.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
@@ -140,6 +142,7 @@ export function createPlugin(o: PluginOptions): Plugin {
     // URL elicitation); a decline ends the flow and the next call starts one.
     present: async url => {
       const flow = signingIn;
+      await testPauseAsync("claude-sign-in-present", o.env);
       try { putSignIn(config.dataDir, o.claude.pid, url); }
       catch (error) { say(`couldn't save the sign-in link for the hook to show: ${message(error)}; approve the sign-in prompt, or open the link in this log`); }
       if (flow) flow.url = url;
@@ -156,7 +159,7 @@ export function createPlugin(o: PluginOptions): Plugin {
         try {
           result = await server!.elicitInput(
             { mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
-            { timeout: SIGN_IN_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
+            { timeout: SIGN_IN_FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
           );
         } catch (error) {
           // Withdrawn: the browser answered first, and the flow went on without it.
@@ -242,7 +245,7 @@ export function createPlugin(o: PluginOptions): Plugin {
     const done = login.login(abort.signal, true).then(
       async () => {
         // The prompt is done either way: completed if it was accepted, and
-        // withdrawn if the link in a tool result was opened instead.
+        // withdrawn if the link the hook showed was opened instead.
         if (flow.prompt) await server!.createElicitationCompletionNotifier(flow.prompt.id)().catch(() => {});
         say("signed in");
         await root.credentialChanged();
@@ -250,17 +253,24 @@ export function createPlugin(o: PluginOptions): Plugin {
       error => {
         if (abort.signal.aborted) return;
         // A failure's text reaches the model in the next result: one that
-        // quotes the URL (an elicitation error is Claude Code's text) doesn't.
+        // quotes the URL (an elicitation error is Claude Code's text, which
+        // may truncate or decode it) doesn't. The flow's `state` is the part a
+        // login-CSRF needs, so any text carrying it is replaced.
         const why = message(error);
-        failed = flow.url && why.includes(flow.url) ? "the sign-in prompt failed" : why;
+        const secret = flow.url ? new URL(flow.url).searchParams.get("state") || flow.url : undefined;
+        failed = secret && why.includes(secret) ? "the sign-in prompt failed" : why;
         say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
       },
     ).finally(() => {
       // However the flow ended, its prompt and link point at a closed callback.
       flow.prompt?.withdraw.abort();
-      if (flow.url && !("error" in config)) dropSignIn(config.dataDir, o.claude.pid);
       show(undefined);
       if (signingIn === flow) signingIn = undefined;
+      // Only this flow's link: a later flow may have written its own.
+      if (flow.url && !("error" in config)) {
+        try { dropSignIn(config.dataDir, o.claude.pid, flow.url); }
+        catch (error) { say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60_000} minutes after it was written`); }
+      }
     });
     const flow: Flow = { abort, done, link, show };
     signingIn = flow;
@@ -412,7 +422,10 @@ export function createPlugin(o: PluginOptions): Plugin {
   const connectTransport = async (transport: Transport) => {
     // A link a killed predecessor left (Claude Code kills a stdio server 500 ms
     // after stop, and a /mcp reconnect replaces it) names a closed callback.
-    if (!("error" in config)) dropSignIn(config.dataDir, o.claude.pid);
+    if (!("error" in config)) {
+      try { dropSignIn(config.dataDir, o.claude.pid); }
+      catch (error) { say(`couldn't remove a sign-in link a previous server left: ${message(error)}`); }
+    }
     // Delivery starts (and rebinds) first, so the instructions say the bound
     // name; start() never rejects, so the race is safe.
     await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);

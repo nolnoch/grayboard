@@ -3,7 +3,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dropSignIn, LEFTOVER_TTL_MS, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, SIGN_IN_MS, takeEnded, takeRecord } from "./claude_agents.ts";
+import { dropSignIn, LEFTOVER_TTL_MS, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeEnded, takeRecord } from "./claude_agents.ts";
+import { SIGN_IN_FLOW_MS } from "./signin.ts";
 import { procStart } from "./proc.ts";
 
 let base: string;
@@ -264,6 +265,8 @@ describe("sign-in link (#500)", () => {
       putSignIn(base, pid, ok);
       expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${new URL(ok).href} to sign in`);
     }
+    putSignIn(base, pid, `https://gb.example.com/authorize?state=${"s".repeat(2048)}`);
+    expect(post()).toBeUndefined();
     for (const bad of ["http://gb.example.com/authorize", "https://u:p@gb.example.com/authorize", "javascript:alert(1)", "file:///etc/passwd", "not a url"]) {
       putSignIn(base, pid, bad);
       expect(post()).toBeUndefined();
@@ -277,9 +280,9 @@ describe("sign-in link (#500)", () => {
 
   test("a link older than a flow, or from the future, is a dead flow's", () => {
     const now = Date.now();
-    putSignIn(base, pid, url, now - SIGN_IN_MS);
+    putSignIn(base, pid, url, now - SIGN_IN_FLOW_MS);
     expect(post(now)).toBeDefined();
-    putSignIn(base, pid, url, now - SIGN_IN_MS - 1);
+    putSignIn(base, pid, url, now - SIGN_IN_FLOW_MS - 1);
     expect(post(now)).toBeUndefined();
     putSignIn(base, pid, url, now + 1);
     expect(post(now)).toBeUndefined();
@@ -290,6 +293,25 @@ describe("sign-in link (#500)", () => {
     expect(post()).toBeUndefined();
     putSignIn(base, pid, url);
     expect(hook("post-tool-use", { tool_use_id: id(1) }, false)).toBeUndefined();
+  });
+
+  test("an ended flow removes only its own link; a failed removal throws, a missing file doesn't", () => {
+    const newer = "https://gb.example.com/authorize?client_id=x&state=t";
+    putSignIn(base, pid, newer);
+    dropSignIn(base, pid, url);
+    expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${newer} to sign in`);
+    dropSignIn(base, pid, newer);
+    expect(post()).toBeUndefined();
+    dropSignIn(base, pid, url);
+    dropSignIn(base, pid);
+    const file = join(sessionDir(base, pid), SIGN_IN);
+    writeFileSync(file, "{");
+    dropSignIn(base, pid, url);
+    expect(existsSync(file)).toBe(true);
+    rmSync(file);
+    mkdirSync(join(file, "x"), { recursive: true });
+    expect(() => dropSignIn(base, pid, url)).toThrow();
+    expect(() => dropSignIn(base, pid)).toThrow();
   });
 
   test("the link file is private: 0600 in a 0700 dir", () => {

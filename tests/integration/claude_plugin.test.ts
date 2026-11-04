@@ -11,7 +11,8 @@
 // once; a second process on the same session id running tools-only until the
 // first exits; -p (no lease, no listener, no sign-in prompt); sign-in by URL
 // elicitation, single-flight within and across processes, re-offered after a
-// decline, and the URL in a tool result when the client can't elicit; the
+// decline; the link shown by the post-tool-use hook and never in a result
+// (#500), with a result before the flow has a link naming the next call; the
 // pre-2026-07-28 protocol; release on EOF with a lease, session_end without.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -514,6 +515,28 @@ test("a sign-in prompt that fails with the link in its error text: the flow's fa
   expect(s.stderr()).toMatch(/ended without an answer: .*could not open /);
   expect(s.stderr()).toMatch(/sign-in failed \(elicitation [^)]+\): the sign-in prompt failed\n/);
   await until(() => !linkFile(s), 5_000, "the failed flow's link removed");
+}, 30_000);
+
+test("a call before the flow has a link says sign-in is starting; the hook shows the link once it is written (#500)", async () => {
+  const release = join(dir, "present-released");
+  const s = await plugin("sess-starting", { elicit: false, env: { BUS_TEST_PAUSE: "claude-sign-in-present", BUS_TEST_PAUSE_FILE: release } });
+  await until(() => s.stderr().includes("test pause hit: claude-sign-in-present"), 10_000, "the flow paused before its link");
+  const r = await texts(s, "whoami");
+  expect(r.texts[0]).toBe("grayboard: sign-in is starting; Claude Code shows its link under the next grayboard call: ask the user to open it, then call a grayboard tool again");
+  expect(shown(s)).toBeUndefined();
+  writeFileSync(release, "");
+  await until(() => s.stderr().includes("to sign in to grayboard"), 10_000, "the sign-in URL");
+  const url = new RegExp(`open (${RegExp.escape(srv.issuer)}/\\S+) to sign in to grayboard`).exec(s.stderr())![1]!;
+  expect(shown(s)).toBe(`grayboard: open ${url} to sign in`);
+}, 60_000);
+
+test("a sign-in prompt whose error carries a truncated copy of the link: still scrubbed, by the flow's state (#500)", async () => {
+  const s = await plugin("sess-elicit-trunc", { answer: async (e) => {
+    const state = new URL(e.url).searchParams.get("state")!;
+    throw new Error(`could not open ${e.url.slice(0, e.url.indexOf(state) + state.length)}`);
+  } });
+  await until(() => /sign-in failed \(elicitation [^)]+\): /.test(s.stderr()), 10_000, "the failed prompt");
+  expect(s.stderr()).toMatch(/sign-in failed \(elicitation [^)]+\): the sign-in prompt failed\n/);
 }, 30_000);
 
 test("a link a killed predecessor left in this Claude Code process's dir is removed at connect (#500)", async () => {

@@ -4,6 +4,9 @@
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync as readFileSync2, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 
+// src/shared/endpoint.ts
+var LOOPBACK = new Set(["127.0.0.1", "[::1]", "localhost"]);
+
 // src/shared/proc.ts
 import { readFileSync } from "fs";
 function statFields(pid) {
@@ -87,9 +90,11 @@ function validSourceId(raw) {
   return typeof raw === "string" && raw.length > 0 && raw.length <= 1024 && !/[\x00-\x1f\x7f]/.test(raw);
 }
 
+// src/shared/signin.ts
+var SIGN_IN_FLOW_MS = 10 * 60000;
+
 // src/shared/claude_agents.ts
 var SIGN_IN = "signin";
-var SIGN_IN_MS = 10 * 60000;
 var ROOT = "-";
 var LEFTOVER_TTL_MS = 10 * 60000;
 var RECORD_CAP = 256;
@@ -116,14 +121,16 @@ function put(path, text) {
   writeFileSync(tmp, text, { mode: 384 });
   renameSync(tmp, path);
 }
-var LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
+var SIGN_IN_URL_MAX = 2048;
 function readSignIn(dir, now = Date.now()) {
   try {
     const value = JSON.parse(readFileSync2(join(dir, SIGN_IN), "utf8"));
     if (typeof value.url !== "string" || typeof value.at !== "number")
       return;
     const age = now - value.at;
-    if (!(age >= 0 && age <= SIGN_IN_MS))
+    if (!(age >= 0 && age <= SIGN_IN_FLOW_MS))
+      return;
+    if (value.url.length > SIGN_IN_URL_MAX)
       return;
     const url = new URL(value.url);
     if (url.username || url.password)

@@ -36,9 +36,11 @@
 // module alone, so a hook costs a process start and a few file operations.
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { LOOPBACK } from "./endpoint.ts";
 import { procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
 import { validSourceId } from "./session_meta.ts";
+import { SIGN_IN_FLOW_MS } from "./signin.ts";
 
 /**
  * The live sign-in link (#500). The plugin's server writes it while its flow
@@ -48,8 +50,6 @@ import { validSourceId } from "./session_meta.ts";
  * an instruction injected into the model's context never sees the URL.
  */
 export const SIGN_IN = "signin";
-/** A sign-in flow's bound: hosted-core's FLOW_MS (login.ts), past which a link is a dead flow's. */
-export const SIGN_IN_MS = 10 * 60_000;
 
 /** A main-agent call's record. */
 export const ROOT = "-";
@@ -108,18 +108,33 @@ export function putSignIn(base: string, claudePid: number, url: string, now = Da
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   put(join(dir, SIGN_IN), JSON.stringify({ url, at: now }));
 }
-export function dropSignIn(base: string, claudePid: number): void {
-  rmSync(join(sessionDir(base, claudePid), SIGN_IN), { force: true });
+/**
+ * Removes the session's sign-in link: with `url`, only that flow's, so a flow
+ * that ended never removes a newer one's. Throws on a read or removal that
+ * fails other than for a missing file.
+ */
+export function dropSignIn(base: string, claudePid: number, url?: string): void {
+  const path = join(sessionDir(base, claudePid), SIGN_IN);
+  if (url !== undefined) {
+    let text: string;
+    try { text = readFileSync(path, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    let held: unknown;
+    try { held = (JSON.parse(text) as { url?: unknown }).url; } catch { return; }
+    if (held !== url) return;
+  }
+  rmSync(path, { force: true });
 }
-// HTTPS, or HTTP on loopback: the shapes an authorization endpoint may take.
-const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
-/** The live sign-in link in `dir`, or undefined: none, malformed, not an authorization URL's shape, or older than a flow. */
+// The longest link shown: canonicalEndpoint's bound (endpoint.ts).
+const SIGN_IN_URL_MAX = 2048;
+/** The live sign-in link in `dir`, or undefined: none, malformed, too long, not an authorization URL's shape (HTTPS, or HTTP on loopback), or older than a flow. */
 export function readSignIn(dir: string, now = Date.now()): string | undefined {
   try {
     const value = JSON.parse(readFileSync(join(dir, SIGN_IN), "utf8")) as { url?: unknown; at?: unknown };
     if (typeof value.url !== "string" || typeof value.at !== "number") return undefined;
     const age = now - value.at;
-    if (!(age >= 0 && age <= SIGN_IN_MS)) return undefined;
+    if (!(age >= 0 && age <= SIGN_IN_FLOW_MS)) return undefined;
+    if (value.url.length > SIGN_IN_URL_MAX) return undefined;
     const url = new URL(value.url);
     if (url.username || url.password) return undefined;
     if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname))) return undefined;

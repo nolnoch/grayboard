@@ -32046,9 +32046,11 @@ function canonicalEndpoint(raw) {
   return u;
 }
 
+// src/shared/signin.ts
+var SIGN_IN_FLOW_MS = 10 * 60000;
+
 // adapters/hosted-core/src/login.ts
 var SCOPES = "grayboard:tools grayboard:delivery";
-var FLOW_MS = 10 * 60000;
 var REFRESH_MARGIN_MS = 60000;
 var REFRESH_LOCK_MS = 15000;
 var WATCH_MS = 2000;
@@ -32377,7 +32379,7 @@ ${config.clientId}`)}.json`);
     const waited = !lock;
     if (!lock) {
       this.config.notify(`sign-in in progress in another ${this.config.harness} session`);
-      lock = await acquire(lockPath, { deadlineMs: FLOW_MS + 60000, ...signal ? { signal } : {} });
+      lock = await acquire(lockPath, { deadlineMs: SIGN_IN_FLOW_MS + 60000, ...signal ? { signal } : {} });
     }
     try {
       const now = await this.read();
@@ -32396,7 +32398,7 @@ ${config.clientId}`)}.json`);
   async flow(outer) {
     const meta = await this.discover();
     await this.drain(meta);
-    const signal = AbortSignal.any([AbortSignal.timeout(FLOW_MS), ...outer ? [outer] : []]);
+    const signal = AbortSignal.any([AbortSignal.timeout(SIGN_IN_FLOW_MS), ...outer ? [outer] : []]);
     const verifier = randomBytes2(32).toString("base64url"), state = randomBytes2(16).toString("base64url");
     const callback = await this.callback(state, signal);
     let params;
@@ -37479,7 +37481,6 @@ var SESSION_FACT_MAX = 64;
 
 // src/shared/claude_agents.ts
 var SIGN_IN = "signin";
-var SIGN_IN_MS = 10 * 60000;
 var ROOT = "-";
 var LEFTOVER_TTL_MS = 10 * 60000;
 var TOOL_USE_META = "claudecode/toolUseId";
@@ -37500,10 +37501,28 @@ function putSignIn(base, claudePid, url, now = Date.now()) {
   mkdirSync2(dir, { recursive: true, mode: 448 });
   put(join5(dir, SIGN_IN), JSON.stringify({ url, at: now }));
 }
-function dropSignIn(base, claudePid) {
-  rmSync(join5(sessionDir(base, claudePid), SIGN_IN), { force: true });
+function dropSignIn(base, claudePid, url) {
+  const path = join5(sessionDir(base, claudePid), SIGN_IN);
+  if (url !== undefined) {
+    let text;
+    try {
+      text = readFileSync4(path, "utf8");
+    } catch (error) {
+      if (error.code === "ENOENT")
+        return;
+      throw error;
+    }
+    let held;
+    try {
+      held = JSON.parse(text).url;
+    } catch {
+      return;
+    }
+    if (held !== url)
+      return;
+  }
+  rmSync(path, { force: true });
 }
-var LOOPBACK2 = new Set(["127.0.0.1", "localhost", "[::1]"]);
 var MISSING_TEXT = {
   bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
   no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
@@ -37613,9 +37632,25 @@ function takeEnded(base, claudePid) {
   return out;
 }
 
+// src/shared/testpause.ts
+import { existsSync } from "fs";
+import { dirname as dirname3 } from "path";
+async function testPauseAsync(point, env = process.env) {
+  const file = env.BUS_TEST_PAUSE_FILE;
+  if (env.BUS_TEST_PAUSE !== point || !file)
+    return;
+  console.error(`[grayboard] test pause hit: ${point}`);
+  while (!existsSync(file)) {
+    if (!existsSync(dirname3(file)))
+      throw new Error(`test pause abandoned: ${point}`);
+    await Bun.sleep(10);
+  }
+  console.error(`[grayboard] test pause released: ${point}`);
+}
+
 // src/shared/identity.ts
-import { existsSync, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
-import { basename as basename2, dirname as dirname3, join as join6, resolve as resolve3 } from "path";
+import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve3 } from "path";
 
 // src/core/session_id.ts
 var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -37652,27 +37687,27 @@ function normalizeAliasName(raw) {
 // src/shared/identity.ts
 var MAX_LEN = 32;
 function gitLocation(cwd) {
-  for (let dir = cwd;; dir = dirname3(dir)) {
+  for (let dir = cwd;; dir = dirname4(dir)) {
     const dotGit = join6(dir, ".git");
-    if (existsSync(dotGit)) {
+    if (existsSync2(dotGit)) {
       if (statSync3(dotGit).isDirectory())
         return { repo: dir, worktree: null };
       const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
       const gitdir = m ? resolve3(dir, m[1].trim()) : "";
       if (!/[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitdir))
         return { repo: dir, worktree: null };
-      const common = dirname3(dirname3(gitdir));
-      const repo = basename2(common) === ".git" ? dirname3(common) : common.replace(/\.git$/, "");
+      const common = dirname4(dirname4(gitdir));
+      const repo = basename2(common) === ".git" ? dirname4(common) : common.replace(/\.git$/, "");
       return { repo, worktree: basename2(dir) };
     }
-    if (dirname3(dir) === dir)
+    if (dirname4(dir) === dir)
       return null;
   }
 }
 function gitBranch(cwd) {
-  for (let dir = cwd;; dir = dirname3(dir)) {
+  for (let dir = cwd;; dir = dirname4(dir)) {
     const dotGit = join6(dir, ".git");
-    if (existsSync(dotGit)) {
+    if (existsSync2(dotGit)) {
       let gitdir = dotGit;
       if (!statSync3(dotGit).isDirectory()) {
         const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
@@ -37683,7 +37718,7 @@ function gitBranch(cwd) {
       const head = readFileSync5(join6(gitdir, "HEAD"), "utf8").trim();
       return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
     }
-    if (dirname3(dir) === dir)
+    if (dirname4(dir) === dir)
       return null;
   }
 }
@@ -37817,6 +37852,7 @@ function createPlugin(o) {
     loginAction,
     present: async (url) => {
       const flow = signingIn;
+      await testPauseAsync("claude-sign-in-present", o.env);
       try {
         putSignIn(config.dataDir, o.claude.pid, url);
       } catch (error) {
@@ -37836,7 +37872,7 @@ function createPlugin(o) {
         const start = Date.now();
         let result;
         try {
-          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
+          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
         } catch (error) {
           if (prompt.withdraw.signal.aborted)
             return;
@@ -37942,15 +37978,21 @@ function createPlugin(o) {
       if (abort.signal.aborted)
         return;
       const why = message(error);
-      failed = flow.url && why.includes(flow.url) ? "the sign-in prompt failed" : why;
+      const secret = flow.url ? new URL(flow.url).searchParams.get("state") || flow.url : undefined;
+      failed = secret && why.includes(secret) ? "the sign-in prompt failed" : why;
       say(`sign-in failed${flow.prompt ? ` (elicitation ${flow.prompt.id})` : ""}: ${failed}`);
     }).finally(() => {
       flow.prompt?.withdraw.abort();
-      if (flow.url && !("error" in config))
-        dropSignIn(config.dataDir, o.claude.pid);
       show(undefined);
       if (signingIn === flow)
         signingIn = undefined;
+      if (flow.url && !("error" in config)) {
+        try {
+          dropSignIn(config.dataDir, o.claude.pid, flow.url);
+        } catch (error) {
+          say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+        }
+      }
     });
     const flow = { abort, done, link, show };
     signingIn = flow;
@@ -38086,8 +38128,13 @@ function createPlugin(o) {
 `);
   };
   const connectTransport = async (transport) => {
-    if (!("error" in config))
-      dropSignIn(config.dataDir, o.claude.pid);
+    if (!("error" in config)) {
+      try {
+        dropSignIn(config.dataDir, o.claude.pid);
+      } catch (error) {
+        say(`couldn't remove a sign-in link a previous server left: ${message(error)}`);
+      }
+    }
     await Promise.race([root?.start(), after(INSTRUCTIONS_MS)]);
     server = serve(await instructions());
     if (offNotice)

@@ -3,7 +3,8 @@
 // fragment, and nothing a parser could read two ways (controls, spaces, a
 // backslash, percent-encoding). Callers add their own path rules. Runs under
 // Node too: the pi and omp bundles import it through hosted-core.
-const LOOPBACK = new Set(["127.0.0.1", "[::1]", "localhost"]);
+/** The hosts HTTP is allowed on: loopback. */
+export const LOOPBACK: ReadonlySet<string> = new Set(["127.0.0.1", "[::1]", "localhost"]);
 
 export function canonicalEndpoint(raw: string): URL | undefined {
   if (typeof raw !== "string" || raw.length > 2048 || /[\x00-\x20\x7f\\%?#]/.test(raw)) return undefined;
