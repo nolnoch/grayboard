@@ -90,6 +90,7 @@ jobs:
           mkdir -p dist
           bash scripts/build_scratch.sh bun build --compile --target=${{ matrix.bun_target }} "$GITHUB_WORKSPACE/src/cli/main.ts"    --outfile "$GITHUB_WORKSPACE/dist/grayboard-${{ matrix.target }}"
           bash scripts/build_scratch.sh bun build --compile --target=${{ matrix.bun_target }} "$GITHUB_WORKSPACE/src/server/main.ts" --outfile "$GITHUB_WORKSPACE/dist/grayboard-server-${{ matrix.target }}"
+          bash scripts/build_scratch.sh bun build --compile --target=${{ matrix.bun_target }} "$GITHUB_WORKSPACE/scripts/inspect.ts"  --outfile "$GITHUB_WORKSPACE/dist/grayboard-inspect-${{ matrix.target }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

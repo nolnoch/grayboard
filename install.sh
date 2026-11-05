@@ -13,20 +13,22 @@
 # Server install (one-deployment-per-org):
 #   curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh \
 #     | sudo INSTALL_SERVER=1 INSTALL_DIR=/usr/local/bin bash
-#   → also installs `grayboard-server`, the release's deploy files (the systemd unit,
+#   → also installs `grayboard-server` and `grayboard-inspect` (the read-only database
+#     viewer, kept in step with the server's schema), the release's deploy files (the systemd unit,
 #     the Caddyfile, and `grayboard-backup` beside the binaries; each verified against
 #     the signed SHA256SUMS like the binaries), then, if the grayboard systemd unit
 #     runs that binary, restarts it and waits for /healthz to report the installed release
 #
 # Overrides:
 #   GRAYBOARD_VERSION=v2.0.0   pin a release (default: latest); a release
-#                              published before signing has no SHA256SUMS and
-#                              needs its own install.sh
+#                              published before signing has no SHA256SUMS, and a
+#                              server install of one older than grayboard-inspect
+#                              (#608) finds no line for it; each needs its own install.sh
 #   INSTALL_DIR=/some/path     install dir   (default: ~/.local/bin)
 #   GRAYBOARD_REPO=fork/repo   alternate repo
 #   GRAYBOARD_RELEASES_URL=https://mirror.example.com
 #                              serves github.com's release paths instead of github.com
-#   INSTALL_SERVER=1           also fetch grayboard-server and the deploy files
+#   INSTALL_SERVER=1           also fetch grayboard-server, grayboard-inspect and the deploy files
 #   GRAYBOARD_NO_DEPLOY=1      with INSTALL_SERVER=1, skip the deploy files
 #   GRAYBOARD_DEPLOY_REPLACE=1 replace a unit or Caddyfile that differs from the release's
 #                              (default: keep it and say so); the old one is kept as <file>.prev.
@@ -160,7 +162,7 @@ deploy=0
 deploy_skip=""
 deploy_assets=(deploy-grayboard.service deploy-Caddyfile deploy-backup.sh)
 if [ "$INSTALL_SERVER" = "1" ]; then
-  bins+=(grayboard-server)
+  bins+=(grayboard-server grayboard-inspect)
   if [ "${GRAYBOARD_NO_DEPLOY:-0}" = "1" ]; then
     deploy_skip="GRAYBOARD_NO_DEPLOY=1 was set"
   elif ! command -v systemctl >/dev/null 2>&1; then

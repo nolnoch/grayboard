@@ -18,8 +18,9 @@ const STUB_BIN = "#!/bin/sh\necho 9.9.9\n";
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 const STUB_SHA = sha(STUB_BIN);
 const target = `${process.platform}-${process.arch}`;
-const BINS = ["grayboard", "grayboard-server"] as const;
+const BINS = ["grayboard", "grayboard-server", "grayboard-inspect"] as const;
 type Bins = Partial<Record<(typeof BINS)[number], string>>;
+const RELEASE: Bins = { grayboard: STUB_BIN, "grayboard-server": STUB_BIN, "grayboard-inspect": STUB_BIN };
 
 // The deploy files a server install takes (#311): asset name -> body.
 const DEPLOY = {
@@ -35,7 +36,7 @@ type Deploy = Record<string, string>;
  * defaulting to `bins`; a bin left out isn't listed), signed by `key`.
  */
 function publish(
-  bins: Bins = { grayboard: STUB_BIN, "grayboard-server": STUB_BIN },
+  bins: Bins = RELEASE,
   o: { api?: Bins; sums?: Bins; sumsTag?: string; key?: TestKey; deploy?: Deploy; deploySums?: Deploy; deployApi?: Deploy } = {},
 ) {
   const rel = join(dir, "release");
@@ -169,9 +170,9 @@ test("an upgrade restarts the unit and waits for /healthz on the env file's port
   expect(readFileSync(join(dir, "api.log"), "utf8")).toContain("/releases/tags/v9.9.9");
 });
 
-// Nothing replaced: no CLI landed, the server binary is the old one, nothing restarted.
+// Nothing replaced: no CLI or inspector landed, the server binary is the old one, nothing restarted.
 function expectUntouched(): void {
-  expect(existsSync(join(dir, "bin", "grayboard"))).toBe(false);
+  for (const bin of ["grayboard", "grayboard-inspect"]) expect(existsSync(join(dir, "bin", bin)), bin).toBe(false);
   expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe("old");
   expect(existsSync(join(dir, "bin", "grayboard-server.prev"))).toBe(false);
   expect(restarts()).toBe(0);
@@ -194,7 +195,7 @@ test("a release signed by either listed key installs, naming the tag and key it 
   expect(r.out).toContain(`verified v9.9.9 (SHA256SUMS signed by key ${testKey("b").id})`);
   // The temp dir inside INSTALL_DIR is gone.
   expect(readFileSync(join(dir, "downloads.log"), "utf8")).toContain("/releases/download/v9.9.9/SHA256SUMS.sig");
-  expect(Bun.spawnSync(["ls", "-A", join(dir, "bin")]).stdout.toString().trim().split("\n").sort()).toEqual(["grayboard", "grayboard-backup", "grayboard-server", "grayboard-server.prev"]);
+  expect(Bun.spawnSync(["ls", "-A", join(dir, "bin")]).stdout.toString().trim().split("\n").sort()).toEqual(["grayboard", "grayboard-backup", "grayboard-inspect", "grayboard-server", "grayboard-server.prev"]);
 });
 
 test("a bad signature, or a missing SHA256SUMS or .sig, is refused", () => {
@@ -276,9 +277,10 @@ test("another release's SHA256SUMS and .sig served under this tag are refused", 
   expectRefused(install(), "SHA256SUMS is signed for v9.9.8, not v9.9.9");
 });
 
-test("a binary SHA256SUMS doesn't list is refused, and nothing is installed (the first binary included)", () => {
-  publish(undefined, { sums: { grayboard: STUB_BIN } });
-  expectRefused(install(), `grayboard-server-${target}: SHA256SUMS lists no sha256`);
+// A release older than the inspector asset (#608) is such a release for a server install.
+test("a binary SHA256SUMS doesn't list is refused, and nothing is installed (the listed binaries included)", () => {
+  publish(undefined, { sums: { grayboard: STUB_BIN, "grayboard-server": STUB_BIN } });
+  expectRefused(install(), `grayboard-inspect-${target}: SHA256SUMS lists no sha256`);
 });
 
 // The forged asset: a replaced binary whose API digest GitHub recomputed.
@@ -305,7 +307,7 @@ test("a release that lists no API digest for the asset is refused", () => {
 
 test("a signed CLI that doesn't report the tag is refused", () => {
   const stale = "#!/bin/sh\necho 9.9.8\n";
-  publish({ grayboard: stale, "grayboard-server": STUB_BIN });
+  publish({ ...RELEASE, grayboard: stale });
   expectRefused(install(), "the downloaded grayboard reports '9.9.8', not v9.9.9");
 });
 

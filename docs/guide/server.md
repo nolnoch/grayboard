@@ -46,7 +46,7 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
 sudo apt update && sudo apt install -y caddy
 ```
 
-Create the `grayboard` system user, then install the binaries (`grayboard-server`, plus the `grayboard` CLI for checks) and the release's deploy files: the systemd unit (`/etc/systemd/system/grayboard.service`), the Caddyfile (`/etc/caddy/Caddyfile`) and the backup script (`/usr/local/bin/grayboard-backup`). The deploy files are release assets listed in the same signed `SHA256SUMS` as the binaries, so the whole install rests on the release key:
+Create the `grayboard` system user, then install the binaries (`grayboard-server`, the `grayboard` CLI for checks, and `grayboard-inspect`, the [read-only data viewer](#browsing-the-servers-data-admin)) and the release's deploy files: the systemd unit (`/etc/systemd/system/grayboard.service`), the Caddyfile (`/etc/caddy/Caddyfile`) and the backup script (`/usr/local/bin/grayboard-backup`). The deploy files are release assets listed in the same signed `SHA256SUMS` as the binaries, so the whole install rests on the release key:
 
 ```bash
 id grayboard || sudo useradd -r -m -d /var/lib/grayboard grayboard
@@ -59,7 +59,7 @@ curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.
 
 `GRAYBOARD_DEPLOY_REPLACE=1` is for this first install only: Caddy's package ships its own `/etc/caddy/Caddyfile`, which the release's replaces (the old one is kept as `Caddyfile.prev`). Without it, the installer keeps any unit or Caddyfile that differs from the release's and says so, with the two checksums and a `diff` command. A symlinked unit (for example a masked one) is never replaced. Your own edits, such as the hostname in step 3 or a source-mode `ExecStart`, then survive every update. `GRAYBOARD_NO_DEPLOY=1` installs only the binaries; a host without `systemctl` installs only the binaries too.
 
-**Check:** `grayboard --version` prints the release you expect, `ls -l /usr/local/bin/grayboard-server /usr/local/bin/grayboard-backup /etc/systemd/system/grayboard.service /etc/caddy/Caddyfile` lists the files, and `caddy version` runs.
+**Check:** `grayboard --version` prints the release you expect, `ls -l /usr/local/bin/grayboard-server /usr/local/bin/grayboard-inspect /usr/local/bin/grayboard-backup /etc/systemd/system/grayboard.service /etc/caddy/Caddyfile` lists the files, and `caddy version` runs.
 
 <details>
 <summary>Alternative: run the server from a source checkout (for hacking on the server itself)</summary>
@@ -245,12 +245,9 @@ echo "0 3 * * * grayboard S3_BUCKET=<bucket> /usr/local/bin/grayboard-backup" | 
 
 ## Browsing the server's data (admin)
 
-The read-only web view from [Boards and claims](local.md#boards-and-claims), `scripts/inspect.ts`, also reads the server's database. There it adds users (with their sessions, teams and last activity), teams and their members, and the audit log. It listens on the host's loopback only, so you reach it through an SSH tunnel and nothing new is exposed. Build it on your machine for the host's architecture and copy it over; the host doesn't need Bun:
+The read-only web view from [Boards and claims](local.md#boards-and-claims), `scripts/inspect.ts`, also reads the server's database. There it adds users (with their sessions, teams and last activity), teams and their members, and the audit log. The server install puts it at `/usr/local/bin/grayboard-inspect` and every update replaces it with the server, so it always reads the schema the running server writes. It listens on the host's loopback only, so you reach it through an SSH tunnel and nothing new is exposed:
 
 ```bash
-bun build --compile --target=bun-linux-arm64 scripts/inspect.ts --outfile grayboard-inspect   # bun-linux-x64 for an x64 host
-scp grayboard-inspect <host>:
-ssh <host> 'sudo install grayboard-inspect /usr/local/bin/'
 ssh -t -L 4777:127.0.0.1:4777 <host> 'sudo -u grayboard grayboard-inspect --db /var/lib/grayboard/bus.db'
 ```
 
