@@ -480,6 +480,8 @@ test("the same session opened twice: the second runs tools-only, says so in its 
   // Only the holder admits.
   await sender.call("dm_send", { to: "twin", body: "to the holder" });
   await until(() => first.deliveries.length === 1);
+  // Delivery is at-least-once: quitting before the receipt lands replays the item to the next holder (#614).
+  await until(() => first.records.some(r => r.event === "receipted"), 10_000, "the holder's receipt");
 
   await first.ext.shutdown("quit");
   // The loser retries the lock every 5 s.

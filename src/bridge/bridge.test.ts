@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { until } from "../../tests/support/until.ts";
 
 import { sha256Hex } from "../shared/hash.ts";
 import { ConfigError, loadConfig } from "./config.ts";
@@ -185,7 +186,7 @@ test("outbox: a bad token stops the relay instead of retrying forever", async ()
     onFatal: (r) => (fatal = r),
   });
   relay.notify({ content: "hi", meta: { message_id: "1", from: "be" } });
-  await Bun.sleep(50);
+  await until(() => fatal, 5000, "the relay's fatal stop");
   expect(fatal).toContain("invalid_auth");
   expect(store.pending()).toHaveLength(1); // kept for after the token is fixed
   store.close();
@@ -249,6 +250,9 @@ function withAttachment(slack: { upload?: number; complete?: string | number; ag
 
 const LOOK = { content: "look", meta: { message_id: "1", from: "be", attachments: `7:shot.png image/png 3B sha256:${sha256Hex(new Uint8Array([1, 2, 3]))}` } };
 const errors = (store: Store) => (store.db.prepare(`SELECT error FROM outbox ORDER BY id`).all() as { error: string | null }[]).map((r) => r.error);
+// The relay marks an outbox row done only after every Slack and bus call for it returns,
+// so an empty outbox is the barrier, not a sleep sized to a fast machine (#466).
+const drained = (store: Store) => until(() => store.pending().length === 0, 5000, "the outbox drained");
 
 function fileRelay(store: Store, x: ReturnType<typeof withAttachment>, extra: Partial<RelayOptions> = {}) {
   const sent: string[] = [];
@@ -265,7 +269,7 @@ test("files: text and files go as one message, whose ts files.info gives; a retr
   const store = new Store(join(dir, "b.db"));
   const { relay, sent } = fileRelay(store, x);
   relay.notify(LOOK);
-  await Bun.sleep(150);
+  await drained(store);
   expect(x.calls).toEqual(["files.getUploadURLExternal", "files.getUploadURLExternal", "F1", "files.completeUploadExternal", "files.info"]);
   expect(x.blocks).toEqual(["**be** look"]);
   expect(x.said).toEqual([]);
@@ -294,7 +298,7 @@ test("files: a share whose answer was lost is completed again, which Slack doesn
   const store = new Store(join(dir, "b.db"));
   const { relay, sent } = fileRelay(store, x);
   relay.notify(LOOK);
-  await Bun.sleep(200);
+  await drained(store);
   // The repeat's answer names the share, so files.info isn't needed.
   expect(x.calls).toEqual(["files.getUploadURLExternal", "F1", "files.completeUploadExternal", "files.completeUploadExternal"]);
   expect(x.blocks).toEqual(["**be** look"]);
@@ -310,7 +314,7 @@ test("files: a completion Slack refuses after a lost answer is a refusal: the te
   const store = new Store(join(dir, "b.db"));
   const { relay, sent } = fileRelay(store, x);
   relay.notify(LOOK);
-  await Bun.sleep(200);
+  await drained(store);
   expect(x.calls.filter((c) => c === "files.completeUploadExternal")).toHaveLength(2);
   expect(x.said).toHaveLength(1);
   expect(x.said[0]).toStartWith("**be** look");
@@ -326,7 +330,7 @@ test("files: a share whose message never shows in files.info leaves the thread u
   const store = new Store(join(dir, "b.db"));
   const { relay, sent } = fileRelay(store, x);
   relay.notify(LOOK);
-  await Bun.sleep(200);
+  await drained(store);
   expect(x.calls.filter((c) => c === "files.info")).toHaveLength(10);
   expect(sent).toEqual(["7→F1@null"]);
   expect(x.said).toEqual(["⚠️ Slack didn't say where it put message 1 from be, so replies in that thread won't reach grayboard. Answer in the next message of that conversation instead."]);
@@ -341,7 +345,7 @@ test("files: an app without files:write still relays the text with a warning, an
   const { relay } = fileRelay(store, x, { onFatal: (r) => (fatal = r) });
   relay.notify(LOOK);
   relay.notify({ content: "next", meta: { message_id: "2", from: "be" } });
-  await Bun.sleep(100);
+  await drained(store);
   expect(fatal).toBe("");
   // The file attempt, the text with the warning as one message, then the next item.
   expect(x.calls).toEqual(["files.getUploadURLExternal", "F1", "files.completeUploadExternal", "chat.postMessage", "chat.postMessage"]);
@@ -359,7 +363,7 @@ test("files: bytes that don't match the stored sha256 never reach Slack", async 
   const store = new Store(join(dir, "b.db"));
   const { relay, sent } = fileRelay(store, x);
   relay.notify(LOOK);
-  await Bun.sleep(100);
+  await drained(store);
   expect(x.calls).toEqual(["chat.postMessage"]);
   expect(x.said).toEqual(["**be** look\n\n⚠️ not delivered to Slack: shot.png: its bytes don't match the stored sha256"]);
   expect(x.told).toHaveLength(1);
@@ -373,7 +377,7 @@ test("files: attachments meta the relay can't read is refused loudly, not droppe
   const store = new Store(join(dir, "b.db"));
   const { relay } = fileRelay(store, x);
   relay.notify({ content: "look", meta: { message_id: "1", from: "be", attachments: "shot.png, 3 bytes" } });
-  await Bun.sleep(100);
+  await drained(store);
   expect(x.calls).toEqual(["chat.postMessage"]);
   expect(x.said[0]).toStartWith("**be** look\n\n⚠️ not delivered to Slack: its files: unreadable attachments meta item");
   expect(x.told).toHaveLength(1);
@@ -453,7 +457,7 @@ test("slack: a reply sent while the one before it is still sending threads under
   const reply = (text: string, ts: string) => relay.onEvent({ type: "event_callback", event: { type: "message", channel: "G1", user: "U1", text, ts, thread_ts: "1.0" } });
   const a = reply("here's the screen", "2.0");
   const b = reply("fix the button in it", "3.0");
-  await Bun.sleep(20);
+  await until(() => posts.length > 0, 5000, "the first reply posted");
   expect(posts.length).toBe(1); // the second waits for the first
   release();
   await Promise.all([a, b]);
