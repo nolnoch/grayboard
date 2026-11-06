@@ -14,6 +14,7 @@ import { latestV1Release, releaseBinaries, type ReleaseBinaries } from "../suppo
 import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
 import { crockford13 } from "../../src/core/session_id.ts";
+import { poke } from "../../src/local/wakeup.ts";
 
 let dir: string;
 
@@ -231,6 +232,8 @@ test("7: a dead holder's row doesn't hide a pre-upgrade session listening on the
   await session("fe");
   await sigkill(pidOf("fe"));
   await localSession(dir, "fe", { bin: rel.cli });
+  // Its handshake can finish before it listens on sock.fe; until then the bind's probe finds only the dead holder's stale socket (#445).
+  await until(() => poke("fe", dir), 10_000, "the pre-upgrade session listening on sock.fe");
   expect(holderOf("fe")).toBeDefined();
   expect(await refusal(s, "bind", { name: "fe" })).toContain("a live session from an older grayboard");
   expect(holderOf("fe")).toBeUndefined();

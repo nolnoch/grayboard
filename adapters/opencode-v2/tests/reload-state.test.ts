@@ -9,13 +9,16 @@ import { assertStable, barrier, bounded, drainSessions, sessionStates, workerBoo
 async function fixture(run: (db: Database, path: string) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), "reload-state-")), path = join(root, "host.sqlite"), db = new Database(path);
   try {
+    // The fixture stands in for OpenCode's database, not its durability: a synced commit per write
+    // made the drain test's ~750 writes take 6-12 s on a slow CI disk (#613).
+    db.exec("PRAGMA synchronous = OFF");
     db.exec("CREATE TABLE session_v2(id TEXT PRIMARY KEY, time_suspended INTEGER); CREATE TABLE session_message(id TEXT, session_id TEXT, type TEXT, data TEXT); CREATE TABLE session_inbox(id TEXT)");
     await run(db, path);
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 }
 
 test("reload drain enumerates all owned sessions and repeats for newly created children", () => fixture(async (db, path) => {
-  for (let n = 0; n < 250; n++) db.query("INSERT INTO session_v2 VALUES (?, 1)").run(String(n));
+  db.transaction(() => { for (let n = 0; n < 250; n++) db.query("INSERT INTO session_v2 VALUES (?, 1)").run(String(n)); })();
   const waited = new Set<string>();
   await drainSessions(path, async id => {
     waited.add(id); db.query("UPDATE session_v2 SET time_suspended = NULL WHERE id = ?").run(id);

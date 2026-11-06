@@ -49,7 +49,10 @@ let app = start();
 const transactionCase = transactionScenarios.includes(process.env.GRAYBOARD_TEST_REAL_RACE ?? "");
 if (transactionCase) await app.stop();
 const realServer = transactionCase ? await spawnRealServer(config, join(root, "pauses")) : undefined;
-let ctx!: Context, target: { tool: string; args: Record<string, unknown> } | undefined, issued = false;
+// The fixture model's next tool call, issued only to a request carrying the
+// invoking prompt's nonce: a bus delivery can wake another session meanwhile,
+// and its model turn must not take the call.
+let ctx!: Context, target: { tool: string; args: Record<string, unknown>; nonce: string } | undefined, issued = false, invokes = 0;
 let dropReceipt = false, receiptAttempts = 0, held = false, release: (() => void) | undefined, entered: (() => void) | undefined, subscriberOutage = false;
 const admissions: NativeInput[] = [];
 // The plugin's MCP requests as forwarded, by method, and its inbox reads, each answer filled in when it lands (#383).
@@ -76,8 +79,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);
   if (url.origin === callbackOrigin) return fetch0(req);
   if (url.origin === "https://model.example.com") {
-    modelCalls++; await req.json();
-    const call = target && !issued; issued = true;
+    modelCalls++; const body = await req.text();
+    const call = !!target && !issued && body.includes(target.nonce); if (call) issued = true;
     const delta = call ? { role: "assistant", tool_calls: [{ index: 0, id: "fixture_call", type: "function", function: { name: codeMode ? "execute" : "grayboard_" + target!.tool, arguments: JSON.stringify(codeMode ? { code: `return await tools.grayboard.${target!.tool}(${JSON.stringify(target!.args)})` } : target!.args) } }] } : { content: "Fixture reply" };
     return new Response("data: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] }) + "\n\ndata: " + JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) + "\n\ndata: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
   }
@@ -176,9 +179,10 @@ async function signIn(integrationID: string) {
   return wait(() => ctx.integration.connection.active(integrationID), c => !!c && (c.type !== "credential" || previous?.type !== "credential" || c.id !== previous.id), "native OAuth selection");
 }
 async function invoke(sessionID: string, tool: string, args: Record<string, unknown>) {
-  target = { tool, args }; issued = false;
+  const nonce = `fixture-invoke-${++invokes}`;
+  target = { tool, args, nonce }; issued = false;
   await host!.session.switchModel({ sessionID, model: { providerID: "fixture", id: "fixture" } });
-  await host!.session.prompt({ sessionID, text: "Invoke " + tool }); await host!.session.wait({ sessionID }); target = undefined;
+  await host!.session.prompt({ sessionID, text: `Invoke ${tool} ${nonce}` }); await host!.session.wait({ sessionID }); target = undefined;
 }
 const row = (raw: string) => hostedRow(app.db, raw);
 const wrote = (tool: string, sessionID: string, rootID: string) => assertWrote(app.db, tool, row(sessionID)!, row(rootID)!, OPENCODE_CLIENT);

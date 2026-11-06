@@ -312,16 +312,22 @@ test("bind_hint: once on an unbound session's first successful write; never on a
 }, 20_000);
 
 test("dm_inbox lists what you owe: replied and acked messages drop out", async () => {
-  const be = await start("be");
-  const fe = await start("fe");
+  const beS = await session("be");
+  const be = beS.c;
+  const feS = await session("fe");
+  const fe = feS.c;
   const q = await call(fe, "dm_send", { to: "be", body: "question?" });
   const fyi = await call(fe, "dm_send", { to: "be", body: "FYI: deployed" });
   const later = await call(fe, "dm_send", { to: "be", body: "follow-up", parent_id: q.message_id });
+  // Each request below waits out the pushes it would overlap: under Bun 1.4.4 an overlap can stall the test client (#457).
+  await until(() => contents(beS).some((c) => c.includes("follow-up")), 15_000, "be's push of the follow-up");
   expect((await call(be, "dm_inbox")).unanswered.map((m: any) => m.id)).toEqual([q.message_id, fyi.message_id, later.message_id]);
 
   await call(be, "dm_send", { to: "fe", body: "answer", parent_id: q.message_id });
   await call(be, "dm_ack", { message_id: fyi.message_id });
   expect((await call(be, "dm_inbox")).unanswered).toEqual([]);
+  // The reply pushes to fe.
+  await until(() => contents(feS).some((c) => c.includes("answer")), 15_000, "fe's push of the answer");
   await expect(call(fe, "dm_ack", { message_id: fyi.message_id })).rejects.toThrow(/no message/);
   expect(be.getInstructions()).toContain("dm_inbox()");
 }, 20_000);

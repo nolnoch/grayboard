@@ -708,8 +708,8 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
       const [dead] = grayboardChildPids(omp.pid);
       await sigkill(dead!);
       await until(() => grayboardChildPids(omp.pid).some((p) => p !== dead), 15_000, "a new grayboard process");
-      await until(() => holder() !== undefined && holder() !== first, 15_000, "omp-carry held by the restarted session");
-      const restarted = holder()!;
+      // One read per poll, and the id it saw: a second read can race the takeover (#466).
+      const restarted = await until(() => { const h = holder(); return h !== undefined && h !== first ? h : undefined; }, 15_000, "omp-carry held by the restarted session");
       await omp.command({ type: "prompt", message: "who" });
       await idle(omp);
       const who = resultText(await toolResult(omp, "whoami"));
@@ -793,7 +793,7 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       await idle(omp);
       expect(resultText(await toolResult(omp, "dm_send", 1))).toContain("grayboard process stopped reading");
       await until(() => !stale.some(alive), 10_000, "the process that stopped reading killed");
-      await until(() => holder() !== undefined && holder() !== first, 15_000, "omp-580 held by the replacement");
+      await until(() => { const h = holder(); return h !== undefined && h !== first ? h : undefined; }, 15_000, "omp-580 held by the replacement");
       const replacement = grayboards(omp.pid);
       expect(replacement).toHaveLength(2);
       expect(localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id = ?", first)[0]?.ended_at).not.toBeNull();
@@ -1045,11 +1045,11 @@ export function ompHostedRefreshLogoutScenario(dir: string): Promise<void> {
     await until(() => srv.app.mcp.activeLeases === 0, 15_000, "both leases dropped");
     expect(srv.app.db.query<{ revoked_at: number | null }, [string]>("SELECT revoked_at FROM oauth_grants WHERE id = ?").get(seeded.grantId)!.revoked_at).not.toBeNull();
     await until(() => b.notices().slice(seenB).includes(LOGIN_NOTICE), 15_000, "the login notice in the other process");
-    for (const omp of [a, b]) {
+    // A root whose subscription closed first sits in `retrying` until its next reopen meets the sign-out (#606).
+    for (const omp of [a, b]) await until(async () => {
       const status = await statusOf(omp);
-      expect(status).toContain("\nsign-in: signed out (logged_out); run /grayboard login\n");
-      expect(status).toMatch(/: paused, /);
-    }
+      return status.includes("\nsign-in: signed out (logged_out); run /grayboard login\n") && /: paused, /.test(status) ? status : undefined;
+    }, 15_000, "both roots paused by the sign-out");
     // The other process's next tool call offers a sign-in; once it lands,
     // both processes' roots restart (unbound: the logout's revoke ended their sessions).
     await expectSignInOffer(srv, b, "omp", { results: 0, whoami: (nth) => toolResult(b, "whoami", nth), idle: (p) => idle(p) });
