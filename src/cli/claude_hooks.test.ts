@@ -173,7 +173,7 @@ test("CLI hooks publish current root/child records and refuse malformed tool inp
   const sock = mkdtempSync(join(tmpdir(), "gb-ss-"));
   const hook = (event: string, input: string) => Bun.spawnSync(["bun", join(import.meta.dir, "main.ts"), "hook", "claude", event], {
     stdin: new TextEncoder().encode(input),
-    env: { ...process.env, BUS_IDENTITY: "", BUS_SOCK_DIR: sock, CLAUDE_PID: String(process.pid) },
+    env: { ...process.env, BUS_IDENTITY: "", BUS_SOCK_DIR: sock, BUS_DB_PATH: join(sock, "bus.db"), CLAUDE_PID: String(process.pid) },
   });
   for (const r of [
     hook("session-start", JSON.stringify({ source: "startup", session_id: "current" })),
@@ -197,7 +197,7 @@ test("the CLI fails visibly when an authoritative SessionStart publication canno
   mkdirSync(current, { recursive: true });
   const r = Bun.spawnSync([process.execPath, join(import.meta.dir, "main.ts"), "hook", "claude", "session-start"], {
     stdin: new TextEncoder().encode(JSON.stringify({ source: "clear", session_id: "B" })),
-    env: { ...process.env, BUS_SOCK_DIR: sock, CLAUDE_PID: String(process.pid) },
+    env: { ...process.env, BUS_SOCK_DIR: sock, BUS_DB_PATH: join(sock, "bus.db"), CLAUDE_PID: String(process.pid) },
   });
   expect(r.exitCode).toBe(1);
   expect(r.stderr.toString()).toContain("current conversation barrier failed");

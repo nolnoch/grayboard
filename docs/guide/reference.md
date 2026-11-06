@@ -19,6 +19,7 @@ grayboard claims [--prefix <p>] [--include-self] [--json]  # exits 2 if another 
 grayboard claim take <key> [--ttl <dur> | --until <time>] [--note <text>] [--board <b>]  # exits 2 if held
 grayboard claim release <key> [--note <text>]
 grayboard claim watch <key> [--off]
+grayboard retention [off | <days> | default] [--json]  # the local bus on any machine; show or store how long it keeps history
 grayboard tail <board> [-n <lines>]      # local mode
 grayboard human [handle] [--mode local]  # local mode; show or declare your human handle
 grayboard announce [--ttl <dur>] [--mode local] <text>  # local mode; post to #announce as your human handle

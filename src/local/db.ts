@@ -1,3 +1,4 @@
+import { LOCAL_UNDELIVERED_FROM_SQL } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 import { SqliteBlobs } from "./blobs.ts";
 import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments, type Uploader } from "../core/attachments.ts";
@@ -155,12 +156,6 @@ function threadRows(id: number): Message[] {
 // only count those sent before it.
 // The read point is the last delivered-and-handled message id (cursors.last_seen_id);
 // unread = `id > read point` — a message is counted undelivered iff `id > read point`.
-// Exported so the EXPLAIN pin asserts the plan of the exact statement the code executes.
-export const LOCAL_UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
-        LEFT JOIN cursors c ON c.reader = m.recipient
-        WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
-          AND m.id > COALESCE(c.last_seen_id, 0) AND m.delivered_at IS NULL AND m.created_at < ?
-        GROUP BY m.recipient ORDER BY m.recipient`;
 export function undeliveredFrom(
   senders: string[],
   olderThan = Infinity,

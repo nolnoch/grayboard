@@ -3,8 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { QUEUED_FOR_SQL } from "./binding.ts";
-import { LOCAL_UNDELIVERED_FROM_SQL } from "./db.ts";
+import { LOCAL_UNDELIVERED_FROM_SQL, QUEUED_FOR_SQL } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 
 // #130: the local undeliveredFrom join keys on the cursors PK (reader), so the

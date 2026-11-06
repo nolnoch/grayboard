@@ -1463,24 +1463,28 @@ export function parseRetentionDays(raw: string | undefined, fallback: number): n
 }
 
 // Operator retention, not an agent operation. Replies outlive their pruned
-// parents as thread roots.
-export function prunePosts(db: Database, olderThanMs: number): string[] {
-  return db.transaction(() => {
+// parents as thread roots. `deleted`, if given, gains each table's count once
+// the transaction commits.
+export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<string, number>): string[] {
+  const counts: Record<string, number> = {};
+  const changed = db.transaction(() => {
     const boards = db.prepare(`SELECT DISTINCT board FROM posts WHERE created_at < ? ORDER BY board`).all(olderThanMs) as { board: string }[];
     const old = `SELECT id FROM posts WHERE created_at < ?`;
     db.prepare(`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old})`).run(olderThanMs);
-    db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs);
-    db.prepare(`DELETE FROM thread_mutes WHERE root_id IN (${old})`).run(olderThanMs);
-    dropAttachments(db, "post", old, olderThanMs);
-    db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs);
-    db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs);
+    counts.outbox = db.prepare(`DELETE FROM outbox WHERE post_id IN (${old})`).run(olderThanMs).changes;
+    counts.thread_mutes = db.prepare(`DELETE FROM thread_mutes WHERE root_id IN (${old})`).run(olderThanMs).changes;
+    counts.attachments = dropAttachments(db, "post", old, olderThanMs);
+    counts.posts = db.prepare(`DELETE FROM posts WHERE created_at < ?`).run(olderThanMs).changes;
+    counts.claim_events = db.prepare(`DELETE FROM claim_events WHERE at < ?`).run(olderThanMs).changes;
     // Each name's latest bound or moved event outlives retention: who holds a
     // name by the record (latestBinder, continuityOf) is read from it (#211).
-    db.prepare(
+    counts.binding_events = db.prepare(
       `DELETE FROM binding_events WHERE COALESCE(last_at, at) < ? AND id NOT IN
          (SELECT MAX(id) FROM binding_events WHERE event IN ('bound', 'moved') GROUP BY name)`,
-    ).run(olderThanMs);
+    ).run(olderThanMs).changes;
     // Expired claims are left to sweepExpired, which announces them.
     return boards.map(b => b.board);
   })();
+  if (deleted) for (const [table, n] of Object.entries(counts)) deleted[table] = (deleted[table] ?? 0) + n;
+  return changed;
 }

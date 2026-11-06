@@ -709,6 +709,14 @@ export async function declareLocalHuman(db: Database, handle: string, socks?: st
 // name past its read point, never a pass over the whole table. It lives here,
 // not in db.ts, because this module takes its database (the Slack bridge
 // opens its own). Exported for the plan pin in db.test.ts.
+// db.ts's undeliveredFrom. Here, not there, so the EXPLAIN pin (db.test.ts) can
+// assert the exact statement: importing db.ts opens this process's bus.
+export const LOCAL_UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
+        LEFT JOIN cursors c ON c.reader = m.recipient
+        WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
+          AND m.id > COALESCE(c.last_seen_id, 0) AND m.delivered_at IS NULL AND m.created_at < ?
+        GROUP BY m.recipient ORDER BY m.recipient`;
+
 export const QUEUED_FOR_SQL = `SELECT j.value AS name,
     (SELECT COUNT(*) FROM messages m
       WHERE m.recipient = j.value AND m.sender != j.value

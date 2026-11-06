@@ -4,7 +4,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
+import { delimiter, dirname, resolve } from "node:path";
 
 import { ANNOUNCE_BOARD, ensureBoard } from "../core/boards.ts";
 import { holdsOf } from "../core/bindings.ts";
@@ -13,7 +13,17 @@ import { openSqlite } from "../core/sqlite.ts";
 import { conversationSnapshot, liveSessions, type Ended, type SessionRow } from "./binding.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
-  return env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`;
+  return refuseForbiddenBus(env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`);
+}
+
+// GRAYBOARD_TEST_FORBID_BUS: the live buses a test run must never open
+// (tests/support/preload.ts). Unset outside tests.
+export function refuseForbiddenBus(path: string): string {
+  const forbidden = process.env.GRAYBOARD_TEST_FORBID_BUS;
+  if (forbidden && forbidden.split(delimiter).some((p) => resolve(p) === resolve(path))) {
+    throw new Error(`a test run tried to open the live bus ${path}; give it its own BUS_DB_PATH (tests/support/env.ts)`);
+  }
+  return path;
 }
 
 /** Title-only lookup: undefined means absent, null suppresses an unacknowledged/empty selection. */
@@ -43,6 +53,7 @@ export function readConversationTitle(session: string, env: Record<string, strin
  * `ended` to deliverEnded (wakeup.ts) once it can await.
  */
 export function openLocalDb(path = localDbPath()): { db: Database; ended: Ended; live: SessionRow[] } {
+  refuseForbiddenBus(path);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const db = openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
@@ -50,7 +61,20 @@ export function openLocalDb(path = localDbPath()): { db: Database; ended: Ended;
   return { db, ended, live: alive };
 }
 
+// The bus's own retention setting (`grayboard retention`; retention.ts). No row:
+// BUS_RETENTION_DAYS or the default decides. days NULL: off. A new table, not a
+// retention_runs column: every release since v1.10.0 rewrites that row with
+// INSERT OR REPLACE, which would clear a column it doesn't know.
+export const RETENTION_SETTING_SQL = `
+  CREATE TABLE IF NOT EXISTS retention_setting (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    days    INTEGER CHECK (days IS NULL OR (typeof(days) = 'integer' AND days > 0)),
+    set_at  INTEGER NOT NULL
+  );
+`;
+
 function initLocalSchema(db: Database): void {
+  db.exec(RETENTION_SETTING_SQL);
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
