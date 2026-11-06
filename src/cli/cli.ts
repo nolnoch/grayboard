@@ -426,6 +426,16 @@ program
     process.exitCode = await runClaims({ ...opts, json: globalJson(), as: globalAs() });
   });
 
+// ── retention (the local bus) ────────────────────────────────────────────────
+
+program
+  .command("retention [setting]")
+  .description("Show or store how long the local bus keeps history: off, a whole number of days, or default. Outranks BUS_RETENTION_DAYS in every session")
+  .action(async (setting: string | undefined) => {
+    const { runRetention } = await import("./retention.ts");
+    process.exitCode = runRetention(setting, { json: globalJson() });
+  });
+
 // ── claim (both modes) ───────────────────────────────────────────────────────
 
 const claimCmd = program.command("claim").description("Take, release or watch a claim as this directory's session (see whoami; --as overrides)");

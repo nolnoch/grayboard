@@ -1,0 +1,3 @@
+[test]
+# Every `bun test` from the repo root: no test can reach the developer's live bus.
+preload = ["./tests/support/preload.ts"]
