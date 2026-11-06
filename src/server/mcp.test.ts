@@ -1102,7 +1102,8 @@ test("a refusal attaching an idle legacy GET ends that GET; the subscription sta
   try { expect(await client.subscribeResource({ uri })).toEqual({}); }
   finally { hosted.sessions.snapshot = original; }
   expect(calls).toBe(2);
-  await untilHosted(() => gets.length === 2 && hosted.activeWatches === 1);
+  // The SDK client reopens an ended GET after its 1000 ms initialReconnectionDelay, so a 1 s window races it (#466).
+  await untilHosted(() => gets.length === 2 && hosted.activeWatches === 1, 5000);
   expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "after refusal" } })).isError).not.toBe(true);
   await untilHosted(() => hints.length === 1);
   expect(hints).toEqual([uri]);
