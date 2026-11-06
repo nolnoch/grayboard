@@ -217,8 +217,7 @@ test("legacy SSE context survives fetch return until SDK reader cancellation", a
 
 test("shutdown closes outstanding legacy SSE products and refuses new contexts", async () => {
   await connect("2025-11-25");
-  await Bun.sleep(0);
-  expect(hosted.activeGetStreams).toBe(1);
+  await untilHosted(() => hosted.activeGetStreams === 1);
   expect(hosted.activeContexts).toBe(1);
   await hosted.close();
   expect(hosted.activeGetStreams).toBe(0);
@@ -923,9 +922,7 @@ test("modern listen capacity is reserved and reusable after cancellation", async
   expect(hosted.activeBusListeners).toBe(128);
   await expect(client.listen(filter)).rejects.toThrow();
   await Promise.all(subscriptions.map(sub => sub.close()));
-  await Bun.sleep(0);
-  expect(hosted.activeListens).toBe(0);
-  expect(hosted.activeBusListeners).toBe(0);
+  await untilHosted(() => hosted.activeListens === 0 && hosted.activeBusListeners === 0);
   const replacement = await client.listen(filter);
   await replacement.close();
 });
@@ -938,12 +935,10 @@ test("legacy registry is bounded and idle disconnected sessions are reclaimed", 
   expect(hosted.activeLegacySessions).toBe(256);
   await expect(connect("2025-11-25")).rejects.toThrow();
   await Promise.all(clients.splice(0).map(client => client.close()));
-  await Bun.sleep(0);
-  expect(hosted.activeGetStreams).toBe(0);
+  await untilHosted(() => hosted.activeGetStreams === 0);
   clock += 60_001;
-  await Bun.sleep(1100);
-  expect(hosted.activeLegacySessions).toBe(0);
-  expect(hosted.activeContexts).toBe(0);
+  // The idle sweep runs on a 1 s timer: wait for its effect, not a sleep sized to one tick (#466).
+  await untilHosted(() => hosted.activeLegacySessions === 0 && hosted.activeContexts === 0, 10_000);
   await connect("2025-11-25");
   expect(hosted.activeLegacySessions).toBe(1);
 }, 30_000);
@@ -964,8 +959,7 @@ test("global board watch bound cleans partial acquisitions without retiring othe
   expect(hosted.activeWatches).toBe(1024);
   expect(hosted.activeListens).toBe(32);
   await Promise.all(subscriptions.map(sub => sub.close()));
-  await Bun.sleep(0);
-  expect(hosted.activeWatches).toBe(0);
+  await untilHosted(() => hosted.activeWatches === 0);
 });
 
 test("shutdown awaits pending original request source cancellation", async () => {
