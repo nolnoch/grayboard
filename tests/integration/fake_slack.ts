@@ -27,7 +27,7 @@ export class FakeSlack {
   /** files.info answers for an uploaded file this many times before its shares show. */
   shareLag = 0;
   /** Files the owner can share: what say() sends in an event's files. */
-  private readonly hosted = new Map<string, { name: string; data: Uint8Array }>();
+  private readonly hosted = new Map<string, { name: string; data: Uint8Array; forbidden?: boolean }>();
   private fileN = 0;
   /** The ts each successful chat.postMessage got. */
   readonly postTs = new WeakMap<Record<string, any>, string>();
@@ -45,7 +45,8 @@ export class FakeSlack {
       }
       if (url.pathname.startsWith("/files/")) {
         const f = this.hosted.get(url.pathname.slice("/files/".length));
-        // Slack serves its sign-in page to a request it won't authorize.
+        // Slack answers 403 to a token without files:read, or (as it once did) its sign-in page.
+        if (f?.forbidden) return new Response("", { status: 403 });
         if (!f || !req.headers.get("authorization")?.startsWith("Bearer xoxb-")) return new Response("<html>sign in</html>", { headers: { "Content-Type": "text/html" } });
         return new Response(f.data);
       }
@@ -135,10 +136,10 @@ export class FakeSlack {
       .map((c) => ({ ...c.body, files: JSON.parse(c.body.files), blocks: c.body.blocks ? JSON.parse(c.body.blocks) : undefined, ts: this.postTs.get(c.body) }));
   }
 
-  /** A file the owner can attach to a message; its event object, or only its id with `idOnly`. */
-  host(name: string, data: Uint8Array | string, opts: { idOnly?: boolean; size?: number } = {}): Record<string, any> {
+  /** A file the owner can attach to a message; its event object, or only its id with `idOnly`; `forbidden` serves it as 403. */
+  host(name: string, data: Uint8Array | string, opts: { idOnly?: boolean; size?: number; forbidden?: boolean } = {}): Record<string, any> {
     const id = `FH${++this.fileN}`;
-    const f = { name, data: typeof data === "string" ? new TextEncoder().encode(data) : data };
+    const f = { name, data: typeof data === "string" ? new TextEncoder().encode(data) : data, forbidden: opts.forbidden };
     this.hosted.set(id, f);
     return opts.idOnly ? { id, mode: "file_access", file_access: "check_file_info" } : { ...this.fileObject(id, f), ...(opts.size ? { size: opts.size } : {}) };
   }
