@@ -518,7 +518,7 @@ export class Relay {
       try {
         data = await this.slack.download(String(f.url_private_download), size);
       } catch (e) {
-        if (e instanceof SlackError && e.code === "size_mismatch") throw new Error(`${label}: Slack didn't serve it (does the app have files:read? reinstall it from the current manifest)`);
+        if (e instanceof SlackError && (e.code === "size_mismatch" || e.code === "forbidden")) throw new Error(`${label}: Slack didn't serve it (does the app have files:read? reinstall it from the current manifest)`);
         if (e instanceof SlackError && e.code === "untrusted_host") throw new Error(`${label}: its download isn't on Slack's own host`);
         throw e;
       }
