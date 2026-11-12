@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } from "../../adapters/factory/bus.ts";
 import { ClaudeRunner } from "../../adapters/factory/claude/runner.ts";
 import { parseDelegation, requestOf, type Request } from "../../adapters/factory/delegate.ts";
-import { Factory } from "../../adapters/factory/factory.ts";
+import { Factory, type Fleet } from "../../adapters/factory/factory.ts";
 import { DEFAULTS, loadConfig } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Runner } from "../../adapters/factory/runner.ts";
 import { Store } from "../../adapters/factory/store.ts";
@@ -190,6 +190,7 @@ class FakeBus implements FactoryBus {
   readonly handle = "factory";
   sent: { tool: string; args: Record<string, unknown> }[] = [];
   fail = false;
+  boards: { name: string; kind: string; mode: string | null }[] = [];
   private q: Delivery[] = [];
   private wake: (() => void) | null = null;
   private done = false;
@@ -199,7 +200,7 @@ class FakeBus implements FactoryBus {
   async call(tool: string, args: Record<string, unknown> = {}) {
     if (this.fail) throw new Error("bus down");
     this.sent.push({ tool, args });
-    return { ok: true };
+    return tool === "board_list" ? this.boards : { ok: true };
   }
   async *deliveries() {
     for (;;) {
@@ -230,10 +231,10 @@ class FakeRunner implements Runner {
   }
 }
 
-function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; timeoutMs?: number } = {}) {
-  const bus = new FakeBus(), runner = o.runner ?? new FakeRunner(), store = o.store ?? new Store(":memory:");
+function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; timeoutMs?: number; fleets?: Fleet[]; bus?: FakeBus } = {}) {
+  const bus = o.bus ?? new FakeBus(), runner = o.runner ?? new FakeRunner(), store = o.store ?? new Store(":memory:");
   const logs: string[] = [];
-  const f = new Factory(bus, store, runner, { maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m) });
+  const f = new Factory(bus, store, runner, { fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m) });
   const done = f.run();
   return { bus, runner, store, logs, done };
 }
@@ -247,7 +248,7 @@ test("loop: a request is acknowledged, run once, and answered in its thread", as
   expect(ack).toStartWith("[factory] taken:");
   expect(ack).toContain("agent `researcher`, starting now");
   expect(out).toBe("[factory] done: fake agent `researcher`\n\nresult for 10");
-  expect(bus.sent.every((s) => s.tool === "dm_send" && s.args.to === "sim")).toBe(true);
+  expect(bus.sent.filter((s) => s.tool !== "board_list").every((s) => s.tool === "dm_send" && s.args.to === "sim")).toBe(true);
   bus.deliver(ask(10)); // a redelivery
   bus.deliver(ask(11, "a release manager"));
   await until(() => bus.replies(11).length === 1, 5000, "decline");
@@ -352,6 +353,108 @@ test("local bus: a second factory on a live name refuses to start", async () => 
   const first = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   await expect(LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir })).rejects.toThrow("didn't bind factory");
   await first.close();
+}, 30_000);
+
+// ── fleets: the factory as a lane on queue boards ────────────────────────────
+
+const task = (postId: number, o: { board?: string; reason?: string; parentId?: number; from?: string } = {}): Delivery =>
+  ({ kind: "board", board: o.board ?? "sim-tasks", postId, from: o.from ?? "fe", reason: o.reason ?? "subscription", ...(o.parentId !== undefined ? { parentId: o.parentId } : {}), body: `do ${postId}` });
+
+test("fleets: the sync creates a missing board as a queue, joins an existing queue, refuses a broadcast board, and leaves a queue no fleet uses", async () => {
+  const bus = new FakeBus();
+  bus.boards = [
+    { name: "be-tasks", kind: "queue", mode: null },
+    { name: "fe-tasks", kind: "broadcast", mode: "push" },
+    { name: "old-tasks", kind: "queue", mode: "push" },
+    { name: "e2e", kind: "broadcast", mode: "push" },
+  ];
+  const { runner, logs, done } = loop({ bus, fleets: [{ name: "sim", agent: "researcher" }, { name: "be", agent: "researcher" }, { name: "fe", agent: "researcher" }] });
+  await until(() => bus.sent.some((c) => c.args.board === "old-tasks"), 5000, "sync");
+  expect(bus.sent.filter((c) => c.tool !== "board_list")).toEqual([
+    { tool: "board_create", args: { name: "sim-tasks", purpose: expect.any(String), kind: "queue" } },
+    { tool: "board_subscribe", args: { board: "be-tasks", mode: "push" } },
+    { tool: "board_subscribe", args: { board: "old-tasks", mode: "off" } },
+  ]);
+  expect(logs.some((l) => l.includes("#fe-tasks exists as a broadcast board"))).toBe(true);
+  // A post on the refused board is not a task.
+  bus.deliver(task(5, { board: "fe-tasks" }));
+  bus.deliver(task(6));
+  await until(() => bus.replies(6).length === 2, 5000, "the sim task runs");
+  expect(runner.runs).toEqual([{ agent: "researcher", id: 6 }]);
+  await bus.close();
+  await done;
+});
+
+test("fleets: a task is answered in its board thread, runs once on redelivery, and thread replies aren't tasks", async () => {
+  const { bus, runner, done } = loop({ fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 2, 5000, "taken and done");
+  const posts = bus.sent.filter((c) => c.args.parent_id === 7);
+  expect(posts.every((c) => c.tool === "board_post" && c.args.board === "sim-tasks")).toBe(true);
+  expect(bus.replies(7)[0]).toStartWith('[factory] taken: fleet "sim" runs as fake agent `researcher`, starting now.');
+  expect(bus.replies(7)[1]).toBe("[factory] done: fake agent `researcher`\n\nresult for 7");
+  bus.deliver(task(7));                     // a redelivery
+  bus.deliver(task(8, { parentId: 7 }));    // chatter in the thread
+  bus.deliver(task(9, { reason: "mention" })); // a direct @mention is a task too
+  await until(() => bus.replies(9).length === 2, 5000, "the mention runs");
+  expect(runner.runs).toEqual([{ agent: "researcher", id: 7 }, { agent: "researcher", id: 9 }]);
+  expect(bus.replies(7)).toHaveLength(2);
+  await bus.close();
+  await done;
+});
+
+test("fleets: a task whose agent is missing passes its claim to the next lane; a mention, which has no claim, is declined", async () => {
+  const { bus, runner, done } = loop({ fleets: [{ name: "sim", agent: "builder" }] });
+  bus.deliver(task(11));
+  bus.deliver(task(12, { reason: "mention" }));
+  await until(() => bus.replies(12).length === 1, 5000, "decline");
+  await until(() => bus.sent.some((c) => c.tool === "claim_release"), 5000, "release");
+  expect(bus.sent.find((c) => c.tool === "claim_release")!.args).toEqual({ key: "queue:sim-tasks:11", note: expect.stringContaining("`builder` isn't in the fake roster") });
+  expect(bus.replies(11)).toEqual([]);
+  expect(bus.replies(12)[0]).toStartWith('[factory] declined: fleet "sim"\'s agent `builder` isn\'t in the fake roster');
+  expect(runner.runs).toEqual([]);
+  await bus.close();
+  await done;
+});
+
+test("local bus: a fleet task posted on the queue board is run by the factory lane and answered in its thread; the reply acks the claim", async () => {
+  const fe = await localSession(dir, "fe");
+  const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
+  const runner = new FakeRunner();
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const done = f.run();
+  await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
+  const p = await call(fe.c, "board_post", { board: "sim-tasks", body: "summarize the spec" });
+  const thread = () => fe.pushes.filter((x) => x.meta.parent_id === String(p.post_id)).map((x) => x.content);
+  await until(() => thread().length === 2, 15_000, "taken and done in fe's thread");
+  expect(thread()[0]).toStartWith('[factory] taken: fleet "sim"');
+  expect(thread()[1]).toBe(`[factory] done: fake agent \`researcher\`\n\nresult for ${p.post_id}`);
+  expect(runner.runs).toEqual([{ agent: "researcher", id: p.post_id }]);
+  expect(await call(fe.c, "claim_list", { prefix: "queue:" })).toEqual([]);
+  await bus.close();
+  expect(await done).toBe("closed");
+}, 30_000);
+
+test("local bus: a factory without the fleet's agent passes the task to another lane", async () => {
+  const fe = await localSession(dir, "fe"), be = await localSession(dir, "be");
+  const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
+  const runner = new FakeRunner();
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { fleets: [{ name: "sim", agent: "builder" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const done = f.run();
+  await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
+  // The rotation offers never-woken lanes first, by handle: the first post
+  // goes to be, the second to the factory, which passes it on to be. Had the
+  // factory kept it, its claim would name the factory.
+  await call(be.c, "board_subscribe", { board: "sim-tasks", mode: "push" });
+  const first = await call(fe.c, "board_post", { board: "sim-tasks", body: "one" });
+  const second = await call(fe.c, "board_post", { board: "sim-tasks", body: "two" });
+  const got = (id: number) => be.pushes.some((x) => x.meta.post_id === String(id));
+  await until(() => got(first.post_id) && got(second.post_id), 15_000, "both tasks reach be: one by rotation, one passed on by the factory");
+  expect(runner.runs).toEqual([]);
+  const claims = (await call(be.c, "claim_list", { prefix: "queue:" })) as { key: string; holder: string }[];
+  expect(claims.map((c) => [c.key, c.holder]).sort()).toEqual([[`queue:sim-tasks:${first.post_id}`, "be"], [`queue:sim-tasks:${second.post_id}`, "be"]]);
+  await bus.close();
+  expect(await done).toBe("closed");
 }, 30_000);
 
 // ── the Claude runner against pinned Claude Code ─────────────────────────────

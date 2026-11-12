@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { LocalBus, sessionFree } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
-import { Factory } from "./factory.ts";
+import { Factory, type Fleet } from "./factory.ts";
 import { Store } from "./store.ts";
 
 export const VERSION = "0.1.0";
@@ -21,6 +21,7 @@ export type Config = {
   cwd: string;             // the children's working directory
   tools?: string[];        // the tools a child has (--tools); absent, Claude Code's restricted default: no shell, no WebFetch
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
+  fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent it runs
   maxConcurrent: number;
   timeoutMs: number;
   retentionMs: number;
@@ -51,6 +52,16 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${path}: "${k}" must be a positive integer`);
     return v;
   };
+  const fleets = raw.fleets ?? [];
+  if (!Array.isArray(fleets)) throw new Error(`${path}: "fleets" must be an array of {name, agent}`);
+  const seen = new Set<string>();
+  for (const f of fleets as Record<string, unknown>[]) {
+    // The board name `<name>-tasks` must fit a board name: [a-z0-9_-], max 32.
+    if (typeof f !== "object" || f === null || typeof f.name !== "string" || !/^[a-z0-9_-]{1,26}$/.test(f.name)) throw new Error(`${path}: each fleet's "name" must be 1-26 characters of a-z 0-9 _ -`);
+    if (typeof f.agent !== "string" || !f.agent.trim()) throw new Error(`${path}: fleet ${f.name}: "agent" must be a non-empty string`);
+    if (seen.has(f.name)) throw new Error(`${path}: fleet ${f.name} is listed twice`);
+    seen.add(f.name);
+  }
   const gb = env.FACTORY_GRAYBOARD?.trim() ? env.FACTORY_GRAYBOARD.trim().split(/\s+/) : strs("grayboard", ["grayboard"]);
   if (gb.length === 0) throw new Error(`${path}: "grayboard" must not be empty`);
   return {
@@ -60,6 +71,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     cwd: resolve(str("cwd", env.HOME ?? homedir())),
     ...(raw.tools !== undefined ? { tools: strs("tools", []) } : {}),
     allowedTools: strs("allowedTools", DEFAULTS.allowedTools),
+    fleets: (fleets as Record<string, string>[]).map((f) => ({ name: f.name!, agent: f.agent!.trim() })),
     maxConcurrent: pos("maxConcurrent", DEFAULTS.maxConcurrent),
     timeoutMs: pos("timeoutMs", DEFAULTS.timeoutMs),
     retentionMs: pos("retentionMs", DEFAULTS.retentionMs),
@@ -81,7 +93,7 @@ export async function main(env: Record<string, string | undefined> = process.env
     return 1;
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
-  const factory = new Factory(bus, store, runner, { maxConcurrent: cfg.maxConcurrent, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
+  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, maxConcurrent: cfg.maxConcurrent, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
   let signalled = false;
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);

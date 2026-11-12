@@ -1,13 +1,21 @@
-// The run loop (docs/factory.md §4–§6), harness-neutral: take a
-// delegation that passes the authority check, record it before anything
-// else, answer in its thread at once, run it on a free slot, and reply with
-// the outcome. Every reply goes to the request's sender, in its thread.
+// The run loop (docs/factory.md §4–§7), harness-neutral: take a
+// delegation that passes the authority check, or a task posted on a fleet's
+// queue board, record it before anything else, answer in its thread at
+// once, run it on a free slot, and reply with the outcome. Every reply goes
+// where the request came from, in its thread.
 import type { Delivery, FactoryBus } from "./bus.ts";
 import { oneLine, requestOf, type Request } from "./delegate.ts";
-import { resolvePersona, type Runner } from "./runner.ts";
+import { resolvePersona, type Agent, type Runner } from "./runner.ts";
 import type { Row, Store } from "./store.ts";
 
+// A fleet (docs/factory.md §7): a queue board `<name>-tasks` the factory is
+// a lane on, and the agent it runs each task with. The agent is the
+// operator's choice, never the post's.
+export type Fleet = { name: string; agent: string };
+export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
+
 export type FactoryOptions = {
+  fleets?: Fleet[];
   maxConcurrent: number;
   timeoutMs: number;
   retentionMs: number;
@@ -23,6 +31,7 @@ export class Factory {
   private stopping = false;
   private readonly children = new Set<AbortController>();
   private timer: ReturnType<typeof setInterval> | undefined;
+  private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
 
   constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {}
 
@@ -31,6 +40,7 @@ export class Factory {
     for (const r of this.store.interrupted(() => `[factory] interrupted: the factory stopped while this ran; nothing is running for it now. Re-delegate it if it's still wanted.`)) {
       this.o.log(`request ${r.id} was running when the factory last stopped; reporting it interrupted`);
     }
+    await this.syncFleets();
     await this.housekeeping();
     this.timer = setInterval(() => void this.housekeeping(), this.o.housekeepingMs ?? 3_600_000);
     this.pump();
@@ -48,6 +58,7 @@ export class Factory {
   }
 
   async take(d: Delivery): Promise<void> {
+    if (d.kind === "board") return this.takePost(d);
     const v = requestOf(d);
     if (!v) return;
     if ("ignored" in v) { this.o.log(`ignored: ${v.ignored}`); return; }
@@ -57,12 +68,81 @@ export class Factory {
       if (this.store.admitFinished(r, this.declineBody(r))) await this.send(this.store.get(r)!);
       return;
     }
-    if (!this.store.admit(r, agent.name)) { this.o.log(`request ${r.id} already taken; redelivery ignored`); return; }
+    await this.admit(r, agent, `persona "${oneLine(r.persona)}"`);
+  }
+
+  // A fleet task: a top-level post on a fleet's board, delivered by the queue
+  // rotation (reason "subscription", this lane holds its claim) or by an
+  // @mention (no claim). Replies in a task's thread are its conversation,
+  // not tasks. The poster is the requester: on a local bus every handle is
+  // the same OS user, as with a delegation.
+  private async takePost(d: Extract<Delivery, { kind: "board" }>): Promise<void> {
+    if (d.parentId !== undefined || d.postId === undefined || !d.from) return;
+    const key = `queue:${d.board}:${d.postId}`;
+    const fleet = this.joined.get(d.board);
+    if (!fleet) {
+      // Not ours (a subscription the sync hasn't dropped yet): pass any claim on.
+      if (d.reason === "subscription") await this.release(key, "not a factory fleet board");
+      return;
+    }
+    const r: Request = { source: "board", board: d.board, id: d.postId, requester: d.from, persona: fleet.name, task: d.body };
+    const agent = this.runner.roster().find((a) => a.name === fleet.agent);
+    if (!agent) {
+      const why = `fleet "${fleet.name}"'s agent \`${fleet.agent}\` isn't in the ${this.runner.harness} roster (${this.runner.rosterSource})`;
+      // A claim passes to the next lane, which may run it; a mention has no
+      // claim, so its poster hears why.
+      if (d.reason === "subscription") { this.o.log(`post ${d.postId}: ${why}; passing it on`); await this.release(key, `factory: ${why}`); return; }
+      if (this.store.admitFinished(r, `[factory] declined: ${why}. Nothing was spawned.`)) await this.send(this.store.get(r)!);
+      return;
+    }
+    await this.admit(r, agent, `fleet "${fleet.name}"`);
+  }
+
+  private async admit(r: Request, agent: Agent, label: string): Promise<void> {
+    if (!this.store.admit(r, agent.name)) { this.o.log(`${r.source} ${r.id} already taken; redelivery ignored`); return; }
     const where = this.running < this.o.maxConcurrent ? "starting now" : `queued, ${this.store.queuedAhead(r)} ahead`;
-    // §13's launcher contract: say it was taken before the work starts. Not
-    // stored: a lost acknowledgement costs nothing the outcome won't say.
-    await this.reply(r, `[factory] taken: persona "${oneLine(r.persona)}" runs as ${this.runner.harness} agent \`${agent.name}\`, ${where}. The outcome follows in this thread.`).catch((e) => this.o.log(`couldn't acknowledge request ${r.id}: ${msg(e)}`));
+    // §13's launcher contract: say it was taken before the work starts. On a
+    // queue board this reply also acks the claim, so the rotation never
+    // redelivers a task that's running. Not stored: a lost acknowledgement
+    // costs nothing the outcome won't say.
+    await this.reply(r, `[factory] taken: ${label} runs as ${this.runner.harness} agent \`${agent.name}\`, ${where}. The outcome follows in this thread.`).catch((e) => this.o.log(`couldn't acknowledge ${r.source} ${r.id}: ${msg(e)}`));
     this.pump();
+  }
+
+  private async release(key: string, note: string): Promise<void> {
+    await this.bus.call("claim_release", { key, note }).catch((e) => this.o.log(`couldn't release ${key}: ${msg(e)}`));
+  }
+
+  private fleets(): Fleet[] {
+    return this.o.fleets ?? [];
+  }
+
+  // Makes the factory a lane on exactly its fleets' boards: creates a
+  // missing board as a queue, subscribes to an existing one, and refuses a
+  // fleet whose board exists as a broadcast board (every post there would
+  // read as a task). Any other queue board it's a lane on is dropped: a lane
+  // that ignores its deliveries holds each claim for the full TTL.
+  async syncFleets(): Promise<void> {
+    const listed = await this.bus.call("board_list");
+    const boards = new Map((Array.isArray(listed) ? listed : []).map((b: { name: string; kind?: string; mode?: string | null }) => [b.name, b]));
+    this.joined.clear();
+    for (const f of this.fleets()) {
+      const name = fleetBoard(f), b = boards.get(name);
+      try {
+        if (!b) await this.bus.call("board_create", { name, purpose: `Tasks for the ${f.name} fleet: each top-level post is one task, run by one lane; replies come in its thread.`, kind: "queue" });
+        else if ((b.kind ?? "broadcast") !== "queue") { this.o.log(`fleet ${f.name}: #${name} exists as a ${b.kind ?? "broadcast"} board, not a queue; skipping it`); continue; }
+        else if (b.mode !== "push") await this.bus.call("board_subscribe", { board: name, mode: "push" });
+        this.joined.set(name, f);
+      } catch (e) {
+        this.o.log(`fleet ${f.name}: couldn't join #${name}: ${msg(e)}`);
+      }
+    }
+    for (const b of boards.values()) {
+      if (b.kind === "queue" && b.mode === "push" && !this.joined.has(b.name)) {
+        await this.bus.call("board_subscribe", { board: b.name, mode: "off" }).catch((e) => this.o.log(`couldn't leave #${b.name}: ${msg(e)}`));
+        this.o.log(`left #${b.name}: no fleet in the config uses it`);
+      }
+    }
   }
 
   private pump(): void {
