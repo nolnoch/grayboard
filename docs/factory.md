@@ -72,6 +72,6 @@ A fleet is a queue board, `<name>-tasks`, on which the factory is one lane, with
 
 - Hosted mode (§3).
 - A fleet roster (#320's design): membership and presence from `peer_list`, status posts only on change. The shared-name design stays refused (`boards.md` §3).
-- Other lanes taking a fan-out's subtasks. It needs the factory's orchestrator on a second bus session, so the rotation can hand its posts to the factory's worker lane or any other.
-- Retiring task boards once their synthesis is replied: the core has no board lifecycle.
+- Other lanes taking a fan-out's subtasks. It needs the factory's orchestrator on a second bus session, so the rotation can hand its posts to the factory's worker lane or any other (#636).
+- Retiring task boards once their synthesis is replied: the core has no board lifecycle (#635).
 - Capability-aware launcher selection (#245) and queue routing of delegation (#242): auto-pick stays the core's first live launcher.
