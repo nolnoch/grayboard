@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: the opt-in factory module (orchestration outside the core): boundary, how it reaches the bus, request authority, headless spawn, its store
-invariants: the module imports nothing in the repo beyond itself and adapters/hosted-core/src/client.ts, and nothing in src/ or adapters/hosted-core/src/ imports it; it reaches the bus only through grayboard's public surface (a `grayboard mcp` child and the MCP tools); it acts on a delegation only when the channel sender is the payload's requester; one request key (source, id) spawns at most once, across restarts; a run cut by a crash is reported interrupted, never re-run; children never share its push channel, inherit no harness session, and read none of the operator's settings, hooks or MCP servers; its store keeps its own retention and never writes to boards; it is a queue lane only on its configured fleets' boards, and a fleet task's agent comes from the config, never the post
+invariants: the module imports nothing in the repo beyond itself and adapters/hosted-core/src/client.ts, and nothing in src/ or adapters/hosted-core/src/ imports it; it reaches the bus only through grayboard's public surface (a `grayboard mcp` child and the MCP tools); it acts on a delegation only when the channel sender is the payload's requester; one request key (source, id) spawns at most once, across restarts; a run cut by a crash is reported interrupted, never re-run; children never share its push channel, inherit no harness session, and read none of the operator's settings, hooks or MCP servers; its store keeps its own retention and never writes to boards; it is a queue lane only on its configured fleets' boards, and a fleet task's agent comes from the config, never the post; a fan-out's plan is parsed by the module's code, its board is broadcast, and a subtask never fans out again
 code-pointers: adapters/factory/, scripts/check_factory_isolation.ts, src/core/delegation.ts (the payload it parses), tests/integration/factory.test.ts
 companions: boards.md (principle 7, §3, §9, §13), architecture.md §Hosted MCP, guide/local.md (running it)
 ```
@@ -49,7 +49,7 @@ A request's key is its source and id: the bus message id for a DM, the post id f
 
 ## 6. The store
 
-SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's key, reply route and state and, once finished, the reply text until it's sent. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had), and unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the key must outlive any replay of its message.
+SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's key, reply route and state and, once finished, the reply text until it's sent. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had), and so does a fanned-out request waiting on its subtasks, with its subtasks still queued (§7); unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the key must outlive any replay of its message.
 
 ## 7. Fleets
 
@@ -61,9 +61,17 @@ A fleet is a queue board, `<name>-tasks`, on which the factory is one lane, with
 - **No agent:** a task from the rotation is passed on with `claim_release`, which offers it to the next lane; an @mention holds no claim, so its poster gets `[factory] declined: …`.
 - Replies go in the post's thread with `board_post`, so they wake the poster and the thread's participants.
 
+**Fan-out.** The model judges; the module's code orchestrates. A fleet task's run gets one more instruction: when the task splits into 2 to `maxSubtasks` (default 5) independent parts better run in parallel, reply with only a plan, a four-backtick block with the info string `factory-plan` holding `{"subtasks": [{"title", "task"}]}`; otherwise do the task. Most tasks are done in that one run, so a simple task costs one run and no board. A fleet with `"fanout": false` never gets the instruction.
+
+- **A plan** (`parsePlan`, `adapters/factory/fanout.ts`) opens a broadcast board `task-<post id>` and posts each subtask there, then says so in the task's thread. The board is the durable, visible record: anyone may read, subscribe or comment. It isn't a queue: the core never hands a poster its own post (`queueLanes`, #284), so a queue the factory posts on could never reach the factory. Each subtask runs here, on the worker pool, as the fleet's agent with no fan-out instruction (a subtask never fans out again), and its outcome goes in its thread.
+- **Synthesis:** once every subtask has an outcome, done or failed, the fleet's agent runs once more on the original task with each outcome (16 KiB each at most), and its answer goes in the original thread.
+- **An unusable plan** (bad JSON, a count outside 2 to `maxSubtasks`, an empty field) fails the task with the reason; nothing is posted. The store admits the subtasks and marks the task waiting in one transaction, after every post landed, so a crash leaves both or neither.
+- Task boards stay: the core has no board archive or delete.
+
 ## 8. Not built
 
 - Hosted mode (§3).
 - A fleet roster (#320's design): membership and presence from `peer_list`, status posts only on change. The shared-name design stays refused (`boards.md` §3).
-- Fan-out: a fleet agent's run returning a plan that the factory posts as subtasks on an ephemeral board, then synthesizes.
+- Other lanes taking a fan-out's subtasks. It needs the factory's orchestrator on a second bus session, so the rotation can hand its posts to the factory's worker lane or any other.
+- Retiring task boards once their synthesis is replied: the core has no board lifecycle.
 - Capability-aware launcher selection (#245) and queue routing of delegation (#242): auto-pick stays the core's first live launcher.

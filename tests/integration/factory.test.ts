@@ -10,6 +10,7 @@ import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } fro
 import { ClaudeRunner } from "../../adapters/factory/claude/runner.ts";
 import { parseDelegation, requestOf, type Request } from "../../adapters/factory/delegate.ts";
 import { Factory, type Fleet } from "../../adapters/factory/factory.ts";
+import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
 import { DEFAULTS, loadConfig } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Runner } from "../../adapters/factory/runner.ts";
 import { Store } from "../../adapters/factory/store.ts";
@@ -173,7 +174,10 @@ test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", 
   expect(loadConfig(dir, {}).tools).toBeUndefined();
   writeFileSync(join(dir, "config.json"), JSON.stringify({ tools: ["Bash", "Read"] }));
   expect(loadConfig(dir, {}).tools).toEqual(["Bash", "Read"]);
-  for (const bad of [{ tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, [1]]) {
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ maxSubtasks: 3, fleets: [{ name: "a", agent: "x" }, { name: "b", agent: "y", fanout: false }] }));
+  expect(loadConfig(dir, {})).toMatchObject({ maxSubtasks: 3, fleets: [{ name: "a", agent: "x" }, { name: "b", agent: "y", fanout: false }] });
+  expect(loadConfig(dir, {}).fleets[0]).not.toHaveProperty("fanout");
+  for (const bad of [{ maxSubtasks: 1 }, { fleets: [{ name: "a", agent: "x", fanout: "yes" }] }, { tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, [1]]) {
     writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
     expect(() => loadConfig(dir, {})).toThrow();
   }
@@ -191,6 +195,7 @@ class FakeBus implements FactoryBus {
   sent: { tool: string; args: Record<string, unknown> }[] = [];
   fail = false;
   boards: { name: string; kind: string; mode: string | null }[] = [];
+  private nextPost = 1000;
   private q: Delivery[] = [];
   private wake: (() => void) | null = null;
   private done = false;
@@ -200,6 +205,7 @@ class FakeBus implements FactoryBus {
   async call(tool: string, args: Record<string, unknown> = {}) {
     if (this.fail) throw new Error("bus down");
     this.sent.push({ tool, args });
+    if (tool === "board_post") return { post_id: this.nextPost++ };
     return tool === "board_list" ? this.boards : { ok: true };
   }
   async *deliveries() {
@@ -218,12 +224,16 @@ class FakeRunner implements Runner {
   readonly harness = "fake";
   readonly rosterSource = "/fake/agents";
   runs: { agent: string; id: number }[] = [];
+  inputs: string[] = []; // each run's task text, in run order
   gates = new Map<number, PromiseWithResolvers<Outcome>>();
+  // A run's text when it returns one (a plan, say); otherwise `result for <id>`.
+  script: (r: Request) => string | undefined = () => undefined;
   constructor(public names = ["researcher"], private readonly hold = false) {}
   roster() { return agents(...this.names); }
   run(agent: Agent, r: Request, signal: AbortSignal): Promise<Outcome> {
     this.runs.push({ agent: agent.name, id: r.id });
-    if (!this.hold) return Promise.resolve({ ok: true, text: `result for ${r.id}` });
+    this.inputs.push(r.task);
+    if (!this.hold) return Promise.resolve({ ok: true, text: this.script(r) ?? `result for ${r.id}` });
     const g = Promise.withResolvers<Outcome>();
     this.gates.set(r.id, g);
     signal.addEventListener("abort", () => g.resolve({ ok: false, error: "aborted" }));
@@ -453,6 +463,125 @@ test("local bus: a factory without the fleet's agent passes the task to another 
   expect(runner.runs).toEqual([]);
   const claims = (await call(be.c, "claim_list", { prefix: "queue:" })) as { key: string; holder: string }[];
   expect(claims.map((c) => [c.key, c.holder]).sort()).toEqual([[`queue:sim-tasks:${first.post_id}`, "be"], [`queue:sim-tasks:${second.post_id}`, "be"]]);
+  await bus.close();
+  expect(await done).toBe("closed");
+}, 30_000);
+
+// ── fan-out: a fleet task's run returns a plan ──────────────────────────────
+
+const PLAN = (n = 2, extra = "") => `Plan:\n\n\`\`\`\`factory-plan\n${JSON.stringify({ subtasks: Array.from({ length: n }, (_, i) => ({ title: `part ${i + 1}`, task: `do part ${i + 1}` })) })}\n\`\`\`\`${extra}`;
+
+test("fan-out: the plan parser finds a plan, refuses unusable ones, and reads a plain result as no plan", () => {
+  expect(parsePlan("just the answer", 5)).toBeNull();
+  expect(parsePlan("inline ````factory-plan\n{}\n````", 5)).toBeNull(); // a fence starts a line
+  expect(parsePlan(PLAN(), 5)).toEqual({ subtasks: [{ title: "part 1", task: "do part 1" }, { title: "part 2", task: "do part 2" }] });
+  expect(parsePlan(PLAN(2).replace(/^Plan:\n\n/, ""), 5)).not.toBeNull(); // a plan at the very start
+  expect(parsePlan(PLAN(1), 5)).toContain("needs 2 to 5");
+  expect(parsePlan(PLAN(6), 5)).toContain("needs 2 to 5");
+  expect(parsePlan("````factory-plan\n{not json\n````", 5)).toBe("the plan isn't valid JSON");
+  expect(parsePlan("````factory-plan\n{}\n", 5)).toBe("the plan block isn't closed");
+  expect(parsePlan('````factory-plan\n{"subtasks":[{"title":"a","task":""},{"title":"b","task":"x"}]}\n````', 5)).toContain("subtask 1 needs");
+  expect(parsePlan('````factory-plan\n{"subtasks":[{"title":"a\\nb","task":"```code```"},{"title":"c","task":"x"}]}\n````', 5)).toEqual({ subtasks: [{ title: "a b", task: "```code```" }, { title: "c", task: "x" }] });
+  expect(triageInstruction(4)).toContain("2 to 4 independent parts");
+  const big = synthesisPrompt("the task", [{ title: "a", reply: "x".repeat(20_000) }, { title: "b", reply: null }]);
+  expect(big).toStartWith("the task\n");
+  expect(big).toContain("(result truncated at 16384 characters)");
+  expect(big).toContain("### 2. b\n\n(no outcome)");
+});
+
+test("store: a fan-out waits on its subtasks, synthesizes once they finish, and a restart interrupts the lot", () => {
+  const path = join(dir, "f.db");
+  let s = new Store(path);
+  const parent: Request = { id: 7, source: "board", board: "sim-tasks", requester: "fe", persona: "sim", task: "big" };
+  const sub = (id: number): { r: Request; title: string } => ({ r: { id, source: "board", board: "task-7", requester: "fe", persona: "sim", task: `part ${id}` }, title: `t${id}` });
+  s.admit(parent, "researcher", { fanout: true });
+  const row = s.next()!;
+  expect(row).toMatchObject({ fanout: true, phase: "run", parent: null });
+  s.fanOut(row, "task-7", [sub(100), sub(101)]);
+  expect(s.get({ source: "board", id: 7 })).toMatchObject({ state: "waiting", fanoutBoard: "task-7" });
+  expect(s.subtasks(row.seq).map((r) => [r.id, r.title, r.fanout, r.agent])).toEqual([[100, "t100", false, "researcher"], [101, "t101", false, "researcher"]]);
+  const a = s.next()!;
+  s.finish(a, "done 100");
+  expect(s.synthesizeWhenDone(row.seq)).toBe(false);
+  s.close();
+  s = new Store(path); // a crash with one subtask finished, one queued
+  expect(s.interrupted(() => "interrupted").map((r) => r.id)).toEqual([7, 101]);
+  expect(s.next()).toBeNull();
+  s.close();
+
+  s = new Store(":memory:");
+  s.admit(parent, "researcher", { fanout: true });
+  const p2 = s.next()!;
+  s.fanOut(p2, "task-7", [sub(100), sub(101)]);
+  for (const r of [s.next()!, s.next()!]) s.finish(r, `done ${r.id}`);
+  expect(s.synthesizeWhenDone(p2.seq)).toBe(true);
+  expect(s.synthesizeWhenDone(p2.seq)).toBe(false); // once
+  expect(s.next()).toMatchObject({ id: 7, phase: "synthesize", state: "running" });
+  s.close();
+});
+
+test("fan-out: a plan opens a task board, runs each subtask once with its outcome in its thread, then synthesizes into the original thread", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const { bus, done } = loop({ runner, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, done");
+  const [taken, fanned, out] = bus.replies(7);
+  expect(taken).toStartWith("[factory] taken:");
+  expect(fanned).toBe("[factory] fanned out: 2 subtasks on #task-7, each run as `researcher` with its outcome in its thread. The combined result follows in this thread.");
+  expect(out).toBe("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-7\n\nresult for 7");
+  const created = bus.sent.find((c) => c.tool === "board_create" && c.args.name === "task-7")!;
+  expect(created.args.kind).toBeUndefined(); // broadcast: a record, not a queue
+  expect(bus.sent.find((c) => c.tool === "board_subscribe" && c.args.board === "task-7")!.args.mode).toBe("off");
+  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "task-7" && c.args.parent_id === undefined).map((c) => c.args.body);
+  expect(subPosts).toEqual(["[factory] subtask 1/2: part 1\n\ndo part 1", "[factory] subtask 2/2: part 2\n\ndo part 2"]);
+  const [, s1, s2] = runner.runs.map((r) => r.id); // the subtasks' post ids (the fake bus numbers every post)
+  expect(bus.replies(s1!)).toEqual([`[factory] done: fake agent \`researcher\`\n\nresult for ${s1}`]);
+  expect(bus.replies(s2!)).toEqual([`[factory] done: fake agent \`researcher\`\n\nresult for ${s2}`]);
+  expect(runner.runs.map((r) => r.id)).toEqual([7, s1, s2, 7]);
+  expect(runner.inputs[0]).toContain("## Before you start");          // the task's run may plan
+  expect(runner.inputs[1]).toBe("do part 1");                          // a subtask's run may not
+  expect(runner.inputs[3]).toContain(`### 1. part 1\n\n[factory] done: fake agent \`researcher\`\n\nresult for ${s1}`);
+  expect(runner.inputs[3]).not.toContain("## Before you start");
+  bus.deliver(task(7)); // a redelivery spawns nothing
+  await bus.close();
+  await done;
+  expect(runner.runs).toHaveLength(4);
+});
+
+test("fan-out: an unusable plan fails the task; a fleet with fanout off never gets the instruction", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 ? PLAN(9) : r.id === 8 ? PLAN() : undefined);
+  const { bus, done } = loop({ runner, fleets: [{ name: "sim", agent: "researcher" }, { name: "solo", agent: "researcher", fanout: false }] });
+  bus.deliver(task(7));
+  bus.deliver(task(8, { board: "solo-tasks" }));
+  await until(() => bus.replies(7).length === 2 && bus.replies(8).length === 2, 5000, "both outcomes");
+  expect(bus.replies(7)[1]).toBe("[factory] failed: fake agent `researcher` returned a plan the factory can't use: the plan has 9 subtasks; it needs 2 to 5. Nothing was fanned out.");
+  expect(bus.replies(8)[1]).toStartWith("[factory] done: fake agent `researcher`\n\nPlan:"); // just text, without fan-out
+  expect(runner.inputs[1]).toBe("do 8");
+  expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).startsWith("task-"))).toBe(false);
+  await bus.close();
+  await done;
+});
+
+test("local bus: a fan-out's subtasks and outcomes are posts on a task board other sessions can read", async () => {
+  const fe = await localSession(dir, "fe");
+  const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
+  const runner = new FakeRunner();
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 2, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const done = f.run();
+  await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
+  const p = await call(fe.c, "board_post", { board: "sim-tasks", body: "summarize three specs" });
+  runner.script = (r) => (r.id === p.post_id && !r.task.includes("## Subtask results") ? PLAN(3) : undefined);
+  const thread = () => fe.pushes.filter((x) => x.meta.parent_id === String(p.post_id)).map((x) => x.content);
+  await until(() => thread().length === 3, 15_000, "taken, fanned out and done in fe's thread");
+  expect(thread()[1]).toContain(`3 subtasks on #task-${p.post_id}`);
+  expect(thread()[2]).toStartWith(`[factory] done: fake agent \`researcher\`, combining 3 subtasks on #task-${p.post_id}`);
+  const posts = (await call(fe.c, "board_read", { board: `task-${p.post_id}` })) as { posts?: { body: string; parent_id: number | null }[] } | { body: string; parent_id: number | null }[];
+  const list = Array.isArray(posts) ? posts : posts.posts ?? [];
+  expect(list.filter((x) => x.parent_id === null).map((x) => x.body.split("\n")[0])).toEqual(["[factory] subtask 1/3: part 1", "[factory] subtask 2/3: part 2", "[factory] subtask 3/3: part 3"]);
+  expect(list.filter((x) => x.parent_id !== null && x.body.startsWith("[factory] done:"))).toHaveLength(3);
+  expect(runner.runs).toHaveLength(5);
   await bus.close();
   expect(await done).toBe("closed");
 }, 30_000);

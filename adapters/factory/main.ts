@@ -23,12 +23,13 @@ export type Config = {
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
   fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent it runs
   maxConcurrent: number;
+  maxSubtasks: number;     // the most subtasks a fleet task's plan may fan out to
   timeoutMs: number;
   retentionMs: number;
 };
 
 const DAY = 86_400_000;
-export const DEFAULTS = { identity: "factory", claude: "claude", allowedTools: [] as string[], maxConcurrent: 2, timeoutMs: 30 * 60_000, retentionMs: 30 * DAY };
+export const DEFAULTS = { identity: "factory", claude: "claude", allowedTools: [] as string[], maxConcurrent: 2, maxSubtasks: 5, timeoutMs: 30 * 60_000, retentionMs: 30 * DAY };
 
 // The config file's fields over the defaults; FACTORY_GRAYBOARD (a command
 // line, split on spaces) over the file's `grayboard`. A field of the wrong
@@ -52,6 +53,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${path}: "${k}" must be a positive integer`);
     return v;
   };
+  const atLeast2 = (n: number) => { if (n < 2) throw new Error(`${path}: "maxSubtasks" must be at least 2`); return n; };
   const fleets = raw.fleets ?? [];
   if (!Array.isArray(fleets)) throw new Error(`${path}: "fleets" must be an array of {name, agent}`);
   const seen = new Set<string>();
@@ -59,6 +61,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     // The board name `<name>-tasks` must fit a board name: [a-z0-9_-], max 32.
     if (typeof f !== "object" || f === null || typeof f.name !== "string" || !/^[a-z0-9_-]{1,26}$/.test(f.name)) throw new Error(`${path}: each fleet's "name" must be 1-26 characters of a-z 0-9 _ -`);
     if (typeof f.agent !== "string" || !f.agent.trim()) throw new Error(`${path}: fleet ${f.name}: "agent" must be a non-empty string`);
+    if (f.fanout !== undefined && typeof f.fanout !== "boolean") throw new Error(`${path}: fleet ${f.name}: "fanout" must be true or false`);
     if (seen.has(f.name)) throw new Error(`${path}: fleet ${f.name} is listed twice`);
     seen.add(f.name);
   }
@@ -71,8 +74,9 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     cwd: resolve(str("cwd", env.HOME ?? homedir())),
     ...(raw.tools !== undefined ? { tools: strs("tools", []) } : {}),
     allowedTools: strs("allowedTools", DEFAULTS.allowedTools),
-    fleets: (fleets as Record<string, string>[]).map((f) => ({ name: f.name!, agent: f.agent!.trim() })),
+    fleets: (fleets as { name: string; agent: string; fanout?: boolean }[]).map((f) => ({ name: f.name, agent: f.agent.trim(), ...(f.fanout === false ? { fanout: false } : {}) })),
     maxConcurrent: pos("maxConcurrent", DEFAULTS.maxConcurrent),
+    maxSubtasks: atLeast2(pos("maxSubtasks", DEFAULTS.maxSubtasks)),
     timeoutMs: pos("timeoutMs", DEFAULTS.timeoutMs),
     retentionMs: pos("retentionMs", DEFAULTS.retentionMs),
   };
@@ -93,7 +97,7 @@ export async function main(env: Record<string, string | undefined> = process.env
     return 1;
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
-  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, maxConcurrent: cfg.maxConcurrent, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
+  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
   let signalled = false;
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);
