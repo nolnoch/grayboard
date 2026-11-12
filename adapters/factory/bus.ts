@@ -12,7 +12,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 // wire form). A DM carries message_id; a board item carries board.
 export type Delivery =
   | { kind: "dm"; id: number; from: string; parentId?: number; body: string }
-  | { kind: "board"; board: string; postId?: number; from?: string; body: string };
+  | { kind: "board"; board: string; postId?: number; parentId?: number; from?: string; reason?: string; body: string };
 
 export interface FactoryBus {
   // The handle this session holds and writes as.
@@ -44,7 +44,10 @@ export function toDelivery(params: unknown): Delivery | null {
     return v !== undefined && /^\d+$/.test(v) ? Number(v) : undefined;
   };
   const board = str("board");
-  if (board !== undefined) return { kind: "board", board, ...(int("post_id") !== undefined ? { postId: int("post_id") } : {}), ...(str("from") ? { from: str("from") } : {}), body: p.content };
+  if (board !== undefined) {
+    const postId = int("post_id"), parentId = int("parent_id"), from = str("from"), reason = str("reason");
+    return { kind: "board", board, ...(postId !== undefined ? { postId } : {}), ...(parentId !== undefined ? { parentId } : {}), ...(from ? { from } : {}), ...(reason ? { reason } : {}), body: p.content };
+  }
   const id = int("message_id");
   const from = str("from");
   if (id === undefined || !from) return null;

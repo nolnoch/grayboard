@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: the opt-in factory module (orchestration outside the core): boundary, how it reaches the bus, request authority, headless spawn, its store
-invariants: the module imports nothing in the repo beyond itself and adapters/hosted-core/src/client.ts, and nothing in src/ or adapters/hosted-core/src/ imports it; it reaches the bus only through grayboard's public surface (a `grayboard mcp` child and the MCP tools); it acts on a delegation only when the channel sender is the payload's requester; one request key (source, id) spawns at most once, across restarts; a run cut by a crash is reported interrupted, never re-run; children never share its push channel, inherit no harness session, and read none of the operator's settings, hooks or MCP servers; its store keeps its own retention and never writes to boards
+invariants: the module imports nothing in the repo beyond itself and adapters/hosted-core/src/client.ts, and nothing in src/ or adapters/hosted-core/src/ imports it; it reaches the bus only through grayboard's public surface (a `grayboard mcp` child and the MCP tools); it acts on a delegation only when the channel sender is the payload's requester; one request key (source, id) spawns at most once, across restarts; a run cut by a crash is reported interrupted, never re-run; children never share its push channel, inherit no harness session, and read none of the operator's settings, hooks or MCP servers; its store keeps its own retention and never writes to boards; it is a queue lane only on its configured fleets' boards, and a fleet task's agent comes from the config, never the post
 code-pointers: adapters/factory/, scripts/check_factory_isolation.ts, src/core/delegation.ts (the payload it parses), tests/integration/factory.test.ts, tests/e2e/factory_claude.e2e.ts (e2e `claude-local`)
 companions: boards.md (principle 7, §3, §9, §13), architecture.md §Hosted MCP, guide/local.md (running it)
 ```
@@ -51,8 +51,19 @@ A request's key is its source and id: the bus message id for a DM, the post id f
 
 SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's key, reply route and state and, once finished, the reply text until it's sent. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had), and unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the key must outlive any replay of its message.
 
-## 7. Not built
+## 7. Fleets
+
+A fleet is a queue board, `<name>-tasks`, on which the factory is one lane, with the agent it runs every task with: config `fleets: [{"name": "sim", "agent": "researcher"}]`. Anyone who can see the board posts a task with plain `board_post`, and the core's rotation (`boards.md`, queue boards) hands each top-level post to exactly one lane. Interactive sessions that subscribe are lanes too.
+
+- **Sync at start** (`syncFleets`, `adapters/factory/factory.ts`): a missing board is created as `kind: "queue"`; an existing queue board is subscribed in push mode; a fleet whose board exists as a broadcast board is refused with a log line (every post there would read as a task). Any other queue board the factory is a lane on is left: a lane that ignores its deliveries holds each claim for the full TTL.
+- **A task** is a top-level post on a joined board, delivered by the rotation or by an @mention. Replies in its thread are its conversation, not tasks. The requester is the poster; locally every handle is the same OS user, as with a delegation. The agent is the fleet's, never resolved from the post's text.
+- **The `taken` reply acks the claim** (a queue reply by the holder releases it), so the 30-minute TTL never redelivers a running task; a crash mid-run is reported interrupted (§6), as for a delegation. The store's `(board, post id)` key makes a redelivery spawn nothing.
+- **No agent:** a task from the rotation is passed on with `claim_release`, which offers it to the next lane; an @mention holds no claim, so its poster gets `[factory] declined: …`.
+- Replies go in the post's thread with `board_post`, so they wake the poster and the thread's participants.
+
+## 8. Not built
 
 - Hosted mode (§3).
-- Fleet roster and queue dispatch (#124's rescoped shape, #320's design): membership from a config file, presence from `peer_list`, status posts only on change, work over a `kind: "queue"` board (#131). The shared-name design stays refused (`boards.md` §3).
+- A fleet roster (#320's design): membership and presence from `peer_list`, status posts only on change. The shared-name design stays refused (`boards.md` §3).
+- Fan-out: a fleet agent's run returning a plan that the factory posts as subtasks on an ephemeral board, then synthesizes.
 - Capability-aware launcher selection (#245) and queue routing of delegation (#242): auto-pick stays the core's first live launcher.
