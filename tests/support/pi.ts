@@ -25,7 +25,7 @@ import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
-import { SIGNED_IN, startupPrompt } from "../../adapters/pi-family/always-on/always-on.ts";
+import { SIGNED_OUT } from "../../adapters/pi-family/always-on/always-on.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
@@ -1355,8 +1355,9 @@ const PI_BIN = join(ROOT, "node_modules/.bin/pi");
 const AGENT = "pi-agent";
 
 // Each extension dialog, then a notice of what each one returned, at the
-// first turn: the startup prompt's. Not at session_start, where a dialog makes
-// pi 1.4.0 in RPC mode exit 0 however it's answered.
+// first turn: the first DM's, since the runner never prompts. Not at
+// session_start, where a dialog makes pi 1.4.0 in RPC mode exit 0 however
+// it's answered.
 const DIALOGS = `export default function (pi) {
   let asked = false;
   pi.on("before_agent_start", async (_event, ctx) => {
@@ -1416,39 +1417,49 @@ function startRunner(dir: string, procs: ChildProcess[], extra: string[] = []): 
 const rootHolding = (srv: HostedServer, name: string): string | undefined => srv.app.db.query<{ raw: string }, [string, string]>(
   "SELECT source_session_id AS raw FROM hosted_sessions h WHERE client_id = ? AND (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = h.session_id ORDER BY bound_at, address LIMIT 1) = ?").get(PI_CLIENT, name)?.raw;
 
-// The always-on runner (#631) under plain Node. Signed out, its first start's
-// bind brings the sign-in offer, and the link is on its log; approved on the
-// consent page, the runner prompts the bind again, which takes the lease with
-// no restart. Each dialog is cancelled and pi carries on. A peer's DM is
-// answered. Stopped, it exits 0 and pi releases the lease; started again, it
-// continues the same pi session, which takes the name back and answers. A pi
-// killed under it makes it exit with pi's status.
+// The extension's notice once a sign-in finishes.
+const SIGNED_IN = "grayboard: signed in";
+
+// The always-on runner (#631) under plain Node, which never prompts: its
+// handle is pi's BUS_IDENTITY. Signed out, the start says so and the runner
+// asks the extension for a sign-in link (/grayboard login, no model turn),
+// which is on its log; approved on the consent page, the extension's own
+// restart binds BUS_IDENTITY and takes the lease, with no restart of the
+// runner and no model call. A peer's DM is answered, and that first turn's
+// dialogs are each cancelled. Stopped, it exits 0 and pi releases the lease;
+// started again, it continues the same pi session, which takes the name back
+// and answers. A pi killed under it makes it exit with pi's status.
 export function piAlwaysOnScenario(dir: string): Promise<void> {
-  return withHosted(dir, [scripted(startupPrompt(AGENT), [{ tool: "mcp__grayboard__bind", args: { name: AGENT, create: true } }])], async ({ srv, peer }) => {
+  return withHosted(dir, [], async ({ srv, peer }) => {
     const procs: ChildProcess[] = [];
     try {
       writeFileSync(join(dir, "dialogs.ts"), DIALOGS);
       let runner = startRunner(dir, procs, ["-e", join(dir, "dialogs.ts")]);
       expect(await until(() => runner.logged().find((l) => l.startsWith("started pi ")), 15_000, "the runner's start")).not.toContain("continuing");
 
-      // Signed out: the startup bind brings the offer, whose link is logged.
+      // Signed out: the start says so, and the runner asks for a link, which is logged.
+      await until(() => runner.logged().includes(`notice: ${SIGNED_OUT}`), 30_000, "the signed-out notice");
+      await until(() => runner.logged().includes("signed out: asked the extension for a sign-in link (/grayboard login)"), 15_000, "the login request");
       const url = await until(() => runner.logged().map((l) => /^notice: grayboard: sign in at (\S+)$/.exec(l)?.[1]).find(Boolean), 30_000, "the logged sign-in link");
       expect(url).toStartWith(`${srv.issuer}/`);
       expect(await browse(srv.issuer, url!, "pi")).toContain("Signed in to grayboard");
       await until(() => runner.logged().includes(`notice: ${SIGNED_IN}`), 15_000, "the signed-in notice");
 
-      // Signed in, the runner prompts the bind again, which takes the lease.
+      // Signed in, the extension's own restart binds BUS_IDENTITY and takes
+      // the lease: no runner restart, and no model call so far.
       const raw = await until(() => rootHolding(srv, AGENT), 30_000, `${AGENT} bound after the sign-in`);
       await until(() => leasedAs(srv, raw, AGENT), 15_000, `${AGENT} holds the lease`);
-      expect(runner.logged().filter((l) => l === "tool mcp__grayboard__bind")).toHaveLength(2);
+      expect(runner.logged().filter((l) => l.startsWith("tool ") || l.startsWith("turn end"))).toEqual([]);
 
-      // Every dialog was cancelled, and pi went on past them.
+      // A peer's DM starts the first turn, whose reply reaches the peer.
+      await pingPong(srv, peer, AGENT);
+
+      // That turn's dialogs were each cancelled, and pi went on past them.
       expect(runner.logged().filter((l) => /^declined (select|confirm|input|editor): /.test(l)).map((l) => l.split(":")[0])).toEqual(
         ["declined select", "declined confirm", "declined input", "declined editor"]);
       expect(runner.logged()).toContain("notice: dialogs: select=undefined confirm=false input=undefined editor=undefined");
-
-      // A peer's DM starts a turn whose reply reaches the peer.
-      await pingPong(srv, peer, AGENT);
+      // The model never binds: BUS_IDENTITY did.
+      expect(runner.logged()).not.toContain("tool mcp__grayboard__bind");
 
       // Stopped: the runner exits 0 and pi releases the lease.
       runner.proc.kill("SIGTERM");

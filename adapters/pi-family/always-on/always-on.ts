@@ -3,6 +3,13 @@
 // message). Plain Node runs it as is: type stripping, no dependencies. A
 // supervisor restarts it when it exits, and it exits with pi's status.
 //
+// It never prompts the agent. --handle goes in pi's BUS_IDENTITY, which the
+// hosted extension binds at a session's first start, creating it if new, and
+// a continued session takes back the names it held (#443). Signed out, it
+// sends pi the extension's own `/grayboard login`, which the extension
+// handles without a model turn, so the sign-in link reaches the log; once
+// it's approved, the extension's own restart binds the handle.
+//
 // The agent has a directory of its own: `<dir>/agent` is its
 // PI_CODING_AGENT_DIR (the hosted extension, its config.json and grant, any
 // mcp.json) and `<dir>/sessions` its session directory. A shared ~/.pi/agent
@@ -21,15 +28,12 @@ const USAGE = "usage: always-on.ts --handle <name> --dir <agent dir> [--agent-di
 const HANDLE = /^[a-z0-9_-]{1,32}$/;
 // Dialogs block pi until a client answers, and nobody is there to.
 const DIALOGS = new Set(["select", "confirm", "input", "editor"]);
-// The extension's notice once a sign-in finishes, in this pi or another.
-export const SIGNED_IN = "grayboard: signed in";
+// The extension's notice for a session that starts signed out (hosted-core
+// AccessExpired with pi's login action).
+export const SIGNED_OUT = "grayboard: Signed out of grayboard in pi; run /grayboard login";
 
 export type Options = { handle: string; dir: string; agentDir: string; cwd: string; pi: string; piArgs: string[] };
 export type Log = (line: string) => void;
-
-/** What each start sends, and each sign-in: bind the handle, creating it the first time. */
-export const startupPrompt = (handle: string): string =>
-  `Startup check. If you aren't bound to grayboard as "${handle}", call bind with name "${handle}" and create: true. Don't read boards or send anything. Reply with one word: ready.`;
 
 export function parse(argv: string[]): Options {
   const { values, positionals } = parseArgs({
@@ -70,7 +74,7 @@ export function run(o: Options, log: Log = stamped): Promise<number> {
   const args = piArgs(o);
   const child = spawn(o.pi, args, {
     cwd: o.cwd,
-    env: { ...process.env, PI_CODING_AGENT_DIR: o.agentDir },
+    env: { ...process.env, PI_CODING_AGENT_DIR: o.agentDir, BUS_IDENTITY: o.handle },
     stdio: ["pipe", "pipe", "inherit"],
   });
   // A pi that died mid-write is reported by its exit, not here.
@@ -78,7 +82,6 @@ export function run(o: Options, log: Log = stamped): Promise<number> {
   const send = (record: Record<string, unknown>) => {
     if (child.stdin.writable) child.stdin.write(`${JSON.stringify(record)}\n`);
   };
-  const startup = () => send({ type: "prompt", message: startupPrompt(o.handle) });
   let stopping = false;
   // A supervisor's stop: closing pi's stdin asks it to shut down in order. Not
   // a signal of our own: a supervisor that signals the whole group (systemd's
@@ -93,8 +96,6 @@ export function run(o: Options, log: Log = stamped): Promise<number> {
 
   child.once("spawn", () => {
     log(`started pi (pid ${child.pid}) as ${o.handle}${args.includes("--continue") ? ", continuing its session" : ""}`);
-    // pi has no ready event: it takes the prompt once it's up.
-    startup();
   });
 
   const onRecord = (line: string) => {
@@ -110,9 +111,13 @@ export function run(o: Options, log: Log = stamped): Promise<number> {
           send({ type: "extension_ui_response", id: e.id, cancelled: true });
           log(`declined ${e.method}: ${clip(e.title ?? e.message)}`);
         } else if (e.method === "notify") {
-          // A signed-out tool call's sign-in link arrives here.
+          // The sign-in link arrives here, as `grayboard: sign in at <url>`.
           log(`notice: ${clip(e.message, 2000)}`);
-          if (e.message === SIGNED_IN) startup();
+          // The extension's own command, handled without a model turn.
+          if (e.message === SIGNED_OUT) {
+            send({ type: "prompt", message: "/grayboard login" });
+            log("signed out: asked the extension for a sign-in link (/grayboard login)");
+          }
         }
         break;
       case "response":
