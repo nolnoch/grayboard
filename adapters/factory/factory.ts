@@ -35,13 +35,15 @@ export class Factory {
   private readonly children = new Set<AbortController>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
+  private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
 
   constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {}
 
   // Runs until the bus closes; resolves with why.
   async run(): Promise<string> {
-    for (const r of this.store.interrupted(() => `[factory] interrupted: the factory stopped while this ran; nothing is running for it now. Re-delegate it if it's still wanted.`)) {
-      this.o.log(`request ${r.id} was running when the factory last stopped; reporting it interrupted`);
+    const again = (r: Row) => (r.parent !== null ? "Its task's combined result won't come." : r.source === "dm" ? "Re-delegate it if it's still wanted." : "Post it again if it's still wanted.");
+    for (const r of this.store.interrupted((r) => `[factory] interrupted: the factory stopped before this finished; nothing is running for it now. ${again(r)}`)) {
+      this.o.log(`request ${r.id} was ${r.state} when the factory last stopped; reporting it interrupted`);
     }
     await this.syncFleets();
     await this.housekeeping();
@@ -85,7 +87,8 @@ export class Factory {
     const fleet = this.joined.get(d.board);
     if (!fleet) {
       // Not ours (a subscription the sync hasn't dropped yet): pass any claim on.
-      if (d.reason === "subscription") await this.release(key, "not a factory fleet board");
+      // (A broadcast board's posts arrive with the same reason and hold no claim.)
+      if (d.reason === "subscription" && this.queues.has(d.board)) await this.release(key, "not a factory fleet board");
       return;
     }
     const r: Request = { source: "board", board: d.board, id: d.postId, requester: d.from, persona: fleet.name, task: d.body };
@@ -129,6 +132,8 @@ export class Factory {
     const listed = await this.bus.call("board_list");
     const boards = new Map((Array.isArray(listed) ? listed : []).map((b: { name: string; kind?: string; mode?: string | null }) => [b.name, b]));
     this.joined.clear();
+    this.queues.clear();
+    for (const b of boards.values()) if (b.kind === "queue") this.queues.add(b.name);
     for (const f of this.fleets()) {
       const name = fleetBoard(f), b = boards.get(name);
       try {
@@ -185,8 +190,10 @@ export class Factory {
       }
     }
     this.store.finish(row, clip(body));
-    await this.send(this.store.get(row)!);
+    // Before the send's await: a crash during it must not strand a parent
+    // whose subtasks all finished.
     if (row.parent !== null && this.store.synthesizeWhenDone(row.parent)) this.o.log(`request ${row.parent}: every subtask finished; synthesizing`);
+    await this.send(this.store.get(row)!);
   }
 
   // Runs the row's agent on `input`; a string is a failure reply that needed no run.
@@ -214,13 +221,24 @@ export class Factory {
   // hands a poster its own post), so the board is a record, not a queue.
   // Returns why it couldn't, or null.
   private async fanOut(row: Row, plan: Plan): Promise<string | null> {
-    const board = `task-${row.source === "board" ? row.id : `dm${row.id}`}`;
-    const where = row.source === "board" ? `post ${row.id} on #${row.board}` : `DM ${row.id}`;
+    if (row.source !== "board") return "only a fleet task fans out";
+    const purpose = `Subtasks of ${oneLine(row.requester)}'s post ${row.id} on #${row.board}, fanned out by ${this.bus.handle}: one top-level post per subtask, its outcome in its thread.`;
+    // A board of that name someone else made: the next suffix.
+    let board = "";
+    for (let k = 1; !board; k++) {
+      const name = k === 1 ? `task-${row.id}` : `task-${row.id}-${k}`;
+      try {
+        await this.bus.call("board_create", { name, purpose });
+        board = name;
+      } catch (e) {
+        if (k < 3 && /already exists/.test(msg(e))) continue;
+        return `couldn't open #${name} for the fan-out: ${msg(e)}`;
+      }
+    }
     try {
-      await this.bus.call("board_create", { name: board, purpose: `Subtasks of ${oneLine(row.requester)}'s ${where}, fanned out by ${this.bus.handle}: one top-level post per subtask, its outcome in its thread.` });
       await this.bus.call("board_subscribe", { board, mode: "off" }); // its own posts and their threads are the factory's to write, not to take
     } catch (e) {
-      return `couldn't open #${board} for the fan-out: ${msg(e)}`;
+      this.o.log(`couldn't mute #${board}: ${msg(e)}`);
     }
     const n = plan.subtasks.length, subtasks: { r: Request; title: string }[] = [];
     for (const [i, s] of plan.subtasks.entries()) {

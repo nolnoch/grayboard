@@ -10,6 +10,8 @@ export type Plan = { subtasks: Subtask[] };
 
 const OPEN = `${DATA_FENCE}factory-plan\n`;
 const MAX_TITLE = 120;
+// A subtask's post must fit a board body (64 KiB, src/core/boards.ts) with its header.
+const MAX_SUBTASK_BYTES = 60 * 1024;
 // What a synthesis run reads of each subtask's outcome: enough to combine,
 // bounded so n subtasks can't blow the prompt up.
 const MAX_RESULT_CHARS = 16 * 1024;
@@ -30,23 +32,26 @@ export function triageInstruction(max: number): string {
 }
 
 // The plan in a run's output: null when there is none (the run did the
-// task), an error string when the block is there but unusable.
+// task), an error string when the block is there but unusable. A plan is
+// the whole reply, as the instruction asks: an answer that quotes a plan
+// block (documenting the format, say) is an answer, not a plan.
 export function parsePlan(text: string, max: number): Plan | string | null {
-  const at = text.indexOf(OPEN);
-  if (at < 0 || (at > 0 && text[at - 1] !== "\n")) return null;
-  const start = at + OPEN.length;
-  const end = text.indexOf(`\n${DATA_FENCE}`, start);
+  const t = text.trim();
+  if (!t.startsWith(OPEN)) return null;
+  const start = OPEN.length;
+  const end = t.indexOf(`\n${DATA_FENCE}`, start);
   if (end < 0) return "the plan block isn't closed";
   let data: unknown;
-  try { data = JSON.parse(text.slice(start, end)); } catch { return "the plan isn't valid JSON"; }
+  try { data = JSON.parse(t.slice(start, end)); } catch { return "the plan isn't valid JSON"; }
   const list = (data as { subtasks?: unknown } | null)?.subtasks;
   if (!Array.isArray(list)) return `the plan has no "subtasks" array`;
   if (list.length < 2 || list.length > max) return `the plan has ${list.length} subtasks; it needs 2 to ${max}`;
   const subtasks: Subtask[] = [];
   for (const [i, s] of list.entries()) {
-    const t = s as { title?: unknown; task?: unknown } | null;
-    if (typeof t?.title !== "string" || !t.title.trim() || typeof t.task !== "string" || !t.task.trim()) return `subtask ${i + 1} needs a non-empty "title" and "task"`;
-    subtasks.push({ title: t.title.replace(/[\r\n]+/g, " ").trim().slice(0, MAX_TITLE), task: t.task.trim() });
+    const x = s as { title?: unknown; task?: unknown } | null;
+    if (typeof x?.title !== "string" || !x.title.trim() || typeof x.task !== "string" || !x.task.trim()) return `subtask ${i + 1} needs a non-empty "title" and "task"`;
+    if (new TextEncoder().encode(x.task).length > MAX_SUBTASK_BYTES) return `subtask ${i + 1}'s task is over ${MAX_SUBTASK_BYTES / 1024} KiB`;
+    subtasks.push({ title: x.title.replace(/[\r\n]+/g, " ").trim().slice(0, MAX_TITLE), task: x.task.trim() });
   }
   return { subtasks };
 }

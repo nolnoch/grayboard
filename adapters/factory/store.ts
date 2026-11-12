@@ -52,6 +52,13 @@ export class Store {
       fanout_board TEXT,
       UNIQUE (source, id)
     )`);
+    // Additive (AGENTS.md): a store an earlier factory wrote gets the fan-out
+    // columns, in one transaction with the check.
+    this.db.transaction(() => {
+      const cols = new Set((this.db.query(`PRAGMA table_info(requests)`).all() as { name: string }[]).map((c) => c.name));
+      const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"]];
+      for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
+    }).immediate();
   }
 
   // Records a request; false when its key is already known (a redelivery).

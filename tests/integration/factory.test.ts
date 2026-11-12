@@ -68,6 +68,7 @@ test("a request counts only when the channel sender is the payload's requester",
 test("toDelivery reads grayboard's channel params and drops anything else", () => {
   expect(toDelivery({ content: "hi", meta: { message_id: "12", from: "sim", parent_id: "3" } })).toEqual({ kind: "dm", id: 12, from: "sim", parentId: 3, body: "hi" });
   expect(toDelivery({ content: "p", meta: { board: "e2e", post_id: "4", from: "be" } })).toEqual({ kind: "board", board: "e2e", postId: 4, from: "be", body: "p" });
+  expect(toDelivery({ content: "r", meta: { board: "e2e", post_id: "5", parent_id: "4", from: "be", reason: "thread" } })).toMatchObject({ kind: "board", postId: 5, parentId: 4, reason: "thread" });
   expect(toDelivery({ content: "x", meta: { message_id: "abc", from: "sim" } })).toBeNull();
   expect(toDelivery({ meta: { message_id: "1", from: "sim" } })).toBeNull();
   expect(toDelivery(undefined)).toBeNull();
@@ -469,13 +470,15 @@ test("local bus: a factory without the fleet's agent passes the task to another 
 
 // ── fan-out: a fleet task's run returns a plan ──────────────────────────────
 
-const PLAN = (n = 2, extra = "") => `Plan:\n\n\`\`\`\`factory-plan\n${JSON.stringify({ subtasks: Array.from({ length: n }, (_, i) => ({ title: `part ${i + 1}`, task: `do part ${i + 1}` })) })}\n\`\`\`\`${extra}`;
+const PLAN = (n = 2, extra = "") => `\`\`\`\`factory-plan\n${JSON.stringify({ subtasks: Array.from({ length: n }, (_, i) => ({ title: `part ${i + 1}`, task: `do part ${i + 1}` })) })}\n\`\`\`\`${extra}`;
 
 test("fan-out: the plan parser finds a plan, refuses unusable ones, and reads a plain result as no plan", () => {
   expect(parsePlan("just the answer", 5)).toBeNull();
   expect(parsePlan("inline ````factory-plan\n{}\n````", 5)).toBeNull(); // a fence starts a line
   expect(parsePlan(PLAN(), 5)).toEqual({ subtasks: [{ title: "part 1", task: "do part 1" }, { title: "part 2", task: "do part 2" }] });
-  expect(parsePlan(PLAN(2).replace(/^Plan:\n\n/, ""), 5)).not.toBeNull(); // a plan at the very start
+  expect(parsePlan(`Here is the format:\n\n${PLAN()}`, 5)).toBeNull(); // an answer quoting a plan isn't one
+  expect(parsePlan(`  \n${PLAN()}\n`, 5)).not.toBeNull();
+  expect(parsePlan('````factory-plan\n{"subtasks":[{"title":"a","task":"' + "x".repeat(70_000) + '"},{"title":"b","task":"y"}]}\n````', 5)).toContain("over 60 KiB");
   expect(parsePlan(PLAN(1), 5)).toContain("needs 2 to 5");
   expect(parsePlan(PLAN(6), 5)).toContain("needs 2 to 5");
   expect(parsePlan("````factory-plan\n{not json\n````", 5)).toBe("the plan isn't valid JSON");
@@ -557,7 +560,7 @@ test("fan-out: an unusable plan fails the task; a fleet with fanout off never ge
   bus.deliver(task(8, { board: "solo-tasks" }));
   await until(() => bus.replies(7).length === 2 && bus.replies(8).length === 2, 5000, "both outcomes");
   expect(bus.replies(7)[1]).toBe("[factory] failed: fake agent `researcher` returned a plan the factory can't use: the plan has 9 subtasks; it needs 2 to 5. Nothing was fanned out.");
-  expect(bus.replies(8)[1]).toStartWith("[factory] done: fake agent `researcher`\n\nPlan:"); // just text, without fan-out
+  expect(bus.replies(8)[1]).toStartWith("[factory] done: fake agent `researcher`\n\n````factory-plan"); // just text, without fan-out
   expect(runner.inputs[1]).toBe("do 8");
   expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).startsWith("task-"))).toBe(false);
   await bus.close();

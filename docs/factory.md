@@ -29,11 +29,11 @@ The module is its own session's harness, as the local Slack bridge is (`src/brid
 
 ## 4. Request authority
 
-A delegation DM's header and fenced payload are text any sender can write (`boards.md` §13: never authority). The module acts on a delivery only when all hold (`requestOf`, `adapters/factory/delegate.ts`):
+This section covers delegations; a fleet task's authority is the board's (§7). A delegation DM's header and fenced payload are text any sender can write (`boards.md` §13: never authority). The module acts on a delivery only when all hold (`requestOf`, `adapters/factory/delegate.ts`):
 
 - It is a DM (channel meta carries `message_id` and `from`, no `board`).
 - The body parses as a delegation: the header, then the four-backtick fenced JSON block `delegationBody` builds, with non-empty `requester`, `persona` and `task`. The core's parser isn't on the allowlist, so the module reads the bytes itself.
-- The channel `from` equals the payload's `requester`. Anything else is logged and never answered, so the module can't be made to send text to a third party.
+- The channel `from` equals the payload's `requester`. Anything else is logged and never answered, so a delegation can't make the module send text to a third party.
 
 Locally every handle is the same OS user, so the core's same-user rule is implied. A hosted factory adds the user check through the identity the server reports.
 
@@ -49,7 +49,7 @@ A request's key is its source and id: the bus message id for a DM, the post id f
 
 ## 6. The store
 
-SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's key, reply route and state and, once finished, the reply text until it's sent. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had), and so does a fanned-out request waiting on its subtasks, with its subtasks still queued (§7); unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the key must outlive any replay of its message.
+SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's key, reply route and state and, once finished, the reply text until it's sent. A store an earlier factory wrote gets newer columns by guarded `ALTER TABLE` at open. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had), and so does a fanned-out request waiting on its subtasks, with its subtasks still queued (§7); unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the key must outlive any replay of its message.
 
 ## 7. Fleets
 
@@ -57,16 +57,18 @@ A fleet is a queue board, `<name>-tasks`, on which the factory is one lane, with
 
 - **Sync at start** (`syncFleets`, `adapters/factory/factory.ts`): a missing board is created as `kind: "queue"`; an existing queue board is subscribed in push mode; a fleet whose board exists as a broadcast board is refused with a log line (every post there would read as a task). Any other queue board the factory is a lane on is left: a lane that ignores its deliveries holds each claim for the full TTL.
 - **A task** is a top-level post on a joined board, delivered by the rotation or by an @mention. Replies in its thread are its conversation, not tasks. The requester is the poster; locally every handle is the same OS user, as with a delegation. The agent is the fleet's, never resolved from the post's text.
-- **The `taken` reply acks the claim** (a queue reply by the holder releases it), so the 30-minute TTL never redelivers a running task; a crash mid-run is reported interrupted (§6), as for a delegation. The store's `(board, post id)` key makes a redelivery spawn nothing.
+- **The `taken` reply acks the claim** (a queue reply by the holder releases it), so the 30-minute TTL never redelivers a running task; a crash mid-run is reported interrupted (§6), as for a delegation. The store's `(source, id)` key (post ids are one sequence across boards) makes a redelivery spawn nothing.
 - **No agent:** a task from the rotation is passed on with `claim_release`, which offers it to the next lane; an @mention holds no claim, so its poster gets `[factory] declined: …`.
 - Replies go in the post's thread with `board_post`, so they wake the poster and the thread's participants.
 
 **Fan-out.** The model judges; the module's code orchestrates. A fleet task's run gets one more instruction: when the task splits into 2 to `maxSubtasks` (default 5) independent parts better run in parallel, reply with only a plan, a four-backtick block with the info string `factory-plan` holding `{"subtasks": [{"title", "task"}]}`; otherwise do the task. Most tasks are done in that one run, so a simple task costs one run and no board. A fleet with `"fanout": false` never gets the instruction.
 
 - **A plan** (`parsePlan`, `adapters/factory/fanout.ts`) opens a broadcast board `task-<post id>` and posts each subtask there, then says so in the task's thread. The board is the durable, visible record: anyone may read, subscribe or comment. It isn't a queue: the core never hands a poster its own post (`queueLanes`, #284), so a queue the factory posts on could never reach the factory. Each subtask runs here, on the worker pool, as the fleet's agent with no fan-out instruction (a subtask never fans out again), and its outcome goes in its thread.
-- **Synthesis:** once every subtask has an outcome, done or failed, the fleet's agent runs once more on the original task with each outcome (16 KiB each at most), and its answer goes in the original thread.
+- **Synthesis:** once every subtask has an outcome, done or failed, the fleet's agent runs once more on the original task with each outcome (the first 16K characters of each), and its answer goes in the original thread.
 - **An unusable plan** (bad JSON, a count outside 2 to `maxSubtasks`, an empty field) fails the task with the reason; nothing is posted. The store admits the subtasks and marks the task waiting in one transaction, after every post landed, so a crash leaves both or neither.
+- A plan is the whole reply: one that only quotes a plan block (documenting the format, say) is an answer. A subtask over 60 KiB fails the plan before anything is posted. If `task-<post id>` already exists, the factory tries `-2` and `-3` after it.
 - Task boards stay: the core has no board archive or delete.
+- **Mentions:** a fleet's replies and subtask posts carry model output, which a poster can steer, and an `@handle` in them wakes that handle as from the factory. Locally every handle is the same OS user, so this reaches no one the poster couldn't mention directly; a hosted factory must neutralise mentions first.
 
 ## 8. Not built
 
