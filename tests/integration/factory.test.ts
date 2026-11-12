@@ -3,7 +3,7 @@
 // runner, the run loop over a real `grayboard mcp` child, and the Claude
 // runner against the pinned Claude Code and a fake Anthropic API.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } from "../../adapters/factory/bus.ts";
@@ -16,7 +16,7 @@ import { Store } from "../../adapters/factory/store.ts";
 import { delegationBody } from "../../src/core/delegation.ts";
 import { claudeCodeBin, claudeHome } from "../support/claude_code.ts";
 import { localEnv } from "../support/env.ts";
-import { startFakeAnthropic, systemText, userTexts } from "../support/fake_anthropic.ts";
+import { called, startFakeAnthropic, systemText, toolResults, userTexts } from "../support/fake_anthropic.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
 import { CLI } from "../support/paths.ts";
 import { until } from "../support/until.ts";
@@ -57,7 +57,7 @@ test("the parser refuses hostile and malformed shapes", () => {
 
 test("a request counts only when the channel sender is the payload's requester", () => {
   const body = delegationBody(brief);
-  expect(requestOf(dm(5, "sim", body))).toEqual({ request: { ...brief, id: 5 } });
+  expect(requestOf(dm(5, "sim", body))).toEqual({ request: { ...brief, id: 5, source: "dm" } });
   const forged = requestOf(dm(6, "mallory", body));
   expect(forged && "ignored" in forged && forged.ignored).toContain("mallory");
   expect(requestOf({ kind: "board", board: "e2e", from: "sim", body })).toBeNull();
@@ -74,7 +74,7 @@ test("toDelivery reads grayboard's channel params and drops anything else", () =
 
 // ── roster and persona ───────────────────────────────────────────────────────
 
-const agents = (...names: string[]): Agent[] => names.map((name) => ({ name, file: `/x/${name}.md` }));
+const agents = (...names: string[]): Agent[] => names.map((name) => ({ name, file: `/x/${name}.md`, prompt: "" }));
 
 test("persona resolution: exact, article-free, whole word, substring; the longest name wins a rung", () => {
   const roster = agents("researcher", "senior researcher", "reviewer", "doc");
@@ -88,7 +88,9 @@ test("persona resolution: exact, article-free, whole word, substring; the longes
 
 test("agent files: frontmatter name or filename; later directories override by name", () => {
   expect(parseAgent("/a/x.md", "no frontmatter")).toBeNull();
-  expect(parseAgent("/a/x.md", "---\ndescription: d\n---\nbody")).toEqual({ file: "/a/x.md", name: "x", description: "d" });
+  expect(parseAgent("/a/x.md", "---\ndescription: d\n---\nbody")).toEqual({ file: "/a/x.md", name: "x", description: "d", prompt: "body" });
+  // Only tools and model come through; a field like permissionMode is never read.
+  expect(parseAgent("/a/x.md", "---\nname: x\ntools: Read, Grep\nmodel: haiku\npermissionMode: bypassPermissions\n---\n\nline one\nline two\n")).toEqual({ file: "/a/x.md", name: "x", prompt: "line one\nline two", tools: ["Read", "Grep"], model: "haiku" });
   expect(parseAgent("/a/x.md", "---\nname: \"Writer\"\n---\n")?.name).toBe("Writer");
   const user = join(dir, "user"), project = join(dir, "project");
   mkdirSync(user); mkdirSync(project);
@@ -103,17 +105,18 @@ test("agent files: frontmatter name or filename; later directories override by n
 
 // ── store ────────────────────────────────────────────────────────────────────
 
-const req = (id: number, persona = "researcher"): Request => ({ id, requester: "sim", persona, task: `task ${id}` });
+const req = (id: number, persona = "researcher"): Request => ({ id, source: "dm", requester: "sim", persona, task: `task ${id}` });
+const k = (id: number) => ({ source: "dm" as const, id });
 
-test("store: a message id is admitted once; queued rows run in id order", () => {
+test("store: a message id is admitted once; queued rows run in arrival order", () => {
   const s = new Store(":memory:");
   expect(s.admit(req(2), "researcher")).toBe(true);
   expect(s.admit(req(2), "researcher")).toBe(false);
   expect(s.admitFinished(req(2), "declined")).toBe(false);
   expect(s.admit(req(1), "researcher")).toBe(true);
-  expect(s.queuedAhead(2)).toBe(1);
-  expect(s.next()!.id).toBe(1);
+  expect(s.queuedAhead(k(1))).toBe(1);
   expect(s.next()!.id).toBe(2);
+  expect(s.next()!.id).toBe(1);
   expect(s.next()).toBeNull();
   s.close();
 });
@@ -129,21 +132,34 @@ test("store: a restart finishes running rows as interrupted, and unsent outcomes
   const hit = s.interrupted((r) => `interrupted ${r.id}`);
   expect(hit.map((r) => r.id)).toEqual([1]);
   expect(s.unsent().map((r) => [r.id, r.reply])).toEqual([[1, "interrupted 1"]]);
-  s.markReplied(1);
+  s.markReplied(k(1));
   expect(s.unsent()).toEqual([]);
-  expect(s.get(2)!.state).toBe("queued");
+  expect(s.get(k(2))!.state).toBe("queued");
+  s.close();
+});
+
+test("store: a DM and a board post with the same id are separate requests; a post keeps its reply route", () => {
+  const s = new Store(":memory:");
+  const post: Request = { id: 2, source: "board", board: "sim-tasks", requester: "fe", persona: "researcher", task: "t" };
+  expect(s.admit(req(2), "researcher")).toBe(true);
+  expect(s.admit(post, "researcher")).toBe(true);
+  expect(s.admit(post, "researcher")).toBe(false);
+  expect(s.get(k(2))).toMatchObject({ source: "dm", requester: "sim" });
+  expect(s.get({ source: "board", id: 2 })).toMatchObject({ source: "board", board: "sim-tasks", requester: "fe" });
+  expect(s.queuedAhead({ source: "board", id: 2 })).toBe(1);
+  expect([s.next()!.source, s.next()!.source]).toEqual(["dm", "board"]);
   s.close();
 });
 
 test("store: prune drops only replied rows past retention", () => {
   let t = 1_000;
   const s = new Store(":memory:", () => t);
-  s.admitFinished(req(1), "a"); s.markReplied(1);
+  s.admitFinished(req(1), "a"); s.markReplied(k(1));
   s.admitFinished(req(2), "b");                    // unsent: kept
   t = 10_000;
   expect(s.prune(5_000)).toBe(1);
-  expect(s.get(1)).toBeNull();
-  expect(s.get(2)).not.toBeNull();
+  expect(s.get(k(1))).toBeNull();
+  expect(s.get(k(2))).not.toBeNull();
   s.close();
 });
 
@@ -154,7 +170,10 @@ test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", 
   expect(c).toMatchObject({ ...DEFAULTS, grayboard: ["grayboard"], cwd: dir });
   writeFileSync(join(dir, "config.json"), JSON.stringify({ identity: "fac", allowedTools: ["Read"], maxConcurrent: 4, cwd: "/srv/work" }));
   expect(loadConfig(dir, { FACTORY_GRAYBOARD: "bun src/cli/main.ts" })).toMatchObject({ identity: "fac", allowedTools: ["Read"], maxConcurrent: 4, cwd: "/srv/work", grayboard: ["bun", "src/cli/main.ts"] });
-  for (const bad of [{ maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, [1]]) {
+  expect(loadConfig(dir, {}).tools).toBeUndefined();
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ tools: ["Bash", "Read"] }));
+  expect(loadConfig(dir, {}).tools).toEqual(["Bash", "Read"]);
+  for (const bad of [{ tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, [1]]) {
     writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
     expect(() => loadConfig(dir, {})).toThrow();
   }
@@ -271,7 +290,7 @@ test("loop: an outcome whose send failed is sent on restart; a run cut by a cras
   const path = join(dir, "f.db");
   const a = loop({ store: new Store(path) });
   a.bus.deliver(ask(40));
-  await until(() => a.store.get(40)?.state === "finished", 5000, "first run finishes");
+  await until(() => a.store.get(k(40))?.state === "finished", 5000, "first run finishes");
   await a.bus.close();
   await a.done;
   const s = new Store(path);
@@ -293,10 +312,10 @@ test("loop: a failed send stays unsent and housekeeping retries it", async () =>
   const done = f.run();
   bus.fail = true;
   bus.deliver(ask(50));
-  await until(() => store.get(50)?.state === "finished", 5000, "run finishes");
-  expect(store.get(50)!.replied).toBe(false);
+  await until(() => store.get(k(50))?.state === "finished", 5000, "run finishes");
+  expect(store.get(k(50))!.replied).toBe(false);
   bus.fail = false;
-  await until(() => store.get(50)?.replied, 5000, "housekeeping resend");
+  await until(() => store.get(k(50))?.replied, 5000, "housekeeping resend");
   expect(bus.replies(50).at(-1)).toContain("result for 50");
   await bus.close();
   await done;
@@ -350,10 +369,51 @@ test("claude runner: runs the named agent headless, prompt on stdin, and returns
     expect(runner.roster().map((a) => a.name)).toEqual(["researcher"]);
     const agent = resolvePersona("a researcher", runner.roster())!;
     // A task starting with "-" would be a flag in argv; on stdin it's text.
-    const out = await runner.run(agent, { id: 1, requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal);
+    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal);
     expect(out).toEqual({ ok: true, text: "RESULT-42" });
     expect(model.unhandled).toEqual([]);
   } finally {
     model.stop();
   }
+}, 120_000);
+
+// The operator's own settings must not widen a child. The fake model has the
+// agent run `touch MARKER` in the working directory; the marker shows whether
+// the shell ran. Measured on the pinned Claude Code: without --restricted, a
+// user rule allowing Bash lets the child's shell run.
+async function shellTrial(user: string[], o: { tools?: string[]; allowedTools: string[] }): Promise<{ marker: boolean; result: string; agentPrompt: boolean }> {
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("FACTORY-SHELL")) ? undefined
+      : called(q, "toolu_sh") ? { text: "ended" } : { tool: "Bash", id: "toolu_sh", input: { command: "touch MARKER", description: "touch a file" } },
+  ]);
+  try {
+    const h = claudeHome(dir, model.url, user);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, ...o, env: h.env });
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal);
+    expect(out).toEqual({ ok: true, text: "ended" });
+    expect(model.unhandled).toEqual([]);
+    return { marker: existsSync(join(h.work, "MARKER")), result: toolResults(model, "toolu_sh").join("\n"), agentPrompt: model.requests.some((r) => systemText(r.body).includes("AGENT-PROMPT-9")) };
+  } finally {
+    model.stop();
+  }
+}
+
+test("claude runner: the operator's user allow rules don't reach a child; no shell unless the config names it", async () => {
+  const t = await shellTrial(["Bash"], { allowedTools: [] });
+  expect(t.agentPrompt).toBe(true);
+  expect(t.marker).toBe(false);
+  expect(t.result).toContain("No such tool available: Bash");
+}, 120_000);
+
+test("claude runner: a shell the config names in tools but not allowedTools is still denied, unprompted", async () => {
+  const t = await shellTrial(["Bash"], { tools: ["Bash", "Read"], allowedTools: [] });
+  expect(t.marker).toBe(false);
+  expect(t.result).toContain("Permission for this tool use was denied");
+}, 120_000);
+
+test("claude runner: a shell the config names in both lists runs", async () => {
+  const t = await shellTrial([], { tools: ["Bash", "Read"], allowedTools: ["Bash"] });
+  expect(t.marker).toBe(true);
 }, 120_000);

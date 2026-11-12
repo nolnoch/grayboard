@@ -8,7 +8,13 @@
 import type { Delivery } from "./bus.ts";
 
 export type DelegationPayload = { requester: string; persona: string; task: string; context?: string };
-export type Request = DelegationPayload & { id: number };
+// Where a request came from, which is also where its replies go: a DM
+// (replies to its sender, in its thread) or a board post (replies in the
+// post's thread). DM and post ids are separate sequences, so a request is
+// keyed by (source, id), never id alone.
+export type Route = { source: "dm" } | { source: "board"; board: string };
+export type Key = { source: Route["source"]; id: number };
+export type Request = DelegationPayload & { id: number } & Route;
 
 export const DATA_FENCE = "````";
 const HEADER = "[delegation request from ";
@@ -41,7 +47,7 @@ export function requestOf(d: Delivery): Verdict {
   const p = parseDelegation(d.body);
   if (!p) return null;
   if (p.requester !== d.from) return { ignored: `message ${d.id}: payload names requester ${JSON.stringify(p.requester)} but was sent by ${d.from}` };
-  return { request: { ...p, id: d.id } };
+  return { request: { ...p, id: d.id, source: "dm" } };
 }
 
 // One line: a persona inside a reply must not forge reply lines.

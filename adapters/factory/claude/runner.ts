@@ -1,8 +1,14 @@
 // The Claude Code runner (docs/factory.md §5, #264): a headless
 // `claude -p` running the resolved agent. The agent file pins model, tools
 // and prompt; the operator's config pins the working directory and the tool
-// allowlist; permission prompts nothing answers are denied (`--permission-
+// lists; permission prompts nothing answers are denied (`--permission-
 // prompts none`), so an unattended child can't wait on a person.
+//
+// `--restricted --strict-mcp-config`: the child ignores the operator's user,
+// project and local settings (allow rules, hooks), and every MCP server.
+// Without it a user rule allowing Bash reaches the child (measured on the
+// pinned Claude Code). Restricted mode also hides user agents, so the agent
+// goes inline (`--agents`), built from the fields the factory read.
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Request } from "../delegate.ts";
@@ -11,7 +17,8 @@ import { execChild, prompt, readAgents, tail, type Agent, type Outcome, type Run
 export type ClaudeOptions = {
   bin: string;                    // the claude executable
   cwd: string;                    // the children's working directory
-  allowedTools: string[];         // --allowedTools; empty adds none beyond the agent's own
+  tools?: string[];               // --tools: the tools a child has; absent, restricted mode's default (no shell, no WebFetch)
+  allowedTools: string[];         // --allowedTools: tools that run without a prompt; empty, none
   env: Record<string, string>;    // the children's env
 };
 
@@ -34,7 +41,9 @@ export class ClaudeRunner implements Runner {
   }
 
   async run(agent: Agent, r: Request, signal: AbortSignal): Promise<Outcome> {
-    const cmd = [this.o.bin, "-p", "--agent", agent.name, "--output-format", "json", "--permission-prompts", "none"];
+    const def = { description: agent.description ?? agent.name, prompt: agent.prompt, ...(agent.tools ? { tools: agent.tools } : {}), ...(agent.model ? { model: agent.model } : {}) };
+    const cmd = [this.o.bin, "-p", "--restricted", "--strict-mcp-config", "--agents", JSON.stringify({ [agent.name]: def }), "--agent", agent.name, "--output-format", "json", "--permission-prompts", "none"];
+    if (this.o.tools) cmd.push("--tools", this.o.tools.join(","));
     if (this.o.allowedTools.length) cmd.push("--allowedTools", ...this.o.allowedTools);
     const x = await execChild(cmd, { cwd: this.o.cwd, env: this.o.env, input: prompt(r), signal });
     if (x.timedOut) return { ok: false, error: "the child ran past the factory's timeout and was stopped" };

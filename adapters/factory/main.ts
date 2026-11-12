@@ -19,7 +19,8 @@ export type Config = {
   grayboard: string[];     // the grayboard CLI command
   claude: string;          // the claude executable
   cwd: string;             // the children's working directory
-  allowedTools: string[];  // extra tools every child may use; default none (no shell)
+  tools?: string[];        // the tools a child has (--tools); absent, Claude Code's restricted default: no shell, no WebFetch
+  allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
   maxConcurrent: number;
   timeoutMs: number;
   retentionMs: number;
@@ -57,6 +58,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     grayboard: gb,
     claude: str("claude", DEFAULTS.claude),
     cwd: resolve(str("cwd", env.HOME ?? homedir())),
+    ...(raw.tools !== undefined ? { tools: strs("tools", []) } : {}),
     allowedTools: strs("allowedTools", DEFAULTS.allowedTools),
     maxConcurrent: pos("maxConcurrent", DEFAULTS.maxConcurrent),
     timeoutMs: pos("timeoutMs", DEFAULTS.timeoutMs),
@@ -69,7 +71,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   const dataDir = resolve(env.FACTORY_DATA_DIR ?? join(env.HOME ?? homedir(), ".grayboard-factory"));
   const cfg = loadConfig(dataDir, env);
   const store = new Store(join(dataDir, "factory.db"));
-  const runner = new ClaudeRunner({ bin: cfg.claude, cwd: cfg.cwd, allowedTools: cfg.allowedTools, env: sessionFree(env) });
+  const runner = new ClaudeRunner({ bin: cfg.claude, cwd: cfg.cwd, ...(cfg.tools ? { tools: cfg.tools } : {}), allowedTools: cfg.allowedTools, env: sessionFree(env) });
   let bus: LocalBus;
   try {
     bus = await LocalBus.start({ command: cfg.grayboard, identity: cfg.identity, version: VERSION, env: sessionFree(env) });

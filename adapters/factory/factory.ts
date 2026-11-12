@@ -54,11 +54,11 @@ export class Factory {
     const r = v.request;
     const agent = resolvePersona(r.persona, this.runner.roster());
     if (!agent) {
-      if (this.store.admitFinished(r, this.declineBody(r))) await this.send(this.store.get(r.id)!);
+      if (this.store.admitFinished(r, this.declineBody(r))) await this.send(this.store.get(r)!);
       return;
     }
     if (!this.store.admit(r, agent.name)) { this.o.log(`request ${r.id} already taken; redelivery ignored`); return; }
-    const where = this.running < this.o.maxConcurrent ? "starting now" : `queued, ${this.store.queuedAhead(r.id)} ahead`;
+    const where = this.running < this.o.maxConcurrent ? "starting now" : `queued, ${this.store.queuedAhead(r)} ahead`;
     // §13's launcher contract: say it was taken before the work starts. Not
     // stored: a lost acknowledgement costs nothing the outcome won't say.
     await this.reply(r, `[factory] taken: persona "${oneLine(r.persona)}" runs as ${this.runner.harness} agent \`${agent.name}\`, ${where}. The outcome follows in this thread.`).catch((e) => this.o.log(`couldn't acknowledge request ${r.id}: ${msg(e)}`));
@@ -96,8 +96,8 @@ export class Factory {
         this.children.delete(ac);
       }
     }
-    this.store.finish(row.id, clip(body));
-    await this.send(this.store.get(row.id)!);
+    this.store.finish(row, clip(body));
+    await this.send(this.store.get(row)!);
   }
 
   private declineBody(r: Request): string {
@@ -110,13 +110,15 @@ export class Factory {
     if (row.replied || row.reply === null) return;
     try {
       await this.reply(row, row.reply);
-      this.store.markReplied(row.id);
+      this.store.markReplied(row);
     } catch (e) {
       this.o.log(`couldn't send the outcome of request ${row.id}; will retry: ${msg(e)}`);
     }
   }
 
-  private reply(r: { id: number; requester: string }, body: string): Promise<unknown> {
+  // Every reply goes where the request came from, in its thread.
+  private reply(r: Request, body: string): Promise<unknown> {
+    if (r.source === "board") return this.bus.call("board_post", { board: r.board, body, parent_id: r.id });
     return this.bus.call("dm_send", { to: r.requester, body, parent_id: r.id });
   }
 

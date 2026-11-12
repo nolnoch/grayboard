@@ -6,7 +6,10 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Request } from "./delegate.ts";
 
-export type Agent = { name: string; file: string; description?: string };
+// `prompt` is the file's body; `tools` and `model` are its frontmatter fields
+// of those names (tools as a comma list). A runner passes these and nothing
+// else from the file, so a field like `permissionMode` can't widen a child.
+export type Agent = { name: string; file: string; description?: string; prompt: string; tools?: string[]; model?: string };
 export type Outcome = { ok: true; text: string } | { ok: false; error: string };
 
 export interface Runner {
@@ -44,8 +47,10 @@ export function parseAgent(file: string, text: string): Agent | null {
   const field = (k: string) => new RegExp(`^${k}:\\s*(.+)$`, "m").exec(fm)?.[1]?.trim().replace(/^["']|["']$/g, "");
   const name = field("name") || (file.split("/").pop() ?? "").replace(/\.md$/i, "");
   if (!name) return null;
-  const description = field("description");
-  return { file, name, ...(description ? { description } : {}) };
+  const description = field("description"), model = field("model");
+  const tools = field("tools")?.split(",").map((t) => t.trim()).filter(Boolean);
+  const prompt = text.slice(close + 4).replace(/^[^\n]*\n/, "").trim();
+  return { file, name, prompt, ...(description ? { description } : {}), ...(tools?.length ? { tools } : {}), ...(model ? { model } : {}) };
 }
 
 // Persona → agent: exact (case-insensitive), then without a leading article,
