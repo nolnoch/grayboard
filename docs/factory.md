@@ -1,0 +1,58 @@
+# The factory module
+
+```doc-meta
+owns: the opt-in factory module (orchestration outside the core): boundary, how it reaches the bus, request authority, headless spawn, its store
+invariants: the module imports nothing in the repo beyond itself and adapters/hosted-core/src/client.ts, and nothing in src/ or adapters/hosted-core/src/ imports it; it reaches the bus only through grayboard's public surface (a `grayboard mcp` child and the MCP tools); it acts on a delegation only when the channel sender is the payload's requester; one request id spawns at most once, across restarts; a run cut by a crash is reported interrupted, never re-run; children never share its push channel and inherit no harness session; its store keeps its own retention and never writes to boards
+code-pointers: adapters/factory/, scripts/check_factory_isolation.ts, src/core/delegation.ts (the payload it parses), tests/integration/factory.test.ts
+companions: boards.md (principle 7, §3, §9, §13), architecture.md §Hosted MCP, guide/local.md (running it)
+```
+
+## 1. Why it exists
+
+Principle 7 (`boards.md` §1, #288) keeps the core to addresses, mailboxes, boards, claims and presence. Users without an orchestrator still want a process that takes delegated work and runs it with no harness UI open. The factory is that process, in this repo but isolated (#293): an opt-in module that coordinates *through* grayboard as an outside orchestrator would, so moving it out later is mechanical. Design credit: the #293 series (#300, #309, #313, #314, #320, #321) gave the `FactoryBus` seam, the delegation parser and the roster design.
+
+## 2. The boundary
+
+- Lives in `adapters/factory/`, entry `main.ts`. Nothing in the default install, build or release references it; it starts only when its entry is run.
+- `scripts/check_factory_isolation.ts` (run by `tests/integration/factory_isolation.test.ts`) refuses both directions: `src/` or `adapters/hosted-core/src/` importing the module, and the module importing any repo file beyond itself and `adapters/hosted-core/src/client.ts` (#282 decision A7). npm packages aren't repo files, so the MCP SDK is allowed.
+- No core tables, tools or instruction text. A missing hook is answered by a core event or an opaque reference (principle 7), never a core feature.
+
+## 3. How it reaches the bus
+
+The module is its own session's harness, as the local Slack bridge is (`src/bridge/slack.ts`): it spawns `grayboard mcp --mode local` with `BUS_IDENTITY` and `BUS_LAUNCHER=1`, push on, and drives it over stdio with the MCP SDK client. Deliveries arrive as `notifications/claude/channel`; everything else is a tool call. `whoami` must report the configured name as primary, else it refuses to start: a second factory on a live name would start unbound and receive nothing (`boards.md` §3, one live session per name).
+
+- **The child env is session-free** (`sessionFree`, `adapters/factory/bus.ts`). A factory started from a shell inside Claude Code inherits `CLAUDECODE` and its session ID; passed on, `grayboard mcp` takes the factory for a Claude Code child and holds every push for a hook record no one writes. Bus identity variables (`BUS_IDENTITY`, `BUS_HARNESS_SESSION`…) are stripped too; the bus's own settings (`BUS_DB_PATH`, `BUS_SOCK_DIR`) stay. Spawned workers get the same env, so a worker's own grayboard session starts unbound instead of contesting the factory's name.
+- **Why not `HostedClient`:** A7's allowlisted client gives hosted tool calls only. Its sign-in and push delivery (`root.ts`, `controller.ts`) aren't importable, so a factory on it alone would be poll-only. Push is principle 3.
+- **Local mode only.** `grayboard mcp` is local on every machine (#282). A hosted factory needs push through the server's lease protocol; whether that is an allowlist widening to hosted-core's root delivery or a module-side client is an open decision for its own PR.
+- `FactoryBus` (`adapters/factory/bus.ts`) is the one seam feature code sees: tool calls plus an async stream of deliveries. A hosted or broker implementation slots in behind it.
+- The child's lifetime is the factory's: when it exits, the factory exits non-zero for a supervisor to restart both (SIGINT/SIGTERM exit 0). The child's restart semantics (name take-back, replay of unconsumed mail) and the store (§6) do the recovery.
+
+## 4. Request authority
+
+A delegation DM's header and fenced payload are text any sender can write (`boards.md` §13: never authority). The module acts on a delivery only when all hold (`requestOf`, `adapters/factory/delegate.ts`):
+
+- It is a DM (channel meta carries `message_id` and `from`, no `board`).
+- The body parses as a delegation: the header, then the four-backtick fenced JSON block `delegationBody` builds, with non-empty `requester`, `persona` and `task`. The core's parser isn't on the allowlist, so the module reads the bytes itself.
+- The channel `from` equals the payload's `requester`. Anything else is logged and never answered, so the module can't be made to send text to a third party.
+
+Locally every handle is the same OS user, so the core's same-user rule is implied. A hosted factory adds the user check through the identity the server reports.
+
+## 5. Spawning
+
+The request id is the bus message id. The module records it in its store before anything else, so a redelivered id (a restart, a replay) spawns nothing. It replies `[factory] taken: …` in the thread at once (`boards.md` §13's launcher contract), naming the agent and whether it starts now or queues, then `[factory] done: …` or `[factory] failed: …` when the child ends. Replies always go to the request's sender in its thread, clipped under the DM body cap.
+
+- **Persona → roster entry** (`resolvePersona`, `adapters/factory/runner.ts`): exact name, then article-stripped, then whole word, then substring; the longest name wins a rung. No match is `[factory] declined: …` naming the roster, so the requester can re-delegate. Model and effort come from the agent file, never the payload (§13's persona rule).
+- **Claude Code** (`adapters/factory/claude/runner.ts`): `claude -p --agent <name> --output-format json --permission-prompts none`, plus `--allowedTools` from config. The prompt (task, then context) goes on stdin, never argv, so a task starting with `-` isn't a flag. `--permission-prompts none` denies any prompt nothing would answer, so an unattended child can't hang on one. The roster is Claude Code's own: `$CLAUDE_CONFIG_DIR/agents` (or `~/.claude/agents`), then the working directory's `.claude/agents`, which wins on a name. pi, OpenCode and Cursor runners implement the same `Runner` interface (#243, #266, #265).
+- **Children are unattended code with tools.** The operator's config names the working directory and the extra allowed tools; the default adds none, so a child has only what its agent file and settings grant, and no prompt can widen it. The factory acts on any delegation its own user's sessions send.
+- **Bus capability (§13).** A child holds no bus connection: the module relays its result, which §13 counts as the parent relaying.
+- Concurrency is capped by config; requests over the cap wait in the store in id order. Each child runs in its own process group with a timeout; on expiry or shutdown the group is killed and the thread gets the failure.
+
+## 6. The store
+
+SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's state and, once finished, the reply text until it's sent. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had), and unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the id must outlive any replay of its message.
+
+## 7. Not built
+
+- Hosted mode (§3).
+- Fleet roster and queue dispatch (#124's rescoped shape, #320's design): membership from a config file, presence from `peer_list`, status posts only on change, work over a `kind: "queue"` board (#131). The shared-name design stays refused (`boards.md` §3).
+- Capability-aware launcher selection (#245) and queue routing of delegation (#242): auto-pick stays the core's first live launcher.
