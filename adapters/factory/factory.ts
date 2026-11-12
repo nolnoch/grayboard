@@ -5,18 +5,21 @@
 // where the request came from, in its thread.
 import type { Delivery, FactoryBus } from "./bus.ts";
 import { oneLine, requestOf, type Request } from "./delegate.ts";
-import { resolvePersona, type Agent, type Runner } from "./runner.ts";
-import type { Row, Store } from "./store.ts";
+import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
+import { resolvePersona, type Agent, type Outcome, type Runner } from "./runner.ts";
+import type { Admit, Row, Store } from "./store.ts";
 
 // A fleet (docs/factory.md §7): a queue board `<name>-tasks` the factory is
 // a lane on, and the agent it runs each task with. The agent is the
-// operator's choice, never the post's.
-export type Fleet = { name: string; agent: string };
+// operator's choice, never the post's. `fanout` (default on) lets a task's
+// run return a plan of subtasks instead of doing it (§7).
+export type Fleet = { name: string; agent: string; fanout?: boolean };
 export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
 
 export type FactoryOptions = {
   fleets?: Fleet[];
   maxConcurrent: number;
+  maxSubtasks?: number; // a fan-out plan's cap (default 5)
   timeoutMs: number;
   retentionMs: number;
   housekeepingMs?: number; // how often unsent replies are retried and the store pruned
@@ -34,13 +37,15 @@ export class Factory {
   private readonly sending = new Set<string>(); // keys whose outcome is being sent, so housekeeping can't send one twice
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
+  private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
 
   constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {}
 
   // Runs until the bus closes; resolves with why.
   async run(): Promise<string> {
-    for (const r of this.store.interrupted(() => `[factory] interrupted: the factory stopped while this ran; nothing is running for it now. Re-delegate it if it's still wanted.`)) {
-      this.o.log(`request ${r.id} was running when the factory last stopped; reporting it interrupted`);
+    const again = (r: Row) => (r.parent !== null ? "Its task's combined result won't come." : r.source === "dm" ? "Re-delegate it if it's still wanted." : "Post it again if it's still wanted.");
+    for (const r of this.store.interrupted((r) => `[factory] interrupted: the factory stopped before this finished; nothing is running for it now. ${again(r)}`)) {
+      this.o.log(`request ${r.id} was ${r.state} when the factory last stopped; reporting it interrupted`);
     }
     await this.syncFleets();
     await this.housekeeping();
@@ -100,7 +105,8 @@ export class Factory {
     const fleet = this.joined.get(d.board);
     if (!fleet) {
       // Not ours (a subscription the sync hasn't dropped yet): pass any claim on.
-      if (d.reason === "subscription") await this.release(key, "not a factory fleet board");
+      // (A broadcast board's posts arrive with the same reason and hold no claim.)
+      if (d.reason === "subscription" && this.queues.has(d.board)) await this.release(key, "not a factory fleet board");
       return;
     }
     const r: Request = { source: "board", board: d.board, id: d.postId, requester: d.from, persona: fleet.name, task: d.body };
@@ -113,11 +119,11 @@ export class Factory {
       if (this.store.admitFinished(r, `[factory] declined: ${why}. Nothing was spawned.`)) await this.send(this.store.get(r)!);
       return;
     }
-    await this.admit(r, agent, `fleet "${fleet.name}"`);
+    await this.admit(r, agent, `fleet "${fleet.name}"`, { fanout: fleet.fanout !== false });
   }
 
-  private async admit(r: Request, agent: Agent, label: string): Promise<void> {
-    if (!this.store.admit(r, agent.name)) { this.o.log(`${r.source} ${r.id} already taken; redelivery ignored`); return; }
+  private async admit(r: Request, agent: Agent, label: string, o: Admit = {}): Promise<void> {
+    if (!this.store.admit(r, agent.name, o)) { this.o.log(`${r.source} ${r.id} already taken; redelivery ignored`); return; }
     const where = this.running < this.o.maxConcurrent ? "starting now" : `queued, ${this.store.queuedAhead(r)} ahead`;
     // §13's launcher contract: say it was taken before the work starts. On a
     // queue board this reply also acks the claim, so the rotation never
@@ -144,6 +150,8 @@ export class Factory {
     const listed = await this.bus.call("board_list");
     const boards = new Map((Array.isArray(listed) ? listed : []).map((b: { name: string; kind?: string; mode?: string | null }) => [b.name, b]));
     this.joined.clear();
+    this.queues.clear();
+    for (const b of boards.values()) if (b.kind === "queue") this.queues.add(b.name);
     for (const f of this.fleets()) {
       const name = fleetBoard(f), b = boards.get(name);
       try {
@@ -175,41 +183,112 @@ export class Factory {
     }
   }
 
-  // Never throws past recording an outcome: anything unexpected finishes the row failed.
+  // One slot's work: a request's run, a subtask's run, or a fanned-out
+  // request's synthesis. A run that returns a plan fans out instead of
+  // finishing; a subtask's end may queue its parent's synthesis. Never
+  // throws past recording an outcome: anything unexpected finishes the row
+  // failed.
   private async exec(row: Row): Promise<void> {
-    let body: string;
+    let body: string | null;
     try {
       body = await this.outcome(row);
     } catch (e) {
       body = `[factory] failed: the factory couldn't run this: ${msg(e)}`;
     }
+    if (body === null) return; // fanned out: its synthesis finishes it
     this.store.finish(row, clip(body));
+    // Before the send's await: a crash during it must not strand a parent
+    // whose subtasks all finished.
+    if (row.parent !== null && this.store.synthesizeWhenDone(row.parent)) this.o.log(`request ${row.parent}: every subtask finished; synthesizing`);
     await this.send(this.store.get(row)!);
   }
 
-  private async outcome(row: Row): Promise<string> {
-    const agent = this.runner.roster().find((a) => a.name === row.agent);
+  // The row's reply, or null when its run fanned out.
+  private async outcome(row: Row): Promise<string | null> {
+    const synth = row.phase === "synthesize";
+    const max = this.o.maxSubtasks ?? 5;
+    const input: Request = synth
+      ? { ...row, task: synthesisPrompt(row.task, this.store.subtasks(row.seq).map((s) => ({ title: s.title ?? "", reply: s.reply }))), context: undefined }
+      : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max)}` } : row;
+    const out = await this.runAgent(row, input);
     let body: string;
-    if (!agent) {
-      body = `[factory] failed: agent \`${row.agent}\` left the ${this.runner.harness} roster before this ran; nothing was spawned.`;
-    } else {
-      const ac = new AbortController();
-      this.children.add(ac);
-      const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
-      this.o.log(`request ${row.id}: running ${this.runner.harness} agent ${agent.name} for ${row.requester}`);
-      try {
-        const out = await this.runner.run(agent, row, ac.signal);
-        body = out.ok
-          ? `[factory] done: ${this.runner.harness} agent \`${agent.name}\`\n\n${out.text}`
-          : `[factory] failed: ${this.runner.harness} agent \`${agent.name}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
-      } catch (e) {
-        body = `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
-      } finally {
-        clearTimeout(t);
-        this.children.delete(ac);
+    if (typeof out === "string") body = out;
+    else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${row.agent}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
+    else {
+      const plan = row.fanout && !synth ? parsePlan(out.text, max) : null;
+      if (plan && typeof plan !== "string") {
+        const why = await this.fanOut(row, plan);
+        if (!why) return null;
+        body = `[factory] failed: ${why}`;
+      } else if (typeof plan === "string") {
+        body = `[factory] failed: ${this.runner.harness} agent \`${row.agent}\` returned a plan the factory can't use: ${plan}. Nothing was fanned out.`;
+      } else {
+        body = synth
+          ? `[factory] done: ${this.runner.harness} agent \`${row.agent}\`, combining ${this.store.subtasks(row.seq).length} subtasks on #${row.fanoutBoard}\n\n${out.text}`
+          : `[factory] done: ${this.runner.harness} agent \`${row.agent}\`\n\n${out.text}`;
       }
     }
     return body;
+  }
+
+  // Runs the row's agent on `input`; a string is a failure reply that needed no run.
+  private async runAgent(row: Row, input: Request): Promise<Outcome | string> {
+    const agent = this.runner.roster().find((a) => a.name === row.agent);
+    if (!agent) return `[factory] failed: agent \`${row.agent}\` left the ${this.runner.harness} roster before this ran; nothing was spawned.`;
+    const ac = new AbortController();
+    this.children.add(ac);
+    const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
+    this.o.log(`request ${row.id}: running ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
+    try {
+      return await this.runner.run(agent, input, ac.signal);
+    } catch (e) {
+      return `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
+    } finally {
+      clearTimeout(t);
+      this.children.delete(ac);
+    }
+  }
+
+  // A plan's fan-out: a broadcast board `task-<post id>` as the durable,
+  // visible record (anyone may read, subscribe or comment), one post per
+  // subtask, each run here on the worker pool with its outcome in its
+  // thread. The factory can't be a lane for posts it wrote (the core never
+  // hands a poster its own post), so the board is a record, not a queue.
+  // Returns why it couldn't, or null.
+  private async fanOut(row: Row, plan: Plan): Promise<string | null> {
+    if (row.source !== "board") return "only a fleet task fans out";
+    const purpose = `Subtasks of ${oneLine(row.requester)}'s post ${row.id} on #${row.board}, fanned out by ${this.bus.handle}: one top-level post per subtask, its outcome in its thread.`;
+    // A board of that name someone else made: the next suffix.
+    let board = "";
+    for (let k = 1; !board; k++) {
+      const name = k === 1 ? `task-${row.id}` : `task-${row.id}-${k}`;
+      try {
+        await this.bus.call("board_create", { name, purpose });
+        board = name;
+      } catch (e) {
+        if (k < 3 && /already exists/.test(msg(e))) continue;
+        return `couldn't open #${name} for the fan-out: ${msg(e)}`;
+      }
+    }
+    try {
+      await this.bus.call("board_subscribe", { board, mode: "off" }); // its own posts and their threads are the factory's to write, not to take
+    } catch (e) {
+      this.o.log(`couldn't mute #${board}: ${msg(e)}`);
+    }
+    const n = plan.subtasks.length, subtasks: { r: Request; title: string }[] = [];
+    for (const [i, s] of plan.subtasks.entries()) {
+      try {
+        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${i + 1}/${n}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
+        if (typeof res?.post_id !== "number") throw new Error("board_post returned no post_id");
+        subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title });
+      } catch (e) {
+        return `couldn't post subtask ${i + 1} of ${n} on #${board} (${subtasks.length} posted, none run): ${msg(e)}`;
+      }
+    }
+    this.store.fanOut(row, board, subtasks);
+    this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}`);
+    await this.reply(row, `[factory] fanned out: ${n} subtasks on #${board}, each run as \`${row.agent}\` with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
+    return null;
   }
 
   private declineBody(r: Request): string {

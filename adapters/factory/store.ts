@@ -10,9 +10,18 @@ import { dirname } from "node:path";
 import type { Key, Request } from "./delegate.ts";
 
 // queued: waiting for a slot. running: a child is (or was, before a crash)
-// working on it. finished: the outcome is in `reply`, sent when replied = 1.
-export type State = "queued" | "running" | "finished";
-export type Row = Request & { seq: number; agent: string; state: State; reply: string | null; replied: boolean; created_at: number; updated_at: number };
+// working on it. waiting: its run returned a fan-out plan, and its subtasks
+// (rows whose `parent` is its seq) are out. finished: the outcome is in
+// `reply`, sent when replied = 1.
+export type State = "queued" | "running" | "waiting" | "finished";
+// run: the request itself (a fan-out-capable one when `fanout`). synthesize:
+// a fanned-out request whose subtasks all finished, combining their results.
+export type Phase = "run" | "synthesize";
+export type Row = Request & {
+  seq: number; agent: string; state: State; reply: string | null; replied: boolean; created_at: number; updated_at: number;
+  phase: Phase; fanout: boolean; parent: number | null; title: string | null; fanoutBoard: string | null;
+};
+export type Admit = { fanout?: boolean; parent?: number; title?: string };
 
 export class Store {
   private readonly db: Database;
@@ -36,13 +45,25 @@ export class Store {
       replied INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
+      phase TEXT NOT NULL DEFAULT 'run',
+      fanout INTEGER NOT NULL DEFAULT 0,
+      parent INTEGER,
+      title TEXT,
+      fanout_board TEXT,
       UNIQUE (source, id)
     )`);
+    // Additive (AGENTS.md): a store an earlier factory wrote gets the fan-out
+    // columns, in one transaction with the check.
+    this.db.transaction(() => {
+      const cols = new Set((this.db.query(`PRAGMA table_info(requests)`).all() as { name: string }[]).map((c) => c.name));
+      const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"]];
+      for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
+    }).immediate();
   }
 
   // Records a request; false when its key is already known (a redelivery).
-  admit(r: Request, agent: string): boolean {
-    return this.insert(r, agent, "queued", null);
+  admit(r: Request, agent: string, o: Admit = {}): boolean {
+    return this.insert(r, agent, "queued", null, o);
   }
 
   // Records an outcome that needs no spawn (a decline); false on a redelivery.
@@ -50,12 +71,34 @@ export class Store {
     return this.insert(r, "", "finished", reply);
   }
 
-  private insert(r: Request, agent: string, state: State, reply: string | null): boolean {
+  private insert(r: Request, agent: string, state: State, reply: string | null, o: Admit = {}): boolean {
     const t = this.now();
     const board = r.source === "board" ? r.board : null;
-    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t);
+    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at, fanout, parent, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t, o.fanout ? 1 : 0, o.parent ?? null, o.title ?? null);
     return res.changes === 1;
+  }
+
+  // A run that returned a plan: the request waits on its subtasks, admitted
+  // in the same transaction, so a crash leaves both or neither.
+  fanOut(parent: Row, board: string, subtasks: { r: Request; title: string }[]): void {
+    this.db.transaction(() => {
+      this.db.query(`UPDATE requests SET state = 'waiting', fanout_board = ?, updated_at = ? WHERE seq = ?`).run(board, this.now(), parent.seq);
+      for (const s of subtasks) this.insert(s.r, parent.agent, "queued", null, { parent: parent.seq, title: s.title });
+    })();
+  }
+
+  // A waiting request's subtasks, in posting order.
+  subtasks(parent: number): Row[] {
+    return (this.db.query(`SELECT * FROM requests WHERE parent = ? ORDER BY seq`).all(parent) as Raw[]).map(toRow);
+  }
+
+  // Once every subtask of a waiting request has finished, queues the
+  // request again to synthesize; true when it did.
+  synthesizeWhenDone(parent: number): boolean {
+    const open = (this.db.query(`SELECT COUNT(*) AS n FROM requests WHERE parent = ? AND state != 'finished'`).get(parent) as { n: number }).n;
+    if (open) return false;
+    return this.db.query(`UPDATE requests SET state = 'queued', phase = 'synthesize', updated_at = ? WHERE seq = ? AND state = 'waiting'`).run(this.now(), parent).changes === 1;
   }
 
   // The oldest queued request, now running; null when none waits.
@@ -82,8 +125,11 @@ export class Store {
   // At start: a request left running had its child die with the previous
   // process, so it finishes as interrupted (re-running it unasked could
   // repeat side effects the child already had). Returns those rows.
+  // A fanned-out request whose subtasks were out goes the same way, and so
+  // do its subtasks still queued: none of them would reach a synthesis now.
   interrupted(reply: (r: Row) => string): Row[] {
-    const rows = (this.db.query(`SELECT * FROM requests WHERE state = 'running'`).all() as Raw[]).map(toRow);
+    const rows = (this.db.query(`SELECT * FROM requests WHERE state IN ('running', 'waiting')
+      OR (state = 'queued' AND parent IN (SELECT seq FROM requests WHERE state = 'waiting')) ORDER BY seq`).all() as Raw[]).map(toRow);
     for (const r of rows) this.finish(r, reply(r));
     return rows;
   }
@@ -110,10 +156,10 @@ export class Store {
   }
 }
 
-type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number };
-type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null };
+type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null };
+type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null };
 function toRow(r: Raw): Row {
-  const { context, replied, source, board, ...rest } = r;
-  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1 };
+  const { context, replied, source, board, fanout, fanout_board, ...rest } = r;
+  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board };
   return source === "board" ? { ...base, source: "board", board: board ?? "" } : { ...base, source: "dm" };
 }
