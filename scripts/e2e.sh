@@ -15,7 +15,9 @@
 #   scripts/e2e.sh claude-local     the pinned Claude Code with local-mode
 #                                   grayboard and its hooks: subagents' calls
 #                                   as child sessions, across /clear
-#                                   (see tests/e2e/claude_local.e2e.ts)
+#                                   (see tests/e2e/claude_local.e2e.ts); and
+#                                   the factory's Claude runner
+#                                   (tests/e2e/factory_claude.e2e.ts)
 # Each run writes its run dir (GRAYBOARD_E2E_RUN_DIR, default
 # .e2e-runs/<suite>-<UTC time>): per bun test run, its output (.log) and JUnit
 # report (.xml), plus whatever the tests keep (tests/support/run_dir.ts), and
@@ -103,7 +105,10 @@ case "$suite" in
     if suite_run claude-hosted ./tests/e2e/claude_hosted.e2e.ts; then verdict "passed"; else verdict "failed (claude-hosted.log in the run dir)"; fi
     ;;
   claude-local)
-    if suite_run claude-local ./tests/e2e/claude_local.e2e.ts; then verdict "passed"; else verdict "failed (claude-local.log in the run dir)"; fi
+    failed=()
+    suite_run claude-local ./tests/e2e/claude_local.e2e.ts || failed+=(claude-local)
+    suite_run factory-claude ./tests/e2e/factory_claude.e2e.ts || failed+=(factory-claude)
+    if [ ${#failed[@]} -eq 0 ]; then verdict "passed"; else verdict "failed (${failed[*]}; logs in the run dir)"; fi
     ;;
   local-resume)
     if suite_run local-resume ./tests/e2e/local_resume.e2e.ts; then verdict "passed"; else verdict "failed (local-resume.log in the run dir)"; fi
