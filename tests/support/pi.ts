@@ -25,6 +25,7 @@ import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
+import { SIGNED_IN, startupPrompt } from "../../adapters/pi-family/always-on/always-on.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
@@ -1344,5 +1345,129 @@ export function piHostedTwiceScenario(dir: string): Promise<void> {
     await idle(b);
     expect(srv.app.mcp.activeLeases).toBe(1);
     await b.quit();
+  });
+}
+
+// ── Always-on pi (#631) ──────────────────────────────────────────────────────
+
+const ALWAYS_ON = join(ROOT, "adapters/pi-family/always-on/always-on.ts");
+const PI_BIN = join(ROOT, "node_modules/.bin/pi");
+const AGENT = "pi-agent";
+
+// Each extension dialog, then a notice of what each one returned, at the
+// first turn: the startup prompt's. Not at session_start, where a dialog makes
+// pi 1.4.0 in RPC mode exit 0 however it's answered.
+const DIALOGS = `export default function (pi) {
+  let asked = false;
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (asked) return;
+    asked = true;
+    const select = await ctx.ui.select("Pick one", ["a", "b"]);
+    const confirm = await ctx.ui.confirm("Allow?", "a dialog nobody answers");
+    const input = await ctx.ui.input("Name?", "placeholder");
+    const editor = await ctx.ui.editor("Edit", "text");
+    ctx.ui.notify(\`dialogs: select=\${select} confirm=\${confirm} input=\${input} editor=\${editor}\`, "info");
+  });
+}
+`;
+
+// The runner under plain Node, as a supervisor starts it, on the hosted
+// install `installHosted` wrote: its own session directory under `runner/`,
+// the fake model after `--`, and `extra` for pi after that.
+class Runner {
+  lines: string[] = [];
+  readonly exited: Promise<number | null>;
+  constructor(readonly proc: ChildProcess) {
+    this.exited = new Promise((r) => proc.once("exit", (code) => r(code)));
+    let buf = "";
+    proc.stdout!.setEncoding("utf8").on("data", (chunk: string) => {
+      buf += chunk;
+      for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+        this.lines.push(buf.slice(0, nl));
+        buf = buf.slice(nl + 1);
+      }
+    });
+    proc.stderr!.setEncoding("utf8").on("data", (chunk: string) => process.stderr.write(chunk));
+  }
+  // The log's lines after its timestamp.
+  logged(): string[] {
+    return this.lines.map((l) => l.slice(l.indexOf(" ") + 1));
+  }
+}
+
+function startRunner(dir: string, procs: ChildProcess[], extra: string[] = []): Runner {
+  const proc = spawn("node", [
+    "--disable-warning=ExperimentalWarning", ALWAYS_ON,
+    "--handle", AGENT, "--dir", join(dir, "runner"), "--agent-dir", agentDirOf(dir), "--cwd", dir, "--pi", PI_BIN,
+    "--", "--offline", "--provider", "fake", "--model", "fake-1", ...extra,
+  ], {
+    cwd: dir,
+    env: cleanEnv({
+      HOME: join(dir, "home"), GRAYBOARD_ATTACHMENTS_DIR: join(dir, "saved"), PATH: `${join(dir, "bin")}${delimiter}${process.env.PATH}`,
+      PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0",
+    }),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  procs.push(proc);
+  return new Runner(proc);
+}
+
+// The pi session (its raw id) whose hosted session holds `name`.
+const rootHolding = (srv: HostedServer, name: string): string | undefined => srv.app.db.query<{ raw: string }, [string, string]>(
+  "SELECT source_session_id AS raw FROM hosted_sessions h WHERE client_id = ? AND (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = h.session_id ORDER BY bound_at, address LIMIT 1) = ?").get(PI_CLIENT, name)?.raw;
+
+// The always-on runner (#631) under plain Node. Signed out, its first start's
+// bind brings the sign-in offer, and the link is on its log; approved on the
+// consent page, the runner prompts the bind again, which takes the lease with
+// no restart. Each dialog is cancelled and pi carries on. A peer's DM is
+// answered. Stopped, it exits 0 and pi releases the lease; started again, it
+// continues the same pi session, which takes the name back and answers. A pi
+// killed under it makes it exit with pi's status.
+export function piAlwaysOnScenario(dir: string): Promise<void> {
+  return withHosted(dir, [scripted(startupPrompt(AGENT), [{ tool: "mcp__grayboard__bind", args: { name: AGENT, create: true } }])], async ({ srv, peer }) => {
+    const procs: ChildProcess[] = [];
+    try {
+      writeFileSync(join(dir, "dialogs.ts"), DIALOGS);
+      let runner = startRunner(dir, procs, ["-e", join(dir, "dialogs.ts")]);
+      expect(await until(() => runner.logged().find((l) => l.startsWith("started pi ")), 15_000, "the runner's start")).not.toContain("continuing");
+
+      // Signed out: the startup bind brings the offer, whose link is logged.
+      const url = await until(() => runner.logged().map((l) => /^notice: grayboard: sign in at (\S+)$/.exec(l)?.[1]).find(Boolean), 30_000, "the logged sign-in link");
+      expect(url).toStartWith(`${srv.issuer}/`);
+      expect(await browse(srv.issuer, url!, "pi")).toContain("Signed in to grayboard");
+      await until(() => runner.logged().includes(`notice: ${SIGNED_IN}`), 15_000, "the signed-in notice");
+
+      // Signed in, the runner prompts the bind again, which takes the lease.
+      const raw = await until(() => rootHolding(srv, AGENT), 30_000, `${AGENT} bound after the sign-in`);
+      await until(() => leasedAs(srv, raw, AGENT), 15_000, `${AGENT} holds the lease`);
+      expect(runner.logged().filter((l) => l === "tool mcp__grayboard__bind")).toHaveLength(2);
+
+      // Every dialog was cancelled, and pi went on past them.
+      expect(runner.logged().filter((l) => /^declined (select|confirm|input|editor): /.test(l)).map((l) => l.split(":")[0])).toEqual(
+        ["declined select", "declined confirm", "declined input", "declined editor"]);
+      expect(runner.logged()).toContain("notice: dialogs: select=undefined confirm=false input=undefined editor=undefined");
+
+      // A peer's DM starts a turn whose reply reaches the peer.
+      await pingPong(srv, peer, AGENT);
+
+      // Stopped: the runner exits 0 and pi releases the lease.
+      runner.proc.kill("SIGTERM");
+      expect(await runner.exited).toBe(0);
+      await until(() => srv.app.mcp.activeLeases === 0, 10_000, "released on stop");
+
+      // Started again: the same pi session takes the name back and answers.
+      runner = startRunner(dir, procs);
+      expect(await until(() => runner.logged().find((l) => l.startsWith("started pi ")), 15_000, "the runner's restart")).toContain("continuing its session");
+      await until(() => leasedAs(srv, raw, AGENT), 30_000, `the same session holds ${AGENT} again`);
+      await pingPong(srv, peer, AGENT);
+
+      // A pi killed under it: the runner exits with pi's status.
+      const pid = Number(/^started pi \(pid (\d+)\)/.exec(runner.logged().find((l) => l.startsWith("started pi "))!)![1]);
+      process.kill(pid, "SIGKILL");
+      expect(await runner.exited).toBe(128 + 9);
+      expect(runner.logged()).toContain("pi exited SIGKILL");
+    } finally {
+      await stopAll(procs);
+    }
   });
 }
