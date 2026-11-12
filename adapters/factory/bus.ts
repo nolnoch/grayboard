@@ -67,6 +67,7 @@ export class LocalBus implements FactoryBus {
   private queue: Delivery[] = [];
   private wake: (() => void) | null = null;
   private done = false;
+  private closing = false;
   private settle!: (why: string) => void;
   readonly closed = new Promise<string>((ok) => (this.settle = ok));
 
@@ -98,7 +99,7 @@ export class LocalBus implements FactoryBus {
     bus = new LocalBus(client, who.primary);
     for (const d of early) bus.push(d);
     // Protocol.onclose, not the transport's: connect() owns that one.
-    client.onclose = () => bus!.end("the grayboard mcp child exited");
+    client.onclose = () => bus!.end(bus!.closing ? "closed" : "the grayboard mcp child exited");
     return bus;
   }
 
@@ -129,9 +130,13 @@ export class LocalBus implements FactoryBus {
     }
   }
 
+  // The client closes first: a delivery the child pushes before it exits
+  // still reaches the queue (the child counts it delivered), and the run
+  // loop records it for the next start instead of losing it.
   async close(): Promise<void> {
-    this.end("closed");
+    this.closing = true;
     await this.client.close().catch(() => {});
+    this.end("closed");
   }
 }
 

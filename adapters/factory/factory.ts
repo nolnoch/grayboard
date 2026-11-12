@@ -22,6 +22,8 @@ export class Factory {
   private running = 0;
   private stopping = false;
   private readonly children = new Set<AbortController>();
+  private readonly inflight = new Set<Promise<void>>(); // running execs, awaited at shutdown
+  private readonly sending = new Set<string>(); // keys whose outcome is being sent, so housekeeping can't send one twice
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {}
@@ -32,13 +34,29 @@ export class Factory {
       this.o.log(`request ${r.id} was running when the factory last stopped; reporting it interrupted`);
     }
     await this.housekeeping();
-    this.timer = setInterval(() => void this.housekeeping(), this.o.housekeepingMs ?? 3_600_000);
+    this.timer = setInterval(() => void this.housekeeping().catch((e) => this.o.log(`housekeeping: ${msg(e)}`)), this.o.housekeepingMs ?? 3_600_000);
     this.pump();
-    const consume = (async () => { for await (const d of this.bus.deliveries()) await this.take(d); })();
+    // One bad delivery must not end the loop: log it and take the next.
+    const consume = (async () => {
+      for await (const d of this.bus.deliveries()) await this.take(d).catch((e) => this.o.log(`couldn't take a delivery: ${msg(e)}`));
+    })();
     const why = await this.bus.closed;
     this.stop();
     await consume.catch(() => {});
+    await this.settle();
     return why;
+  }
+
+  // Waits for running execs to record their outcome (stop() aborted their
+  // children, whose groups get SIGKILL after a grace), so the caller can
+  // close the store. A row still running past the deadline is reported
+  // interrupted at the next start.
+  private async settle(deadlineMs = 15_000): Promise<void> {
+    if (!this.inflight.size) return;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((ok) => (t = setTimeout(() => { this.o.log(`${this.inflight.size} run(s) didn't finish within ${deadlineMs} ms of stopping`); ok(); }, deadlineMs)));
+    await Promise.race([Promise.allSettled([...this.inflight]), late]);
+    clearTimeout(t);
   }
 
   stop(): void {
@@ -70,11 +88,26 @@ export class Factory {
       const row = this.store.next();
       if (!row) return;
       this.running++;
-      void this.exec(row).finally(() => { this.running--; this.pump(); });
+      const p: Promise<void> = this.exec(row)
+        .catch((e) => this.o.log(`request ${row.id}: ${msg(e)}`))
+        .finally(() => { this.running--; this.inflight.delete(p); this.pump(); });
+      this.inflight.add(p);
     }
   }
 
+  // Never throws past recording an outcome: anything unexpected finishes the row failed.
   private async exec(row: Row): Promise<void> {
+    let body: string;
+    try {
+      body = await this.outcome(row);
+    } catch (e) {
+      body = `[factory] failed: the factory couldn't run this: ${msg(e)}`;
+    }
+    this.store.finish(row, clip(body));
+    await this.send(this.store.get(row)!);
+  }
+
+  private async outcome(row: Row): Promise<string> {
     const agent = this.runner.roster().find((a) => a.name === row.agent);
     let body: string;
     if (!agent) {
@@ -96,8 +129,7 @@ export class Factory {
         this.children.delete(ac);
       }
     }
-    this.store.finish(row, clip(body));
-    await this.send(this.store.get(row)!);
+    return body;
   }
 
   private declineBody(r: Request): string {
@@ -106,13 +138,19 @@ export class Factory {
   }
 
   // A finished outcome's reply; it stays unsent (retried by housekeeping) if the send fails.
-  private async send(row: Row): Promise<void> {
-    if (row.replied || row.reply === null) return;
+  private async send(k: Row): Promise<void> {
+    const key = `${k.source}:${k.id}`;
+    if (this.sending.has(key)) return;
+    const row = this.store.get(k); // fresh: a caller's copy may predate another send
+    if (!row || row.replied || row.reply === null) return;
+    this.sending.add(key);
     try {
       await this.reply(row, row.reply);
       this.store.markReplied(row);
     } catch (e) {
       this.o.log(`couldn't send the outcome of request ${row.id}; will retry: ${msg(e)}`);
+    } finally {
+      this.sending.delete(key);
     }
   }
 
