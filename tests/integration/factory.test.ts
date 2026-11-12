@@ -1,22 +1,20 @@
 // The factory module (#293, docs/factory.md): its parser and authority
 // check, persona resolution, store, config, the run loop over a fake bus and
-// runner, the run loop over a real `grayboard mcp` child, and the Claude
-// runner against the pinned Claude Code and a fake Anthropic API.
+// runner, and the run loop over a real `grayboard mcp` child. The Claude
+// runner against the pinned Claude Code is tests/e2e/factory_claude.e2e.ts:
+// here it would make the pre-push hook fetch Claude Code (#456).
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } from "../../adapters/factory/bus.ts";
-import { ClaudeRunner } from "../../adapters/factory/claude/runner.ts";
 import { parseDelegation, requestOf, type Request } from "../../adapters/factory/delegate.ts";
 import { Factory, type Fleet } from "../../adapters/factory/factory.ts";
 import { DEFAULTS, loadConfig } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Runner } from "../../adapters/factory/runner.ts";
 import { Store } from "../../adapters/factory/store.ts";
 import { delegationBody } from "../../src/core/delegation.ts";
-import { claudeCodeBin, claudeHome } from "../support/claude_code.ts";
 import { localEnv } from "../support/env.ts";
-import { called, startFakeAnthropic, systemText, toolResults, userTexts } from "../support/fake_anthropic.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
 import { CLI } from "../support/paths.ts";
 import { until } from "../support/until.ts";
@@ -92,12 +90,17 @@ test("agent files: frontmatter name or filename; later directories override by n
   // Only tools and model come through; a field like permissionMode is never read.
   expect(parseAgent("/a/x.md", "---\nname: x\ntools: Read, Grep\nmodel: haiku\npermissionMode: bypassPermissions\n---\n\nline one\nline two\n")).toEqual({ file: "/a/x.md", name: "x", prompt: "line one\nline two", tools: ["Read", "Grep"], model: "haiku" });
   expect(parseAgent("/a/x.md", "---\nname: \"Writer\"\n---\n")?.name).toBe("Writer");
+  // An empty field is absent; it never takes the next line's value.
+  expect(parseAgent("/a/x.md", "---\nname: x\ndescription:\nmodel: haiku\n---\nb")).toEqual({ file: "/a/x.md", name: "x", prompt: "b", model: "haiku" });
   const user = join(dir, "user"), project = join(dir, "project");
   mkdirSync(user); mkdirSync(project);
   writeFileSync(join(user, "a.md"), "---\nname: alpha\n---\n");
   writeFileSync(join(user, "b.md"), "---\nname: beta\n---\n");
   writeFileSync(join(project, "b2.md"), "---\nname: beta\n---\n");
   writeFileSync(join(project, "notes.txt"), "---\nname: gamma\n---\n");
+  // Neither a dangling symlink nor a directory named *.md empties the roster.
+  symlinkSync(join(dir, "gone.md"), join(project, "dangling.md"));
+  mkdirSync(join(project, "folder.md"));
   const r = readAgents([user, project, join(dir, "missing")]);
   expect(r.map((a) => a.name).sort()).toEqual(["alpha", "beta"]);
   expect(r.find((a) => a.name === "beta")!.file).toBe(join(project, "b2.md"));
@@ -167,13 +170,13 @@ test("store: prune drops only replied rows past retention", () => {
 
 test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", () => {
   const c = loadConfig(dir, { HOME: dir });
-  expect(c).toMatchObject({ ...DEFAULTS, grayboard: ["grayboard"], cwd: dir });
+  expect(c).toMatchObject({ ...DEFAULTS, grayboard: ["grayboard"], cwd: join(dir, "work") }); // never $HOME
   writeFileSync(join(dir, "config.json"), JSON.stringify({ identity: "fac", allowedTools: ["Read"], maxConcurrent: 4, cwd: "/srv/work" }));
   expect(loadConfig(dir, { FACTORY_GRAYBOARD: "bun src/cli/main.ts" })).toMatchObject({ identity: "fac", allowedTools: ["Read"], maxConcurrent: 4, cwd: "/srv/work", grayboard: ["bun", "src/cli/main.ts"] });
   expect(loadConfig(dir, {}).tools).toBeUndefined();
   writeFileSync(join(dir, "config.json"), JSON.stringify({ tools: ["Bash", "Read"] }));
   expect(loadConfig(dir, {}).tools).toEqual(["Bash", "Read"]);
-  for (const bad of [{ tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, [1]]) {
+  for (const bad of [{ tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, { identity: "Factory" }, { maxConcurrent: null }, { cwd: null }, [1]]) {
     writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
     expect(() => loadConfig(dir, {})).toThrow();
   }
@@ -191,6 +194,7 @@ class FakeBus implements FactoryBus {
   sent: { tool: string; args: Record<string, unknown> }[] = [];
   fail = false;
   boards: { name: string; kind: string; mode: string | null }[] = [];
+  delayMs = 0;
   private q: Delivery[] = [];
   private wake: (() => void) | null = null;
   private done = false;
@@ -199,6 +203,7 @@ class FakeBus implements FactoryBus {
   deliver(d: Delivery) { this.q.push(d); this.wake?.(); }
   async call(tool: string, args: Record<string, unknown> = {}) {
     if (this.fail) throw new Error("bus down");
+    if (this.delayMs) await Bun.sleep(this.delayMs);
     this.sent.push({ tool, args });
     return tool === "board_list" ? this.boards : { ok: true };
   }
@@ -219,14 +224,16 @@ class FakeRunner implements Runner {
   readonly rosterSource = "/fake/agents";
   runs: { agent: string; id: number }[] = [];
   gates = new Map<number, PromiseWithResolvers<Outcome>>();
+  broken = false; // roster() throws, as a filesystem error would
+  abortLagMs = 0; // how long a held run takes to end once aborted, as a child's SIGTERM grace
   constructor(public names = ["researcher"], private readonly hold = false) {}
-  roster() { return agents(...this.names); }
+  roster() { if (this.broken) throw new Error("EIO: roster unreadable"); return agents(...this.names); }
   run(agent: Agent, r: Request, signal: AbortSignal): Promise<Outcome> {
     this.runs.push({ agent: agent.name, id: r.id });
     if (!this.hold) return Promise.resolve({ ok: true, text: `result for ${r.id}` });
     const g = Promise.withResolvers<Outcome>();
     this.gates.set(r.id, g);
-    signal.addEventListener("abort", () => g.resolve({ ok: false, error: "aborted" }));
+    signal.addEventListener("abort", () => setTimeout(() => g.resolve({ ok: false, error: "aborted" }), this.abortLagMs));
     return g.promise;
   }
 }
@@ -318,6 +325,58 @@ test("loop: a failed send stays unsent and housekeeping retries it", async () =>
   bus.fail = false;
   await until(() => store.get(k(50))?.replied, 5000, "housekeeping resend");
   expect(bus.replies(50).at(-1)).toContain("result for 50");
+  await bus.close();
+  await done;
+});
+
+test("loop: a throw while taking a delivery is logged and the loop takes the next", async () => {
+  const runner = new FakeRunner();
+  const { bus, store, logs, done } = loop({ runner });
+  runner.broken = true;
+  bus.deliver(ask(56)); // take() reads the roster
+  await until(() => logs.some((l) => l.includes("couldn't take a delivery") && l.includes("EIO")), 5000, "take's throw logged");
+  runner.broken = false;
+  bus.deliver(ask(57));
+  await until(() => bus.replies(57).length === 2, 5000, "the next request runs");
+  expect(store.get(k(56))).toBeNull();
+  await bus.close();
+  await done;
+});
+
+test("loop: a run whose roster read throws finishes failed, not stuck running", async () => {
+  const runner = new FakeRunner(["researcher"]);
+  const store = new Store(":memory:");
+  store.admit(req(60), "researcher"); // admitted before the roster broke
+  runner.broken = true;
+  const { bus, done } = loop({ runner, store });
+  await until(() => store.get(k(60))?.state === "finished", 5000, "60 finishes");
+  expect(store.get(k(60))!.reply).toStartWith("[factory] failed: the factory couldn't run this: EIO");
+  await until(() => bus.replies(60).length === 1, 5000, "60 answered");
+  await bus.close();
+  await done;
+});
+
+test("loop: stopping waits for a running child's outcome before run() returns", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  runner.abortLagMs = 200;
+  const { bus, store, done } = loop({ runner });
+  bus.deliver(ask(65));
+  await until(() => runner.gates.has(65), 5000, "run starts");
+  await bus.close();
+  await done;
+  // Recorded before the caller closes the store; sent at the next start.
+  expect(store.get(k(65))).toMatchObject({ state: "finished", reply: "[factory] failed: fake agent `researcher`: the factory stopped while this ran" });
+});
+
+test("loop: housekeeping never sends an outcome a send in flight is already sending", async () => {
+  const bus = new FakeBus(), store = new Store(":memory:");
+  const f = new Factory(bus, store, new FakeRunner(), { maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 20, log: () => {} });
+  const done = f.run();
+  bus.delayMs = 300; // every send outlasts several housekeeping passes
+  bus.deliver(ask(70));
+  await until(() => store.get(k(70))?.replied, 5000, "sent");
+  await Bun.sleep(200);
+  expect(bus.replies(70).filter((b) => b.startsWith("[factory] done:"))).toHaveLength(1);
   await bus.close();
   await done;
 });
@@ -456,67 +515,3 @@ test("local bus: a factory without the fleet's agent passes the task to another 
   await bus.close();
   expect(await done).toBe("closed");
 }, 30_000);
-
-// ── the Claude runner against pinned Claude Code ─────────────────────────────
-
-test("claude runner: runs the named agent headless, prompt on stdin, and returns its result", async () => {
-  const bin = claudeCodeBin();
-  const model = startFakeAnthropic([
-    (q) => (userTexts(q).some((t) => t.includes("-- FACTORY-TASK")) ? { text: systemText(q).includes("AGENT-PROMPT-7") ? "RESULT-42" : "wrong agent" } : undefined),
-  ]);
-  try {
-    const h = claudeHome(dir, model.url);
-    mkdirSync(join(h.config, "agents"), { recursive: true });
-    writeFileSync(join(h.config, "agents", "researcher.md"), "---\nname: researcher\ndescription: researches\n---\nAGENT-PROMPT-7: you research.\n");
-    const runner = new ClaudeRunner({ bin, cwd: h.work, allowedTools: [], env: h.env });
-    expect(runner.roster().map((a) => a.name)).toEqual(["researcher"]);
-    const agent = resolvePersona("a researcher", runner.roster())!;
-    // A task starting with "-" would be a flag in argv; on stdin it's text.
-    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal);
-    expect(out).toEqual({ ok: true, text: "RESULT-42" });
-    expect(model.unhandled).toEqual([]);
-  } finally {
-    model.stop();
-  }
-}, 120_000);
-
-// The operator's own settings must not widen a child. The fake model has the
-// agent run `touch MARKER` in the working directory; the marker shows whether
-// the shell ran. Measured on the pinned Claude Code: without --restricted, a
-// user rule allowing Bash lets the child's shell run.
-async function shellTrial(user: string[], o: { tools?: string[]; allowedTools: string[] }): Promise<{ marker: boolean; result: string; agentPrompt: boolean }> {
-  const model = startFakeAnthropic([
-    (q) => !userTexts(q).some((t) => t.includes("FACTORY-SHELL")) ? undefined
-      : called(q, "toolu_sh") ? { text: "ended" } : { tool: "Bash", id: "toolu_sh", input: { command: "touch MARKER", description: "touch a file" } },
-  ]);
-  try {
-    const h = claudeHome(dir, model.url, user);
-    mkdirSync(join(h.config, "agents"), { recursive: true });
-    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
-    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, ...o, env: h.env });
-    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal);
-    expect(out).toEqual({ ok: true, text: "ended" });
-    expect(model.unhandled).toEqual([]);
-    return { marker: existsSync(join(h.work, "MARKER")), result: toolResults(model, "toolu_sh").join("\n"), agentPrompt: model.requests.some((r) => systemText(r.body).includes("AGENT-PROMPT-9")) };
-  } finally {
-    model.stop();
-  }
-}
-
-test("claude runner: the operator's user allow rules don't reach a child; no shell unless the config names it", async () => {
-  const t = await shellTrial(["Bash"], { allowedTools: [] });
-  expect(t.agentPrompt).toBe(true);
-  expect(t.marker).toBe(false);
-  expect(t.result).toContain("No such tool available: Bash");
-}, 120_000);
-
-test("claude runner: a shell the config names in tools but not allowedTools is still denied, unprompted", async () => {
-  const t = await shellTrial(["Bash"], { tools: ["Bash", "Read"], allowedTools: [] });
-  expect(t.marker).toBe(false);
-  expect(t.result).toContain("Permission for this tool use was denied");
-}, 120_000);
-
-test("claude runner: a shell the config names in both lists runs", async () => {
-  const t = await shellTrial([], { tools: ["Bash", "Read"], allowedTools: ["Bash"] });
-  expect(t.marker).toBe(true);
-}, 120_000);
