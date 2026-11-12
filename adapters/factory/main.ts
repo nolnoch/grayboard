@@ -4,7 +4,7 @@
 // launchd, a tmux loop) restarts it; the store makes a restart safe.
 //
 //   bun adapters/factory/main.ts            (config: $FACTORY_DATA_DIR/config.json)
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { LocalBus, sessionFree } from "./bus.ts";
@@ -18,7 +18,7 @@ export type Config = {
   identity: string;        // the bus name the factory binds (BUS_IDENTITY)
   grayboard: string[];     // the grayboard CLI command
   claude: string;          // the claude executable
-  cwd: string;             // the children's working directory
+  cwd: string;             // the children's working directory; default $FACTORY_DATA_DIR/work, never $HOME (the file tools reach all of it)
   tools?: string[];        // the tools a child has (--tools); absent, Claude Code's restricted default: no shell, no WebFetch
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
   fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent it runs
@@ -33,23 +33,24 @@ export const DEFAULTS = { identity: "factory", claude: "claude", allowedTools: [
 
 // The config file's fields over the defaults; FACTORY_GRAYBOARD (a command
 // line, split on spaces) over the file's `grayboard`. A field of the wrong
-// type is an error, never silently the default.
+// type (null included) is an error, never silently the default.
 export function loadConfig(dataDir: string, env: Record<string, string | undefined>): Config {
   const path = join(dataDir, "config.json");
   const raw: Record<string, unknown> = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error(`${path}: not a JSON object`);
+  const get = (k: string, d: unknown) => (raw[k] === undefined ? d : raw[k]);
   const str = (k: string, d: string) => {
-    const v = raw[k] ?? d;
+    const v = get(k, d);
     if (typeof v !== "string" || !v.trim()) throw new Error(`${path}: "${k}" must be a non-empty string`);
     return v;
   };
   const strs = (k: string, d: string[]) => {
-    const v = raw[k] ?? d;
+    const v = get(k, d);
     if (!Array.isArray(v) || !v.every((x) => typeof x === "string" && x)) throw new Error(`${path}: "${k}" must be an array of non-empty strings`);
     return v as string[];
   };
   const pos = (k: string, d: number) => {
-    const v = raw[k] ?? d;
+    const v = get(k, d);
     if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${path}: "${k}" must be a positive integer`);
     return v;
   };
@@ -67,11 +68,14 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   }
   const gb = env.FACTORY_GRAYBOARD?.trim() ? env.FACTORY_GRAYBOARD.trim().split(/\s+/) : strs("grayboard", ["grayboard"]);
   if (gb.length === 0) throw new Error(`${path}: "grayboard" must not be empty`);
+  const identity = str("identity", DEFAULTS.identity);
+  // A bus name (boards.md §3); anything else could never be bound.
+  if (!/^[a-z0-9_-]{1,32}$/.test(identity)) throw new Error(`${path}: "identity" must be 1-32 characters of a-z 0-9 _ -`);
   return {
-    identity: str("identity", DEFAULTS.identity),
+    identity,
     grayboard: gb,
     claude: str("claude", DEFAULTS.claude),
-    cwd: resolve(str("cwd", env.HOME ?? homedir())),
+    cwd: resolve(dataDir, str("cwd", join(dataDir, "work"))),
     ...(raw.tools !== undefined ? { tools: strs("tools", []) } : {}),
     allowedTools: strs("allowedTools", DEFAULTS.allowedTools),
     fleets: (fleets as { name: string; agent: string; fanout?: boolean }[]).map((f) => ({ name: f.name, agent: f.agent.trim(), ...(f.fanout === false ? { fanout: false } : {}) })),
@@ -86,6 +90,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   const log = (m: string) => console.error(`[factory] ${m}`);
   const dataDir = resolve(env.FACTORY_DATA_DIR ?? join(env.HOME ?? homedir(), ".grayboard-factory"));
   const cfg = loadConfig(dataDir, env);
+  mkdirSync(cfg.cwd, { recursive: true });
   const store = new Store(join(dataDir, "factory.db"));
   const runner = new ClaudeRunner({ bin: cfg.claude, cwd: cfg.cwd, ...(cfg.tools ? { tools: cfg.tools } : {}), allowedTools: cfg.allowedTools, env: sessionFree(env) });
   let bus: LocalBus;

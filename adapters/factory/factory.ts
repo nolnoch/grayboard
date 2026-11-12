@@ -33,6 +33,8 @@ export class Factory {
   private running = 0;
   private stopping = false;
   private readonly children = new Set<AbortController>();
+  private readonly inflight = new Set<Promise<void>>(); // running execs, awaited at shutdown
+  private readonly sending = new Set<string>(); // keys whose outcome is being sent, so housekeeping can't send one twice
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
@@ -47,13 +49,29 @@ export class Factory {
     }
     await this.syncFleets();
     await this.housekeeping();
-    this.timer = setInterval(() => void this.housekeeping(), this.o.housekeepingMs ?? 3_600_000);
+    this.timer = setInterval(() => void this.housekeeping().catch((e) => this.o.log(`housekeeping: ${msg(e)}`)), this.o.housekeepingMs ?? 3_600_000);
     this.pump();
-    const consume = (async () => { for await (const d of this.bus.deliveries()) await this.take(d); })();
+    // One bad delivery must not end the loop: log it and take the next.
+    const consume = (async () => {
+      for await (const d of this.bus.deliveries()) await this.take(d).catch((e) => this.o.log(`couldn't take a delivery: ${msg(e)}`));
+    })();
     const why = await this.bus.closed;
     this.stop();
     await consume.catch(() => {});
+    await this.settle();
     return why;
+  }
+
+  // Waits for running execs to record their outcome (stop() aborted their
+  // children, whose groups get SIGKILL after a grace), so the caller can
+  // close the store. A row still running past the deadline is reported
+  // interrupted at the next start.
+  private async settle(deadlineMs = 15_000): Promise<void> {
+    if (!this.inflight.size) return;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((ok) => (t = setTimeout(() => { this.o.log(`${this.inflight.size} run(s) didn't finish within ${deadlineMs} ms of stopping`); ok(); }, deadlineMs)));
+    await Promise.race([Promise.allSettled([...this.inflight]), late]);
+    clearTimeout(t);
   }
 
   stop(): void {
@@ -158,14 +176,35 @@ export class Factory {
       const row = this.store.next();
       if (!row) return;
       this.running++;
-      void this.exec(row).finally(() => { this.running--; this.pump(); });
+      const p: Promise<void> = this.exec(row)
+        .catch((e) => this.o.log(`request ${row.id}: ${msg(e)}`))
+        .finally(() => { this.running--; this.inflight.delete(p); this.pump(); });
+      this.inflight.add(p);
     }
   }
 
   // One slot's work: a request's run, a subtask's run, or a fanned-out
   // request's synthesis. A run that returns a plan fans out instead of
-  // finishing; a subtask's end may queue its parent's synthesis.
+  // finishing; a subtask's end may queue its parent's synthesis. Never
+  // throws past recording an outcome: anything unexpected finishes the row
+  // failed.
   private async exec(row: Row): Promise<void> {
+    let body: string | null;
+    try {
+      body = await this.outcome(row);
+    } catch (e) {
+      body = `[factory] failed: the factory couldn't run this: ${msg(e)}`;
+    }
+    if (body === null) return; // fanned out: its synthesis finishes it
+    this.store.finish(row, clip(body));
+    // Before the send's await: a crash during it must not strand a parent
+    // whose subtasks all finished.
+    if (row.parent !== null && this.store.synthesizeWhenDone(row.parent)) this.o.log(`request ${row.parent}: every subtask finished; synthesizing`);
+    await this.send(this.store.get(row)!);
+  }
+
+  // The row's reply, or null when its run fanned out.
+  private async outcome(row: Row): Promise<string | null> {
     const synth = row.phase === "synthesize";
     const max = this.o.maxSubtasks ?? 5;
     const input: Request = synth
@@ -179,7 +218,7 @@ export class Factory {
       const plan = row.fanout && !synth ? parsePlan(out.text, max) : null;
       if (plan && typeof plan !== "string") {
         const why = await this.fanOut(row, plan);
-        if (!why) return;
+        if (!why) return null;
         body = `[factory] failed: ${why}`;
       } else if (typeof plan === "string") {
         body = `[factory] failed: ${this.runner.harness} agent \`${row.agent}\` returned a plan the factory can't use: ${plan}. Nothing was fanned out.`;
@@ -189,11 +228,7 @@ export class Factory {
           : `[factory] done: ${this.runner.harness} agent \`${row.agent}\`\n\n${out.text}`;
       }
     }
-    this.store.finish(row, clip(body));
-    // Before the send's await: a crash during it must not strand a parent
-    // whose subtasks all finished.
-    if (row.parent !== null && this.store.synthesizeWhenDone(row.parent)) this.o.log(`request ${row.parent}: every subtask finished; synthesizing`);
-    await this.send(this.store.get(row)!);
+    return body;
   }
 
   // Runs the row's agent on `input`; a string is a failure reply that needed no run.
@@ -262,13 +297,19 @@ export class Factory {
   }
 
   // A finished outcome's reply; it stays unsent (retried by housekeeping) if the send fails.
-  private async send(row: Row): Promise<void> {
-    if (row.replied || row.reply === null) return;
+  private async send(k: Row): Promise<void> {
+    const key = `${k.source}:${k.id}`;
+    if (this.sending.has(key)) return;
+    const row = this.store.get(k); // fresh: a caller's copy may predate another send
+    if (!row || row.replied || row.reply === null) return;
+    this.sending.add(key);
     try {
       await this.reply(row, row.reply);
       this.store.markReplied(row);
     } catch (e) {
       this.o.log(`couldn't send the outcome of request ${row.id}; will retry: ${msg(e)}`);
+    } finally {
+      this.sending.delete(key);
     }
   }
 

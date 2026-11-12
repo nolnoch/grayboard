@@ -2,7 +2,7 @@
 // and a headless run of one agent on one request. The run loop is
 // harness-neutral; a runner is the only per-harness code.
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Request } from "./delegate.ts";
 
@@ -24,15 +24,23 @@ export interface Runner {
 
 // Agent files: markdown with `name:` (and optionally `description:`) in YAML
 // frontmatter; no frontmatter, not an agent. A name-less file is named by its
-// filename. Later directories override earlier ones by name.
+// filename. Later directories override earlier ones by name. A missing
+// directory, or an entry that isn't a readable file (a dangling symlink, a
+// directory named *.md), is skipped: one bad file can't empty the roster.
 export function readAgents(dirs: string[]): Agent[] {
   const byName = new Map<string, Agent>();
   for (const dir of dirs) {
-    if (!existsSync(dir)) continue;
-    for (const e of readdirSync(dir).sort()) {
+    let entries: string[];
+    try { entries = readdirSync(dir).sort(); } catch { continue; }
+    for (const e of entries) {
       if (!e.endsWith(".md")) continue;
       const file = join(dir, e);
-      const a = parseAgent(file, readFileSync(file, "utf8"));
+      let text: string;
+      try {
+        if (!statSync(file).isFile()) continue;
+        text = readFileSync(file, "utf8");
+      } catch { continue; }
+      const a = parseAgent(file, text);
       if (a) byName.set(a.name, a);
     }
   }
@@ -44,7 +52,7 @@ export function parseAgent(file: string, text: string): Agent | null {
   const close = text.indexOf("\n---", 3);
   if (close < 0) return null;
   const fm = text.slice(3, close);
-  const field = (k: string) => new RegExp(`^${k}:\\s*(.+)$`, "m").exec(fm)?.[1]?.trim().replace(/^["']|["']$/g, "");
+  const field = (k: string) => new RegExp(`^${k}:[ \\t]*(.+)$`, "m").exec(fm)?.[1]?.trim().replace(/^["']|["']$/g, "");
   const name = field("name") || (file.split("/").pop() ?? "").replace(/\.md$/i, "");
   if (!name) return null;
   const description = field("description"), model = field("model");
