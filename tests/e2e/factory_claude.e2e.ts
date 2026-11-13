@@ -5,7 +5,7 @@
 // `scripts/e2e.sh claude-local`; outside `bun test`'s discovery, so the
 // pre-push hook never fetches Claude Code for it (#456).
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeRunner } from "../../adapters/factory/claude/runner.ts";
@@ -30,9 +30,14 @@ test("claude runner: runs the named agent headless, prompt on stdin, and returns
     expect(runner.roster().map((a) => a.name)).toEqual(["researcher"]);
     const agent = resolvePersona("a researcher", runner.roster())!;
     // A task starting with "-" would be a flag in argv; on stdin it's text.
-    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] });
-    expect(out).toEqual({ ok: true, text: "RESULT-42" });
+    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: true, text: "RESULT-42", run: { code: 0, turns: 1 } });
+    expect(typeof out.run?.session).toBe("string");
     expect(model.unhandled).toEqual([]);
+    // The transcript (#649): the child's stream-json events, 0600, ending in its result.
+    expect(statSync(join(dir, "t.jsonl")).mode & 0o777).toBe(0o600);
+    const events = readFileSync(join(dir, "t.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(events.at(-1)).toMatchObject({ type: "result", subtype: "success", result: "RESULT-42", session_id: out.run?.session });
   } finally {
     model.stop();
   }
@@ -52,8 +57,8 @@ async function shellTrial(user: string[], o: { tools?: string[]; allowedTools: s
     mkdirSync(join(h.config, "agents"), { recursive: true });
     writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
     const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
-    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal, o, { cwd: h.work, addDirs: [] });
-    expect(out).toEqual({ ok: true, text: "ended" });
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal, o, { cwd: h.work, addDirs: [] }, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: true, text: "ended" });
     expect(model.unhandled).toEqual([]);
     return { marker: existsSync(join(h.work, "MARKER")), result: toolResults(model, "toolu_sh").join("\n"), agentPrompt: model.requests.some((r) => systemText(r.body).includes("AGENT-PROMPT-9")) };
   } finally {
@@ -96,8 +101,8 @@ async function readTrial(add: boolean): Promise<string> {
     writeFileSync(join(dir, "tree", "8", "out.txt"), "SUBTASK-OUTPUT-8\n");
     const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
     const place = { cwd: join(dir, "tree", "main"), addDirs: add ? [join(dir, "tree")] : [] };
-    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-READ" }, new AbortController().signal, { allowedTools: [] }, place);
-    expect(out).toEqual({ ok: true, text: "ended" });
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-READ" }, new AbortController().signal, { allowedTools: [] }, place, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: true, text: "ended" });
     expect(model.unhandled).toEqual([]);
     return toolResults(model, "toolu_rd").join("\n");
   } finally {
@@ -109,3 +114,26 @@ test("claude runner: a child reads a sibling directory only when the run adds it
   expect(await readTrial(true)).toContain("SUBTASK-OUTPUT-8");
   expect(await readTrial(false)).not.toContain("SUBTASK-OUTPUT-8");
 }, 240_000);
+
+// A budget (#649): Claude Code checks it after each turn, so a child that
+// would loop forever stops at the first turn past it, exit 1.
+test("claude runner: a run past its budget stops, and the outcome says so", async () => {
+  let n = 0;
+  const model = startFakeAnthropic([
+    (q) => (userTexts(q).some((t) => t.includes("FACTORY-LOOP")) ? { tool: "Read", id: `toolu_l${++n}`, input: { file_path: `/nonexistent/${n}` } } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-LOOP" }, new AbortController().signal, { allowedTools: [], budgetUsd: 0.00001 }, { cwd: h.work, addDirs: [] }, join(dir, "t.jsonl"));
+    expect(out).toMatchObject({ ok: false, run: { code: 1, stop: "budget" } });
+    expect(out.ok ? "" : out.error).toStartWith("stopped at its budget of $0.00001");
+    expect(n).toBeLessThan(5); // stopped, not timed out
+    const last = JSON.parse(readFileSync(join(dir, "t.jsonl"), "utf8").trim().split("\n").at(-1)!);
+    expect(last).toMatchObject({ type: "result", subtype: "error_max_budget_usd" });
+  } finally {
+    model.stop();
+  }
+}, 120_000);

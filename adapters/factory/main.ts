@@ -24,6 +24,7 @@ export type Config = {
   workdir: Workdir;        // the global working-directory mode (#641): scratch (default), worktree (needs repo) or shared
   tools?: string[];        // the tools a child has (--tools); absent, Claude Code's restricted default: no shell, no WebFetch
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
+  budgetUsd?: number;      // the most one run may spend, in USD (#649); absent, no cap
   profiles: Profile[];     // named agent + tool lists a fleet runs under (#643)
   fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent (and policy) it runs; projects (#645) included, with their routes
   maxConcurrent: number;
@@ -34,7 +35,7 @@ export type Config = {
 
 // A profile (#643): the agent, what its children may do and where they run
 // (#641). Its tool lists, mode and repo fall back to the global ones field by field.
-export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; workdir?: WorkdirMode; repo?: string };
+export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; budgetUsd?: number; workdir?: WorkdirMode; repo?: string };
 
 // The fields a SIGHUP reload can't change: they shape the bus session, the
 // runner or the worker pool, which live as long as the process.
@@ -66,6 +67,11 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${path}: "${k}" must be a positive integer`);
     return v;
   };
+  // A budget (#649): a positive number of dollars, fractions allowed.
+  const usd = (v: unknown, what: string) => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) throw new Error(`${path}: ${what} must be a positive number (USD)`);
+    return v;
+  };
   const atLeast2 = (n: number) => { if (n < 2) throw new Error(`${path}: "maxSubtasks" must be at least 2`); return n; };
   const NAME = /^[a-z0-9_-]{1,26}$/;
   const list = (v: unknown, what: string) => {
@@ -74,7 +80,8 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   };
   const tools = raw.tools !== undefined ? strs("tools", []) : undefined;
   const allowedTools = strs("allowedTools", DEFAULTS.allowedTools);
-  const global: Policy = { ...(tools ? { tools } : {}), allowedTools };
+  const budgetUsd = raw.budgetUsd !== undefined ? usd(raw.budgetUsd, `"budgetUsd"`) : undefined;
+  const global: Policy = { ...(tools ? { tools } : {}), allowedTools, ...(budgetUsd !== undefined ? { budgetUsd } : {}) };
   const mode = (v: unknown, what: string): WorkdirMode => {
     if (typeof v !== "string" || !(WORKDIR_MODES as readonly string[]).includes(v)) throw new Error(`${path}: ${what} must be one of ${WORKDIR_MODES.join(", ")}`);
     return v as WorkdirMode;
@@ -96,7 +103,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   const workdir = workdirOf(raw.workdir !== undefined ? mode(raw.workdir, `"workdir"`) : "scratch", globalRepo, "the global config");
 
   const rawProfiles = raw.profiles ?? [];
-  if (!Array.isArray(rawProfiles)) throw new Error(`${path}: "profiles" must be an array of {name, agent, tools?, allowedTools?, workdir?, repo?}`);
+  if (!Array.isArray(rawProfiles)) throw new Error(`${path}: "profiles" must be an array of {name, agent, tools?, allowedTools?, budgetUsd?, workdir?, repo?}`);
   const profiles = new Map<string, Profile>();
   for (const p of rawProfiles as Record<string, unknown>[]) {
     if (typeof p !== "object" || p === null || typeof p.name !== "string" || !NAME.test(p.name)) throw new Error(`${path}: each profile's "name" must be 1-26 characters of a-z 0-9 _ -`);
@@ -106,6 +113,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
       name: p.name, agent: p.agent.trim(),
       ...(p.tools !== undefined ? { tools: list(p.tools, `profile ${p.name}: "tools"`) } : {}),
       ...(p.allowedTools !== undefined ? { allowedTools: list(p.allowedTools, `profile ${p.name}: "allowedTools"`) } : {}),
+      ...(p.budgetUsd !== undefined ? { budgetUsd: usd(p.budgetUsd, `profile ${p.name}: "budgetUsd"`) } : {}),
       ...(p.workdir !== undefined ? { workdir: mode(p.workdir, `profile ${p.name}: "workdir"`) } : {}),
       ...(p.repo !== undefined ? { repo: repo(p.repo, `profile ${p.name}: "repo"`) } : {}),
     });
@@ -118,7 +126,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   // replaces the profile's.
   const routeOf = (p: Profile, repoOver?: string): Route => ({
     profile: p.name, agent: p.agent,
-    policy: { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools },
+    policy: { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools, ...((p.budgetUsd ?? budgetUsd) !== undefined ? { budgetUsd: p.budgetUsd ?? budgetUsd } : {}) },
     workdir: workdirOf(p.workdir ?? workdir.mode, repoOver ?? p.repo ?? workdir.repo, `profile ${p.name}`),
   });
   const fromRoutes = (name: string, routes: Route[], fanout: { fanout?: boolean }): Fleet => {
@@ -188,6 +196,11 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   };
 }
 
+// The global policy: delegations, and fleets without a profile.
+export function policyOf(c: Config): Policy {
+  return { ...(c.tools ? { tools: c.tools } : {}), allowedTools: c.allowedTools, ...(c.budgetUsd !== undefined ? { budgetUsd: c.budgetUsd } : {}) };
+}
+
 export async function main(env: Record<string, string | undefined> = process.env): Promise<number> {
   const log = (m: string) => console.error(`[factory] ${m}`);
   const dataDir = resolve(env.FACTORY_DATA_DIR ?? join(env.HOME ?? homedir(), ".grayboard-factory"));
@@ -205,7 +218,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
   const workspaces = new Workspaces(join(dataDir, "trees"), cfg.cwd);
-  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: { ...(cfg.tools ? { tools: cfg.tools } : {}), allowedTools: cfg.allowedTools }, workdir: cfg.workdir, workspaces, maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
+  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
   let signalled = false;
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);
@@ -223,7 +236,7 @@ export async function main(env: Record<string, string | undefined> = process.env
       }
       const restart = RESTART_ONLY.filter((k) => JSON.stringify(next[k]) !== JSON.stringify(cfg[k]));
       if (restart.length) log(`reload: ${restart.join(", ")} changed, which takes a restart; the running values stay`);
-      await factory.reconfigure({ fleets: next.fleets, policy: { ...(next.tools ? { tools: next.tools } : {}), allowedTools: next.allowedTools }, workdir: next.workdir });
+      await factory.reconfigure({ fleets: next.fleets, policy: policyOf(next), workdir: next.workdir });
       log(`reloaded: ${next.fleets.length} fleet(s) and project(s)`);
     }).catch((e) => log(`reload failed: ${e instanceof Error ? e.message : String(e)}`));
   };
