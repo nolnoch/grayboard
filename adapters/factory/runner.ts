@@ -11,6 +11,10 @@ import type { Request } from "./delegate.ts";
 // else from the file, so a field like `permissionMode` can't widen a child.
 export type Agent = { name: string; file: string; description?: string; prompt: string; tools?: string[]; model?: string };
 export type Outcome = { ok: true; text: string } | { ok: false; error: string };
+// What a child may do (#643): the tools it has (absent, the harness's
+// restricted default) and those that run without a prompt. From the run's
+// profile, else the config's global lists; never from the request.
+export type Policy = { tools?: string[]; allowedTools: string[] };
 
 export interface Runner {
   readonly harness: string;
@@ -18,8 +22,8 @@ export interface Runner {
   roster(): Agent[];
   // Where the roster comes from, for a decline's text.
   readonly rosterSource: string;
-  // Runs `agent` on the request until it ends or `signal` aborts (a timeout).
-  run(agent: Agent, r: Request, signal: AbortSignal): Promise<Outcome>;
+  // Runs `agent` on the request under `policy` until it ends or `signal` aborts (a timeout).
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy): Promise<Outcome>;
 }
 
 // Agent files: markdown with `name:` (and optionally `description:`) in YAML

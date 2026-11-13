@@ -26,11 +26,11 @@ test("claude runner: runs the named agent headless, prompt on stdin, and returns
     const h = claudeHome(dir, model.url);
     mkdirSync(join(h.config, "agents"), { recursive: true });
     writeFileSync(join(h.config, "agents", "researcher.md"), "---\nname: researcher\ndescription: researches\n---\nAGENT-PROMPT-7: you research.\n");
-    const runner = new ClaudeRunner({ bin, cwd: h.work, allowedTools: [], env: h.env });
+    const runner = new ClaudeRunner({ bin, cwd: h.work, env: h.env });
     expect(runner.roster().map((a) => a.name)).toEqual(["researcher"]);
     const agent = resolvePersona("a researcher", runner.roster())!;
     // A task starting with "-" would be a flag in argv; on stdin it's text.
-    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal);
+    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal, { allowedTools: [] });
     expect(out).toEqual({ ok: true, text: "RESULT-42" });
     expect(model.unhandled).toEqual([]);
   } finally {
@@ -51,8 +51,8 @@ async function shellTrial(user: string[], o: { tools?: string[]; allowedTools: s
     const h = claudeHome(dir, model.url, user);
     mkdirSync(join(h.config, "agents"), { recursive: true });
     writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
-    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, ...o, env: h.env });
-    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal);
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal, o);
     expect(out).toEqual({ ok: true, text: "ended" });
     expect(model.unhandled).toEqual([]);
     return { marker: existsSync(join(h.work, "MARKER")), result: toolResults(model, "toolu_sh").join("\n"), agentPrompt: model.requests.some((r) => systemText(r.body).includes("AGENT-PROMPT-9")) };

@@ -12,7 +12,7 @@ import { parseDelegation, requestOf, type Request } from "../../adapters/factory
 import { Factory, type Fleet } from "../../adapters/factory/factory.ts";
 import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
 import { DEFAULTS, loadConfig } from "../../adapters/factory/main.ts";
-import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Runner } from "../../adapters/factory/runner.ts";
+import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "../../adapters/factory/runner.ts";
 import { Store } from "../../adapters/factory/store.ts";
 import { delegationBody } from "../../src/core/delegation.ts";
 import { localEnv } from "../support/env.ts";
@@ -181,7 +181,18 @@ test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", 
   writeFileSync(join(dir, "config.json"), JSON.stringify({ maxSubtasks: 3, fleets: [{ name: "a", agent: "x" }, { name: "b", agent: "y", fanout: false }] }));
   expect(loadConfig(dir, {})).toMatchObject({ maxSubtasks: 3, fleets: [{ name: "a", agent: "x" }, { name: "b", agent: "y", fanout: false }] });
   expect(loadConfig(dir, {}).fleets[0]).not.toHaveProperty("fanout");
-  for (const bad of [{ maxSubtasks: 1 }, { fleets: [{ name: "a", agent: "x", fanout: "yes" }] }, { tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, { identity: "Factory" }, { maxConcurrent: null }, { cwd: null }, [1]]) {
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ tools: ["Read"], allowedTools: ["Read"], profiles: [{ name: "code", agent: "coder", tools: ["Bash", "Read"], allowedTools: ["Bash"] }, { name: "research", agent: " researcher ", allowedTools: [] }], fleets: [{ name: "app", profile: "code" }, { name: "lab", profile: "research", fanout: false }, { name: "old", agent: "x" }] }));
+  const pc = loadConfig(dir, {});
+  expect(pc.profiles.map((p) => p.name)).toEqual(["code", "research"]);
+  expect(pc.fleets).toEqual([
+    { name: "app", agent: "coder", profile: "code", policy: { tools: ["Bash", "Read"], allowedTools: ["Bash"] } },
+    { name: "lab", agent: "researcher", fanout: false, profile: "research", policy: { tools: ["Read"], allowedTools: [] } }, // tools fall back to the global list, field by field
+    { name: "old", agent: "x" }, // no profile: the global lists at run time
+  ]);
+  for (const bad of [{ maxSubtasks: 1 }, { fleets: [{ name: "a", agent: "x", fanout: "yes" }] },
+    { profiles: [{ name: "p", agent: "x" }], fleets: [{ name: "a", profile: "p", agent: "x" }] }, { fleets: [{ name: "a", profile: "nope" }] },
+    { profiles: [{ name: "p", agent: "x" }, { name: "p", agent: "y" }] }, { profiles: [{ name: "p" }] }, { profiles: [{ name: "P", agent: "x" }] },
+    { profiles: [{ name: "p", agent: "x", tools: "Bash" }] }, { profiles: [{ name: "p", agent: "x", allowedTools: [""] }] }, { profiles: {} }, { tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, { identity: "Factory" }, { maxConcurrent: null }, { cwd: null }, [1]]) {
     writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
     expect(() => loadConfig(dir, {})).toThrow();
   }
@@ -226,10 +237,13 @@ class FakeBus implements FactoryBus {
   replies(id: number) { return this.sent.filter((s) => s.args.parent_id === id).map((s) => String(s.args.body)); }
 }
 
+const GLOBAL: Policy = { allowedTools: ["Read"] };
+
 class FakeRunner implements Runner {
   readonly harness = "fake";
   readonly rosterSource = "/fake/agents";
   runs: { agent: string; id: number }[] = [];
+  policies: Policy[] = []; // each run's policy, in run order
   inputs: string[] = []; // each run's task text, in run order
   gates = new Map<number, PromiseWithResolvers<Outcome>>();
   // A run's text when it returns one (a plan, say); otherwise `result for <id>`.
@@ -238,8 +252,9 @@ class FakeRunner implements Runner {
   abortLagMs = 0; // how long a held run takes to end once aborted, as a child's SIGTERM grace
   constructor(public names = ["researcher"], private readonly hold = false) {}
   roster() { if (this.broken) throw new Error("EIO: roster unreadable"); return agents(...this.names); }
-  run(agent: Agent, r: Request, signal: AbortSignal): Promise<Outcome> {
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy): Promise<Outcome> {
     this.runs.push({ agent: agent.name, id: r.id });
+    this.policies.push(policy);
     this.inputs.push(r.task);
     if (!this.hold) return Promise.resolve({ ok: true, text: this.script(r) ?? `result for ${r.id}` });
     const g = Promise.withResolvers<Outcome>();
@@ -252,7 +267,7 @@ class FakeRunner implements Runner {
 function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; timeoutMs?: number; fleets?: Fleet[]; bus?: FakeBus } = {}) {
   const bus = o.bus ?? new FakeBus(), runner = o.runner ?? new FakeRunner(), store = o.store ?? new Store(":memory:");
   const logs: string[] = [];
-  const f = new Factory(bus, store, runner, { fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m) });
+  const f = new Factory(bus, store, runner, { policy: GLOBAL, fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m) });
   const done = f.run();
   return { bus, runner, store, logs, done };
 }
@@ -331,7 +346,7 @@ test("loop: a restart mid fan-out interrupts only the running subtask, runs the 
   s.admit({ id: 7, source: "board", board: "sim-tasks", requester: "fe", persona: "sim", task: "big" }, "researcher", { fanout: true });
   s.fanOut(s.next()!, "task-7", [sub(100), sub(101)]);
   s.next(); // 100 was running when the process died; 101 never started
-  const { bus, runner, done } = loop({ store: s });
+  const { bus, runner, done } = loop({ store: s, fleets: [{ name: "sim", agent: "researcher" }] });
   await until(() => bus.replies(7).length === 1, 5000, "synthesis");
   expect(bus.replies(100)).toEqual(["[factory] interrupted: the factory stopped before this finished; nothing is running for it now. The task's combined result will say this subtask was interrupted."]);
   expect(bus.replies(101)).toEqual(["[factory] done: fake agent `researcher`\n\nresult for 101"]);
@@ -343,7 +358,7 @@ test("loop: a restart mid fan-out interrupts only the running subtask, runs the 
 
 test("loop: a failed send stays unsent and housekeeping retries it", async () => {
   const bus = new FakeBus(), store = new Store(":memory:");
-  const f = new Factory(bus, store, new FakeRunner(), { maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 100, log: () => {} });
+  const f = new Factory(bus, store, new FakeRunner(), { policy: GLOBAL, maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 100, log: () => {} });
   const done = f.run();
   bus.fail = true;
   bus.deliver(ask(50));
@@ -397,7 +412,7 @@ test("loop: stopping waits for a running child's outcome before run() returns", 
 
 test("loop: housekeeping never sends an outcome a send in flight is already sending", async () => {
   const bus = new FakeBus(), store = new Store(":memory:");
-  const f = new Factory(bus, store, new FakeRunner(), { maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 20, log: () => {} });
+  const f = new Factory(bus, store, new FakeRunner(), { policy: GLOBAL, maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 20, log: () => {} });
   const done = f.run();
   bus.delayMs = 300; // every send outlasts several housekeeping passes
   bus.deliver(ask(70));
@@ -415,7 +430,7 @@ test("local bus: a delegate from a real session reaches the factory, which answe
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   expect(bus.handle).toBe("factory");
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   // The factory is a launcher: delegate's auto-pick finds it.
   const peers = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
@@ -507,7 +522,7 @@ test("local bus: a fleet task posted on the queue board is run by the factory la
   const fe = await localSession(dir, "fe");
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
   const p = await call(fe.c, "board_post", { board: "sim-tasks", body: "summarize the spec" });
@@ -525,7 +540,7 @@ test("local bus: a factory without the fleet's agent passes the task to another 
   const fe = await localSession(dir, "fe"), be = await localSession(dir, "be");
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { fleets: [{ name: "sim", agent: "builder" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, fleets: [{ name: "sim", agent: "builder" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
   // The rotation offers never-woken lanes first, by handle: the first post
@@ -657,7 +672,7 @@ test("local bus: a fan-out's subtasks and outcomes are posts on a task board oth
   const fe = await localSession(dir, "fe");
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 2, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 2, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
   const p = await call(fe.c, "board_post", { board: "sim-tasks", body: "summarize three specs" });
@@ -674,3 +689,26 @@ test("local bus: a fan-out's subtasks and outcomes are posts on a task board oth
   await bus.close();
   expect(await done).toBe("closed");
 }, 30_000);
+
+test("profiles: a fleet task and its subtasks run under the fleet's policy, a delegation under the global one, and a fleet gone from the config runs nothing (#643)", async () => {
+  const code: Policy = { tools: ["Bash", "Read"], allowedTools: ["Bash"] };
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const fleets: Fleet[] = [{ name: "sim", agent: "researcher", profile: "code", policy: code }, { name: "old", agent: "researcher" }];
+  const { bus, store, done } = loop({ runner, fleets });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "fan-out and synthesis");
+  bus.deliver(task(50, { board: "old-tasks" }));
+  await until(() => bus.replies(50).length === 2, 5000, "profile-less fleet task");
+  bus.deliver(ask(60));
+  await until(() => bus.replies(60).length === 2, 5000, "delegation");
+  expect(runner.policies).toEqual([code, code, code, code, GLOBAL, GLOBAL]); // 7, its 2 subtasks, its synthesis; 50; 60
+  // A queued task whose fleet left the config: no run, and it says why.
+  store.admit({ id: 70, source: "board", board: "gone-tasks", requester: "fe", persona: "gone", task: "x" }, "researcher");
+  bus.deliver(ask(61)); // pumps the queue
+  await until(() => bus.replies(70).length === 1, 5000, "gone fleet fails");
+  expect(bus.replies(70)[0]).toBe('[factory] failed: fleet "gone" is no longer in the factory\'s config; nothing was spawned.');
+  expect(runner.runs.map((r) => r.id)).not.toContain(70);
+  await bus.close();
+  await done;
+});

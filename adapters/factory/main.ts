@@ -10,6 +10,7 @@ import { join, resolve } from "node:path";
 import { LocalBus, sessionFree } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
 import { Factory, type Fleet } from "./factory.ts";
+import type { Policy } from "./runner.ts";
 import { Store } from "./store.ts";
 
 export const VERSION = "0.1.0";
@@ -21,12 +22,17 @@ export type Config = {
   cwd: string;             // the children's working directory; default $FACTORY_DATA_DIR/work, never $HOME (the file tools reach all of it)
   tools?: string[];        // the tools a child has (--tools); absent, Claude Code's restricted default: no shell, no WebFetch
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
-  fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent it runs
+  profiles: Profile[];     // named agent + tool lists a fleet runs under (#643)
+  fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent (and policy) it runs
   maxConcurrent: number;
   maxSubtasks: number;     // the most subtasks a fleet task's plan may fan out to
   timeoutMs: number;
   retentionMs: number;
 };
+
+// A profile (#643): the agent and what its children may do. Its tool lists
+// fall back to the global ones field by field.
+export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[] };
 
 const DAY = 86_400_000;
 export const DEFAULTS = { identity: "factory", claude: "claude", allowedTools: [] as string[], maxConcurrent: 2, maxSubtasks: 5, timeoutMs: 30 * 60_000, retentionMs: 30 * DAY };
@@ -55,16 +61,49 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     return v;
   };
   const atLeast2 = (n: number) => { if (n < 2) throw new Error(`${path}: "maxSubtasks" must be at least 2`); return n; };
-  const fleets = raw.fleets ?? [];
-  if (!Array.isArray(fleets)) throw new Error(`${path}: "fleets" must be an array of {name, agent}`);
-  const seen = new Set<string>();
-  for (const f of fleets as Record<string, unknown>[]) {
+  const NAME = /^[a-z0-9_-]{1,26}$/;
+  const list = (v: unknown, what: string) => {
+    if (!Array.isArray(v) || !v.every((x) => typeof x === "string" && x)) throw new Error(`${path}: ${what} must be an array of non-empty strings`);
+    return v as string[];
+  };
+  const tools = raw.tools !== undefined ? strs("tools", []) : undefined;
+  const allowedTools = strs("allowedTools", DEFAULTS.allowedTools);
+  const global: Policy = { ...(tools ? { tools } : {}), allowedTools };
+
+  const rawProfiles = raw.profiles ?? [];
+  if (!Array.isArray(rawProfiles)) throw new Error(`${path}: "profiles" must be an array of {name, agent, tools?, allowedTools?}`);
+  const profiles = new Map<string, Profile>();
+  for (const p of rawProfiles as Record<string, unknown>[]) {
+    if (typeof p !== "object" || p === null || typeof p.name !== "string" || !NAME.test(p.name)) throw new Error(`${path}: each profile's "name" must be 1-26 characters of a-z 0-9 _ -`);
+    if (typeof p.agent !== "string" || !p.agent.trim()) throw new Error(`${path}: profile ${p.name}: "agent" must be a non-empty string`);
+    if (profiles.has(p.name)) throw new Error(`${path}: profile ${p.name} is listed twice`);
+    profiles.set(p.name, {
+      name: p.name, agent: p.agent.trim(),
+      ...(p.tools !== undefined ? { tools: list(p.tools, `profile ${p.name}: "tools"`) } : {}),
+      ...(p.allowedTools !== undefined ? { allowedTools: list(p.allowedTools, `profile ${p.name}: "allowedTools"`) } : {}),
+    });
+  }
+
+  const rawFleets = raw.fleets ?? [];
+  if (!Array.isArray(rawFleets)) throw new Error(`${path}: "fleets" must be an array of {name, agent} or {name, profile}`);
+  const fleets: Fleet[] = [];
+  for (const f of rawFleets as Record<string, unknown>[]) {
     // The board name `<name>-tasks` must fit a board name: [a-z0-9_-], max 32.
-    if (typeof f !== "object" || f === null || typeof f.name !== "string" || !/^[a-z0-9_-]{1,26}$/.test(f.name)) throw new Error(`${path}: each fleet's "name" must be 1-26 characters of a-z 0-9 _ -`);
-    if (typeof f.agent !== "string" || !f.agent.trim()) throw new Error(`${path}: fleet ${f.name}: "agent" must be a non-empty string`);
+    if (typeof f !== "object" || f === null || typeof f.name !== "string" || !NAME.test(f.name)) throw new Error(`${path}: each fleet's "name" must be 1-26 characters of a-z 0-9 _ -`);
     if (f.fanout !== undefined && typeof f.fanout !== "boolean") throw new Error(`${path}: fleet ${f.name}: "fanout" must be true or false`);
-    if (seen.has(f.name)) throw new Error(`${path}: fleet ${f.name} is listed twice`);
-    seen.add(f.name);
+    if (fleets.some((x) => x.name === f.name)) throw new Error(`${path}: fleet ${f.name} is listed twice`);
+    const fanout = f.fanout === false ? { fanout: false } : {};
+    if (f.profile !== undefined) {
+      // A profile carries the agent: naming both would leave one ignored.
+      if (f.agent !== undefined) throw new Error(`${path}: fleet ${f.name}: give "profile" or "agent", not both`);
+      const p = typeof f.profile === "string" ? profiles.get(f.profile) : undefined;
+      if (!p) throw new Error(`${path}: fleet ${f.name}: "profile" must name a profile in "profiles"`);
+      const policy: Policy = { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools };
+      fleets.push({ name: f.name, agent: p.agent, ...fanout, profile: p.name, policy });
+    } else {
+      if (typeof f.agent !== "string" || !f.agent.trim()) throw new Error(`${path}: fleet ${f.name}: "agent" (or "profile") must be a non-empty string`);
+      fleets.push({ name: f.name, agent: f.agent.trim(), ...fanout });
+    }
   }
   const gb = env.FACTORY_GRAYBOARD?.trim() ? env.FACTORY_GRAYBOARD.trim().split(/\s+/) : strs("grayboard", ["grayboard"]);
   if (gb.length === 0) throw new Error(`${path}: "grayboard" must not be empty`);
@@ -76,9 +115,9 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     grayboard: gb,
     claude: str("claude", DEFAULTS.claude),
     cwd: resolve(dataDir, str("cwd", join(dataDir, "work"))),
-    ...(raw.tools !== undefined ? { tools: strs("tools", []) } : {}),
-    allowedTools: strs("allowedTools", DEFAULTS.allowedTools),
-    fleets: (fleets as { name: string; agent: string; fanout?: boolean }[]).map((f) => ({ name: f.name, agent: f.agent.trim(), ...(f.fanout === false ? { fanout: false } : {}) })),
+    ...global,
+    profiles: [...profiles.values()],
+    fleets,
     maxConcurrent: pos("maxConcurrent", DEFAULTS.maxConcurrent),
     maxSubtasks: atLeast2(pos("maxSubtasks", DEFAULTS.maxSubtasks)),
     timeoutMs: pos("timeoutMs", DEFAULTS.timeoutMs),
@@ -92,7 +131,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   const cfg = loadConfig(dataDir, env);
   mkdirSync(cfg.cwd, { recursive: true });
   const store = new Store(join(dataDir, "factory.db"));
-  const runner = new ClaudeRunner({ bin: cfg.claude, cwd: cfg.cwd, ...(cfg.tools ? { tools: cfg.tools } : {}), allowedTools: cfg.allowedTools, env: sessionFree(env) });
+  const runner = new ClaudeRunner({ bin: cfg.claude, cwd: cfg.cwd, env: sessionFree(env) });
   let bus: LocalBus;
   try {
     bus = await LocalBus.start({ command: cfg.grayboard, identity: cfg.identity, version: VERSION, env: sessionFree(env) });
@@ -102,7 +141,7 @@ export async function main(env: Record<string, string | undefined> = process.env
     return 1;
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
-  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
+  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: { ...(cfg.tools ? { tools: cfg.tools } : {}), allowedTools: cfg.allowedTools }, maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
   let signalled = false;
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);

@@ -6,18 +6,20 @@
 import type { Delivery, FactoryBus } from "./bus.ts";
 import { oneLine, requestOf, type Request } from "./delegate.ts";
 import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
-import { resolvePersona, type Agent, type Outcome, type Runner } from "./runner.ts";
+import { resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "./runner.ts";
 import type { Admit, Row, Store } from "./store.ts";
 
 // A fleet (docs/factory.md §7): a queue board `<name>-tasks` the factory is
 // a lane on, and the agent it runs each task with. The agent is the
 // operator's choice, never the post's. `fanout` (default on) lets a task's
-// run return a plan of subtasks instead of doing it (§7).
-export type Fleet = { name: string; agent: string; fanout?: boolean };
+// run return a plan of subtasks instead of doing it (§7). `policy` is its
+// profile's (#643); absent, the factory's global one.
+export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy };
 export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
 
 export type FactoryOptions = {
   fleets?: Fleet[];
+  policy: Policy; // the global tool lists: delegations, and fleets without a profile
   maxConcurrent: number;
   maxSubtasks?: number; // a fan-out plan's cap (default 5)
   timeoutMs: number;
@@ -235,18 +237,31 @@ export class Factory {
   private async runAgent(row: Row, input: Request): Promise<Outcome | string> {
     const agent = this.runner.roster().find((a) => a.name === row.agent);
     if (!agent) return `[factory] failed: agent \`${row.agent}\` left the ${this.runner.harness} roster before this ran; nothing was spawned.`;
+    const policy = this.policyFor(row);
+    if (typeof policy === "string") return policy;
     const ac = new AbortController();
     this.children.add(ac);
     const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
     this.o.log(`request ${row.id}: running ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
     try {
-      return await this.runner.run(agent, input, ac.signal);
+      return await this.runner.run(agent, input, ac.signal, policy);
     } catch (e) {
       return `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
     } finally {
       clearTimeout(t);
       this.children.delete(ac);
     }
+  }
+
+  // The run's policy, from the config as it is now: a fleet task and its
+  // subtasks (persona = the fleet's name) get the fleet's; a delegation the
+  // global one. A fleet gone from the config fails the run rather than fall
+  // back to the global lists, which may be wider than its profile.
+  private policyFor(row: Row): Policy | string {
+    if (row.source === "dm") return this.o.policy;
+    const f = this.fleets().find((f) => f.name === row.persona);
+    if (!f) return `[factory] failed: fleet "${oneLine(row.persona)}" is no longer in the factory's config; nothing was spawned.`;
+    return f.policy ?? this.o.policy;
   }
 
   // A plan's fan-out: a broadcast board `task-<post id>` as the durable,
