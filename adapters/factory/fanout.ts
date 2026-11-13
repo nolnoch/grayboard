@@ -17,8 +17,9 @@ const MAX_SUBTASK_BYTES = 60 * 1024;
 const MAX_RESULT_CHARS = 16 * 1024;
 
 // Appended to a fan-out-capable task. Doing the task is the default; a plan
-// is for work that splits into parts worth running in parallel.
-export function triageInstruction(max: number): string {
+// is for work that splits into parts worth running in parallel. `ownDirs`:
+// each subtask gets a working directory of its own (#641), not this run's.
+export function triageInstruction(max: number, ownDirs = false): string {
   return [
     "## Before you start",
     "",
@@ -27,7 +28,9 @@ export function triageInstruction(max: number): string {
     `${OPEN}{"subtasks": [{"title": "a short title", "task": "everything that agent needs: it sees only its own task text"}]}`,
     DATA_FENCE,
     "",
-    "Each subtask's agent has the same tools and working directory as you, and none of this conversation. Otherwise, do the task yourself and reply with the result.",
+    ownDirs
+      ? "Each subtask's agent has the same tools as you, a working directory of its own that starts without your files, and none of this conversation. Otherwise, do the task yourself and reply with the result."
+      : "Each subtask's agent has the same tools and working directory as you, and none of this conversation. Otherwise, do the task yourself and reply with the result.",
   ].join("\n");
 }
 
@@ -58,11 +61,14 @@ export function parsePlan(text: string, max: number): Plan | string | null {
 
 // The synthesis run's prompt: the original task, each subtask's outcome
 // (done or failed, as replied in its thread), and what to do with them.
-export function synthesisPrompt(task: string, results: { title: string; reply: string | null }[]): string {
+// `dir`: the subtask's own working directory, a sibling of the synthesis
+// run's (#641), so it can read what the subtask left.
+export function synthesisPrompt(task: string, results: { title: string; reply: string | null; dir?: string }[]): string {
   const parts = results.map((r, i) => {
     const body = r.reply ?? "(no outcome)";
     const clipped = body.length > MAX_RESULT_CHARS ? `${body.slice(0, MAX_RESULT_CHARS)}\n\n(result truncated at ${MAX_RESULT_CHARS} characters)` : body;
-    return `### ${i + 1}. ${r.title}\n\n${clipped}`;
+    const where = r.dir ? `Its files: \`../${r.dir}\`, beside your working directory.\n\n` : "";
+    return `### ${i + 1}. ${r.title}\n\n${where}${clipped}`;
   });
   return [
     task,

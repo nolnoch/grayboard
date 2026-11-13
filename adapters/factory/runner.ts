@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Request } from "./delegate.ts";
+import type { Place } from "./workdir.ts";
 
 // `prompt` is the file's body; `tools` and `model` are its frontmatter fields
 // of those names (tools as a comma list). A runner passes these and nothing
@@ -22,8 +23,9 @@ export interface Runner {
   roster(): Agent[];
   // Where the roster comes from, for a decline's text.
   readonly rosterSource: string;
-  // Runs `agent` on the request under `policy` until it ends or `signal` aborts (a timeout).
-  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy): Promise<Outcome>;
+  // Runs `agent` on the request under `policy`, in `place` (#641), until it
+  // ends or `signal` aborts (a timeout).
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place): Promise<Outcome>;
 }
 
 // Agent files: markdown with `name:` (and optionally `description:`) in YAML
