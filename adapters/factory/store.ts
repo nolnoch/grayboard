@@ -36,7 +36,7 @@ export type Row = Request & {
 };
 export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string; round?: number };
 // A child process (#649): one per run of a request (a fanned-out request has
-// two, its triage and its synthesis). `outcome` is null while it runs; a run
+// its triage and each synthesis or review, #658). `outcome` is null while it runs; a run
 // cut off by a restart ends as interrupted. Its transcript is the file
 // runs/<id>.jsonl beside the store, pruned with it.
 export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted" | "cancelled" | "deadline";
