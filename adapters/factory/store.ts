@@ -145,6 +145,12 @@ export class Store {
     return (this.db.query(`SELECT * FROM requests WHERE state = 'finished' AND replied = 0 ORDER BY seq`).all() as Raw[]).map(toRow);
   }
 
+  // Whether the store still holds the row with this seq: a working
+  // directory's tree (#641) is swept once its request's row is gone.
+  has(seq: number): boolean {
+    return this.db.query(`SELECT 1 FROM requests WHERE seq = ?`).get(seq) !== null;
+  }
+
   get(k: Key): Row | null {
     const r = this.db.query(`SELECT * FROM requests WHERE source = ? AND id = ?`).get(k.source, k.id) as Raw | null;
     return r ? toRow(r) : null;

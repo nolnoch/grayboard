@@ -30,7 +30,7 @@ test("claude runner: runs the named agent headless, prompt on stdin, and returns
     expect(runner.roster().map((a) => a.name)).toEqual(["researcher"]);
     const agent = resolvePersona("a researcher", runner.roster())!;
     // A task starting with "-" would be a flag in argv; on stdin it's text.
-    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal, { allowedTools: [] });
+    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "a researcher", task: "-- FACTORY-TASK: find it" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] });
     expect(out).toEqual({ ok: true, text: "RESULT-42" });
     expect(model.unhandled).toEqual([]);
   } finally {
@@ -52,7 +52,7 @@ async function shellTrial(user: string[], o: { tools?: string[]; allowedTools: s
     mkdirSync(join(h.config, "agents"), { recursive: true });
     writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
     const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
-    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal, o);
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-SHELL" }, new AbortController().signal, o, { cwd: h.work, addDirs: [] });
     expect(out).toEqual({ ok: true, text: "ended" });
     expect(model.unhandled).toEqual([]);
     return { marker: existsSync(join(h.work, "MARKER")), result: toolResults(model, "toolu_sh").join("\n"), agentPrompt: model.requests.some((r) => systemText(r.body).includes("AGENT-PROMPT-9")) };
@@ -78,3 +78,34 @@ test("claude runner: a shell the config names in both lists runs", async () => {
   const t = await shellTrial([], { tools: ["Bash", "Read"], allowedTools: ["Bash"] });
   expect(t.marker).toBe(true);
 }, 120_000);
+
+// Synthesis reads its subtasks' directories through --add-dir (#641), which
+// restricted mode's file confinement includes. The fake model has the child
+// Read a file in a sibling of its working directory, with the parent added
+// and without.
+async function readTrial(add: boolean): Promise<string> {
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("FACTORY-READ")) ? undefined
+      : called(q, "toolu_rd") ? { text: "ended" } : { tool: "Read", id: "toolu_rd", input: { file_path: join(dir, "tree", "8", "out.txt") } },
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    for (const d of ["main", "8"]) mkdirSync(join(dir, "tree", d), { recursive: true });
+    writeFileSync(join(dir, "tree", "8", "out.txt"), "SUBTASK-OUTPUT-8\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const place = { cwd: join(dir, "tree", "main"), addDirs: add ? [join(dir, "tree")] : [] };
+    const out = await runner.run(runner.roster()[0]!, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-READ" }, new AbortController().signal, { allowedTools: [] }, place);
+    expect(out).toEqual({ ok: true, text: "ended" });
+    expect(model.unhandled).toEqual([]);
+    return toolResults(model, "toolu_rd").join("\n");
+  } finally {
+    model.stop();
+  }
+}
+
+test("claude runner: a child reads a sibling directory only when the run adds it (#641)", async () => {
+  expect(await readTrial(true)).toContain("SUBTASK-OUTPUT-8");
+  expect(await readTrial(false)).not.toContain("SUBTASK-OUTPUT-8");
+}, 240_000);

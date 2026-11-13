@@ -8,18 +8,21 @@ import { oneLine, requestOf, type Request } from "./delegate.ts";
 import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "./runner.ts";
 import type { Admit, Row, Store } from "./store.ts";
+import type { Place, Workdir, Workspaces } from "./workdir.ts";
 
 // A fleet (docs/factory.md §7): a queue board `<name>-tasks` the factory is
 // a lane on, and the agent it runs each task with. The agent is the
 // operator's choice, never the post's. `fanout` (default on) lets a task's
-// run return a plan of subtasks instead of doing it (§7). `policy` is its
-// profile's (#643); absent, the factory's global one.
-export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy };
+// run return a plan of subtasks instead of doing it (§7). `policy` and
+// `workdir` are its profile's (#643, #641); absent, the factory's global ones.
+export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy; workdir?: Workdir };
 export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
 
 export type FactoryOptions = {
   fleets?: Fleet[];
   policy: Policy; // the global tool lists: delegations, and fleets without a profile
+  workdir: Workdir; // the global working-directory mode, likewise
+  workspaces: Workspaces; // where each run's directory is made, and swept once its tree is pruned
   maxConcurrent: number;
   maxSubtasks?: number; // a fan-out plan's cap (default 5)
   timeoutMs: number;
@@ -209,10 +212,13 @@ export class Factory {
   private async outcome(row: Row): Promise<string | null> {
     const synth = row.phase === "synthesize";
     const max = this.o.maxSubtasks ?? 5;
+    const set = this.settingsFor(row);
+    if (typeof set === "string") return set;
+    const own = set.workdir.mode !== "shared";
     const input: Request = synth
-      ? { ...row, task: synthesisPrompt(row.task, this.store.subtasks(row.seq).map((s) => ({ title: s.title ?? "", reply: s.reply }))), context: undefined }
-      : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max)}` } : row;
-    const out = await this.runAgent(row, input);
+      ? { ...row, task: synthesisPrompt(row.task, this.store.subtasks(row.seq).map((s) => ({ title: s.title ?? "", reply: s.reply, dir: own ? String(s.seq) : undefined }))), context: undefined }
+      : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max, own)}` } : row;
+    const out = await this.runAgent(row, input, set);
     let body: string;
     if (typeof out === "string") body = out;
     else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${row.agent}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
@@ -234,17 +240,21 @@ export class Factory {
   }
 
   // Runs the row's agent on `input`; a string is a failure reply that needed no run.
-  private async runAgent(row: Row, input: Request): Promise<Outcome | string> {
+  private async runAgent(row: Row, input: Request, set: Settings): Promise<Outcome | string> {
     const agent = this.runner.roster().find((a) => a.name === row.agent);
     if (!agent) return `[factory] failed: agent \`${row.agent}\` left the ${this.runner.harness} roster before this ran; nothing was spawned.`;
-    const policy = this.policyFor(row);
-    if (typeof policy === "string") return policy;
+    let place: Place;
+    try {
+      place = await this.o.workspaces.place(set.workdir, { tree: row.parent ?? row.seq, sub: row.parent !== null ? row.seq : null, synthesis: row.phase === "synthesize" });
+    } catch (e) {
+      return `[factory] failed: couldn't make the ${set.workdir.mode} working directory: ${msg(e)}; nothing was spawned.`;
+    }
     const ac = new AbortController();
     this.children.add(ac);
     const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
     this.o.log(`request ${row.id}: running ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
     try {
-      return await this.runner.run(agent, input, ac.signal, policy);
+      return await this.runner.run(agent, input, ac.signal, set.policy, place);
     } catch (e) {
       return `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
     } finally {
@@ -253,15 +263,17 @@ export class Factory {
     }
   }
 
-  // The run's policy, from the config as it is now: a fleet task and its
-  // subtasks (persona = the fleet's name) get the fleet's; a delegation the
-  // global one. A fleet gone from the config fails the run rather than fall
-  // back to the global lists, which may be wider than its profile.
-  private policyFor(row: Row): Policy | string {
-    if (row.source === "dm") return this.o.policy;
+  // The run's policy and working-directory mode, from the config as it is
+  // now: a fleet task and its subtasks (persona = the fleet's name) get the
+  // fleet's; a delegation the global ones. A fleet gone from the config
+  // fails the run rather than fall back to the global lists, which may be
+  // wider than its profile.
+  private settingsFor(row: Row): Settings | string {
+    const global: Settings = { policy: this.o.policy, workdir: this.o.workdir };
+    if (row.source === "dm") return global;
     const f = this.fleets().find((f) => f.name === row.persona);
     if (!f) return `[factory] failed: fleet "${oneLine(row.persona)}" is no longer in the factory's config; nothing was spawned.`;
-    return f.policy ?? this.o.policy;
+    return { policy: f.policy ?? global.policy, workdir: f.workdir ?? global.workdir };
   }
 
   // A plan's fan-out: a broadcast board `task-<post id>` as the durable,
@@ -341,8 +353,13 @@ export class Factory {
     }
     const n = this.store.prune(this.o.retentionMs);
     if (n) this.o.log(`pruned ${n} finished request${n === 1 ? "" : "s"}`);
+    // After the prune: a tree goes once its request's row has.
+    const t = await this.o.workspaces.sweep((seq) => this.store.has(seq));
+    if (t) this.o.log(`removed ${t} working director${t === 1 ? "y" : "ies"} of pruned requests`);
   }
 }
+
+type Settings = { policy: Policy; workdir: Workdir };
 
 function clip(body: string): string {
   const bytes = new TextEncoder().encode(body);

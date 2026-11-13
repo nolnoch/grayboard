@@ -13,10 +13,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Request } from "../delegate.ts";
 import { execChild, prompt, readAgents, tail, type Agent, type Outcome, type Policy, type Runner } from "../runner.ts";
+import type { Place } from "../workdir.ts";
 
 export type ClaudeOptions = {
   bin: string;                    // the claude executable
-  cwd: string;                    // the children's working directory
+  cwd: string;                    // where the roster's project agents live (`.claude/agents`); a run's directory is its Place
   env: Record<string, string>;    // the children's env
 };
 
@@ -39,13 +40,16 @@ export class ClaudeRunner implements Runner {
   }
 
   // policy.tools → --tools (absent: restricted mode's default, no shell, no
-  // WebFetch); policy.allowedTools → --allowedTools (empty: none).
-  async run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy): Promise<Outcome> {
+  // WebFetch); policy.allowedTools → --allowedTools (empty: none). The child
+  // runs in place.cwd; place.addDirs → --add-dir, which restricted mode's
+  // file confinement includes.
+  async run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place): Promise<Outcome> {
     const def = { description: agent.description ?? agent.name, prompt: agent.prompt, ...(agent.tools ? { tools: agent.tools } : {}), ...(agent.model ? { model: agent.model } : {}) };
     const cmd = [this.o.bin, "-p", "--restricted", "--strict-mcp-config", "--agents", JSON.stringify({ [agent.name]: def }), "--agent", agent.name, "--output-format", "json", "--permission-prompts", "none"];
     if (policy.tools) cmd.push("--tools", policy.tools.join(","));
     if (policy.allowedTools.length) cmd.push("--allowedTools", ...policy.allowedTools);
-    const x = await execChild(cmd, { cwd: this.o.cwd, env: this.o.env, input: prompt(r), signal });
+    if (place.addDirs.length) cmd.push("--add-dir", ...place.addDirs);
+    const x = await execChild(cmd, { cwd: place.cwd, env: this.o.env, input: prompt(r), signal });
     if (x.timedOut) return { ok: false, error: "the child ran past the factory's timeout and was stopped" };
     let out: { result?: unknown; is_error?: unknown; subtype?: unknown } | null = null;
     try { out = JSON.parse(x.stdout.trim().split("\n").pop() ?? ""); } catch {}

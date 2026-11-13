@@ -4,7 +4,7 @@
 // runner against the pinned Claude Code is tests/e2e/factory_claude.e2e.ts:
 // here it would make the pre-push hook fetch Claude Code (#456).
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } from "../../adapters/factory/bus.ts";
@@ -14,6 +14,8 @@ import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/fa
 import { DEFAULTS, loadConfig } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "../../adapters/factory/runner.ts";
 import { Store } from "../../adapters/factory/store.ts";
+import { Workspaces, type Place, type Workdir } from "../../adapters/factory/workdir.ts";
+import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 import { delegationBody } from "../../src/core/delegation.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession } from "../support/mcp.ts";
@@ -172,7 +174,7 @@ test("store: prune drops only replied rows past retention", () => {
 
 test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", () => {
   const c = loadConfig(dir, { HOME: dir });
-  expect(c).toMatchObject({ ...DEFAULTS, grayboard: ["grayboard"], cwd: join(dir, "work") }); // never $HOME
+  expect(c).toMatchObject({ ...DEFAULTS, grayboard: ["grayboard"], cwd: join(dir, "work"), workdir: { mode: "scratch" } }); // never $HOME
   writeFileSync(join(dir, "config.json"), JSON.stringify({ identity: "fac", allowedTools: ["Read"], maxConcurrent: 4, cwd: "/srv/work" }));
   expect(loadConfig(dir, { FACTORY_GRAYBOARD: "bun src/cli/main.ts" })).toMatchObject({ identity: "fac", allowedTools: ["Read"], maxConcurrent: 4, cwd: "/srv/work", grayboard: ["bun", "src/cli/main.ts"] });
   expect(loadConfig(dir, {}).tools).toBeUndefined();
@@ -185,14 +187,15 @@ test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", 
   const pc = loadConfig(dir, {});
   expect(pc.profiles.map((p) => p.name)).toEqual(["code", "research"]);
   expect(pc.fleets).toEqual([
-    { name: "app", agent: "coder", profile: "code", policy: { tools: ["Bash", "Read"], allowedTools: ["Bash"] } },
-    { name: "lab", agent: "researcher", fanout: false, profile: "research", policy: { tools: ["Read"], allowedTools: [] } }, // tools fall back to the global list, field by field
+    { name: "app", agent: "coder", profile: "code", policy: { tools: ["Bash", "Read"], allowedTools: ["Bash"] }, workdir: { mode: "scratch" } },
+    { name: "lab", agent: "researcher", fanout: false, profile: "research", policy: { tools: ["Read"], allowedTools: [] }, workdir: { mode: "scratch" } }, // tools fall back to the global list, field by field
     { name: "old", agent: "x" }, // no profile: the global lists at run time
   ]);
   for (const bad of [{ maxSubtasks: 1 }, { fleets: [{ name: "a", agent: "x", fanout: "yes" }] },
     { profiles: [{ name: "p", agent: "x" }], fleets: [{ name: "a", profile: "p", agent: "x" }] }, { fleets: [{ name: "a", profile: "nope" }] },
     { profiles: [{ name: "p", agent: "x" }, { name: "p", agent: "y" }] }, { profiles: [{ name: "p" }] }, { profiles: [{ name: "P", agent: "x" }] },
-    { profiles: [{ name: "p", agent: "x", tools: "Bash" }] }, { profiles: [{ name: "p", agent: "x", allowedTools: [""] }] }, { profiles: {} }, { tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, { identity: "Factory" }, { maxConcurrent: null }, { cwd: null }, [1]]) {
+    { profiles: [{ name: "p", agent: "x", tools: "Bash" }] }, { profiles: [{ name: "p", agent: "x", allowedTools: [""] }] }, { profiles: {} }, { tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, { identity: "Factory" }, { maxConcurrent: null }, { cwd: null }, [1],
+    { workdir: "tmp" }, { workdir: "worktree" }, { repo: "nope" }, { profiles: [{ name: "p", agent: "x", workdir: "worktree" }] }, { profiles: [{ name: "p", agent: "x", repo: 7 }] }]) {
     writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
     expect(() => loadConfig(dir, {})).toThrow();
   }
@@ -238,6 +241,9 @@ class FakeBus implements FactoryBus {
 }
 
 const GLOBAL: Policy = { allowedTools: ["Read"] };
+const SHARED: Workdir = { mode: "shared" };
+// The working-directory options: shared mode (today's single directory) unless a test picks another (#641).
+const wd = (workdir: Workdir = SHARED) => ({ workdir, workspaces: new Workspaces(join(dir, "trees"), join(dir, "work")) });
 
 class FakeRunner implements Runner {
   readonly harness = "fake";
@@ -252,9 +258,11 @@ class FakeRunner implements Runner {
   abortLagMs = 0; // how long a held run takes to end once aborted, as a child's SIGTERM grace
   constructor(public names = ["researcher"], private readonly hold = false) {}
   roster() { if (this.broken) throw new Error("EIO: roster unreadable"); return agents(...this.names); }
-  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy): Promise<Outcome> {
+  places: Place[] = []; // each run's place, in run order
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place): Promise<Outcome> {
     this.runs.push({ agent: agent.name, id: r.id });
     this.policies.push(policy);
+    this.places.push(place);
     this.inputs.push(r.task);
     if (!this.hold) return Promise.resolve({ ok: true, text: this.script(r) ?? `result for ${r.id}` });
     const g = Promise.withResolvers<Outcome>();
@@ -264,10 +272,10 @@ class FakeRunner implements Runner {
   }
 }
 
-function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; timeoutMs?: number; fleets?: Fleet[]; bus?: FakeBus } = {}) {
+function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; timeoutMs?: number; fleets?: Fleet[]; bus?: FakeBus; workdir?: Workdir } = {}) {
   const bus = o.bus ?? new FakeBus(), runner = o.runner ?? new FakeRunner(), store = o.store ?? new Store(":memory:");
   const logs: string[] = [];
-  const f = new Factory(bus, store, runner, { policy: GLOBAL, fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m) });
+  const f = new Factory(bus, store, runner, { policy: GLOBAL, ...wd(o.workdir), fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m) });
   const done = f.run();
   return { bus, runner, store, logs, done };
 }
@@ -358,7 +366,7 @@ test("loop: a restart mid fan-out interrupts only the running subtask, runs the 
 
 test("loop: a failed send stays unsent and housekeeping retries it", async () => {
   const bus = new FakeBus(), store = new Store(":memory:");
-  const f = new Factory(bus, store, new FakeRunner(), { policy: GLOBAL, maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 100, log: () => {} });
+  const f = new Factory(bus, store, new FakeRunner(), { policy: GLOBAL, ...wd(), maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 100, log: () => {} });
   const done = f.run();
   bus.fail = true;
   bus.deliver(ask(50));
@@ -412,7 +420,7 @@ test("loop: stopping waits for a running child's outcome before run() returns", 
 
 test("loop: housekeeping never sends an outcome a send in flight is already sending", async () => {
   const bus = new FakeBus(), store = new Store(":memory:");
-  const f = new Factory(bus, store, new FakeRunner(), { policy: GLOBAL, maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 20, log: () => {} });
+  const f = new Factory(bus, store, new FakeRunner(), { policy: GLOBAL, ...wd(), maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 20, log: () => {} });
   const done = f.run();
   bus.delayMs = 300; // every send outlasts several housekeeping passes
   bus.deliver(ask(70));
@@ -430,7 +438,7 @@ test("local bus: a delegate from a real session reaches the factory, which answe
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   expect(bus.handle).toBe("factory");
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, ...wd(), maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   // The factory is a launcher: delegate's auto-pick finds it.
   const peers = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
@@ -522,7 +530,7 @@ test("local bus: a fleet task posted on the queue board is run by the factory la
   const fe = await localSession(dir, "fe");
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, ...wd(), fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
   const p = await call(fe.c, "board_post", { board: "sim-tasks", body: "summarize the spec" });
@@ -540,7 +548,7 @@ test("local bus: a factory without the fleet's agent passes the task to another 
   const fe = await localSession(dir, "fe"), be = await localSession(dir, "be");
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, fleets: [{ name: "sim", agent: "builder" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, ...wd(), fleets: [{ name: "sim", agent: "builder" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
   // The rotation offers never-woken lanes first, by handle: the first post
@@ -672,7 +680,7 @@ test("local bus: a fan-out's subtasks and outcomes are posts on a task board oth
   const fe = await localSession(dir, "fe");
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   const runner = new FakeRunner();
-  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 2, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, ...wd(), fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 2, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
   const done = f.run();
   await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
   const p = await call(fe.c, "board_post", { board: "sim-tasks", body: "summarize three specs" });
@@ -709,6 +717,98 @@ test("profiles: a fleet task and its subtasks run under the fleet's policy, a de
   await until(() => bus.replies(70).length === 1, 5000, "gone fleet fails");
   expect(bus.replies(70)[0]).toBe('[factory] failed: fleet "gone" is no longer in the factory\'s config; nothing was spawned.');
   expect(runner.runs.map((r) => r.id)).not.toContain(70);
+  await bus.close();
+  await done;
+});
+
+// ── working directories (#641) ───────────────────────────────────────────────
+
+test("config: working-directory modes and repos fall back field by field (#641)", () => {
+  const repo = join(dir, "repo");
+  mkdirSync(repo);
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ workdir: "shared", profiles: [{ name: "wt", agent: "coder", workdir: "worktree", repo: "repo" }, { name: "s", agent: "x", workdir: "scratch" }, { name: "inh", agent: "y" }], fleets: [{ name: "a", profile: "wt" }, { name: "b", profile: "s" }, { name: "c", profile: "inh" }, { name: "d", agent: "z" }] }));
+  const c = loadConfig(dir, {});
+  expect(c.workdir).toEqual({ mode: "shared" });
+  expect(c.fleets.map((f) => f.workdir)).toEqual([{ mode: "worktree", repo }, { mode: "scratch" }, { mode: "shared" }, undefined]); // d: the global mode at run time
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ workdir: "worktree", repo: "repo", profiles: [{ name: "p", agent: "x" }], fleets: [{ name: "a", profile: "p" }] }));
+  expect(loadConfig(dir, {})).toMatchObject({ workdir: { mode: "worktree", repo }, fleets: [{ workdir: { mode: "worktree", repo } }] });
+});
+
+test("workspaces: scratch gives a tree a directory, each subtask one inside it, synthesis all of them; sweep removes pruned trees (#641)", async () => {
+  const ws = new Workspaces(join(dir, "trees"), join(dir, "work"));
+  const scratch: Workdir = { mode: "scratch" };
+  const tree = join(dir, "trees", "4");
+  expect(await ws.place(scratch, { tree: 4, sub: null, synthesis: false })).toEqual({ cwd: join(tree, "main"), addDirs: [] });
+  expect(await ws.place(scratch, { tree: 4, sub: 5, synthesis: false })).toEqual({ cwd: join(tree, "5"), addDirs: [] });
+  expect(await ws.place(scratch, { tree: 4, sub: null, synthesis: true })).toEqual({ cwd: join(tree, "main"), addDirs: [tree] });
+  expect(existsSync(join(tree, "5"))).toBe(true);
+  expect(await ws.place(SHARED, { tree: 9, sub: null, synthesis: true })).toEqual({ cwd: join(dir, "work"), addDirs: [] });
+  expect(existsSync(join(dir, "trees", "9"))).toBe(false);
+  await ws.place(scratch, { tree: 6, sub: null, synthesis: false });
+  mkdirSync(join(dir, "trees", "notes")); // not a tree: never touched
+  expect(await ws.sweep((t) => t === 6)).toBe(1);
+  expect([existsSync(tree), existsSync(join(dir, "trees", "6")), existsSync(join(dir, "trees", "notes"))]).toEqual([false, true, true]);
+});
+
+test("workspaces: worktree mode makes detached worktrees, a subtask's from its request's HEAD, and sweep has git forget them (#641)", async () => {
+  const env = repositoryGitEnv();
+  const git = (cwd: string, ...args: string[]) => {
+    const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+    return r.stdout.toString().trim();
+  };
+  const repo = join(dir, "repo");
+  mkdirSync(repo);
+  git(repo, "init", "-q");
+  writeFileSync(join(repo, "a.txt"), "a\n");
+  git(repo, "add", "a.txt");
+  git(repo, "commit", "-qm", "a");
+  const wt: Workdir = { mode: "worktree", repo };
+  const ws = new Workspaces(join(dir, "trees"), join(dir, "work"));
+  const main = await ws.place(wt, { tree: 3, sub: null, synthesis: false });
+  expect(main.cwd).toBe(join(dir, "trees", "3", "main"));
+  expect(readFileSync(join(main.cwd, "a.txt"), "utf8")).toBe("a\n");
+  writeFileSync(join(main.cwd, "b.txt"), "b\n");
+  git(main.cwd, "add", "b.txt");
+  git(main.cwd, "commit", "-qm", "b"); // what the planning run committed
+  const [s1, s2] = await Promise.all([ws.place(wt, { tree: 3, sub: 8, synthesis: false }), ws.place(wt, { tree: 3, sub: 9, synthesis: false })]);
+  expect(git(s1.cwd, "rev-parse", "HEAD")).toBe(git(main.cwd, "rev-parse", "HEAD"));
+  expect(existsSync(join(s2.cwd, "b.txt"))).toBe(true);
+  expect(await ws.place(wt, { tree: 3, sub: null, synthesis: true })).toEqual({ cwd: main.cwd, addDirs: [join(dir, "trees", "3")] }); // a restart reuses it
+  expect(git(repo, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(4);
+  expect(await ws.sweep(() => false)).toBe(1);
+  expect(existsSync(join(dir, "trees", "3"))).toBe(false);
+  expect(git(repo, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+  await expect(ws.place({ mode: "worktree", repo: join(dir, "work") }, { tree: 4, sub: null, synthesis: false })).rejects.toThrow("git rev-parse");
+});
+
+test("loop: scratch mode runs a fan-out's request, subtasks and synthesis in their tree, sweeps pruned trees, and a failed directory spawns nothing (#641)", async () => {
+  mkdirSync(join(dir, "trees", "999"), { recursive: true }); // a tree whose request was pruned while the factory was down
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const fleets: Fleet[] = [{ name: "sim", agent: "researcher" }, { name: "ro", agent: "researcher", workdir: SHARED }, { name: "bad", agent: "researcher", workdir: { mode: "worktree", repo: join(dir, "work") } }];
+  const { bus, store, done } = loop({ runner, fleets, workdir: { mode: "scratch" } });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "fan-out and synthesis");
+  const seq = store.get({ source: "board", id: 7 })!.seq, tree = join(dir, "trees", String(seq));
+  const subs = store.subtasks(seq).map((s) => s.seq);
+  expect(runner.places).toEqual([
+    { cwd: join(tree, "main"), addDirs: [] },
+    { cwd: join(tree, String(subs[0])), addDirs: [] },
+    { cwd: join(tree, String(subs[1])), addDirs: [] },
+    { cwd: join(tree, "main"), addDirs: [tree] },
+  ]);
+  expect(runner.inputs[0]).toContain("a working directory of its own");
+  expect(runner.inputs[3]).toContain(`Its files: \`../${subs[0]}\``);
+  expect(existsSync(join(dir, "trees", "999"))).toBe(false);
+  bus.deliver(task(20, { board: "ro-tasks" }));
+  await until(() => bus.replies(20).length === 2, 5000, "shared fleet task");
+  expect(runner.places[4]).toEqual({ cwd: join(dir, "work"), addDirs: [] });
+  expect(runner.inputs[4]).toContain("same tools and working directory as you");
+  bus.deliver(task(30, { board: "bad-tasks" }));
+  await until(() => bus.replies(30).length === 2, 5000, "worktree failure");
+  expect(bus.replies(30)[1]).toStartWith("[factory] failed: couldn't make the worktree working directory: git rev-parse");
+  expect(runner.runs.map((r) => r.id)).not.toContain(30);
   await bus.close();
   await done;
 });
