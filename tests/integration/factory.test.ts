@@ -325,6 +325,22 @@ test("loop: an outcome whose send failed is sent on restart; a run cut by a cras
   await b.done;
 });
 
+test("loop: a restart mid fan-out interrupts only the running subtask, runs the queued one and synthesizes (#642)", async () => {
+  const s = new Store(":memory:");
+  const sub = (id: number): { r: Request; title: string } => ({ r: { id, source: "board", board: "task-7", requester: "fe", persona: "sim", task: `part ${id}` }, title: `t${id}` });
+  s.admit({ id: 7, source: "board", board: "sim-tasks", requester: "fe", persona: "sim", task: "big" }, "researcher", { fanout: true });
+  s.fanOut(s.next()!, "task-7", [sub(100), sub(101)]);
+  s.next(); // 100 was running when the process died; 101 never started
+  const { bus, runner, done } = loop({ store: s });
+  await until(() => bus.replies(7).length === 1, 5000, "synthesis");
+  expect(bus.replies(100)).toEqual(["[factory] interrupted: the factory stopped before this finished; nothing is running for it now. The task's combined result will say this subtask was interrupted."]);
+  expect(bus.replies(101)).toEqual(["[factory] done: fake agent `researcher`\n\nresult for 101"]);
+  expect(bus.replies(7)[0]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-7");
+  expect(runner.runs.map((r) => r.id)).toEqual([101, 7]);
+  await bus.close();
+  await done;
+});
+
 test("loop: a failed send stays unsent and housekeeping retries it", async () => {
   const bus = new FakeBus(), store = new Store(":memory:");
   const f = new Factory(bus, store, new FakeRunner(), { maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, housekeepingMs: 100, log: () => {} });
@@ -551,7 +567,7 @@ test("fan-out: the plan parser finds a plan, refuses unusable ones, and reads a 
   expect(big).toContain("### 2. b\n\n(no outcome)");
 });
 
-test("store: a fan-out waits on its subtasks, synthesizes once they finish, and a restart interrupts the lot", () => {
+test("store: a fan-out waits on its subtasks, synthesizes once they finish, and survives a restart", () => {
   const path = join(dir, "f.db");
   let s = new Store(path);
   const parent: Request = { id: 7, source: "board", board: "sim-tasks", requester: "fe", persona: "sim", task: "big" };
@@ -566,8 +582,19 @@ test("store: a fan-out waits on its subtasks, synthesizes once they finish, and 
   s.finish(a, "done 100");
   expect(s.synthesizeWhenDone(row.seq)).toBe(false);
   s.close();
-  s = new Store(path); // a crash with one subtask finished, one queued
-  expect(s.interrupted(() => "interrupted").map((r) => r.id)).toEqual([7, 101]);
+  s = new Store(path); // a crash with one subtask finished, one queued (#642)
+  expect(s.interrupted(() => "interrupted")).toEqual([]);
+  expect(s.get({ source: "board", id: 7 })).toMatchObject({ state: "waiting" });
+  const b = s.next()!;
+  expect(b).toMatchObject({ id: 101, state: "running" });
+  s.close();
+  s = new Store(path); // another crash, the last subtask running: it's interrupted, and the parent synthesizes
+  expect(s.interrupted((r) => `interrupted ${r.id}`).map((r) => r.id)).toEqual([101]);
+  expect(s.subtasks(row.seq).map((r) => r.reply)).toEqual(["done 100", "interrupted 101"]);
+  expect(s.next()).toMatchObject({ id: 7, phase: "synthesize", state: "running" });
+  s.close();
+  s = new Store(path); // a crash during the synthesis: the request itself is interrupted
+  expect(s.interrupted(() => "interrupted").map((r) => r.id)).toEqual([7]);
   expect(s.next()).toBeNull();
   s.close();
 
