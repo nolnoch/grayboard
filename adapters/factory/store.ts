@@ -35,7 +35,7 @@ export type Admit = { fanout?: boolean; parent?: number; title?: string; profile
 // cut off by a restart ends as interrupted. Its transcript is the file
 // runs/<id>.jsonl beside the store, pruned with it.
 export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted" | "cancelled";
-export type Run = { id: number; seq: number; agent: string; started_at: number; ended_at: number | null; code: number | null; session: string | null; turns: number | null; cost_usd: number | null; outcome: RunOutcome | null };
+export type Run = { id: number; seq: number; agent: string; started_at: number; ended_at: number | null; code: number | null; session: string | null; turns: number | null; cost_usd: number | null; granted_usd: number | null; outcome: RunOutcome | null };
 
 export class Store {
   private readonly db: Database;
@@ -88,7 +88,8 @@ export class Store {
       session TEXT,
       turns INTEGER,
       cost_usd REAL,
-      outcome TEXT
+      outcome TEXT,
+      granted_usd REAL
     )`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS runs_seq ON runs (seq)`);
     // Thread commands (#651). threads: each reply the factory sent for a
@@ -104,6 +105,9 @@ export class Store {
       const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"],
         ["question", "TEXT"], ["ask_human", "INTEGER NOT NULL DEFAULT 0"], ["asked_at", "INTEGER"], ["escalated_at", "INTEGER"], ["answer", "TEXT"], ["asks", "INTEGER NOT NULL DEFAULT 0"], ["resume", "INTEGER NOT NULL DEFAULT 0"]];
       for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
+      // A run's granted budget (#655): its reservation while open, its charge when it ends without a cost.
+      const runCols = new Set((this.db.query(`PRAGMA table_info(runs)`).all() as { name: string }[]).map((c) => c.name));
+      if (!runCols.has("granted_usd")) this.db.exec(`ALTER TABLE runs ADD COLUMN granted_usd REAL`);
     }).immediate();
   }
 
@@ -273,8 +277,33 @@ export class Store {
   }
 
   // A run of the request `seq` starts; returns its id.
-  startRun(seq: number, agent: string): number {
-    return Number(this.db.query(`INSERT INTO runs (seq, agent, started_at) VALUES (?, ?, ?)`).run(seq, agent, this.now()).lastInsertRowid);
+  startRun(seq: number, agent: string, grantedUsd?: number): number {
+    return Number(this.db.query(`INSERT INTO runs (seq, agent, started_at, granted_usd) VALUES (?, ?, ?, ?)`).run(seq, agent, this.now(), grantedUsd ?? null).lastInsertRowid);
+  }
+
+  // Spend (#655): a run's cost, else its grant. An open run has no cost
+  // yet, so its grant is its reservation; a run killed before its final
+  // event (timeout, cancel, interrupted) never gets one, so it's charged
+  // its grant rather than nothing. A run with neither counts as free: no
+  // cap applied when it started.
+  treeSpent(root: number): number {
+    return (this.db.query(`SELECT COALESCE(SUM(COALESCE(r.cost_usd, r.granted_usd, 0)), 0) AS n FROM runs r JOIN requests q ON q.seq = r.seq WHERE q.seq = ? OR q.parent = ?`).get(root, root) as { n: number }).n;
+  }
+
+  // Spend on runs started since `since`: every run, or a fleet's (its root
+  // a post on `board`). Rows pruned by retention drop out, so a daily cap
+  // needs retention of at least a day (main.ts refuses less).
+  spentSince(since: number, board?: string): number {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
+    return (this.db.query(`SELECT COALESCE(SUM(COALESCE(r.cost_usd, r.granted_usd, 0)), 0) AS n FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ?${scope}`).get(...args) as { n: number }).n;
+  }
+
+  // When the oldest charge in the window leaves it: the earliest a held fleet may run again.
+  oldestSince(since: number, board?: string): number | null {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
+    return (this.db.query(`SELECT MIN(r.started_at) AS t FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ? AND COALESCE(r.cost_usd, r.granted_usd, 0) > 0${scope}`).get(...args) as { t: number | null }).t;
   }
 
   endRun(id: number, outcome: RunOutcome, m: Partial<RunMeta> = {}): void {
