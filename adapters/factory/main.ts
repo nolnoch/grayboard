@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { LocalBus, sessionFree } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
-import { Factory, type Fleet, type Route } from "./factory.ts";
+import { ASK_DEFAULTS, Factory, type AskPolicy, type Fleet, type Route } from "./factory.ts";
 import type { Policy } from "./runner.ts";
 import { Store } from "./store.ts";
 import { WORKDIR_MODES, Workspaces, type Workdir, type WorkdirMode } from "./workdir.ts";
@@ -31,6 +31,10 @@ export type Config = {
   maxSubtasks: number;     // the most subtasks a fleet task's plan may fan out to
   timeoutMs: number;
   retentionMs: number;
+  maxAsks: number;         // the most questions one request's runs may ask (#652)
+  askEscalateMs: number;   // an unanswered question goes to your user after this long
+  askGiveUpMs: number;     // and after this long more, the run resumes on its own judgement
+  human?: string;          // who escalations go to; absent, the bus's first human
 };
 
 // A profile (#643): the agent, what its children may do and where they run
@@ -180,6 +184,8 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   const identity = str("identity", DEFAULTS.identity);
   // A bus name (boards.md §3); anything else could never be bound.
   if (!/^[a-z0-9_-]{1,32}$/.test(identity)) throw new Error(`${path}: "identity" must be 1-32 characters of a-z 0-9 _ -`);
+  const human = raw.human !== undefined ? str("human", "") : undefined;
+  if (human !== undefined && !/^[a-z0-9_-]{1,32}$/.test(human)) throw new Error(`${path}: "human" must be a bus handle, 1-32 characters of a-z 0-9 _ -`);
   return {
     identity,
     grayboard: gb,
@@ -193,7 +199,16 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     maxSubtasks: atLeast2(pos("maxSubtasks", DEFAULTS.maxSubtasks)),
     timeoutMs: pos("timeoutMs", DEFAULTS.timeoutMs),
     retentionMs: pos("retentionMs", DEFAULTS.retentionMs),
+    maxAsks: pos("maxAsks", ASK_DEFAULTS.max),
+    askEscalateMs: pos("askEscalateMs", ASK_DEFAULTS.escalateMs),
+    askGiveUpMs: pos("askGiveUpMs", ASK_DEFAULTS.giveUpMs),
+    ...(human !== undefined ? { human } : {}),
   };
+}
+
+// The asking policy (#652): reloadable, and read when each clock is checked.
+export function askOf(c: Config): AskPolicy {
+  return { max: c.maxAsks, escalateMs: c.askEscalateMs, giveUpMs: c.askGiveUpMs, ...(c.human ? { human: c.human } : {}) };
 }
 
 // The global policy: delegations, and fleets without a profile.
@@ -218,13 +233,13 @@ export async function main(env: Record<string, string | undefined> = process.env
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
   const workspaces = new Workspaces(join(dataDir, "trees"), cfg.cwd);
-  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
+  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
   let signalled = false;
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
-  // SIGHUP reloads the config (#645): fleets, projects, profiles and the
-  // global tool lists and working directory. A config that doesn't load
+  // SIGHUP reloads the config (#645): fleets, projects, profiles, the
+  // global tool lists and working directory, and the asking policy (#652). A config that doesn't load
   // leaves the running one in place; the other fields need a restart.
   let reloads = Promise.resolve();
   const reload = () => {
@@ -236,7 +251,7 @@ export async function main(env: Record<string, string | undefined> = process.env
       }
       const restart = RESTART_ONLY.filter((k) => JSON.stringify(next[k]) !== JSON.stringify(cfg[k]));
       if (restart.length) log(`reload: ${restart.join(", ")} changed, which takes a restart; the running values stay`);
-      await factory.reconfigure({ fleets: next.fleets, policy: policyOf(next), workdir: next.workdir });
+      await factory.reconfigure({ fleets: next.fleets, policy: policyOf(next), workdir: next.workdir, ask: askOf(next) });
       log(`reloaded: ${next.fleets.length} fleet(s) and project(s)`);
     }).catch((e) => log(`reload failed: ${e instanceof Error ? e.message : String(e)}`));
   };

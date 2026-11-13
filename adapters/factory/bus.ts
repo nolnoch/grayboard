@@ -19,6 +19,8 @@ export type Delivery =
 export interface FactoryBus {
   // The handle this session holds and writes as.
   readonly handle: string;
+  // The bus's declared human handles (#652): who "your user" is. Absent or empty, none.
+  readonly humans?: readonly string[];
   // One tool call; its JSON result, or its text when not JSON. A tool error throws.
   call(tool: string, args?: Record<string, unknown>): Promise<unknown>;
   // Pushed deliveries, in arrival order; ends when the bus closes.
@@ -77,7 +79,7 @@ export class LocalBus implements FactoryBus {
   private settle!: (why: string) => void;
   readonly closed = new Promise<string>((ok) => (this.settle = ok));
 
-  private constructor(private readonly client: Client, readonly handle: string) {}
+  private constructor(private readonly client: Client, readonly handle: string, readonly humans: readonly string[]) {}
 
   static async start(o: LocalBusOptions): Promise<LocalBus> {
     const [command, ...prefix] = o.command;
@@ -102,7 +104,7 @@ export class LocalBus implements FactoryBus {
       await client.close().catch(() => {});
       throw new Error(`the factory didn't bind ${o.identity} (whoami: ${JSON.stringify(who)}); is another live session holding it?`);
     }
-    bus = new LocalBus(client, who.primary);
+    bus = new LocalBus(client, who.primary, humansOf(client.getInstructions()));
     for (const d of early) bus.push(d);
     // Protocol.onclose, not the transport's: connect() owns that one.
     client.onclose = () => bus!.end(bus!.closing ? "closed" : "the grayboard mcp child exited");
@@ -144,6 +146,14 @@ export class LocalBus implements FactoryBus {
     await this.client.close().catch(() => {});
     this.end("closed");
   }
+}
+
+// The human handles from the session's instructions (src/core/tools.ts
+// humanInstruction): `Humans on this bus: "a", "b".`; none when the bus has
+// no declared human.
+export function humansOf(instructions: string | undefined): string[] {
+  const m = /Humans on this bus: ((?:"[^"]+"(?:, )?)+)\./.exec(instructions ?? "");
+  return m ? [...m[1]!.matchAll(/"([^"]+)"/g)].map((x) => x[1]!) : [];
 }
 
 function parse(r: unknown): unknown {

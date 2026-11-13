@@ -7,8 +7,9 @@ import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Delivery, FactoryBus } from "./bus.ts";
 import { oneLine, requestOf, type Key, type Request } from "./delegate.ts";
+import { answerPrompt, askInstruction, NO_ANSWER, NO_MORE, parseAsk, reseeded, type Ask } from "./ask.ts";
 import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
-import { resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "./runner.ts";
+import { resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner } from "./runner.ts";
 import type { Admit, Row, RunOutcome, Store } from "./store.ts";
 import type { Place, Workdir, Workspaces } from "./workdir.ts";
 
@@ -23,8 +24,15 @@ export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: s
 export type Route = { profile: string; agent: string; policy: Policy; workdir: Workdir };
 export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
 
+// Asking (#652): the most questions one request's tree may ask; how long a
+// question waits before it's sent to your user, and how long after that
+// before the run resumes on its own judgement; who your user is (absent,
+// the bus's declared human).
+export type AskPolicy = { max: number; escalateMs: number; giveUpMs: number; human?: string };
+export const ASK_DEFAULTS: AskPolicy = { max: 3, escalateMs: 3_600_000, giveUpMs: 24 * 3_600_000 };
+
 // What a config reload (#645) replaces; the rest needs a restart.
-export type Reconfig = { fleets: Fleet[]; policy: Policy; workdir: Workdir };
+export type Reconfig = { fleets: Fleet[]; policy: Policy; workdir: Workdir; ask?: AskPolicy };
 
 export type FactoryOptions = {
   fleets?: Fleet[];
@@ -37,6 +45,8 @@ export type FactoryOptions = {
   timeoutMs: number;
   retentionMs: number;
   housekeepingMs?: number; // how often unsent replies are retried and the store pruned
+  ask?: AskPolicy; // default ASK_DEFAULTS
+  askTickMs?: number; // how often parked questions' clocks are checked (default 30 s)
   log(message: string): void;
 };
 
@@ -50,16 +60,18 @@ export class Factory {
   private readonly inflight = new Set<Promise<void>>(); // running execs, awaited at shutdown
   private readonly sending = new Set<string>(); // keys whose outcome is being sent, so housekeeping can't send one twice
   private timer: ReturnType<typeof setInterval> | undefined;
+  private askTimer: ReturnType<typeof setInterval> | undefined;
+  private ticking = false;
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
   private readonly active = new Map<number, AbortController>(); // seq → its running child's controller
   private readonly cancelledBy = new Map<number, string>(); // seq → who cancelled it while it ran (#651)
   private load = ""; // the peer_status text last set
 
-  private cfg: Reconfig;
+  private cfg: Reconfig & { ask: AskPolicy };
 
   constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {
-    this.cfg = { fleets: o.fleets ?? [], policy: o.policy, workdir: o.workdir };
+    this.cfg = { fleets: o.fleets ?? [], policy: o.policy, workdir: o.workdir, ask: o.ask ?? ASK_DEFAULTS };
     // A transcript holds whatever its child read and wrote.
     mkdirSync(o.runs, { recursive: true, mode: 0o700 });
     chmodSync(o.runs, 0o700);
@@ -69,7 +81,7 @@ export class Factory {
   // global lists; a run already started keeps what it started with. A
   // queued task whose fleet is gone fails when it would run (settingsFor).
   async reconfigure(c: Reconfig): Promise<void> {
-    this.cfg = c;
+    this.cfg = { ...c, ask: c.ask ?? this.cfg.ask };
     await this.syncFleets();
     this.pump();
   }
@@ -83,6 +95,9 @@ export class Factory {
     await this.syncFleets();
     await this.housekeeping();
     this.timer = setInterval(() => void this.housekeeping().catch((e) => this.o.log(`housekeeping: ${msg(e)}`)), this.o.housekeepingMs ?? 3_600_000);
+    // Parked questions' clocks (#652) run from their stored times, so a
+    // restart resumes them where they were.
+    this.askTimer = setInterval(() => void this.askTick().catch((e) => this.o.log(`questions: ${msg(e)}`)), this.o.askTickMs ?? 30_000);
     this.pump();
     // One bad delivery must not end the loop: log it and take the next.
     const consume = (async () => {
@@ -110,6 +125,7 @@ export class Factory {
   stop(): void {
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
+    if (this.askTimer) clearInterval(this.askTimer);
     for (const c of this.children) c.abort();
   }
 
@@ -227,8 +243,8 @@ export class Factory {
   // The factory's load in peer_list (#651), set when it changes.
   private showLoad(): void {
     if (this.stopping) return;
-    const { running, queued } = this.store.load();
-    const text = running || queued ? `${running} running, ${queued} queued` : "idle";
+    const { running, queued, asking } = this.store.load();
+    const text = running || queued || asking ? `${running} running, ${queued} queued${asking ? `, ${asking} asking` : ""}` : "idle";
     if (text === this.load) return;
     this.load = text;
     void this.bus.call("peer_status", { text }).catch((e) => this.o.log(`couldn't set peer_status: ${msg(e)}`));
@@ -247,7 +263,7 @@ export class Factory {
       body = `[factory] failed: the factory couldn't run this: ${msg(e)}`;
     }
     this.cancelledBy.delete(row.seq);
-    if (body === null) return; // fanned out: its synthesis finishes it
+    if (body === null) return; // fanned out (its synthesis finishes it) or asking (its resume does)
     this.store.finish(row, clip(body));
     // Before the send's await: a crash during it must not strand a parent
     // whose subtasks all finished.
@@ -255,7 +271,7 @@ export class Factory {
     await this.send(this.store.get(row)!);
   }
 
-  // The row's reply, or null when its run fanned out.
+  // The row's reply, or null when its run fanned out or asked.
   private async outcome(row: Row): Promise<string | null> {
     const synth = row.phase === "synthesize";
     const max = this.o.maxSubtasks ?? 5;
@@ -263,10 +279,19 @@ export class Factory {
     if (typeof set === "string") return set;
     const ownDir = (s: Settings | string) => typeof s !== "string" && s.workdir.mode !== "shared";
     const routes = this.fleets().find((f) => f.name === row.persona)?.routes ?? [];
-    const input: Request = synth
+    let input: Request = synth
       ? { ...row, task: synthesisPrompt(row.task, this.store.subtasks(row.seq).map((s) => ({ title: s.title ?? "", reply: s.reply, dir: ownDir(this.settingsFor(s)) ? String(s.seq) : undefined }))), context: undefined }
       : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max, ownDir(set), row.source === "board" ? routes.map((r) => ({ name: r.profile, agent: r.agent, tools: r.policy.tools?.join(", ") ?? "the default: no shell, no web fetch" })) : [])}` } : row;
-    const out = await this.runAgent(row, input, set);
+    // An answered question (#652) resumes the conversation that asked it;
+    // with no session to resume, a fresh run is told what it asked and what came back.
+    let resume: Resume | undefined;
+    const session = row.resume && row.answer !== null ? this.store.lastSession(row.seq) : null;
+    if (session) resume = { session, input: row.answer! };
+    else {
+      const task = `${input.task}\n\n${askInstruction()}`;
+      input = { ...input, task: row.resume && row.answer !== null ? reseeded(task, row.question ?? "", row.answer) : task };
+    }
+    const out = await this.runAgent(row, input, set, resume);
     const who = set.agent ?? row.agent;
     const by = this.cancelledBy.get(row.seq);
     if (by !== undefined && typeof out !== "string") return `[factory] cancelled: by ${by} while ${this.runner.harness} agent \`${who}\` ran.`;
@@ -274,6 +299,8 @@ export class Factory {
     if (typeof out === "string") body = out;
     else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${who}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
     else {
+      const q = parseAsk(out.text);
+      if (q !== null) return typeof q === "string" ? `[factory] failed: ${this.runner.harness} agent \`${who}\` asked a question the factory can't use: ${q}.` : this.ask(row, q, who);
       const plan = row.fanout && !synth ? parsePlan(out.text, max) : null;
       if (plan && typeof plan !== "string") {
         const why = await this.fanOut(row, plan);
@@ -293,7 +320,7 @@ export class Factory {
   }
 
   // Runs the row's agent on `input`; a string is a failure reply that needed no run.
-  private async runAgent(row: Row, input: Request, set: Settings): Promise<Outcome | string> {
+  private async runAgent(row: Row, input: Request, set: Settings, resume?: Resume): Promise<Outcome | string> {
     const name = set.agent ?? row.agent;
     const agent = this.runner.roster().find((a) => a.name === name);
     if (!agent) return `[factory] failed: agent \`${name}\` left the ${this.runner.harness} roster before this ran; nothing was spawned.`;
@@ -310,12 +337,12 @@ export class Factory {
     this.children.add(ac);
     this.active.set(row.seq, ac);
     const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
-    this.o.log(`request ${row.id}: running ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
+    this.o.log(`request ${row.id}: ${resume ? "resuming" : "running"} ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
     const run = this.store.startRun(row.seq, agent.name);
     let ended: RunOutcome = "failed";
     let out: Outcome | undefined;
     try {
-      out = await this.runner.run(agent, input, ac.signal, set.policy, place, join(this.o.runs, `${run}.jsonl`));
+      out = await this.runner.run(agent, input, ac.signal, set.policy, place, join(this.o.runs, `${run}.jsonl`), resume);
       ended = this.cancelledBy.has(row.seq) ? "cancelled" : out.run?.stop ?? (out.ok ? "ok" : ac.signal.aborted ? "timeout" : "failed");
       return out;
     } catch (e) {
@@ -406,6 +433,119 @@ export class Factory {
     return null;
   }
 
+  // ── asking (#652) ───────────────────────────────────────────────────────
+  // A run ended on a question: the row parks (no slot held) and the
+  // question goes in its request's thread; a subtask's goes in its parent's,
+  // which the requester watches. Addressed to your user, it's sent to them
+  // at once too. Past the tree's cap it isn't parked: the run resumes told
+  // to decide, and asking again after that fails it. Returns a failure or
+  // cancel reply, or null when the row parked or queued again.
+  private async ask(row: Row, q: Ask, who: string): Promise<string | null> {
+    const root = this.rootOf(row);
+    const by = this.cancelledBy.get(row.seq);
+    if (by !== undefined) return `[factory] cancelled: by ${by} while ${this.runner.harness} agent \`${who}\` ran.`;
+    const max = this.cfg.ask.max;
+    if (this.store.treeAsks(root.seq) >= max) {
+      if (row.answer === NO_MORE) return `[factory] failed: ${this.runner.harness} agent \`${who}\` asked again after the task's ${max} question${max === 1 ? " was" : "s were"} used up. Its question: ${q.question}`;
+      this.store.refuse(row.seq, q.question, NO_MORE);
+      this.o.log(`request ${row.id}: a question past the cap of ${max}; resuming it told to decide`);
+      return null;
+    }
+    this.store.park(row.seq, q.question, q.human);
+    this.o.log(`request ${row.id}: asking ${q.human ? "your user" : root.requester}; parked`);
+    const body = `[factory] question${this.subtaskLabel(row)} from ${this.runner.harness} agent \`${who}\`${q.human ? ", for your user" : ""}:\n\n${q.question}\n\nReply to this message with the answer; the run waits for it.`;
+    try {
+      const res = root.source === "board"
+        ? await this.bus.call("board_post", { board: root.board, body, parent_id: root.id })
+        : await this.bus.call("dm_send", { to: root.requester, body, parent_id: root.id });
+      this.remember(root.source, res, row.seq);
+    } catch (e) {
+      this.o.log(`couldn't post request ${row.id}'s question; it goes to your user when it escalates: ${msg(e)}`);
+    }
+    if (q.human) await this.escalate(this.store.bySeq(row.seq)!, root);
+    return null;
+  }
+
+  private rootOf(row: Row): Row {
+    return (row.parent !== null ? this.store.bySeq(row.parent) : null) ?? row;
+  }
+
+  private subtaskLabel(row: Row): string {
+    return row.parent !== null && row.source === "board" ? ` for subtask "${oneLine(row.title ?? "")}" on #${row.board}` : "";
+  }
+
+  // Your user: the config's handle, else the bus's declared human.
+  private human(): string | undefined {
+    return this.cfg.ask.human ?? this.bus.humans?.[0];
+  }
+
+  // The question in a DM to your user, once; their reply to it answers it.
+  private async escalate(row: Row, root: Row): Promise<void> {
+    const human = this.human();
+    if (!human) { this.o.log(`request ${row.id}: no human handle to send its question to (set "human" in the config or declare one with \`grayboard human\`)`); return; }
+    const where = root.source === "board" ? `post ${root.id} on #${root.board}` : `a delegation by DM`;
+    const why = row.askHuman ? "asks you" : `has waited ${ago(row.askedAt ?? Date.now())} for an answer from ${oneLine(root.requester)}`;
+    const body = `[factory] ${oneLine(root.requester)}'s task (${where})${this.subtaskLabel(row)} ${why}:\n\n${row.question ?? ""}\n\nReply to this message with the answer. With none in ${dur(this.cfg.ask.giveUpMs)}, the run carries on with its own judgement.`;
+    try {
+      this.remember("dm", await this.bus.call("dm_send", { to: human, body }), row.seq);
+    } catch (e) {
+      this.o.log(`couldn't send request ${row.id}'s question to ${human}: ${msg(e)}`);
+    }
+  }
+
+  // Parked questions' clocks: unanswered past escalateMs goes to your user
+  // once; past giveUpMs after that, the run resumes on its own judgement.
+  private async askTick(): Promise<void> {
+    if (this.ticking || this.stopping) return;
+    this.ticking = true;
+    try {
+      const a = this.cfg.ask, now = Date.now();
+      for (const r of this.store.asking()) {
+        if (r.escalatedAt === null) {
+          if (now - (r.askedAt ?? now) < a.escalateMs) continue;
+          this.store.escalated(r.seq);
+          this.o.log(`request ${r.id}: question unanswered for ${ago(r.askedAt ?? now)}; sending it to your user`);
+          await this.escalate(r, this.rootOf(r));
+        } else if (now - r.escalatedAt >= a.giveUpMs && this.store.answer(r.seq, NO_ANSWER) === "queued") {
+          this.o.log(`request ${r.id}: question unanswered; resuming on its own judgement`);
+          const root = this.rootOf(r);
+          await this.reply(root, `[factory] no answer${this.subtaskLabel(r)}: the run carries on with its own judgement.`).catch((e) => this.o.log(`couldn't say so in request ${root.id}'s thread: ${msg(e)}`));
+        }
+      }
+      this.pump();
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  // A free-text reply that answers a parked question: one to the question
+  // (in the thread or the DM to your user) answers that row; one elsewhere
+  // in the request's thread answers its tree's only open question. From the
+  // requester or your user; anyone else's is chatter. False: not an answer.
+  private async answerQuestion(d: Delivery, id: number, hit: Row, root: Row, inThread: boolean): Promise<boolean> {
+    if (!(d.human === true || d.from === root.requester)) return false;
+    const text = d.body.trim().replace(/^(@[\w.-]+[\s,:]*)+/, "").trim();
+    if (!text) return false;
+    let target: Row | undefined;
+    if (hit.state === "asking") target = hit;
+    else if (inThread) {
+      const open = [root, ...this.store.subtasks(root.seq)].filter((r) => r.state === "asking");
+      if (open.length > 1) {
+        await this.answer(d, id, `[factory] ${open.length} questions are open in this task; reply to the one you're answering.`, root.seq);
+        return true;
+      }
+      target = open[0];
+    }
+    if (!target) return false;
+    const res = this.store.answer(target.seq, answerPrompt(oneLine(d.from!), text), { source: d.kind, id });
+    if (res === "closed") return false;
+    if (res === "replay") { this.o.log(`${d.kind} ${id}: answer already taken; replay ignored`); return true; }
+    this.o.log(`request ${target.id}: answered by ${d.from}; queued to resume`);
+    await this.answer(d, id, `[factory] answered${this.subtaskLabel(target)}: the run resumes with it.`, target.seq);
+    this.pump();
+    return true;
+  }
+
   private declineBody(r: Request): string {
     const names = this.runner.roster().map((a) => a.name).slice(0, 20);
     return `[factory] declined: no ${this.runner.harness} agent matches persona "${oneLine(r.persona)}" (roster: ${names.length ? names.join(", ") : "empty"}; read from ${this.runner.rosterSource}). Nothing was spawned. Re-delegate to another launcher or handle it yourself.`;
@@ -450,16 +590,23 @@ export class Factory {
   // reads it, never a model. True when the delivery was a command for one
   // of the factory's requests, acted on or refused; false lets take() treat
   // it as before.
+  // A free-text reply may answer a parked question instead (#652).
   private async command(d: Delivery): Promise<boolean> {
     if (d.parentId === undefined || !d.from) return false;
-    const verb = commandOf(d.body);
-    if (!verb) return false;
     const id = d.kind === "dm" ? d.id : d.postId;
     if (id === undefined) return false;
-    const row = this.store.threadOf(d.kind, d.parentId);
+    const hit = this.store.threadOf(d.kind, d.parentId);
+    if (!hit) return false;
+    // A subtask's question is posted in its request's thread, so a reply
+    // there finds the subtask: commands act on the request it belongs to.
+    const row = this.rootOf(hit);
     // Post ids are global, so the board check is belt and braces; a
-    // subtask's thread on a fan-out board takes no commands.
-    if (!row || row.parent !== null || (d.kind === "board" && (row.source !== "board" || row.board !== d.board))) return false;
+    // subtask's thread on a fan-out board takes no commands. The DM that
+    // sent a question to your user takes theirs.
+    const inThread = d.kind === row.source && (d.kind !== "board" || (row.source === "board" && row.board === d.board));
+    const verb = commandOf(d.body);
+    if (!verb) return this.answerQuestion(d, id, hit, row, inThread);
+    if (!inThread && !(d.kind === "dm" && d.human === true)) return false;
     const cmd: Key = { source: d.kind, id };
     if (!this.store.command(cmd, row.seq)) { this.o.log(`${d.kind} ${id}: command already acted on; replay ignored`); return true; }
     const answer = (body: string) => this.answer(d, id, body, row.seq);
@@ -489,9 +636,10 @@ export class Factory {
   private async cancel(row: Row, by: string, answer: (b: string) => Promise<void>): Promise<void> {
     const who = oneLine(by);
     const res = this.store.cancel(row.seq, (r) =>
-      r.seq !== row.seq ? `[factory] cancelled: by ${who} with the task it belongs to, before it ran.`
+      r.seq !== row.seq ? `[factory] cancelled: by ${who} with the task it belongs to, ${r.state === "asking" ? "while it waited for an answer" : "before it ran"}.`
         : r.state === "waiting" ? `[factory] cancelled: by ${who} after it fanned out on #${r.fanoutBoard}; its subtasks stop and nothing is combined.`
-          : `[factory] cancelled: by ${who} before it ran.`);
+          : r.state === "asking" ? `[factory] cancelled: by ${who} while it waited for an answer.`
+            : `[factory] cancelled: by ${who} before it ran.`);
     if (!res) return answer(`[factory] cancel: this already finished; nothing to cancel. Reply \`retry\` to run it again.`);
     for (const r of res.running) {
       this.cancelledBy.set(r.seq, who);
@@ -505,7 +653,7 @@ export class Factory {
   // and answered in its thread. A DM's goes to whoever sent the command, the
   // only party in that thread.
   private async retry(row: Row, d: Delivery, cmd: Key, answer: (b: string) => Promise<void>): Promise<void> {
-    if (row.state !== "finished") return answer(`[factory] retry: this is still ${row.state === "waiting" ? "running its subtasks" : row.state}; reply \`cancel\` first.`);
+    if (row.state !== "finished") return answer(`[factory] retry: this is still ${row.state === "waiting" ? "running its subtasks" : row.state === "asking" ? "waiting for an answer" : row.state}; reply \`cancel\` first.`);
     const base = { id: cmd.id, persona: row.persona, task: row.task, ...(row.context !== undefined ? { context: row.context } : {}) };
     if (row.source === "dm") {
       const r: Request = { ...base, source: "dm", requester: d.from! };
@@ -532,7 +680,10 @@ export class Factory {
     let state: string;
     if (row.state === "queued") state = `queued, ${this.store.queuedAhead(row)} ahead`;
     else if (row.state === "running") state = open.length ? `running: ${this.runner.harness} agent \`${open[0]!.agent}\` for ${ago(open[0]!.started_at)}` : "running: starting";
-    else if (row.state === "waiting") state = `fanned out on #${row.fanoutBoard}: ${subs.filter((s) => s.state === "finished").length} of ${subs.length} subtasks finished`;
+    else if (row.state === "waiting") {
+      const asking = subs.filter((s) => s.state === "asking").length;
+      state = `fanned out on #${row.fanoutBoard}: ${subs.filter((s) => s.state === "finished").length} of ${subs.length} subtasks finished${asking ? `, ${asking} asking` : ""}`;
+    } else if (row.state === "asking") state = `asking${row.askHuman ? " your user" : ""}: "${oneLine((row.question ?? "").split("\n")[0] ?? "")}", for ${ago(row.askedAt ?? Date.now())}`;
     else state = `finished: ${oneLine((row.reply ?? "").split("\n")[0] ?? "")}`;
     const done = runs.filter((r) => r.ended_at !== null);
     const turns = done.reduce((n, r) => n + (r.turns ?? 0), 0), cost = done.reduce((n, r) => n + (r.cost_usd ?? 0), 0);
@@ -585,7 +736,11 @@ export function commandOf(body: string): "cancel" | "retry" | "status" | null {
 }
 
 function ago(t: number): string {
-  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return dur(Date.now() - t);
+}
+
+function dur(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
   return s < 120 ? `${s}s` : s < 7200 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
 }
 

@@ -13,8 +13,10 @@ import type { RunMeta } from "./runner.ts";
 // queued: waiting for a slot. running: a child is (or was, before a crash)
 // working on it. waiting: its run returned a fan-out plan, and its subtasks
 // (rows whose `parent` is its seq) are out. finished: the outcome is in
-// `reply`, sent when replied = 1.
-export type State = "queued" | "running" | "waiting" | "finished";
+// `reply`, sent when replied = 1. asking (#652): its run ended on a
+// question (`question`), and it holds no slot until an answer queues it again
+// to resume (`resume` = 1, the answer in `answer`).
+export type State = "queued" | "running" | "waiting" | "asking" | "finished";
 // run: the request itself (a fan-out-capable one when `fanout`). synthesize:
 // a fanned-out request whose subtasks all finished, combining their results.
 export type Phase = "run" | "synthesize";
@@ -22,6 +24,10 @@ export type Row = Request & {
   seq: number; agent: string; state: State; reply: string | null; replied: boolean; created_at: number; updated_at: number;
   phase: Phase; fanout: boolean; parent: number | null; title: string | null; fanoutBoard: string | null;
   profile: string | null; // a routed subtask's profile (#645); null runs as its project's lead
+  // Asking (#652): the last question and the answer it got (kept for a
+  // reseeded run and the cap check), when it was asked and escalated to
+  // your user, how many this row asked, and whether its next run resumes.
+  question: string | null; askHuman: boolean; askedAt: number | null; escalatedAt: number | null; answer: string | null; asks: number; resume: boolean;
 };
 export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string };
 // A child process (#649): one per run of a request (a fanned-out request has
@@ -63,6 +69,13 @@ export class Store {
       title TEXT,
       fanout_board TEXT,
       profile TEXT,
+      question TEXT,
+      ask_human INTEGER NOT NULL DEFAULT 0,
+      asked_at INTEGER,
+      escalated_at INTEGER,
+      answer TEXT,
+      asks INTEGER NOT NULL DEFAULT 0,
+      resume INTEGER NOT NULL DEFAULT 0,
       UNIQUE (source, id)
     )`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS runs (
@@ -88,7 +101,8 @@ export class Store {
     // columns, in one transaction with the check.
     this.db.transaction(() => {
       const cols = new Set((this.db.query(`PRAGMA table_info(requests)`).all() as { name: string }[]).map((c) => c.name));
-      const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"]];
+      const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"],
+        ["question", "TEXT"], ["ask_human", "INTEGER NOT NULL DEFAULT 0"], ["asked_at", "INTEGER"], ["escalated_at", "INTEGER"], ["answer", "TEXT"], ["asks", "INTEGER NOT NULL DEFAULT 0"], ["resume", "INTEGER NOT NULL DEFAULT 0"]];
       for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
     }).immediate();
   }
@@ -134,12 +148,61 @@ export class Store {
     return this.db.query(`UPDATE requests SET state = 'queued', phase = 'synthesize', updated_at = ? WHERE seq = ? AND state = 'waiting'`).run(this.now(), parent).changes === 1;
   }
 
-  // The oldest queued request, now running; null when none waits.
+  // The oldest queued request, now running; null when none waits. The
+  // returned row says whether this run resumes (#652); the store clears it,
+  // so a later run of the row (a synthesis) starts fresh.
   next(): Row | null {
     const row = this.db.query(`SELECT * FROM requests WHERE state = 'queued' ORDER BY seq LIMIT 1`).get() as Raw | null;
     if (!row) return null;
-    this.db.query(`UPDATE requests SET state = 'running', updated_at = ? WHERE seq = ?`).run(this.now(), row.seq);
+    this.db.query(`UPDATE requests SET state = 'running', resume = 0, updated_at = ? WHERE seq = ?`).run(this.now(), row.seq);
     return toRow({ ...row, state: "running" });
+  }
+
+  // ── asking (#652) ──
+  // A running row's run ended on a question: it parks. `human`: addressed
+  // to your user, so it counts as escalated at once.
+  park(seq: number, question: string, human: boolean): void {
+    const t = this.now();
+    this.db.query(`UPDATE requests SET state = 'asking', question = ?, ask_human = ?, asked_at = ?, escalated_at = ?, answer = NULL, asks = asks + 1, updated_at = ? WHERE seq = ? AND state = 'running'`)
+      .run(question, human ? 1 : 0, t, human ? t : null, t, seq);
+  }
+
+  // A question past the tree's cap: counted, never parked; the row queues
+  // again at once to resume with `answer`.
+  refuse(seq: number, question: string, answer: string): void {
+    this.db.query(`UPDATE requests SET state = 'queued', question = ?, answer = ?, resume = 1, asks = asks + 1, updated_at = ? WHERE seq = ? AND state = 'running'`)
+      .run(question, answer, this.now(), seq);
+  }
+
+  // Answers an asking row: queues it to resume with `answer`. With `cmd`
+  // (the answering message), records it in the same transaction, so a
+  // replayed answer acts once and a crash can't lose a recorded one.
+  // "replay": `cmd` was already acted on; "closed": the row isn't asking.
+  answer(seq: number, answer: string, cmd?: Key): "queued" | "replay" | "closed" {
+    return this.db.transaction(() => {
+      if (this.bySeq(seq)?.state !== "asking") return "closed";
+      if (cmd && !this.command(cmd, seq)) return "replay";
+      this.db.query(`UPDATE requests SET state = 'queued', answer = ?, resume = 1, updated_at = ? WHERE seq = ?`).run(answer, this.now(), seq);
+      return "queued";
+    }).immediate() as "queued" | "replay" | "closed";
+  }
+
+  escalated(seq: number): void {
+    this.db.query(`UPDATE requests SET escalated_at = ? WHERE seq = ? AND state = 'asking'`).run(this.now(), seq);
+  }
+
+  asking(): Row[] {
+    return (this.db.query(`SELECT * FROM requests WHERE state = 'asking' ORDER BY seq`).all() as Raw[]).map(toRow);
+  }
+
+  // Questions asked in the tree rooted at `root` (itself and its subtasks).
+  treeAsks(root: number): number {
+    return (this.db.query(`SELECT COALESCE(SUM(asks), 0) AS n FROM requests WHERE seq = ? OR parent = ?`).get(root, root) as { n: number }).n;
+  }
+
+  // The session of the row's latest run that reported one: what a resume continues.
+  lastSession(seq: number): string | null {
+    return (this.db.query(`SELECT session FROM runs WHERE seq = ? AND session IS NOT NULL ORDER BY id DESC LIMIT 1`).get(seq) as { session: string } | null)?.session ?? null;
   }
 
   finish(k: Key, reply: string): void {
@@ -174,9 +237,9 @@ export class Store {
     return this.db.query(`INSERT OR IGNORE INTO commands (source, id, seq) VALUES (?, ?, ?)`).run(k.source, k.id, seq).changes === 1;
   }
 
-  // A cancel (#651), in one transaction. A queued request finishes with
-  // `reply`. A waiting one finishes too (so it never synthesizes), with its
-  // queued subtasks; its running subtasks are returned for the caller to
+  // A cancel (#651), in one transaction. A queued or asking request finishes
+  // with `reply`. A waiting one finishes too (so it never synthesizes), with
+  // its queued and asking subtasks; its running subtasks are returned for the caller to
   // stop. A running request is the caller's to stop. Returns the rows
   // finished here and the running ones, or null when it had already finished.
   cancel(seq: number, reply: (r: Row) => string): { finished: Row[]; running: Row[] } | null {
@@ -185,15 +248,15 @@ export class Store {
       if (!r || r.state === "finished") return null;
       if (r.state === "running") return { finished: [], running: [r] };
       const subs = r.state === "waiting" ? this.subtasks(seq) : [];
-      const finished = [r, ...subs.filter((s) => s.state === "queued")];
+      const finished = [r, ...subs.filter((s) => s.state === "queued" || s.state === "asking")];
       for (const f of finished) this.finish(f, reply(f));
       return { finished: finished.map((f) => this.bySeq(f.seq)!), running: subs.filter((s) => s.state === "running") };
     }).immediate();
   }
 
-  // How many rows run now and how many wait for a slot.
-  load(): { running: number; queued: number } {
-    return this.db.query(`SELECT COALESCE(SUM(state = 'running'), 0) AS running, COALESCE(SUM(state = 'queued'), 0) AS queued FROM requests`).get() as { running: number; queued: number };
+  // How many rows run now, wait for a slot, and wait for an answer.
+  load(): { running: number; queued: number; asking: number } {
+    return this.db.query(`SELECT COALESCE(SUM(state = 'running'), 0) AS running, COALESCE(SUM(state = 'queued'), 0) AS queued, COALESCE(SUM(state = 'asking'), 0) AS asking FROM requests`).get() as { running: number; queued: number; asking: number };
   }
 
   // Queued requests admitted before this one.
@@ -227,7 +290,8 @@ export class Store {
   // else is lost: a fanned-out request stays waiting, and its subtasks still
   // queued never started, so they run as before (#642). A subtask that was
   // cut off counts as finished, and once its siblings are done the parent
-  // synthesizes with the interruption in its results.
+  // synthesizes with the interruption in its results. A row left asking
+  // (#652) had nothing running: it stays parked, its clocks where they were.
   interrupted(reply: (r: Row) => string): Row[] {
     const rows = (this.db.query(`SELECT * FROM requests WHERE state = 'running' ORDER BY seq`).all() as Raw[]).map(toRow);
     this.db.transaction(() => {
@@ -275,10 +339,10 @@ export class Store {
   }
 }
 
-type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null };
-type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null };
+type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number };
+type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number };
 function toRow(r: Raw): Row {
-  const { context, replied, source, board, fanout, fanout_board, ...rest } = r;
-  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board };
+  const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, ...rest } = r;
+  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board, askHuman: ask_human === 1, askedAt: asked_at, escalatedAt: escalated_at, resume: resume === 1 };
   return source === "board" ? { ...base, source: "board", board: board ?? "" } : { ...base, source: "dm" };
 }
