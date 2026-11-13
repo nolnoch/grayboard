@@ -259,7 +259,7 @@ class FakeBus implements FactoryBus {
   humans: string[] = [];
   sent: { tool: string; args: Record<string, unknown> }[] = [];
   fail = false;
-  refuse: (tool: string, args: Record<string, unknown>) => boolean = () => false; // a call that fails, as one send would
+  refuse: (tool: string, args: Record<string, unknown>) => boolean | string = () => false; // a call that fails, as one send would; a string is its error
   boards: { name: string; kind: string; mode: string | null }[] = [];
   private nextPost = 1000;
   private nextMsg = 5000;
@@ -271,7 +271,8 @@ class FakeBus implements FactoryBus {
   readonly closed = new Promise<string>((ok) => (this.settle = ok));
   deliver(d: Delivery) { this.q.push(d); this.wake?.(); }
   async call(tool: string, args: Record<string, unknown> = {}) {
-    if (this.fail || this.refuse(tool, args)) throw new Error("bus down");
+    const no = this.fail || this.refuse(tool, args);
+    if (no) throw new Error(typeof no === "string" ? no : "bus down");
     if (this.delayMs) await Bun.sleep(this.delayMs);
     this.sent.push({ tool, args });
     if (tool === "board_post") return { post_id: this.nextPost++ };
@@ -787,6 +788,68 @@ test("fan-out: an unusable plan fails the task; a fleet with fanout off never ge
   await done;
 });
 
+test("work board (#665, #668): a create another process won first is retried as found; a failed open is dropped and tried again on the next fan-out", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => ((r.id === 7 || r.id === 8 || r.id === 9) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const bus = new FakeBus();
+  let creates = 0;
+  bus.refuse = (tool, args) => {
+    if (tool !== "board_create" || args.name !== "sim-work") return false;
+    creates++;
+    if (creates === 1) return "board_create: bus down"; // the first open fails outright
+    if (creates === 2) { bus.boards.push({ name: "sim-work", kind: "broadcast", mode: "push" }); return "board sim-work already exists"; } // another process won the race
+    return false;
+  };
+  const { done } = loop({ runner, bus, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 2, 5000, "7 failed to open");
+  expect(bus.replies(7)[1]).toBe("[factory] failed: couldn't open #sim-work for the fan-out: board_create: bus down");
+  bus.deliver(task(8));
+  await until(() => bus.replies(8).length === 3, 5000, "8 fanned out and combined");
+  expect(bus.replies(8)[1]).toStartWith("[factory] fanned out: 2 subtasks on #sim-work (posts ");
+  expect(creates).toBe(2); // dropped after the failure, tried again; the race's loser lists it and goes on
+  bus.deliver(task(9));
+  await until(() => bus.replies(9).length === 3, 5000, "9 combined");
+  expect(creates).toBe(2);
+  // Kept once open: the fake board still lists as pushed, so a second open would subscribe again.
+  expect(bus.sent.filter((c) => c.tool === "board_subscribe" && c.args.board === "sim-work").map((c) => c.args.mode)).toEqual(["off"]);
+  await bus.close();
+  await done;
+});
+
+test("work board (#668): a review whose round-2 plan is unusable names the earlier round's posts", async () => {
+  const runner = new FakeRunner();
+  const leadRuns = () => runner.runs.filter((x) => x.id === 7).length;
+  runner.script = (r) => (r.id !== 7 ? undefined : leadRuns() === 1 ? PLAN() : PLAN(9));
+  const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { maxRounds: 2 } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, failed");
+  expect(bus.replies(7)[2]).toBe("[factory] failed: fake agent `researcher` returned a plan the factory can't use: the plan has 9 subtasks; it needs 2 to 5. Nothing more was fanned out; nothing is combined, and each earlier subtask's outcome is on #sim-work (posts 1001, 1002).");
+  await bus.close();
+  await done;
+});
+
+test("work board (#665, #668): a tree that fanned out on a task-<id> board before #665 plans its next round there", async () => {
+  const store = new Store(":memory:");
+  const sub = (id: number) => ({ r: { source: "board" as const, board: "task-7", id, requester: "fe", persona: "sim", task: `do ${id}` }, title: `part ${id}` });
+  store.admit({ source: "board", board: "sim-tasks", id: 7, requester: "fe", persona: "sim", task: "do 7" }, "researcher", { fanout: true });
+  const root = store.next()!;
+  store.fanOut(root, "task-7", [sub(100), sub(101)]);
+  for (const r of [store.next()!, store.next()!]) store.finish(r, `done ${r.id}`);
+  expect(store.synthesizeWhenDone(root.seq)).toBe(true);
+  const runner = new FakeRunner();
+  let reviews = 0;
+  runner.script = (r) => (r.id === 7 ? (++reviews === 1 ? PLAN() : "final") : undefined);
+  const { bus, done } = loop({ runner, store, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { maxRounds: 2 } }] });
+  await until(() => bus.replies(7).some((b) => b.startsWith("[factory] done:")), 5000, "the second round combined");
+  expect(bus.replies(7)[0]).toStartWith("[factory] fanned out, round 2: 2 subtasks on #task-7 (posts ");
+  expect(bus.sent.some((c) => String(c.args.name ?? c.args.board ?? "").endsWith("-work"))).toBe(false); // no work board opened
+  expect(bus.sent.filter((c) => c.tool === "board_post" && c.args.parent_id === undefined).map((c) => c.args.board)).toEqual(["task-7", "task-7"]);
+  expect(bus.replies(7).at(-1)).toBe("[factory] done: fake agent `researcher`, combining 4 subtasks over 2 rounds on #task-7\n\nfinal");
+  await bus.close();
+  await done;
+});
+
 test("work board (#665): two trees on one fleet share #sim-work, opened and muted once, and each combines only its own subtasks", async () => {
   const runner = new FakeRunner();
   runner.script = (r) => ((r.id === 7 || r.id === 8) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
@@ -1189,12 +1252,12 @@ test("commands: cancelling a fan-out stops its running subtask, finishes the que
   bus.deliver({ ...task(72, { parentId: 7, from: "fe" }), body: "retry" });
   bus.deliver({ ...task(73, { board: "sim-work", parentId: s1!, from: "fe" }), body: "cancel" }); // a subtask's thread takes none
   await until(() => bus.replies(71).length === 1 && bus.replies(72).length === 1, 5000, "answers");
-  expect(bus.replies(71)[0]).toBe("[factory] status: fanned out on #sim-work: 0 of 2 subtasks finished. 1 run finished so far: 0 turns, $0.0000.");
+  expect(bus.replies(71)[0]).toBe("[factory] status: fanned out on #sim-work (posts 1001, 1002): 0 of 2 subtasks finished. 1 run finished so far: 0 turns, $0.0000.");
   expect(bus.replies(72)[0]).toBe("[factory] retry: this is still running its subtasks; reply `cancel` first.");
   expect(bus.sent.find((s) => s.args.parent_id === 71)!.args).toMatchObject({ board: "sim-tasks" });
   bus.deliver({ ...task(74, { parentId: fanned, from: "fe" }), body: "cancel" });
   await until(() => bus.replies(7).length === 3 && bus.replies(s1!).length === 1 && bus.replies(s2!).length === 1, 5000, "all cancelled");
-  expect(bus.replies(7)[2]).toBe("[factory] cancelled: by fe after it fanned out on #sim-work; its subtasks stop and nothing is combined.");
+  expect(bus.replies(7)[2]).toBe("[factory] cancelled: by fe after it fanned out on #sim-work (posts 1001, 1002); its subtasks stop and nothing is combined.");
   expect(bus.replies(s1!)).toEqual(["[factory] cancelled: by fe while fake agent `researcher` ran."]);
   expect(bus.replies(s2!)).toEqual(["[factory] cancelled: by fe with the task it belongs to, before it ran."]);
   expect(bus.replies(70)).toEqual([]);
@@ -1337,7 +1400,7 @@ test("ask: a subtask's question goes in its request's thread and parks only it; 
   expect(root.state).toBe("waiting");
   bus.deliver({ ...task(90, { parentId: 9, from: "be" }), body: "status" });
   await until(() => bus.replies(90).length === 1, 5000, "status");
-  expect(bus.replies(90)[0]).toStartWith("[factory] status: fanned out on #sim-work: 1 of 2 subtasks finished, 1 asking.");
+  expect(bus.replies(90)[0]).toStartWith("[factory] status: fanned out on #sim-work (posts 1001, 1002): 1 of 2 subtasks finished, 1 asking.");
   bus.deliver({ ...task(91, { parentId: 9, from: "be" }), body: "the first" });   // not the requester (fe)
   bus.deliver({ ...task(92, { parentId: bus.replyId(9, 2), from: "fe" }), body: "the first" });
   await until(() => bus.replies(9).length === 4, 5000, "answered and synthesized");
@@ -1578,7 +1641,7 @@ test("limits: a spent tree budget stops the tree; the request's thread names the
   bus.deliver(task(7));
   await until(() => store.get({ source: "board", id: 7 })?.state === "finished" && bus.replies(7).length === 3, 5000, "stopped");
   expect(runner.runs.map((r) => r.id)).toEqual([7]); // the triage spent it all: no subtask ran
-  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $0.5 is spent after it fanned out on #sim-work; nothing more runs and nothing is combined; each finished subtask's outcome is on #sim-work.");
+  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $0.5 is spent after it fanned out on #sim-work (posts 1001, 1002); nothing more runs and nothing is combined; each finished subtask's outcome is on #sim-work.");
   const subs = store.subtasks(store.get({ source: "board", id: 7 })!.seq);
   expect(subs.map((s) => s.state)).toEqual(["finished", "finished"]);
   for (const s of subs) expect(bus.replies(s.id)[0]).toStartWith("[factory] stopped:");
@@ -1695,7 +1758,7 @@ test("limits: a tree spent by the time it would synthesize stops there, pointing
   const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { treeBudgetUsd: 1 } }] });
   bus.deliver(task(7));
   await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, stopped");
-  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $1 is spent ($1.00 used); nothing is combined, and each subtask's outcome is on #sim-work");
+  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $1 is spent ($1.00 used); nothing is combined, and each subtask's outcome is on #sim-work (posts 1001, 1002)");
   expect(runner.runs).toHaveLength(3); // triage and two subtasks; no synthesis
   await bus.close();
   await done;

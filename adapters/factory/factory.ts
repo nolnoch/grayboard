@@ -371,9 +371,9 @@ export class Factory {
         if (!res) return null;
         // A cancel that landed while the plan was being posted.
         const late = this.cancelledBy.get(row.seq), where = res.board ?? row.fanoutBoard ?? workBoard(row.persona);
-        body = late !== undefined ? `[factory] ${late.head} while its ${synth ? `round ${row.round + 1} ` : ""}plan was being posted on #${where}; no subtask of it ran.` : `[factory] failed: ${res.error}${earlierOn(row)}`;
+        body = late !== undefined ? `[factory] ${late.head} while its ${synth ? `round ${row.round + 1} ` : ""}plan was being posted on #${where}; no subtask of it ran.` : `[factory] failed: ${res.error}${this.earlierOn(row)}`;
       } else if (typeof plan === "string") {
-        body = `[factory] failed: ${this.runner.harness} agent \`${who}\` returned a plan the factory can't use: ${plan}. Nothing ${synth ? "more " : ""}was fanned out${earlierOn(row)}.`;
+        body = `[factory] failed: ${this.runner.harness} agent \`${who}\` returned a plan the factory can't use: ${plan}. Nothing ${synth ? "more " : ""}was fanned out${this.earlierOn(row)}.`;
       } else {
         body = synth
           ? `[factory] done: ${this.runner.harness} agent \`${who}\`, combining ${this.store.subtasks(row.seq).length} subtasks${row.round > 1 ? ` over ${row.round} rounds` : ""} on #${row.fanoutBoard}\n\n${text}`
@@ -426,7 +426,7 @@ export class Factory {
     if (typeof g === "string") {
       await this.stopTree(root, this.budgetStop(lim.treeBudgetUsd!, root));
       // The synthesis is the root itself, which stopTree leaves to this reply.
-      return `[factory] ${g}${row.seq === root.seq && root.fanoutBoard ? `; nothing is combined, and each subtask's outcome is on #${root.fanoutBoard}` : ""}`;
+      return `[factory] ${g}${row.seq === root.seq && root.fanoutBoard ? `; nothing is combined, and each subtask's outcome is on #${root.fanoutBoard}${this.postsOf(root)}` : ""}`;
     }
     const policy: Policy = g === undefined ? set.policy : { ...set.policy, budgetUsd: g };
     // A fresh run holds no tree claims (#669); a resume keeps its own.
@@ -833,7 +833,7 @@ export class Factory {
   private async stopTree(root: Row, s: Stop): Promise<boolean> {
     const res = this.store.cancel(root.seq, (r) =>
       r.seq !== root.seq ? `[factory] ${s.sub}, ${r.state === "asking" ? "while it waited for an answer" : "before it ran"}.`
-        : r.state === "waiting" ? `[factory] ${s.head} after it fanned out on #${r.fanoutBoard}; ${s.after}.`
+        : r.state === "waiting" ? `[factory] ${s.head} after it fanned out on #${r.fanoutBoard}${this.postsOf(r)}; ${s.after}.`
           : r.state === "asking" ? `[factory] ${s.head} while it waited for an answer.`
             : `[factory] ${s.head} before it ran.`);
     if (!res) return false;
@@ -910,7 +910,7 @@ export class Factory {
   }
 
   private budgetStop(usd: number, root: Row): Stop {
-    const where = root.fanoutBoard ? `; each finished subtask's outcome is on #${root.fanoutBoard}` : "";
+    const where = root.fanoutBoard ? `; each finished subtask's outcome is on #${root.fanoutBoard}` : ""; // stopTree's reply names the posts
     return { outcome: "budget", head: `stopped: the task's budget of $${usd} is spent`, sub: `stopped: its task's budget of $${usd} is spent`, after: `nothing more runs and nothing is combined${where}` };
   }
 
@@ -947,6 +947,18 @@ export class Factory {
     return this.admit(r, agent, `fleet "${fleet.name}"`, { fanout: fleet.fanout !== false && !this.noFanout.has(fleet.name) });
   }
 
+  // The tree's subtask posts (#668): a work board holds many trees' posts,
+  // so a reply that points at it names this tree's.
+  private postsOf(root: Row): string {
+    const ids = this.store.subtasks(root.seq).filter((s) => s.source === "board" && s.board === root.fanoutBoard).map((s) => s.id);
+    return ids.length ? ` (post${ids.length === 1 ? "" : "s"} ${ids.join(", ")})` : "";
+  }
+
+  // A failed review's pointer to the rounds it can't combine.
+  private earlierOn(row: Row): string {
+    return row.phase === "synthesize" && row.fanoutBoard ? `; nothing is combined, and each earlier subtask's outcome is on #${row.fanoutBoard}${this.postsOf(row)}` : "";
+  }
+
   // State, and the turns and cost of the tree's finished runs so far.
   private statusOf(row: Row): string {
     const subs = this.store.subtasks(row.seq);
@@ -957,7 +969,7 @@ export class Factory {
     else if (row.state === "running") state = open.length ? `running: ${this.runner.harness} agent \`${open[0]!.agent}\` for ${ago(open[0]!.started_at)}` : "running: starting";
     else if (row.state === "waiting") {
       const cur = subs.filter((s) => s.round === row.round), asking = cur.filter((s) => s.state === "asking").length, m = this.limitsFor(row).maxRounds ?? 1;
-      state = `fanned out on #${row.fanoutBoard}${m > 1 ? `, round ${row.round} of ${m}` : ""}: ${cur.filter((s) => s.state === "finished").length} of ${cur.length} subtasks finished${asking ? `, ${asking} asking` : ""}`;
+      state = `fanned out on #${row.fanoutBoard}${this.postsOf(row)}${m > 1 ? `, round ${row.round} of ${m}` : ""}: ${cur.filter((s) => s.state === "finished").length} of ${cur.length} subtasks finished${asking ? `, ${asking} asking` : ""}`;
     } else if (row.state === "asking") state = `asking${row.askHuman ? " your user" : ""}: "${oneLine((row.question ?? "").split("\n")[0] ?? "")}", for ${ago(row.askedAt ?? Date.now())}`;
     else state = `finished: ${oneLine((row.reply ?? "").split("\n")[0] ?? "")}`;
     const done = runs.filter((r) => r.ended_at !== null);
@@ -1000,10 +1012,6 @@ type Settings = { policy: Policy; workdir: Workdir; agent?: string };
 type Stop = { outcome: RunOutcome; head: string; sub: string; after: string };
 const HELD = "\u0000held";
 
-// A failed review's pointer to the rounds it can't combine.
-function earlierOn(row: Row): string {
-  return row.phase === "synthesize" && row.fanoutBoard ? `; nothing is combined, and each earlier subtask's outcome is on #${row.fanoutBoard}` : "";
-}
 
 function clip(body: string): string {
   const bytes = new TextEncoder().encode(body);
