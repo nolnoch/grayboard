@@ -13,7 +13,7 @@ import { closeSync, fchmodSync, openSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Request } from "../delegate.ts";
-import { execChild, prompt, readAgents, tail, type Agent, type Outcome, type Policy, type Runner, type RunMeta } from "../runner.ts";
+import { execChild, prompt, readAgents, tail, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../runner.ts";
 import type { Place } from "../workdir.ts";
 
 export type ClaudeOptions = {
@@ -52,9 +52,10 @@ export class ClaudeRunner implements Runner {
   // `num_turns` and `total_cost_usd`. A budget stop exits 1 with subtype
   // `error_max_budget_usd` and the reason in `errors`; the check runs after
   // a turn, so a run can pass its budget by up to one turn.
-  async run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string): Promise<Outcome> {
+  async run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string, resume?: Resume): Promise<Outcome> {
     const def = { description: agent.description ?? agent.name, prompt: agent.prompt, ...(agent.tools ? { tools: agent.tools } : {}), ...(agent.model ? { model: agent.model } : {}) };
     const cmd = [this.o.bin, "-p", "--restricted", "--strict-mcp-config", "--agents", JSON.stringify({ [agent.name]: def }), "--agent", agent.name, "--output-format", "stream-json", "--verbose", "--permission-prompts", "none"];
+    if (resume) cmd.push("--resume", resume.session);
     if (policy.tools) cmd.push("--tools", policy.tools.join(","));
     if (policy.allowedTools.length) cmd.push("--allowedTools", ...policy.allowedTools);
     if (policy.budgetUsd !== undefined) cmd.push("--max-budget-usd", String(policy.budgetUsd));
@@ -64,13 +65,16 @@ export class ClaudeRunner implements Runner {
     const events = new Lines();
     try {
       fchmodSync(fd, 0o600); // a file left by an earlier store keeps its mode under "w"
-      x = await execChild(cmd, { cwd: place.cwd, env: this.o.env, input: prompt(r), signal, onStdout: (c) => { writeSync(fd, c); events.push(c); } });
+      x = await execChild(cmd, { cwd: place.cwd, env: this.o.env, input: resume ? resume.input : prompt(r), signal, onStdout: (c) => { writeSync(fd, c); events.push(c); } });
     } finally {
       closeSync(fd);
     }
     events.end();
     const res = events.result;
-    const meta: RunMeta = { code: x.code, ...(typeof res?.session_id === "string" ? { session: res.session_id } : {}), ...(typeof res?.num_turns === "number" ? { turns: res.num_turns } : {}), ...(typeof res?.total_cost_usd === "number" ? { costUsd: res.total_cost_usd } : {}) };
+    // A resumed session's total_cost_usd includes its earlier runs (measured
+    // on the pinned Claude Code); this run's share is what's past them.
+    const cost = typeof res?.total_cost_usd === "number" ? Math.max(0, res.total_cost_usd - (resume?.priorUsd ?? 0)) : undefined;
+    const meta: RunMeta = { code: x.code, ...(typeof res?.session_id === "string" ? { session: res.session_id } : {}), ...(typeof res?.num_turns === "number" ? { turns: res.num_turns } : {}), ...(cost !== undefined ? { costUsd: cost } : {}) };
     if (x.timedOut) return { ok: false, error: "the child ran past the factory's timeout and was stopped", run: { ...meta, stop: "timeout" } };
     if (x.code === 0 && res && res.is_error !== true && typeof res.result === "string") return { ok: true, text: res.result, run: meta };
     if (res?.subtype === "error_max_budget_usd") return { ok: false, error: `stopped at its budget of $${policy.budgetUsd} after ${meta.turns ?? "?"} turn(s), $${meta.costUsd?.toFixed(4) ?? "?"} spent`, run: { ...meta, stop: "budget" } };

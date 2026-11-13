@@ -21,6 +21,10 @@ export type Outcome = ({ ok: true; text: string } | { ok: false; error: string }
 // most one run may spend (#649; absent, no cap). From the run's profile,
 // else the config's global ones; never from the request.
 export type Policy = { tools?: string[]; allowedTools: string[]; budgetUsd?: number };
+// `priorUsd`: what the session's earlier runs cost. Claude Code's
+// `total_cost_usd` is the session's running total across `--resume`, while
+// its budget and turn count are per invocation, so a runner subtracts it.
+export type Resume = { session: string; input: string; priorUsd: number };
 
 export interface Runner {
   readonly harness: string;
@@ -30,8 +34,10 @@ export interface Runner {
   readonly rosterSource: string;
   // Runs `agent` on the request under `policy`, in `place` (#641), until it
   // ends or `signal` aborts (a timeout). The child's event stream goes to
-  // the file `transcript` (#649), which the runner creates 0600.
-  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string): Promise<Outcome>;
+  // the file `transcript` (#649), which the runner creates 0600. `resume`
+  // (#652) continues the conversation `session` with `input` as the next
+  // prompt instead of the request's; its transcript is its own file.
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string, resume?: Resume): Promise<Outcome>;
 }
 
 // Agent files: markdown with `name:` (and optionally `description:`) in YAML

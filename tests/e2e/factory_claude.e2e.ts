@@ -137,3 +137,44 @@ test("claude runner: a run past its budget stops, and the outcome says so", asyn
     model.stop();
   }
 }, 120_000);
+
+// Ask and resume (#652): a run that ends on a question continues the same
+// conversation under the same flags, with the answer as the next prompt.
+// The second turn must see the first (task, question) and the agent's prompt.
+test("claude runner: a resumed run continues the conversation with the answer (#652)", async () => {
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("ANSWER-5")) ? undefined
+      : { text: userTexts(q).some((t) => t.includes("FACTORY-ASK")) && systemText(q).includes("AGENT-PROMPT-7") ? "RESUMED-OK" : "lost context" },
+    (q) => (userTexts(q).some((t) => t.includes("FACTORY-ASK")) ? { text: "QUESTION-1?" } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "researcher.md"), "---\nname: researcher\ndescription: researches\n---\nAGENT-PROMPT-7\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const agent = runner.roster()[0]!;
+    const req = { id: 1, source: "dm" as const, requester: "sim", persona: "researcher", task: "FACTORY-ASK" };
+    const t1 = join(dir, "t1.jsonl"), t2 = join(dir, "t2.jsonl");
+    const first = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t1);
+    expect(first).toMatchObject({ ok: true, text: "QUESTION-1?" });
+    const session = first.run!.session!;
+    const second = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t2, { session, input: "ANSWER-5", priorUsd: first.run!.costUsd! });
+    expect(second).toMatchObject({ ok: true, text: "RESUMED-OK" });
+    expect(model.unhandled).toEqual([]);
+    // Each run its own transcript, as the factory gives it.
+    const results = (f: string) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "result");
+    expect(results(t1).map((e) => e.result)).toEqual(["QUESTION-1?"]);
+    expect(results(t2).map((e) => e.result)).toEqual(["RESUMED-OK"]);
+    expect(second.run?.session).toBe(session); // --resume continues, it doesn't fork
+    // total_cost_usd is the session's running total across --resume; less
+    // priorUsd, each run reports its own share (the same usage, so the same cost).
+    expect(results(t2)[0].total_cost_usd).toBeCloseTo(2 * first.run!.costUsd!, 9);
+    expect(first.run!.costUsd!).toBeGreaterThan(0);
+    expect(second.run!.costUsd!).toBeCloseTo(first.run!.costUsd!, 9);
+    // Restricted mode's default tools keep Agent (measured on the pinned
+    // Claude Code), so a child can run subagents without a profile naming it.
+    expect(model.requests[0]!.body.tools?.map((x) => x.name)).toContain("Agent");
+  } finally {
+    model.stop();
+  }
+}, 120_000);
