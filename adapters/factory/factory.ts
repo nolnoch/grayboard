@@ -361,17 +361,30 @@ export class Factory {
     if (g === HELD) { this.store.requeue(row.seq, row.resume); this.o.log(`request ${row.id}: held, the daily budget is spent`); return HELD; }
     if (typeof g === "string") {
       await this.stopTree(root, this.budgetStop(lim.treeBudgetUsd!, root));
-      return `[factory] ${g}`;
+      // The synthesis is the root itself, which stopTree leaves to this reply.
+      return `[factory] ${g}${row.seq === root.seq && root.fanoutBoard ? `; nothing is combined, and each subtask's outcome is on #${root.fanoutBoard}` : ""}`;
     }
     const policy: Policy = g === undefined ? set.policy : { ...set.policy, budgetUsd: g };
     const ac = new AbortController();
     this.children.add(ac);
     this.active.set(row.seq, ac);
-    const byDeadline = deadline !== undefined && deadline - Date.now() < this.o.timeoutMs;
-    const t = setTimeout(() => {
-      if (byDeadline) void this.stopTree(this.store.bySeq(root.seq) ?? root, this.deadlineStop(lim.deadlineMs!)).catch((e) => this.o.log(`request ${root.id}: ${msg(e)}`));
-      ac.abort();
-    }, byDeadline ? Math.max(0, deadline! - Date.now()) : this.o.timeoutMs);
+    // The timeout, clamped to the deadline. A deadline is re-read when it
+    // fires, so a reload that moved it is honoured: past, the tree stops;
+    // later, the timer re-arms.
+    const timeoutAt = Date.now() + this.o.timeoutMs;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const arm = (end: number | undefined) => {
+      const byDeadline = end !== undefined && end < timeoutAt;
+      t = setTimeout(() => {
+        if (byDeadline) {
+          const ms = this.limitsFor(root).deadlineMs, moved = root.created_at + (ms ?? Infinity);
+          if (moved > Date.now()) return arm(moved);
+          void this.stopTree(this.store.bySeq(root.seq) ?? root, this.deadlineStop(ms!)).catch((e) => this.o.log(`request ${root.id}: ${msg(e)}`));
+        }
+        ac.abort();
+      }, Math.max(0, (byDeadline ? end : timeoutAt) - Date.now()));
+    };
+    arm(deadline);
     this.o.log(`request ${row.id}: ${resume ? "resuming" : "running"} ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}${g !== undefined ? `, granted $${g.toFixed(2)}` : ""}`);
     const run = this.store.startRun(row.seq, agent.name, g);
     let ended: RunOutcome = "failed";
@@ -747,7 +760,8 @@ export class Factory {
     const board = h.all ? undefined : (root.source === "board" ? root.board : undefined);
     const cap = h.all ? this.cfg.limits.dailyBudgetUsd! : this.fleetOf(root)?.limits?.dailyBudgetUsd;
     const oldest = this.store.oldestSince(since, board);
-    const when = oldest !== null ? `; it frees in about ${dur(oldest + DAY_MS - Date.now())}` : "";
+    const roll = oldest !== null ? `about ${dur(oldest + DAY_MS - Date.now())}` : "";
+    const when = this.store.openGrants(since, board) ? `; it may free when running work reports what it spent${roll ? `, and frees in ${roll} at most` : ""}` : roll ? `; it frees in ${roll}` : "";
     return `held: ${h.all ? "the factory's" : `fleet ${root.persona}'s`} daily budget${cap !== undefined ? ` of $${cap}` : ""} is spent${when}`;
   }
 

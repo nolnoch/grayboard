@@ -295,9 +295,11 @@ export class Store {
     return (this.db.query(`SELECT * FROM requests WHERE parent IS NULL AND state != 'finished' ORDER BY seq`).all() as Raw[]).map(toRow);
   }
 
-  // A subtask's siblings that will still run: queued, or asking (a resume runs).
+  // A subtask's siblings that will still run: queued, asking (a resume
+  // runs), or taken by next() but not yet granted (no open run, so no
+  // reservation): pump() takes several rows before any reaches its grant.
   siblingsLeft(parent: number, self: number): number {
-    return (this.db.query(`SELECT COUNT(*) AS n FROM requests WHERE parent = ? AND seq != ? AND state IN ('queued', 'asking')`).get(parent, self) as { n: number }).n;
+    return (this.db.query(`SELECT COUNT(*) AS n FROM requests q WHERE q.parent = ? AND q.seq != ? AND (q.state IN ('queued', 'asking') OR (q.state = 'running' AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.seq = q.seq AND r.ended_at IS NULL)))`).get(parent, self) as { n: number }).n;
   }
 
   // Queued requests admitted before this one.
@@ -333,6 +335,14 @@ export class Store {
     const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
     const args: (number | string)[] = board === undefined ? [since] : [since, board];
     return (this.db.query(`SELECT MIN(r.started_at) AS t FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ? AND COALESCE(r.cost_usd, r.granted_usd, 0) > 0${scope}`).get(...args) as { t: number | null }).t;
+  }
+
+  // Whether a run still open holds a grant in the window: the hold may end
+  // when it reports a cost under its grant, well before the window rolls.
+  openGrants(since: number, board?: string): boolean {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
+    return this.db.query(`SELECT 1 FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ? AND r.ended_at IS NULL AND r.granted_usd > 0${scope} LIMIT 1`).get(...args) !== null;
   }
 
   endRun(id: number, outcome: RunOutcome, m: Partial<RunMeta> = {}): void {

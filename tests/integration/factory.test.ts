@@ -1518,7 +1518,7 @@ test("limits: a spent daily budget holds new work, a killed run is charged its g
   expect(runner.policies[0]!.budgetUsd).toBe(1); // the day's whole budget, as nothing else runs
   bus.deliver(ask(91));
   await until(() => bus.replies(91).length === 1, 5000, "91 taken");
-  expect(bus.replies(91)[0]).toMatch(/queued, held: the factory's daily budget of \$1 is spent; it frees in about [\d.]+h/);
+  expect(bus.replies(91)[0]).toMatch(/queued, held: the factory's daily budget of \$1 is spent; it may free when running work reports what it spent, and frees in about [\d.]+h at most\./);
   await until(() => bus.replies(90).length === 2, 5000, "90 timed out"); // killed with no cost reported: its grant is what it spent
   expect(store.runs(store.get(k(90))!.seq)).toMatchObject([{ outcome: "timeout", cost_usd: null, granted_usd: 1 }]);
   await until(() => bus.statuses().includes("0 running, 1 queued (1 held: daily budget spent)"), 5000, "a free slot, and 91 still held");
@@ -1526,7 +1526,7 @@ test("limits: a spent daily budget holds new work, a killed run is charged its g
   expect(store.get(k(91))!.state).toBe("queued");
   bus.deliver(reply(92, bus.replyId(91), "status"));
   await until(() => bus.replies(92).length === 1, 5000, "status");
-  expect(bus.replies(92)[0]).toStartWith("[factory] status: queued, held: the factory's daily budget of $1 is spent");
+  expect(bus.replies(92)[0]).toMatch(/^\[factory\] status: queued, held: the factory's daily budget of \$1 is spent; it frees in about [\d.]+h\./); // 90 ended: only the window frees it
   await f.reconfigure({ fleets: [], policy: GLOBAL, workdir: SHARED, limits: { dailyBudgetUsd: 2 } }); // a reload raises the cap
   await until(() => runner.gates.has(91), 5000, "91 runs");
   expect(runner.policies[1]!.budgetUsd).toBeCloseTo(1, 9);
@@ -1574,10 +1574,10 @@ test("limits: a deadline stops a running tree, one parked on a question, and at 
   await a.done;
 
   // Asking: the question clock's tick stops it.
-  const b = loop({ runner: asker(), askTickMs: 50, limits: { deadlineMs: 400 } });
+  const b = loop({ runner: asker(), askTickMs: 50, limits: { deadlineMs: 1500 } });
   b.bus.deliver(ask(71));
   await until(() => b.bus.replies(71).length === 3, 5000, "71 asked, then stopped");
-  expect(b.bus.replies(71)[2]).toBe("[factory] stopped: the task passed its deadline of 0s while it waited for an answer.");
+  expect(b.bus.replies(71)[2]).toBe("[factory] stopped: the task passed its deadline of 2s while it waited for an answer.");
   await b.bus.close();
   await b.done;
 
@@ -1591,4 +1591,49 @@ test("limits: a deadline stops a running tree, one parked on a question, and at 
   expect(c.runner.runs).toEqual([]);
   await c.bus.close();
   await c.done;
+});
+
+test("limits: parallel subtasks split the tree's remainder evenly, counting siblings taken but not yet granted (#655)", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  const { bus, done } = loop({ runner, maxConcurrent: 3, fleets: [{ name: "sim", agent: "researcher", limits: { treeBudgetUsd: 1 } }] });
+  bus.deliver(task(7));
+  await until(() => runner.gates.has(7), 5000, "triage runs");
+  runner.gates.get(7)!.resolve({ ok: true, text: PLAN(3), run: { code: 0, costUsd: 0.1 } });
+  await until(() => runner.runs.length === 4, 5000, "three subtasks run at once");
+  // $0.90 over three subtasks and the synthesis: each gets $0.225, whatever order they reach their grant in.
+  runner.policies.slice(1).forEach((p) => expect(p.budgetUsd!).toBeCloseTo(0.225, 9));
+  for (const r of runner.runs.slice(1)) runner.gates.get(r.id)!.resolve({ ok: true, text: "part", run: { code: 0, costUsd: 0.1 } });
+  await until(() => runner.runs.length === 5, 5000, "synthesis runs");
+  expect(runner.policies[4]!.budgetUsd!).toBeCloseTo(0.6, 9);
+  runner.gates.get(7)!.resolve({ ok: true, text: "combined" });
+  await until(() => bus.replies(7).length === 3, 5000, "done");
+  await bus.close();
+  await done;
+});
+
+test("limits: a tree spent by the time it would synthesize stops there, pointing at its task board (#655)", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  runner.meta = (r) => ({ code: 0, costUsd: r.id === 7 ? 0.1 : 0.45 }); // each subtask overshoots its grant by a turn
+  const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { treeBudgetUsd: 1 } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, stopped");
+  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $1 is spent ($1.00 used); nothing is combined, and each subtask's outcome is on #task-7");
+  expect(runner.runs).toHaveLength(3); // triage and two subtasks; no synthesis
+  await bus.close();
+  await done;
+});
+
+test("limits: a reload that extends a deadline is honoured by a run already clamped to it (#655)", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  const { bus, f, done } = loop({ runner, limits: { deadlineMs: 300 } });
+  const t0 = Date.now();
+  bus.deliver(ask(75));
+  await until(() => runner.gates.has(75), 5000, "75 runs");
+  await f.reconfigure({ fleets: [], policy: GLOBAL, workdir: SHARED, limits: { deadlineMs: 1200 } });
+  await until(() => bus.replies(75).length === 2, 5000, "stopped at the new deadline");
+  expect(Date.now() - t0).toBeGreaterThanOrEqual(1100);
+  expect(bus.replies(75)[1]).toBe("[factory] stopped: the task passed its deadline of 1s while fake agent `researcher` ran.");
+  await bus.close();
+  await done;
 });
