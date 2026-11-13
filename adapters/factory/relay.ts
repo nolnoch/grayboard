@@ -7,8 +7,10 @@
 //
 // The tool surface is the security boundary, not the token: a child with a
 // shell runs as the factory's uid and can read the socket's path and its
-// token from its environment. So every tool here is a read that is safe for
-// any local process to make. The token scopes a call to a live run: it is
+// token from its environment. So every bus tool here is a read that is safe
+// for any local process to make; the tree claim tools write only the
+// factory's own store, inside the run's tree, which that uid could already
+// write. The token scopes a call to a live run: it is
 // minted per run and revoked when the run ends.
 import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
@@ -16,7 +18,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { fenced } from "./fanout.ts";
 
-// The relayed tools: reads only. No posts, DMs, creates, subscribes, bind or
+// The relayed bus tools: reads only. No posts, DMs, creates, subscribes, bind or
 // delegate; no DM reads at all, since the factory's inbox holds other
 // requesters' delegations.
 export const RELAY_TOOLS = ["board_list", "board_read", "claim_list", "peer_list"] as const;
@@ -28,7 +30,8 @@ export const TREE_TOOLS = ["tree_claim_take", "tree_claim_release", "tree_claims
 export type TreeTool = (typeof TREE_TOOLS)[number];
 // A run's place in its tree: the root's seq and its own.
 export type Scope = { tree: number; holder: number };
-export type ClaimHolder = { seq: number; title: string | null; note: string | null; takenAt: number };
+import type { ClaimHolder } from "./store.ts";
+export type { ClaimHolder };
 // The store's side of tree claims (store.ts).
 export interface TreeClaims {
   claimTake(tree: number, holder: number, key: string, note: string | null): { ok: true; renewed: boolean } | { ok: false; holder: ClaimHolder };
@@ -84,9 +87,9 @@ export function cleanArgs(tool: RelayTool, a: Record<string, unknown>): Record<s
 }
 
 // A result as the child sees it: the note, then the JSON fenced as data, cut to the cap.
-export function render(result: unknown): string {
+export function render(result: unknown, less = "a smaller limit, a thread, before_id"): string {
   let text = typeof result === "string" ? result : JSON.stringify(result, null, 1);
-  if (text.length > MAX_RESULT_CHARS) text = `${text.slice(0, MAX_RESULT_CHARS)}\n… cut at ${MAX_RESULT_CHARS} of ${text.length} characters: ask for less (a smaller limit, a thread, before_id).`;
+  if (text.length > MAX_RESULT_CHARS) text = `${text.slice(0, MAX_RESULT_CHARS)}\n… cut at ${MAX_RESULT_CHARS} of ${text.length} characters: ask for less (${less}).`;
   return `${DATA_NOTE}\n\n${fenced(text)}`;
 }
 
@@ -230,7 +233,7 @@ export class Relay implements ChildTools {
 export function treeCall(c: TreeClaims, scope: Scope, tool: TreeTool, a: Record<string, unknown>): string {
   const who = (h: { seq: number; title: string | null }) => `subtask ${h.seq}${h.title ? `: ${h.title}` : ""}`;
   if (tool === "tree_claims") {
-    return render(c.claims(scope.tree).map((x) => ({ key: x.key, holder: x.seq === scope.holder ? "you" : who(x), ...(x.note ? { note: x.note } : {}), taken_at: new Date(x.takenAt).toISOString() })));
+    return render(c.claims(scope.tree).map((x) => ({ key: x.key, holder: x.seq === scope.holder ? "you" : who(x), ...(x.note ? { note: x.note } : {}), taken_at: new Date(x.takenAt).toISOString() })), "tree_claim_take on the key you need, which names its holder");
   }
   if (typeof a.key !== "string" || !a.key.trim()) throw new Error(`${tool} needs key: what you're claiming, e.g. a path`);
   if (a.key.length > MAX_CLAIM_KEY) throw new Error(`a key is at most ${MAX_CLAIM_KEY} characters`);

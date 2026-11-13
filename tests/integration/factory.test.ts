@@ -2120,6 +2120,8 @@ test("tree claims: one holder per key in a tree; a holder's claims last while it
   expect(store.claimRelease(t, s2.seq, "src/a.ts")).toBe(false); // not the holder's
   store.park(s1.seq, "which one?", false);
   expect(store.claims(t).map((c) => [c.key, c.seq])).toEqual([["src/a.ts", s1.seq]]); // asking keeps it
+  expect(store.answer(s1.seq, "this one")).toBe("queued");
+  expect(store.claims(t).map((c) => [c.key, c.seq])).toEqual([["src/a.ts", s1.seq]]); // answered, waiting to resume: still held
   store.finish({ source: "dm", id: 2 }, "done");
   expect(store.claims(t)).toEqual([]); // finished: lapsed, with no release step
   expect(store.claimTake(t, s2.seq, "src/a.ts", null)).toEqual({ ok: true, renewed: false });

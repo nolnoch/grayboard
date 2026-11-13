@@ -456,8 +456,9 @@ export class Store {
       .map((c) => ({ key: c.key, seq: c.holder, title: c.title, note: c.note, takenAt: c.taken_at }));
   }
 
-  // A fresh run (not a resume) starts with nothing claimed: a root's
-  // triage claims don't carry into its synthesis, nor a retried row's.
+  // A fresh run (not a resume) starts with nothing claimed. Defensive: a
+  // root never holds claims and a retry is a new row, so today no row with
+  // claims starts fresh; this keeps that true if either changes.
   clearClaims(holder: number): void {
     this.db.query(`DELETE FROM claims WHERE holder = ?`).run(holder);
   }
