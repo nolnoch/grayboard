@@ -28,8 +28,12 @@ export type Row = Request & {
   // reseeded run and the cap check), when it was asked and escalated to
   // your user, how many this row asked, and whether its next run resumes.
   question: string | null; askHuman: boolean; askedAt: number | null; escalatedAt: number | null; answer: string | null; asks: number; resume: boolean;
+  // Rounds (#658): on a root, how many times it fanned out; on a subtask,
+  // the round it belongs to. `notes`: a root's working memory, from its
+  // lead's notes blocks, carried into each review's digest.
+  round: number; notes: string | null;
 };
-export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string };
+export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string; round?: number };
 // A child process (#649): one per run of a request (a fanned-out request has
 // two, its triage and its synthesis). `outcome` is null while it runs; a run
 // cut off by a restart ends as interrupted. Its transcript is the file
@@ -78,6 +82,8 @@ export class Store {
       answer TEXT,
       asks INTEGER NOT NULL DEFAULT 0,
       resume INTEGER NOT NULL DEFAULT 0,
+      round INTEGER NOT NULL DEFAULT 0,
+      notes TEXT,
       UNIQUE (source, id)
     )`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS runs (
@@ -105,7 +111,8 @@ export class Store {
     this.db.transaction(() => {
       const cols = new Set((this.db.query(`PRAGMA table_info(requests)`).all() as { name: string }[]).map((c) => c.name));
       const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"],
-        ["question", "TEXT"], ["ask_human", "INTEGER NOT NULL DEFAULT 0"], ["asked_at", "INTEGER"], ["escalated_at", "INTEGER"], ["answer", "TEXT"], ["asks", "INTEGER NOT NULL DEFAULT 0"], ["resume", "INTEGER NOT NULL DEFAULT 0"]];
+        ["question", "TEXT"], ["ask_human", "INTEGER NOT NULL DEFAULT 0"], ["asked_at", "INTEGER"], ["escalated_at", "INTEGER"], ["answer", "TEXT"], ["asks", "INTEGER NOT NULL DEFAULT 0"], ["resume", "INTEGER NOT NULL DEFAULT 0"],
+        ["round", "INTEGER NOT NULL DEFAULT 0"], ["notes", "TEXT"]];
       for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
       // A run's granted budget (#655): its reservation while open, its charge when it ends without a cost.
       const runCols = new Set((this.db.query(`PRAGMA table_info(runs)`).all() as { name: string }[]).map((c) => c.name));
@@ -126,22 +133,30 @@ export class Store {
   private insert(r: Request, agent: string, state: State, reply: string | null, o: Admit = {}): boolean {
     const t = this.now();
     const board = r.source === "board" ? r.board : null;
-    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at, fanout, parent, title, profile) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t, o.fanout ? 1 : 0, o.parent ?? null, o.title ?? null, o.profile ?? null);
+    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at, fanout, parent, title, profile, round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t, o.fanout ? 1 : 0, o.parent ?? null, o.title ?? null, o.profile ?? null, o.round ?? 0);
     return res.changes === 1;
   }
 
   // A run that returned a plan: the request waits on its subtasks, admitted
-  // in the same transaction, so a crash leaves both or neither.
+  // in the same transaction, so a crash leaves both or neither. Each plan is
+  // a round (#658): the request's count goes up by one and its subtasks
+  // carry the new count.
   // A subtask runs as `agent` (its profile's, #645) when given, else as its parent's.
   fanOut(parent: Row, board: string, subtasks: { r: Request; title: string; profile?: string; agent?: string }[]): void {
     this.db.transaction(() => {
-      this.db.query(`UPDATE requests SET state = 'waiting', fanout_board = ?, updated_at = ? WHERE seq = ?`).run(board, this.now(), parent.seq);
-      for (const s of subtasks) this.insert(s.r, s.agent ?? parent.agent, "queued", null, { parent: parent.seq, title: s.title, ...(s.profile ? { profile: s.profile } : {}) });
+      const round = (this.bySeq(parent.seq)?.round ?? parent.round) + 1;
+      this.db.query(`UPDATE requests SET state = 'waiting', fanout_board = ?, round = ?, updated_at = ? WHERE seq = ?`).run(board, round, this.now(), parent.seq);
+      for (const s of subtasks) this.insert(s.r, s.agent ?? parent.agent, "queued", null, { parent: parent.seq, title: s.title, round, ...(s.profile ? { profile: s.profile } : {}) });
     })();
   }
 
-  // A waiting request's subtasks, in posting order.
+  // A root's working memory (#658), replaced whole: the caller caps it.
+  setNotes(seq: number, notes: string): void {
+    this.db.query(`UPDATE requests SET notes = ?, updated_at = ? WHERE seq = ?`).run(notes, this.now(), seq);
+  }
+
+  // A request's subtasks across every round, in posting order (so by round).
   subtasks(parent: number): Row[] {
     return (this.db.query(`SELECT * FROM requests WHERE parent = ? ORDER BY seq`).all(parent) as Raw[]).map(toRow);
   }
@@ -415,7 +430,7 @@ export class Store {
   }
 }
 
-type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number };
+type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number; round: number; notes: string | null };
 // The fleet a row belongs to, by its root's board: in `boards` (`within`) or not.
 function held(boards: string[], within: boolean): string {
   if (!boards.length) return "";
