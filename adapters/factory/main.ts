@@ -285,6 +285,7 @@ export async function main(env: Record<string, string | undefined> = process.env
     dir: join(dataDir, "relay"),
     shim: shimCommand(join(dataDir, "relay"), join(import.meta.dir, "relay_shim.ts")),
     reader: () => startReader({ command: cfg.grayboard, parentSession: harnessSession, identity: bus.handle, version: VERSION, env: sessionFree(env) }),
+    claims: store,
     log,
   });
   const factory = new Factory(bus, store, runner, { childTools, fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, limits: cfg.limits, log });

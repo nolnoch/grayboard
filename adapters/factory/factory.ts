@@ -429,11 +429,14 @@ export class Factory {
       return `[factory] ${g}${row.seq === root.seq && root.fanoutBoard ? `; nothing is combined, and each subtask's outcome is on #${root.fanoutBoard}` : ""}`;
     }
     const policy: Policy = g === undefined ? set.policy : { ...set.policy, budgetUsd: g };
-    // Bus tools (#669): a token for this run only, revoked when it ends.
+    // A fresh run holds no tree claims (#669); a resume keeps its own.
+    if (!row.resume) this.store.clearClaims(row.seq);
+    // Bus tools (#669): a token for this run only, revoked when it ends. A
+    // subtask's also scopes it to its tree, for the tree claim tools.
     let tools: Awaited<ReturnType<ChildTools["grant"]>> | undefined;
     if (policy.busTools) {
       if (!this.o.childTools) return `[factory] failed: this run's profile has busTools on, but this factory has no relay for them; nothing was spawned.`;
-      try { tools = await this.o.childTools.grant(); } catch (e) {
+      try { tools = await this.o.childTools.grant(row.parent !== null ? { tree: root.seq, holder: row.seq } : undefined); } catch (e) {
         return `[factory] failed: couldn't open the bus tools for this run: ${msg(e)}; nothing was spawned.`;
       }
       // The grant can take seconds (the reader's start), and until the lines

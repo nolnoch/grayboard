@@ -107,6 +107,11 @@ export class Store {
     // on, so a replay acts once.
     this.db.exec(`CREATE TABLE IF NOT EXISTS threads (source TEXT NOT NULL, id INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (source, id))`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS commands (source TEXT NOT NULL, id INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (source, id))`);
+    // Tree claims (#669): what one subtask of a tree says is its own, for
+    // its siblings to see. Kept here, not on the bus: every child acts under
+    // the factory's one name, and a bus claim is re-entrant for its holder,
+    // so it couldn't tell one subtask from another.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS claims (tree INTEGER NOT NULL, key TEXT NOT NULL, holder INTEGER NOT NULL, note TEXT, taken_at INTEGER NOT NULL, PRIMARY KEY (tree, key))`);
     // Additive (AGENTS.md): a store an earlier factory wrote gets the fan-out
     // columns, in one transaction with the check.
     this.db.transaction(() => {
@@ -422,14 +427,49 @@ export class Store {
       this.db.query(`DELETE FROM runs WHERE seq NOT IN (SELECT seq FROM requests)`).run();
       this.db.query(`DELETE FROM threads WHERE seq NOT IN (SELECT seq FROM requests)`).run();
       this.db.query(`DELETE FROM commands WHERE seq NOT IN (SELECT seq FROM requests)`).run();
+      this.db.query(`DELETE FROM claims WHERE holder NOT IN (SELECT seq FROM requests)`).run();
       return n;
     }).immediate();
+  }
+
+  // Tree claims (#669). A claim holds only while its holder is live:
+  // running, asking, or queued to resume. So every path that ends a row
+  // (finish, cancel, kill, a stopped tree, interrupted at restart, prune)
+  // releases its claims without a step of its own, and a dead holder's key
+  // is free to take.
+  claimTake(tree: number, holder: number, key: string, note: string | null): { ok: true; renewed: boolean } | { ok: false; holder: ClaimHolder } {
+    return this.db.transaction(() => {
+      const cur = this.db.query(`SELECT c.holder, r.title, c.note, c.taken_at FROM claims c JOIN requests r ON r.seq = c.holder WHERE c.tree = ? AND c.key = ? AND ${LIVE}`).get(tree, key) as { holder: number; title: string | null; note: string | null; taken_at: number } | null;
+      if (cur && cur.holder !== holder) return { ok: false as const, holder: { seq: cur.holder, title: cur.title, note: cur.note, takenAt: cur.taken_at } };
+      this.db.query(`INSERT INTO claims (tree, key, holder, note, taken_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (tree, key) DO UPDATE SET holder = excluded.holder, note = excluded.note, taken_at = CASE WHEN claims.holder = excluded.holder THEN claims.taken_at ELSE excluded.taken_at END`).run(tree, key, holder, note, this.now());
+      return { ok: true as const, renewed: cur !== null };
+    }).immediate();
+  }
+
+  // False when `holder` doesn't hold `key`.
+  claimRelease(tree: number, holder: number, key: string): boolean {
+    return this.db.query(`DELETE FROM claims WHERE tree = ? AND key = ? AND holder = ?`).run(tree, key, holder).changes > 0;
+  }
+
+  claims(tree: number): (ClaimHolder & { key: string })[] {
+    return (this.db.query(`SELECT c.key, c.holder, r.title, c.note, c.taken_at FROM claims c JOIN requests r ON r.seq = c.holder WHERE c.tree = ? AND ${LIVE} ORDER BY c.key`).all(tree) as { key: string; holder: number; title: string | null; note: string | null; taken_at: number }[])
+      .map((c) => ({ key: c.key, seq: c.holder, title: c.title, note: c.note, takenAt: c.taken_at }));
+  }
+
+  // A fresh run (not a resume) starts with nothing claimed. Defensive: a
+  // root never holds claims and a retry is a new row, so today no row with
+  // claims starts fresh; this keeps that true if either changes.
+  clearClaims(holder: number): void {
+    this.db.query(`DELETE FROM claims WHERE holder = ?`).run(holder);
   }
 
   close(): void {
     this.db.close();
   }
 }
+
+export type ClaimHolder = { seq: number; title: string | null; note: string | null; takenAt: number };
+const LIVE = `(r.state IN ('running', 'asking') OR (r.state = 'queued' AND r.resume = 1))`;
 
 type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number; round: number; notes: string | null };
 // The fleet a row belongs to, by its root's board: in `boards` (`within`) or not.

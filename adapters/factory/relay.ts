@@ -7,8 +7,10 @@
 //
 // The tool surface is the security boundary, not the token: a child with a
 // shell runs as the factory's uid and can read the socket's path and its
-// token from its environment. So every tool here is a read that is safe for
-// any local process to make. The token scopes a call to a live run: it is
+// token from its environment. So every bus tool here is a read that is safe
+// for any local process to make; the tree claim tools write only the
+// factory's own store, inside the run's tree, which that uid could already
+// write. The token scopes a call to a live run: it is
 // minted per run and revoked when the run ends.
 import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
@@ -16,11 +18,28 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { fenced } from "./fanout.ts";
 
-// The relayed tools: reads only. No posts, DMs, creates, subscribes, bind or
+// The relayed bus tools: reads only. No posts, DMs, creates, subscribes, bind or
 // delegate; no DM reads at all, since the factory's inbox holds other
 // requesters' delegations.
 export const RELAY_TOOLS = ["board_list", "board_read", "claim_list", "peer_list"] as const;
 export type RelayTool = (typeof RELAY_TOOLS)[number];
+// Tree claims (#669 slice 2): answered by the factory from its own store,
+// never the bus, for a run that is part of a tree. Not bus writes: they
+// reach only the run's own tree, keyed by the token's scope.
+export const TREE_TOOLS = ["tree_claim_take", "tree_claim_release", "tree_claims"] as const;
+export type TreeTool = (typeof TREE_TOOLS)[number];
+// A run's place in its tree: the root's seq and its own.
+export type Scope = { tree: number; holder: number };
+import type { ClaimHolder } from "./store.ts";
+export type { ClaimHolder };
+// The store's side of tree claims (store.ts).
+export interface TreeClaims {
+  claimTake(tree: number, holder: number, key: string, note: string | null): { ok: true; renewed: boolean } | { ok: false; holder: ClaimHolder };
+  claimRelease(tree: number, holder: number, key: string): boolean;
+  claims(tree: number): (ClaimHolder & { key: string })[];
+}
+export const MAX_CLAIM_KEY = 200;
+export const MAX_CLAIM_NOTE = 500;
 
 // The MCP server a run attaches (#669): harness-neutral, so a runner maps it
 // to its own flags. `tools`: the tool names the server offers, for a runner
@@ -28,9 +47,9 @@ export type RelayTool = (typeof RELAY_TOOLS)[number];
 export type McpServer = { name: string; command: string; args: string[]; env: Record<string, string>; tools: readonly string[] };
 
 // What the factory asks of the relay: a server for one run, revoked when
-// the run ends.
+// the run ends. `scope`: the run's tree, for the tree claim tools.
 export interface ChildTools {
-  grant(): Promise<{ server: McpServer; revoke(): void }>;
+  grant(scope?: Scope): Promise<{ server: McpServer; revoke(): void }>;
   close(): Promise<void>;
 }
 
@@ -68,9 +87,9 @@ export function cleanArgs(tool: RelayTool, a: Record<string, unknown>): Record<s
 }
 
 // A result as the child sees it: the note, then the JSON fenced as data, cut to the cap.
-export function render(result: unknown): string {
+export function render(result: unknown, less = "a smaller limit, a thread, before_id"): string {
   let text = typeof result === "string" ? result : JSON.stringify(result, null, 1);
-  if (text.length > MAX_RESULT_CHARS) text = `${text.slice(0, MAX_RESULT_CHARS)}\n… cut at ${MAX_RESULT_CHARS} of ${text.length} characters: ask for less (a smaller limit, a thread, before_id).`;
+  if (text.length > MAX_RESULT_CHARS) text = `${text.slice(0, MAX_RESULT_CHARS)}\n… cut at ${MAX_RESULT_CHARS} of ${text.length} characters: ask for less (${less}).`;
   return `${DATA_NOTE}\n\n${fenced(text)}`;
 }
 
@@ -88,6 +107,7 @@ export type RelayOptions = {
   dir: string;                     // where the socket goes: made 0700
   shim: string[];                  // the command that runs relay_shim.ts (shimCommand)
   reader: () => Promise<Reader>;   // started on the first grant, again if it exits
+  claims?: TreeClaims;             // tree claims; absent, a run gets only the reads
   log(message: string): void;
 };
 
@@ -95,7 +115,7 @@ export type RelayOptions = {
 // started on the first grant, so a factory whose profiles never opt in
 // opens nothing.
 export class Relay implements ChildTools {
-  private readonly tokens = new Set<string>();
+  private readonly tokens = new Map<string, Scope | null>();
   private server: Server | null = null;
   private starting: Promise<void> | null = null;
   private reader: Promise<Reader> | null = null;
@@ -106,14 +126,16 @@ export class Relay implements ChildTools {
     this.path = join(o.dir, "relay.sock");
   }
 
-  async grant(): Promise<{ server: McpServer; revoke(): void }> {
+  async grant(scope?: Scope): Promise<{ server: McpServer; revoke(): void }> {
     await (this.starting ??= this.listen().catch((e) => { this.starting = null; throw e; }));
     await this.read(); // a reader that can't start fails the grant, not each call
     const token = randomBytes(32).toString("hex");
-    this.tokens.add(token);
+    const tree = scope && this.o.claims ? scope : null;
+    this.tokens.set(token, tree);
+    const tools = tree ? [...RELAY_TOOLS, ...TREE_TOOLS] : [...RELAY_TOOLS];
     const [command, ...args] = this.o.shim;
     return {
-      server: { name: SERVER_NAME, command: command!, args, env: { FACTORY_RELAY_SOCK: this.path, FACTORY_RELAY_TOKEN: token }, tools: RELAY_TOOLS },
+      server: { name: SERVER_NAME, command: command!, args, env: { FACTORY_RELAY_SOCK: this.path, FACTORY_RELAY_TOKEN: token, FACTORY_RELAY_TOOLS: tools.join(",") }, tools },
       revoke: () => { this.tokens.delete(token); },
     };
   }
@@ -184,7 +206,15 @@ export class Relay implements ChildTools {
     let req: { token?: unknown; tool?: unknown; args?: unknown };
     try { req = JSON.parse(line); } catch { return { ok: false, error: "not a JSON request" }; }
     if (typeof req.token !== "string" || !this.tokens.has(req.token)) return { ok: false, error: "this run's bus tools have ended" };
+    const scope = this.tokens.get(req.token) ?? null;
     const tool = req.tool;
+    if (typeof tool === "string" && (TREE_TOOLS as readonly string[]).includes(tool)) {
+      if (!scope || !this.o.claims) return { ok: false, error: `not a relayed tool: ${tool}` };
+      const raw = req.args !== null && typeof req.args === "object" && !Array.isArray(req.args) ? (req.args as Record<string, unknown>) : {};
+      try { return { ok: true, text: treeCall(this.o.claims, scope, tool as TreeTool, raw) }; } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    }
     if (typeof tool !== "string" || !(RELAY_TOOLS as readonly string[]).includes(tool)) return { ok: false, error: `not a relayed tool: ${String(tool)}` };
     const raw = req.args !== null && typeof req.args === "object" && !Array.isArray(req.args) ? (req.args as Record<string, unknown>) : {};
     try {
@@ -196,4 +226,25 @@ export class Relay implements ChildTools {
       return { ok: false, error: m.length > 500 ? `${m.slice(0, 500)}…` : m };
     }
   }
+}
+
+// One tree claim call. Keys and notes are the children's own words, so
+// what comes back is rendered as data like a bus read.
+export function treeCall(c: TreeClaims, scope: Scope, tool: TreeTool, a: Record<string, unknown>): string {
+  const who = (h: { seq: number; title: string | null }) => `subtask ${h.seq}${h.title ? `: ${h.title}` : ""}`;
+  if (tool === "tree_claims") {
+    return render(c.claims(scope.tree).map((x) => ({ key: x.key, holder: x.seq === scope.holder ? "you" : who(x), ...(x.note ? { note: x.note } : {}), taken_at: new Date(x.takenAt).toISOString() })), "tree_claim_take on the key you need, which names its holder");
+  }
+  if (typeof a.key !== "string" || !a.key.trim()) throw new Error(`${tool} needs key: what you're claiming, e.g. a path`);
+  if (a.key.length > MAX_CLAIM_KEY) throw new Error(`a key is at most ${MAX_CLAIM_KEY} characters`);
+  const key = a.key;
+  if (tool === "tree_claim_release") {
+    return c.claimRelease(scope.tree, scope.holder, key) ? `released ${key}` : `you don't hold ${key}; nothing changed`;
+  }
+  if (a.note !== undefined && typeof a.note !== "string") throw new Error("note must be text");
+  const note = typeof a.note === "string" && a.note ? a.note.slice(0, MAX_CLAIM_NOTE) : null;
+  const r = c.claimTake(scope.tree, scope.holder, key, note);
+  if (r.ok) return r.renewed ? `you already held ${key}; the note is updated` : `claimed ${key}: yours until you release it or your run ends`;
+  // The holder's title and note are another child's words: inside the fence.
+  return `not claimed: another run of this tree holds ${key}. Work on something else, or check again later with tree_claims.\n\n${render({ holder: who(r.holder), ...(r.holder.note ? { note: r.holder.note } : {}), taken_at: new Date(r.holder.takenAt).toISOString() })}`;
 }
