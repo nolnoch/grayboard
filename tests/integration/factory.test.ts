@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } from "../../adapters/factory/bus.ts";
 import { parseDelegation, requestOf, type Request } from "../../adapters/factory/delegate.ts";
 import { Database } from "bun:sqlite";
-import { Factory, type Fleet, type Route } from "../../adapters/factory/factory.ts";
+import { commandOf, Factory, type Fleet, type Route } from "../../adapters/factory/factory.ts";
 import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
 import { DEFAULTS, loadConfig, policyOf } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
@@ -73,6 +73,10 @@ test("toDelivery reads grayboard's channel params and drops anything else", () =
   expect(toDelivery({ content: "x", meta: { message_id: "abc", from: "sim" } })).toBeNull();
   expect(toDelivery({ meta: { message_id: "1", from: "sim" } })).toBeNull();
   expect(toDelivery(undefined)).toBeNull();
+  // Your user's authority rides on human="true" (#651); nothing else sets it.
+  expect(toDelivery({ content: "cancel", meta: { message_id: "13", from: "wade", parent_id: "3", human: "true" } })).toEqual({ kind: "dm", id: 13, from: "wade", parentId: 3, human: true, body: "cancel" });
+  expect(toDelivery({ content: "c", meta: { board: "e2e", post_id: "6", from: "wade", human: "true" } })).toMatchObject({ human: true });
+  expect(toDelivery({ content: "c", meta: { board: "e2e", post_id: "6", from: "be", human: "yes" } })).not.toHaveProperty("human");
 });
 
 // ── roster and persona ───────────────────────────────────────────────────────
@@ -249,6 +253,7 @@ class FakeBus implements FactoryBus {
   fail = false;
   boards: { name: string; kind: string; mode: string | null }[] = [];
   private nextPost = 1000;
+  private nextMsg = 5000;
   delayMs = 0;
   private q: Delivery[] = [];
   private wake: (() => void) | null = null;
@@ -261,6 +266,7 @@ class FakeBus implements FactoryBus {
     if (this.delayMs) await Bun.sleep(this.delayMs);
     this.sent.push({ tool, args });
     if (tool === "board_post") return { post_id: this.nextPost++ };
+    if (tool === "dm_send") return { message_id: this.nextMsg++ };
     return tool === "board_list" ? this.boards : { ok: true };
   }
   async *deliveries() {
@@ -273,6 +279,9 @@ class FakeBus implements FactoryBus {
   }
   async close() { this.done = true; this.settle("closed"); this.wake?.(); }
   replies(id: number) { return this.sent.filter((s) => s.args.parent_id === id).map((s) => String(s.args.body)); }
+  // The id the bus gave the nth reply (0-based) in `id`'s thread.
+  replyId(id: number, n = 0) { let i = 0, mid = 5000, pid = 1000; for (const s of this.sent) { const own = s.tool === "dm_send" ? mid++ : s.tool === "board_post" ? pid++ : -1; if (s.args.parent_id === id && i++ === n) return own; } throw new Error(`no reply ${n} in ${id}'s thread`); }
+  statuses() { return this.sent.filter((s) => s.tool === "peer_status").map((s) => String(s.args.text)); }
 }
 
 const GLOBAL: Policy = { allowedTools: ["Read"] };
@@ -331,7 +340,7 @@ test("loop: a request is acknowledged, run once, and answered in its thread", as
   expect(ack).toStartWith("[factory] taken:");
   expect(ack).toContain("agent `researcher`, starting now");
   expect(out).toBe("[factory] done: fake agent `researcher`\n\nresult for 10");
-  expect(bus.sent.filter((s) => s.tool !== "board_list").every((s) => s.tool === "dm_send" && s.args.to === "sim")).toBe(true);
+  expect(bus.sent.filter((s) => s.tool !== "board_list" && s.tool !== "peer_status").every((s) => s.tool === "dm_send" && s.args.to === "sim")).toBe(true);
   bus.deliver(ask(10)); // a redelivery
   bus.deliver(ask(11, "a release manager"));
   await until(() => bus.replies(11).length === 1, 5000, "decline");
@@ -559,7 +568,7 @@ test("fleets: the sync creates a missing board as a queue, joins an existing que
   ];
   const { runner, logs, done } = loop({ bus, fleets: [{ name: "sim", agent: "researcher" }, { name: "be", agent: "researcher" }, { name: "fe", agent: "researcher" }] });
   await until(() => bus.sent.some((c) => c.args.board === "old-tasks"), 5000, "sync");
-  expect(bus.sent.filter((c) => c.tool !== "board_list")).toEqual([
+  expect(bus.sent.filter((c) => c.tool !== "board_list" && c.tool !== "peer_status")).toEqual([
     { tool: "board_create", args: { name: "sim-tasks", purpose: expect.any(String), kind: "queue" } },
     { tool: "board_subscribe", args: { board: "be-tasks", mode: "push" } },
     { tool: "board_subscribe", args: { board: "old-tasks", mode: "off" } },
@@ -1006,3 +1015,143 @@ test("store: a store written before projects opens with the profile column added
   expect(store.get({ source: "board", id: 6 })).toMatchObject({ profile: "code", agent: "coder", parent: parent.seq });
   store.close();
 });
+
+// ── thread commands (#651) ───────────────────────────────────────────────────
+
+test("commands: the whole body, leading @mentions, case and trailing punctuation aside", () => {
+  expect(["cancel", " Cancel.", "@factory cancel", "@factory, @be: STATUS?", "retry!"].map(commandOf)).toEqual(["cancel", "cancel", "cancel", "status", "retry"]);
+  expect(["please cancel", "cancel it", "cancel\nnow", "", "@factory", "stat us"].map(commandOf)).toEqual([null, null, null, null, null, null]);
+});
+
+const reply = (id: number, parentId: number, body: string, from = "sim", human = false): Delivery => ({ kind: "dm", id, from, parentId, ...(human ? { human: true as const } : {}), body });
+
+test("commands: status and cancel on a running delegation; a stranger is refused, a replay does nothing, retry runs it again in the command's thread", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  const { bus, store, done } = loop({ runner });
+  bus.deliver(ask(50));
+  await until(() => runner.gates.has(50), 5000, "50 runs");
+  const ack = bus.replyId(50);
+  bus.deliver(reply(51, ack, "status", "mallory"));          // a DM thread is its parties' only
+  bus.deliver(reply(52, 50, "@factory status"));             // on the request itself
+  await until(() => bus.replies(52).length === 1 && bus.replies(51).length === 1, 5000, "status answers");
+  expect(bus.replies(51)[0]).toBe("[factory] status: only sim, who asked for this, or your user can status it.");
+  expect(bus.replies(52)[0]).toMatch(/^\[factory\] status: running: fake agent `researcher` for \d+s\. 0 runs finished so far\.$/);
+  expect(bus.sent.find((s) => s.args.parent_id === 52)!.args.to).toBe("sim");
+  bus.deliver(reply(53, ack, "cancel", "mallory"));
+  await until(() => bus.replies(53).length === 1, 5000, "refusal");
+  expect(runner.gates.has(50) && store.get(k(50))!.state).toBe("running");
+  bus.deliver(reply(54, ack, "Cancel."));
+  await until(() => bus.replies(50).length === 2, 5000, "cancelled");
+  expect(bus.replies(50)[1]).toBe("[factory] cancelled: by sim while fake agent `researcher` ran.");
+  expect(store.runs(store.get(k(50))!.seq).map((r) => r.outcome)).toEqual(["cancelled"]);
+  bus.deliver(reply(54, ack, "cancel"));                     // a replay
+  bus.deliver(reply(55, bus.replyId(50, 1), "cancel"));      // on the outcome: already finished
+  await until(() => bus.replies(55).length === 1, 5000, "already finished");
+  expect(bus.replies(55)[0]).toStartWith("[factory] cancel: this already finished");
+  expect(bus.replies(54)).toEqual([]);
+  bus.deliver(reply(56, ack, "retry", "wade", true));       // your user may, from anywhere in the thread
+  await until(() => runner.gates.has(56), 5000, "the retry runs");
+  expect(store.get(k(56))).toMatchObject({ requester: "wade", task: "task 50", persona: "a researcher" });
+  runner.gates.get(56)!.resolve({ ok: true, text: "again" });
+  await until(() => bus.replies(56).length === 2, 5000, "retry answered in its thread");
+  expect(bus.replies(56)).toEqual([expect.stringMatching(/^\[factory\] taken:/), "[factory] done: fake agent `researcher`\n\nagain"]);
+  expect(bus.sent.filter((s) => s.args.parent_id === 56).every((s) => s.args.to === "wade")).toBe(true);
+  expect(runner.runs.map((r) => r.id)).toEqual([50, 56]);
+  expect(bus.statuses()).toEqual(["idle", "1 running, 0 queued", "idle", "1 running, 0 queued", "idle"]);
+  await bus.close();
+  await done;
+});
+
+test("commands: a queued request cancels without a run; retry while queued says cancel first", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  const { bus, store, done } = loop({ runner, maxConcurrent: 1 });
+  bus.deliver(ask(60));
+  bus.deliver(ask(61));
+  await until(() => bus.replies(61).length === 1 && runner.gates.has(60), 5000, "60 runs, 61 queued");
+  bus.deliver(reply(62, 61, "status"));
+  bus.deliver(reply(63, 61, "retry"));
+  await until(() => bus.replies(62).length === 1 && bus.replies(63).length === 1, 5000, "answers");
+  expect(bus.replies(62)[0]).toBe("[factory] status: queued, 0 ahead. 0 runs finished so far.");
+  expect(bus.replies(63)[0]).toBe("[factory] retry: this is still queued; reply `cancel` first.");
+  bus.deliver(reply(64, bus.replyId(61), "cancel"));
+  await until(() => bus.replies(61).length === 2, 5000, "61 cancelled");
+  expect(bus.replies(61)[1]).toBe("[factory] cancelled: by sim before it ran.");
+  runner.gates.get(60)!.resolve({ ok: true, text: "fine" });
+  await until(() => bus.replies(60).length === 2, 5000, "60 done");
+  expect(runner.runs.map((r) => r.id)).toEqual([60]);
+  expect(store.runs(store.get(k(61))!.seq)).toEqual([]);
+  expect(bus.statuses()).toEqual(["idle", "1 running, 0 queued", "1 running, 1 queued", "1 running, 0 queued", "idle"]);
+  await bus.close();
+  await done;
+});
+
+test("commands: cancelling a fan-out stops its running subtask, finishes the queued one and never synthesizes; anyone on the board may ask status", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  const { bus, store, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => runner.gates.has(7), 5000, "triage runs");
+  runner.gates.get(7)!.resolve({ ok: true, text: PLAN() });
+  await until(() => bus.replies(7).length === 2 && runner.runs.length === 2, 5000, "fanned out, first subtask runs");
+  const [s1, s2] = store.subtasks(store.get({ source: "board", id: 7 })!.seq).map((s) => s.id);
+  const fanned = bus.replyId(7, 1);
+  bus.deliver(task(70, { parentId: fanned, from: "be" }));                   // chatter, not a command
+  bus.deliver({ ...task(71, { parentId: fanned, from: "be" }), body: "status" });
+  bus.deliver({ ...task(72, { parentId: 7, from: "fe" }), body: "retry" });
+  bus.deliver({ ...task(73, { board: "task-7", parentId: s1!, from: "fe" }), body: "cancel" }); // a subtask's thread takes none
+  await until(() => bus.replies(71).length === 1 && bus.replies(72).length === 1, 5000, "answers");
+  expect(bus.replies(71)[0]).toBe("[factory] status: fanned out on #task-7: 0 of 2 subtasks finished. 1 run finished so far: 0 turns, $0.0000.");
+  expect(bus.replies(72)[0]).toBe("[factory] retry: this is still running its subtasks; reply `cancel` first.");
+  expect(bus.sent.find((s) => s.args.parent_id === 71)!.args).toMatchObject({ board: "sim-tasks" });
+  bus.deliver({ ...task(74, { parentId: fanned, from: "fe" }), body: "cancel" });
+  await until(() => bus.replies(7).length === 3 && bus.replies(s1!).length === 1 && bus.replies(s2!).length === 1, 5000, "all cancelled");
+  expect(bus.replies(7)[2]).toBe("[factory] cancelled: by fe after it fanned out on #task-7; its subtasks stop and nothing is combined.");
+  expect(bus.replies(s1!)).toEqual(["[factory] cancelled: by fe while fake agent `researcher` ran."]);
+  expect(bus.replies(s2!)).toEqual(["[factory] cancelled: by fe with the task it belongs to, before it ran."]);
+  expect(bus.replies(70)).toEqual([]);
+  expect(bus.replies(73)).toEqual([]);
+  expect(runner.runs.map((r) => r.id)).toEqual([7, s1]);
+  await until(() => bus.statuses().at(-1) === "idle", 5000, "idle");
+  await bus.close();
+  await done;
+});
+
+test("store: threads and commands map back to their request and go with it at prune (#651)", () => {
+  let t = 1_000;
+  const s = new Store(":memory:", () => t);
+  s.admit(req(1), "researcher");
+  const seq = s.get(k(1))!.seq;
+  s.recordReply({ source: "dm", id: 900 }, seq);
+  expect(s.threadOf("dm", 1)!.seq).toBe(seq);
+  expect(s.threadOf("dm", 900)!.seq).toBe(seq);
+  expect(s.threadOf("board", 900)).toBeNull();
+  expect(s.command({ source: "dm", id: 901 }, seq)).toBe(true);
+  expect(s.command({ source: "dm", id: 901 }, seq)).toBe(false);
+  expect(s.cancel(seq, () => "c")).toMatchObject({ finished: [{ state: "finished", reply: "c" }], running: [] });
+  expect(s.cancel(seq, () => "c")).toBeNull();
+  s.markReplied(k(1));
+  t = 10_000;
+  expect(s.prune(5_000)).toBe(1);
+  expect(s.threadOf("dm", 900)).toBeNull();
+  expect(s.command({ source: "dm", id: 901 }, seq)).toBe(true); // its record went with the request
+  s.close();
+});
+
+test("local bus: a status reply to the factory's ack wakes it and is answered in the command's thread; its peer_status shows its load (#651)", async () => {
+  const fe = await localSession(dir, "fe");
+  const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
+  const runner = new FakeRunner(["researcher"], true);
+  const f = new Factory(bus, new Store(join(dir, "f.db")), runner, { policy: GLOBAL, ...wd(), fleets: [{ name: "sim", agent: "researcher" }], maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 60_000, log: () => {} });
+  const done = f.run();
+  await until(async () => ((await call(fe.c, "board_list")) as { name: string }[]).some((b) => b.name === "sim-tasks"), 15_000, "the factory creates its fleet board");
+  const p = await call(fe.c, "board_post", { board: "sim-tasks", body: "summarize the spec" });
+  const ack = await until(() => fe.pushes.find((x) => x.meta.parent_id === String(p.post_id)), 15_000, "taken");
+  const status = async () => ((await call(fe.c, "peer_list")) as { peers: { handle: string; status?: string }[] }).peers.find((x) => x.handle === "factory")?.status;
+  await until(async () => (await status()) === "1 running, 0 queued", 15_000, "load in peer_list");
+  const cmd = await call(fe.c, "board_post", { board: "sim-tasks", body: "status", parent_id: Number(ack.meta.post_id) });
+  const answer = await until(() => fe.pushes.find((x) => x.meta.parent_id === String(cmd.post_id)), 15_000, "status answered");
+  expect(answer.content).toMatch(/^\[factory\] status: running: fake agent `researcher` for \d+s\./);
+  runner.gates.get(p.post_id)!.resolve({ ok: true, text: "fine" });
+  await until(async () => (await status()) === "idle", 15_000, "idle again");
+  await bus.close();
+  expect(await done).toBe("closed");
+}, 30_000);

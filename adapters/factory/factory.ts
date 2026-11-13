@@ -6,7 +6,7 @@
 import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Delivery, FactoryBus } from "./bus.ts";
-import { oneLine, requestOf, type Request } from "./delegate.ts";
+import { oneLine, requestOf, type Key, type Request } from "./delegate.ts";
 import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "./runner.ts";
 import type { Admit, Row, RunOutcome, Store } from "./store.ts";
@@ -52,6 +52,9 @@ export class Factory {
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
+  private readonly active = new Map<number, AbortController>(); // seq → its running child's controller
+  private readonly cancelledBy = new Map<number, string>(); // seq → who cancelled it while it ran (#651)
+  private load = ""; // the peer_status text last set
 
   private cfg: Reconfig;
 
@@ -111,6 +114,7 @@ export class Factory {
   }
 
   async take(d: Delivery): Promise<void> {
+    if (await this.command(d)) return;
     if (d.kind === "board") return this.takePost(d);
     const v = requestOf(d);
     if (!v) return;
@@ -159,7 +163,7 @@ export class Factory {
     // queue board this reply also acks the claim, so the rotation never
     // redelivers a task that's running. Not stored: a lost acknowledgement
     // costs nothing the outcome won't say.
-    await this.reply(r, `[factory] taken: ${label} runs as ${this.runner.harness} agent \`${agent.name}\`, ${where}. The outcome follows in this thread.`).catch((e) => this.o.log(`couldn't acknowledge ${r.source} ${r.id}: ${msg(e)}`));
+    await this.reply(r, `[factory] taken: ${label} runs as ${this.runner.harness} agent \`${agent.name}\`, ${where}. The outcome follows in this thread; reply \`status\` or \`cancel\` to this message.`).catch((e) => this.o.log(`couldn't acknowledge ${r.source} ${r.id}: ${msg(e)}`));
     this.pump();
   }
 
@@ -210,13 +214,24 @@ export class Factory {
   private pump(): void {
     while (!this.stopping && this.running < this.o.maxConcurrent) {
       const row = this.store.next();
-      if (!row) return;
+      if (!row) break;
       this.running++;
       const p: Promise<void> = this.exec(row)
         .catch((e) => this.o.log(`request ${row.id}: ${msg(e)}`))
         .finally(() => { this.running--; this.inflight.delete(p); this.pump(); });
       this.inflight.add(p);
     }
+    this.showLoad();
+  }
+
+  // The factory's load in peer_list (#651), set when it changes.
+  private showLoad(): void {
+    if (this.stopping) return;
+    const { running, queued } = this.store.load();
+    const text = running || queued ? `${running} running, ${queued} queued` : "idle";
+    if (text === this.load) return;
+    this.load = text;
+    void this.bus.call("peer_status", { text }).catch((e) => this.o.log(`couldn't set peer_status: ${msg(e)}`));
   }
 
   // One slot's work: a request's run, a subtask's run, or a fanned-out
@@ -231,6 +246,7 @@ export class Factory {
     } catch (e) {
       body = `[factory] failed: the factory couldn't run this: ${msg(e)}`;
     }
+    this.cancelledBy.delete(row.seq);
     if (body === null) return; // fanned out: its synthesis finishes it
     this.store.finish(row, clip(body));
     // Before the send's await: a crash during it must not strand a parent
@@ -252,6 +268,8 @@ export class Factory {
       : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max, ownDir(set), row.source === "board" ? routes.map((r) => ({ name: r.profile, agent: r.agent, tools: r.policy.tools?.join(", ") ?? "the default: no shell, no web fetch" })) : [])}` } : row;
     const out = await this.runAgent(row, input, set);
     const who = set.agent ?? row.agent;
+    const by = this.cancelledBy.get(row.seq);
+    if (by !== undefined && typeof out !== "string") return `[factory] cancelled: by ${by} while ${this.runner.harness} agent \`${who}\` ran.`;
     let body: string;
     if (typeof out === "string") body = out;
     else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${who}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
@@ -260,7 +278,9 @@ export class Factory {
       if (plan && typeof plan !== "string") {
         const why = await this.fanOut(row, plan);
         if (!why) return null;
-        body = `[factory] failed: ${why}`;
+        // A cancel that landed while the plan was being posted.
+        const late = this.cancelledBy.get(row.seq);
+        body = late !== undefined ? `[factory] cancelled: by ${late} while its plan was being posted on #task-${row.id}; no subtask ran.` : `[factory] failed: ${why}`;
       } else if (typeof plan === "string") {
         body = `[factory] failed: ${this.runner.harness} agent \`${who}\` returned a plan the factory can't use: ${plan}. Nothing was fanned out.`;
       } else {
@@ -283,8 +303,12 @@ export class Factory {
     } catch (e) {
       return `[factory] failed: couldn't make the ${set.workdir.mode} working directory: ${msg(e)}; nothing was spawned.`;
     }
+    // A cancel between the slot and the spawn: nothing runs.
+    const early = this.cancelledBy.get(row.seq);
+    if (early !== undefined) return `[factory] cancelled: by ${early} before it ran.`;
     const ac = new AbortController();
     this.children.add(ac);
+    this.active.set(row.seq, ac);
     const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
     this.o.log(`request ${row.id}: running ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
     const run = this.store.startRun(row.seq, agent.name);
@@ -292,13 +316,14 @@ export class Factory {
     let out: Outcome | undefined;
     try {
       out = await this.runner.run(agent, input, ac.signal, set.policy, place, join(this.o.runs, `${run}.jsonl`));
-      ended = out.run?.stop ?? (out.ok ? "ok" : ac.signal.aborted ? "timeout" : "failed");
+      ended = this.cancelledBy.has(row.seq) ? "cancelled" : out.run?.stop ?? (out.ok ? "ok" : ac.signal.aborted ? "timeout" : "failed");
       return out;
     } catch (e) {
       return `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
     } finally {
       clearTimeout(t);
       this.children.delete(ac);
+      this.active.delete(row.seq);
       this.store.endRun(run, ended, out?.run);
       const m = out?.run;
       this.o.log(`request ${row.id}: run ${run} ended ${ended}${m?.turns !== undefined ? `, ${m.turns} turn(s)` : ""}${m?.costUsd !== undefined ? `, $${m.costUsd.toFixed(4)}` : ""}`);
@@ -372,6 +397,7 @@ export class Factory {
         return `couldn't post subtask ${i + 1} of ${n} on #${board} (${subtasks.length} posted, none run): ${msg(e)}`;
       }
     }
+    if (this.cancelledBy.has(row.seq)) return "cancelled";
     this.store.fanOut(row, board, subtasks);
     this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}`);
     const agents = [...new Set(subtasks.map((s) => s.agent ?? row.agent))];
@@ -402,10 +428,115 @@ export class Factory {
     }
   }
 
-  // Every reply goes where the request came from, in its thread.
-  private reply(r: Request, body: string): Promise<unknown> {
-    if (r.source === "board") return this.bus.call("board_post", { board: r.board, body, parent_id: r.id });
-    return this.bus.call("dm_send", { to: r.requester, body, parent_id: r.id });
+  // Every reply goes where the request came from, in its thread. Its id is
+  // recorded, so a command answering it finds the request (#651).
+  private async reply(r: Request, body: string): Promise<unknown> {
+    const res = r.source === "board"
+      ? await this.bus.call("board_post", { board: r.board, body, parent_id: r.id })
+      : await this.bus.call("dm_send", { to: r.requester, body, parent_id: r.id });
+    const seq = "seq" in r && typeof r.seq === "number" ? r.seq : this.store.get(r)?.seq;
+    if (seq !== undefined) this.remember(r.source, res, seq);
+    return res;
+  }
+
+  private remember(source: Key["source"], res: unknown, seq: number): void {
+    const v = (res as { post_id?: unknown; message_id?: unknown } | null)?.[source === "board" ? "post_id" : "message_id"];
+    if (typeof v === "number") this.store.recordReply({ source, id: v }, seq);
+  }
+
+  // ── thread commands (#651) ──────────────────────────────────────────────
+  // A reply in a top-level request's thread (to the request itself, or to
+  // one of the factory's replies) whose whole body is a command word. Code
+  // reads it, never a model. True when the delivery was a command for one
+  // of the factory's requests, acted on or refused; false lets take() treat
+  // it as before.
+  private async command(d: Delivery): Promise<boolean> {
+    if (d.parentId === undefined || !d.from) return false;
+    const verb = commandOf(d.body);
+    if (!verb) return false;
+    const id = d.kind === "dm" ? d.id : d.postId;
+    if (id === undefined) return false;
+    const row = this.store.threadOf(d.kind, d.parentId);
+    // Post ids are global, so the board check is belt and braces; a
+    // subtask's thread on a fan-out board takes no commands.
+    if (!row || row.parent !== null || (d.kind === "board" && (row.source !== "board" || row.board !== d.board))) return false;
+    const cmd: Key = { source: d.kind, id };
+    if (!this.store.command(cmd, row.seq)) { this.o.log(`${d.kind} ${id}: command already acted on; replay ignored`); return true; }
+    const answer = (body: string) => this.answer(d, id, body, row.seq);
+    // A DM thread is its two parties' only; a board thread anyone on the board can read.
+    const allowed = d.human === true || d.from === row.requester || (verb === "status" && row.source === "board");
+    this.o.log(`request ${row.id}: ${verb} from ${d.from}${allowed ? "" : " refused"}`);
+    if (!allowed) await answer(`[factory] ${verb}: only ${oneLine(row.requester)}, who asked for this, or your user can ${verb} it.`);
+    else if (verb === "status") await answer(this.statusOf(row));
+    else if (verb === "cancel") await this.cancel(row, d.from, answer);
+    else await this.retry(row, d, cmd, answer);
+    return true;
+  }
+
+  // A command's answer, in the command's own thread.
+  private async answer(d: Delivery, id: number, body: string, seq: number): Promise<void> {
+    try {
+      const res = d.kind === "board" ? await this.bus.call("board_post", { board: d.board, body, parent_id: id }) : await this.bus.call("dm_send", { to: d.from, body, parent_id: id });
+      this.remember(d.kind, res, seq);
+    } catch (e) {
+      this.o.log(`couldn't answer ${d.kind} ${id}: ${msg(e)}`);
+    }
+  }
+
+  // Queued: finishes cancelled. Running: its child is stopped and the run
+  // ends cancelled. Fanned out: queued subtasks finish cancelled, running
+  // ones are stopped, and the request finishes without synthesizing.
+  private async cancel(row: Row, by: string, answer: (b: string) => Promise<void>): Promise<void> {
+    const who = oneLine(by);
+    const res = this.store.cancel(row.seq, (r) =>
+      r.seq !== row.seq ? `[factory] cancelled: by ${who} with the task it belongs to, before it ran.`
+        : r.state === "waiting" ? `[factory] cancelled: by ${who} after it fanned out on #${r.fanoutBoard}; its subtasks stop and nothing is combined.`
+          : `[factory] cancelled: by ${who} before it ran.`);
+    if (!res) return answer(`[factory] cancel: this already finished; nothing to cancel. Reply \`retry\` to run it again.`);
+    for (const r of res.running) {
+      this.cancelledBy.set(r.seq, who);
+      this.active.get(r.seq)?.abort();
+    }
+    this.showLoad();
+    for (const f of res.finished) await this.send(f);
+  }
+
+  // A finished request's task again, as a new request keyed by the command
+  // and answered in its thread. A DM's goes to whoever sent the command, the
+  // only party in that thread.
+  private async retry(row: Row, d: Delivery, cmd: Key, answer: (b: string) => Promise<void>): Promise<void> {
+    if (row.state !== "finished") return answer(`[factory] retry: this is still ${row.state === "waiting" ? "running its subtasks" : row.state}; reply \`cancel\` first.`);
+    const base = { id: cmd.id, persona: row.persona, task: row.task, ...(row.context !== undefined ? { context: row.context } : {}) };
+    if (row.source === "dm") {
+      const r: Request = { ...base, source: "dm", requester: d.from! };
+      const agent = resolvePersona(r.persona, this.runner.roster());
+      if (!agent) { if (this.store.admitFinished(r, this.declineBody(r))) await this.send(this.store.get(r)!); return; }
+      return this.admit(r, agent, `persona "${oneLine(r.persona)}"`);
+    }
+    const r: Request = { ...base, source: "board", board: row.board, requester: row.requester };
+    const fleet = this.fleets().find((f) => f.name === row.persona);
+    const agent = fleet && this.runner.roster().find((a) => a.name === fleet.agent);
+    if (!fleet || !agent) {
+      const why = fleet ? `fleet "${fleet.name}"'s agent \`${fleet.agent}\` isn't in the ${this.runner.harness} roster (${this.runner.rosterSource})` : `fleet "${oneLine(row.persona)}" is no longer in the factory's config`;
+      if (this.store.admitFinished(r, `[factory] declined: ${why}. Nothing was spawned.`)) await this.send(this.store.get(r)!);
+      return;
+    }
+    return this.admit(r, agent, `fleet "${fleet.name}"`, { fanout: fleet.fanout !== false });
+  }
+
+  // State, and the turns and cost of the tree's finished runs so far.
+  private statusOf(row: Row): string {
+    const subs = this.store.subtasks(row.seq);
+    const runs = [row, ...subs].flatMap((r) => this.store.runs(r.seq));
+    const open = runs.filter((r) => r.ended_at === null);
+    let state: string;
+    if (row.state === "queued") state = `queued, ${this.store.queuedAhead(row)} ahead`;
+    else if (row.state === "running") state = open.length ? `running: ${this.runner.harness} agent \`${open[0]!.agent}\` for ${ago(open[0]!.started_at)}` : "running: starting";
+    else if (row.state === "waiting") state = `fanned out on #${row.fanoutBoard}: ${subs.filter((s) => s.state === "finished").length} of ${subs.length} subtasks finished`;
+    else state = `finished: ${oneLine((row.reply ?? "").split("\n")[0] ?? "")}`;
+    const done = runs.filter((r) => r.ended_at !== null);
+    const turns = done.reduce((n, r) => n + (r.turns ?? 0), 0), cost = done.reduce((n, r) => n + (r.cost_usd ?? 0), 0);
+    return `[factory] status: ${state}. ${done.length} run${done.length === 1 ? "" : "s"} finished so far${done.length ? `: ${turns} turn${turns === 1 ? "" : "s"}, $${cost.toFixed(4)}` : ""}.`;
   }
 
   private async housekeeping(): Promise<void> {
@@ -444,6 +575,18 @@ function clip(body: string): string {
   if (bytes.length <= MAX_REPLY_BYTES) return body;
   const cut = new TextDecoder().decode(bytes.slice(0, MAX_REPLY_BYTES)).replace(/�$/, "");
   return `${cut}\n\n[factory] output truncated at ${MAX_REPLY_BYTES} bytes.`;
+}
+
+// A thread command (#651): the whole body, leading @mentions stripped, case
+// and trailing punctuation ignored.
+export function commandOf(body: string): "cancel" | "retry" | "status" | null {
+  const w = body.trim().replace(/^(@[\w.-]+[\s,:]*)+/, "").trim().toLowerCase().replace(/[.!?]+$/, "");
+  return w === "cancel" || w === "retry" || w === "status" ? w : null;
+}
+
+function ago(t: number): string {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return s < 120 ? `${s}s` : s < 7200 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
 }
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
