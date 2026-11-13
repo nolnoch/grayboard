@@ -10,6 +10,7 @@ import { oneLine, requestOf, type Key, type Request } from "./delegate.ts";
 import { answerPrompt, askInstruction, NO_ANSWER, NO_MORE, parseAsk, reseeded, type Ask } from "./ask.ts";
 import { notesInstruction, parsePlan, splitNotes, synthesisPrompt, triageInstruction, type Plan, type Result, type Round } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner } from "./runner.ts";
+import type { ChildTools } from "./relay.ts";
 import type { Admit, Hold, Row, RunOutcome, Store } from "./store.ts";
 import type { Place, Workdir, Workspaces } from "./workdir.ts";
 
@@ -63,6 +64,7 @@ export type FactoryOptions = {
   ask?: AskPolicy; // default ASK_DEFAULTS
   limits?: Limits; // the global limits (#655); default none
   askTickMs?: number; // how often parked questions' clocks are checked (default 30 s)
+  childTools?: ChildTools; // the relay (#669) a run whose policy has busTools gets; absent, such a run fails unspawned
   log(message: string): void;
 };
 
@@ -427,6 +429,21 @@ export class Factory {
       return `[factory] ${g}${row.seq === root.seq && root.fanoutBoard ? `; nothing is combined, and each subtask's outcome is on #${root.fanoutBoard}` : ""}`;
     }
     const policy: Policy = g === undefined ? set.policy : { ...set.policy, budgetUsd: g };
+    // Bus tools (#669): a token for this run only, revoked when it ends.
+    let tools: Awaited<ReturnType<ChildTools["grant"]>> | undefined;
+    if (policy.busTools) {
+      if (!this.o.childTools) return `[factory] failed: this run's profile has busTools on, but this factory has no relay for them; nothing was spawned.`;
+      try { tools = await this.o.childTools.grant(); } catch (e) {
+        return `[factory] failed: couldn't open the bus tools for this run: ${msg(e)}; nothing was spawned.`;
+      }
+      // The grant can take seconds (the reader's start), and until the lines
+      // below a cancel or stop has no run to abort: check again.
+      const late = this.cancelledBy.get(row.seq);
+      if (late !== undefined || this.stopping) {
+        tools.revoke();
+        return late !== undefined ? `[factory] ${late.head} before it ran.` : `[factory] failed: the factory stopped before this ran; nothing was spawned.`;
+      }
+    }
     const ac = new AbortController();
     this.children.add(ac);
     this.active.set(row.seq, ac);
@@ -452,12 +469,13 @@ export class Factory {
     let ended: RunOutcome = "failed";
     let out: Outcome | undefined;
     try {
-      out = await this.runner.run(agent, input, ac.signal, policy, place, join(this.o.runs, `${run}.jsonl`), resume);
+      out = await this.runner.run(agent, input, ac.signal, policy, place, join(this.o.runs, `${run}.jsonl`), resume, tools?.server);
       ended = this.cancelledBy.get(row.seq)?.outcome ?? out.run?.stop ?? (out.ok ? "ok" : ac.signal.aborted ? "timeout" : "failed");
       return out;
     } catch (e) {
       return `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
     } finally {
+      tools?.revoke();
       clearTimeout(t);
       this.children.delete(ac);
       this.active.delete(row.seq);
@@ -965,7 +983,7 @@ export class Factory {
     let names: string[];
     try { names = readdirSync(this.o.runs); } catch { return 0; }
     for (const f of names) {
-      const m = /^(\d+)\.jsonl$/.exec(f);
+      const m = /^(\d+)\.jsonl(?:\.mcp\.json)?$/.exec(f); // a crashed run's --mcp-config file (#669) too
       if (!m || this.store.hasRun(Number(m[1]))) continue;
       try { rmSync(join(this.o.runs, f), { force: true }); n++; } catch {}
     }

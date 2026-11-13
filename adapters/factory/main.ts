@@ -4,12 +4,14 @@
 // launchd, a tmux loop) restarts it; the store makes a restart safe.
 //
 //   bun adapters/factory/main.ts            (config: $FACTORY_DATA_DIR/config.json)
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { LocalBus, sessionFree } from "./bus.ts";
+import { LocalBus, sessionFree, startReader } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
 import { ASK_DEFAULTS, Factory, type AskPolicy, type Fleet, type Limits, type Route } from "./factory.ts";
+import { Relay, shimCommand } from "./relay.ts";
 import type { Policy } from "./runner.ts";
 import { Store } from "./store.ts";
 import { WORKDIR_MODES, Workspaces, type Workdir, type WorkdirMode } from "./workdir.ts";
@@ -25,6 +27,7 @@ export type Config = {
   tools?: string[];        // the tools a child has (--tools); absent, Claude Code's restricted default: no shell, no WebFetch
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
   budgetUsd?: number;      // the most one run may spend, in USD (#649); absent, no cap
+  busTools?: boolean;      // children get the read-only bus tools (#669); default off
   profiles: Profile[];     // named agent + tool lists a fleet runs under (#643)
   fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent (and policy) it runs; projects (#645) included, with their routes
   maxConcurrent: number;
@@ -40,7 +43,7 @@ export type Config = {
 
 // A profile (#643): the agent, what its children may do and where they run
 // (#641). Its tool lists, mode and repo fall back to the global ones field by field.
-export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; budgetUsd?: number; workdir?: WorkdirMode; repo?: string };
+export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; budgetUsd?: number; busTools?: boolean; workdir?: WorkdirMode; repo?: string };
 
 // The fields a SIGHUP reload can't change: they shape the bus session, the
 // runner or the worker pool, which live as long as the process.
@@ -110,7 +113,12 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   const tools = raw.tools !== undefined ? strs("tools", []) : undefined;
   const allowedTools = strs("allowedTools", DEFAULTS.allowedTools);
   const budgetUsd = raw.budgetUsd !== undefined ? usd(raw.budgetUsd, `"budgetUsd"`) : undefined;
-  const global: Policy = { ...(tools ? { tools } : {}), allowedTools, ...(budgetUsd !== undefined ? { budgetUsd } : {}) };
+  const bool = (v: unknown, what: string) => {
+    if (typeof v !== "boolean") throw new Error(`${path}: ${what} must be true or false`);
+    return v;
+  };
+  const busTools = raw.busTools !== undefined ? bool(raw.busTools, `"busTools"`) : false;
+  const global: Policy = { ...(tools ? { tools } : {}), allowedTools, ...(budgetUsd !== undefined ? { budgetUsd } : {}), ...(busTools ? { busTools } : {}) };
   const mode = (v: unknown, what: string): WorkdirMode => {
     if (typeof v !== "string" || !(WORKDIR_MODES as readonly string[]).includes(v)) throw new Error(`${path}: ${what} must be one of ${WORKDIR_MODES.join(", ")}`);
     return v as WorkdirMode;
@@ -132,7 +140,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   const workdir = workdirOf(raw.workdir !== undefined ? mode(raw.workdir, `"workdir"`) : "scratch", globalRepo, "the global config");
 
   const rawProfiles = raw.profiles ?? [];
-  if (!Array.isArray(rawProfiles)) throw new Error(`${path}: "profiles" must be an array of {name, agent, tools?, allowedTools?, budgetUsd?, workdir?, repo?}`);
+  if (!Array.isArray(rawProfiles)) throw new Error(`${path}: "profiles" must be an array of {name, agent, tools?, allowedTools?, budgetUsd?, busTools?, workdir?, repo?}`);
   const profiles = new Map<string, Profile>();
   for (const p of rawProfiles as Record<string, unknown>[]) {
     if (typeof p !== "object" || p === null || typeof p.name !== "string" || !NAME.test(p.name)) throw new Error(`${path}: each profile's "name" must be 1-26 characters of a-z 0-9 _ -`);
@@ -143,6 +151,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
       ...(p.tools !== undefined ? { tools: list(p.tools, `profile ${p.name}: "tools"`) } : {}),
       ...(p.allowedTools !== undefined ? { allowedTools: list(p.allowedTools, `profile ${p.name}: "allowedTools"`) } : {}),
       ...(p.budgetUsd !== undefined ? { budgetUsd: usd(p.budgetUsd, `profile ${p.name}: "budgetUsd"`) } : {}),
+      ...(p.busTools !== undefined ? { busTools: bool(p.busTools, `profile ${p.name}: "busTools"`) } : {}),
       ...(p.workdir !== undefined ? { workdir: mode(p.workdir, `profile ${p.name}: "workdir"`) } : {}),
       ...(p.repo !== undefined ? { repo: repo(p.repo, `profile ${p.name}: "repo"`) } : {}),
     });
@@ -155,7 +164,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   // replaces the profile's.
   const routeOf = (p: Profile, repoOver?: string): Route => ({
     profile: p.name, agent: p.agent,
-    policy: { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools, ...((p.budgetUsd ?? budgetUsd) !== undefined ? { budgetUsd: p.budgetUsd ?? budgetUsd } : {}) },
+    policy: { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools, ...((p.budgetUsd ?? budgetUsd) !== undefined ? { budgetUsd: p.budgetUsd ?? budgetUsd } : {}), ...((p.busTools ?? busTools) ? { busTools: true } : {}) },
     workdir: workdirOf(p.workdir ?? workdir.mode, repoOver ?? p.repo ?? workdir.repo, `profile ${p.name}`),
   });
   const fromRoutes = (name: string, routes: Route[], fanout: { fanout?: boolean }): Fleet => {
@@ -249,7 +258,7 @@ export function askOf(c: Config): AskPolicy {
 
 // The global policy: delegations, and fleets without a profile.
 export function policyOf(c: Config): Policy {
-  return { ...(c.tools ? { tools: c.tools } : {}), allowedTools: c.allowedTools, ...(c.budgetUsd !== undefined ? { budgetUsd: c.budgetUsd } : {}) };
+  return { ...(c.tools ? { tools: c.tools } : {}), allowedTools: c.allowedTools, ...(c.budgetUsd !== undefined ? { budgetUsd: c.budgetUsd } : {}), ...(c.busTools ? { busTools: true } : {}) };
 }
 
 export async function main(env: Record<string, string | undefined> = process.env): Promise<number> {
@@ -260,8 +269,10 @@ export async function main(env: Record<string, string | undefined> = process.env
   const store = new Store(join(dataDir, "factory.db"));
   const runner = new ClaudeRunner({ bin: cfg.claude, cwd: cfg.cwd, env: sessionFree(env) });
   let bus: LocalBus;
+  // The id a bus reader (#669) names to act under this session.
+  const harnessSession = `factory-${randomUUID()}`;
   try {
-    bus = await LocalBus.start({ command: cfg.grayboard, identity: cfg.identity, version: VERSION, env: sessionFree(env) });
+    bus = await LocalBus.start({ command: cfg.grayboard, identity: cfg.identity, version: VERSION, env: sessionFree(env), harnessSession });
   } catch (e) {
     log(e instanceof Error ? e.message : String(e));
     store.close();
@@ -269,7 +280,14 @@ export async function main(env: Record<string, string | undefined> = process.env
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
   const workspaces = new Workspaces(join(dataDir, "trees"), cfg.cwd);
-  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, limits: cfg.limits, log });
+  // The bus tools' relay (#669): opens its socket and reader on the first run that has them.
+  const childTools = new Relay({
+    dir: join(dataDir, "relay"),
+    shim: shimCommand(join(dataDir, "relay"), join(import.meta.dir, "relay_shim.ts")),
+    reader: () => startReader({ command: cfg.grayboard, parentSession: harnessSession, identity: bus.handle, version: VERSION, env: sessionFree(env) }),
+    log,
+  });
+  const factory = new Factory(bus, store, runner, { childTools, fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, limits: cfg.limits, log });
   let signalled = false;
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);
@@ -300,6 +318,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   const why = await factory.run();
   process.off("SIGHUP", reload);
   log(`stopping: ${why}`);
+  await childTools.close();
   store.close();
   return signalled ? 0 : 1;
 }
