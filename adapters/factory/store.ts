@@ -34,8 +34,10 @@ export type Admit = { fanout?: boolean; parent?: number; title?: string; profile
 // two, its triage and its synthesis). `outcome` is null while it runs; a run
 // cut off by a restart ends as interrupted. Its transcript is the file
 // runs/<id>.jsonl beside the store, pruned with it.
-export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted" | "cancelled";
-export type Run = { id: number; seq: number; agent: string; started_at: number; ended_at: number | null; code: number | null; session: string | null; turns: number | null; cost_usd: number | null; outcome: RunOutcome | null };
+export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted" | "cancelled" | "deadline";
+// Work a spent daily budget holds (#655): everything, or the fleets on these boards.
+export type Hold = { all: boolean; boards: string[] };
+export type Run = { id: number; seq: number; agent: string; started_at: number; ended_at: number | null; code: number | null; session: string | null; turns: number | null; cost_usd: number | null; granted_usd: number | null; outcome: RunOutcome | null };
 
 export class Store {
   private readonly db: Database;
@@ -88,7 +90,8 @@ export class Store {
       session TEXT,
       turns INTEGER,
       cost_usd REAL,
-      outcome TEXT
+      outcome TEXT,
+      granted_usd REAL
     )`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS runs_seq ON runs (seq)`);
     // Thread commands (#651). threads: each reply the factory sent for a
@@ -104,6 +107,9 @@ export class Store {
       const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"],
         ["question", "TEXT"], ["ask_human", "INTEGER NOT NULL DEFAULT 0"], ["asked_at", "INTEGER"], ["escalated_at", "INTEGER"], ["answer", "TEXT"], ["asks", "INTEGER NOT NULL DEFAULT 0"], ["resume", "INTEGER NOT NULL DEFAULT 0"]];
       for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
+      // A run's granted budget (#655): its reservation while open, its charge when it ends without a cost.
+      const runCols = new Set((this.db.query(`PRAGMA table_info(runs)`).all() as { name: string }[]).map((c) => c.name));
+      if (!runCols.has("granted_usd")) this.db.exec(`ALTER TABLE runs ADD COLUMN granted_usd REAL`);
     }).immediate();
   }
 
@@ -151,8 +157,10 @@ export class Store {
   // The oldest queued request, now running; null when none waits. The
   // returned row says whether this run resumes (#652); the store clears it,
   // so a later run of the row (a synthesis) starts fresh.
-  next(): Row | null {
-    const row = this.db.query(`SELECT * FROM requests WHERE state = 'queued' ORDER BY seq LIMIT 1`).get() as Raw | null;
+  // Held work (#655) is skipped, so a held fleet doesn't block another's.
+  next(hold: Hold = { all: false, boards: [] }): Row | null {
+    if (hold.all) return null;
+    const row = this.db.query(`SELECT q.* FROM requests q LEFT JOIN requests p ON p.seq = q.parent WHERE q.state = 'queued'${held(hold.boards, false)} ORDER BY q.seq LIMIT 1`).get(...hold.boards) as Raw | null;
     if (!row) return null;
     this.db.query(`UPDATE requests SET state = 'running', resume = 0, updated_at = ? WHERE seq = ?`).run(this.now(), row.seq);
     return toRow({ ...row, state: "running" });
@@ -267,14 +275,74 @@ export class Store {
     return this.db.query(`SELECT COALESCE(SUM(state = 'running'), 0) AS running, COALESCE(SUM(state = 'queued'), 0) AS queued, COALESCE(SUM(state = 'asking'), 0) AS asking FROM requests`).get() as { running: number; queued: number; asking: number };
   }
 
+  // Queued rows a spent daily budget holds (#655), or whether this one is held.
+  heldCount(hold: Hold, seq?: number): number {
+    if (!hold.all && !hold.boards.length) return 0;
+    const one = seq === undefined ? "" : " AND q.seq = ?";
+    const args: (string | number)[] = hold.all ? [] : [...hold.boards];
+    if (seq !== undefined) args.push(seq);
+    return (this.db.query(`SELECT COUNT(*) AS n FROM requests q LEFT JOIN requests p ON p.seq = q.parent WHERE q.state = 'queued'${hold.all ? "" : held(hold.boards, true)}${one}`).get(...args) as { n: number }).n;
+  }
+
+  // A row taken by next() that a spent budget turned back (#655): queued
+  // again as it was, its resume flag restored.
+  requeue(seq: number, resume: boolean): void {
+    this.db.query(`UPDATE requests SET state = 'queued', resume = ?, updated_at = ? WHERE seq = ? AND state = 'running'`).run(resume ? 1 : 0, this.now(), seq);
+  }
+
+  // Top-level requests not yet finished: what a deadline (#655) is checked on.
+  openRoots(): Row[] {
+    return (this.db.query(`SELECT * FROM requests WHERE parent IS NULL AND state != 'finished' ORDER BY seq`).all() as Raw[]).map(toRow);
+  }
+
+  // A subtask's siblings that will still run: queued, asking (a resume
+  // runs), or taken by next() but not yet granted (no open run, so no
+  // reservation): pump() takes several rows before any reaches its grant.
+  siblingsLeft(parent: number, self: number): number {
+    return (this.db.query(`SELECT COUNT(*) AS n FROM requests q WHERE q.parent = ? AND q.seq != ? AND (q.state IN ('queued', 'asking') OR (q.state = 'running' AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.seq = q.seq AND r.ended_at IS NULL)))`).get(parent, self) as { n: number }).n;
+  }
+
   // Queued requests admitted before this one.
   queuedAhead(k: Key): number {
     return (this.db.query(`SELECT COUNT(*) AS n FROM requests WHERE state = 'queued' AND seq < (SELECT seq FROM requests WHERE source = ? AND id = ?)`).get(k.source, k.id) as { n: number }).n;
   }
 
   // A run of the request `seq` starts; returns its id.
-  startRun(seq: number, agent: string): number {
-    return Number(this.db.query(`INSERT INTO runs (seq, agent, started_at) VALUES (?, ?, ?)`).run(seq, agent, this.now()).lastInsertRowid);
+  startRun(seq: number, agent: string, grantedUsd?: number): number {
+    return Number(this.db.query(`INSERT INTO runs (seq, agent, started_at, granted_usd) VALUES (?, ?, ?, ?)`).run(seq, agent, this.now(), grantedUsd ?? null).lastInsertRowid);
+  }
+
+  // Spend (#655): a run's cost, else its grant. An open run has no cost
+  // yet, so its grant is its reservation; a run killed before its final
+  // event (timeout, cancel, interrupted) never gets one, so it's charged
+  // its grant rather than nothing. A run with neither counts as free: no
+  // cap applied when it started.
+  treeSpent(root: number): number {
+    return (this.db.query(`SELECT COALESCE(SUM(COALESCE(r.cost_usd, r.granted_usd, 0)), 0) AS n FROM runs r JOIN requests q ON q.seq = r.seq WHERE q.seq = ? OR q.parent = ?`).get(root, root) as { n: number }).n;
+  }
+
+  // Spend on runs started since `since`: every run, or a fleet's (its root
+  // a post on `board`). Rows pruned by retention drop out, so a daily cap
+  // needs retention of at least a day (main.ts refuses less).
+  spentSince(since: number, board?: string): number {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
+    return (this.db.query(`SELECT COALESCE(SUM(COALESCE(r.cost_usd, r.granted_usd, 0)), 0) AS n FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ?${scope}`).get(...args) as { n: number }).n;
+  }
+
+  // When the oldest charge in the window leaves it: the earliest a held fleet may run again.
+  oldestSince(since: number, board?: string): number | null {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
+    return (this.db.query(`SELECT MIN(r.started_at) AS t FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ? AND COALESCE(r.cost_usd, r.granted_usd, 0) > 0${scope}`).get(...args) as { t: number | null }).t;
+  }
+
+  // Whether a run still open holds a grant in the window: the hold may end
+  // when it reports a cost under its grant, well before the window rolls.
+  openGrants(since: number, board?: string): boolean {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
+    return this.db.query(`SELECT 1 FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ? AND r.ended_at IS NULL AND r.granted_usd > 0${scope} LIMIT 1`).get(...args) !== null;
   }
 
   endRun(id: number, outcome: RunOutcome, m: Partial<RunMeta> = {}): void {
@@ -348,6 +416,13 @@ export class Store {
 }
 
 type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number };
+// The fleet a row belongs to, by its root's board: in `boards` (`within`) or not.
+function held(boards: string[], within: boolean): string {
+  if (!boards.length) return "";
+  const inList = `COALESCE(p.board, q.board) IN (${boards.map(() => "?").join(", ")})`;
+  return within ? ` AND ${inList}` : ` AND NOT (q.source = 'board' AND COALESCE(${inList}, 0))`;
+}
+
 type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number };
 function toRow(r: Raw): Row {
   const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, ...rest } = r;

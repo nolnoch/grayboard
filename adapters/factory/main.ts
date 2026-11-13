@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { LocalBus, sessionFree } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
-import { ASK_DEFAULTS, Factory, type AskPolicy, type Fleet, type Route } from "./factory.ts";
+import { ASK_DEFAULTS, Factory, type AskPolicy, type Fleet, type Limits, type Route } from "./factory.ts";
 import type { Policy } from "./runner.ts";
 import { Store } from "./store.ts";
 import { WORKDIR_MODES, Workspaces, type Workdir, type WorkdirMode } from "./workdir.ts";
@@ -35,6 +35,7 @@ export type Config = {
   askEscalateMs: number;   // an unanswered question goes to your user after this long
   askGiveUpMs: number;     // and after this long more, the run resumes on its own judgement
   human?: string;          // who escalations go to; absent, the bus's first human
+  limits: Limits;          // the whole factory's spend and time limits (#655); a fleet's or project's own sit on its Fleet
 };
 
 // A profile (#643): the agent, what its children may do and where they run
@@ -75,6 +76,23 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   const usd = (v: unknown, what: string) => {
     if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) throw new Error(`${path}: ${what} must be a positive number (USD)`);
     return v;
+  };
+  // Limits (#655), on the top level, a fleet or a project: each optional.
+  const limitsIn = (o: Record<string, unknown>, what: string): Limits => {
+    const at = (k: string) => (what ? `${what}: "${k}"` : `"${k}"`);
+    const ms = (v: unknown, k: string) => {
+      if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${path}: ${at(k)} must be a positive integer`);
+      return v;
+    };
+    return {
+      ...(o.treeBudgetUsd !== undefined ? { treeBudgetUsd: usd(o.treeBudgetUsd, at("treeBudgetUsd")) } : {}),
+      ...(o.dailyBudgetUsd !== undefined ? { dailyBudgetUsd: usd(o.dailyBudgetUsd, at("dailyBudgetUsd")) } : {}),
+      ...(o.deadlineMs !== undefined ? { deadlineMs: ms(o.deadlineMs, "deadlineMs") } : {}),
+    };
+  };
+  const withLimits = (f: Fleet, o: Record<string, unknown>, what: string): Fleet => {
+    const l = limitsIn(o, what);
+    return Object.keys(l).length ? { ...f, limits: l } : f;
   };
   const atLeast2 = (n: number) => { if (n < 2) throw new Error(`${path}: "maxSubtasks" must be at least 2`); return n; };
   const NAME = /^[a-z0-9_-]{1,26}$/;
@@ -155,10 +173,10 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
       if (f.agent !== undefined) throw new Error(`${path}: fleet ${f.name}: give "profile" or "agent", not both`);
       const p = typeof f.profile === "string" ? profiles.get(f.profile) : undefined;
       if (!p) throw new Error(`${path}: fleet ${f.name}: "profile" must name a profile in "profiles"`);
-      fleets.push(fromRoutes(f.name, [routeOf(p)], fanout));
+      fleets.push(withLimits(fromRoutes(f.name, [routeOf(p)], fanout), f, `fleet ${f.name}`));
     } else {
       if (typeof f.agent !== "string" || !f.agent.trim()) throw new Error(`${path}: fleet ${f.name}: "agent" (or "profile") must be a non-empty string`);
-      fleets.push({ name: f.name, agent: f.agent.trim(), ...fanout });
+      fleets.push(withLimits({ name: f.name, agent: f.agent.trim(), ...fanout }, f, `fleet ${f.name}`));
     }
   }
 
@@ -177,7 +195,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     if (typeof j.lead !== "string" || !names.includes(j.lead)) throw new Error(`${path}: project ${j.name}: "lead" must be one of its "profiles"`);
     const projRepo = j.repo !== undefined ? repo(j.repo, `project ${j.name}: "repo"`) : undefined;
     const ordered = [j.lead, ...names.filter((n) => n !== j.lead)];
-    fleets.push(fromRoutes(j.name, ordered.map((n) => routeOf(profiles.get(n)!, projRepo)), fanout));
+    fleets.push(withLimits(fromRoutes(j.name, ordered.map((n) => routeOf(profiles.get(n)!, projRepo)), fanout), j, `project ${j.name}`));
   }
   const gb = env.FACTORY_GRAYBOARD?.trim() ? env.FACTORY_GRAYBOARD.trim().split(/\s+/) : strs("grayboard", ["grayboard"]);
   if (gb.length === 0) throw new Error(`${path}: "grayboard" must not be empty`);
@@ -186,6 +204,11 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   if (!/^[a-z0-9_-]{1,32}$/.test(identity)) throw new Error(`${path}: "identity" must be 1-32 characters of a-z 0-9 _ -`);
   const human = raw.human !== undefined ? str("human", "") : undefined;
   if (human !== undefined && !/^[a-z0-9_-]{1,32}$/.test(human)) throw new Error(`${path}: "human" must be a bus handle, 1-32 characters of a-z 0-9 _ -`);
+  const limits = limitsIn(raw, "");
+  const retentionMs = pos("retentionMs", DEFAULTS.retentionMs);
+  // A daily cap sums the last 24 hours of runs: pruning them sooner would undercount.
+  const daily = [...(limits.dailyBudgetUsd !== undefined ? ["the global config"] : []), ...fleets.filter((f) => f.limits?.dailyBudgetUsd !== undefined).map((f) => f.name)];
+  if (daily.length && retentionMs < DAY) throw new Error(`${path}: "dailyBudgetUsd" (${daily.join(", ")}) needs "retentionMs" of at least ${DAY} (a day)`);
   return {
     identity,
     grayboard: gb,
@@ -198,12 +221,18 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     maxConcurrent: pos("maxConcurrent", DEFAULTS.maxConcurrent),
     maxSubtasks: atLeast2(pos("maxSubtasks", DEFAULTS.maxSubtasks)),
     timeoutMs: pos("timeoutMs", DEFAULTS.timeoutMs),
-    retentionMs: pos("retentionMs", DEFAULTS.retentionMs),
+    retentionMs,
     maxAsks: pos("maxAsks", ASK_DEFAULTS.max),
     askEscalateMs: pos("askEscalateMs", ASK_DEFAULTS.escalateMs),
     askGiveUpMs: pos("askGiveUpMs", ASK_DEFAULTS.giveUpMs),
     ...(human !== undefined ? { human } : {}),
+    limits,
   };
+}
+
+// Whether any daily cap is set, globally or on a fleet or project (#655).
+export function hasDailyCap(c: Config): boolean {
+  return c.limits.dailyBudgetUsd !== undefined || c.fleets.some((f) => f.limits?.dailyBudgetUsd !== undefined);
 }
 
 // The asking policy (#652): reloadable, and read when each clock is checked.
@@ -233,13 +262,13 @@ export async function main(env: Record<string, string | undefined> = process.env
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
   const workspaces = new Workspaces(join(dataDir, "trees"), cfg.cwd);
-  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, log });
+  const factory = new Factory(bus, store, runner, { fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, limits: cfg.limits, log });
   let signalled = false;
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   // SIGHUP reloads the config (#645): fleets, projects, profiles, the
-  // global tool lists and working directory, and the asking policy (#652). A config that doesn't load
+  // global tool lists and working directory, the asking policy (#652) and the limits (#655). A config that doesn't load
   // leaves the running one in place; the other fields need a restart.
   let reloads = Promise.resolve();
   const reload = () => {
@@ -249,9 +278,14 @@ export async function main(env: Record<string, string | undefined> = process.env
         log(`reload refused, the running config stays: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
+      // retentionMs takes a restart, so a daily cap is checked against the running one.
+      if (hasDailyCap(next) && cfg.retentionMs < DAY) {
+        log(`reload refused, the running config stays: "dailyBudgetUsd" needs a running "retentionMs" of at least ${DAY} (a day); restart to change it`);
+        return;
+      }
       const restart = RESTART_ONLY.filter((k) => JSON.stringify(next[k]) !== JSON.stringify(cfg[k]));
       if (restart.length) log(`reload: ${restart.join(", ")} changed, which takes a restart; the running values stay`);
-      await factory.reconfigure({ fleets: next.fleets, policy: policyOf(next), workdir: next.workdir, ask: askOf(next) });
+      await factory.reconfigure({ fleets: next.fleets, policy: policyOf(next), workdir: next.workdir, ask: askOf(next), limits: next.limits });
       log(`reloaded: ${next.fleets.length} fleet(s) and project(s)`);
     }).catch((e) => log(`reload failed: ${e instanceof Error ? e.message : String(e)}`));
   };
