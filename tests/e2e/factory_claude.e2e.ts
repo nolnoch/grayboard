@@ -137,3 +137,38 @@ test("claude runner: a run past its budget stops, and the outcome says so", asyn
     model.stop();
   }
 }, 120_000);
+
+// Ask and resume (#652): a run that ends on a question continues the same
+// conversation under the same flags, with the answer as the next prompt.
+// The second turn must see the first (task, question) and the agent's prompt.
+test("claude runner: a resumed run continues the conversation with the answer (#652)", async () => {
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("ANSWER-5")) ? undefined
+      : { text: userTexts(q).some((t) => t.includes("FACTORY-ASK")) && systemText(q).includes("AGENT-PROMPT-7") ? "RESUMED-OK" : "lost context" },
+    (q) => (userTexts(q).some((t) => t.includes("FACTORY-ASK")) ? { text: "QUESTION-1?" } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "researcher.md"), "---\nname: researcher\ndescription: researches\n---\nAGENT-PROMPT-7\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const agent = runner.roster()[0]!;
+    const req = { id: 1, source: "dm" as const, requester: "sim", persona: "researcher", task: "FACTORY-ASK" };
+    const t = join(dir, "t.jsonl");
+    const first = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t);
+    expect(first).toMatchObject({ ok: true, text: "QUESTION-1?" });
+    const session = first.run!.session!;
+    const second = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t, { session, input: "ANSWER-5" });
+    expect(second).toMatchObject({ ok: true, text: "RESUMED-OK" });
+    expect(model.unhandled).toEqual([]);
+    // One transcript, both runs' events.
+    const results = readFileSync(t, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "result");
+    expect(results.map((e) => e.result)).toEqual(["QUESTION-1?", "RESUMED-OK"]);
+    expect(second.run?.session).toBe(session); // --resume continues, it doesn't fork
+    // Restricted mode's default tools keep Agent (measured on the pinned
+    // Claude Code), so a child can run subagents without a profile naming it.
+    expect(model.requests[0]!.body.tools?.map((x) => x.name)).toContain("Agent");
+  } finally {
+    model.stop();
+  }
+}, 120_000);

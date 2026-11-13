@@ -13,7 +13,7 @@ import { closeSync, fchmodSync, openSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Request } from "../delegate.ts";
-import { execChild, prompt, readAgents, tail, type Agent, type Outcome, type Policy, type Runner, type RunMeta } from "../runner.ts";
+import { execChild, prompt, readAgents, tail, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../runner.ts";
 import type { Place } from "../workdir.ts";
 
 export type ClaudeOptions = {
@@ -52,19 +52,20 @@ export class ClaudeRunner implements Runner {
   // `num_turns` and `total_cost_usd`. A budget stop exits 1 with subtype
   // `error_max_budget_usd` and the reason in `errors`; the check runs after
   // a turn, so a run can pass its budget by up to one turn.
-  async run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string): Promise<Outcome> {
+  async run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string, resume?: Resume): Promise<Outcome> {
     const def = { description: agent.description ?? agent.name, prompt: agent.prompt, ...(agent.tools ? { tools: agent.tools } : {}), ...(agent.model ? { model: agent.model } : {}) };
     const cmd = [this.o.bin, "-p", "--restricted", "--strict-mcp-config", "--agents", JSON.stringify({ [agent.name]: def }), "--agent", agent.name, "--output-format", "stream-json", "--verbose", "--permission-prompts", "none"];
+    if (resume) cmd.push("--resume", resume.session);
     if (policy.tools) cmd.push("--tools", policy.tools.join(","));
     if (policy.allowedTools.length) cmd.push("--allowedTools", ...policy.allowedTools);
     if (policy.budgetUsd !== undefined) cmd.push("--max-budget-usd", String(policy.budgetUsd));
     if (place.addDirs.length) cmd.push("--add-dir", ...place.addDirs);
-    const fd = openSync(transcript, "w", 0o600);
+    const fd = openSync(transcript, resume ? "a" : "w", 0o600);
     let x: Awaited<ReturnType<typeof execChild>>;
     const events = new Lines();
     try {
       fchmodSync(fd, 0o600); // a file left by an earlier store keeps its mode under "w"
-      x = await execChild(cmd, { cwd: place.cwd, env: this.o.env, input: prompt(r), signal, onStdout: (c) => { writeSync(fd, c); events.push(c); } });
+      x = await execChild(cmd, { cwd: place.cwd, env: this.o.env, input: resume ? resume.input : prompt(r), signal, onStdout: (c) => { writeSync(fd, c); events.push(c); } });
     } finally {
       closeSync(fd);
     }
