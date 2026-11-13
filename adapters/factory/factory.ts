@@ -43,7 +43,7 @@ export class Factory {
 
   // Runs until the bus closes; resolves with why.
   async run(): Promise<string> {
-    const again = (r: Row) => (r.parent !== null ? "Its task's combined result won't come." : r.source === "dm" ? "Re-delegate it if it's still wanted." : "Post it again if it's still wanted.");
+    const again = (r: Row) => (r.parent !== null ? "The task's combined result will say this subtask was interrupted." : r.source === "dm" ? "Re-delegate it if it's still wanted." : "Post it again if it's still wanted.");
     for (const r of this.store.interrupted((r) => `[factory] interrupted: the factory stopped before this finished; nothing is running for it now. ${again(r)}`)) {
       this.o.log(`request ${r.id} was ${r.state} when the factory last stopped; reporting it interrupted`);
     }

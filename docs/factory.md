@@ -49,7 +49,7 @@ A request's key is its source and id: the bus message id for a DM, the post id f
 
 ## 6. The store
 
-SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's key, reply route and state and, once finished, the reply text until it's sent. A store an earlier factory wrote gets newer columns by guarded `ALTER TABLE` at open. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had), and so does a fanned-out request waiting on its subtasks, with its subtasks still queued (§7); unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the key must outlive any replay of its message.
+SQLite in the module's data directory (`FACTORY_DATA_DIR`, default `~/.grayboard-factory`), separate from the bus database. It keeps what a restart needs: each request's key, reply route and state and, once finished, the reply text until it's sent. A store an earlier factory wrote gets newer columns by guarded `ALTER TABLE` at open. At start, a request left running finishes as interrupted (re-running it unasked could repeat side effects the dead child already had); nothing else is lost (#642). A fanned-out request stays waiting and its queued subtasks, which never started, run as before; a subtask that was running counts as finished, interrupted, so its task still synthesizes, with the interruption among the results (§7). Unsent replies are resent; the resend repeats hourly. Replied rows are pruned past the retention, default 30 days: the key must outlive any replay of its message.
 
 ## 7. Fleets
 

@@ -122,15 +122,21 @@ export class Store {
     return (this.db.query(`SELECT COUNT(*) AS n FROM requests WHERE state = 'queued' AND seq < (SELECT seq FROM requests WHERE source = ? AND id = ?)`).get(k.source, k.id) as { n: number }).n;
   }
 
-  // At start: a request left running had its child die with the previous
+  // At start: a row left running had its child die with the previous
   // process, so it finishes as interrupted (re-running it unasked could
-  // repeat side effects the child already had). Returns those rows.
-  // A fanned-out request whose subtasks were out goes the same way, and so
-  // do its subtasks still queued: none of them would reach a synthesis now.
+  // repeat side effects the child already had). Returns those rows. Nothing
+  // else is lost: a fanned-out request stays waiting, and its subtasks still
+  // queued never started, so they run as before (#642). A subtask that was
+  // cut off counts as finished, and once its siblings are done the parent
+  // synthesizes with the interruption in its results.
   interrupted(reply: (r: Row) => string): Row[] {
-    const rows = (this.db.query(`SELECT * FROM requests WHERE state IN ('running', 'waiting')
-      OR (state = 'queued' AND parent IN (SELECT seq FROM requests WHERE state = 'waiting')) ORDER BY seq`).all() as Raw[]).map(toRow);
-    for (const r of rows) this.finish(r, reply(r));
+    const rows = (this.db.query(`SELECT * FROM requests WHERE state = 'running' ORDER BY seq`).all() as Raw[]).map(toRow);
+    this.db.transaction(() => {
+      for (const r of rows) this.finish(r, reply(r));
+      // Every waiting parent, not only those of the rows above: a crash
+      // between a subtask's finish and its parent's check strands one too.
+      for (const { seq } of this.db.query(`SELECT seq FROM requests WHERE state = 'waiting'`).all() as { seq: number }[]) this.synthesizeWhenDone(seq);
+    }).immediate();
     return rows;
   }
 
