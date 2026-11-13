@@ -37,6 +37,14 @@ export const SHIM_TOOLS = [
       },
     },
   },
+  // Tree claims (#669): only the runs of one request's tree see these.
+  {
+    name: "tree_claim_take",
+    description: "tree_claim_take(key, note?): claim something (a file, a module, a decision) for yourself among the other runs of this request, so they work around it. Yours until you release it or your run ends; refused if another run holds it.",
+    inputSchema: { type: "object", properties: { key: { type: "string", description: 'What you claim, e.g. "src/auth/session.ts".' }, note: { type: "string", description: "What you're doing with it." } }, required: ["key"] },
+  },
+  { name: "tree_claim_release", description: "tree_claim_release(key): give back a claim you hold.", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+  { name: "tree_claims", description: `tree_claims(): what the runs of this request hold now, and who holds each. ${DATA}`, inputSchema: { type: "object", properties: {} } },
 ];
 
 // One connection, requests answered in order.
@@ -79,7 +87,10 @@ export async function serve(env: Record<string, string | undefined> = process.en
   if (!path || !token) throw new Error("FACTORY_RELAY_SOCK and FACTORY_RELAY_TOKEN must be set");
   const link = new Link(path);
   const server = new Server({ name: "grayboard-factory-relay", version: "0.1.0" }, { capabilities: { tools: {} } });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: SHIM_TOOLS }));
+  // The tools this run was granted (FACTORY_RELAY_TOOLS); the relay refuses any other anyway.
+  const granted = new Set((env.FACTORY_RELAY_TOOLS ?? "").split(",").filter(Boolean));
+  const tools = SHIM_TOOLS.filter((t) => granted.has(t.name));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
   server.setRequestHandler(CallToolRequestSchema, async (r) => {
     const line = await link.ask({ token, tool: r.params.name, args: r.params.arguments ?? {} });
     let a: { ok?: unknown; text?: unknown; error?: unknown } = {};
