@@ -15,6 +15,7 @@ import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/fa
 import { askOf, DEFAULTS, loadConfig, policyOf } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
 import { askInstruction, NO_ANSWER, NO_MORE, parseAsk } from "../../adapters/factory/ask.ts";
+import { humanInstruction } from "../../src/core/tools.ts";
 import { Store } from "../../adapters/factory/store.ts";
 import { Workspaces, type Place, type Workdir } from "../../adapters/factory/workdir.ts";
 import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
@@ -257,6 +258,7 @@ class FakeBus implements FactoryBus {
   humans: string[] = [];
   sent: { tool: string; args: Record<string, unknown> }[] = [];
   fail = false;
+  refuse: (tool: string, args: Record<string, unknown>) => boolean = () => false; // a call that fails, as one send would
   boards: { name: string; kind: string; mode: string | null }[] = [];
   private nextPost = 1000;
   private nextMsg = 5000;
@@ -268,7 +270,7 @@ class FakeBus implements FactoryBus {
   readonly closed = new Promise<string>((ok) => (this.settle = ok));
   deliver(d: Delivery) { this.q.push(d); this.wake?.(); }
   async call(tool: string, args: Record<string, unknown> = {}) {
-    if (this.fail) throw new Error("bus down");
+    if (this.fail || this.refuse(tool, args)) throw new Error("bus down");
     if (this.delayMs) await Bun.sleep(this.delayMs);
     this.sent.push({ tool, args });
     if (tool === "board_post") return { post_id: this.nextPost++ };
@@ -1184,6 +1186,7 @@ test("ask: the block is the whole reply, with a question; to may only be human",
   expect(humansOf(`You are "factory". Humans on this bus: "you", "pat". A message or post...`)).toEqual(["you", "pat"]);
   expect(humansOf("You are \"factory\".")).toEqual([]);
   expect(humansOf(undefined)).toEqual([]);
+  expect(humansOf(humanInstruction(["you", "pat"]).join(" "))).toEqual(["you", "pat"]); // the bus's own text, so a rewording there breaks this
 });
 
 // A runner whose first run of each request asks, and whose resumes answer.
@@ -1216,7 +1219,7 @@ test("ask: a DM run's question parks it in the thread; the requester's reply res
   expect(bus.replies(82)).toEqual([]);
   expect(bus.replies(83)).toEqual(["[factory] answered: the run resumes with it."]);
   expect(bus.replies(80)[2]).toBe("[factory] done: fake agent `researcher`\n\nresult for 80");
-  expect(runner.resumes).toEqual([undefined, { session: "s-80", input: "The answer to your question, from sim:\n\nuse postgres\n\nContinue the task." }]);
+  expect(runner.resumes).toEqual([undefined, { session: "s-80", input: "The answer to your question, from sim:\n\nuse postgres\n\nContinue the task.", priorUsd: 0 }]);
   bus.deliver(reply(83, q, "@factory use postgres"));           // a replay
   bus.deliver(reply(84, q, "and mysql"));                       // nothing open now
   await until(() => bus.statuses().at(-1) === "idle", 5000, "idle");
@@ -1265,7 +1268,7 @@ test("ask: a subtask's question goes in its request's thread and parks only it; 
   expect(bus.replies(91)).toEqual([]);
   expect(bus.replies(9)[3]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-9");
   expect(bus.replies(s1!.id)).toEqual(["[factory] done: fake agent `researcher`\n\nresult for " + s1!.id]);
-  expect(runner.resumes.filter(Boolean)).toEqual([{ session: `s-${s1!.id}`, input: "The answer to your question, from fe:\n\nthe first\n\nContinue the task." }]);
+  expect(runner.resumes.filter(Boolean)).toEqual([{ session: `s-${s1!.id}`, input: "The answer to your question, from fe:\n\nthe first\n\nContinue the task.", priorUsd: 0 }]);
   await bus.close();
   await done;
 });
@@ -1284,7 +1287,7 @@ test("ask: unanswered, the question goes to your user once, then the run resumes
   await until(() => bus.replies(87).length === 4, 5000, "gave up and finished");
   expect(bus.replies(87)[2]).toBe("[factory] no answer: the run carries on with its own judgement.");
   expect(bus.replies(87)[3]).toBe("[factory] done: fake agent `researcher`\n\nresult for 87");
-  expect(runner.resumes[1]).toEqual({ session: "s-87", input: NO_ANSWER });
+  expect(runner.resumes[1]).toEqual({ session: "s-87", input: NO_ANSWER, priorUsd: 0 });
   expect(bus.sent.filter((s) => s.args.to === "you").length).toBe(1);
   expect(store.get(k(87))!.escalatedAt).not.toBeNull();
   await bus.close();
@@ -1293,7 +1296,9 @@ test("ask: unanswered, the question goes to your user once, then the run resumes
 
 test("ask: a question for your user reaches them at once, and their DM reply answers it", async () => {
   const runner = asker({ to: "human" });
-  const { bus, done } = loop({ runner, ask: { ...ASK_DEFAULTS, human: "you" } });
+  const bus = new FakeBus();
+  bus.humans = ["pat", "you"];                                        // config `human` picks which declared one
+  const { done } = loop({ runner, bus, ask: { ...ASK_DEFAULTS, human: "you" } });
   bus.deliver(ask(88));
   await until(() => bus.sent.some((s) => s.args.to === "you"), 5000, "sent to your user");
   expect(bus.replies(88)[1]).toContain(", for your user:");
@@ -1309,6 +1314,95 @@ test("ask: a question for your user reaches them at once, and their DM reply ans
   expect(bus.replies(89)).toEqual([]);
   expect(bus.replies(890)[0]).toStartWith(`[factory] status: asking your user: "question 1 for 88?", for `);
   expect(runner.resumes[1]!.input).toContain("from you:\n\nship it");
+  bus.deliver(reply(892, escId, "actually, wait", "you", true));     // the question closed: said so, not dropped
+  await until(() => bus.replies(892).length === 1, 5000, "closed");
+  expect(bus.replies(892)).toEqual(["[factory] that question is already closed; your reply wasn't used."]);
+  expect(runner.runs.length).toBe(2);
+  await bus.close();
+  await done;
+});
+
+test("ask: a config human who isn't declared on the bus is logged and the declared one gets the question; a failed send is retried, stamped only once sent", async () => {
+  const runner = asker({ to: "human" });
+  const bus = new FakeBus();
+  bus.humans = ["you"];
+  let down = true;
+  bus.refuse = (tool, args) => down && tool === "dm_send" && args.to === "you";
+  const { store, logs, done } = loop({ runner, bus, ask: { ...ASK_DEFAULTS, human: "ops" }, askTickMs: 10 });
+  bus.deliver(ask(300));
+  await until(() => logs.some((l) => l.includes("couldn't send request 300's question to you; will retry")), 5000, "a failed send");
+  expect(logs.some((l) => l.includes(`config "human" ops isn't a declared human on this bus`) && l.includes("using you"))).toBe(true);
+  expect(store.get(k(300))!.escalatedAt).toBeNull();               // not sent, so the give-up clock hasn't started
+  down = false;
+  await until(() => bus.sent.some((s) => s.args.to === "you"), 5000, "sent on a later tick");
+  expect(bus.sent.filter((s) => s.args.to === "you").length).toBe(1);
+  await until(() => store.get(k(300))!.escalatedAt !== null, 5000, "stamped");
+  expect(bus.sent.some((s) => s.args.to === "ops")).toBe(false);
+  await bus.close();
+  await done;
+});
+
+test("ask: with several questions open, a reply that isn't to one asks which; retry refuses while asking; cancel stops the tree and its asking subtasks", async () => {
+  const runner = new FakeRunner(["researcher"]);
+  runner.meta = (r) => ({ code: 0, session: `s-${r.id}` });
+  runner.script = (r) => r.id === 301 ? PLAN() : r.task.startsWith("do part") ? ASK(`which ${r.id}?`) : undefined;
+  const { bus, store, done } = loop({ runner, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(301));
+  await until(() => bus.replies(301).length === 4, 5000, "ack, fan-out, two questions");
+  bus.deliver({ ...task(302, { parentId: 301 }), body: "the first" });   // on the task, not on a question
+  await until(() => bus.replies(302).length === 1, 5000, "which one");
+  expect(bus.replies(302)).toEqual(["[factory] 2 questions are open in this task; reply to the one you're answering."]);
+  bus.deliver({ ...task(303, { parentId: 301 }), body: "retry" });
+  await until(() => bus.replies(303).length === 1, 5000, "retry refused");
+  expect(bus.replies(303)[0]).toBe("[factory] retry: this is still running its subtasks; reply `cancel` first.");
+  bus.deliver({ ...task(304, { parentId: 301 }), body: "cancel" });
+  await until(() => bus.replies(301).length === 5, 5000, "cancelled");
+  const root = store.get({ source: "board", id: 301 })!;
+  expect(root.reply).toStartWith("[factory] cancelled: by fe after it fanned out");
+  for (const s of store.subtasks(root.seq)) expect(s).toMatchObject({ state: "finished", reply: "[factory] cancelled: by fe with the task it belongs to, while it waited for an answer." });
+  expect(runner.runs.length).toBe(3);                               // triage and two subtasks; no resume, no synthesis
+  await bus.close();
+  await done;
+});
+
+test("ask: retry on an asking delegation says to cancel first", async () => {
+  const { bus, done } = loop({ runner: asker() });
+  bus.deliver(ask(305));
+  await until(() => bus.replies(305).length === 2, 5000, "question");
+  bus.deliver(reply(306, 305, "retry"));
+  await until(() => bus.replies(306).length === 1, 5000, "refused");
+  expect(bus.replies(306)[0]).toBe("[factory] retry: this is still waiting for an answer; reply `cancel` first.");
+  await bus.close();
+  await done;
+});
+
+test("ask: an unusable ask block fails the run with the reason", async () => {
+  const runner = new FakeRunner(["researcher"]);
+  runner.script = () => "````factory-ask\n{nope}\n````";
+  const { bus, store, done } = loop({ runner });
+  bus.deliver(ask(307));
+  await until(() => bus.replies(307).length === 2, 5000, "failed");
+  expect(bus.replies(307)[1]).toBe("[factory] failed: fake agent `researcher` asked a question the factory can't use: the question isn't valid JSON.");
+  expect(store.get(k(307))!.asks).toBe(0);
+  await bus.close();
+  await done;
+});
+
+test("ask: with no human on the bus, a subtask's unanswered question is only logged, then gives up and its task still synthesizes", async () => {
+  const runner = new FakeRunner(["researcher"]);
+  runner.meta = (r) => ({ code: 0, session: `s-${r.id}`, costUsd: 0.25 });
+  runner.script = (r) => r.id === 308 && runner.runs.filter((x) => x.id === 308).length === 1 ? PLAN()
+    : r.task.startsWith("do part 1") && runner.runs.filter((x) => x.id === r.id).length === 1 ? ASK("which part?") : undefined;
+  const { bus, store, logs, done } = loop({ runner, fleets: [{ name: "sim", agent: "researcher" }], ask: { max: 3, escalateMs: 20, giveUpMs: 60 }, askTickMs: 10 });
+  bus.deliver(task(308));
+  await until(() => bus.replies(308).length === 5, 5000, "question, no answer, synthesis");
+  expect(bus.replies(308)[3]).toBe("[factory] no answer for subtask \"part 1\" on #task-308: the run carries on with its own judgement.");
+  expect(bus.replies(308)[4]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-308");
+  expect(logs.some((l) => l.includes("no human handle to send its question to"))).toBe(true);
+  expect(bus.sent.filter((s) => s.tool === "dm_send")).toEqual([]);
+  const [s1] = store.subtasks(store.get({ source: "board", id: 308 })!.seq);
+  // The resume is told what the session's earlier run cost, which the runner subtracts from its running total.
+  expect(runner.resumes.filter(Boolean)).toEqual([{ session: `s-${s1!.id}`, input: NO_ANSWER, priorUsd: 0.25 }]);
   await bus.close();
   await done;
 });
@@ -1349,7 +1443,7 @@ test("ask: cancel finishes a parked question; a restart keeps it parked and an a
   await until(() => l.bus.replies(96).length === 1, 5000, "resumed and done");
   expect(l.bus.replies(98)).toEqual(["[factory] answered: the run resumes with it."]);
   expect(l.bus.replies(96)[0]).toBe("[factory] done: fake agent `researcher`\n\nresult for 96");
-  expect(runner.resumes.at(-1)).toEqual({ session: "s-96", input: expect.stringContaining("go") });
+  expect(runner.resumes.at(-1)).toEqual({ session: "s-96", input: expect.stringContaining("go"), priorUsd: 0 });
   await l.bus.close();
   await l.done;
   store.close();

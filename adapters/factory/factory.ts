@@ -67,6 +67,7 @@ export class Factory {
   private readonly active = new Map<number, AbortController>(); // seq → its running child's controller
   private readonly cancelledBy = new Map<number, string>(); // seq → who cancelled it while it ran (#651)
   private load = ""; // the peer_status text last set
+  private warnedHuman: string | undefined; // a config `human` already logged as undeclared
 
   private cfg: Reconfig & { ask: AskPolicy };
 
@@ -286,7 +287,7 @@ export class Factory {
     // with no session to resume, a fresh run is told what it asked and what came back.
     let resume: Resume | undefined;
     const session = row.resume && row.answer !== null ? this.store.lastSession(row.seq) : null;
-    if (session) resume = { session, input: row.answer! };
+    if (session) resume = { session, input: row.answer!, priorUsd: this.store.sessionUsd(session) };
     else {
       const task = `${input.task}\n\n${askInstruction()}`;
       input = { ...input, task: row.resume && row.answer !== null ? reseeded(task, row.question ?? "", row.answer) : task };
@@ -462,7 +463,10 @@ export class Factory {
     } catch (e) {
       this.o.log(`couldn't post request ${row.id}'s question; it goes to your user when it escalates: ${msg(e)}`);
     }
-    if (q.human) await this.escalate(this.store.bySeq(row.seq)!, root);
+    // Answered or cancelled during the post: nothing to send. A failed send
+    // leaves it unstamped, so the next tick sends it.
+    const now = this.store.bySeq(row.seq);
+    if (q.human && now?.state === "asking" && await this.escalate(now, root)) this.store.escalated(now.seq, now.askedAt);
     return null;
   }
 
@@ -474,38 +478,54 @@ export class Factory {
     return row.parent !== null && row.source === "board" ? ` for subtask "${oneLine(row.title ?? "")}" on #${row.board}` : "";
   }
 
-  // Your user: the config's handle, else the bus's declared human.
+  // Your user: a declared human (the bus marks only theirs \`human="true"\`,
+  // so only theirs can answer). Config \`human\` picks which; one that isn't
+  // declared is logged and the first declared one is used.
   private human(): string | undefined {
-    return this.cfg.ask.human ?? this.bus.humans?.[0];
+    const declared = this.bus.humans ?? [], want = this.cfg.ask.human;
+    if (want === undefined || declared.includes(want)) return want ?? declared[0];
+    if (this.warnedHuman !== want) {
+      this.warnedHuman = want;
+      this.o.log(`config "human" ${want} isn't a declared human on this bus (\`grayboard human\`), so its replies couldn't answer; ${declared[0] ? `using ${declared[0]}` : "no one gets questions"}`);
+    }
+    return declared[0];
   }
 
   // The question in a DM to your user, once; their reply to it answers it.
-  private async escalate(row: Row, root: Row): Promise<void> {
+  // True when it went, or when there's no one to send it to (so the
+  // give-up clock runs); false when the send failed and should be retried.
+  private async escalate(row: Row, root: Row): Promise<boolean> {
     const human = this.human();
-    if (!human) { this.o.log(`request ${row.id}: no human handle to send its question to (set "human" in the config or declare one with \`grayboard human\`)`); return; }
+    if (!human) { this.o.log(`request ${row.id}: no human handle to send its question to (declare one with \`grayboard human\`)`); return true; }
     const where = root.source === "board" ? `post ${root.id} on #${root.board}` : `a delegation by DM`;
     const why = row.askHuman ? "asks you" : `has waited ${ago(row.askedAt ?? Date.now())} for an answer from ${oneLine(root.requester)}`;
     const body = `[factory] ${oneLine(root.requester)}'s task (${where})${this.subtaskLabel(row)} ${why}:\n\n${row.question ?? ""}\n\nReply to this message with the answer. With none in ${dur(this.cfg.ask.giveUpMs)}, the run carries on with its own judgement.`;
     try {
       this.remember("dm", await this.bus.call("dm_send", { to: human, body }), row.seq);
+      return true;
     } catch (e) {
-      this.o.log(`couldn't send request ${row.id}'s question to ${human}: ${msg(e)}`);
+      this.o.log(`couldn't send request ${row.id}'s question to ${human}; will retry: ${msg(e)}`);
+      return false;
     }
   }
 
-  // Parked questions' clocks: unanswered past escalateMs goes to your user
-  // once; past giveUpMs after that, the run resumes on its own judgement.
+  // Parked questions' clocks: unanswered past escalateMs (or addressed to
+  // your user and not yet sent) goes to your user once; past giveUpMs after
+  // that, the run resumes on its own judgement.
   private async askTick(): Promise<void> {
     if (this.ticking || this.stopping) return;
     this.ticking = true;
     try {
       const a = this.cfg.ask, now = Date.now();
-      for (const r of this.store.asking()) {
+      for (const listed of this.store.asking()) {
+        // Fresh: an earlier row's send awaited, and this one may have been
+        // answered, or answered and parked on a new question, since the list.
+        const r = this.store.bySeq(listed.seq);
+        if (!r || r.state !== "asking" || r.askedAt !== listed.askedAt) continue;
         if (r.escalatedAt === null) {
-          if (now - (r.askedAt ?? now) < a.escalateMs) continue;
-          this.store.escalated(r.seq);
-          this.o.log(`request ${r.id}: question unanswered for ${ago(r.askedAt ?? now)}; sending it to your user`);
-          await this.escalate(r, this.rootOf(r));
+          if (!r.askHuman && now - (r.askedAt ?? now) < a.escalateMs) continue;
+          if (!r.askHuman) this.o.log(`request ${r.id}: question unanswered for ${ago(r.askedAt ?? now)}; sending it to your user`);
+          if (await this.escalate(r, this.rootOf(r))) this.store.escalated(r.seq, r.askedAt);
         } else if (now - r.escalatedAt >= a.giveUpMs && this.store.answer(r.seq, NO_ANSWER) === "queued") {
           this.o.log(`request ${r.id}: question unanswered; resuming on its own judgement`);
           const root = this.rootOf(r);
@@ -536,9 +556,11 @@ export class Factory {
       }
       target = open[0];
     }
-    if (!target) return false;
+    const closed = () => this.answer(d, id, `[factory] that question is already closed; your reply wasn't used.`, hit.seq).then(() => true);
+    // Your user replying to the DM that sent them a question answered since.
+    if (!target) return d.human === true && d.kind === "dm" && hit.question !== null && hit.state !== "asking" ? closed() : false;
     const res = this.store.answer(target.seq, answerPrompt(oneLine(d.from!), text), { source: d.kind, id });
-    if (res === "closed") return false;
+    if (res === "closed") return closed();
     if (res === "replay") { this.o.log(`${d.kind} ${id}: answer already taken; replay ignored`); return true; }
     this.o.log(`request ${target.id}: answered by ${d.from}; queued to resume`);
     await this.answer(d, id, `[factory] answered${this.subtaskLabel(target)}: the run resumes with it.`, target.seq);

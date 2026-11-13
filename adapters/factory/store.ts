@@ -160,11 +160,11 @@ export class Store {
 
   // ── asking (#652) ──
   // A running row's run ended on a question: it parks. `human`: addressed
-  // to your user, so it counts as escalated at once.
+  // to your user; it's stamped escalated only once it reaches them.
   park(seq: number, question: string, human: boolean): void {
     const t = this.now();
-    this.db.query(`UPDATE requests SET state = 'asking', question = ?, ask_human = ?, asked_at = ?, escalated_at = ?, answer = NULL, asks = asks + 1, updated_at = ? WHERE seq = ? AND state = 'running'`)
-      .run(question, human ? 1 : 0, t, human ? t : null, t, seq);
+    this.db.query(`UPDATE requests SET state = 'asking', question = ?, ask_human = ?, asked_at = ?, escalated_at = NULL, answer = NULL, asks = asks + 1, updated_at = ? WHERE seq = ? AND state = 'running'`)
+      .run(question, human ? 1 : 0, t, t, seq);
   }
 
   // A question past the tree's cap: counted, never parked; the row queues
@@ -187,8 +187,10 @@ export class Store {
     }).immediate() as "queued" | "replay" | "closed";
   }
 
-  escalated(seq: number): void {
-    this.db.query(`UPDATE requests SET escalated_at = ? WHERE seq = ? AND state = 'asking'`).run(this.now(), seq);
+  // Stamps the question asked at `askedAt` as sent to your user; a row
+  // answered or parked again since is left alone.
+  escalated(seq: number, askedAt: number | null): void {
+    this.db.query(`UPDATE requests SET escalated_at = ? WHERE seq = ? AND state = 'asking' AND asked_at IS ?`).run(this.now(), seq, askedAt);
   }
 
   asking(): Row[] {
@@ -203,6 +205,12 @@ export class Store {
   // The session of the row's latest run that reported one: what a resume continues.
   lastSession(seq: number): string | null {
     return (this.db.query(`SELECT session FROM runs WHERE seq = ? AND session IS NOT NULL ORDER BY id DESC LIMIT 1`).get(seq) as { session: string } | null)?.session ?? null;
+  }
+
+  // What the session's earlier runs cost (each row holds its own
+  // invocation's share): a resume reports the session's running total.
+  sessionUsd(session: string): number {
+    return (this.db.query(`SELECT COALESCE(SUM(cost_usd), 0) AS c FROM runs WHERE session = ?`).get(session) as { c: number }).c;
   }
 
   finish(k: Key, reply: string): void {

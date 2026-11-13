@@ -60,7 +60,7 @@ export class ClaudeRunner implements Runner {
     if (policy.allowedTools.length) cmd.push("--allowedTools", ...policy.allowedTools);
     if (policy.budgetUsd !== undefined) cmd.push("--max-budget-usd", String(policy.budgetUsd));
     if (place.addDirs.length) cmd.push("--add-dir", ...place.addDirs);
-    const fd = openSync(transcript, resume ? "a" : "w", 0o600);
+    const fd = openSync(transcript, "w", 0o600);
     let x: Awaited<ReturnType<typeof execChild>>;
     const events = new Lines();
     try {
@@ -71,7 +71,10 @@ export class ClaudeRunner implements Runner {
     }
     events.end();
     const res = events.result;
-    const meta: RunMeta = { code: x.code, ...(typeof res?.session_id === "string" ? { session: res.session_id } : {}), ...(typeof res?.num_turns === "number" ? { turns: res.num_turns } : {}), ...(typeof res?.total_cost_usd === "number" ? { costUsd: res.total_cost_usd } : {}) };
+    // A resumed session's total_cost_usd includes its earlier runs (measured
+    // on the pinned Claude Code); this run's share is what's past them.
+    const cost = typeof res?.total_cost_usd === "number" ? Math.max(0, res.total_cost_usd - (resume?.priorUsd ?? 0)) : undefined;
+    const meta: RunMeta = { code: x.code, ...(typeof res?.session_id === "string" ? { session: res.session_id } : {}), ...(typeof res?.num_turns === "number" ? { turns: res.num_turns } : {}), ...(cost !== undefined ? { costUsd: cost } : {}) };
     if (x.timedOut) return { ok: false, error: "the child ran past the factory's timeout and was stopped", run: { ...meta, stop: "timeout" } };
     if (x.code === 0 && res && res.is_error !== true && typeof res.result === "string") return { ok: true, text: res.result, run: meta };
     if (res?.subtype === "error_max_budget_usd") return { ok: false, error: `stopped at its budget of $${policy.budgetUsd} after ${meta.turns ?? "?"} turn(s), $${meta.costUsd?.toFixed(4) ?? "?"} spent`, run: { ...meta, stop: "budget" } };

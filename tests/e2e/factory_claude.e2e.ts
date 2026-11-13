@@ -154,17 +154,23 @@ test("claude runner: a resumed run continues the conversation with the answer (#
     const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
     const agent = runner.roster()[0]!;
     const req = { id: 1, source: "dm" as const, requester: "sim", persona: "researcher", task: "FACTORY-ASK" };
-    const t = join(dir, "t.jsonl");
-    const first = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t);
+    const t1 = join(dir, "t1.jsonl"), t2 = join(dir, "t2.jsonl");
+    const first = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t1);
     expect(first).toMatchObject({ ok: true, text: "QUESTION-1?" });
     const session = first.run!.session!;
-    const second = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t, { session, input: "ANSWER-5" });
+    const second = await runner.run(agent, req, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t2, { session, input: "ANSWER-5", priorUsd: first.run!.costUsd! });
     expect(second).toMatchObject({ ok: true, text: "RESUMED-OK" });
     expect(model.unhandled).toEqual([]);
-    // One transcript, both runs' events.
-    const results = readFileSync(t, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "result");
-    expect(results.map((e) => e.result)).toEqual(["QUESTION-1?", "RESUMED-OK"]);
+    // Each run its own transcript, as the factory gives it.
+    const results = (f: string) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.type === "result");
+    expect(results(t1).map((e) => e.result)).toEqual(["QUESTION-1?"]);
+    expect(results(t2).map((e) => e.result)).toEqual(["RESUMED-OK"]);
     expect(second.run?.session).toBe(session); // --resume continues, it doesn't fork
+    // total_cost_usd is the session's running total across --resume; less
+    // priorUsd, each run reports its own share (the same usage, so the same cost).
+    expect(results(t2)[0].total_cost_usd).toBeCloseTo(2 * first.run!.costUsd!, 9);
+    expect(first.run!.costUsd!).toBeGreaterThan(0);
+    expect(second.run!.costUsd!).toBeCloseTo(first.run!.costUsd!, 9);
     // Restricted mode's default tools keep Agent (measured on the pinned
     // Claude Code), so a child can run subagents without a profile naming it.
     expect(model.requests[0]!.body.tools?.map((x) => x.name)).toContain("Agent");
