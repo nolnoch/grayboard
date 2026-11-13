@@ -49,8 +49,9 @@ class Link {
   private open(): Socket {
     if (this.sock && !this.sock.destroyed) return this.sock;
     const s = connect(this.path);
-    s.on("data", (c) => {
-      this.buf += c.toString();
+    s.setEncoding("utf8"); // a character split across reads stays whole
+    s.on("data", (c: string) => {
+      this.buf += c;
       let nl: number;
       while ((nl = this.buf.indexOf("\n")) >= 0) {
         const line = this.buf.slice(0, nl);
@@ -87,6 +88,10 @@ export async function serve(env: Record<string, string | undefined> = process.en
     return { content: [{ type: "text", text: typeof a.error === "string" ? a.error : "the factory's relay isn't answering" }], isError: true };
   });
   await server.connect(new StdioServerTransport());
+  // The harness gone (stdin closed), so is the shim: its socket would keep it alive.
+  const quit = () => process.exit(0);
+  process.stdin.on("end", quit);
+  process.stdin.on("close", quit);
 }
 
 if (import.meta.main) await serve();

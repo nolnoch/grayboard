@@ -170,7 +170,13 @@ export async function startReader(o: { command: string[]; parentSession: string;
   const closed = new Promise<void>((ok) => (gone = ok));
   await client.connect(transport);
   client.onclose = () => gone();
-  const who = parse(await client.callTool({ name: "whoami", arguments: {} })) as { primary?: unknown; child?: unknown };
+  let who: { primary?: unknown; child?: unknown };
+  try {
+    who = parse(await client.callTool({ name: "whoami", arguments: {} })) as { primary?: unknown; child?: unknown };
+  } catch (e) {
+    await client.close().catch(() => {}); // else each failed start leaves a grayboard mcp running
+    throw e;
+  }
   // Not a child (no live root it could prove), it would be a session of its
   // own, unbound: its reads would see other boards, and its cursors move.
   if (who.child !== true || who.primary !== o.identity) {

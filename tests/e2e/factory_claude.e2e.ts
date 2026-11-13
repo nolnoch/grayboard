@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeRunner } from "../../adapters/factory/claude/runner.ts";
-import { DATA_NOTE, RELAY_TOOLS, Relay, type Reader } from "../../adapters/factory/relay.ts";
+import { DATA_NOTE, RELAY_TOOLS, Relay, shimCommand, type Reader } from "../../adapters/factory/relay.ts";
 import { resolvePersona } from "../../adapters/factory/runner.ts";
 import { claudeCodeBin, claudeHome } from "../support/claude_code.ts";
 import { called, startFakeAnthropic, systemText, toolResults, userTexts } from "../support/fake_anthropic.ts";
@@ -190,7 +190,7 @@ test("claude runner: a run with the relay calls a bus tool unprompted; one witho
     close: async () => {},
     closed: new Promise<void>(() => {}),
   });
-  const relay = new Relay({ dir: join(dir, "relay"), shim: [process.execPath, join(import.meta.dir, "../../adapters/factory/relay_shim.ts")], reader, log: () => {} });
+  const relay = new Relay({ dir: join(dir, "relay"), shim: shimCommand(join(dir, "relay"), join(import.meta.dir, "../../adapters/factory/relay_shim.ts")), reader, log: () => {} });
   const model = startFakeAnthropic([
     (q) => !userTexts(q).some((t) => t.includes("FACTORY-BUS")) ? undefined
       : called(q, "toolu_bus") ? { text: "ended" } : { tool: "mcp__bus__board_read", id: "toolu_bus", input: { board: "notes", limit: 5, extra: "dropped" } },

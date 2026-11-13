@@ -436,6 +436,13 @@ export class Factory {
       try { tools = await this.o.childTools.grant(); } catch (e) {
         return `[factory] failed: couldn't open the bus tools for this run: ${msg(e)}; nothing was spawned.`;
       }
+      // The grant can take seconds (the reader's start), and until the lines
+      // below a cancel or stop has no run to abort: check again.
+      const late = this.cancelledBy.get(row.seq);
+      if (late !== undefined || this.stopping) {
+        tools.revoke();
+        return late !== undefined ? `[factory] ${late.head} before it ran.` : `[factory] failed: the factory stopped before this ran; nothing was spawned.`;
+      }
     }
     const ac = new AbortController();
     this.children.add(ac);
@@ -976,7 +983,7 @@ export class Factory {
     let names: string[];
     try { names = readdirSync(this.o.runs); } catch { return 0; }
     for (const f of names) {
-      const m = /^(\d+)\.jsonl$/.exec(f);
+      const m = /^(\d+)\.jsonl(?:\.mcp\.json)?$/.exec(f); // a crashed run's --mcp-config file (#669) too
       if (!m || this.store.hasRun(Number(m[1]))) continue;
       try { rmSync(join(this.o.runs, f), { force: true }); n++; } catch {}
     }

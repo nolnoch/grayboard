@@ -11,7 +11,7 @@
 // any local process to make. The token scopes a call to a live run: it is
 // minted per run and revoked when the run ends.
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { fenced } from "./fanout.ts";
@@ -74,9 +74,19 @@ export function render(result: unknown): string {
   return `${DATA_NOTE}\n\n${fenced(text)}`;
 }
 
+// The command that runs the shim under Bun. A stdio server starts in the
+// child's working directory, where Bun would read bunfig.toml (a preload
+// runs code before the shim), tsconfig.json and .env: a child with only
+// file tools could plant one and run code as the factory's uid (#670
+// audit). So every file Bun reads at start is one the factory owns, in the
+// relay directory (written by the first grant).
+export function shimCommand(dir: string, shim: string, bun: string = process.execPath): string[] {
+  return [bun, "--no-env-file", `--config=${join(dir, "bunfig.toml")}`, `--tsconfig-override=${join(dir, "tsconfig.json")}`, shim];
+}
+
 export type RelayOptions = {
   dir: string;                     // where the socket goes: made 0700
-  shim: string[];                  // the command that runs relay_shim.ts
+  shim: string[];                  // the command that runs relay_shim.ts (shimCommand)
   reader: () => Promise<Reader>;   // started on the first grant, again if it exits
   log(message: string): void;
 };
@@ -134,6 +144,11 @@ export class Relay implements ChildTools {
     if (Buffer.byteLength(this.path) > 100) throw new Error(`the relay socket path ${this.path} is too long for a Unix socket; use a shorter FACTORY_DATA_DIR`);
     mkdirSync(this.o.dir, { recursive: true, mode: 0o700 });
     chmodSync(this.o.dir, 0o700);
+    // shimCommand's Bun config: empty, the factory's own.
+    for (const [f, text] of [["bunfig.toml", ""], ["tsconfig.json", "{}\n"]] as const) {
+      const fd = openSync(join(this.o.dir, f), "w", 0o600);
+      try { fchmodSync(fd, 0o600); writeSync(fd, text); } finally { closeSync(fd); }
+    }
     rmSync(this.path, { force: true }); // a crashed run's socket
     const srv = createServer((s) => this.serve(s));
     await new Promise<void>((ok, fail) => { srv.once("error", fail); srv.listen(this.path, () => { srv.off("error", fail); ok(); }); });
@@ -147,11 +162,11 @@ export class Relay implements ChildTools {
     this.sockets.add(s);
     s.on("close", () => this.sockets.delete(s));
     s.on("error", () => {});
+    s.setEncoding("utf8"); // a character split across reads stays whole
     let buf = "";
     let chain = Promise.resolve();
-    s.on("data", (c) => {
-      buf += c.toString();
-      if (Buffer.byteLength(buf) > MAX_LINE_BYTES) { s.destroy(); return; }
+    s.on("data", (c: string) => {
+      buf += c;
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl);
@@ -161,6 +176,7 @@ export class Relay implements ChildTools {
           if (!s.destroyed) s.write(`${JSON.stringify(answer)}\n`);
         });
       }
+      if (Buffer.byteLength(buf) > MAX_LINE_BYTES) s.destroy(); // one unfinished line past the cap
     });
   }
 

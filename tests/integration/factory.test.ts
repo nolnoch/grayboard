@@ -16,7 +16,7 @@ import { askOf, DEFAULTS, hasDailyCap, loadConfig, policyOf } from "../../adapte
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
 import { askInstruction, NO_ANSWER, NO_MORE, parseAsk } from "../../adapters/factory/ask.ts";
 import { humanInstruction } from "../../src/core/tools.ts";
-import { DATA_NOTE, MAX_RESULT_CHARS, Relay, RELAY_TOOLS, type ChildTools, type McpServer, type Reader } from "../../adapters/factory/relay.ts";
+import { DATA_NOTE, MAX_RESULT_CHARS, Relay, RELAY_TOOLS, shimCommand, type ChildTools, type McpServer, type Reader } from "../../adapters/factory/relay.ts";
 import { Store } from "../../adapters/factory/store.ts";
 import { Workspaces, type Place, type Workdir } from "../../adapters/factory/workdir.ts";
 import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
@@ -1875,7 +1875,8 @@ test("rounds: a tree fanned out before rounds existed only combines, whatever ma
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-const SHIM = [process.execPath, join(import.meta.dir, "../../adapters/factory/relay_shim.ts")];
+const SHIM_PATH = join(import.meta.dir, "../../adapters/factory/relay_shim.ts");
+const SHIM = [process.execPath, SHIM_PATH];
 
 // A reader that records its calls and answers from `answer`.
 function fakeReader(answer: (tool: string, args: Record<string, unknown>) => unknown = () => [{ name: "notes" }]) {
@@ -1889,9 +1890,9 @@ function fakeReader(answer: (tool: string, args: Record<string, unknown>) => unk
 }
 
 // The child's side, as a harness drives it: the shim over stdio.
-async function shimClient(server: McpServer): Promise<Client> {
+async function shimClient(server: McpServer, cwd?: string): Promise<Client> {
   const c = new Client({ name: "child", version: "test" }, { capabilities: {} });
-  await c.connect(new StdioClientTransport({ command: server.command, args: server.args, env: { ...(process.env as Record<string, string>), ...server.env }, stderr: "inherit" }));
+  await c.connect(new StdioClientTransport({ command: server.command, args: server.args, env: { ...(process.env as Record<string, string>), ...server.env }, stderr: "inherit", ...(cwd ? { cwd } : {}) }));
   return c;
 }
 const textOf = (r: unknown) => ((r as { content: { text: string }[] }).content[0]!.text);
@@ -2019,3 +2020,85 @@ test("local bus: the relay's reader acts under the factory's name and reads with
   await expect(startReader({ command: [process.execPath, CLI], parentSession: "no-such-session", identity: "factory", version: "test", env })).rejects.toThrow("didn't start as a subagent of factory");
   await bus.close();
 }, 60_000);
+
+test("relay: the shim reads no Bun config, tsconfig or .env from the child's directory; text past one socket read stays whole (#669)", async () => {
+  const work = join(dir, "work");
+  mkdirSync(work, { recursive: true });
+  // A child with only file tools could write these where its stdio servers start.
+  writeFileSync(join(work, "bunfig.toml"), 'preload = ["./x.ts"]\n');
+  writeFileSync(join(work, "x.ts"), `require("node:fs").writeFileSync(${JSON.stringify(join(dir, "PWNED"))}, "1");\n`);
+  writeFileSync(join(work, ".env"), "FACTORY_RELAY_TOKEN=planted\n");
+  const wide = "界".repeat(20_000); // ~60 KB as UTF-8: more than one socket read
+  const r = fakeReader((tool) => (tool === "board_read" ? wide : []));
+  const relay = new Relay({ dir: join(dir, "relay"), shim: shimCommand(join(dir, "relay"), SHIM_PATH), reader: r.reader, log: () => {} });
+  const g = await relay.grant();
+  expect(statSync(join(dir, "relay", "bunfig.toml")).mode & 0o777).toBe(0o600);
+  const c = await shimClient(g.server, work);
+  try {
+    const read = textOf(await c.callTool({ name: "board_read", arguments: { board: "notes" } }));
+    expect(read).toContain(wide);
+    expect(read).not.toContain("\uFFFD");
+    expect(existsSync(join(dir, "PWNED"))).toBe(false);
+  } finally {
+    await c.close();
+    await relay.close();
+  }
+}, 30_000);
+
+test("relay: a reader that exits is replaced on the next call (#669)", async () => {
+  const exits: (() => void)[] = [];
+  let starts = 0;
+  const reader = async (): Promise<Reader> => {
+    starts++;
+    const closed = new Promise<void>((ok) => exits.push(ok));
+    return { call: async () => [{ name: `notes-${starts}` }], close: async () => {}, closed };
+  };
+  const logs: string[] = [];
+  const relay = new Relay({ dir: join(dir, "relay"), shim: SHIM, reader, log: (m) => logs.push(m) });
+  const g = await relay.grant();
+  const ask = () => relay.answer(JSON.stringify({ token: g.server.env.FACTORY_RELAY_TOKEN, tool: "board_list", args: {} }));
+  expect(await ask()).toMatchObject({ ok: true, text: expect.stringContaining("notes-1") });
+  exits[0]!();
+  await until(() => logs.length === 1, 2_000, "the exit logged");
+  expect(logs[0]).toContain("the reader exited");
+  expect(await ask()).toMatchObject({ ok: true, text: expect.stringContaining("notes-2") });
+  expect(starts).toBe(2);
+  await relay.close();
+});
+
+test("relay: a grant that fails fails the run unspawned; a cancel while a grant is pending stops the run before it spawns (#669)", async () => {
+  const policy: Policy = { allowedTools: [], busTools: true };
+  const failing: ChildTools = { grant: async () => { throw new Error("no socket here"); }, close: async () => {} };
+  const r1 = new FakeRunner();
+  const l1 = loop({ runner: r1, policy, childTools: failing });
+  l1.bus.deliver(ask(80));
+  await until(() => l1.bus.replies(80).length === 2, 5_000, "the failure");
+  expect(l1.bus.replies(80)[1]).toBe("[factory] failed: couldn't open the bus tools for this run: no socket here; nothing was spawned.");
+  expect(r1.runs).toEqual([]);
+  await l1.bus.close();
+  await l1.done;
+
+  let release!: () => void, revoked = 0, asked = false;
+  const slow: ChildTools = {
+    grant: async () => {
+      asked = true;
+      await new Promise<void>((ok) => (release = ok));
+      return { server: { name: "bus", command: "x", args: [], env: {}, tools: RELAY_TOOLS }, revoke: () => { revoked++; } };
+    },
+    close: async () => {},
+  };
+  const r2 = new FakeRunner();
+  const l2 = loop({ runner: r2, policy, childTools: slow });
+  l2.bus.deliver(ask(81));
+  await until(() => asked, 5_000, "the grant asked for");
+  l2.bus.deliver(reply(82, l2.bus.replyId(81), "cancel"));
+  l2.bus.deliver(reply(83, l2.bus.replyId(81), "status")); // answered after the cancel is taken
+  await until(() => l2.bus.replies(83).length === 1, 5_000, "the cancel taken");
+  release();
+  await until(() => l2.bus.replies(81).length === 2, 5_000, "the outcome");
+  expect(l2.bus.replies(81)[1]).toBe("[factory] cancelled: by sim before it ran.");
+  expect(r2.runs).toEqual([]);
+  expect(revoked).toBe(1);
+  await l2.bus.close();
+  await l2.done;
+}, 20_000);

@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { LocalBus, sessionFree, startReader } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
 import { ASK_DEFAULTS, Factory, type AskPolicy, type Fleet, type Limits, type Route } from "./factory.ts";
-import { Relay } from "./relay.ts";
+import { Relay, shimCommand } from "./relay.ts";
 import type { Policy } from "./runner.ts";
 import { Store } from "./store.ts";
 import { WORKDIR_MODES, Workspaces, type Workdir, type WorkdirMode } from "./workdir.ts";
@@ -283,7 +283,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   // The bus tools' relay (#669): opens its socket and reader on the first run that has them.
   const childTools = new Relay({
     dir: join(dataDir, "relay"),
-    shim: [process.execPath, join(import.meta.dir, "relay_shim.ts")],
+    shim: shimCommand(join(dataDir, "relay"), join(import.meta.dir, "relay_shim.ts")),
     reader: () => startReader({ command: cfg.grayboard, parentSession: harnessSession, identity: bus.handle, version: VERSION, env: sessionFree(env) }),
     log,
   });
