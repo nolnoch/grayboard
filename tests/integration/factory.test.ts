@@ -742,13 +742,13 @@ test("fan-out: a plan opens a task board, runs each subtask once with its outcom
   await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, done");
   const [taken, fanned, out] = bus.replies(7);
   expect(taken).toStartWith("[factory] taken:");
-  expect(fanned).toBe("[factory] fanned out: 2 subtasks on #task-7, each run as `researcher` with its outcome in its thread. The combined result follows in this thread.");
-  expect(out).toBe("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-7\n\nresult for 7");
-  const created = bus.sent.find((c) => c.tool === "board_create" && c.args.name === "task-7")!;
+  expect(fanned).toBe("[factory] fanned out: 2 subtasks on #sim-work (posts 1001, 1002), each run as `researcher` with its outcome in its thread. The combined result follows in this thread.");
+  expect(out).toBe("[factory] done: fake agent `researcher`, combining 2 subtasks on #sim-work\n\nresult for 7");
+  const created = bus.sent.find((c) => c.tool === "board_create" && c.args.name === "sim-work")!;
   expect(created.args.kind).toBeUndefined(); // broadcast: a record, not a queue
-  expect(bus.sent.find((c) => c.tool === "board_subscribe" && c.args.board === "task-7")!.args.mode).toBe("off");
-  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "task-7" && c.args.parent_id === undefined).map((c) => c.args.body);
-  expect(subPosts).toEqual(["[factory] subtask 1/2: part 1\n\ndo part 1", "[factory] subtask 2/2: part 2\n\ndo part 2"]);
+  expect(bus.sent.find((c) => c.tool === "board_subscribe" && c.args.board === "sim-work")!.args.mode).toBe("off");
+  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "sim-work" && c.args.parent_id === undefined).map((c) => c.args.body);
+  expect(subPosts).toEqual(["[factory] subtask 1/2 for fe's post 7 on #sim-tasks: part 1\n\ndo part 1", "[factory] subtask 2/2 for fe's post 7 on #sim-tasks: part 2\n\ndo part 2"]);
   const [, s1, s2] = runner.runs.map((r) => r.id); // the subtasks' post ids (the fake bus numbers every post)
   expect(bus.replies(s1!)).toEqual([`[factory] done: fake agent \`researcher\`\n\nresult for ${s1}`]);
   expect(bus.replies(s2)).toEqual([`[factory] done: fake agent \`researcher\`\n\nresult for ${s2}`]);
@@ -773,12 +773,77 @@ test("fan-out: an unusable plan fails the task; a fleet with fanout off never ge
   expect(bus.replies(7)[1]).toBe("[factory] failed: fake agent `researcher` returned a plan the factory can't use: the plan has 9 subtasks; it needs 2 to 5. Nothing was fanned out.");
   expect(bus.replies(8)[1]).toStartWith("[factory] done: fake agent `researcher`\n\n````factory-plan"); // just text, without fan-out
   expect(runner.inputs[1]).toBe("do 8");
-  expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).startsWith("task-"))).toBe(false);
+  expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).endsWith("-work"))).toBe(false);
   await bus.close();
   await done;
 });
 
-test("local bus: a fan-out's subtasks and outcomes are posts on a task board other sessions can read", async () => {
+test("work board (#665): two trees on one fleet share #sim-work, opened and muted once, and each combines only its own subtasks", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => ((r.id === 7 || r.id === 8) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const { bus, done } = loop({ runner, maxConcurrent: 2, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  bus.deliver(task(8));
+  await until(() => bus.replies(7).length === 3 && bus.replies(8).length === 3, 5000, "both trees combined");
+  expect(bus.sent.filter((c) => c.tool === "board_create" && c.args.name === "sim-work")).toHaveLength(1);
+  expect(bus.sent.filter((c) => c.tool === "board_subscribe" && c.args.board === "sim-work")).toHaveLength(1);
+  const own = (id: number) => (/\(posts (\d+), (\d+)\)/.exec(bus.replies(id)[1]!) ?? []).slice(1).map(Number);
+  const [a7, b7] = own(7), [a8, b8] = own(8);
+  expect([a7, b7, a8, b8].every((n) => Number.isInteger(n))).toBe(true);
+  for (const [id, mine, theirs] of [[7, [a7, b7], [a8, b8]], [8, [a8, b8], [a7, b7]]] as const) {
+    const synth = runner.inputs.findLast((_, i) => runner.runs[i]!.id === id)!;
+    for (const s of mine) expect(synth).toContain(`result for ${s}`);
+    for (const s of theirs) expect(synth).not.toContain(`result for ${s}`);
+    expect(bus.replies(id)[2]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #sim-work");
+  }
+  await bus.close();
+  await done;
+});
+
+test("work board (#665): a queue board of that name at sync turns the fleet's fan-out off; one made later refuses the plan; a broadcast one is used as is", async () => {
+  const bus = new FakeBus();
+  // A muted subscription lists with no mode (the core deletes it).
+  bus.boards = [{ name: "be-work", kind: "queue", mode: null }, { name: "lab-work", kind: "broadcast", mode: null }];
+  const runner = new FakeRunner();
+  runner.script = (r) => ([6, 7, 8].includes(r.id) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const { done, logs } = loop({ bus, runner, fleets: [{ name: "be", agent: "researcher" }, { name: "sim", agent: "researcher" }, { name: "lab", agent: "researcher" }] });
+  await until(() => bus.sent.some((c) => c.tool === "board_create" && c.args.name === "lab-tasks"), 5000, "the sync");
+  expect(logs).toContain("fleet be: #be-work is a queue board, so its tasks don't fan out; rename the fleet to give it a work board");
+  bus.boards = [...bus.boards, { name: "sim-work", kind: "queue", mode: null }]; // made after the sync saw none
+  bus.deliver(task(6, { board: "be-tasks" }));
+  await until(() => bus.replies(6).length === 2, 5000, "be's task, run whole");
+  expect(runner.inputs[0]).toBe("do 6"); // no fan-out instruction
+  expect(bus.replies(6)[1]).toStartWith("[factory] done: fake agent `researcher`\n\n````factory-plan");
+  bus.deliver(task(7));
+  bus.deliver(task(8, { board: "lab-tasks" }));
+  await until(() => bus.replies(7).length === 2 && bus.replies(8).length === 3, 5000, "the refusal and the lab tree");
+  expect(bus.replies(7)[1]).toBe("[factory] failed: #sim-work, where sim's subtasks would go, is a queue board, which would hand them to other lanes; the sim fleet doesn't fan out while it is. Nothing was fanned out.");
+  expect(bus.sent.some((c) => c.tool === "board_post" && (c.args.board === "sim-work" || c.args.board === "be-work"))).toBe(false);
+  expect(bus.replies(8)[1]).toStartWith("[factory] fanned out: 2 subtasks on #lab-work (posts ");
+  expect(bus.sent.some((c) => (c.tool === "board_create" || c.tool === "board_subscribe") && String(c.args.name ?? c.args.board).endsWith("-work"))).toBe(false);
+  await bus.close();
+  await done;
+});
+
+test("work board (#665): a failed mute is tried again on the next fan-out, which still posts", async () => {
+  const bus = new FakeBus();
+  let mutes = 0;
+  bus.refuse = (tool, args) => tool === "board_subscribe" && args.board === "sim-work" && ++mutes === 1;
+  const runner = new FakeRunner();
+  runner.script = (r) => ((r.id === 7 || r.id === 8) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const { done, logs } = loop({ bus, runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "the first tree");
+  bus.deliver(task(8));
+  await until(() => bus.replies(8).length === 3, 5000, "the second tree");
+  expect(logs.filter((l) => l.startsWith("couldn't mute #sim-work"))).toHaveLength(1);
+  expect(mutes).toBe(2);
+  expect(bus.replies(7)[1]).toStartWith("[factory] fanned out: 2 subtasks on #sim-work (posts ");
+  await bus.close();
+  await done;
+});
+
+test("local bus: a fan-out's subtasks and outcomes are posts on the fleet's work board other sessions can read", async () => {
   const fe = await localSession(dir, "fe");
   const bus = await LocalBus.start({ command: [process.execPath, CLI], identity: "factory", version: "test", env: localEnv(dir), cwd: dir });
   const runner = new FakeRunner();
@@ -789,11 +854,12 @@ test("local bus: a fan-out's subtasks and outcomes are posts on a task board oth
   runner.script = (r) => (r.id === p.post_id && !r.task.includes("## Subtask results") ? PLAN(3) : undefined);
   const thread = () => fe.pushes.filter((x) => x.meta.parent_id === String(p.post_id)).map((x) => x.content);
   await until(() => thread().length === 3, 15_000, "taken, fanned out and done in fe's thread");
-  expect(thread()[1]).toContain(`3 subtasks on #task-${p.post_id}`);
-  expect(thread()[2]).toStartWith(`[factory] done: fake agent \`researcher\`, combining 3 subtasks on #task-${p.post_id}`);
-  const posts = (await call(fe.c, "board_read", { board: `task-${p.post_id}` })) as { posts?: { body: string; parent_id: number | null }[] } | { body: string; parent_id: number | null }[];
+  expect(thread()[1]).toMatch(/^\[factory\] fanned out: 3 subtasks on #sim-work \(posts \d+, \d+, \d+\),/);
+  expect(thread()[2]).toStartWith(`[factory] done: fake agent \`researcher\`, combining 3 subtasks on #sim-work`);
+  const posts = (await call(fe.c, "board_read", { board: "sim-work" })) as { posts?: { body: string; parent_id: number | null }[] } | { body: string; parent_id: number | null }[];
   const list = Array.isArray(posts) ? posts : posts.posts ?? [];
-  expect(list.filter((x) => x.parent_id === null).map((x) => x.body.split("\n")[0])).toEqual(["[factory] subtask 1/3: part 1", "[factory] subtask 2/3: part 2", "[factory] subtask 3/3: part 3"]);
+  const of = `for fe's post ${p.post_id} on #sim-tasks`;
+  expect(list.filter((x) => x.parent_id === null).map((x) => x.body.split("\n")[0])).toEqual([`[factory] subtask 1/3 ${of}: part 1`, `[factory] subtask 2/3 ${of}: part 2`, `[factory] subtask 3/3 ${of}: part 3`]);
   expect(list.filter((x) => x.parent_id !== null && x.body.startsWith("[factory] done:"))).toHaveLength(3);
   expect(runner.runs).toHaveLength(5);
   await bus.close();
@@ -963,8 +1029,8 @@ test("projects: the lead's triage lists the profiles; a routed subtask runs as i
   expect(runner.inputs[0]).toContain('"profile" picks who runs a subtask; without it, `lead` does.');
   expect(runner.inputs[0]).toContain("`code` (agent coder; tools: Bash, Read)");
   expect(bus.replies(7)[1]).toContain("each run as its profile's agent");
-  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "task-7" && c.args.parent_id === undefined).map((c) => c.args.body);
-  expect(subPosts).toEqual(["[factory] subtask 1/2 (code): a\n\ndo a", "[factory] subtask 2/2: b\n\ndo b"]);
+  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "sim-work" && c.args.parent_id === undefined).map((c) => c.args.body);
+  expect(subPosts).toEqual(["[factory] subtask 1/2 (code) for fe's post 7 on #sim-tasks: a\n\ndo a", "[factory] subtask 2/2 for fe's post 7 on #sim-tasks: b\n\ndo b"]);
   const byTask = new Map(runner.inputs.map((t, i) => [t, { agent: runner.runs[i]!.agent, policy: runner.policies[i] }]));
   expect(byTask.get("do a")).toEqual({ agent: "coder", policy: CODE });
   expect(byTask.get("do b")).toEqual({ agent: "researcher", policy: LEAD });
@@ -983,7 +1049,7 @@ test("projects: a plan naming a profile outside the project fails with nothing p
   bus.deliver(task(7));
   await until(() => bus.replies(7).length === 2, 5000, "the failure");
   expect(bus.replies(7)[1]).toBe('[factory] failed: subtask 1 names profile "ops", which isn\'t one of sim\'s (lead, code). Nothing was fanned out.');
-  expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).startsWith("task-"))).toBe(false);
+  expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).endsWith("-work"))).toBe(false);
   bus.deliver(task(8, { board: "solo-tasks" }));
   await until(() => bus.replies(8).length === 2, 5000, "solo task");
   expect(runner.inputs[1]).toContain("## Before you start");
@@ -1112,14 +1178,14 @@ test("commands: cancelling a fan-out stops its running subtask, finishes the que
   bus.deliver(task(70, { parentId: fanned, from: "be" }));                   // chatter, not a command
   bus.deliver({ ...task(71, { parentId: fanned, from: "be" }), body: "status" });
   bus.deliver({ ...task(72, { parentId: 7, from: "fe" }), body: "retry" });
-  bus.deliver({ ...task(73, { board: "task-7", parentId: s1!, from: "fe" }), body: "cancel" }); // a subtask's thread takes none
+  bus.deliver({ ...task(73, { board: "sim-work", parentId: s1!, from: "fe" }), body: "cancel" }); // a subtask's thread takes none
   await until(() => bus.replies(71).length === 1 && bus.replies(72).length === 1, 5000, "answers");
-  expect(bus.replies(71)[0]).toBe("[factory] status: fanned out on #task-7: 0 of 2 subtasks finished. 1 run finished so far: 0 turns, $0.0000.");
+  expect(bus.replies(71)[0]).toBe("[factory] status: fanned out on #sim-work: 0 of 2 subtasks finished. 1 run finished so far: 0 turns, $0.0000.");
   expect(bus.replies(72)[0]).toBe("[factory] retry: this is still running its subtasks; reply `cancel` first.");
   expect(bus.sent.find((s) => s.args.parent_id === 71)!.args).toMatchObject({ board: "sim-tasks" });
   bus.deliver({ ...task(74, { parentId: fanned, from: "fe" }), body: "cancel" });
   await until(() => bus.replies(7).length === 3 && bus.replies(s1!).length === 1 && bus.replies(s2!).length === 1, 5000, "all cancelled");
-  expect(bus.replies(7)[2]).toBe("[factory] cancelled: by fe after it fanned out on #task-7; its subtasks stop and nothing is combined.");
+  expect(bus.replies(7)[2]).toBe("[factory] cancelled: by fe after it fanned out on #sim-work; its subtasks stop and nothing is combined.");
   expect(bus.replies(s1!)).toEqual(["[factory] cancelled: by fe while fake agent `researcher` ran."]);
   expect(bus.replies(s2!)).toEqual(["[factory] cancelled: by fe with the task it belongs to, before it ran."]);
   expect(bus.replies(70)).toEqual([]);
@@ -1255,20 +1321,20 @@ test("ask: a subtask's question goes in its request's thread and parks only it; 
   const { bus, store, done } = loop({ runner, fleets: [{ name: "sim", agent: "researcher" }] });
   bus.deliver(task(9));
   await until(() => bus.replies(9).length === 3, 5000, "ack, fan-out, question");
-  expect(bus.replies(9)[2]).toBe("[factory] question for subtask \"part 1\" on #task-9 from fake agent `researcher`:\n\nwhich part?\n\nReply to this message with the answer; the run waits for it.");
+  expect(bus.replies(9)[2]).toBe("[factory] question for subtask \"part 1\" on #sim-work from fake agent `researcher`:\n\nwhich part?\n\nReply to this message with the answer; the run waits for it.");
   const root = store.get({ source: "board", id: 9 })!;
   const [s1] = store.subtasks(root.seq);
   expect(s1!.state).toBe("asking");
   expect(root.state).toBe("waiting");
   bus.deliver({ ...task(90, { parentId: 9, from: "be" }), body: "status" });
   await until(() => bus.replies(90).length === 1, 5000, "status");
-  expect(bus.replies(90)[0]).toStartWith("[factory] status: fanned out on #task-9: 1 of 2 subtasks finished, 1 asking.");
+  expect(bus.replies(90)[0]).toStartWith("[factory] status: fanned out on #sim-work: 1 of 2 subtasks finished, 1 asking.");
   bus.deliver({ ...task(91, { parentId: 9, from: "be" }), body: "the first" });   // not the requester (fe)
   bus.deliver({ ...task(92, { parentId: bus.replyId(9, 2), from: "fe" }), body: "the first" });
   await until(() => bus.replies(9).length === 4, 5000, "answered and synthesized");
-  expect(bus.replies(92)).toEqual(["[factory] answered for subtask \"part 1\" on #task-9: the run resumes with it."]);
+  expect(bus.replies(92)).toEqual(["[factory] answered for subtask \"part 1\" on #sim-work: the run resumes with it."]);
   expect(bus.replies(91)).toEqual([]);
-  expect(bus.replies(9)[3]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-9");
+  expect(bus.replies(9)[3]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #sim-work");
   expect(bus.replies(s1!.id)).toEqual(["[factory] done: fake agent `researcher`\n\nresult for " + s1!.id]);
   expect(runner.resumes.filter(Boolean)).toEqual([{ session: `s-${s1!.id}`, input: "The answer to your question, from fe:\n\nthe first\n\nContinue the task.", priorUsd: 0 }]);
   await bus.close();
@@ -1398,8 +1464,8 @@ test("ask: with no human on the bus, a subtask's unanswered question is only log
   const { bus, store, logs, done } = loop({ runner, fleets: [{ name: "sim", agent: "researcher" }], ask: { max: 3, escalateMs: 20, giveUpMs: 60 }, askTickMs: 10 });
   bus.deliver(task(308));
   await until(() => bus.replies(308).length === 5, 5000, "question, no answer, synthesis");
-  expect(bus.replies(308)[3]).toBe("[factory] no answer for subtask \"part 1\" on #task-308: the run carries on with its own judgement.");
-  expect(bus.replies(308)[4]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-308");
+  expect(bus.replies(308)[3]).toBe("[factory] no answer for subtask \"part 1\" on #sim-work: the run carries on with its own judgement.");
+  expect(bus.replies(308)[4]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #sim-work");
   expect(logs.some((l) => l.includes("no human handle to send its question to"))).toBe(true);
   expect(bus.sent.filter((s) => s.tool === "dm_send")).toEqual([]);
   const [s1] = store.subtasks(store.get({ source: "board", id: 308 })!.seq);
@@ -1503,7 +1569,7 @@ test("limits: a spent tree budget stops the tree; the request's thread names the
   bus.deliver(task(7));
   await until(() => store.get({ source: "board", id: 7 })?.state === "finished" && bus.replies(7).length === 3, 5000, "stopped");
   expect(runner.runs.map((r) => r.id)).toEqual([7]); // the triage spent it all: no subtask ran
-  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $0.5 is spent after it fanned out on #task-7; nothing more runs and nothing is combined; each finished subtask's outcome is on #task-7.");
+  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $0.5 is spent after it fanned out on #sim-work; nothing more runs and nothing is combined; each finished subtask's outcome is on #sim-work.");
   const subs = store.subtasks(store.get({ source: "board", id: 7 })!.seq);
   expect(subs.map((s) => s.state)).toEqual(["finished", "finished"]);
   for (const s of subs) expect(bus.replies(s.id)[0]).toStartWith("[factory] stopped:");
@@ -1620,7 +1686,7 @@ test("limits: a tree spent by the time it would synthesize stops there, pointing
   const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { treeBudgetUsd: 1 } }] });
   bus.deliver(task(7));
   await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, stopped");
-  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $1 is spent ($1.00 used); nothing is combined, and each subtask's outcome is on #task-7");
+  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task's budget of $1 is spent ($1.00 used); nothing is combined, and each subtask's outcome is on #sim-work");
   expect(runner.runs).toHaveLength(3); // triage and two subtasks; no synthesis
   await bus.close();
   await done;
@@ -1677,13 +1743,13 @@ test("rounds: with maxRounds 2 the review plans a second round on the same board
   bus.deliver(task(7));
   await until(() => bus.replies(7).length === 4, 5000, "taken, two fan-outs, done");
   const [, f1, f2, out] = bus.replies(7);
-  expect(f1).toStartWith("[factory] fanned out: 2 subtasks on #task-7,");
-  expect(f2).toStartWith("[factory] fanned out, round 2: 2 subtasks on #task-7,");
-  expect(out).toBe("[factory] done: fake agent `researcher`, combining 4 subtasks over 2 rounds on #task-7\n\nfinal answer");
-  expect(bus.sent.filter((c) => c.tool === "board_create" && String(c.args.name).startsWith("task-"))).toHaveLength(1);
-  expect(bus.sent.filter((c) => c.tool === "board_subscribe" && c.args.board === "task-7")).toHaveLength(1);
-  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "task-7" && c.args.parent_id === undefined).map((c) => String(c.args.body).split("\n")[0]);
-  expect(subPosts).toEqual(["[factory] subtask 1/2: part 1", "[factory] subtask 2/2: part 2", "[factory] subtask 2.1/2: part 1", "[factory] subtask 2.2/2: part 2"]);
+  expect(f1).toStartWith("[factory] fanned out: 2 subtasks on #sim-work (posts ");
+  expect(f2).toStartWith("[factory] fanned out, round 2: 2 subtasks on #sim-work (posts ");
+  expect(out).toBe("[factory] done: fake agent `researcher`, combining 4 subtasks over 2 rounds on #sim-work\n\nfinal answer");
+  expect(bus.sent.filter((c) => c.tool === "board_create" && String(c.args.name).endsWith("-work"))).toHaveLength(1);
+  expect(bus.sent.filter((c) => c.tool === "board_subscribe" && c.args.board === "sim-work")).toHaveLength(1);
+  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "sim-work" && c.args.parent_id === undefined).map((c) => String(c.args.body).split("\n")[0]);
+  expect(subPosts).toEqual(["[factory] subtask 1/2 for fe's post 7 on #sim-tasks: part 1", "[factory] subtask 2/2 for fe's post 7 on #sim-tasks: part 2", "[factory] subtask 2.1/2 for fe's post 7 on #sim-tasks: part 1", "[factory] subtask 2.2/2 for fe's post 7 on #sim-tasks: part 2"]);
   const ids = runner.runs.map((r) => r.id);
   expect(ids).toHaveLength(7);
   const [, s1, , , s3] = ids;
@@ -1720,7 +1786,7 @@ test("rounds: a review past its rounds only combines: a plan it returns is its a
     await until(() => bus.replies(7).length === 2 + n, 5000, "taken, fan-outs, done");
     expect(runner.runs).toHaveLength(1 + 3 * n);
     const out = bus.replies(7).at(-1)!;
-    expect(out).toStartWith(`[factory] done: fake agent \`researcher\`, combining ${2 * n} subtasks${n > 1 ? " over 2 rounds" : ""} on #task-7\n\n\`\`\`\`factory-plan`);
+    expect(out).toStartWith(`[factory] done: fake agent \`researcher\`, combining ${2 * n} subtasks${n > 1 ? " over 2 rounds" : ""} on #sim-work\n\n\`\`\`\`factory-plan`);
     // At maxRounds 1, nothing about rounds or notes reaches the lead: today's prompts.
     if (n === 1) {
       expect(runner.inputs[0]).not.toContain("## Notes for your next review");
@@ -1755,7 +1821,7 @@ test("rounds: a review without a quarter of a grant left, or two timeouts before
     const { bus, done } = loop({ runner, maxConcurrent: 1, timeoutMs: 60_000, fleets: [{ name: "sim", agent: "researcher", limits }] });
     bus.deliver(task(7));
     await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, done");
-    expect(bus.replies(7)[2]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-7");
+    expect(bus.replies(7)[2]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #sim-work");
     expect(runner.inputs[3]).not.toContain("reply instead with only a plan");
     if (limits.treeBudgetUsd) expect(runner.policies[3]!.budgetUsd).toBeCloseTo(0.025, 9); // one stage: all that's left
     await bus.close();
