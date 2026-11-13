@@ -36480,6 +36480,7 @@ class Controller {
   place;
   wait;
   configured;
+  skipped = new Set;
   constructor(port, options = {}) {
     this.port = port;
     this.Transport = options.Transport ?? Wire;
@@ -36590,8 +36591,20 @@ class Controller {
     if (!this.port.approval)
       return;
     await this.activeRoot(r.e.sessionID);
-    await this.port.approval.save(r.e, r.approval, enabled, [...new Set([...this.roots.keys(), r.e.sessionID])]);
+    await this.port.approval.save(r.e, r.approval, enabled);
     await this.port.storage.set(`paused:${r.e.sessionID}`, !enabled);
+    this.skipped.delete(r.e.sessionID);
+    await this.prune();
+  }
+  async prune() {
+    for (const id of this.skipped) {
+      this.skipped.delete(id);
+      try {
+        await this.activeRoot(id);
+        continue;
+      } catch {}
+      await this.port.approval.drop(id).catch((error) => this.failure("restore", error));
+    }
   }
   async guard(r, epoch, signal) {
     const e = r.e, key = this.key(e);
@@ -37098,6 +37111,7 @@ class Controller {
         try {
           await this.activeRoot(id);
         } catch {
+          this.skipped.add(id);
           continue;
         }
         if (!saved.approval)

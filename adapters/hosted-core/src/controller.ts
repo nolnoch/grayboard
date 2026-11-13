@@ -86,6 +86,10 @@ export class Controller<E extends Enrollment = Enrollment> {
   private readonly place: string;
   private readonly wait: Wait;
   private readonly configured?: { name: string; create: boolean };
+  // Saved roots restore skipped because their session had ended: the next
+  // save drops their records (`prune`). An edited record stays, and every
+  // restore reports it, since it may be another location's (#660).
+  private readonly skipped = new Set<string>();
   constructor(readonly port: HostPort<E>, options: ControllerOptions = {}) {
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep;
@@ -181,8 +185,20 @@ export class Controller<E extends Enrollment = Enrollment> {
   private async save(r: Root<E>, enabled: boolean) {
     if (!this.port.approval) return;
     await this.activeRoot(r.e.sessionID);
-    await this.port.approval.save(r.e, r.approval, enabled, [...new Set([...this.roots.keys(), r.e.sessionID])]);
+    await this.port.approval.save(r.e, r.approval, enabled);
     await this.port.storage.set(`paused:${r.e.sessionID}`, !enabled);
+    this.skipped.delete(r.e.sessionID);
+    await this.prune();
+  }
+  // Drops the saved records of roots restore skipped as ended, each only while
+  // its session still doesn't resolve: another location may enroll it again
+  // after this one's restore (#660). A failed drop never fails the save.
+  private async prune() {
+    for (const id of this.skipped) {
+      this.skipped.delete(id);
+      try { await this.activeRoot(id); continue; } catch {}
+      await this.port.approval!.drop(id).catch(error => this.failure("restore", error));
+    }
   }
   private async guard(r: Root<E>, epoch: number, signal: AbortSignal) {
     const e = r.e, key = this.key(e);
@@ -604,7 +620,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       if (this.stopped) continue;
       try {
         try { await this.activeRoot(id); }
-        catch { continue; }
+        catch { this.skipped.add(id); continue; }
         if (!saved.approval) throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`);
         const e = saved.approval;
         const previous = this.status().roots.find(record => record.sessionID === id);

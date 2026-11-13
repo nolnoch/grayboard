@@ -110,6 +110,7 @@ function runtime(mode: Mode) {
     save: async (e, saved, enabled) => { approvals.set(e.sessionID, { approval: structuredClone(saved), enabled }); },
     approved: async (e, saved) => { const s = approvals.get(e.sessionID); return !!s?.enabled && same(s.approval, saved); },
     saved: async () => [...approvals].map(([sessionID, s]) => ({ sessionID, approval: structuredClone(s.approval), enabled: s.enabled })),
+    drop: async sessionID => { approvals.delete(sessionID); },
   } : null;
   const port: HostPort<Enrollment> = {
     harness: "pi", resumeHint: "run /grayboard resume", loginAction: "run /grayboard login", sessionKey: SESSION_KEY,
