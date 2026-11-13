@@ -36,6 +36,9 @@ export type LocalBusOptions = {
   env?: Record<string, string>;  // the child's base env (default: this process's)
   cwd?: string;
   version: string;               // reported as the MCP client's version
+  // BUS_HARNESS_SESSION: the id a reader child (#669) names as its
+  // BUS_PARENT_SESSION to act under this session. A fresh one per start.
+  harnessSession?: string;
 };
 
 export function toDelivery(params: unknown): Delivery | null {
@@ -86,7 +89,7 @@ export class LocalBus implements FactoryBus {
     if (!command) throw new Error("no grayboard command");
     // Push on (the module is the delivery owner, boards.md §9) and launcher:
     // delegation auto-pick finds it like any launcher session (§13).
-    const env = { ...sessionFree(o.env ?? process.env), BUS_IDENTITY: o.identity, BUS_LAUNCHER: "1" };
+    const env = { ...sessionFree(o.env ?? process.env), BUS_IDENTITY: o.identity, BUS_LAUNCHER: "1", ...(o.harnessSession ? { BUS_HARNESS_SESSION: o.harnessSession } : {}) };
     const transport = new StdioClientTransport({ command, args: [...prefix, "mcp", "--mode", "local"], env, ...(o.cwd ? { cwd: o.cwd } : {}), stderr: "inherit" });
     const client = new Client({ name: "grayboard-factory", version: o.version }, { capabilities: {} });
     const early: Delivery[] = [];
@@ -151,6 +154,36 @@ export class LocalBus implements FactoryBus {
 // The human handles from the session's instructions (src/core/tools.ts
 // humanInstruction): `Humans on this bus: "a", "b".`; none when the bus has
 // no declared human.
+// A reader for the relay (#669): a second `grayboard mcp`, started as a
+// subagent of the factory's session (BUS_PARENT_SESSION, #523 step 5). It
+// acts under the factory's addresses, so it sees the boards the factory
+// sees, but owns no delivery, and its board_read peeks: the factory's
+// cursors and pending pushes stay as they were. The factory's process is
+// both sessions' parent, which is the ancestry the bus checks.
+export async function startReader(o: { command: string[]; parentSession: string; identity: string; env?: Record<string, string>; version: string }): Promise<{ call(tool: string, args?: Record<string, unknown>): Promise<unknown>; close(): Promise<void>; readonly closed: Promise<void> }> {
+  const [command, ...prefix] = o.command;
+  if (!command) throw new Error("no grayboard command");
+  const env = { ...sessionFree(o.env ?? process.env), BUS_PARENT_SESSION: o.parentSession };
+  const transport = new StdioClientTransport({ command, args: [...prefix, "mcp", "--mode", "local"], env, stderr: "inherit" });
+  const client = new Client({ name: "grayboard-factory-reader", version: o.version }, { capabilities: {} });
+  let gone!: () => void;
+  const closed = new Promise<void>((ok) => (gone = ok));
+  await client.connect(transport);
+  client.onclose = () => gone();
+  const who = parse(await client.callTool({ name: "whoami", arguments: {} })) as { primary?: unknown; child?: unknown };
+  // Not a child (no live root it could prove), it would be a session of its
+  // own, unbound: its reads would see other boards, and its cursors move.
+  if (who.child !== true || who.primary !== o.identity) {
+    await client.close().catch(() => {});
+    throw new Error(`the bus reader didn't start as a subagent of ${o.identity} (whoami: ${JSON.stringify(who)}); is the grayboard command a wrapper that doesn't exec?`);
+  }
+  return {
+    call: async (tool, args = {}) => parse(await client.callTool({ name: tool, arguments: args })),
+    close: () => client.close().catch(() => {}),
+    closed,
+  };
+}
+
 export function humansOf(instructions: string | undefined): string[] {
   const m = /Humans on this bus: ((?:"[^"]+"(?:, )?)+)\./.exec(instructions ?? "");
   return m ? [...m[1]!.matchAll(/"([^"]+)"/g)].map((x) => x[1]!) : [];

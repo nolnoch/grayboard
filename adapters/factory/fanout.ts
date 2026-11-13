@@ -174,7 +174,7 @@ export function splitNotes(reply: string): { text: string; notes: string | null 
 }
 
 // Fenced with more backticks than any run inside, so the text can't close it.
-function fenced(text: string): string {
+export function fenced(text: string): string {
   const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((m) => m.length));
   const f = "`".repeat(Math.max(4, longest + 1));
   return `${f}text\n${text}\n${f}`;

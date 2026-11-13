@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Request } from "./delegate.ts";
+import type { McpServer } from "./relay.ts";
 import type { Place } from "./workdir.ts";
 
 // `prompt` is the file's body; `tools` and `model` are its frontmatter fields
@@ -19,8 +20,9 @@ export type Outcome = ({ ok: true; text: string } | { ok: false; error: string }
 // What a child may do (#643): the tools it has (absent, the harness's
 // restricted default) and those that run without a prompt; `budgetUsd`, the
 // most one run may spend (#649; absent, no cap). From the run's profile,
-// else the config's global ones; never from the request.
-export type Policy = { tools?: string[]; allowedTools: string[]; budgetUsd?: number };
+// else the config's global ones; never from the request. `busTools` (#669):
+// the run gets the factory's read-only bus tools (relay.ts).
+export type Policy = { tools?: string[]; allowedTools: string[]; budgetUsd?: number; busTools?: boolean };
 // `priorUsd`: what the session's earlier runs cost. Claude Code's
 // `total_cost_usd` is the session's running total across `--resume`, while
 // its budget and turn count are per invocation, so a runner subtracts it.
@@ -36,8 +38,10 @@ export interface Runner {
   // ends or `signal` aborts (a timeout). The child's event stream goes to
   // the file `transcript` (#649), which the runner creates 0600. `resume`
   // (#652) continues the conversation `session` with `input` as the next
-  // prompt instead of the request's; its transcript is its own file.
-  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string, resume?: Resume): Promise<Outcome>;
+  // prompt instead of the request's; its transcript is its own file. `mcp`
+  // (#669): an MCP server the run attaches, its tools allowed unprompted;
+  // absent, the run has no MCP server at all.
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string, resume?: Resume, mcp?: McpServer): Promise<Outcome>;
 }
 
 // Agent files: markdown with `name:` (and optionally `description:`) in YAML
