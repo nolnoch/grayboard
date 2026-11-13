@@ -10,7 +10,7 @@ import { oneLine, requestOf, type Key, type Request } from "./delegate.ts";
 import { answerPrompt, askInstruction, NO_ANSWER, NO_MORE, parseAsk, reseeded, type Ask } from "./ask.ts";
 import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner } from "./runner.ts";
-import type { Admit, Row, RunOutcome, Store } from "./store.ts";
+import type { Admit, Hold, Row, RunOutcome, Store } from "./store.ts";
 import type { Place, Workdir, Workspaces } from "./workdir.ts";
 
 // A fleet (docs/factory.md §7): a queue board `<name>-tasks` the factory is
@@ -20,7 +20,17 @@ import type { Place, Workdir, Workspaces } from "./workdir.ts";
 // `workdir` are its profile's (#643, #641); absent, the factory's global ones.
 // A project (#645) is a fleet whose `routes` are the profiles its plans may
 // name, the lead's first; a fleet with a profile routes to that one alone.
-export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy; workdir?: Workdir; routes?: Route[] };
+export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy; workdir?: Workdir; routes?: Route[]; limits?: Limits };
+// Spend and time limits (#655), config only. treeBudgetUsd: the most one
+// request's tree (its runs, its subtasks', its synthesis) may spend.
+// dailyBudgetUsd: the most spent in any 24 h, the global one across the
+// whole factory, a fleet's across its own. deadlineMs: how long a tree may
+// take from its admission. A fleet's tree budget and deadline replace the
+// global ones; both daily caps apply.
+export type Limits = { treeBudgetUsd?: number; dailyBudgetUsd?: number; deadlineMs?: number };
+// A grant under this is no budget at all.
+export const MIN_GRANT_USD = 0.01;
+const DAY_MS = 86_400_000;
 export type Route = { profile: string; agent: string; policy: Policy; workdir: Workdir };
 export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
 
@@ -32,7 +42,7 @@ export type AskPolicy = { max: number; escalateMs: number; giveUpMs: number; hum
 export const ASK_DEFAULTS: AskPolicy = { max: 3, escalateMs: 3_600_000, giveUpMs: 24 * 3_600_000 };
 
 // What a config reload (#645) replaces; the rest needs a restart.
-export type Reconfig = { fleets: Fleet[]; policy: Policy; workdir: Workdir; ask?: AskPolicy };
+export type Reconfig = { fleets: Fleet[]; policy: Policy; workdir: Workdir; ask?: AskPolicy; limits?: Limits };
 
 export type FactoryOptions = {
   fleets?: Fleet[];
@@ -46,6 +56,7 @@ export type FactoryOptions = {
   retentionMs: number;
   housekeepingMs?: number; // how often unsent replies are retried and the store pruned
   ask?: AskPolicy; // default ASK_DEFAULTS
+  limits?: Limits; // the global limits (#655); default none
   askTickMs?: number; // how often parked questions' clocks are checked (default 30 s)
   log(message: string): void;
 };
@@ -65,14 +76,14 @@ export class Factory {
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
   private readonly active = new Map<number, AbortController>(); // seq → its running child's controller
-  private readonly cancelledBy = new Map<number, string>(); // seq → who cancelled it while it ran (#651)
+  private readonly cancelledBy = new Map<number, Stop>(); // seq → what stopped it while it ran: a cancel (#651), a deadline or a spent tree budget (#655)
   private load = ""; // the peer_status text last set
   private warnedHuman: string | undefined; // a config `human` already logged as undeclared
 
-  private cfg: Reconfig & { ask: AskPolicy };
+  private cfg: Reconfig & { ask: AskPolicy; limits: Limits };
 
   constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {
-    this.cfg = { fleets: o.fleets ?? [], policy: o.policy, workdir: o.workdir, ask: o.ask ?? ASK_DEFAULTS };
+    this.cfg = { fleets: o.fleets ?? [], policy: o.policy, workdir: o.workdir, ask: o.ask ?? ASK_DEFAULTS, limits: o.limits ?? {} };
     // A transcript holds whatever its child read and wrote.
     mkdirSync(o.runs, { recursive: true, mode: 0o700 });
     chmodSync(o.runs, 0o700);
@@ -82,7 +93,7 @@ export class Factory {
   // global lists; a run already started keeps what it started with. A
   // queued task whose fleet is gone fails when it would run (settingsFor).
   async reconfigure(c: Reconfig): Promise<void> {
-    this.cfg = { ...c, ask: c.ask ?? this.cfg.ask };
+    this.cfg = { ...c, ask: c.ask ?? this.cfg.ask, limits: c.limits ?? this.cfg.limits };
     await this.syncFleets();
     this.pump();
   }
@@ -94,6 +105,7 @@ export class Factory {
       this.o.log(`request ${r.id} was ${r.state} when the factory last stopped; reporting it interrupted`);
     }
     await this.syncFleets();
+    await this.deadlines(); // trees that expired while the factory was down
     await this.housekeeping();
     this.timer = setInterval(() => void this.housekeeping().catch((e) => this.o.log(`housekeeping: ${msg(e)}`)), this.o.housekeepingMs ?? 3_600_000);
     // Parked questions' clocks (#652) run from their stored times, so a
@@ -175,7 +187,8 @@ export class Factory {
 
   private async admit(r: Request, agent: Agent, label: string, o: Admit = {}): Promise<void> {
     if (!this.store.admit(r, agent.name, o)) { this.o.log(`${r.source} ${r.id} already taken; redelivery ignored`); return; }
-    const where = this.running < this.o.maxConcurrent ? "starting now" : `queued, ${this.store.queuedAhead(r)} ahead`;
+    const seq = this.store.get(r)!.seq, hold = this.holdNote(seq);
+    const where = hold ? `queued, ${hold}` : this.running < this.o.maxConcurrent ? "starting now" : `queued, ${this.store.queuedAhead(r)} ahead`;
     // §13's launcher contract: say it was taken before the work starts. On a
     // queue board this reply also acks the claim, so the rotation never
     // redelivers a task that's running. Not stored: a lost acknowledgement
@@ -230,7 +243,7 @@ export class Factory {
 
   private pump(): void {
     while (!this.stopping && this.running < this.o.maxConcurrent) {
-      const row = this.store.next();
+      const row = this.store.next(this.hold());
       if (!row) break;
       this.running++;
       const p: Promise<void> = this.exec(row)
@@ -245,7 +258,8 @@ export class Factory {
   private showLoad(): void {
     if (this.stopping) return;
     const { running, queued, asking } = this.store.load();
-    const text = running || queued || asking ? `${running} running, ${queued} queued${asking ? `, ${asking} asking` : ""}` : "idle";
+    const held = queued ? this.store.heldCount(this.hold()) : 0;
+    const text = running || queued || asking ? `${running} running, ${queued} queued${held ? ` (${held} held: daily budget spent)` : ""}${asking ? `, ${asking} asking` : ""}` : "idle";
     if (text === this.load) return;
     this.load = text;
     void this.bus.call("peer_status", { text }).catch((e) => this.o.log(`couldn't set peer_status: ${msg(e)}`));
@@ -294,8 +308,9 @@ export class Factory {
     }
     const out = await this.runAgent(row, input, set, resume);
     const who = set.agent ?? row.agent;
+    if (out === HELD) return null; // queued again: its fleet's day is spent
     const by = this.cancelledBy.get(row.seq);
-    if (by !== undefined && typeof out !== "string") return `[factory] cancelled: by ${by} while ${this.runner.harness} agent \`${who}\` ran.`;
+    if (by !== undefined && typeof out !== "string") return `[factory] ${by.head} while ${this.runner.harness} agent \`${who}\` ran.`;
     let body: string;
     if (typeof out === "string") body = out;
     else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${who}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
@@ -308,7 +323,7 @@ export class Factory {
         if (!why) return null;
         // A cancel that landed while the plan was being posted.
         const late = this.cancelledBy.get(row.seq);
-        body = late !== undefined ? `[factory] cancelled: by ${late} while its plan was being posted on #task-${row.id}; no subtask ran.` : `[factory] failed: ${why}`;
+        body = late !== undefined ? `[factory] ${late.head} while its plan was being posted on #task-${row.id}; no subtask ran.` : `[factory] failed: ${why}`;
       } else if (typeof plan === "string") {
         body = `[factory] failed: ${this.runner.harness} agent \`${who}\` returned a plan the factory can't use: ${plan}. Nothing was fanned out.`;
       } else {
@@ -320,7 +335,8 @@ export class Factory {
     return body;
   }
 
-  // Runs the row's agent on `input`; a string is a failure reply that needed no run.
+  // Runs the row's agent on `input`; a string is a failure reply that needed
+  // no run; HELD, the row went back to the queue (its day is spent).
   private async runAgent(row: Row, input: Request, set: Settings, resume?: Resume): Promise<Outcome | string> {
     const name = set.agent ?? row.agent;
     const agent = this.runner.roster().find((a) => a.name === name);
@@ -333,18 +349,36 @@ export class Factory {
     }
     // A cancel between the slot and the spawn: nothing runs.
     const early = this.cancelledBy.get(row.seq);
-    if (early !== undefined) return `[factory] cancelled: by ${early} before it ran.`;
+    if (early !== undefined) return `[factory] ${early.head} before it ran.`;
+    // The tree's deadline and the money left (#655), decided here in code.
+    const root = this.rootOf(row), lim = this.limitsFor(root);
+    const deadline = lim.deadlineMs !== undefined ? root.created_at + lim.deadlineMs : undefined;
+    if (deadline !== undefined && deadline <= Date.now()) {
+      await this.stopTree(root, this.deadlineStop(lim.deadlineMs!));
+      return `[factory] ${this.cancelledBy.get(row.seq)?.head ?? this.deadlineStop(lim.deadlineMs!).head} before it ran.`;
+    }
+    const g = this.grant(row, root, set, lim);
+    if (g === HELD) { this.store.requeue(row.seq, row.resume); this.o.log(`request ${row.id}: held, the daily budget is spent`); return HELD; }
+    if (typeof g === "string") {
+      await this.stopTree(root, this.budgetStop(lim.treeBudgetUsd!, root));
+      return `[factory] ${g}`;
+    }
+    const policy: Policy = g === undefined ? set.policy : { ...set.policy, budgetUsd: g };
     const ac = new AbortController();
     this.children.add(ac);
     this.active.set(row.seq, ac);
-    const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
-    this.o.log(`request ${row.id}: ${resume ? "resuming" : "running"} ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
-    const run = this.store.startRun(row.seq, agent.name);
+    const byDeadline = deadline !== undefined && deadline - Date.now() < this.o.timeoutMs;
+    const t = setTimeout(() => {
+      if (byDeadline) void this.stopTree(this.store.bySeq(root.seq) ?? root, this.deadlineStop(lim.deadlineMs!)).catch((e) => this.o.log(`request ${root.id}: ${msg(e)}`));
+      ac.abort();
+    }, byDeadline ? Math.max(0, deadline! - Date.now()) : this.o.timeoutMs);
+    this.o.log(`request ${row.id}: ${resume ? "resuming" : "running"} ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}${g !== undefined ? `, granted $${g.toFixed(2)}` : ""}`);
+    const run = this.store.startRun(row.seq, agent.name, g);
     let ended: RunOutcome = "failed";
     let out: Outcome | undefined;
     try {
-      out = await this.runner.run(agent, input, ac.signal, set.policy, place, join(this.o.runs, `${run}.jsonl`), resume);
-      ended = this.cancelledBy.has(row.seq) ? "cancelled" : out.run?.stop ?? (out.ok ? "ok" : ac.signal.aborted ? "timeout" : "failed");
+      out = await this.runner.run(agent, input, ac.signal, policy, place, join(this.o.runs, `${run}.jsonl`), resume);
+      ended = this.cancelledBy.get(row.seq)?.outcome ?? out.run?.stop ?? (out.ok ? "ok" : ac.signal.aborted ? "timeout" : "failed");
       return out;
     } catch (e) {
       return `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
@@ -444,7 +478,7 @@ export class Factory {
   private async ask(row: Row, q: Ask, who: string): Promise<string | null> {
     const root = this.rootOf(row);
     const by = this.cancelledBy.get(row.seq);
-    if (by !== undefined) return `[factory] cancelled: by ${by} while ${this.runner.harness} agent \`${who}\` ran.`;
+    if (by !== undefined) return `[factory] ${by.head} while ${this.runner.harness} agent \`${who}\` ran.`;
     const max = this.cfg.ask.max;
     if (this.store.treeAsks(root.seq) >= max) {
       if (row.answer === NO_MORE) return `[factory] failed: ${this.runner.harness} agent \`${who}\` asked again after the task's ${max} question${max === 1 ? " was" : "s were"} used up. Its question: ${q.question}`;
@@ -532,6 +566,7 @@ export class Factory {
           await this.reply(root, `[factory] no answer${this.subtaskLabel(r)}: the run carries on with its own judgement.`).catch((e) => this.o.log(`couldn't say so in request ${root.id}'s thread: ${msg(e)}`));
         }
       }
+      await this.deadlines();
       this.pump();
     } finally {
       this.ticking = false;
@@ -657,18 +692,104 @@ export class Factory {
   // ones are stopped, and the request finishes without synthesizing.
   private async cancel(row: Row, by: string, answer: (b: string) => Promise<void>): Promise<void> {
     const who = oneLine(by);
-    const res = this.store.cancel(row.seq, (r) =>
-      r.seq !== row.seq ? `[factory] cancelled: by ${who} with the task it belongs to, ${r.state === "asking" ? "while it waited for an answer" : "before it ran"}.`
-        : r.state === "waiting" ? `[factory] cancelled: by ${who} after it fanned out on #${r.fanoutBoard}; its subtasks stop and nothing is combined.`
-          : r.state === "asking" ? `[factory] cancelled: by ${who} while it waited for an answer.`
-            : `[factory] cancelled: by ${who} before it ran.`);
-    if (!res) return answer(`[factory] cancel: this already finished; nothing to cancel. Reply \`retry\` to run it again.`);
+    if (!await this.stopTree(row, { outcome: "cancelled", head: `cancelled: by ${who}`, sub: `cancelled: by ${who} with the task it belongs to`, after: "its subtasks stop and nothing is combined" })) {
+      return answer(`[factory] cancel: this already finished; nothing to cancel. Reply \`retry\` to run it again.`);
+    }
+  }
+
+  // The one stop path (#655) for a cancel, a deadline and a spent tree
+  // budget: queued and asking members finish with the stop's reply, running
+  // ones are killed and end with it, and the request never synthesizes.
+  // False when the request had already finished.
+  private async stopTree(root: Row, s: Stop): Promise<boolean> {
+    const res = this.store.cancel(root.seq, (r) =>
+      r.seq !== root.seq ? `[factory] ${s.sub}, ${r.state === "asking" ? "while it waited for an answer" : "before it ran"}.`
+        : r.state === "waiting" ? `[factory] ${s.head} after it fanned out on #${r.fanoutBoard}; ${s.after}.`
+          : r.state === "asking" ? `[factory] ${s.head} while it waited for an answer.`
+            : `[factory] ${s.head} before it ran.`);
+    if (!res) return false;
+    this.o.log(`request ${root.id}: ${s.head}`);
     for (const r of res.running) {
-      this.cancelledBy.set(r.seq, who);
+      if (!this.cancelledBy.has(r.seq)) this.cancelledBy.set(r.seq, s);
       this.active.get(r.seq)?.abort();
     }
     this.showLoad();
     for (const f of res.finished) await this.send(f);
+    return true;
+  }
+
+  // ── limits (#655) ───────────────────────────────────────────────────────
+  // A root's tree budget and deadline: its fleet's, else the global ones,
+  // from the config as it is now. Daily caps are read in hold() and grant().
+  private limitsFor(root: Row): Limits {
+    const g = this.cfg.limits, f = root.source === "board" ? this.fleets().find((f) => f.name === root.persona)?.limits : undefined;
+    return { treeBudgetUsd: f?.treeBudgetUsd ?? g.treeBudgetUsd, deadlineMs: f?.deadlineMs ?? g.deadlineMs };
+  }
+
+  private fleetOf(root: Row): Fleet | undefined {
+    return root.source === "board" ? this.fleets().find((f) => f.name === root.persona && fleetBoard(f) === root.board) : undefined;
+  }
+
+  // What a spent daily budget holds: everything (the global cap), or the
+  // fleets whose own cap is spent. An open run's grant counts as spent.
+  private hold(): Hold {
+    const since = Date.now() - DAY_MS, g = this.cfg.limits.dailyBudgetUsd;
+    if (g !== undefined && g - this.store.spentSince(since) < MIN_GRANT_USD) return { all: true, boards: [] };
+    const boards = this.fleets().filter((f) => f.limits?.dailyBudgetUsd !== undefined && f.limits.dailyBudgetUsd - this.store.spentSince(since, fleetBoard(f)) < MIN_GRANT_USD).map(fleetBoard);
+    return { all: false, boards };
+  }
+
+  // Why a queued row is held, with about when it frees; null when it isn't.
+  private holdNote(seq: number): string | null {
+    const h = this.hold();
+    if (!this.store.heldCount(h, seq)) return null;
+    const row = this.store.bySeq(seq)!, root = this.rootOf(row), since = Date.now() - DAY_MS;
+    const board = h.all ? undefined : (root.source === "board" ? root.board : undefined);
+    const cap = h.all ? this.cfg.limits.dailyBudgetUsd! : this.fleetOf(root)?.limits?.dailyBudgetUsd;
+    const oldest = this.store.oldestSince(since, board);
+    const when = oldest !== null ? `; it frees in about ${dur(oldest + DAY_MS - Date.now())}` : "";
+    return `held: ${h.all ? "the factory's" : `fleet ${root.persona}'s`} daily budget${cap !== undefined ? ` of $${cap}` : ""} is spent${when}`;
+  }
+
+  // The most this run may spend: the least of its per-run cap, what the
+  // tree has left over its remaining stages, and what each day cap has
+  // left. undefined: no cap. HELD: a day is spent (the row waits). A
+  // string: the tree's budget is spent (the tree stops).
+  private grant(row: Row, root: Row, set: Settings, lim: Limits): number | undefined | string | typeof HELD {
+    const caps: number[] = [];
+    if (set.policy.budgetUsd !== undefined) caps.push(set.policy.budgetUsd);
+    const since = Date.now() - DAY_MS, g = this.cfg.limits.dailyBudgetUsd, f = this.fleetOf(root)?.limits?.dailyBudgetUsd;
+    if (g !== undefined) caps.push(g - this.store.spentSince(since));
+    if (f !== undefined && root.source === "board") caps.push(f - this.store.spentSince(since, root.board));
+    if (caps.slice(set.policy.budgetUsd !== undefined ? 1 : 0).some((c) => c < MIN_GRANT_USD)) return HELD;
+    if (lim.treeBudgetUsd !== undefined) {
+      // A subtask shares what's left with its siblings still to run and the
+      // synthesis, so fan-out stays parallel and the synthesis keeps a share.
+      const stages = row.parent !== null ? this.store.siblingsLeft(row.parent, row.seq) + 2 : 1;
+      const left = lim.treeBudgetUsd - this.store.treeSpent(root.seq);
+      if (left / stages < MIN_GRANT_USD) return `stopped: the task's budget of $${lim.treeBudgetUsd} is spent ($${Math.max(0, lim.treeBudgetUsd - left).toFixed(2)} used)`;
+      caps.push(left / stages);
+    }
+    return caps.length ? Math.min(...caps) : undefined;
+  }
+
+  private deadlineStop(ms: number): Stop {
+    return { outcome: "deadline", head: `stopped: the task passed its deadline of ${dur(ms)}`, sub: `stopped: its task passed its deadline of ${dur(ms)}`, after: "its subtasks stop and nothing is combined" };
+  }
+
+  private budgetStop(usd: number, root: Row): Stop {
+    const where = root.fanoutBoard ? `; each finished subtask's outcome is on #${root.fanoutBoard}` : "";
+    return { outcome: "budget", head: `stopped: the task's budget of $${usd} is spent`, sub: `stopped: its task's budget of $${usd} is spent`, after: `nothing more runs and nothing is combined${where}` };
+  }
+
+  // Trees past their deadline stop, whatever their members are doing
+  // (running, asking or held). Checked with the question clocks and at start.
+  private async deadlines(): Promise<void> {
+    const now = Date.now();
+    for (const r of this.store.openRoots()) {
+      const ms = this.limitsFor(r).deadlineMs;
+      if (ms !== undefined && r.created_at + ms <= now) await this.stopTree(r, this.deadlineStop(ms));
+    }
   }
 
   // A finished request's task again, as a new request keyed by the command
@@ -700,7 +821,7 @@ export class Factory {
     const runs = [row, ...subs].flatMap((r) => this.store.runs(r.seq));
     const open = runs.filter((r) => r.ended_at === null);
     let state: string;
-    if (row.state === "queued") state = `queued, ${this.store.queuedAhead(row)} ahead`;
+    if (row.state === "queued") state = `queued, ${this.holdNote(row.seq) ?? `${this.store.queuedAhead(row)} ahead`}`;
     else if (row.state === "running") state = open.length ? `running: ${this.runner.harness} agent \`${open[0]!.agent}\` for ${ago(open[0]!.started_at)}` : "running: starting";
     else if (row.state === "waiting") {
       const asking = subs.filter((s) => s.state === "asking").length;
@@ -742,6 +863,10 @@ export class Factory {
 }
 
 type Settings = { policy: Policy; workdir: Workdir; agent?: string };
+// What stopped a tree (#655): the run outcome its running members end with,
+// the reply's head, and what the fanned-out request's reply adds.
+type Stop = { outcome: RunOutcome; head: string; sub: string; after: string };
+const HELD = "\u0000held";
 
 function clip(body: string): string {
   const bytes = new TextEncoder().encode(body);

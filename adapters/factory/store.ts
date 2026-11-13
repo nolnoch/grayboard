@@ -34,7 +34,9 @@ export type Admit = { fanout?: boolean; parent?: number; title?: string; profile
 // two, its triage and its synthesis). `outcome` is null while it runs; a run
 // cut off by a restart ends as interrupted. Its transcript is the file
 // runs/<id>.jsonl beside the store, pruned with it.
-export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted" | "cancelled";
+export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted" | "cancelled" | "deadline";
+// Work a spent daily budget holds (#655): everything, or the fleets on these boards.
+export type Hold = { all: boolean; boards: string[] };
 export type Run = { id: number; seq: number; agent: string; started_at: number; ended_at: number | null; code: number | null; session: string | null; turns: number | null; cost_usd: number | null; granted_usd: number | null; outcome: RunOutcome | null };
 
 export class Store {
@@ -155,8 +157,10 @@ export class Store {
   // The oldest queued request, now running; null when none waits. The
   // returned row says whether this run resumes (#652); the store clears it,
   // so a later run of the row (a synthesis) starts fresh.
-  next(): Row | null {
-    const row = this.db.query(`SELECT * FROM requests WHERE state = 'queued' ORDER BY seq LIMIT 1`).get() as Raw | null;
+  // Held work (#655) is skipped, so a held fleet doesn't block another's.
+  next(hold: Hold = { all: false, boards: [] }): Row | null {
+    if (hold.all) return null;
+    const row = this.db.query(`SELECT q.* FROM requests q LEFT JOIN requests p ON p.seq = q.parent WHERE q.state = 'queued'${held(hold.boards, false)} ORDER BY q.seq LIMIT 1`).get(...hold.boards) as Raw | null;
     if (!row) return null;
     this.db.query(`UPDATE requests SET state = 'running', resume = 0, updated_at = ? WHERE seq = ?`).run(this.now(), row.seq);
     return toRow({ ...row, state: "running" });
@@ -271,6 +275,31 @@ export class Store {
     return this.db.query(`SELECT COALESCE(SUM(state = 'running'), 0) AS running, COALESCE(SUM(state = 'queued'), 0) AS queued, COALESCE(SUM(state = 'asking'), 0) AS asking FROM requests`).get() as { running: number; queued: number; asking: number };
   }
 
+  // Queued rows a spent daily budget holds (#655), or whether this one is held.
+  heldCount(hold: Hold, seq?: number): number {
+    if (!hold.all && !hold.boards.length) return 0;
+    const one = seq === undefined ? "" : " AND q.seq = ?";
+    const args: (string | number)[] = hold.all ? [] : [...hold.boards];
+    if (seq !== undefined) args.push(seq);
+    return (this.db.query(`SELECT COUNT(*) AS n FROM requests q LEFT JOIN requests p ON p.seq = q.parent WHERE q.state = 'queued'${hold.all ? "" : held(hold.boards, true)}${one}`).get(...args) as { n: number }).n;
+  }
+
+  // A row taken by next() that a spent budget turned back (#655): queued
+  // again as it was, its resume flag restored.
+  requeue(seq: number, resume: boolean): void {
+    this.db.query(`UPDATE requests SET state = 'queued', resume = ?, updated_at = ? WHERE seq = ? AND state = 'running'`).run(resume ? 1 : 0, this.now(), seq);
+  }
+
+  // Top-level requests not yet finished: what a deadline (#655) is checked on.
+  openRoots(): Row[] {
+    return (this.db.query(`SELECT * FROM requests WHERE parent IS NULL AND state != 'finished' ORDER BY seq`).all() as Raw[]).map(toRow);
+  }
+
+  // A subtask's siblings that will still run: queued, or asking (a resume runs).
+  siblingsLeft(parent: number, self: number): number {
+    return (this.db.query(`SELECT COUNT(*) AS n FROM requests WHERE parent = ? AND seq != ? AND state IN ('queued', 'asking')`).get(parent, self) as { n: number }).n;
+  }
+
   // Queued requests admitted before this one.
   queuedAhead(k: Key): number {
     return (this.db.query(`SELECT COUNT(*) AS n FROM requests WHERE state = 'queued' AND seq < (SELECT seq FROM requests WHERE source = ? AND id = ?)`).get(k.source, k.id) as { n: number }).n;
@@ -377,6 +406,13 @@ export class Store {
 }
 
 type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number };
+// The fleet a row belongs to, by its root's board: in `boards` (`within`) or not.
+function held(boards: string[], within: boolean): string {
+  if (!boards.length) return "";
+  const inList = `COALESCE(p.board, q.board) IN (${boards.map(() => "?").join(", ")})`;
+  return within ? ` AND ${inList}` : ` AND NOT (q.source = 'board' AND COALESCE(${inList}, 0))`;
+}
+
 type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number };
 function toRow(r: Raw): Row {
   const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, ...rest } = r;
