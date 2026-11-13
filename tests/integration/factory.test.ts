@@ -11,7 +11,7 @@ import { humansOf, LocalBus, sessionFree, toDelivery, type Delivery, type Factor
 import { parseDelegation, requestOf, type Request } from "../../adapters/factory/delegate.ts";
 import { Database } from "bun:sqlite";
 import { ASK_DEFAULTS, commandOf, Factory, type AskPolicy, type Fleet, type Limits, type Route } from "../../adapters/factory/factory.ts";
-import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
+import { MAX_NOTES_CHARS, parsePlan, splitNotes, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
 import { askOf, DEFAULTS, hasDailyCap, loadConfig, policyOf } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
 import { askInstruction, NO_ANSWER, NO_MORE, parseAsk } from "../../adapters/factory/ask.ts";
@@ -1022,10 +1022,12 @@ test("store: a store written before projects opens with the profile column added
   db.exec(`INSERT INTO requests (source, id, board, requester, persona, task, agent, state, created_at, updated_at) VALUES ('board', 5, 'sim-tasks', 'fe', 'sim', 'old task', 'researcher', 'queued', 1, 1)`);
   db.close();
   const store = new Store(path);
-  expect(store.get({ source: "board", id: 5 })).toMatchObject({ task: "old task", profile: null });
+  expect(store.get({ source: "board", id: 5 })).toMatchObject({ task: "old task", profile: null, round: 0, notes: null }); // and the round columns (#658)
   const parent = store.get({ source: "board", id: 5 })!;
   store.fanOut(parent, "task-5", [{ r: { source: "board", board: "task-5", id: 6, requester: "fe", persona: "sim", task: "t" }, title: "t", profile: "code", agent: "coder" }]);
   expect(store.get({ source: "board", id: 6 })).toMatchObject({ profile: "code", agent: "coder", parent: parent.seq });
+  expect(store.get({ source: "board", id: 5 })).toMatchObject({ round: 1 });
+  expect(store.get({ source: "board", id: 6 })).toMatchObject({ round: 1 });
   store.close();
 });
 
@@ -1453,21 +1455,21 @@ test("ask: cancel finishes a parked question; a restart keeps it parked and an a
 
 test("config: limits on the top level, a fleet and a project; a daily cap needs a day's retention (#655)", () => {
   writeFileSync(join(dir, "config.json"), JSON.stringify({
-    treeBudgetUsd: 5, dailyBudgetUsd: 100, deadlineMs: 3_600_000,
+    treeBudgetUsd: 5, dailyBudgetUsd: 100, deadlineMs: 3_600_000, maxRounds: 3,
     profiles: [{ name: "p", agent: "x" }],
     fleets: [{ name: "a", agent: "x", treeBudgetUsd: 1.5 }, { name: "b", profile: "p", dailyBudgetUsd: 10 }, { name: "c", agent: "y" }],
-    projects: [{ name: "j", lead: "p", profiles: ["p"], deadlineMs: 60_000 }],
+    projects: [{ name: "j", lead: "p", profiles: ["p"], deadlineMs: 60_000, maxRounds: 2 }],
   }));
   const c = loadConfig(dir, {});
-  expect(c.limits).toEqual({ treeBudgetUsd: 5, dailyBudgetUsd: 100, deadlineMs: 3_600_000 });
-  expect(c.fleets.map((f) => f.limits)).toEqual([{ treeBudgetUsd: 1.5 }, { dailyBudgetUsd: 10 }, undefined, { deadlineMs: 60_000 }]);
+  expect(c.limits).toEqual({ treeBudgetUsd: 5, dailyBudgetUsd: 100, deadlineMs: 3_600_000, maxRounds: 3 });
+  expect(c.fleets.map((f) => f.limits)).toEqual([{ treeBudgetUsd: 1.5 }, { dailyBudgetUsd: 10 }, undefined, { deadlineMs: 60_000, maxRounds: 2 }]);
   expect(hasDailyCap(c)).toBe(true);
   writeFileSync(join(dir, "config.json"), "{}");
   expect(loadConfig(dir, {}).limits).toEqual({}); // absent: no cap and no deadline
   expect(hasDailyCap(loadConfig(dir, {}))).toBe(false);
   writeFileSync(join(dir, "config.json"), JSON.stringify({ retentionMs: 3_600_000, fleets: [{ name: "a", agent: "x", treeBudgetUsd: 1 }] }));
   expect(loadConfig(dir, {}).retentionMs).toBe(3_600_000); // a short retention is fine without a daily cap
-  for (const bad of [{ treeBudgetUsd: 0 }, { dailyBudgetUsd: "1" }, { deadlineMs: 1.5 }, { deadlineMs: 0 }, { fleets: [{ name: "a", agent: "x", treeBudgetUsd: -1 }] },
+  for (const bad of [{ treeBudgetUsd: 0 }, { dailyBudgetUsd: "1" }, { deadlineMs: 1.5 }, { deadlineMs: 0 }, { maxRounds: 0 }, { maxRounds: 1.5 }, { fleets: [{ name: "a", agent: "x", treeBudgetUsd: -1 }] },
     { projects: [{ name: "j", lead: "p", profiles: ["p"], deadlineMs: null }], profiles: [{ name: "p", agent: "x" }] },
     { dailyBudgetUsd: 1, retentionMs: 3_600_000 }, { retentionMs: 3_600_000, fleets: [{ name: "a", agent: "x", dailyBudgetUsd: 1 }] }]) {
     writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
@@ -1634,6 +1636,105 @@ test("limits: a reload that extends a deadline is honoured by a run already clam
   await until(() => bus.replies(75).length === 2, 5000, "stopped at the new deadline");
   expect(Date.now() - t0).toBeGreaterThanOrEqual(1100);
   expect(bus.replies(75)[1]).toBe("[factory] stopped: the task passed its deadline of 1s while fake agent `researcher` ran.");
+  await bus.close();
+  await done;
+});
+
+// ── rounds (#658): a review may plan again, with a digest the code builds ───
+
+const NOTES = (n: string) => `\n\n\`\`\`\`factory-notes\n${n}\n\`\`\`\``;
+
+test("rounds: a notes block splits off only at the reply's end, capped; anything else is text", () => {
+  expect(splitNotes("answer")).toEqual({ text: "answer", notes: null });
+  expect(splitNotes(`answer${NOTES("keep this")}`)).toEqual({ text: "answer", notes: "keep this" });
+  expect(splitNotes(`${PLAN()}${NOTES("why")}\n  `)).toEqual({ text: PLAN(), notes: "why" });
+  expect(splitNotes(`answer${NOTES("  ")}`)).toEqual({ text: "answer", notes: null }); // an empty block is dropped
+  const mid = `before${NOTES("quoted")}\n\nafter`;
+  expect(splitNotes(mid)).toEqual({ text: mid, notes: null }); // quoted mid-reply
+  const inline = "see ````factory-notes\nx\n````";
+  expect(splitNotes(inline)).toEqual({ text: inline, notes: null }); // a fence starts a line
+  const nested = `a${NOTES("x\n````\ny")}`;
+  expect(splitNotes(nested).notes).toBeNull(); // a closing fence inside: not one block
+  expect(splitNotes(`a${NOTES("n".repeat(MAX_NOTES_CHARS + 50))}`).notes).toHaveLength(MAX_NOTES_CHARS);
+});
+
+test("rounds: with maxRounds 2 the review plans a second round on the same board, the last review gets a digest of both and the notes, and notes are never posted", async () => {
+  const runner = new FakeRunner();
+  const leadRuns = () => runner.runs.filter((x) => x.id === 7).length;
+  runner.script = (r) => r.id !== 7 ? undefined
+    : leadRuns() === 1 ? `${PLAN()}${NOTES("NOTE-ONE")}`
+      : leadRuns() === 2 ? `${PLAN()}${NOTES("NOTE-TWO")}`
+        : `final answer${NOTES("NOTE-THREE")}`;
+  const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { maxRounds: 2 } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 4, 5000, "taken, two fan-outs, done");
+  const [, f1, f2, out] = bus.replies(7);
+  expect(f1).toStartWith("[factory] fanned out: 2 subtasks on #task-7,");
+  expect(f2).toStartWith("[factory] fanned out, round 2: 2 subtasks on #task-7,");
+  expect(out).toBe("[factory] done: fake agent `researcher`, combining 4 subtasks over 2 rounds on #task-7\n\nfinal answer");
+  expect(bus.sent.filter((c) => c.tool === "board_create" && String(c.args.name).startsWith("task-"))).toHaveLength(1);
+  expect(bus.sent.filter((c) => c.tool === "board_subscribe" && c.args.board === "task-7")).toHaveLength(1);
+  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "task-7" && c.args.parent_id === undefined).map((c) => String(c.args.body).split("\n")[0]);
+  expect(subPosts).toEqual(["[factory] subtask 1/2: part 1", "[factory] subtask 2/2: part 2", "[factory] subtask 2.1/2: part 1", "[factory] subtask 2.2/2: part 2"]);
+  const ids = runner.runs.map((r) => r.id);
+  expect(ids).toHaveLength(7);
+  const [, s1, , , s3] = ids;
+  expect(ids.filter((i) => i === 7)).toHaveLength(3);
+  // The triage may plan and is told about notes; the first review may plan its last round.
+  expect(runner.inputs[0]).toContain("## Before you start");
+  expect(runner.inputs[0]).toContain("## Notes for your next review");
+  const review1 = runner.inputs[3]!, review2 = runner.inputs[6]!;
+  expect(review1).toContain("This is the review of round 1.");
+  expect(review1).toContain("## Your notes\n\nWhat you noted in earlier runs of this task:\n\nNOTE-ONE");
+  expect(review1).toContain("This is the last round you may plan");
+  expect(review1).not.toContain("## Earlier rounds");
+  expect(review1).toContain(`### 1. part 1\n\n[factory] done: fake agent \`researcher\`\n\nresult for ${s1}`);
+  // The last review: round 1 in a line each, round 2 in full, the latest notes, and no plan offer.
+  expect(review2).toContain("This is the review of round 2.");
+  expect(review2).toContain(`### Round 1\n\n1. part 1: done: result for ${s1}\n2. part 2: done: result for ${ids[2]}`);
+  expect(review2).toContain(`### 1. part 1\n\n[factory] done: fake agent \`researcher\`\n\nresult for ${s3}`);
+  expect(review2).toContain("NOTE-TWO");
+  expect(review2).not.toContain("NOTE-ONE");
+  expect(review2).toContain("Combine these results into one answer to the task.");
+  expect(review2).not.toContain("factory-plan");
+  for (const c of bus.sent) expect(JSON.stringify(c.args)).not.toMatch(/NOTE-(ONE|TWO|THREE)/);
+  await bus.close();
+  await done;
+});
+
+test("rounds: a review past its rounds only combines: a plan it returns is its answer, at maxRounds 1 (the default) as at 2", async () => {
+  for (const maxRounds of [undefined, 2]) {
+    const runner = new FakeRunner();
+    runner.script = (r) => (r.id === 7 ? PLAN() : undefined); // the lead always plans
+    const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", ...(maxRounds ? { limits: { maxRounds } } : {}) }] });
+    bus.deliver(task(7));
+    const n = maxRounds ?? 1;
+    await until(() => bus.replies(7).length === 2 + n, 5000, "taken, fan-outs, done");
+    expect(runner.runs).toHaveLength(1 + 3 * n);
+    const out = bus.replies(7).at(-1)!;
+    expect(out).toStartWith(`[factory] done: fake agent \`researcher\`, combining ${2 * n} subtasks${n > 1 ? " over 2 rounds" : ""} on #task-7\n\n\`\`\`\`factory-plan`);
+    // At maxRounds 1, nothing about rounds or notes reaches the lead: today's prompts.
+    if (n === 1) {
+      expect(runner.inputs[0]).not.toContain("## Notes for your next review");
+      expect(runner.inputs[3]).toBe(synthesisPrompt("do 7", [1, 2].map((i) => ({ title: `part ${i}`, reply: `[factory] done: fake agent \`researcher\`\n\nresult for ${runner.runs[i]!.id}` }))));
+    }
+    await bus.close();
+    await done;
+  }
+});
+
+test("rounds: a review that may plan is granted a quarter of what's left; the last review, its share as before (#655)", async () => {
+  const runner = new FakeRunner();
+  const leadRuns = () => runner.runs.filter((x) => x.id === 7).length;
+  runner.script = (r) => (r.id === 7 && leadRuns() < 3 ? PLAN() : undefined);
+  runner.meta = () => ({ code: 0, costUsd: 0.1 });
+  const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { treeBudgetUsd: 1, maxRounds: 2 } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 4, 5000, "taken, two fan-outs, done");
+  // triage $1; subtasks $0.90/3, $0.80/2; review $0.70/4; round 2's subtasks $0.60/3, $0.50/2; last review $0.40.
+  const grants = runner.policies.map((p) => p.budgetUsd!);
+  expect(grants).toHaveLength(7);
+  [1, 0.3, 0.4, 0.175, 0.2, 0.25, 0.4].forEach((g, i) => expect(grants[i]).toBeCloseTo(g, 9));
   await bus.close();
   await done;
 });
