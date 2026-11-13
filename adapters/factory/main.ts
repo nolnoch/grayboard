@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { LocalBus, sessionFree } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
-import { Factory, type Fleet } from "./factory.ts";
+import { Factory, type Fleet, type Route } from "./factory.ts";
 import type { Policy } from "./runner.ts";
 import { Store } from "./store.ts";
 import { WORKDIR_MODES, Workspaces, type Workdir, type WorkdirMode } from "./workdir.ts";
@@ -25,7 +25,7 @@ export type Config = {
   tools?: string[];        // the tools a child has (--tools); absent, Claude Code's restricted default: no shell, no WebFetch
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
   profiles: Profile[];     // named agent + tool lists a fleet runs under (#643)
-  fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent (and policy) it runs
+  fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent (and policy) it runs; projects (#645) included, with their routes
   maxConcurrent: number;
   maxSubtasks: number;     // the most subtasks a fleet task's plan may fan out to
   timeoutMs: number;
@@ -35,6 +35,10 @@ export type Config = {
 // A profile (#643): the agent, what its children may do and where they run
 // (#641). Its tool lists, mode and repo fall back to the global ones field by field.
 export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; workdir?: WorkdirMode; repo?: string };
+
+// The fields a SIGHUP reload can't change: they shape the bus session, the
+// runner or the worker pool, which live as long as the process.
+const RESTART_ONLY = ["identity", "grayboard", "claude", "cwd", "maxConcurrent", "maxSubtasks", "timeoutMs", "retentionMs"] as const;
 
 const DAY = 86_400_000;
 export const DEFAULTS = { identity: "factory", claude: "claude", allowedTools: [] as string[], maxConcurrent: 2, maxSubtasks: 5, timeoutMs: 30 * 60_000, retentionMs: 30 * DAY };
@@ -109,26 +113,59 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     workdirOf(q.workdir ?? workdir.mode, q.repo ?? workdir.repo, `profile ${p.name}`); // a profile no fleet uses yet must still be runnable
   }
 
+  // A profile as a route (#645): its agent, tool lists and working directory,
+  // each falling back to the global one. `repoOver`: a project's repo, which
+  // replaces the profile's.
+  const routeOf = (p: Profile, repoOver?: string): Route => ({
+    profile: p.name, agent: p.agent,
+    policy: { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools },
+    workdir: workdirOf(p.workdir ?? workdir.mode, repoOver ?? p.repo ?? workdir.repo, `profile ${p.name}`),
+  });
+  const fromRoutes = (name: string, routes: Route[], fanout: { fanout?: boolean }): Fleet => {
+    const lead = routes[0]!;
+    return { name, agent: lead.agent, ...fanout, profile: lead.profile, policy: lead.policy, workdir: lead.workdir, routes };
+  };
+
   const rawFleets = raw.fleets ?? [];
   if (!Array.isArray(rawFleets)) throw new Error(`${path}: "fleets" must be an array of {name, agent} or {name, profile}`);
   const fleets: Fleet[] = [];
+  const fanoutOf = (f: Record<string, unknown>, what: string) => {
+    if (f.fanout !== undefined && typeof f.fanout !== "boolean") throw new Error(`${path}: ${what} ${f.name}: "fanout" must be true or false`);
+    return f.fanout === false ? { fanout: false } : {};
+  };
   for (const f of rawFleets as Record<string, unknown>[]) {
     // The board name `<name>-tasks` must fit a board name: [a-z0-9_-], max 32.
     if (typeof f !== "object" || f === null || typeof f.name !== "string" || !NAME.test(f.name)) throw new Error(`${path}: each fleet's "name" must be 1-26 characters of a-z 0-9 _ -`);
-    if (f.fanout !== undefined && typeof f.fanout !== "boolean") throw new Error(`${path}: fleet ${f.name}: "fanout" must be true or false`);
+    const fanout = fanoutOf(f, "fleet");
     if (fleets.some((x) => x.name === f.name)) throw new Error(`${path}: fleet ${f.name} is listed twice`);
-    const fanout = f.fanout === false ? { fanout: false } : {};
     if (f.profile !== undefined) {
       // A profile carries the agent: naming both would leave one ignored.
       if (f.agent !== undefined) throw new Error(`${path}: fleet ${f.name}: give "profile" or "agent", not both`);
       const p = typeof f.profile === "string" ? profiles.get(f.profile) : undefined;
       if (!p) throw new Error(`${path}: fleet ${f.name}: "profile" must name a profile in "profiles"`);
-      const policy: Policy = { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools };
-      fleets.push({ name: f.name, agent: p.agent, ...fanout, profile: p.name, policy, workdir: workdirOf(p.workdir ?? workdir.mode, p.repo ?? workdir.repo, `profile ${p.name}`) });
+      fleets.push(fromRoutes(f.name, [routeOf(p)], fanout));
     } else {
       if (typeof f.agent !== "string" || !f.agent.trim()) throw new Error(`${path}: fleet ${f.name}: "agent" (or "profile") must be a non-empty string`);
       fleets.push({ name: f.name, agent: f.agent.trim(), ...fanout });
     }
+  }
+
+  // A project (#645): a fleet whose plans may route each subtask to one of
+  // its profiles; the lead triages, runs unrouted subtasks and synthesizes.
+  const rawProjects = raw.projects ?? [];
+  if (!Array.isArray(rawProjects)) throw new Error(`${path}: "projects" must be an array of {name, lead, profiles, repo?, fanout?}`);
+  for (const j of rawProjects as Record<string, unknown>[]) {
+    if (typeof j !== "object" || j === null || typeof j.name !== "string" || !NAME.test(j.name)) throw new Error(`${path}: each project's "name" must be 1-26 characters of a-z 0-9 _ -`);
+    if (fleets.some((x) => x.name === j.name)) throw new Error(`${path}: project ${j.name}: the name is already a fleet's or another project's (both get the board ${j.name}-tasks)`);
+    const fanout = fanoutOf(j, "project");
+    const names = list(j.profiles, `project ${j.name}: "profiles"`);
+    if (names.length === 0) throw new Error(`${path}: project ${j.name}: "profiles" must name at least one profile`);
+    if (new Set(names).size !== names.length) throw new Error(`${path}: project ${j.name}: "profiles" lists a profile twice`);
+    for (const n of names) if (!profiles.has(n)) throw new Error(`${path}: project ${j.name}: profile ${n} isn't in "profiles"`);
+    if (typeof j.lead !== "string" || !names.includes(j.lead)) throw new Error(`${path}: project ${j.name}: "lead" must be one of its "profiles"`);
+    const projRepo = j.repo !== undefined ? repo(j.repo, `project ${j.name}: "repo"`) : undefined;
+    const ordered = [j.lead, ...names.filter((n) => n !== j.lead)];
+    fleets.push(fromRoutes(j.name, ordered.map((n) => routeOf(profiles.get(n)!, projRepo)), fanout));
   }
   const gb = env.FACTORY_GRAYBOARD?.trim() ? env.FACTORY_GRAYBOARD.trim().split(/\s+/) : strs("grayboard", ["grayboard"]);
   if (gb.length === 0) throw new Error(`${path}: "grayboard" must not be empty`);
@@ -173,7 +210,26 @@ export async function main(env: Record<string, string | undefined> = process.env
   const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+  // SIGHUP reloads the config (#645): fleets, projects, profiles and the
+  // global tool lists and working directory. A config that doesn't load
+  // leaves the running one in place; the other fields need a restart.
+  let reloads = Promise.resolve();
+  const reload = () => {
+    reloads = reloads.then(async () => {
+      let next: Config;
+      try { next = loadConfig(dataDir, env); } catch (e) {
+        log(`reload refused, the running config stays: ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+      const restart = RESTART_ONLY.filter((k) => JSON.stringify(next[k]) !== JSON.stringify(cfg[k]));
+      if (restart.length) log(`reload: ${restart.join(", ")} changed, which takes a restart; the running values stay`);
+      await factory.reconfigure({ fleets: next.fleets, policy: { ...(next.tools ? { tools: next.tools } : {}), allowedTools: next.allowedTools }, workdir: next.workdir });
+      log(`reloaded: ${next.fleets.length} fleet(s) and project(s)`);
+    }).catch((e) => log(`reload failed: ${e instanceof Error ? e.message : String(e)}`));
+  };
+  process.on("SIGHUP", reload);
   const why = await factory.run();
+  process.off("SIGHUP", reload);
   log(`stopping: ${why}`);
   store.close();
   return signalled ? 0 : 1;

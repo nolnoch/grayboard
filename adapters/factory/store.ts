@@ -20,8 +20,9 @@ export type Phase = "run" | "synthesize";
 export type Row = Request & {
   seq: number; agent: string; state: State; reply: string | null; replied: boolean; created_at: number; updated_at: number;
   phase: Phase; fanout: boolean; parent: number | null; title: string | null; fanoutBoard: string | null;
+  profile: string | null; // a routed subtask's profile (#645); null runs as its project's lead
 };
-export type Admit = { fanout?: boolean; parent?: number; title?: string };
+export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string };
 
 export class Store {
   private readonly db: Database;
@@ -50,13 +51,14 @@ export class Store {
       parent INTEGER,
       title TEXT,
       fanout_board TEXT,
+      profile TEXT,
       UNIQUE (source, id)
     )`);
     // Additive (AGENTS.md): a store an earlier factory wrote gets the fan-out
     // columns, in one transaction with the check.
     this.db.transaction(() => {
       const cols = new Set((this.db.query(`PRAGMA table_info(requests)`).all() as { name: string }[]).map((c) => c.name));
-      const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"]];
+      const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"]];
       for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
     }).immediate();
   }
@@ -74,17 +76,18 @@ export class Store {
   private insert(r: Request, agent: string, state: State, reply: string | null, o: Admit = {}): boolean {
     const t = this.now();
     const board = r.source === "board" ? r.board : null;
-    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at, fanout, parent, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t, o.fanout ? 1 : 0, o.parent ?? null, o.title ?? null);
+    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at, fanout, parent, title, profile) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t, o.fanout ? 1 : 0, o.parent ?? null, o.title ?? null, o.profile ?? null);
     return res.changes === 1;
   }
 
   // A run that returned a plan: the request waits on its subtasks, admitted
   // in the same transaction, so a crash leaves both or neither.
-  fanOut(parent: Row, board: string, subtasks: { r: Request; title: string }[]): void {
+  // A subtask runs as `agent` (its profile's, #645) when given, else as its parent's.
+  fanOut(parent: Row, board: string, subtasks: { r: Request; title: string; profile?: string; agent?: string }[]): void {
     this.db.transaction(() => {
       this.db.query(`UPDATE requests SET state = 'waiting', fanout_board = ?, updated_at = ? WHERE seq = ?`).run(board, this.now(), parent.seq);
-      for (const s of subtasks) this.insert(s.r, parent.agent, "queued", null, { parent: parent.seq, title: s.title });
+      for (const s of subtasks) this.insert(s.r, s.agent ?? parent.agent, "queued", null, { parent: parent.seq, title: s.title, ...(s.profile ? { profile: s.profile } : {}) });
     })();
   }
 
@@ -168,7 +171,7 @@ export class Store {
   }
 }
 
-type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null };
+type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null };
 type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null };
 function toRow(r: Raw): Row {
   const { context, replied, source, board, fanout, fanout_board, ...rest } = r;

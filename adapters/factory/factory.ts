@@ -15,8 +15,14 @@ import type { Place, Workdir, Workspaces } from "./workdir.ts";
 // operator's choice, never the post's. `fanout` (default on) lets a task's
 // run return a plan of subtasks instead of doing it (§7). `policy` and
 // `workdir` are its profile's (#643, #641); absent, the factory's global ones.
-export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy; workdir?: Workdir };
+// A project (#645) is a fleet whose `routes` are the profiles its plans may
+// name, the lead's first; a fleet with a profile routes to that one alone.
+export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy; workdir?: Workdir; routes?: Route[] };
+export type Route = { profile: string; agent: string; policy: Policy; workdir: Workdir };
 export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
+
+// What a config reload (#645) replaces; the rest needs a restart.
+export type Reconfig = { fleets: Fleet[]; policy: Policy; workdir: Workdir };
 
 export type FactoryOptions = {
   fleets?: Fleet[];
@@ -44,7 +50,20 @@ export class Factory {
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
 
-  constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {}
+  private cfg: Reconfig;
+
+  constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {
+    this.cfg = { fleets: o.fleets ?? [], policy: o.policy, workdir: o.workdir };
+  }
+
+  // A config reload (#645): new runs read the new fleets, projects and
+  // global lists; a run already started keeps what it started with. A
+  // queued task whose fleet is gone fails when it would run (settingsFor).
+  async reconfigure(c: Reconfig): Promise<void> {
+    this.cfg = c;
+    await this.syncFleets();
+    this.pump();
+  }
 
   // Runs until the bus closes; resolves with why.
   async run(): Promise<string> {
@@ -143,7 +162,7 @@ export class Factory {
   }
 
   private fleets(): Fleet[] {
-    return this.o.fleets ?? [];
+    return this.cfg.fleets;
   }
 
   // Makes the factory a lane on exactly its fleets' boards: creates a
@@ -154,22 +173,28 @@ export class Factory {
   async syncFleets(): Promise<void> {
     const listed = await this.bus.call("board_list");
     const boards = new Map((Array.isArray(listed) ? listed : []).map((b: { name: string; kind?: string; mode?: string | null }) => [b.name, b]));
-    this.joined.clear();
-    this.queues.clear();
-    for (const b of boards.values()) if (b.kind === "queue") this.queues.add(b.name);
+    // Built aside and swapped in at the end: a reload (#645) runs this while
+    // deliveries arrive, and one seen mid-sync must not find its fleet gone.
+    const joined = new Map<string, Fleet>(), queues = new Set<string>();
+    for (const b of boards.values()) if (b.kind === "queue") queues.add(b.name);
     for (const f of this.fleets()) {
       const name = fleetBoard(f), b = boards.get(name);
       try {
         if (!b) await this.bus.call("board_create", { name, purpose: `Tasks for the ${f.name} fleet: each top-level post is one task, run by one lane; replies come in its thread.`, kind: "queue" });
         else if ((b.kind ?? "broadcast") !== "queue") { this.o.log(`fleet ${f.name}: #${name} exists as a ${b.kind ?? "broadcast"} board, not a queue; skipping it`); continue; }
         else if (b.mode !== "push") await this.bus.call("board_subscribe", { board: name, mode: "push" });
-        this.joined.set(name, f);
+        joined.set(name, f);
+        queues.add(name);
       } catch (e) {
         this.o.log(`fleet ${f.name}: couldn't join #${name}: ${msg(e)}`);
       }
     }
+    this.joined.clear();
+    for (const [k, v] of joined) this.joined.set(k, v);
+    this.queues.clear();
+    for (const q of queues) this.queues.add(q);
     for (const b of boards.values()) {
-      if (b.kind === "queue" && b.mode === "push" && !this.joined.has(b.name)) {
+      if (b.kind === "queue" && b.mode === "push" && !joined.has(b.name)) {
         await this.bus.call("board_subscribe", { board: b.name, mode: "off" }).catch((e) => this.o.log(`couldn't leave #${b.name}: ${msg(e)}`));
         this.o.log(`left #${b.name}: no fleet in the config uses it`);
       }
@@ -214,14 +239,16 @@ export class Factory {
     const max = this.o.maxSubtasks ?? 5;
     const set = this.settingsFor(row);
     if (typeof set === "string") return set;
-    const own = set.workdir.mode !== "shared";
+    const ownDir = (s: Settings | string) => typeof s !== "string" && s.workdir.mode !== "shared";
+    const routes = this.fleets().find((f) => f.name === row.persona)?.routes ?? [];
     const input: Request = synth
-      ? { ...row, task: synthesisPrompt(row.task, this.store.subtasks(row.seq).map((s) => ({ title: s.title ?? "", reply: s.reply, dir: own ? String(s.seq) : undefined }))), context: undefined }
-      : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max, own)}` } : row;
+      ? { ...row, task: synthesisPrompt(row.task, this.store.subtasks(row.seq).map((s) => ({ title: s.title ?? "", reply: s.reply, dir: ownDir(this.settingsFor(s)) ? String(s.seq) : undefined }))), context: undefined }
+      : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max, ownDir(set), row.source === "board" ? routes.map((r) => ({ name: r.profile, agent: r.agent, tools: r.policy.tools?.join(", ") ?? "the default: no shell, no web fetch" })) : [])}` } : row;
     const out = await this.runAgent(row, input, set);
+    const who = set.agent ?? row.agent;
     let body: string;
     if (typeof out === "string") body = out;
-    else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${row.agent}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
+    else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${who}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
     else {
       const plan = row.fanout && !synth ? parsePlan(out.text, max) : null;
       if (plan && typeof plan !== "string") {
@@ -229,11 +256,11 @@ export class Factory {
         if (!why) return null;
         body = `[factory] failed: ${why}`;
       } else if (typeof plan === "string") {
-        body = `[factory] failed: ${this.runner.harness} agent \`${row.agent}\` returned a plan the factory can't use: ${plan}. Nothing was fanned out.`;
+        body = `[factory] failed: ${this.runner.harness} agent \`${who}\` returned a plan the factory can't use: ${plan}. Nothing was fanned out.`;
       } else {
         body = synth
-          ? `[factory] done: ${this.runner.harness} agent \`${row.agent}\`, combining ${this.store.subtasks(row.seq).length} subtasks on #${row.fanoutBoard}\n\n${out.text}`
-          : `[factory] done: ${this.runner.harness} agent \`${row.agent}\`\n\n${out.text}`;
+          ? `[factory] done: ${this.runner.harness} agent \`${who}\`, combining ${this.store.subtasks(row.seq).length} subtasks on #${row.fanoutBoard}\n\n${out.text}`
+          : `[factory] done: ${this.runner.harness} agent \`${who}\`\n\n${out.text}`;
       }
     }
     return body;
@@ -241,8 +268,9 @@ export class Factory {
 
   // Runs the row's agent on `input`; a string is a failure reply that needed no run.
   private async runAgent(row: Row, input: Request, set: Settings): Promise<Outcome | string> {
-    const agent = this.runner.roster().find((a) => a.name === row.agent);
-    if (!agent) return `[factory] failed: agent \`${row.agent}\` left the ${this.runner.harness} roster before this ran; nothing was spawned.`;
+    const name = set.agent ?? row.agent;
+    const agent = this.runner.roster().find((a) => a.name === name);
+    if (!agent) return `[factory] failed: agent \`${name}\` left the ${this.runner.harness} roster before this ran; nothing was spawned.`;
     let place: Place;
     try {
       place = await this.o.workspaces.place(set.workdir, { tree: row.parent ?? row.seq, sub: row.parent !== null ? row.seq : null, synthesis: row.phase === "synthesize" });
@@ -268,12 +296,21 @@ export class Factory {
   // fleet's; a delegation the global ones. A fleet gone from the config
   // fails the run rather than fall back to the global lists, which may be
   // wider than its profile.
+  // A routed subtask (#645) gets its profile's, which must still be one of
+  // its project's.
   private settingsFor(row: Row): Settings | string {
-    const global: Settings = { policy: this.o.policy, workdir: this.o.workdir };
+    const global: Settings = { policy: this.cfg.policy, workdir: this.cfg.workdir };
     if (row.source === "dm") return global;
     const f = this.fleets().find((f) => f.name === row.persona);
     if (!f) return `[factory] failed: fleet "${oneLine(row.persona)}" is no longer in the factory's config; nothing was spawned.`;
-    return { policy: f.policy ?? global.policy, workdir: f.workdir ?? global.workdir };
+    if (row.profile !== null) {
+      const r = f.routes?.find((r) => r.profile === row.profile);
+      if (!r) return `[factory] failed: profile "${row.profile}" is no longer one of ${f.name}'s; nothing was spawned.`;
+      return { policy: r.policy, workdir: r.workdir, agent: r.agent };
+    }
+    // The fleet's agent as the config now names it, so a reload never pairs
+    // one agent with another's tool lists.
+    return { policy: f.policy ?? global.policy, workdir: f.workdir ?? global.workdir, agent: f.agent };
   }
 
   // A plan's fan-out: a broadcast board `task-<post id>` as the durable,
@@ -284,6 +321,14 @@ export class Factory {
   // Returns why it couldn't, or null.
   private async fanOut(row: Row, plan: Plan): Promise<string | null> {
     if (row.source !== "board") return "only a fleet task fans out";
+    // Routing (#645), checked before anything is posted: a subtask may name
+    // only one of its project's profiles, so no plan widens what runs.
+    const routes = this.fleets().find((f) => f.name === row.persona)?.routes ?? [];
+    for (const [i, s] of plan.subtasks.entries()) {
+      if (s.profile !== undefined && !routes.some((r) => r.profile === s.profile)) {
+        return `subtask ${i + 1} names profile "${oneLine(s.profile)}", which isn't one of ${row.persona}'s (${routes.length ? routes.map((r) => r.profile).join(", ") : "it names none"}). Nothing was fanned out.`;
+      }
+    }
     const purpose = `Subtasks of ${oneLine(row.requester)}'s post ${row.id} on #${row.board}, fanned out by ${this.bus.handle}: one top-level post per subtask, its outcome in its thread.`;
     // A board of that name someone else made: the next suffix.
     let board = "";
@@ -302,19 +347,22 @@ export class Factory {
     } catch (e) {
       this.o.log(`couldn't mute #${board}: ${msg(e)}`);
     }
-    const n = plan.subtasks.length, subtasks: { r: Request; title: string }[] = [];
+    const n = plan.subtasks.length, subtasks: { r: Request; title: string; profile?: string; agent?: string }[] = [];
     for (const [i, s] of plan.subtasks.entries()) {
       try {
-        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${i + 1}/${n}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
+        const route = s.profile !== undefined ? routes.find((r) => r.profile === s.profile)! : undefined;
+        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${i + 1}/${n}${route ? ` (${route.profile})` : ""}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
         if (typeof res?.post_id !== "number") throw new Error("board_post returned no post_id");
-        subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title });
+        subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title, ...(route ? { profile: route.profile, agent: route.agent } : {}) });
       } catch (e) {
         return `couldn't post subtask ${i + 1} of ${n} on #${board} (${subtasks.length} posted, none run): ${msg(e)}`;
       }
     }
     this.store.fanOut(row, board, subtasks);
     this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}`);
-    await this.reply(row, `[factory] fanned out: ${n} subtasks on #${board}, each run as \`${row.agent}\` with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
+    const agents = [...new Set(subtasks.map((s) => s.agent ?? row.agent))];
+    const as = agents.length === 1 ? `each run as \`${agents[0]}\`` : `each run as its profile's agent`;
+    await this.reply(row, `[factory] fanned out: ${n} subtasks on #${board}, ${as} with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
     return null;
   }
 
@@ -359,7 +407,7 @@ export class Factory {
   }
 }
 
-type Settings = { policy: Policy; workdir: Workdir };
+type Settings = { policy: Policy; workdir: Workdir; agent?: string };
 
 function clip(body: string): string {
   const bytes = new TextEncoder().encode(body);
