@@ -585,7 +585,9 @@ export class Factory {
         if (typeof res?.post_id !== "number") throw new Error("board_post returned no post_id");
         subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title, ...(route ? { profile: route.profile, agent: route.agent } : {}) });
       } catch (e) {
-        return { error: `couldn't post subtask ${i + 1} of ${n} on #${board} (${subtasks.length} posted, none run): ${msg(e)}`, board };
+        // Name what was posted: those posts stay on the board, never run.
+        const made = subtasks.length ? `${subtasks.length} posted: post${subtasks.length === 1 ? "" : "s"} ${subtasks.map((s) => s.r.id).join(", ")}` : "none posted";
+        return { error: `couldn't post subtask ${i + 1} of ${n} on #${board} (${made}; none run): ${msg(e)}`, board };
       }
     }
     if (this.cancelledBy.has(row.seq)) return { error: "cancelled", board };
