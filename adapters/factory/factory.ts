@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { Delivery, FactoryBus } from "./bus.ts";
 import { oneLine, requestOf, type Key, type Request } from "./delegate.ts";
 import { answerPrompt, askInstruction, NO_ANSWER, NO_MORE, parseAsk, reseeded, type Ask } from "./ask.ts";
-import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
+import { notesInstruction, parsePlan, splitNotes, synthesisPrompt, triageInstruction, type Plan, type Result, type Round } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner } from "./runner.ts";
 import type { Admit, Hold, Row, RunOutcome, Store } from "./store.ts";
 import type { Place, Workdir, Workspaces } from "./workdir.ts";
@@ -26,8 +26,10 @@ export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: s
 // dailyBudgetUsd: the most spent in any 24 h, the global one across the
 // whole factory, a fleet's across its own. deadlineMs: how long a tree may
 // take from its admission. A fleet's tree budget and deadline replace the
-// global ones; both daily caps apply.
-export type Limits = { treeBudgetUsd?: number; dailyBudgetUsd?: number; deadlineMs?: number };
+// global ones; both daily caps apply. maxRounds (#658): how many plans a
+// tree's lead may make, its triage's included (default 1: a review only
+// combines); a fleet's replaces the global one.
+export type Limits = { treeBudgetUsd?: number; dailyBudgetUsd?: number; deadlineMs?: number; maxRounds?: number };
 // A grant under this is no budget at all.
 export const MIN_GRANT_USD = 0.01;
 const DAY_MS = 86_400_000;
@@ -294,9 +296,21 @@ export class Factory {
     if (typeof set === "string") return set;
     const ownDir = (s: Settings | string) => typeof s !== "string" && s.workdir.mode !== "shared";
     const routes = this.fleets().find((f) => f.name === row.persona)?.routes ?? [];
-    let input: Request = synth
-      ? { ...row, task: synthesisPrompt(row.task, this.store.subtasks(row.seq).map((s) => ({ title: s.title ?? "", reply: s.reply, dir: ownDir(this.settingsFor(s)) ? String(s.seq) : undefined }))), context: undefined }
-      : row.fanout ? { ...row, task: `${row.task}\n\n${triageInstruction(max, ownDir(set), row.source === "board" ? routes.map((r) => ({ name: r.profile, agent: r.agent, tools: r.policy.tools?.join(", ") ?? "the default: no shell, no web fetch" })) : [])}` } : row;
+    const profiles = row.source === "board" ? routes.map((r) => ({ name: r.profile, agent: r.agent, tools: r.policy.tools?.join(", ") ?? "the default: no shell, no web fetch" })) : [];
+    // Rounds (#658): the lead is a fan-out-capable root; its triage may plan,
+    // and so may each review while the tree has rounds left.
+    const lead = row.parent === null && row.fanout, maxRounds = this.limitsFor(row).maxRounds ?? 1, plans = this.canPlan(row);
+    let input: Request = row;
+    if (synth) {
+      // The digest, built here from the store: the latest round's outcomes
+      // in full, earlier rounds' in a line each, and the lead's notes.
+      const subs = this.store.subtasks(row.seq);
+      const res = (s: Row): Result => ({ title: s.title ?? "", reply: s.reply, dir: ownDir(this.settingsFor(s)) ? String(s.seq) : undefined, profile: s.profile });
+      const earlier: Round[] = [];
+      for (let k = 1; k < row.round; k++) earlier.push({ round: k, results: subs.filter((s) => s.round === k).map(res) });
+      const next = plans ? { max, left: maxRounds - row.round, ownDirs: ownDir(set), worktree: set.workdir.mode === "worktree", profiles } : undefined;
+      input = { ...row, task: synthesisPrompt(row.task, subs.filter((s) => s.round === row.round).map(res), { earlier, notes: row.notes, next, round: row.round }), context: undefined };
+    } else if (row.fanout) input = { ...row, task: `${row.task}\n\n${triageInstruction(max, ownDir(set), profiles)}${lead && maxRounds > 1 ? `\n\n${notesInstruction()}` : ""}` };
     // An answered question (#652) resumes the conversation that asked it;
     // with no session to resume, a fresh run is told what it asked and what came back.
     let resume: Resume | undefined;
@@ -315,24 +329,39 @@ export class Factory {
     if (typeof out === "string") body = out;
     else if (!out.ok) body = `[factory] failed: ${this.runner.harness} agent \`${who}\`: ${this.stopping ? "the factory stopped while this ran" : out.error}`;
     else {
-      const q = parseAsk(out.text);
+      // A lead's notes block is kept for its next review, never posted.
+      let text = out.text;
+      if (lead) {
+        const n = splitNotes(text);
+        text = n.text;
+        if (n.notes !== null) this.store.setNotes(row.seq, n.notes);
+      }
+      const q = parseAsk(text);
       if (q !== null) return typeof q === "string" ? `[factory] failed: ${this.runner.harness} agent \`${who}\` asked a question the factory can't use: ${q}.` : this.ask(row, q, who);
-      const plan = row.fanout && !synth ? parsePlan(out.text, max) : null;
+      const plan = plans ? parsePlan(text, max) : null;
       if (plan && typeof plan !== "string") {
         const why = await this.fanOut(row, plan);
         if (!why) return null;
         // A cancel that landed while the plan was being posted.
         const late = this.cancelledBy.get(row.seq);
-        body = late !== undefined ? `[factory] ${late.head} while its plan was being posted on #task-${row.id}; no subtask ran.` : `[factory] failed: ${why}`;
+        body = late !== undefined ? `[factory] ${late.head} while its plan was being posted on #${row.fanoutBoard ?? `task-${row.id}`}; no subtask ran.` : `[factory] failed: ${why}`;
       } else if (typeof plan === "string") {
         body = `[factory] failed: ${this.runner.harness} agent \`${who}\` returned a plan the factory can't use: ${plan}. Nothing was fanned out.`;
       } else {
         body = synth
-          ? `[factory] done: ${this.runner.harness} agent \`${who}\`, combining ${this.store.subtasks(row.seq).length} subtasks on #${row.fanoutBoard}\n\n${out.text}`
-          : `[factory] done: ${this.runner.harness} agent \`${who}\`\n\n${out.text}`;
+          ? `[factory] done: ${this.runner.harness} agent \`${who}\`, combining ${this.store.subtasks(row.seq).length} subtasks${row.round > 1 ? ` over ${row.round} rounds` : ""} on #${row.fanoutBoard}\n\n${text}`
+          : `[factory] done: ${this.runner.harness} agent \`${who}\`\n\n${text}`;
       }
     }
     return body;
+  }
+
+  // Whether this run may return a plan (#658): a fan-out-capable request's
+  // triage always may; its review only while the tree has rounds left. A
+  // review of round 0 is a store from before rounds: it only combines.
+  private canPlan(row: Row): boolean {
+    if (!row.fanout || row.parent !== null) return false;
+    return row.phase !== "synthesize" || (row.round >= 1 && row.round < (this.limitsFor(row).maxRounds ?? 1));
   }
 
   // Runs the row's agent on `input`; a string is a failure reply that needed
@@ -444,8 +473,10 @@ export class Factory {
       }
     }
     const purpose = `Subtasks of ${oneLine(row.requester)}'s post ${row.id} on #${row.board}, fanned out by ${this.bus.handle}: one top-level post per subtask, its outcome in its thread.`;
-    // A board of that name someone else made: the next suffix.
-    let board = "";
+    // A later round (#658) posts on the tree's board. A board of that name
+    // someone else made: the next suffix.
+    let board = row.fanoutBoard ?? "";
+    const round = row.round + 1, label = round > 1 ? `${round}.` : "";
     for (let k = 1; !board; k++) {
       const name = k === 1 ? `task-${row.id}` : `task-${row.id}-${k}`;
       try {
@@ -456,16 +487,18 @@ export class Factory {
         return `couldn't open #${name} for the fan-out: ${msg(e)}`;
       }
     }
-    try {
-      await this.bus.call("board_subscribe", { board, mode: "off" }); // its own posts and their threads are the factory's to write, not to take
-    } catch (e) {
-      this.o.log(`couldn't mute #${board}: ${msg(e)}`);
+    if (row.fanoutBoard === null) {
+      try {
+        await this.bus.call("board_subscribe", { board, mode: "off" }); // its own posts and their threads are the factory's to write, not to take
+      } catch (e) {
+        this.o.log(`couldn't mute #${board}: ${msg(e)}`);
+      }
     }
     const n = plan.subtasks.length, subtasks: { r: Request; title: string; profile?: string; agent?: string }[] = [];
     for (const [i, s] of plan.subtasks.entries()) {
       try {
         const route = s.profile !== undefined ? routes.find((r) => r.profile === s.profile)! : undefined;
-        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${i + 1}/${n}${route ? ` (${route.profile})` : ""}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
+        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${label}${i + 1}/${n}${route ? ` (${route.profile})` : ""}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
         if (typeof res?.post_id !== "number") throw new Error("board_post returned no post_id");
         subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title, ...(route ? { profile: route.profile, agent: route.agent } : {}) });
       } catch (e) {
@@ -474,10 +507,10 @@ export class Factory {
     }
     if (this.cancelledBy.has(row.seq)) return "cancelled";
     this.store.fanOut(row, board, subtasks);
-    this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}`);
+    this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}${round > 1 ? `, round ${round}` : ""}`);
     const agents = [...new Set(subtasks.map((s) => s.agent ?? row.agent))];
     const as = agents.length === 1 ? `each run as \`${agents[0]}\`` : `each run as its profile's agent`;
-    await this.reply(row, `[factory] fanned out: ${n} subtasks on #${board}, ${as} with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
+    await this.reply(row, `[factory] fanned out${round > 1 ? `, round ${round}` : ""}: ${n} subtasks on #${board}, ${as} with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
     return null;
   }
 
@@ -736,7 +769,7 @@ export class Factory {
   // from the config as it is now. Daily caps are read in hold() and grant().
   private limitsFor(root: Row): Limits {
     const g = this.cfg.limits, f = root.source === "board" ? this.fleets().find((f) => f.name === root.persona)?.limits : undefined;
-    return { treeBudgetUsd: f?.treeBudgetUsd ?? g.treeBudgetUsd, deadlineMs: f?.deadlineMs ?? g.deadlineMs };
+    return { treeBudgetUsd: f?.treeBudgetUsd ?? g.treeBudgetUsd, deadlineMs: f?.deadlineMs ?? g.deadlineMs, maxRounds: f?.maxRounds ?? g.maxRounds ?? 1 };
   }
 
   private fleetOf(root: Row): Fleet | undefined {
@@ -779,7 +812,9 @@ export class Factory {
     if (lim.treeBudgetUsd !== undefined) {
       // A subtask shares what's left with its siblings still to run and the
       // synthesis, so fan-out stays parallel and the synthesis keeps a share.
-      const stages = row.parent !== null ? this.store.siblingsLeft(row.parent, row.seq) + 2 : 1;
+      // A review that may plan (#658) keeps a quarter: the rest is for its
+      // round (at least two subtasks) and the review after it.
+      const stages = row.parent !== null ? this.store.siblingsLeft(row.parent, row.seq) + 2 : row.phase === "synthesize" && this.canPlan(row) ? 4 : 1;
       const left = lim.treeBudgetUsd - this.store.treeSpent(root.seq);
       if (left / stages < MIN_GRANT_USD) return `stopped: the task's budget of $${lim.treeBudgetUsd} is spent ($${Math.max(0, lim.treeBudgetUsd - left).toFixed(2)} used)`;
       caps.push(left / stages);
@@ -838,8 +873,8 @@ export class Factory {
     if (row.state === "queued") state = `queued, ${this.holdNote(row.seq) ?? `${this.store.queuedAhead(row)} ahead`}`;
     else if (row.state === "running") state = open.length ? `running: ${this.runner.harness} agent \`${open[0]!.agent}\` for ${ago(open[0]!.started_at)}` : "running: starting";
     else if (row.state === "waiting") {
-      const asking = subs.filter((s) => s.state === "asking").length;
-      state = `fanned out on #${row.fanoutBoard}: ${subs.filter((s) => s.state === "finished").length} of ${subs.length} subtasks finished${asking ? `, ${asking} asking` : ""}`;
+      const cur = subs.filter((s) => s.round === row.round), asking = cur.filter((s) => s.state === "asking").length, m = this.limitsFor(row).maxRounds ?? 1;
+      state = `fanned out on #${row.fanoutBoard}${m > 1 ? `, round ${row.round} of ${m}` : ""}: ${cur.filter((s) => s.state === "finished").length} of ${cur.length} subtasks finished${asking ? `, ${asking} asking` : ""}`;
     } else if (row.state === "asking") state = `asking${row.askHuman ? " your user" : ""}: "${oneLine((row.question ?? "").split("\n")[0] ?? "")}", for ${ago(row.askedAt ?? Date.now())}`;
     else state = `finished: ${oneLine((row.reply ?? "").split("\n")[0] ?? "")}`;
     const done = runs.filter((r) => r.ended_at !== null);

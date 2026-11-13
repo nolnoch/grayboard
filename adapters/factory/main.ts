@@ -88,6 +88,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
       ...(o.treeBudgetUsd !== undefined ? { treeBudgetUsd: usd(o.treeBudgetUsd, at("treeBudgetUsd")) } : {}),
       ...(o.dailyBudgetUsd !== undefined ? { dailyBudgetUsd: usd(o.dailyBudgetUsd, at("dailyBudgetUsd")) } : {}),
       ...(o.deadlineMs !== undefined ? { deadlineMs: ms(o.deadlineMs, "deadlineMs") } : {}),
+      ...(o.maxRounds !== undefined ? { maxRounds: ms(o.maxRounds, "maxRounds") } : {}),
     };
   };
   const withLimits = (f: Fleet, o: Record<string, unknown>, what: string): Fleet => {

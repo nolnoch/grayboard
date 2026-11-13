@@ -18,7 +18,8 @@ import type { RunMeta } from "./runner.ts";
 // to resume (`resume` = 1, the answer in `answer`).
 export type State = "queued" | "running" | "waiting" | "asking" | "finished";
 // run: the request itself (a fan-out-capable one when `fanout`). synthesize:
-// a fanned-out request whose subtasks all finished, combining their results.
+// a fanned-out request whose subtasks all finished, combining their results;
+// with rounds left (#658) it's the lead's review, which may plan again.
 export type Phase = "run" | "synthesize";
 export type Row = Request & {
   seq: number; agent: string; state: State; reply: string | null; replied: boolean; created_at: number; updated_at: number;
