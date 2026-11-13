@@ -11,6 +11,7 @@ import { same } from "./core/model.js";
 
 export const METADATA = "grayboard.enrollment";
 const HASH = "enrollmentHash:";
+const LEGACY_INDEX = "rootSessionIDs";
 export type OpenCodeEnrollment = Enrollment & { mcpName: string; integrationID: string; connectionID: string };
 export function enrollmentHash(e: OpenCodeEnrollment) {
   const c = e.configuration;
@@ -36,6 +37,11 @@ export class Approval implements ApprovalPort<OpenCodeEnrollment> {
     return !!saved?.enabled && same(saved.enrollment, approval);
   }
   async saved() {
+    // Before #660 a shared `rootSessionIDs` index named the saved roots. Each
+    // root's fingerprint record already had its own key, so the scan below
+    // finds every root the index named, and any a lost update dropped from it;
+    // the index itself is retired here.
+    await this.ctx.storage.remove(LEGACY_INDEX);
     const hashes = new Map<string, unknown>();
     let after: string | undefined;
     do {
@@ -49,6 +55,9 @@ export class Approval implements ApprovalPort<OpenCodeEnrollment> {
       try { saved = (await this.metadata(id)).saved; }
       catch { result.push({ sessionID: id, approval: null, enabled: false }); continue; }
       const e = saved?.enrollment;
+      // A root saved under another MCP name is another location's plugin
+      // configuration (plugin storage is shared): not this one's to restore or report.
+      if (typeof e?.mcpName === "string" && e.mcpName !== this.mcpName) continue;
       const valid = !!e && e.version === 2 && e.sessionID === id && e.mcpName === this.mcpName && hash === enrollmentHash(e);
       result.push({ sessionID: id, approval: valid ? e! : null, enabled: !!saved?.enabled });
     }

@@ -8,7 +8,7 @@ import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
 import { observeEvents } from "../src/core/events.js";
 import { Wire, LAUNCHER_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
-import { Approval, METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
+import { Approval, METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
@@ -809,6 +809,35 @@ test("saving an approval prunes the saved roots that restore dropped", async () 
     expect(savedRoots(r.storage)).toEqual(["B"]);
   } finally { await restarted?.close(); await r.controller.close(); }
 });
+// Plugin storage is shared by every location, so a save prunes nothing it
+// can't show is gone: a root restore found ended but another location brought
+// back, an edited record, and a root another plugin configuration saved all stay.
+test("a save drops only saved roots still ended, keeps edited and foreign ones, and survives a failed drop (#660)", async () => {
+  const r = runtime(); let restarted: Controller | undefined;
+  try {
+    for (const id of ["X", "E", "O"]) r.nodes.set(id, { id, time: {}, metadata: {} });
+    for (const [id, name] of [["R", "be"], ["B", "fe"], ["X", "x"], ["E", "e"], ["O", "o"]] as const) { r.bind(id, name); await r.controller.enroll(id); }
+    await r.controller.close();
+    const back = r.nodes.get("R")!; r.nodes.delete("R"); r.nodes.delete("X");
+    r.storage.set("enrollmentHash:E", "edited");
+    const foreign = r.nodes.get("O")!.metadata[METADATA] as { enrollment: Enrollment };
+    foreign.enrollment = { ...foreign.enrollment, mcpName: "gb" }; r.storage.set("enrollmentHash:O", enrollmentHash(foreign.enrollment));
+    restarted = r.restart(); await restarted.restore();
+    expect(restarted.status().roots.find(root => root.sessionID === "E")?.message).toContain("Saved enrollment invalid");
+    expect(restarted.status().roots.find(root => root.sessionID === "O")?.message ?? "").not.toContain("Saved enrollment invalid");
+    // R's session resolves again (another location re-enrolled it); X's stays gone, but removing it fails once.
+    r.nodes.set("R", back);
+    const remove = r.ctx.storage.remove; let failed = 0;
+    r.ctx.storage.remove = async key => { failed++; throw new Error(`remove ${key}`); };
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(failed).toBe(1); expect(r.storage.get("paused:B")).toBe(false);
+    expect(savedRoots(r.storage)).toEqual(["B", "E", "O", "R", "X"]);
+    r.ctx.storage.remove = remove;
+    await restarted.close(); restarted = r.restart(); await restarted.restore();
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(savedRoots(r.storage)).toEqual(["B", "E", "O", "R"]);
+  } finally { await restarted?.close(); await r.controller.close(); }
+});
 // Two Controllers on one plugin storage are two OpenCode locations of one
 // shared service. Before #660 each save rewrote one shared root list with its
 // own Controller's roots, so the other location's root dropped out of restore.
@@ -827,6 +856,22 @@ test("one location's saves never drop another location's saved root (#660)", asy
     await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
     expect(restarted.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "paused", message: "Saved approval paused; explicitly enroll again" });
   } finally { await restarted?.close(); await other.close(); await r.controller.close(); }
+});
+// Storage written before #660: the shared index lost B to another location's
+// save, but B's fingerprint record stayed. Restore brings both roots back
+// without re-enrollment and retires the index.
+test("restore migrates the pre-#660 root index without re-enrollment", async () => {
+  const r = runtime(); let restarted: Controller | undefined;
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    await r.controller.enroll("R"); await r.controller.enroll("B");
+    await r.controller.close();
+    r.storage.set("rootSessionIDs", ["R"]);
+    restarted = r.restart(); await restarted.restore();
+    await until(() => ["R", "B"].every(id => restarted!.status().roots.find(root => root.sessionID === id)?.state === "active"));
+    expect(r.storage.has("rootSessionIDs")).toBe(false);
+    expect(savedRoots(r.storage)).toEqual(["B", "R"]);
+  } finally { await restarted?.close(); await r.controller.close(); }
 });
 test("ordinary native unbound result rebinds the durable name once with create:false", async () => {
   const r = runtime();

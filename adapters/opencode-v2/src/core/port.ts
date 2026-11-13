@@ -58,6 +58,6 @@ export interface ApprovalPort<E extends Enrollment> {
   // Restore input, one entry per saved root; `approval: null` is a saved
   // record that no longer verifies (edited), which restore reports and skips.
   saved(): Promise<Array<{ sessionID: string; approval: E | null; enabled: boolean }>>;
-  // Deletes a saved root's record that restore skipped (ended, or edited).
+  // Deletes the saved record of a root whose session has ended.
   drop(sessionID: string): Promise<void>;
 }
