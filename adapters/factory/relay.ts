@@ -1,4 +1,4 @@
-// Bus tools for children (#669, docs/factory.md §12): a relay, not a
+// Bus tools for children (#669, docs/factory.md §10): a relay, not a
 // session. A child never holds a bus name of its own (design decision 5);
 // with a profile's `busTools` on, its run gets a small stdio MCP server
 // (relay_shim.ts) that forwards each call over a Unix socket to the

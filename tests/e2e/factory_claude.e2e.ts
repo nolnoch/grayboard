@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeRunner } from "../../adapters/factory/claude/runner.ts";
+import { DATA_NOTE, RELAY_TOOLS, Relay, type Reader } from "../../adapters/factory/relay.ts";
 import { resolvePersona } from "../../adapters/factory/runner.ts";
 import { claudeCodeBin, claudeHome } from "../support/claude_code.ts";
 import { called, startFakeAnthropic, systemText, toolResults, userTexts } from "../support/fake_anthropic.ts";
@@ -176,5 +177,52 @@ test("claude runner: a resumed run continues the conversation with the answer (#
     expect(model.requests[0]!.body.tools?.map((x) => x.name)).toContain("Agent");
   } finally {
     model.stop();
+  }
+}, 120_000);
+
+// Bus tools (#669): a run given the relay's MCP server calls a relayed tool
+// unprompted and gets the reader's answer fenced as data; its --mcp-config
+// file goes when the run ends. A run without it has no MCP tool at all.
+test("claude runner: a run with the relay calls a bus tool unprompted; one without has none (#669)", async () => {
+  const calls: { tool: string; args: Record<string, unknown> }[] = [];
+  const reader = async (): Promise<Reader> => ({
+    call: async (tool, args = {}) => { calls.push({ tool, args }); return { board: "notes", posts: [{ id: 3, body: "BOARD-TEXT-3" }] }; },
+    close: async () => {},
+    closed: new Promise<void>(() => {}),
+  });
+  const relay = new Relay({ dir: join(dir, "relay"), shim: [process.execPath, join(import.meta.dir, "../../adapters/factory/relay_shim.ts")], reader, log: () => {} });
+  const model = startFakeAnthropic([
+    (q) => !userTexts(q).some((t) => t.includes("FACTORY-BUS")) ? undefined
+      : called(q, "toolu_bus") ? { text: "ended" } : { tool: "mcp__bus__board_read", id: "toolu_bus", input: { board: "notes", limit: 5, extra: "dropped" } },
+    (q) => (userTexts(q).some((t) => t.includes("FACTORY-NOBUS")) ? { text: "plain" } : undefined),
+  ]);
+  try {
+    const h = claudeHome(dir, model.url);
+    mkdirSync(join(h.config, "agents"), { recursive: true });
+    writeFileSync(join(h.config, "agents", "builder.md"), "---\nname: builder\ndescription: builds\n---\nAGENT-PROMPT-9\n");
+    const runner = new ClaudeRunner({ bin: claudeCodeBin(), cwd: h.work, env: h.env });
+    const agent = runner.roster()[0]!;
+    const g = await relay.grant();
+    const t = join(dir, "t.jsonl");
+    const out = await runner.run(agent, { id: 1, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-BUS" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, t, undefined, g.server);
+    g.revoke();
+    expect(out).toMatchObject({ ok: true, text: "ended" });
+    expect(model.unhandled).toEqual([]);
+    expect(calls).toEqual([{ tool: "board_read", args: { board: "notes", limit: 5 } }]);
+    const result = toolResults(model, "toolu_bus").join("\n");
+    expect(result).toContain(DATA_NOTE);
+    expect(result).toContain("BOARD-TEXT-3");
+    expect(existsSync(`${t}.mcp.json`)).toBe(false);
+    const names = model.requests.find((r) => userTexts(r.body).some((x) => x.includes("FACTORY-BUS")))!.body.tools?.map((x) => x.name) ?? [];
+    expect(names.filter((n) => n.startsWith("mcp__")).sort()).toEqual(RELAY_TOOLS.map((n) => `mcp__bus__${n}`).sort());
+
+    const plain = await runner.run(agent, { id: 2, source: "dm", requester: "sim", persona: "builder", task: "FACTORY-NOBUS" }, new AbortController().signal, { allowedTools: [] }, { cwd: h.work, addDirs: [] }, join(dir, "t2.jsonl"));
+    expect(plain).toMatchObject({ ok: true, text: "plain" });
+    const plainNames = model.requests.find((r) => userTexts(r.body).some((x) => x.includes("FACTORY-NOBUS")))!.body.tools?.map((x) => x.name) ?? [];
+    expect(plainNames.length).toBeGreaterThan(0);
+    expect(plainNames.filter((n) => n.startsWith("mcp__"))).toEqual([]);
+  } finally {
+    model.stop();
+    await relay.close();
   }
 }, 120_000);
