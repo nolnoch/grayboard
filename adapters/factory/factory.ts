@@ -80,7 +80,8 @@ export class Factory {
   private ticking = false;
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
-  private readonly work = new Map<string, Promise<string | null>>(); // work boards opened or opening (#665); a failed open is dropped to be tried again
+  private readonly work = new Map<string, Promise<string | null>>(); // work boards opened or opening (#665); a failed open or mute is dropped to be tried again
+  private readonly noFanout = new Set<string>(); // fleets whose work board's name is a queue board's, as the last sync saw them
   private readonly active = new Map<number, AbortController>(); // seq → its running child's controller
   private readonly planning = new Set<number>(); // reviews told they may plan (#658), so their grant keeps a quarter
   private readonly cancelledBy = new Map<number, Stop>(); // seq → what stopped it while it ran: a cancel (#651), a deadline or a spent tree budget (#655)
@@ -189,7 +190,7 @@ export class Factory {
       if (this.store.admitFinished(r, `[factory] declined: ${why}. Nothing was spawned.`)) await this.send(this.store.get(r)!);
       return;
     }
-    await this.admit(r, agent, `fleet "${fleet.name}"`, { fanout: fleet.fanout !== false });
+    await this.admit(r, agent, `fleet "${fleet.name}"`, { fanout: fleet.fanout !== false && !this.noFanout.has(fleet.name) });
   }
 
   private async admit(r: Request, agent: Agent, label: string, o: Admit = {}): Promise<void> {
@@ -222,10 +223,16 @@ export class Factory {
     const boards = new Map((Array.isArray(listed) ? listed : []).map((b: { name: string; kind?: string; mode?: string | null }) => [b.name, b]));
     // Built aside and swapped in at the end: a reload (#645) runs this while
     // deliveries arrive, and one seen mid-sync must not find its fleet gone.
-    const joined = new Map<string, Fleet>(), queues = new Set<string>();
+    const joined = new Map<string, Fleet>(), queues = new Set<string>(), noFanout = new Set<string>();
     for (const b of boards.values()) if (b.kind === "queue") queues.add(b.name);
     for (const f of this.fleets()) {
       const name = fleetBoard(f), b = boards.get(name);
+      // A queue board where its subtasks would go (#665): the fleet runs each
+      // task whole rather than pay for a triage whose plan can't be posted.
+      if (f.fanout !== false && boards.get(workBoard(f.name))?.kind === "queue") {
+        noFanout.add(f.name);
+        this.o.log(`fleet ${f.name}: #${workBoard(f.name)} is a queue board, so its tasks don't fan out; rename the fleet to give it a work board`);
+      }
       try {
         if (!b) await this.bus.call("board_create", { name, purpose: `Tasks for the ${f.name} fleet: each top-level post is one task, run by one lane; replies come in its thread.`, kind: "queue" });
         else if ((b.kind ?? "broadcast") !== "queue") { this.o.log(`fleet ${f.name}: #${name} exists as a ${b.kind ?? "broadcast"} board, not a queue; skipping it`); continue; }
@@ -238,6 +245,8 @@ export class Factory {
     }
     this.joined.clear();
     for (const [k, v] of joined) this.joined.set(k, v);
+    this.noFanout.clear();
+    for (const n of noFanout) this.noFanout.add(n);
     this.queues.clear();
     for (const q of queues) this.queues.add(q);
     for (const b of boards.values()) {
@@ -484,33 +493,41 @@ export class Factory {
   // factory's subscription: its posts and their threads are the factory's
   // to write, not to take. A queue board of that name would hand subtasks to
   // other lanes, so it's refused; a broadcast board someone else made is
-  // used as is. Concurrent fan-outs share one open. Returns why it couldn't,
-  // or null.
+  // used as is. Concurrent fan-outs share one open; a failed one, or a
+  // failed mute, is tried again on the next. Returns why it couldn't, or null.
   private openWork(name: string, fleet: string): Promise<string | null> {
     let p = this.work.get(name);
     if (!p) {
-      p = this.openWorkOnce(name, fleet).catch((e) => `couldn't open #${name} for the fan-out: ${msg(e)}`);
+      const o = this.openWorkOnce(name, fleet).catch((e) => ({ why: `couldn't open #${name} for the fan-out: ${msg(e)}`, keep: false }));
+      p = o.then((r) => r.why);
       this.work.set(name, p);
-      void p.then((why) => { if (why !== null) this.work.delete(name); });
+      void o.then((r) => { if (!r.keep) this.work.delete(name); });
     }
     return p;
   }
 
-  private async openWorkOnce(name: string, fleet: string): Promise<string | null> {
+  private async openWorkOnce(name: string, fleet: string): Promise<{ why: string | null; keep: boolean }> {
     for (let tries = 0; ; tries++) {
       const listed = await this.bus.call("board_list");
       const b = (Array.isArray(listed) ? listed : []).find((b: { name: string }) => b.name === name) as { kind?: string; mode?: string | null } | undefined;
-      if (b && b.kind === "queue") return `#${name}, where ${fleet}'s subtasks go, exists as a queue board, which would hand them to other lanes. Rename or remove it. Nothing was fanned out.`;
+      if (b && b.kind === "queue") return { why: `#${name}, where ${fleet}'s subtasks would go, is a queue board, which would hand them to other lanes; the ${fleet} fleet doesn't fan out while it is. Nothing was fanned out.`, keep: false };
       if (!b) {
         try {
           await this.bus.call("board_create", { name, purpose: `Subtasks the factory ${this.bus.handle} fans out for the ${fleet} fleet: one top-level post per subtask, naming the task it's part of, with its outcome in its thread.` });
         } catch (e) {
-          if (tries < 1 && /already exists/.test(msg(e))) continue; // another tree's fan-out made it first
-          return `couldn't open #${name} for the fan-out: ${msg(e)}`;
+          if (tries < 1 && /already exists/.test(msg(e))) continue; // another handle or process made it first
+          return { why: `couldn't open #${name} for the fan-out: ${msg(e)}`, keep: false };
         }
       }
-      if (b?.mode !== "off") await this.bus.call("board_subscribe", { board: name, mode: "off" }).catch((e) => this.o.log(`couldn't mute #${name}: ${msg(e)}`));
-      return null;
+      // Muting deletes the subscription, so a muted board lists with no mode.
+      if (b && (b.mode ?? "off") === "off") return { why: null, keep: true };
+      try {
+        await this.bus.call("board_subscribe", { board: name, mode: "off" });
+        return { why: null, keep: true };
+      } catch (e) {
+        this.o.log(`couldn't mute #${name}: ${msg(e)}`);
+        return { why: null, keep: false };
+      }
     }
   }
 
@@ -906,7 +923,7 @@ export class Factory {
       if (this.store.admitFinished(r, `[factory] declined: ${why}. Nothing was spawned.`)) await this.send(this.store.get(r)!);
       return;
     }
-    return this.admit(r, agent, `fleet "${fleet.name}"`, { fanout: fleet.fanout !== false });
+    return this.admit(r, agent, `fleet "${fleet.name}"`, { fanout: fleet.fanout !== false && !this.noFanout.has(fleet.name) });
   }
 
   // State, and the turns and cost of the tree's finished runs so far.

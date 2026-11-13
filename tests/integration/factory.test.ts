@@ -800,19 +800,45 @@ test("work board (#665): two trees on one fleet share #sim-work, opened and mute
   await done;
 });
 
-test("work board (#665): a queue board of that name refuses the fan-out; an existing broadcast board is used as is", async () => {
+test("work board (#665): a queue board of that name at sync turns the fleet's fan-out off; one made later refuses the plan; a broadcast one is used as is", async () => {
   const bus = new FakeBus();
-  bus.boards = [{ name: "sim-work", kind: "queue", mode: null }, { name: "lab-work", kind: "broadcast", mode: "off" }];
+  // A muted subscription lists with no mode (the core deletes it).
+  bus.boards = [{ name: "be-work", kind: "queue", mode: null }, { name: "lab-work", kind: "broadcast", mode: null }];
   const runner = new FakeRunner();
-  runner.script = (r) => ((r.id === 7 || r.id === 8) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
-  const { done } = loop({ bus, runner, fleets: [{ name: "sim", agent: "researcher" }, { name: "lab", agent: "researcher" }] });
+  runner.script = (r) => ([6, 7, 8].includes(r.id) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const { done, logs } = loop({ bus, runner, fleets: [{ name: "be", agent: "researcher" }, { name: "sim", agent: "researcher" }, { name: "lab", agent: "researcher" }] });
+  await until(() => bus.sent.some((c) => c.tool === "board_create" && c.args.name === "lab-tasks"), 5000, "the sync");
+  expect(logs).toContain("fleet be: #be-work is a queue board, so its tasks don't fan out; rename the fleet to give it a work board");
+  bus.boards = [...bus.boards, { name: "sim-work", kind: "queue", mode: null }]; // made after the sync saw none
+  bus.deliver(task(6, { board: "be-tasks" }));
+  await until(() => bus.replies(6).length === 2, 5000, "be's task, run whole");
+  expect(runner.inputs[0]).toBe("do 6"); // no fan-out instruction
+  expect(bus.replies(6)[1]).toStartWith("[factory] done: fake agent `researcher`\n\n````factory-plan");
   bus.deliver(task(7));
   bus.deliver(task(8, { board: "lab-tasks" }));
   await until(() => bus.replies(7).length === 2 && bus.replies(8).length === 3, 5000, "the refusal and the lab tree");
-  expect(bus.replies(7)[1]).toBe("[factory] failed: #sim-work, where sim's subtasks go, exists as a queue board, which would hand them to other lanes. Rename or remove it. Nothing was fanned out.");
-  expect(bus.sent.some((c) => c.tool === "board_post" && c.args.board === "sim-work")).toBe(false);
+  expect(bus.replies(7)[1]).toBe("[factory] failed: #sim-work, where sim's subtasks would go, is a queue board, which would hand them to other lanes; the sim fleet doesn't fan out while it is. Nothing was fanned out.");
+  expect(bus.sent.some((c) => c.tool === "board_post" && (c.args.board === "sim-work" || c.args.board === "be-work"))).toBe(false);
   expect(bus.replies(8)[1]).toStartWith("[factory] fanned out: 2 subtasks on #lab-work (posts ");
   expect(bus.sent.some((c) => (c.tool === "board_create" || c.tool === "board_subscribe") && String(c.args.name ?? c.args.board).endsWith("-work"))).toBe(false);
+  await bus.close();
+  await done;
+});
+
+test("work board (#665): a failed mute is tried again on the next fan-out, which still posts", async () => {
+  const bus = new FakeBus();
+  let mutes = 0;
+  bus.refuse = (tool, args) => tool === "board_subscribe" && args.board === "sim-work" && ++mutes === 1;
+  const runner = new FakeRunner();
+  runner.script = (r) => ((r.id === 7 || r.id === 8) && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const { done, logs } = loop({ bus, runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "the first tree");
+  bus.deliver(task(8));
+  await until(() => bus.replies(8).length === 3, 5000, "the second tree");
+  expect(logs.filter((l) => l.startsWith("couldn't mute #sim-work"))).toHaveLength(1);
+  expect(mutes).toBe(2);
+  expect(bus.replies(7)[1]).toStartWith("[factory] fanned out: 2 subtasks on #sim-work (posts ");
   await bus.close();
   await done;
 });
