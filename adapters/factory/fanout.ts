@@ -5,7 +5,8 @@
 // carrying ordinary code fences still parses.
 import { DATA_FENCE } from "./delegate.ts";
 
-export type Subtask = { title: string; task: string };
+// `profile`: which of the project's profiles runs it (#645); absent, the lead's.
+export type Subtask = { title: string; task: string; profile?: string };
 export type Plan = { subtasks: Subtask[] };
 
 const OPEN = `${DATA_FENCE}factory-plan\n`;
@@ -19,18 +20,23 @@ const MAX_RESULT_CHARS = 16 * 1024;
 // Appended to a fan-out-capable task. Doing the task is the default; a plan
 // is for work that splits into parts worth running in parallel. `ownDirs`:
 // each subtask gets a working directory of its own (#641), not this run's.
-export function triageInstruction(max: number, ownDirs = false): string {
+//
+// `profiles` (#645): the project's profiles a subtask may name, each with
+// what it can do; listed only when there's a choice to make.
+export function triageInstruction(max: number, ownDirs = false, profiles: { name: string; agent: string; tools: string }[] = []): string {
+  const routed = profiles.length > 1;
+  const tools = routed ? "the tools of its profile" : "the same tools as you";
+  const dir = ownDirs ? "a working directory of its own that starts without your files" : "your working directory";
   return [
     "## Before you start",
     "",
     `If this task splits into 2 to ${max} independent parts that separate agents could do in parallel, and doing it that way is clearly better, don't do the task. Reply with only a plan, in exactly this form:`,
     "",
-    `${OPEN}{"subtasks": [{"title": "a short title", "task": "everything that agent needs: it sees only its own task text"}]}`,
+    `${OPEN}{"subtasks": [{"title": "a short title", "task": "everything that agent needs: it sees only its own task text"${routed ? `, "profile": "${profiles[0]!.name}"` : ""}}]}`,
     DATA_FENCE,
     "",
-    ownDirs
-      ? "Each subtask's agent has the same tools as you, a working directory of its own that starts without your files, and none of this conversation. Otherwise, do the task yourself and reply with the result."
-      : "Each subtask's agent has the same tools and working directory as you, and none of this conversation. Otherwise, do the task yourself and reply with the result.",
+    ...(routed ? [`"profile" picks who runs a subtask; without it, \`${profiles[0]!.name}\` does. Name only one of these: ${profiles.map((p) => `\`${p.name}\` (agent ${p.agent}; tools: ${p.tools})`).join(", ")}. A plan naming any other fails.`, ""] : []),
+    `Each subtask's agent has ${tools}, ${dir}, and none of this conversation. Otherwise, do the task yourself and reply with the result.`,
   ].join("\n");
 }
 
@@ -51,10 +57,11 @@ export function parsePlan(text: string, max: number): Plan | string | null {
   if (list.length < 2 || list.length > max) return `the plan has ${list.length} subtasks; it needs 2 to ${max}`;
   const subtasks: Subtask[] = [];
   for (const [i, s] of list.entries()) {
-    const x = s as { title?: unknown; task?: unknown } | null;
+    const x = s as { title?: unknown; task?: unknown; profile?: unknown } | null;
     if (typeof x?.title !== "string" || !x.title.trim() || typeof x.task !== "string" || !x.task.trim()) return `subtask ${i + 1} needs a non-empty "title" and "task"`;
     if (new TextEncoder().encode(x.task).length > MAX_SUBTASK_BYTES) return `subtask ${i + 1}'s task is over ${MAX_SUBTASK_BYTES / 1024} KiB`;
-    subtasks.push({ title: x.title.replace(/[\r\n]+/g, " ").trim().slice(0, MAX_TITLE), task: x.task.trim() });
+    if (x.profile !== undefined && (typeof x.profile !== "string" || !x.profile.trim())) return `subtask ${i + 1}'s "profile" must be a non-empty string`;
+    subtasks.push({ title: x.title.replace(/[\r\n]+/g, " ").trim().slice(0, MAX_TITLE), task: x.task.trim(), ...(typeof x.profile === "string" ? { profile: x.profile.trim() } : {}) });
   }
   return { subtasks };
 }

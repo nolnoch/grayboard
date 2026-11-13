@@ -9,7 +9,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } from "../../adapters/factory/bus.ts";
 import { parseDelegation, requestOf, type Request } from "../../adapters/factory/delegate.ts";
-import { Factory, type Fleet } from "../../adapters/factory/factory.ts";
+import { Database } from "bun:sqlite";
+import { Factory, type Fleet, type Route } from "../../adapters/factory/factory.ts";
 import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
 import { DEFAULTS, loadConfig } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "../../adapters/factory/runner.ts";
@@ -187,8 +188,8 @@ test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", 
   const pc = loadConfig(dir, {});
   expect(pc.profiles.map((p) => p.name)).toEqual(["code", "research"]);
   expect(pc.fleets).toEqual([
-    { name: "app", agent: "coder", profile: "code", policy: { tools: ["Bash", "Read"], allowedTools: ["Bash"] }, workdir: { mode: "scratch" } },
-    { name: "lab", agent: "researcher", fanout: false, profile: "research", policy: { tools: ["Read"], allowedTools: [] }, workdir: { mode: "scratch" } }, // tools fall back to the global list, field by field
+    { name: "app", agent: "coder", profile: "code", policy: { tools: ["Bash", "Read"], allowedTools: ["Bash"] }, workdir: { mode: "scratch" }, routes: [{ profile: "code", agent: "coder", policy: { tools: ["Bash", "Read"], allowedTools: ["Bash"] }, workdir: { mode: "scratch" } }] },
+    { name: "lab", agent: "researcher", fanout: false, profile: "research", policy: { tools: ["Read"], allowedTools: [] }, workdir: { mode: "scratch" }, routes: [{ profile: "research", agent: "researcher", policy: { tools: ["Read"], allowedTools: [] }, workdir: { mode: "scratch" } }] }, // tools fall back to the global list, field by field
     { name: "old", agent: "x" }, // no profile: the global lists at run time
   ]);
   for (const bad of [{ maxSubtasks: 1 }, { fleets: [{ name: "a", agent: "x", fanout: "yes" }] },
@@ -277,7 +278,7 @@ function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; t
   const logs: string[] = [];
   const f = new Factory(bus, store, runner, { policy: GLOBAL, ...wd(o.workdir), fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m) });
   const done = f.run();
-  return { bus, runner, store, logs, done };
+  return { bus, runner, store, logs, done, f };
 }
 const ask = (id: number, persona = "a researcher", from = "sim") => dm(id, from, delegationBody({ requester: from, persona, task: `task ${id}` }));
 
@@ -649,7 +650,7 @@ test("fan-out: a plan opens a task board, runs each subtask once with its outcom
   expect(subPosts).toEqual(["[factory] subtask 1/2: part 1\n\ndo part 1", "[factory] subtask 2/2: part 2\n\ndo part 2"]);
   const [, s1, s2] = runner.runs.map((r) => r.id); // the subtasks' post ids (the fake bus numbers every post)
   expect(bus.replies(s1!)).toEqual([`[factory] done: fake agent \`researcher\`\n\nresult for ${s1}`]);
-  expect(bus.replies(s2!)).toEqual([`[factory] done: fake agent \`researcher\`\n\nresult for ${s2}`]);
+  expect(bus.replies(s2)).toEqual([`[factory] done: fake agent \`researcher\`\n\nresult for ${s2}`]);
   expect(runner.runs.map((r) => r.id)).toEqual([7, s1, s2, 7]);
   expect(runner.inputs[0]).toContain("## Before you start");          // the task's run may plan
   expect(runner.inputs[1]).toBe("do part 1");                          // a subtask's run may not
@@ -804,11 +805,125 @@ test("loop: scratch mode runs a fan-out's request, subtasks and synthesis in the
   bus.deliver(task(20, { board: "ro-tasks" }));
   await until(() => bus.replies(20).length === 2, 5000, "shared fleet task");
   expect(runner.places[4]).toEqual({ cwd: join(dir, "work"), addDirs: [] });
-  expect(runner.inputs[4]).toContain("same tools and working directory as you");
+  expect(runner.inputs[4]).toContain("the same tools as you, your working directory");
   bus.deliver(task(30, { board: "bad-tasks" }));
   await until(() => bus.replies(30).length === 2, 5000, "worktree failure");
   expect(bus.replies(30)[1]).toStartWith("[factory] failed: couldn't make the worktree working directory: git rev-parse");
   expect(runner.runs.map((r) => r.id)).not.toContain(30);
   await bus.close();
   await done;
+});
+
+// ── projects (#645) ──────────────────────────────────────────────────────────
+
+test("config: a project routes to its profiles, lead first; its repo replaces theirs; a bad one is refused (#645)", () => {
+  const repo = join(dir, "repo"), other = join(dir, "other");
+  mkdirSync(repo);
+  mkdirSync(other);
+  const profiles = [{ name: "lead", agent: "planner", tools: ["Read"] }, { name: "code", agent: "coder", tools: ["Bash", "Read"], allowedTools: ["Bash"], workdir: "worktree", repo: "other" }, { name: "docs", agent: "writer" }];
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ allowedTools: ["Read"], profiles, projects: [{ name: "app", lead: "lead", profiles: ["code", "lead"], repo: "repo", fanout: false }], fleets: [{ name: "d", profile: "docs" }] }));
+  const c = loadConfig(dir, {});
+  const lead: Route = { profile: "lead", agent: "planner", policy: { tools: ["Read"], allowedTools: ["Read"] }, workdir: { mode: "scratch", repo } };
+  const code: Route = { profile: "code", agent: "coder", policy: { tools: ["Bash", "Read"], allowedTools: ["Bash"] }, workdir: { mode: "worktree", repo } }; // the project's repo, not the profile's
+  expect(c.fleets).toEqual([
+    { name: "d", agent: "writer", profile: "docs", policy: { allowedTools: ["Read"] }, workdir: { mode: "scratch" }, routes: [{ profile: "docs", agent: "writer", policy: { allowedTools: ["Read"] }, workdir: { mode: "scratch" } }] },
+    { name: "app", agent: "planner", fanout: false, profile: "lead", policy: lead.policy, workdir: lead.workdir, routes: [lead, code] },
+  ]);
+  for (const bad of [
+    { profiles, projects: [{ name: "d", lead: "lead", profiles: ["lead"] }], fleets: [{ name: "d", agent: "x" }] }, // the fleet's board
+    { profiles, projects: [{ name: "a", lead: "lead", profiles: ["lead"] }, { name: "a", lead: "lead", profiles: ["lead"] }] },
+    { profiles, projects: [{ name: "a", lead: "docs", profiles: ["lead"] }] },
+    { profiles, projects: [{ name: "a", profiles: ["lead"] }] },
+    { profiles, projects: [{ name: "a", lead: "lead", profiles: ["lead", "nope"] }] },
+    { profiles, projects: [{ name: "a", lead: "lead", profiles: [] }] },
+    { profiles, projects: [{ name: "a", lead: "lead", profiles: ["lead", "lead"] }] },
+    { profiles, projects: [{ name: "a", lead: "lead", profiles: ["lead"], repo: "nope" }] },
+    { profiles, projects: [{ name: "a", lead: "lead", profiles: ["lead"], fanout: 1 }] },
+    { profiles, projects: [{ name: "A", lead: "lead", profiles: ["lead"] }] },
+    { profiles, projects: {} },
+  ]) {
+    writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
+    expect(() => loadConfig(dir, {})).toThrow();
+  }
+});
+
+const LEAD: Policy = { tools: ["Read"], allowedTools: ["Read"] };
+const CODE: Policy = { tools: ["Bash", "Read"], allowedTools: ["Bash"] };
+const project = (routes: Route[] = [{ profile: "lead", agent: "researcher", policy: LEAD, workdir: SHARED }, { profile: "code", agent: "coder", policy: CODE, workdir: SHARED }]): Fleet =>
+  ({ name: "sim", agent: routes[0]!.agent, profile: routes[0]!.profile, policy: routes[0]!.policy, workdir: routes[0]!.workdir, routes });
+const ROUTED = (subtasks: { title: string; task: string; profile?: string }[]) => `\`\`\`\`factory-plan\n${JSON.stringify({ subtasks })}\n\`\`\`\``;
+
+test("projects: the lead's triage lists the profiles; a routed subtask runs as its profile's agent under its policy, an unrouted one as the lead (#645)", async () => {
+  const runner = new FakeRunner(["researcher", "coder"]);
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? ROUTED([{ title: "a", task: "do a", profile: "code" }, { title: "b", task: "do b" }]) : undefined);
+  const { bus, done } = loop({ runner, fleets: [project()] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, done");
+  expect(runner.inputs[0]).toContain('"profile" picks who runs a subtask; without it, `lead` does.');
+  expect(runner.inputs[0]).toContain("`code` (agent coder; tools: Bash, Read)");
+  expect(bus.replies(7)[1]).toContain("each run as its profile's agent");
+  const subPosts = bus.sent.filter((c) => c.tool === "board_post" && c.args.board === "task-7" && c.args.parent_id === undefined).map((c) => c.args.body);
+  expect(subPosts).toEqual(["[factory] subtask 1/2 (code): a\n\ndo a", "[factory] subtask 2/2: b\n\ndo b"]);
+  const byTask = new Map(runner.inputs.map((t, i) => [t, { agent: runner.runs[i]!.agent, policy: runner.policies[i] }]));
+  expect(byTask.get("do a")).toEqual({ agent: "coder", policy: CODE });
+  expect(byTask.get("do b")).toEqual({ agent: "researcher", policy: LEAD });
+  const s1 = runner.runs.find((r) => r.agent === "coder")!.id;
+  expect(bus.replies(s1)).toEqual([`[factory] done: fake agent \`coder\`\n\nresult for ${s1}`]);
+  expect(runner.runs.at(-1)).toEqual({ agent: "researcher", id: 7 }); // the lead synthesizes
+  await bus.close();
+  await done;
+});
+
+test("projects: a plan naming a profile outside the project fails with nothing posted; a lone-profile fleet gets no routing text (#645)", async () => {
+  const runner = new FakeRunner(["researcher", "coder"]);
+  runner.script = (r) => (r.id === 7 ? ROUTED([{ title: "a", task: "do a", profile: "ops" }, { title: "b", task: "do b" }]) : undefined);
+  const solo: Fleet = { name: "solo", agent: "researcher", profile: "lead", policy: LEAD, workdir: SHARED, routes: [{ profile: "lead", agent: "researcher", policy: LEAD, workdir: SHARED }] };
+  const { bus, done } = loop({ runner, fleets: [project(), solo] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 2, 5000, "the failure");
+  expect(bus.replies(7)[1]).toBe('[factory] failed: subtask 1 names profile "ops", which isn\'t one of sim\'s (lead, code). Nothing was fanned out.');
+  expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).startsWith("task-"))).toBe(false);
+  bus.deliver(task(8, { board: "solo-tasks" }));
+  await until(() => bus.replies(8).length === 2, 5000, "solo task");
+  expect(runner.inputs[1]).toContain("## Before you start");
+  expect(runner.inputs[1]).not.toContain('"profile"');
+  await bus.close();
+  await done;
+});
+
+test("projects: a reload adds a fleet's board, and a queued subtask whose profile it removed fails without a run (#645)", async () => {
+  const runner = new FakeRunner(["researcher", "coder"], true);
+  const { bus, f, store, done } = loop({ runner, fleets: [project()], maxConcurrent: 1 });
+  bus.deliver(task(7));
+  await until(() => runner.gates.has(7), 5000, "the lead's run");
+  runner.gates.get(7)!.resolve({ ok: true, text: ROUTED([{ title: "a", task: "do a" }, { title: "b", task: "do b", profile: "code" }]) });
+  await until(() => runner.runs.length === 2, 5000, "subtask 1 running, subtask 2 queued");
+  const subs = store.subtasks(store.get({ source: "board", id: 7 })!.seq);
+  const s1 = subs.find((x) => x.profile === null)!.id, s2 = subs.find((x) => x.profile === "code")!.id;
+  expect(runner.runs[1]!.id).toBe(s1);
+  await f.reconfigure({ fleets: [project([{ profile: "lead", agent: "researcher", policy: LEAD, workdir: SHARED }]), { name: "new", agent: "researcher" }], policy: GLOBAL, workdir: SHARED });
+  expect(bus.sent.some((c) => c.tool === "board_create" && c.args.name === "new-tasks" && c.args.kind === "queue")).toBe(true);
+  runner.gates.get(s1)!.resolve({ ok: true, text: "a done" });
+  await until(() => bus.replies(s2).length === 1, 5000, "the removed profile's subtask fails");
+  expect(bus.replies(s2)[0]).toBe('[factory] failed: profile "code" is no longer one of sim\'s; nothing was spawned.');
+  await until(() => runner.gates.has(7) && runner.runs.length === 3, 5000, "synthesis");
+  expect(runner.runs.map((r) => r.agent)).toEqual(["researcher", "researcher", "researcher"]); // the coder never ran
+  runner.gates.get(7)!.resolve({ ok: true, text: "combined" });
+  await until(() => bus.replies(7).length === 3, 5000, "the combined result");
+  await bus.close();
+  await done;
+});
+
+test("store: a store written before projects opens with the profile column added, its rows unrouted (#645)", () => {
+  const path = join(dir, "old.db");
+  const db = new Database(path, { create: true, strict: true });
+  db.exec(`CREATE TABLE requests (seq INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, id INTEGER NOT NULL, board TEXT, requester TEXT NOT NULL, persona TEXT NOT NULL, task TEXT NOT NULL, context TEXT, agent TEXT NOT NULL, state TEXT NOT NULL, reply TEXT, replied INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, phase TEXT NOT NULL DEFAULT 'run', fanout INTEGER NOT NULL DEFAULT 0, parent INTEGER, title TEXT, fanout_board TEXT, UNIQUE (source, id))`);
+  db.exec(`INSERT INTO requests (source, id, board, requester, persona, task, agent, state, created_at, updated_at) VALUES ('board', 5, 'sim-tasks', 'fe', 'sim', 'old task', 'researcher', 'queued', 1, 1)`);
+  db.close();
+  const store = new Store(path);
+  expect(store.get({ source: "board", id: 5 })).toMatchObject({ task: "old task", profile: null });
+  const parent = store.get({ source: "board", id: 5 })!;
+  store.fanOut(parent, "task-5", [{ r: { source: "board", board: "task-5", id: 6, requester: "fe", persona: "sim", task: "t" }, title: "t", profile: "code", agent: "coder" }]);
+  expect(store.get({ source: "board", id: 6 })).toMatchObject({ profile: "code", agent: "coder", parent: parent.seq });
+  store.close();
 });
