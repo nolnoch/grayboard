@@ -264,6 +264,7 @@ class FakeBus implements FactoryBus {
   private nextPost = 1000;
   private nextMsg = 5000;
   delayMs = 0;
+  pause: Promise<void> | null = null; // every call waits on it while set
   private q: Delivery[] = [];
   private wake: (() => void) | null = null;
   private done = false;
@@ -274,6 +275,7 @@ class FakeBus implements FactoryBus {
     const no = this.fail || this.refuse(tool, args);
     if (no) throw new Error(typeof no === "string" ? no : "bus down");
     if (this.delayMs) await Bun.sleep(this.delayMs);
+    if (this.pause) await this.pause;
     this.sent.push({ tool, args });
     if (tool === "board_post") return { post_id: this.nextPost++ };
     if (tool === "dm_send") return { message_id: this.nextMsg++ };
@@ -1929,6 +1931,116 @@ test("rounds: a tree fanned out before rounds existed only combines, whatever ma
   expect(runner.inputs[0]).not.toContain("reply instead with only a plan");
   expect(runner.inputs[0]).toContain("### 1. t6\n\nr6");
   expect(bus.replies(5)[0]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-5\n\n````factory-plan");
+  await bus.close();
+  await done;
+});
+
+test("rounds (#664): a review that asks keeps its notes block for the next review; status names the round", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  const leadRuns = () => runner.runs.filter((x) => x.id === 7).length;
+  const { bus, store, done } = loop({ runner, maxConcurrent: 3, fleets: [{ name: "sim", agent: "researcher", limits: { maxRounds: 2 } }] });
+  const subs = (round: number) => store.subtasks(store.get({ source: "board", id: 7 })!.seq).filter((x) => x.round === round);
+  const finishRound = async (round: number) => {
+    await until(() => subs(round).length === 2 && subs(round).every((x) => runner.gates.has(x.id)), 5000, `round ${round}'s subtasks run`);
+    for (const x of subs(round)) runner.gates.get(x.id)!.resolve({ ok: true, text: `out ${x.id}` });
+  };
+  bus.deliver(task(7));
+  await until(() => leadRuns() === 1, 5000, "the triage");
+  runner.gates.get(7)!.resolve({ ok: true, text: `${PLAN()}${NOTES("NOTE-ONE")}` });
+  await finishRound(1);
+  await until(() => leadRuns() === 2, 5000, "the first review");
+  runner.gates.get(7)!.resolve({ ok: true, text: `${ASK("another round?")}${NOTES("NOTE-TWO")}` });
+  await until(() => bus.replies(7).length === 3, 5000, "the review's question");
+  expect(bus.replies(7)[2]).toContain("another round?");
+  expect(store.get({ source: "board", id: 7 })!.notes).toBe("NOTE-TWO");
+  bus.deliver({ ...task(80, { parentId: bus.replyId(7, 2), from: "fe" }), body: "yes" });
+  await until(() => leadRuns() === 3, 5000, "the review resumes");
+  expect(runner.raw.at(-1)).toContain("yes");
+  runner.gates.get(7)!.resolve({ ok: true, text: PLAN() });
+  await until(() => bus.replies(7).some((b) => b.startsWith("[factory] fanned out, round 2:")), 5000, "round 2");
+  bus.deliver({ ...task(81, { parentId: 7, from: "be" }), body: "status" });
+  await until(() => bus.replies(81).length === 1, 5000, "status");
+  expect(bus.replies(81)[0]).toStartWith("[factory] status: fanned out on #sim-work");
+  expect(bus.replies(81)[0]).toContain(", round 2 of 2: 0 of 2 subtasks finished.");
+  await finishRound(2);
+  await until(() => leadRuns() === 4, 5000, "the last review");
+  expect(runner.inputs.at(-1)).toContain("NOTE-TWO"); // the asking review's notes reach the next review
+  runner.gates.get(7)!.resolve({ ok: true, text: "final" });
+  await until(() => (bus.replies(7).at(-1) ?? "").startsWith("[factory] done:"), 5000, "done");
+  expect(bus.replies(7).at(-1)).toBe("[factory] done: fake agent `researcher`, combining 4 subtasks over 2 rounds on #sim-work\n\nfinal");
+  expect(bus.sent.some((c) => String(c.args.body ?? "").includes("factory-notes"))).toBe(false);
+  await bus.close();
+  await done;
+});
+
+test("rounds (#664): a cancel that lands while a review's round-2 plan is posted runs none of it", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 ? PLAN() : undefined);
+  const bus = new FakeBus();
+  const gate = Promise.withResolvers<void>();
+  bus.refuse = (tool, args) => {
+    if (tool === "board_post" && String(args.body).startsWith("[factory] subtask 2.1/2")) {
+      bus.pause = gate.promise; // the plan's posting stops here until the cancel has landed
+      bus.deliver({ ...task(90, { parentId: 7, from: "fe" }), body: "cancel" });
+    }
+    return false;
+  };
+  const { store, done, f } = loop({ runner, bus, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { maxRounds: 2 } }] });
+  bus.deliver(task(7));
+  const cancelled = () => (f as unknown as { cancelledBy: Map<number, unknown> }).cancelledBy.size > 0;
+  await until(() => bus.pause !== null && cancelled(), 5000, "the cancel lands mid-post");
+  bus.pause = null;
+  gate.resolve();
+  await until(() => bus.replies(7).some((b) => b.startsWith("[factory] cancelled:")), 5000, "the cancel's reply");
+  expect(bus.replies(7).at(-1)).toBe("[factory] cancelled: by fe while its round 2 plan was being posted on #sim-work; no subtask of it ran.");
+  const root = store.get({ source: "board", id: 7 })!;
+  expect(root.state).toBe("finished");
+  expect(store.subtasks(root.seq).map((x) => x.round)).toEqual([1, 1]); // round 2's posts went up, but no row
+  expect(runner.runs.map((r) => r.id).filter((id) => id !== 7)).toHaveLength(2); // only round 1's subtasks ran
+  await bus.close();
+  await done;
+});
+
+test("rounds (#664): a project's review may route its round-2 plan, and a routed subtask runs as its profile", async () => {
+  const runner = new FakeRunner(["researcher", "coder"]);
+  const leadRuns = () => runner.runs.filter((x) => x.id === 7).length;
+  runner.script = (r) => r.id !== 7 ? undefined
+    : leadRuns() === 1 ? ROUTED([{ title: "a", task: "do a" }, { title: "b", task: "do b" }])
+      : leadRuns() === 2 ? ROUTED([{ title: "c", task: "do c", profile: "code" }, { title: "d", task: "do d" }])
+        : "final";
+  const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ ...project(), limits: { maxRounds: 2 } }] });
+  bus.deliver(task(7));
+  await until(() => (bus.replies(7).at(-1) ?? "").startsWith("[factory] done:"), 5000, "done");
+  expect(bus.replies(7)[2]).toStartWith("[factory] fanned out, round 2: 2 subtasks on #sim-work (posts ");
+  expect(bus.replies(7)[2]).toContain("each run as its profile's agent");
+  const review = runner.inputs[3]!; // triage, a, b, then the first review
+  expect(review).toContain("`code` (agent coder; tools: Bash, Read)");
+  const byTask = new Map(runner.inputs.map((t, i) => [t, { agent: runner.runs[i]!.agent, policy: runner.policies[i] }]));
+  expect(byTask.get("do c")).toEqual({ agent: "coder", policy: CODE });
+  expect(byTask.get("do d")).toEqual({ agent: "researcher", policy: LEAD });
+  await bus.close();
+  await done;
+});
+
+test("rounds (#664): a restart mid round 2 interrupts the running subtask, runs the queued one, and the last review combines both rounds", async () => {
+  const s = new Store(":memory:");
+  const sub = (id: number): { r: Request; title: string } => ({ r: { id, source: "board", board: "sim-work", requester: "fe", persona: "sim", task: `part ${id}` }, title: `t${id}` });
+  s.admit({ id: 7, source: "board", board: "sim-tasks", requester: "fe", persona: "sim", task: "big" }, "researcher", { fanout: true });
+  s.fanOut(s.next()!, "sim-work", [sub(100), sub(101)]);
+  for (const r of [s.next()!, s.next()!]) s.finish(r, `done ${r.id}`);
+  expect(s.synthesizeWhenDone(s.get({ source: "board", id: 7 })!.seq)).toBe(true);
+  s.fanOut(s.next()!, "sim-work", [sub(102), sub(103)]); // the first review planned round 2
+  expect(s.next()).toMatchObject({ id: 102, round: 2 }); // 102 was running when the process died; 103 never started
+  const runner = new FakeRunner();
+  runner.script = () => PLAN(); // the last review may not plan: its plan is its answer
+  const { bus, done } = loop({ runner, store: s, fleets: [{ name: "sim", agent: "researcher", limits: { maxRounds: 2 } }] });
+  await until(() => bus.replies(7).length === 1, 5000, "the last review");
+  expect(bus.replies(102)[0]).toStartWith("[factory] interrupted:");
+  expect(bus.replies(103)).toEqual(["[factory] done: fake agent `researcher`\n\n" + PLAN()]);
+  expect(runner.runs.map((r) => r.id)).toEqual([103, 7]);
+  expect(runner.inputs[1]).toContain("This is the review of round 2.");
+  expect(runner.inputs[1]).toContain("[factory] interrupted:");
+  expect(bus.replies(7)[0]).toStartWith("[factory] done: fake agent `researcher`, combining 4 subtasks over 2 rounds on #sim-work\n\n````factory-plan");
   await bus.close();
   await done;
 });
