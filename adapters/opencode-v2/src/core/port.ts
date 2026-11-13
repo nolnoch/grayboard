@@ -50,11 +50,14 @@ export interface CredentialPort<E extends Enrollment> {
 }
 export interface ApprovalPort<E extends Enrollment> {
   key(e: E): string;                                   // OpenCode: enrollmentHash
-  // `roots`: every live root's sessionID, `e`'s included. The saved root list
-  // becomes exactly these, so a root restore dropped (ended, or edited) is pruned.
-  save(e: E, approval: E, enabled: boolean, roots: readonly string[]): Promise<void>;
+  // Writes `e`'s own saved record only. No call rewrites another root's record,
+  // so a concurrent save (another OpenCode location on the same plugin
+  // storage) can never drop it (#660).
+  save(e: E, approval: E, enabled: boolean): Promise<void>;
   approved(e: E, approval: E): Promise<boolean>;
   // Restore input, one entry per saved root; `approval: null` is a saved
   // record that no longer verifies (edited), which restore reports and skips.
   saved(): Promise<Array<{ sessionID: string; approval: E | null; enabled: boolean }>>;
+  // Deletes a saved root's record that restore skipped (ended, or edited).
+  drop(sessionID: string): Promise<void>;
 }

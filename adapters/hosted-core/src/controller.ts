@@ -86,6 +86,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   private readonly place: string;
   private readonly wait: Wait;
   private readonly configured?: { name: string; create: boolean };
+  // Saved roots restore skipped (ended, or edited): the next save drops their
+  // records, as the whole-list save pruned them before #660.
+  private readonly skipped = new Set<string>();
   constructor(readonly port: HostPort<E>, options: ControllerOptions = {}) {
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep;
@@ -181,7 +184,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   private async save(r: Root<E>, enabled: boolean) {
     if (!this.port.approval) return;
     await this.activeRoot(r.e.sessionID);
-    await this.port.approval.save(r.e, r.approval, enabled, [...new Set([...this.roots.keys(), r.e.sessionID])]);
+    await this.port.approval.save(r.e, r.approval, enabled);
+    this.skipped.delete(r.e.sessionID);
+    for (const id of this.skipped) { await this.port.approval.drop(id); this.skipped.delete(id); }
     await this.port.storage.set(`paused:${r.e.sessionID}`, !enabled);
   }
   private async guard(r: Root<E>, epoch: number, signal: AbortSignal) {
@@ -604,8 +609,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       if (this.stopped) continue;
       try {
         try { await this.activeRoot(id); }
-        catch { continue; }
-        if (!saved.approval) throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`);
+        catch { this.skipped.add(id); continue; }
+        if (!saved.approval) { this.skipped.add(id); throw new Refusal("root", `Saved enrollment was edited; ${this.hint}`); }
         const e = saved.approval;
         const previous = this.status().roots.find(record => record.sessionID === id);
         // A pause for an access token the host rotates itself isn't a refusal

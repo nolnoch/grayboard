@@ -8,7 +8,7 @@ import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
 import { observeEvents } from "../src/core/events.js";
 import { Wire, LAUNCHER_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
-import { METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
+import { Approval, METADATA, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
@@ -72,7 +72,12 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
   }
   const ctx = {
     ...f.ctx, location: { directory: "/worktree" },
-    storage: { get: async (key: string) => storage.get(key), set: async (key: string, value: unknown) => { storage.set(key, structuredClone(value)); } },
+    // One entry per scan page, so every restore walks OpenCode's `next` cursor.
+    storage: { get: async (key: string) => storage.get(key), set: async (key: string, value: unknown) => { storage.set(key, structuredClone(value)); }, remove: async (key: string) => { storage.delete(key); },
+      scan: async ({ prefix, after }: { prefix: string; after?: string }) => {
+        const keys = [...storage.keys()].filter(key => key.startsWith(prefix) && (after === undefined || key > after)).sort();
+        return { entries: keys.slice(0, 1).map(key => ({ key, value: structuredClone(storage.get(key)) })), ...(keys.length > 1 ? { next: keys[0] } : {}) };
+      } },
     session: {
       get: async ({ sessionID }: { sessionID: string }) => { const value = nodes.get(sessionID); if (!value) throw new Error("missing"); return structuredClone(value); },
       update: async ({ sessionID, metadata }: { sessionID: string; metadata: Record<string, unknown> }) => { nodes.get(sessionID)!.metadata = structuredClone(metadata); },
@@ -606,21 +611,23 @@ test.each([false, true])("a native access expiry pause doesn't survive a restart
     const first = Promise.withResolvers<void>();
     let listens = 0;
     r.subscriptions(() => ++listens === 1 ? first.promise : undefined);
-    r.bind("R", "be"); r.bind("B", "fe");
-    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active" && listens === 1);
-    await r.controller.enroll("B"); await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2);
+    // Restore walks saved roots in storage-key order (#660): the expired root
+    // is B, so it is restored first and the grace's first poll samples it.
+    r.bind("B", "be"); r.bind("R", "fe");
+    await r.controller.enroll("B"); await until(() => r.controller.status().state === "active" && listens === 1);
+    await r.controller.enroll("R"); await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2);
     r.f.expire(); first.resolve();
-    await until(() => r.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused");
-    expect(r.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
+    await until(() => r.controller.status().roots.find(root => root.sessionID === "B")?.state === "paused");
+    expect(r.controller.status().roots.find(root => root.sessionID === "B")?.code).toBe("native_access_expired");
     await r.controller.close();
     if (legacy) {
       const saved = r.storage.get("diagnostics:v1") as { sessionID?: string; code?: string; time: number }[];
-      r.storage.set("diagnostics:v1", saved.map(({ code, ...d }) => d.sessionID === "R" ? { ...d, failure: { operation: "reopen", code: "native_access_expired", time: d.time } } : { ...d, ...(code ? { code } : {}) }));
+      r.storage.set("diagnostics:v1", saved.map(({ code, ...d }) => d.sessionID === "B" ? { ...d, failure: { operation: "reopen", code: "native_access_expired", time: d.time } } : { ...d, ...(code ? { code } : {}) }));
     }
     // OpenCode restarts with the token still expired and refreshes it after the plugin loads.
     let polls = 0, during: unknown;
     restarted = r.restart(async () => {
-      if (++polls === 1) during = restarted!.status().roots.find(root => root.sessionID === "R");
+      if (++polls === 1) during = restarted!.status().roots.find(root => root.sessionID === "B");
       if (polls === 3) r.f.rotate("fake-access-two");
     });
     const start = r.calls.length;
@@ -629,10 +636,10 @@ test.each([false, true])("a native access expiry pause doesn't survive a restart
     expect(polls).toBe(3);
     // The grace is visible: the old paused record gives way to a retrying one before the check.
     expect(during).toMatchObject({ state: "retrying", operation: "restore", code: "native_access_expired" });
-    expect(restarted.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "active", ownership: 1 });
+    expect(restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "active", ownership: 1 });
     expect(r.calls.slice(start).filter(c => c.name === "delivery_open").map(c => c.sessionID).sort()).toEqual(["B", "R"]);
     expect(r.calls.slice(start).some(c => c.name === "bind")).toBe(false);
-    expect(r.storage.get("paused:R")).toBe(false);
+    expect(r.storage.get("paused:B")).toBe(false);
   } finally { await restarted?.close(); await r.controller.close(); }
 });
 test.each(["account", "revoked"])("a genuine refusal at restart keeps a native access expiry pause, for good (%s)", async refusal => {
@@ -786,20 +793,40 @@ test("restart skips ended roots, restores another root, and resumes a paused dur
   } finally { await restarted?.close(); await r.controller.close(); }
 });
 
+const savedRoots = (storage: Map<string, unknown>) => [...storage.keys()].filter(key => key.startsWith("enrollmentHash:")).map(key => key.slice("enrollmentHash:".length)).sort();
 test("saving an approval prunes the saved roots that restore dropped", async () => {
   const r = runtime(); let restarted: Controller | undefined;
   try {
     r.bind("R", "be"); r.bind("B", "fe");
     await r.controller.enroll("R"); await r.controller.enroll("B");
-    expect(r.storage.get("rootSessionIDs")).toEqual(["R", "B"]);
+    expect(savedRoots(r.storage)).toEqual(["B", "R"]);
     await r.controller.close();
     // R ended while OpenCode was down: restore skips it, and the next save drops it.
     r.nodes.delete("R");
     restarted = r.restart(); await restarted.restore();
-    expect(r.storage.get("rootSessionIDs")).toEqual(["R", "B"]);
+    expect(savedRoots(r.storage)).toEqual(["B", "R"]);
     await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
-    expect(r.storage.get("rootSessionIDs")).toEqual(["B"]);
+    expect(savedRoots(r.storage)).toEqual(["B"]);
   } finally { await restarted?.close(); await r.controller.close(); }
+});
+// Two Controllers on one plugin storage are two OpenCode locations of one
+// shared service. Before #660 each save rewrote one shared root list with its
+// own Controller's roots, so the other location's root dropped out of restore.
+test("one location's saves never drop another location's saved root (#660)", async () => {
+  const r = runtime(), other = r.restart(), approval = new Approval(r.ctx, "grayboard"); let restarted: Controller | undefined;
+  const saved = async () => (await approval.saved()).map(s => [s.sessionID, !!s.approval, s.enabled]).sort();
+  try {
+    r.bind("R", "be"); r.bind("B", "fe");
+    await Promise.all([r.controller.enroll("R"), other.enroll("B")]);
+    expect(await saved()).toEqual([["B", true, true], ["R", true, true]]);
+    await r.controller.pause(); await other.enroll("B");
+    expect(await saved()).toEqual([["B", true, true], ["R", true, false]]);
+    await r.controller.close(); await other.close();
+    // R comes back from its saved approval, not only from its diagnostic record.
+    restarted = r.restart(); await restarted.restore();
+    await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(restarted.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "paused", message: "Saved approval paused; explicitly enroll again" });
+  } finally { await restarted?.close(); await other.close(); await r.controller.close(); }
 });
 test("ordinary native unbound result rebinds the durable name once with create:false", async () => {
   const r = runtime();
@@ -863,7 +890,7 @@ test("configured name binds create:false on root start without approving or leas
   try {
     await r.controller.observe("session.created", { sessionID: "R" });
     expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "be", create: false, where: "/worktree" } }]);
-    expect(r.storage.get("rootSessionIDs")).toBeUndefined();
+    expect(savedRoots(r.storage)).toEqual([]);
     expect(r.controller.status().state).toBe("unenrolled");
   } finally { await r.controller.close(); }
 });
@@ -874,7 +901,7 @@ test.each([true, false, undefined])("configured creation %s reaches startup bind
     expect(r.calls).toEqual([]);
     await r.controller.observe("session.created", { sessionID: "R" });
     expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "fe", create: create === true, where: "/worktree" } }]);
-    expect(r.storage.get("rootSessionIDs")).toBeUndefined();
+    expect(savedRoots(r.storage)).toEqual([]);
     expect(r.nodes.get("R")!.metadata).toEqual({});
     expect(r.admissions).toEqual([]);
     expect(r.controller.status().state).toBe("unenrolled");
@@ -907,7 +934,7 @@ test.each([true, false, undefined, "true", "false", 1, {}, null])("Promise lifec
     } as unknown as Context, () => {});
     await bound;
     expect(r.calls).toEqual([{ sessionID: "R", name: "bind", args: { name: "fe", create: create === true, where: "/worktree" } }]);
-    expect(r.storage.get("rootSessionIDs")).toBeUndefined();
+    expect(savedRoots(r.storage)).toEqual([]);
     expect(r.nodes.get("R")!.metadata).toEqual({});
   } finally {
     await cleanup?.(); await r.controller.close();
