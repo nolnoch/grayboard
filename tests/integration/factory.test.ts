@@ -808,10 +808,23 @@ test("work board (#665, #668): a create another process won first is retried as 
   await until(() => bus.replies(8).length === 3, 5000, "8 fanned out and combined");
   expect(bus.replies(8)[1]).toStartWith("[factory] fanned out: 2 subtasks on #sim-work (posts ");
   expect(creates).toBe(2); // dropped after the failure, tried again; the race's loser lists it and goes on
-  expect(bus.sent.filter((c) => c.tool === "board_subscribe" && c.args.board === "sim-work").map((c) => c.args.mode)).toEqual(["off"]);
   bus.deliver(task(9));
   await until(() => bus.replies(9).length === 3, 5000, "9 combined");
-  expect(creates).toBe(2); // kept once open
+  expect(creates).toBe(2);
+  // Kept once open: the fake board still lists as pushed, so a second open would subscribe again.
+  expect(bus.sent.filter((c) => c.tool === "board_subscribe" && c.args.board === "sim-work").map((c) => c.args.mode)).toEqual(["off"]);
+  await bus.close();
+  await done;
+});
+
+test("work board (#668): a review whose round-2 plan is unusable names the earlier round's posts", async () => {
+  const runner = new FakeRunner();
+  const leadRuns = () => runner.runs.filter((x) => x.id === 7).length;
+  runner.script = (r) => (r.id !== 7 ? undefined : leadRuns() === 1 ? PLAN() : PLAN(9));
+  const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher", limits: { maxRounds: 2 } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, failed");
+  expect(bus.replies(7)[2]).toBe("[factory] failed: fake agent `researcher` returned a plan the factory can't use: the plan has 9 subtasks; it needs 2 to 5. Nothing more was fanned out; nothing is combined, and each earlier subtask's outcome is on #sim-work (posts 1001, 1002).");
   await bus.close();
   await done;
 });
