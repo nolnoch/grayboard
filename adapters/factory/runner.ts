@@ -11,11 +11,16 @@ import type { Place } from "./workdir.ts";
 // of those names (tools as a comma list). A runner passes these and nothing
 // else from the file, so a field like `permissionMode` can't widen a child.
 export type Agent = { name: string; file: string; description?: string; prompt: string; tools?: string[]; model?: string };
-export type Outcome = { ok: true; text: string } | { ok: false; error: string };
+// What a run reports about itself (#649), for its row in the store: the
+// child's exit code, and what its final event said when it said it. `stop`:
+// the factory's timeout or the run's budget ended it.
+export type RunMeta = { code: number | null; session?: string; turns?: number; costUsd?: number; stop?: "timeout" | "budget" };
+export type Outcome = ({ ok: true; text: string } | { ok: false; error: string }) & { run?: RunMeta };
 // What a child may do (#643): the tools it has (absent, the harness's
-// restricted default) and those that run without a prompt. From the run's
-// profile, else the config's global lists; never from the request.
-export type Policy = { tools?: string[]; allowedTools: string[] };
+// restricted default) and those that run without a prompt; `budgetUsd`, the
+// most one run may spend (#649; absent, no cap). From the run's profile,
+// else the config's global ones; never from the request.
+export type Policy = { tools?: string[]; allowedTools: string[]; budgetUsd?: number };
 
 export interface Runner {
   readonly harness: string;
@@ -24,8 +29,9 @@ export interface Runner {
   // Where the roster comes from, for a decline's text.
   readonly rosterSource: string;
   // Runs `agent` on the request under `policy`, in `place` (#641), until it
-  // ends or `signal` aborts (a timeout).
-  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place): Promise<Outcome>;
+  // ends or `signal` aborts (a timeout). The child's event stream goes to
+  // the file `transcript` (#649), which the runner creates 0600.
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string): Promise<Outcome>;
 }
 
 // Agent files: markdown with `name:` (and optionally `description:`) in YAML
@@ -99,12 +105,14 @@ export type Exec = { code: number | null; stdout: string; stderr: string; timedO
 
 // Runs a child in its own process group, the prompt on stdin (never argv: a
 // task starting with "-" would read as a flag). An abort kills the whole
-// group, so a child's own children die with it.
-export function execChild(cmd: string[], o: { cwd: string; env: Record<string, string>; input: string; signal: AbortSignal; graceMs?: number }): Promise<Exec> {
+// group, so a child's own children die with it. With `onStdout`, stdout goes
+// there as it arrives and `stdout` stays empty: a long run's stream needn't
+// sit in memory.
+export function execChild(cmd: string[], o: { cwd: string; env: Record<string, string>; input: string; signal: AbortSignal; graceMs?: number; onStdout?: (chunk: Buffer) => void }): Promise<Exec> {
   return new Promise((done) => {
     const p = spawn(cmd[0]!, cmd.slice(1), { cwd: o.cwd, env: o.env, stdio: ["pipe", "pipe", "pipe"], detached: true });
     let stdout = "", stderr = "", timedOut = false;
-    p.stdout!.on("data", (c: Buffer) => (stdout += c.toString()));
+    p.stdout!.on("data", o.onStdout ?? ((c: Buffer) => (stdout += c.toString())));
     p.stderr!.on("data", (c: Buffer) => (stderr += c.toString()));
     p.stdin!.on("error", () => {});
     p.stdin!.end(o.input);

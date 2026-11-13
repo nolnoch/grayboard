@@ -4,7 +4,7 @@
 // runner against the pinned Claude Code is tests/e2e/factory_claude.e2e.ts:
 // here it would make the pre-push hook fetch Claude Code (#456).
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalBus, sessionFree, toDelivery, type Delivery, type FactoryBus } from "../../adapters/factory/bus.ts";
@@ -12,8 +12,8 @@ import { parseDelegation, requestOf, type Request } from "../../adapters/factory
 import { Database } from "bun:sqlite";
 import { Factory, type Fleet, type Route } from "../../adapters/factory/factory.ts";
 import { parsePlan, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
-import { DEFAULTS, loadConfig } from "../../adapters/factory/main.ts";
-import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "../../adapters/factory/runner.ts";
+import { DEFAULTS, loadConfig, policyOf } from "../../adapters/factory/main.ts";
+import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
 import { Store } from "../../adapters/factory/store.ts";
 import { Workspaces, type Place, type Workdir } from "../../adapters/factory/workdir.ts";
 import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
@@ -171,6 +171,34 @@ test("store: prune drops only replied rows past retention", () => {
   s.close();
 });
 
+test("store: runs record each child, a restart ends open ones as interrupted, and prune drops a pruned request's runs (#649)", () => {
+  let t = 1_000;
+  const path = join(dir, "f.db");
+  let s = new Store(path, () => t);
+  s.admit(req(1), "researcher");
+  const row = s.next()!;
+  const a = s.startRun(row.seq, "researcher");
+  expect(s.runs(row.seq)).toMatchObject([{ id: a, seq: row.seq, agent: "researcher", started_at: 1_000, ended_at: null, outcome: null }]);
+  t = 2_000;
+  s.endRun(a, "budget", { code: 1, session: "sess", turns: 3, costUsd: 0.25 });
+  const b = s.startRun(row.seq, "researcher"); // a second run (a synthesis), cut by a crash
+  expect(s.runs(row.seq)[0]).toMatchObject({ ended_at: 2_000, outcome: "budget", code: 1, session: "sess", turns: 3, cost_usd: 0.25 });
+  s.close();
+  t = 3_000;
+  s = new Store(path, () => t); // a restart
+  s.interrupted(() => "interrupted");
+  expect(s.runs(row.seq).map((r) => [r.id, r.outcome, r.ended_at])).toEqual([[a, "budget", 2_000], [b, "interrupted", 3_000]]);
+  expect(statSync(dir).mode & 0o777).toBe(0o700); // the data directory: tasks, replies, transcripts
+  s.markReplied(k(1));
+  s.admitFinished(req(2), "b"); s.markReplied(k(2));
+  const c = s.startRun(s.get(k(2))!.seq, "b");
+  t = 10_000;
+  s.markReplied(k(2)); // touched later: kept
+  expect(s.prune(5_000)).toBe(1);
+  expect([s.hasRun(a), s.hasRun(b), s.hasRun(c)]).toEqual([false, false, true]);
+  s.close();
+});
+
 // ── config and env ───────────────────────────────────────────────────────────
 
 test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", () => {
@@ -192,7 +220,13 @@ test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", 
     { name: "lab", agent: "researcher", fanout: false, profile: "research", policy: { tools: ["Read"], allowedTools: [] }, workdir: { mode: "scratch" }, routes: [{ profile: "research", agent: "researcher", policy: { tools: ["Read"], allowedTools: [] }, workdir: { mode: "scratch" } }] }, // tools fall back to the global list, field by field
     { name: "old", agent: "x" }, // no profile: the global lists at run time
   ]);
-  for (const bad of [{ maxSubtasks: 1 }, { fleets: [{ name: "a", agent: "x", fanout: "yes" }] },
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ budgetUsd: 2.5, profiles: [{ name: "cheap", agent: "x", budgetUsd: 0.5 }, { name: "std", agent: "y" }], fleets: [{ name: "a", profile: "cheap" }, { name: "b", profile: "std" }] }));
+  const bc = loadConfig(dir, {});
+  expect(policyOf(bc)).toEqual({ allowedTools: [], budgetUsd: 2.5 });
+  expect(bc.fleets.map((f) => f.policy?.budgetUsd)).toEqual([0.5, 2.5]); // a profile's own, else the global one (#649)
+  writeFileSync(join(dir, "config.json"), "{}");
+  expect(policyOf(loadConfig(dir, {}))).toEqual({ allowedTools: [] }); // absent: no cap
+  for (const bad of [{ budgetUsd: 0 }, { budgetUsd: -1 }, { budgetUsd: "1" }, { budgetUsd: null }, { profiles: [{ name: "p", agent: "x", budgetUsd: 0 }] }, { maxSubtasks: 1 }, { fleets: [{ name: "a", agent: "x", fanout: "yes" }] },
     { profiles: [{ name: "p", agent: "x" }], fleets: [{ name: "a", profile: "p", agent: "x" }] }, { fleets: [{ name: "a", profile: "nope" }] },
     { profiles: [{ name: "p", agent: "x" }, { name: "p", agent: "y" }] }, { profiles: [{ name: "p" }] }, { profiles: [{ name: "P", agent: "x" }] },
     { profiles: [{ name: "p", agent: "x", tools: "Bash" }] }, { profiles: [{ name: "p", agent: "x", allowedTools: [""] }] }, { profiles: {} }, { tools: "Bash" }, { maxConcurrent: 0 }, { maxConcurrent: "2" }, { allowedTools: "Bash" }, { identity: "" }, { identity: "Factory" }, { maxConcurrent: null }, { cwd: null }, [1],
@@ -244,7 +278,8 @@ class FakeBus implements FactoryBus {
 const GLOBAL: Policy = { allowedTools: ["Read"] };
 const SHARED: Workdir = { mode: "shared" };
 // The working-directory options: shared mode (today's single directory) unless a test picks another (#641).
-const wd = (workdir: Workdir = SHARED) => ({ workdir, workspaces: new Workspaces(join(dir, "trees"), join(dir, "work")) });
+// Transcripts go to dir/runs (#649).
+const wd = (workdir: Workdir = SHARED) => ({ workdir, workspaces: new Workspaces(join(dir, "trees"), join(dir, "work")), runs: join(dir, "runs") });
 
 class FakeRunner implements Runner {
   readonly harness = "fake";
@@ -260,12 +295,18 @@ class FakeRunner implements Runner {
   constructor(public names = ["researcher"], private readonly hold = false) {}
   roster() { if (this.broken) throw new Error("EIO: roster unreadable"); return agents(...this.names); }
   places: Place[] = []; // each run's place, in run order
-  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place): Promise<Outcome> {
+  transcripts: string[] = []; // each run's transcript path, in run order; a run writes one line to it
+  meta: (r: Request) => RunMeta | undefined = () => undefined; // what a run reports about itself (#649)
+  run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string): Promise<Outcome> {
     this.runs.push({ agent: agent.name, id: r.id });
     this.policies.push(policy);
     this.places.push(place);
     this.inputs.push(r.task);
-    if (!this.hold) return Promise.resolve({ ok: true, text: this.script(r) ?? `result for ${r.id}` });
+    this.transcripts.push(transcript);
+    writeFileSync(transcript, `{"type":"result","id":${r.id}}\n`, { mode: 0o600 });
+    const m = this.meta(r);
+    if (m?.stop === "budget") return Promise.resolve({ ok: false, error: "stopped at its budget", run: m });
+    if (!this.hold) return Promise.resolve({ ok: true, text: this.script(r) ?? `result for ${r.id}`, ...(m ? { run: m } : {}) });
     const g = Promise.withResolvers<Outcome>();
     this.gates.set(r.id, g);
     signal.addEventListener("abort", () => setTimeout(() => g.resolve({ ok: false, error: "aborted" }), this.abortLagMs));
@@ -361,6 +402,44 @@ test("loop: a restart mid fan-out interrupts only the running subtask, runs the 
   expect(bus.replies(101)).toEqual(["[factory] done: fake agent `researcher`\n\nresult for 101"]);
   expect(bus.replies(7)[0]).toStartWith("[factory] done: fake agent `researcher`, combining 2 subtasks on #task-7");
   expect(runner.runs.map((r) => r.id)).toEqual([101, 7]);
+  await bus.close();
+  await done;
+});
+
+test("loop: each run gets a row with what it reported, and a 0600 transcript in a 0700 directory; a budget stop is recorded as one (#649)", async () => {
+  const runner = new FakeRunner();
+  runner.meta = (r) => r.id === 81 ? { code: 1, turns: 2, costUsd: 0.5, stop: "budget" } : { code: 0, session: "s80", turns: 4, costUsd: 0.125 };
+  const { bus, store, logs, done } = loop({ runner });
+  bus.deliver(ask(80));
+  await until(() => bus.replies(80).length === 2, 5000, "80 answered");
+  bus.deliver(ask(81));
+  await until(() => bus.replies(81).length === 2, 5000, "81 answered");
+  expect(bus.replies(81)[1]).toStartWith("[factory] failed:");
+  expect(bus.replies(81)[1]).toContain("stopped at its budget");
+  const r80 = store.runs(store.get(k(80))!.seq), r81 = store.runs(store.get(k(81))!.seq);
+  expect(r80).toMatchObject([{ agent: "researcher", outcome: "ok", code: 0, session: "s80", turns: 4, cost_usd: 0.125 }]);
+  expect(r81).toMatchObject([{ outcome: "budget", code: 1, turns: 2, cost_usd: 0.5 }]);
+  expect(runner.transcripts).toEqual([join(dir, "runs", `${r80[0]!.id}.jsonl`), join(dir, "runs", `${r81[0]!.id}.jsonl`)]);
+  expect(statSync(join(dir, "runs")).mode & 0o777).toBe(0o700);
+  expect(statSync(runner.transcripts[0]!).mode & 0o777).toBe(0o600);
+  expect(logs).toContain(`request 80: run ${r80[0]!.id} ended ok, 4 turn(s), $0.1250`);
+  await bus.close();
+  await done;
+});
+
+test("loop: housekeeping removes the transcripts of pruned runs and leaves other files alone (#649)", async () => {
+  let t = 1_000;
+  const bus = new FakeBus(), store = new Store(":memory:", () => t), runner = new FakeRunner();
+  const f = new Factory(bus, store, runner, { policy: GLOBAL, ...wd(), maxConcurrent: 1, timeoutMs: 60_000, retentionMs: 5_000, housekeepingMs: 20, log: () => {} });
+  writeFileSync(join(dir, "runs", "notes.txt"), "mine");
+  const done = f.run();
+  bus.deliver(ask(90));
+  await until(() => store.get(k(90))?.replied, 5000, "90 answered");
+  expect(readdirSync(join(dir, "runs")).sort()).toEqual(["1.jsonl", "notes.txt"]);
+  t = 100_000; // past retention: the row, its run and then its transcript go
+  await until(() => !existsSync(join(dir, "runs", "1.jsonl")), 5000, "transcript swept");
+  expect(store.get(k(90))).toBeNull();
+  expect(readdirSync(join(dir, "runs"))).toEqual(["notes.txt"]);
   await bus.close();
   await done;
 });

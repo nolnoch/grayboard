@@ -5,9 +5,10 @@
 // redelivery) finds its row and spawns nothing. DM and post ids are separate
 // sequences, so the id alone would collide. `seq` orders the queue.
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Key, Request } from "./delegate.ts";
+import type { RunMeta } from "./runner.ts";
 
 // queued: waiting for a slot. running: a child is (or was, before a crash)
 // working on it. waiting: its run returned a fan-out plan, and its subtasks
@@ -23,12 +24,22 @@ export type Row = Request & {
   profile: string | null; // a routed subtask's profile (#645); null runs as its project's lead
 };
 export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string };
+// A child process (#649): one per run of a request (a fanned-out request has
+// two, its triage and its synthesis). `outcome` is null while it runs; a run
+// cut off by a restart ends as interrupted. Its transcript is the file
+// runs/<id>.jsonl beside the store, pruned with it.
+export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted";
+export type Run = { id: number; seq: number; agent: string; started_at: number; ended_at: number | null; code: number | null; session: string | null; turns: number | null; cost_usd: number | null; outcome: RunOutcome | null };
 
 export class Store {
   private readonly db: Database;
 
   constructor(path: string, private readonly now: () => number = Date.now) {
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+    // The data directory holds tasks, replies and transcripts: the operator's only (#649).
+    if (path !== ":memory:") {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      chmodSync(dirname(path), 0o700);
+    }
     this.db = new Database(path, { create: true, strict: true });
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
@@ -54,6 +65,19 @@ export class Store {
       profile TEXT,
       UNIQUE (source, id)
     )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      seq INTEGER NOT NULL,
+      agent TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      code INTEGER,
+      session TEXT,
+      turns INTEGER,
+      cost_usd REAL,
+      outcome TEXT
+    )`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS runs_seq ON runs (seq)`);
     // Additive (AGENTS.md): a store an earlier factory wrote gets the fan-out
     // columns, in one transaction with the check.
     this.db.transaction(() => {
@@ -125,6 +149,26 @@ export class Store {
     return (this.db.query(`SELECT COUNT(*) AS n FROM requests WHERE state = 'queued' AND seq < (SELECT seq FROM requests WHERE source = ? AND id = ?)`).get(k.source, k.id) as { n: number }).n;
   }
 
+  // A run of the request `seq` starts; returns its id.
+  startRun(seq: number, agent: string): number {
+    return Number(this.db.query(`INSERT INTO runs (seq, agent, started_at) VALUES (?, ?, ?)`).run(seq, agent, this.now()).lastInsertRowid);
+  }
+
+  endRun(id: number, outcome: RunOutcome, m: Partial<RunMeta> = {}): void {
+    this.db.query(`UPDATE runs SET ended_at = ?, outcome = ?, code = ?, session = ?, turns = ?, cost_usd = ? WHERE id = ?`)
+      .run(this.now(), outcome, m.code ?? null, m.session ?? null, m.turns ?? null, m.costUsd ?? null, id);
+  }
+
+  // The request's runs, oldest first.
+  runs(seq: number): Run[] {
+    return this.db.query(`SELECT * FROM runs WHERE seq = ? ORDER BY id`).all(seq) as Run[];
+  }
+
+  // Whether the store still holds run `id`: a transcript is swept once its run's row is gone.
+  hasRun(id: number): boolean {
+    return this.db.query(`SELECT 1 FROM runs WHERE id = ?`).get(id) !== null;
+  }
+
   // At start: a row left running had its child die with the previous
   // process, so it finishes as interrupted (re-running it unasked could
   // repeat side effects the child already had). Returns those rows. Nothing
@@ -136,6 +180,7 @@ export class Store {
     const rows = (this.db.query(`SELECT * FROM requests WHERE state = 'running' ORDER BY seq`).all() as Raw[]).map(toRow);
     this.db.transaction(() => {
       for (const r of rows) this.finish(r, reply(r));
+      this.db.query(`UPDATE runs SET ended_at = ?, outcome = 'interrupted' WHERE outcome IS NULL`).run(this.now());
       // Every waiting parent, not only those of the rows above: a crash
       // between a subtask's finish and its parent's check strands one too.
       for (const { seq } of this.db.query(`SELECT seq FROM requests WHERE state = 'waiting'`).all() as { seq: number }[]) this.synthesizeWhenDone(seq);
@@ -162,8 +207,13 @@ export class Store {
   // Retention: replied rows older than `ms` go. The key must outlive any
   // redelivery of its message, which a replay does within a session's life,
   // so the default retention is generous (main.ts).
+  // A pruned request's runs go with it.
   prune(ms: number): number {
-    return this.db.query(`DELETE FROM requests WHERE state = 'finished' AND replied = 1 AND updated_at < ?`).run(this.now() - ms).changes;
+    return this.db.transaction(() => {
+      const n = this.db.query(`DELETE FROM requests WHERE state = 'finished' AND replied = 1 AND updated_at < ?`).run(this.now() - ms).changes;
+      this.db.query(`DELETE FROM runs WHERE seq NOT IN (SELECT seq FROM requests)`).run();
+      return n;
+    }).immediate();
   }
 
   close(): void {

@@ -3,11 +3,13 @@
 // queue board, record it before anything else, answer in its thread at
 // once, run it on a free slot, and reply with the outcome. Every reply goes
 // where the request came from, in its thread.
+import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { Delivery, FactoryBus } from "./bus.ts";
 import { oneLine, requestOf, type Request } from "./delegate.ts";
 import { parsePlan, synthesisPrompt, triageInstruction, type Plan } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Runner } from "./runner.ts";
-import type { Admit, Row, Store } from "./store.ts";
+import type { Admit, Row, RunOutcome, Store } from "./store.ts";
 import type { Place, Workdir, Workspaces } from "./workdir.ts";
 
 // A fleet (docs/factory.md §7): a queue board `<name>-tasks` the factory is
@@ -29,6 +31,7 @@ export type FactoryOptions = {
   policy: Policy; // the global tool lists: delegations, and fleets without a profile
   workdir: Workdir; // the global working-directory mode, likewise
   workspaces: Workspaces; // where each run's directory is made, and swept once its tree is pruned
+  runs: string; // the transcripts' directory (#649): <run id>.jsonl, 0700, swept once its run's row is pruned
   maxConcurrent: number;
   maxSubtasks?: number; // a fan-out plan's cap (default 5)
   timeoutMs: number;
@@ -54,6 +57,9 @@ export class Factory {
 
   constructor(private readonly bus: FactoryBus, private readonly store: Store, private readonly runner: Runner, private readonly o: FactoryOptions) {
     this.cfg = { fleets: o.fleets ?? [], policy: o.policy, workdir: o.workdir };
+    // A transcript holds whatever its child read and wrote.
+    mkdirSync(o.runs, { recursive: true, mode: 0o700 });
+    chmodSync(o.runs, 0o700);
   }
 
   // A config reload (#645): new runs read the new fleets, projects and
@@ -281,13 +287,21 @@ export class Factory {
     this.children.add(ac);
     const t = setTimeout(() => ac.abort(), this.o.timeoutMs);
     this.o.log(`request ${row.id}: running ${this.runner.harness} agent ${agent.name}${row.phase === "synthesize" ? " (synthesis)" : row.parent !== null ? " (subtask)" : ""} for ${row.requester}`);
+    const run = this.store.startRun(row.seq, agent.name);
+    let ended: RunOutcome = "failed";
+    let out: Outcome | undefined;
     try {
-      return await this.runner.run(agent, input, ac.signal, set.policy, place);
+      out = await this.runner.run(agent, input, ac.signal, set.policy, place, join(this.o.runs, `${run}.jsonl`));
+      ended = out.run?.stop ?? (out.ok ? "ok" : ac.signal.aborted ? "timeout" : "failed");
+      return out;
     } catch (e) {
       return `[factory] failed: ${this.runner.harness} agent \`${agent.name}\` couldn't start: ${msg(e)}`;
     } finally {
       clearTimeout(t);
       this.children.delete(ac);
+      this.store.endRun(run, ended, out?.run);
+      const m = out?.run;
+      this.o.log(`request ${row.id}: run ${run} ended ${ended}${m?.turns !== undefined ? `, ${m.turns} turn(s)` : ""}${m?.costUsd !== undefined ? `, $${m.costUsd.toFixed(4)}` : ""}`);
     }
   }
 
@@ -404,6 +418,22 @@ export class Factory {
     // After the prune: a tree goes once its request's row has.
     const t = await this.o.workspaces.sweep((seq) => this.store.has(seq));
     if (t) this.o.log(`removed ${t} working director${t === 1 ? "y" : "ies"} of pruned requests`);
+    const x = this.sweepTranscripts();
+    if (x) this.o.log(`removed ${x} transcript${x === 1 ? "" : "s"} of pruned runs`);
+  }
+
+  // A transcript goes once its run's row has (pruned with its request).
+  // Anything else in the directory is left alone.
+  private sweepTranscripts(): number {
+    let n = 0;
+    let names: string[];
+    try { names = readdirSync(this.o.runs); } catch { return 0; }
+    for (const f of names) {
+      const m = /^(\d+)\.jsonl$/.exec(f);
+      if (!m || this.store.hasRun(Number(m[1]))) continue;
+      try { rmSync(join(this.o.runs, f), { force: true }); n++; } catch {}
+    }
+    return n;
   }
 }
 
