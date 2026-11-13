@@ -47,6 +47,7 @@ export type Profile = { name: string; agent: string; tools?: string[]; allowedTo
 const RESTART_ONLY = ["identity", "grayboard", "claude", "cwd", "maxConcurrent", "maxSubtasks", "timeoutMs", "retentionMs"] as const;
 
 const DAY = 86_400_000;
+const MAX_ROUNDS = 10;
 export const DEFAULTS = { identity: "factory", claude: "claude", allowedTools: [] as string[], maxConcurrent: 2, maxSubtasks: 5, timeoutMs: 30 * 60_000, retentionMs: 30 * DAY };
 
 // The config file's fields over the defaults; FACTORY_GRAYBOARD (a command
@@ -84,10 +85,16 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
       if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${path}: ${at(k)} must be a positive integer`);
       return v;
     };
+    const rounds = (v: unknown) => {
+      if (ms(v, "maxRounds") > MAX_ROUNDS) throw new Error(`${path}: ${at("maxRounds")} must be at most ${MAX_ROUNDS}`);
+      return v as number;
+    };
     return {
       ...(o.treeBudgetUsd !== undefined ? { treeBudgetUsd: usd(o.treeBudgetUsd, at("treeBudgetUsd")) } : {}),
       ...(o.dailyBudgetUsd !== undefined ? { dailyBudgetUsd: usd(o.dailyBudgetUsd, at("dailyBudgetUsd")) } : {}),
       ...(o.deadlineMs !== undefined ? { deadlineMs: ms(o.deadlineMs, "deadlineMs") } : {}),
+      // Bounded so the digest's earlier rounds (a line per subtask) stay small (#658).
+      ...(o.maxRounds !== undefined ? { maxRounds: rounds(o.maxRounds) } : {}),
     };
   };
   const withLimits = (f: Fleet, o: Record<string, unknown>, what: string): Fleet => {
