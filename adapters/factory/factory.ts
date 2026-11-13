@@ -35,6 +35,9 @@ export const MIN_GRANT_USD = 0.01;
 const DAY_MS = 86_400_000;
 export type Route = { profile: string; agent: string; policy: Policy; workdir: Workdir };
 export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
+// Where a fleet's fan-outs post their subtasks (#665): one standing broadcast
+// board per fleet, named from the persona so a tree outlives a reload.
+export const workBoard = (fleet: string) => `${fleet}-work`;
 
 // Asking (#652): the most questions one request's tree may ask; how long a
 // question waits before it's sent to your user, and how long after that
@@ -77,6 +80,7 @@ export class Factory {
   private ticking = false;
   private readonly joined = new Map<string, Fleet>(); // board → fleet, as the last sync left it
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
+  private readonly work = new Map<string, Promise<string | null>>(); // work boards opened or opening (#665); a failed open is dropped to be tried again
   private readonly active = new Map<number, AbortController>(); // seq → its running child's controller
   private readonly planning = new Set<number>(); // reviews told they may plan (#658), so their grant keeps a quarter
   private readonly cancelledBy = new Map<number, Stop>(); // seq → what stopped it while it ran: a cancel (#651), a deadline or a spent tree budget (#655)
@@ -355,7 +359,7 @@ export class Factory {
         const res = await this.fanOut(row, plan);
         if (!res) return null;
         // A cancel that landed while the plan was being posted.
-        const late = this.cancelledBy.get(row.seq), where = res.board ?? row.fanoutBoard ?? `task-${row.id}`;
+        const late = this.cancelledBy.get(row.seq), where = res.board ?? row.fanoutBoard ?? workBoard(row.persona);
         body = late !== undefined ? `[factory] ${late.head} while its ${synth ? `round ${row.round + 1} ` : ""}plan was being posted on #${where}; no subtask of it ran.` : `[factory] failed: ${res.error}${earlierOn(row)}`;
       } else if (typeof plan === "string") {
         body = `[factory] failed: ${this.runner.harness} agent \`${who}\` returned a plan the factory can't use: ${plan}. Nothing ${synth ? "more " : ""}was fanned out${earlierOn(row)}.`;
@@ -476,12 +480,47 @@ export class Factory {
     return { policy: f.policy ?? global.policy, workdir: f.workdir ?? global.workdir, agent: f.agent };
   }
 
-  // A plan's fan-out: a broadcast board `task-<post id>` as the durable,
-  // visible record (anyone may read, subscribe or comment), one post per
-  // subtask, each run here on the worker pool with its outcome in its
-  // thread. The factory can't be a lane for posts it wrote (the core never
-  // hands a poster its own post), so the board is a record, not a queue.
-  // Returns why it couldn't, or null.
+  // Opens the fleet's work board on its first fan-out (#665) and mutes the
+  // factory's subscription: its posts and their threads are the factory's
+  // to write, not to take. A queue board of that name would hand subtasks to
+  // other lanes, so it's refused; a broadcast board someone else made is
+  // used as is. Concurrent fan-outs share one open. Returns why it couldn't,
+  // or null.
+  private openWork(name: string, fleet: string): Promise<string | null> {
+    let p = this.work.get(name);
+    if (!p) {
+      p = this.openWorkOnce(name, fleet).catch((e) => `couldn't open #${name} for the fan-out: ${msg(e)}`);
+      this.work.set(name, p);
+      void p.then((why) => { if (why !== null) this.work.delete(name); });
+    }
+    return p;
+  }
+
+  private async openWorkOnce(name: string, fleet: string): Promise<string | null> {
+    for (let tries = 0; ; tries++) {
+      const listed = await this.bus.call("board_list");
+      const b = (Array.isArray(listed) ? listed : []).find((b: { name: string }) => b.name === name) as { kind?: string; mode?: string | null } | undefined;
+      if (b && b.kind === "queue") return `#${name}, where ${fleet}'s subtasks go, exists as a queue board, which would hand them to other lanes. Rename or remove it. Nothing was fanned out.`;
+      if (!b) {
+        try {
+          await this.bus.call("board_create", { name, purpose: `Subtasks the factory ${this.bus.handle} fans out for the ${fleet} fleet: one top-level post per subtask, naming the task it's part of, with its outcome in its thread.` });
+        } catch (e) {
+          if (tries < 1 && /already exists/.test(msg(e))) continue; // another tree's fan-out made it first
+          return `couldn't open #${name} for the fan-out: ${msg(e)}`;
+        }
+      }
+      if (b?.mode !== "off") await this.bus.call("board_subscribe", { board: name, mode: "off" }).catch((e) => this.o.log(`couldn't mute #${name}: ${msg(e)}`));
+      return null;
+    }
+  }
+
+  // A plan's fan-out: one post per subtask on the fleet's work board, the
+  // durable, visible record (anyone may read, subscribe or comment), each
+  // run here on the worker pool with its outcome in its thread. The factory
+  // can't be a lane for posts it wrote (the core never hands a poster its
+  // own post), so the board is a record, not a queue. A tree that fanned
+  // out on a `task-<post id>` board before #665 keeps it. Returns why it
+  // couldn't, or null.
   private async fanOut(row: Row, plan: Plan): Promise<{ error: string; board?: string } | null> {
     if (row.source !== "board") return { error: "only a fleet task fans out" };
     // Routing (#645), checked before anything is posted: a subtask may name
@@ -492,33 +531,19 @@ export class Factory {
         return { error: `subtask ${i + 1} names profile "${oneLine(s.profile)}", which isn't one of ${row.persona}'s (${routes.length ? routes.map((r) => r.profile).join(", ") : "it names none"}). Nothing was fanned out.` };
       }
     }
-    const purpose = `Subtasks of ${oneLine(row.requester)}'s post ${row.id} on #${row.board}, fanned out by ${this.bus.handle}: one top-level post per subtask, its outcome in its thread.`;
-    // A later round (#658) posts on the tree's board. A board of that name
-    // someone else made: the next suffix.
-    let board = row.fanoutBoard ?? "";
-    const round = row.round + 1, label = round > 1 ? `${round}.` : "";
-    for (let k = 1; !board; k++) {
-      const name = k === 1 ? `task-${row.id}` : `task-${row.id}-${k}`;
-      try {
-        await this.bus.call("board_create", { name, purpose });
-        board = name;
-      } catch (e) {
-        if (k < 3 && /already exists/.test(msg(e))) continue;
-        return { error: `couldn't open #${name} for the fan-out: ${msg(e)}` };
-      }
-    }
+    // A later round (#658) posts where the tree's first did.
+    const board = row.fanoutBoard ?? workBoard(row.persona);
     if (row.fanoutBoard === null) {
-      try {
-        await this.bus.call("board_subscribe", { board, mode: "off" }); // its own posts and their threads are the factory's to write, not to take
-      } catch (e) {
-        this.o.log(`couldn't mute #${board}: ${msg(e)}`);
-      }
+      const why = await this.openWork(board, row.persona);
+      if (why !== null) return { error: why };
     }
+    const round = row.round + 1, label = round > 1 ? `${round}.` : "";
+    const of = `for ${oneLine(row.requester)}'s post ${row.id} on #${row.board}`;
     const n = plan.subtasks.length, subtasks: { r: Request; title: string; profile?: string; agent?: string }[] = [];
     for (const [i, s] of plan.subtasks.entries()) {
       try {
         const route = s.profile !== undefined ? routes.find((r) => r.profile === s.profile)! : undefined;
-        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${label}${i + 1}/${n}${route ? ` (${route.profile})` : ""}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
+        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${label}${i + 1}/${n}${route ? ` (${route.profile})` : ""} ${of}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
         if (typeof res?.post_id !== "number") throw new Error("board_post returned no post_id");
         subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title, ...(route ? { profile: route.profile, agent: route.agent } : {}) });
       } catch (e) {
@@ -530,7 +555,7 @@ export class Factory {
     this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}${round > 1 ? `, round ${round}` : ""}`);
     const agents = [...new Set(subtasks.map((s) => s.agent ?? row.agent))];
     const as = agents.length === 1 ? `each run as \`${agents[0]}\`` : `each run as its profile's agent`;
-    await this.reply(row, `[factory] fanned out${round > 1 ? `, round ${round}` : ""}: ${n} subtasks on #${board}, ${as} with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
+    await this.reply(row, `[factory] fanned out${round > 1 ? `, round ${round}` : ""}: ${n} subtasks on #${board} (post${n === 1 ? "" : "s"} ${subtasks.map((s) => s.r.id).join(", ")}), ${as} with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
     return null;
   }
 
