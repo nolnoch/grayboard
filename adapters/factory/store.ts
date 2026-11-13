@@ -28,7 +28,7 @@ export type Admit = { fanout?: boolean; parent?: number; title?: string; profile
 // two, its triage and its synthesis). `outcome` is null while it runs; a run
 // cut off by a restart ends as interrupted. Its transcript is the file
 // runs/<id>.jsonl beside the store, pruned with it.
-export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted";
+export type RunOutcome = "ok" | "failed" | "timeout" | "budget" | "interrupted" | "cancelled";
 export type Run = { id: number; seq: number; agent: string; started_at: number; ended_at: number | null; code: number | null; session: string | null; turns: number | null; cost_usd: number | null; outcome: RunOutcome | null };
 
 export class Store {
@@ -78,6 +78,12 @@ export class Store {
       outcome TEXT
     )`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS runs_seq ON runs (seq)`);
+    // Thread commands (#651). threads: each reply the factory sent for a
+    // request, keyed like a request (a DM's message id or a post id), so a
+    // command answering it finds its request. commands: each command acted
+    // on, so a replay acts once.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS threads (source TEXT NOT NULL, id INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (source, id))`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS commands (source TEXT NOT NULL, id INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (source, id))`);
     // Additive (AGENTS.md): a store an earlier factory wrote gets the fan-out
     // columns, in one transaction with the check.
     this.db.transaction(() => {
@@ -142,6 +148,52 @@ export class Store {
 
   markReplied(k: Key): void {
     this.db.query(`UPDATE requests SET replied = 1, updated_at = ? WHERE source = ? AND id = ?`).run(this.now(), k.source, k.id);
+  }
+
+  // A reply the factory sent in request `seq`'s thread.
+  recordReply(k: Key, seq: number): void {
+    this.db.query(`INSERT OR IGNORE INTO threads (source, id, seq) VALUES (?, ?, ?)`).run(k.source, k.id, seq);
+  }
+
+  // The request whose thread `parent` (a command's parent id) is: the
+  // request itself, or one of the factory's replies to it.
+  threadOf(source: Key["source"], parent: number): Row | null {
+    const own = this.get({ source, id: parent });
+    if (own) return own;
+    const t = this.db.query(`SELECT seq FROM threads WHERE source = ? AND id = ?`).get(source, parent) as { seq: number } | null;
+    return t ? this.bySeq(t.seq) : null;
+  }
+
+  bySeq(seq: number): Row | null {
+    const r = this.db.query(`SELECT * FROM requests WHERE seq = ?`).get(seq) as Raw | null;
+    return r ? toRow(r) : null;
+  }
+
+  // Records command `k` on request `seq`; false when it was already acted on (a replay).
+  command(k: Key, seq: number): boolean {
+    return this.db.query(`INSERT OR IGNORE INTO commands (source, id, seq) VALUES (?, ?, ?)`).run(k.source, k.id, seq).changes === 1;
+  }
+
+  // A cancel (#651), in one transaction. A queued request finishes with
+  // `reply`. A waiting one finishes too (so it never synthesizes), with its
+  // queued subtasks; its running subtasks are returned for the caller to
+  // stop. A running request is the caller's to stop. Returns the rows
+  // finished here and the running ones, or null when it had already finished.
+  cancel(seq: number, reply: (r: Row) => string): { finished: Row[]; running: Row[] } | null {
+    return this.db.transaction(() => {
+      const r = this.bySeq(seq);
+      if (!r || r.state === "finished") return null;
+      if (r.state === "running") return { finished: [], running: [r] };
+      const subs = r.state === "waiting" ? this.subtasks(seq) : [];
+      const finished = [r, ...subs.filter((s) => s.state === "queued")];
+      for (const f of finished) this.finish(f, reply(f));
+      return { finished: finished.map((f) => this.bySeq(f.seq)!), running: subs.filter((s) => s.state === "running") };
+    }).immediate();
+  }
+
+  // How many rows run now and how many wait for a slot.
+  load(): { running: number; queued: number } {
+    return this.db.query(`SELECT COALESCE(SUM(state = 'running'), 0) AS running, COALESCE(SUM(state = 'queued'), 0) AS queued FROM requests`).get() as { running: number; queued: number };
   }
 
   // Queued requests admitted before this one.
@@ -212,6 +264,8 @@ export class Store {
     return this.db.transaction(() => {
       const n = this.db.query(`DELETE FROM requests WHERE state = 'finished' AND replied = 1 AND updated_at < ?`).run(this.now() - ms).changes;
       this.db.query(`DELETE FROM runs WHERE seq NOT IN (SELECT seq FROM requests)`).run();
+      this.db.query(`DELETE FROM threads WHERE seq NOT IN (SELECT seq FROM requests)`).run();
+      this.db.query(`DELETE FROM commands WHERE seq NOT IN (SELECT seq FROM requests)`).run();
       return n;
     }).immediate();
   }

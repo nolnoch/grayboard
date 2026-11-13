@@ -9,10 +9,12 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 // One channel notification, as grayboard renders it for every harness
 // (src/shared/notifications.ts builds the shape; the module reads only the
-// wire form). A DM carries message_id; a board item carries board.
+// wire form). A DM carries message_id; a board item carries board. `human`:
+// from the bus's human handle (meta human="true", which only the session
+// sets: src/local/mcp.ts), so it carries the user's authority.
 export type Delivery =
-  | { kind: "dm"; id: number; from: string; parentId?: number; body: string }
-  | { kind: "board"; board: string; postId?: number; parentId?: number; from?: string; reason?: string; body: string };
+  | { kind: "dm"; id: number; from: string; parentId?: number; human?: true; body: string }
+  | { kind: "board"; board: string; postId?: number; parentId?: number; from?: string; reason?: string; human?: true; body: string };
 
 export interface FactoryBus {
   // The handle this session holds and writes as.
@@ -43,15 +45,16 @@ export function toDelivery(params: unknown): Delivery | null {
     const v = str(k);
     return v !== undefined && /^\d+$/.test(v) ? Number(v) : undefined;
   };
+  const human = str("human") === "true" ? { human: true as const } : {};
   const board = str("board");
   if (board !== undefined) {
     const postId = int("post_id"), parentId = int("parent_id"), from = str("from"), reason = str("reason");
-    return { kind: "board", board, ...(postId !== undefined ? { postId } : {}), ...(parentId !== undefined ? { parentId } : {}), ...(from ? { from } : {}), ...(reason ? { reason } : {}), body: p.content };
+    return { kind: "board", board, ...(postId !== undefined ? { postId } : {}), ...(parentId !== undefined ? { parentId } : {}), ...(from ? { from } : {}), ...(reason ? { reason } : {}), ...human, body: p.content };
   }
   const id = int("message_id");
   const from = str("from");
   if (id === undefined || !from) return null;
-  return { kind: "dm", id, from, ...(int("parent_id") !== undefined ? { parentId: int("parent_id") } : {}), body: p.content };
+  return { kind: "dm", id, from, ...(int("parent_id") !== undefined ? { parentId: int("parent_id") } : {}), ...human, body: p.content };
 }
 
 // An env with no session of its own: what a factory launched from inside a
