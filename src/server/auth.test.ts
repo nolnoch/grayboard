@@ -52,11 +52,11 @@ test("a touch scheduled after cancelAll never runs: stop() closed the queue (#38
 
 describe("verifySessionToken", () => {
   let repo: Repo;
+  let db: ReturnType<typeof openDatabase>["db"];
   const touches = createTouchQueue();
 
   beforeEach(() => {
-    const { repo: r } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-    repo = r;
+    ({ repo, db } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
   });
 
   test("valid token returns authed user", () => {
@@ -66,6 +66,25 @@ describe("verifySessionToken", () => {
     const authed = verifySessionToken(raw, repo, touches);
     expect(authed).not.toBeNull();
     expect(authed!.user_email).toBe("wade@example.com");
+  });
+
+  // Security audit F-14: idle, not age. A token used within the window keeps
+  // working however old it is; one unused for longer is refused; 0 never expires.
+  test("a token unused longer than idleDays is refused; use keeps it alive", () => {
+    const u   = repo.users.upsertByEmail("wade@example.com", null);
+    const raw = mintToken();
+    const s   = repo.sessions.create(u.id, hashToken(raw), null);
+    const day = 86_400_000;
+    const idle = (days: number) => repo.sessions.touch(s.id, repo.now() - days * day);
+    idle(29);
+    expect(verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
+    idle(31);
+    expect(verifySessionToken(raw, repo, touches, 30)).toBeNull();
+    expect(verifySessionToken(raw, repo, touches, 0)).not.toBeNull();
+    // Age doesn't count: a year-old token used yesterday works.
+    db.run("UPDATE sessions SET created_at = ? WHERE id = ?", [repo.now() - 365 * day, s.id]);
+    repo.sessions.touch(s.id, repo.now() - day);
+    expect(verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
   });
 
   test("missing token returns null", () => {
