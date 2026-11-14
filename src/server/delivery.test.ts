@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { refusalCount } from "./metrics.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -297,7 +298,9 @@ test("the per-user lease count frees a slot on release and never double-counts a
   for (const c of contexts.slice(0, 4)) await delivery.open(bob, c);
   const contender = context(bob, "contender");
   await hosted.bind(bob, contender, { name: "contender", create: true });
+  const counted = refusalCount("delivery_lease");
   await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+  expect(refusalCount("delivery_lease")).toBe(counted + 1);
   await delivery.release(bob, contexts[5]!, leases[5]!.capability);
   expect(delivery.activeLeaseCount).toBe(31);
   await delivery.open(bob, contender);

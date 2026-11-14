@@ -922,6 +922,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session, true);
       return snapshot(db, reader(session, board), board, options);
     },
+    // O(1), for the metrics scrape (#805).
+    get observerCount() { return observers.size; },
     observeBoard(session: ApplicationSession, boardInput: string, hooks: BoardObserver): () => void {
       valid(session);
       const board = normalizeBoard(boardInput);

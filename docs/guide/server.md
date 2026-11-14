@@ -243,13 +243,13 @@ Open file descriptors need no tuning: Bun raises its own soft limit to the hard 
 
 ### Metrics
 
-Set `GRAYBOARD_METRICS_ADDR` to serve Prometheus metrics at `/metrics` on a listener of its own. A bare port (`9464`) binds 127.0.0.1; `host:port` or `[v6]:port` binds that address. Unset, there's no listener. The main port never serves metrics: behind Caddy every proxied request arrives from loopback, so the only access control is the bind address. Keep it on loopback, or on a private interface your scraper reaches, and don't proxy it.
+Set `GRAYBOARD_METRICS_ADDR` to serve Prometheus metrics at `/metrics` on a listener of its own. A bare port (`9464`) binds 127.0.0.1; `host:port` or `[v6]:port` binds that address. Unset, there's no listener, and the startup log says `metrics off`. The listener has no authentication, so the bind address is the only access control (why: [`docs/architecture.md`](../architecture.md#7-build-and-deploy)). Keep it on loopback, or on a private interface your scraper reaches, and don't proxy it.
 
 ```bash
 curl -s localhost:9464/metrics | grep capacity_refusals   # refusals per cap, since start
 ```
 
-The series cover what sizing the caps needs: admissions held per cap, open leases and watches, capacity refusals by cap, tool-call latency by tool, event-loop lag, and resident memory. A rising refusal count for one cap is the signal to raise that cap. The names and help text are in `src/server/metrics.ts` and `src/server/app.ts`; every counter and gauge is per process.
+The series cover admissions held per request cap, open leases, watches and board observers, capacity refusals by cap, native tool-call latency by tool, event-loop lag, and resident memory. A rising refusal count for one cap is the signal to raise that cap. The names and help text are in `src/server/metrics.ts` and `src/server/app.ts`; every counter and gauge is per process.
 
 ## 7. Backups (optional)
 

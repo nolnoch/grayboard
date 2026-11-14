@@ -363,7 +363,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         try {
           authorize(context, ctx.mcpReq.signal);
           if (subscribe) {
-            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
+            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
             const cap = watchable(context, uri);
             const previous = sessionContext(context.principal, legacy.meta);
             if (legacy.subscriptions.size && (!("id" in previous) || !("id" in context.sessionContext) || previous.id !== context.sessionContext.id)) {
@@ -583,7 +583,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         boundary.principal = principal.authed.user_id;
         postReservation = post ? reserve("post", principal) : undefined;
       } catch (error) { report(error, "hosted-fetch", boundary); return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
-      if (post && !postReservation) return new Response("MCP request capacity reached", { status: 429 });
+      if (post && !postReservation) return new Response("MCP request capacity reached", { status: 429 }); // counted in reserve()
       let released = false, legacyPost: Legacy | undefined;
       const releasePost = () => {
         if (post && !released) { released = true; posts--; postReservation!(); }
@@ -615,10 +615,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               const listen = SubscriptionsListenRequestSchema.safeParse(body.parsedBody);
               if (listen.success) {
                 releaseListen = reserve("listen", principal);
-                if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); }
+                if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); } // counted in reserve()
                 const context = exchange.context = await select(req);
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
-                if (uris.length > caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
+                if (uris.length > caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
                 const authorized = new Map(uris.map(uri => [uri, watchable(context, uri)]));
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
                 live = makeLive(context, authorized, ownHandler);
@@ -647,7 +647,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 // Teardown needs no admission.
                 if (req.method === "DELETE") { drop(legacy, "deleted"); context.finish(); releasePost(); return new Response(null, { status: 200 }); }
                 const release = reserve("legacy", principal, { ref: legacy.ref });
-                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
+                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); } // counted in reserve()
                 const since = legacy.dormant.since;
                 legacy.dormant.release();
                 legacy.dormant = undefined;
@@ -661,7 +661,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               if (!legacy) {
                 if (req.method !== "POST") { context.finish(); releasePost(); return new Response("missing MCP session", { status: 400 }); }
                 const release = reserve("legacy", principal);
-                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
+                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); } // counted in reserve()
                 legacy = { ref: crypto.randomUUID(), meta: exchange.meta, binding: binding(context), principal, release, subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false, controls: Promise.resolve() } as Legacy;
                 const created = legacy;
                 newLegacy = legacy;
@@ -760,8 +760,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
-      const context = current(ctx);
-      return said(text(await timeTool(tool, () => hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; })) ?? "ok"), notice);
+      return said(text(await timeTool(tool, () => { const context = current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }); }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
@@ -770,9 +769,8 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     }
   };
   server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
-    const context = current(ctx);
     let notice: string | undefined;
-    return said(text(await timeTool("whoami", () => hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }))), notice);
+    return said(text(await timeTool("whoami", () => { const context = current(ctx); return hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }); })), notice);
   });
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
@@ -782,11 +780,11 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
     inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
-    try { const context = current(ctx); return await timeTool("bind", () => hosted.bind(context.principal, context.sessionContext, args, context.declared)); }
+    try { return await timeTool("bind", () => { const context = current(ctx); return hosted.bind(context.principal, context.sessionContext, args, context.declared); }); }
     catch (e) { return bindRefusal(e, "bind"); }
   });
   server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: HOSTED_UNBIND_INPUT }, async (args, ctx) => {
-    try { const context = current(ctx); return await timeTool("unbind", () => hosted.unbind(context.principal, context.sessionContext, args, context.declared)); }
+    try { return await timeTool("unbind", () => { const context = current(ctx); return hosted.unbind(context.principal, context.sessionContext, args, context.declared); }); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).

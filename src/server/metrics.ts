@@ -10,7 +10,8 @@ import pkg from "../../package.json" with { type: "json" };
 // One per capacity refusal site; `count` the refusal where the request is turned away.
 export const REFUSAL_KINDS = [
   "mcp_post", "mcp_listen", "mcp_legacy", "mcp_dormant", "mcp_exchange",
-  "hosted_session", "hosted_child", "delivery_lease", "resource_watch", "board_observer",
+  "hosted_session", "hosted_child", "delivery_lease", "delivery_receipts", "resource_watch", "board_observer",
+  "attachment_requests",
 ] as const;
 export type RefusalKind = typeof REFUSAL_KINDS[number];
 
@@ -24,6 +25,7 @@ const refusals = new Map<RefusalKind, number>(REFUSAL_KINDS.map(k => [k, 0]));
 const tools = new Map<string, Histogram>();
 
 export function countRefusal(kind: RefusalKind) { refusals.set(kind, refusals.get(kind)! + 1); }
+export function refusalCount(kind: RefusalKind): number { return refusals.get(kind)!; }
 
 export function observeTool(tool: string, seconds: number) {
   if (!tools.has(tool) && tools.size >= MAX_TOOL_SERIES) tool = "other";
@@ -41,8 +43,9 @@ export async function timeTool<T>(tool: string, fn: () => Promise<T> | T): Promi
 
 // Event-loop lag, in windows: each window's p50/p99/max of the loop's delay, then a reset. The
 // scrape reports the last finished window, so it costs nothing and doesn't depend on the scraper's
-// cadence. Shared by every server in the process: started and stopped by reference count.
-export type LagWindow = { p50: number; p99: number; max: number; endedAt: number };
+// cadence. Shared by every server in the process: started and stopped by reference count; the
+// first start's window holds until the last stop.
+export type LagWindow = { p50: number; p99: number; max: number };
 export const LAG_WINDOW_MS = 10_000;
 let lag: { histogram: ReturnType<typeof monitorEventLoopDelay>; timer: ReturnType<typeof setInterval>; users: number } | undefined;
 let lastLag: LagWindow | undefined;
@@ -53,7 +56,7 @@ export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
     histogram.enable();
     const timer = setInterval(() => {
       // Nanoseconds in, seconds out. A window with no tick (count 0) leaves the last one standing.
-      if (histogram.count > 0) lastLag = { p50: histogram.percentile(50) / 1e9, p99: histogram.percentile(99) / 1e9, max: histogram.max / 1e9, endedAt: Date.now() };
+      if (histogram.count > 0) lastLag = { p50: histogram.percentile(50) / 1e9, p99: histogram.percentile(99) / 1e9, max: histogram.max / 1e9 };
       histogram.reset();
     }, windowMs);
     timer.unref?.();
@@ -68,7 +71,9 @@ export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
     clearInterval(lag.timer); lag.histogram.disable(); lag = undefined; lastLag = undefined;
   };
 }
+// The last finished window: what the /healthz lag gate will read (#805, the PR after this one).
 export function lagWindow(): LagWindow | undefined { return lastLag; }
+export function lagSamplerUsers(): number { return lag?.users ?? 0; }
 
 // Gauges the caller reads at scrape time from O(1) getters. Keys are metric-name suffixes.
 export type Gauge = { help: string; values: { value: number; labels?: Record<string, string> }[] };
@@ -104,7 +109,7 @@ export function render(gauges: Gauges = {}): string {
   family("grayboard_capacity_refusals_total", "counter", "Requests refused at a capacity limit, by limit.");
   for (const [kind, n] of refusals) out.push(`grayboard_capacity_refusals_total${labelText({ kind })} ${n}`);
 
-  family("grayboard_tool_call_duration_seconds", "histogram", "Hosted MCP tool-call latency, by tool.");
+  family("grayboard_tool_call_duration_seconds", "histogram", "Native hosted MCP tool-call latency, by tool, authorization and refusals included.");
   for (const [tool, h] of tools) {
     LATENCY_BUCKETS.forEach((le, i) => out.push(`grayboard_tool_call_duration_seconds_bucket${labelText({ tool, le: String(le) })} ${h.buckets[i]}`));
     out.push(`grayboard_tool_call_duration_seconds_bucket${labelText({ tool, le: "+Inf" })} ${h.count}`,

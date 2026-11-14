@@ -67,6 +67,20 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
   const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
 
+  // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
+  const gauges = (): Gauges => {
+    const used = mcp.capacityUsed;
+    return {
+      mcp_admissions: { help: "Hosted MCP admissions held, by capacity kind.", values: (["listen", "legacy", "post", "dormant"] as const).map(kind => ({ value: used[kind], labels: { kind } })) },
+      mcp_exchanges_in_flight: { help: "Hosted MCP exchanges being handled.", values: [{ value: mcp.pendingExchanges }] },
+      hosted_sessions_holding: { help: "Bound hosted sessions this process holds a name for.", values: [{ value: mcp.sessions.holderCount }] },
+      delivery_leases: { help: "Open delivery leases.", values: [{ value: mcp.activeLeases }] },
+      resource_watches: { help: "Open board resource watches.", values: [{ value: mcp.activeWatches }] },
+      board_observers: { help: "Board observers server-wide (the resource watch global cap bounds them).", values: [{ value: application.observerCount }] },
+      hosted_refusal_rows_lost: { help: "Refusal audit rows that failed to write.", values: [{ value: mcp.sessions.refusalRowsLost }] },
+    };
+  };
+
   const server = Bun.serve<RefusalData>({
     hostname: opts.hostname,
     port: config.httpPort,
@@ -120,6 +134,11 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     },
   });
 
+  // Before the timers and the lag sampler: a metrics port in use fails startup with only the main listener to unwind.
+  let metrics: ReturnType<typeof serveMetrics> | undefined;
+  try { metrics = config.metricsAddr ? serveMetrics(config.metricsAddr, gauges) : undefined; }
+  catch (e) { server.stop(true); throw e; }
+
   const timers: ReturnType<typeof setInterval>[] = [];
   let stopRetention: (() => void) | undefined;
   let stopPromise: Promise<void> | undefined;
@@ -132,19 +151,6 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   }
   // The lag sampler runs with or without a listener: /healthz will read it (#805).
   const stopLag = opts.background !== false ? startLagSampler() : undefined;
-  // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
-  const gauges = (): Gauges => {
-    const used = mcp.capacityUsed;
-    return {
-      mcp_admissions: { help: "Hosted MCP admissions held, by capacity kind.", values: (["listen", "legacy", "post", "dormant"] as const).map(kind => ({ value: used[kind], labels: { kind } })) },
-      mcp_exchanges_in_flight: { help: "Hosted MCP exchanges being handled.", values: [{ value: mcp.pendingExchanges }] },
-      hosted_sessions_holding: { help: "Bound hosted sessions this process holds a name for.", values: [{ value: mcp.sessions.holderCount }] },
-      delivery_leases: { help: "Open delivery leases.", values: [{ value: mcp.activeLeases }] },
-      resource_watches: { help: "Open board resource watches.", values: [{ value: mcp.activeWatches }] },
-      hosted_refusal_rows_lost: { help: "Refusal audit rows that failed to write.", values: [{ value: mcp.sessions.refusalRowsLost }] },
-    };
-  };
-  const metrics = config.metricsAddr ? serveMetrics(config.metricsAddr, gauges) : undefined;
 
   return {
     server,

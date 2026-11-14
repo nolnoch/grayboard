@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { countRefusal, lagWindow, LATENCY_BUCKETS, observeTool, render, startLagSampler } from "./metrics.ts";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { countRefusal, lagSamplerUsers, lagWindow, LATENCY_BUCKETS, observeTool, render, startLagSampler } from "./metrics.ts";
 import { DEFAULT_MCP_LIMITS, parseMetricsAddr } from "./config.ts";
 import { TestServer } from "../../tests/support/server.ts";
 import { until } from "../../tests/support/until.ts";
@@ -32,6 +34,39 @@ test("render writes the exposition format: types, cumulative buckets, escaped la
   expect(text).toMatch(/^grayboard_build_info\{version="[^"]+"\} 1$/m);
   expect(sample(text, "grayboard_process_resident_memory_bytes")).toBeGreaterThan(0);
   expect(LATENCY_BUCKETS).toEqual([...LATENCY_BUCKETS].sort((a, b) => a - b));
+});
+
+// A capacity refusal that doesn't count itself reads zero on the dashboard while clients are refused.
+// Every site that answers with a capacity message counts on that line or the one before, or says
+// where it's counted.
+test("every capacity refusal site counts its refusal", () => {
+  const dir = import.meta.dir, sites: string[] = [], uncounted: string[] = [];
+  for (const file of readdirSync(dir).filter(f => f.endsWith(".ts") && !f.endsWith(".test.ts") && f !== "metrics.ts")) {
+    const lines = readFileSync(join(dir, file), "utf8").split("\n");
+    lines.forEach((line, i) => {
+      if (!/capacity reached|childCapacity\(|too many attachment requests/.test(line) || /function childCapacity/.test(line)) return;
+      sites.push(`${file}:${i + 1}`);
+      if (!/countRefusal\(|counted in reserve\(\)/.test(`${lines[i - 1]}\n${line}`)) uncounted.push(`${file}:${i + 1}`);
+    });
+  }
+  expect(sites.length).toBeGreaterThanOrEqual(14);
+  expect(uncounted).toEqual([]);
+});
+
+test("a background server holds one lag sampler reference until it stops", async () => {
+  const before = lagSamplerUsers();
+  const srv = new TestServer({}, { background: true, retentionFirstDelayMs: 3_600_000 });
+  try { expect(lagSamplerUsers()).toBe(before + 1); } finally { await srv.stop(); }
+  expect(lagSamplerUsers()).toBe(before);
+  const quiet = new TestServer();
+  try { expect(lagSamplerUsers()).toBe(before); } finally { await quiet.stop(); }
+});
+
+test("a metrics port in use fails startup", async () => {
+  const taken = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+  try {
+    expect(() => new TestServer({ metricsAddr: { hostname: "127.0.0.1", port: taken.port! } })).toThrow();
+  } finally { taken.stop(true); }
 });
 
 test("GRAYBOARD_METRICS_ADDR: a bare port binds loopback; host:port and [v6]:port as given", () => {
