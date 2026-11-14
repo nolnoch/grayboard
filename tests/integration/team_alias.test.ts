@@ -117,6 +117,26 @@ test("acting as a team alias over HTTP follows membership", async () => {
   expect(await srv.upload(bob, "eng/build", "a.txt", "x")).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "eng/build": ${REASON}` } });
 });
 
+// #284 acceptance 4, #356: eng/x is one alias, reached by a DM to its one
+// holder; team:eng is the team, reached only through its board.
+test("a DM to a team alias reaches its holder alone; team:eng isn't a DM recipient, its board reaches every member", async () => {
+  const deploy = await srv.connected(bob, "eng/deploy");
+  const bobFe = await srv.connected(bob, "fe");
+  const aliceQa = await srv.connected(alice, "qa");
+  const be = await srv.connected(alice, "be");
+
+  await be.send("eng/deploy", "ship it");
+  await deploy.next(direct((m) => m.body === "ship it"));
+  expect(rows(`SELECT sender, recipient FROM messages WHERE body = 'ship it'`)).toEqual([{ sender: "alice@example.com/be", recipient: "eng/deploy" }]);
+  await bobFe.none(direct((m) => m.body === "ship it"));
+  await aliceQa.none(direct((m) => m.body === "ship it"));
+
+  await expect(be.send("team:eng", "everyone")).rejects.toMatchObject({ message: "team:eng isn't a person; to reach a team, board_post to its board #eng" });
+  expect(rows(`SELECT 1 FROM messages WHERE body = 'everyone'`)).toEqual([]);
+  await be.call("board_post", { board: "eng", body: "everyone" });
+  for (const s of [deploy, bobFe, aliceQa]) expect((await s.call<{ posts: { body: string }[] }>("board_read", { board: "eng" })).posts.map((p) => p.body)).toEqual(["everyone"]);
+});
+
 // A team's alias follows its own team's board, not its creator's others.
 // hosted twin: #451 (a team alias on a session)
 test("a lazily created team alias follows only its team's board", async () => {
