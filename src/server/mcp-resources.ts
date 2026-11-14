@@ -32,7 +32,9 @@ const domainCode = (error: unknown) => error instanceof ApplicationError && erro
 // A holder names another session of the same account (bind only searches the caller's own); it reaches the
 // subscriber so a refused rebind can say who holds the name. Free text: bounded, and no control or bidi characters.
 const holderText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
-function domainData(error: unknown): { code: string; known?: string[]; holder?: string } {
+// A refusal's wire data, the same on every role's tool and resource errors (#806): its code, and for
+// identity_unknown/alias_held the sanitized known names or holder.
+export function domainData(error: unknown): { code: string; known?: string[]; holder?: string } {
   const result: { code: string; known?: string[]; holder?: string } = { code: domainCode(error) };
   if (!(error instanceof ApplicationError) || (result.code !== "identity_unknown" && result.code !== "alias_held")) return result;
   try {
