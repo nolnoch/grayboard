@@ -306,6 +306,13 @@ plan() {
     echo "grayboard: kept ${dest}: it is a symlink (a masked or linked file); replace it by hand to take the release's ${what}"
     return 0
   fi
+  # A directory there isn't a file this install placed: renaming the staged
+  # file onto it would land inside it (#396).
+  if [ -d "$dest" ]; then
+    outcome=kept
+    echo "grayboard: kept ${dest}: it is a directory, not a ${what}; move it aside and rerun to take the release's"
+    return 0
+  fi
   if [ -e "$dest" ]; then
     cmp -s "${tmp}/${asset}" "$dest" && return 0
     if [ "$keep" = "1" ]; then
@@ -385,6 +392,12 @@ if [ "$unit_out" = "installed" ] || [ "$unit_out" = "replaced" ]; then
   need_reload=1
 elif [ -n "$unit_out" ] && [ "$(systemctl show -p NeedDaemonReload --value grayboard 2>/dev/null)" = "yes" ]; then
   need_reload=1
+fi
+# systemctl with no systemd running (a container): it reports "offline", and
+# a reload could only fail after the files were placed (#396).
+if [ "$need_reload" = "1" ] && [ "$(systemctl is-system-running 2>/dev/null)" = "offline" ]; then
+  need_reload=0
+  echo "grayboard: systemd isn't running here, so ${unit_dest} was written without a daemon-reload"
 fi
 if [ "$need_reload" = "1" ]; then
   systemctl daemon-reload || {
