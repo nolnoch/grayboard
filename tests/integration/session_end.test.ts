@@ -73,7 +73,7 @@ test("a restart ends a leftover session: holds released, claims of its ID releas
   expect((await b2.call<{ key: string; holder: string }[]>("claim_list")).map((c) => [c.key, c.holder])).toEqual([["ticket:ENG-142", `${A}/be`]]);
   const bounce = await b2.next(direct());
   expect(bounce.message).toMatchObject({ sender: a.id, parent_id: sent.message_id, kind: "bounce" });
-  expect(bounce.message.body).toBe(`${a.id} ended at ${new Date(clock).toISOString()} before reading this; it held \`${A}/be\`.`);
+  expect(bounce.message.body).toBe(`\`${a.id}\` ended at ${new Date(clock).toISOString()} before reading this; it held \`${A}/be\`.`);
 
   // Its alias is free for a new session.
   expect((await srv.appSession(alice, "be").connect()).bind?.alias).toBe(`${A}/be`);

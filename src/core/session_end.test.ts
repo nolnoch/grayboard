@@ -48,7 +48,28 @@ test("unread mail to an ended ID bounces to its senders; nothing else does", () 
   expect(r).toEqual({ ended: true, held: ["fe"], wake: ["be"] });
   expect(JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail)).toMatchObject({ bounced: 1, unbounced: 1 });
   expect(db.prepare(`SELECT sender, sender_id, recipient, parent_id, kind, body FROM messages WHERE kind IS NOT NULL`).all()).toEqual([
-    { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `${ID} ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.` },
+    { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.` },
+  ]);
+});
+
+// #334: a sender with several unread messages gets one bounce, threaded under
+// the latest and naming the others; a sender ID whose row is gone (pruned)
+// gets none, counted in `unbounced`.
+test("bounces coalesce per sender; a sender ID with no row is skipped", () => {
+  const db = bus();
+  const first = send(db, "be", ID, "one");
+  const fromFe = send(db, "fe", ID, "hi");
+  const second = send(db, "be", ID, "two");
+  const third = send(db, "be", ID, "three");
+  send(db, "id:0123456789abf", ID, "from a pruned ID");
+  send(db, "id:0123456789abf", ID, "again");
+
+  const r = end(db);
+  expect(r.wake.sort()).toEqual(["be", "fe"]);
+  expect(JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail)).toMatchObject({ bounced: 4, unbounced: 2 });
+  expect(db.prepare(`SELECT recipient, parent_id, body FROM messages WHERE kind = 'bounce' ORDER BY recipient`).all()).toEqual([
+    { recipient: "be", parent_id: third, body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this or your earlier messages ${first}, ${second}; it held no alias.` },
+    { recipient: "fe", parent_id: fromFe, body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this; it held no alias.` },
   ]);
 });
 
