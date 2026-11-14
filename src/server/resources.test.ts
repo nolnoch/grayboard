@@ -485,3 +485,22 @@ test("resource background session storage faults fail closed, but authoritative 
   finally { application.revalidateSession = validate; }
   for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
 });
+
+// #805: a session's watches are counted per session, not by scanning every watch; closing one frees its slot, and
+// a revoked session's watches all close.
+test("per-session watch capacity counts only that session's watches and frees on unwatch and revoke", async () => {
+  const a = await select(alice), b = await select(bob);
+  application.call(a, "board_create", { name: "cap", purpose: "capacity" });
+  application.call(b, "board_create", { name: "other", purpose: "capacity" });
+  const ids = Array.from({ length: 32 }, () => resources.watch(a, "grayboard://boards/cap", hooks()));
+  expect(() => resources.watch(a, "grayboard://boards/cap", hooks())).toThrow("resource watch capacity reached");
+  const theirs = resources.watch(b, "grayboard://boards/other", hooks());
+  resources.unwatch(a, ids[0]!);
+  ids[0] = resources.watch(a, "grayboard://boards/cap", hooks());
+  expect(resources.activeWatchCount).toBe(33);
+  revoked.add(a);
+  expect(() => resources.list(a)).toThrow("resource session is closed or unauthorized");
+  expect(resources.activeWatchCount).toBe(1);
+  resources.unwatch(b, theirs);
+  expect(resources.activeWatchCount).toBe(0);
+});
