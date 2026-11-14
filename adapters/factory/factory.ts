@@ -22,12 +22,7 @@ import type { Place, Workdir, Workspaces } from "./workdir.ts";
 // `workdir` are its profile's (#643, #641); absent, the factory's global ones.
 // A project (#645) is a fleet whose `routes` are the profiles its plans may
 // name, the lead's first; a fleet with a profile routes to that one alone.
-export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy; workdir?: Workdir; routes?: Route[]; limits?: Limits; share?: Share };
-// Shared subtasks (#636): a fleet's fan-outs go on its `<name>-share` queue
-// board, where any lane may take one; only an outcome from a handle in
-// `with` counts. `timeoutMs`: how long the factory waits for one before it
-// runs the subtask itself (default: the run timeout).
-export type Share = { with: string[]; timeoutMs?: number };
+export type Fleet = { name: string; agent: string; fanout?: boolean; profile?: string; policy?: Policy; workdir?: Workdir; routes?: Route[]; limits?: Limits };
 // Spend and time limits (#655), config only. treeBudgetUsd: the most one
 // request's tree (its runs, its subtasks', its synthesis) may spend.
 // dailyBudgetUsd: the most spent in any 24 h, the global one across the
@@ -45,16 +40,6 @@ export const fleetBoard = (f: Fleet) => `${f.name}-tasks`;
 // Where a fleet's fan-outs post their subtasks (#665): one standing broadcast
 // board per fleet, named from the persona so a tree outlives a reload.
 export const workBoard = (fleet: string) => `${fleet}-work`;
-// Where a sharing fleet's subtasks go (#636): a queue board of their own,
-// so every post on it is a subtask, and no lane triages one as a fresh task.
-export const shareBoard = (fleet: string) => `${fleet}-share`;
-const NOT_RECORDED = "[factory] not run: the fan-out this subtask belongs to stopped before it was recorded; nothing waits for its outcome.";
-// An outside lane's outcome (#636): its reply in the subtask's thread, led
-// by `done:` or `failed:`, after an optional `[tag] ` (the factory's own lane writes `[factory] done:`).
-export const outcomeOf = (body: string): "done" | "failed" | null => {
-  const m = /^\s*(?:\[[^\]\n]{1,40}\]\s*)?(done|failed):/i.exec(body);
-  return m ? (m[1]!.toLowerCase() as "done" | "failed") : null;
-};
 
 // Asking (#652): the most questions one request's tree may ask; how long a
 // question waits before it's sent to your user, and how long after that
@@ -82,7 +67,6 @@ export type FactoryOptions = {
   askTickMs?: number; // how often parked questions' clocks are checked (default 30 s)
   mirrorRenewMs?: number; // how often live mirrored claims (#675) are renewed on the bus (default RENEW_MS)
   childTools?: ChildTools; // the relay (#669) a run whose policy has busTools gets; absent, such a run fails unspawned
-  poster?: FactoryBus; // the session that posts shared subtasks (#636) and hears their threads; absent, no fleet shares
   log(message: string): void;
 };
 
@@ -102,8 +86,6 @@ export class Factory {
   private readonly queues = new Set<string>(); // every queue board, as the last sync saw them
   private readonly work = new Map<string, Promise<string | null>>(); // work boards opened or opening (#665); a failed open or mute is dropped to be tried again
   private readonly noFanout = new Set<string>(); // fleets whose work board's name is a queue board's, as the last sync saw them
-  private readonly shares = new Map<string, Fleet>(); // share board → its sharing fleet (#636), as the last sync left it
-  private readonly sharing = new Set<Promise<void>>(); // shared fan-outs posting now: a subtask post may reach our own lane before its row exists
   private readonly active = new Map<number, AbortController>(); // seq → its running child's controller
   private readonly planning = new Set<number>(); // reviews told they may plan (#658), so their grant keeps a quarter
   private readonly cancelledBy = new Map<number, Stop>(); // seq → what stopped it while it ran: a cancel (#651), a deadline or a spent tree budget (#655)
@@ -152,27 +134,15 @@ export class Factory {
     this.timer = setInterval(() => void this.housekeeping().catch((e) => this.o.log(`housekeeping: ${msg(e)}`)), this.o.housekeepingMs ?? 3_600_000);
     // Parked questions' clocks (#652) run from their stored times, so a
     // restart resumes them where they were.
-    // Shared subtasks (#636) first: a tick's timeout fallback must not beat an outcome already in a thread.
-    await this.recoverShared();
     this.askTimer = setInterval(() => void this.askTick().catch((e) => this.o.log(`questions: ${msg(e)}`)), this.o.askTickMs ?? 30_000);
     this.pump();
     // One bad delivery must not end the loop: log it and take the next.
     const consume = (async () => {
       for await (const d of this.bus.deliveries()) await this.take(d).catch((e) => this.o.log(`couldn't take a delivery: ${msg(e)}`));
     })();
-    // The poster (#636) hears its subtasks' threads: outside outcomes.
-    const poster = this.o.poster;
-    const heard = poster ? (async () => {
-      for await (const d of poster.deliveries()) await this.takeShared(d).catch((e) => this.o.log(`couldn't take a shared subtask's reply: ${msg(e)}`));
-    })() : Promise.resolve();
-    const why = await Promise.race([this.bus.closed, ...(poster ? [poster.closed.then((w) => `the poster session ${poster.handle} closed: ${w}`)] : [])]);
+    const why = await this.bus.closed;
     this.stop();
-    // Either session ending ends the factory: both are closed here, so both loops end
-    // (a dead poster with a live lane would leave run() waiting forever).
-    await poster?.close().catch(() => {});
-    await this.bus.close().catch(() => {});
     await consume.catch(() => {});
-    await heard.catch(() => {});
     await this.settle();
     return why;
   }
@@ -265,7 +235,6 @@ export class Factory {
   // the same OS user, as with a delegation.
   private async takePost(d: Extract<Delivery, { kind: "board" }>): Promise<void> {
     if (d.parentId !== undefined || d.postId === undefined || !d.from) return;
-    if (this.shares.has(d.board)) return this.takeShare(d, this.shares.get(d.board)!);
     const key = `queue:${d.board}:${d.postId}`;
     const fleet = this.joined.get(d.board);
     if (!fleet) {
@@ -317,7 +286,7 @@ export class Factory {
     const boards = new Map((Array.isArray(listed) ? listed : []).map((b: { name: string; kind?: string; mode?: string | null }) => [b.name, b]));
     // Built aside and swapped in at the end: a reload (#645) runs this while
     // deliveries arrive, and one seen mid-sync must not find its fleet gone.
-    const joined = new Map<string, Fleet>(), queues = new Set<string>(), noFanout = new Set<string>(), shares = new Map<string, Fleet>();
+    const joined = new Map<string, Fleet>(), queues = new Set<string>(), noFanout = new Set<string>();
     for (const b of boards.values()) if (b.kind === "queue") queues.add(b.name);
     for (const f of this.fleets()) {
       const name = fleetBoard(f), b = boards.get(name);
@@ -336,31 +305,15 @@ export class Factory {
       } catch (e) {
         this.o.log(`fleet ${f.name}: couldn't join #${name}: ${msg(e)}`);
       }
-      // A sharing fleet (#636): this session is a lane on its share board
-      // too, so a subtask the rotation hands it runs here and its reply acks the claim.
-      if (f.share && this.o.poster && !noFanout.has(f.name)) {
-        const sname = shareBoard(f.name), sb = boards.get(sname);
-        try {
-          if (!sb) await this.bus.call("board_create", { name: sname, purpose: `Shared subtasks of the ${f.name} fleet: each top-level post is one subtask, taken by one lane, which replies at once and then with its outcome, led by done: or failed:.`, kind: "queue" });
-          else if ((sb.kind ?? "broadcast") !== "queue") { this.o.log(`fleet ${f.name}: #${sname} exists as a ${sb.kind ?? "broadcast"} board, not a queue; its subtasks go on #${workBoard(f.name)} and run here`); continue; }
-          else if (sb.mode !== "push") await this.bus.call("board_subscribe", { board: sname, mode: "push" });
-          shares.set(sname, f);
-          queues.add(sname);
-        } catch (e) {
-          this.o.log(`fleet ${f.name}: couldn't join #${sname}; its subtasks go on #${workBoard(f.name)} and run here: ${msg(e)}`);
-        }
-      }
     }
     this.joined.clear();
     for (const [k, v] of joined) this.joined.set(k, v);
     this.noFanout.clear();
     for (const n of noFanout) this.noFanout.add(n);
-    this.shares.clear();
-    for (const [k, v] of shares) this.shares.set(k, v);
     this.queues.clear();
     for (const q of queues) this.queues.add(q);
     for (const b of boards.values()) {
-      if (b.kind === "queue" && b.mode === "push" && !joined.has(b.name) && !shares.has(b.name)) {
+      if (b.kind === "queue" && b.mode === "push" && !joined.has(b.name)) {
         await this.bus.call("board_subscribe", { board: b.name, mode: "off" }).catch((e) => this.o.log(`couldn't leave #${b.name}: ${msg(e)}`));
         this.o.log(`left #${b.name}: no fleet in the config uses it`);
       }
@@ -440,8 +393,7 @@ export class Factory {
       // The digest, built here from the store: the latest round's outcomes
       // in full, earlier rounds' in a line each, and the lead's notes.
       const subs = this.store.subtasks(row.seq);
-      // A subtask an outside lane finished (#636) left no directory here.
-      const res = (s: Row): Result => ({ title: s.title ?? "", reply: s.reply, dir: s.sharedBy === null && ownDir(this.settingsFor(s)) ? String(s.seq) : undefined, profile: s.profile, ...(s.sharedBy !== null ? { by: s.sharedBy } : {}) });
+      const res = (s: Row): Result => ({ title: s.title ?? "", reply: s.reply, dir: ownDir(this.settingsFor(s)) ? String(s.seq) : undefined, profile: s.profile });
       const earlier: Round[] = [];
       for (let k = 1; k < row.round; k++) earlier.push({ round: k, results: subs.filter((s) => s.round === k).map(res) });
       const next = plans ? { max, left: maxRounds - row.round, ownDirs: ownDir(set), worktree: set.workdir.mode === "worktree", profiles } : undefined;
@@ -686,176 +638,34 @@ export class Factory {
         return { error: `subtask ${i + 1} names profile "${oneLine(s.profile)}", which isn't one of ${row.persona}'s (${routes.length ? routes.map((r) => r.profile).join(", ") : "it names none"}). Nothing was fanned out.` };
       }
     }
-    // A later round (#658) posts where the tree's first did. A sharing
-    // fleet's first goes on its share board (#636), posted by the poster
-    // session so any lane, this factory's own included, may be handed it.
-    const fleet = this.fleets().find((f) => f.name === row.persona);
-    const board = row.fanoutBoard ?? (fleet?.share && this.shares.has(shareBoard(row.persona)) ? shareBoard(row.persona) : workBoard(row.persona));
-    const shared = board === shareBoard(row.persona);
-    const poster = this.o.poster;
-    if (shared && !poster) return { error: `#${board} takes shared subtasks, and this factory has no poster session to post them; nothing was fanned out` };
-    if (row.fanoutBoard === null && !shared) {
+    // A later round (#658) posts where the tree's first did.
+    const board = row.fanoutBoard ?? workBoard(row.persona);
+    if (row.fanoutBoard === null) {
       const why = await this.openWork(board, row.persona);
       if (why !== null) return { error: why };
     }
     const round = row.round + 1, label = round > 1 ? `${round}.` : "";
     const of = `for ${oneLine(row.requester)}'s post ${row.id} on #${row.board}`;
-    const take = shared ? `\n\n---\nTo take this subtask, reply to this post at once (any reply acks the queue's claim), then do the task above and reply with its outcome, starting \`done:\` or \`failed:\`.` : "";
     const n = plan.subtasks.length, subtasks: { r: Request; title: string; profile?: string; agent?: string }[] = [];
-    let posted!: () => void;
-    const p = new Promise<void>((ok) => (posted = ok));
-    if (shared) this.sharing.add(p);
-    try {
-      for (const [i, s] of plan.subtasks.entries()) {
-        try {
-          const route = s.profile !== undefined ? routes.find((r) => r.profile === s.profile)! : undefined;
-          const res = (await (shared ? poster! : this.bus).call("board_post", { board, body: `[factory] subtask ${label}${i + 1}/${n}${route ? ` (${route.profile})` : ""} ${of}: ${s.title}\n\n${s.task}${take}` })) as { post_id?: unknown };
-          if (typeof res?.post_id !== "number") throw new Error("board_post returned no post_id");
-          subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title, ...(route ? { profile: route.profile, agent: route.agent } : {}) });
-        } catch (e) {
-          // Name what was posted: those posts stay on the board, never run.
-          const made = subtasks.length ? `${subtasks.length} posted: post${subtasks.length === 1 ? "" : "s"} ${subtasks.map((s) => s.r.id).join(", ")}` : "none posted";
-          if (shared) await this.notRun(subtasks.map((s) => s.r));
-          return { error: `couldn't post subtask ${i + 1} of ${n} on #${board} (${made}; ${shared ? "none run here, and each thread says so" : "none run"}): ${msg(e)}`, board };
-        }
+    for (const [i, s] of plan.subtasks.entries()) {
+      try {
+        const route = s.profile !== undefined ? routes.find((r) => r.profile === s.profile)! : undefined;
+        const res = (await this.bus.call("board_post", { board, body: `[factory] subtask ${label}${i + 1}/${n}${route ? ` (${route.profile})` : ""} ${of}: ${s.title}\n\n${s.task}` })) as { post_id?: unknown };
+        if (typeof res?.post_id !== "number") throw new Error("board_post returned no post_id");
+        subtasks.push({ r: { source: "board", board, id: res.post_id, requester: row.requester, persona: row.persona, task: s.task }, title: s.title, ...(route ? { profile: route.profile, agent: route.agent } : {}) });
+      } catch (e) {
+        // Name what was posted: those posts stay on the board, never run.
+        const made = subtasks.length ? `${subtasks.length} posted: post${subtasks.length === 1 ? "" : "s"} ${subtasks.map((s) => s.r.id).join(", ")}` : "none posted";
+        return { error: `couldn't post subtask ${i + 1} of ${n} on #${board} (${made}; none run): ${msg(e)}`, board };
       }
-      if (this.cancelledBy.has(row.seq)) {
-        if (shared) await this.notRun(subtasks.map((s) => s.r));
-        return { error: "cancelled", board };
-      }
-      const waitMs = fleet?.share?.timeoutMs ?? this.o.timeoutMs;
-      this.store.fanOut(row, board, subtasks, shared ? Date.now() + waitMs : undefined);
-    } finally {
-      posted();
-      this.sharing.delete(p);
     }
-    this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}${round > 1 ? `, round ${round}` : ""}${shared ? ", shared" : ""}`);
+    if (this.cancelledBy.has(row.seq)) return { error: "cancelled", board };
+    this.store.fanOut(row, board, subtasks);
+    this.o.log(`request ${row.id}: fanned out ${n} subtasks on #${board}${round > 1 ? `, round ${round}` : ""}`);
     const agents = [...new Set(subtasks.map((s) => s.agent ?? row.agent))];
-    const as = shared ? `for ${fleet?.share ? fleet.share.with.join(", ") : "a listed lane"} or this factory's own lane to take, any not answered within ${dur(fleet?.share?.timeoutMs ?? this.o.timeoutMs)} run here,` : agents.length === 1 ? `each run as \`${agents[0]}\`` : `each run as its profile's agent`;
+    const as = agents.length === 1 ? `each run as \`${agents[0]}\`` : `each run as its profile's agent`;
     await this.reply(row, `[factory] fanned out${round > 1 ? `, round ${round}` : ""}: ${n} subtasks on #${board} (post${n === 1 ? "" : "s"} ${subtasks.map((s) => s.r.id).join(", ")}), ${as} with its outcome in its thread. The combined result follows in this thread.`).catch((e) => this.o.log(`couldn't announce the fan-out of ${row.source} ${row.id}: ${msg(e)}`));
     return null;
-  }
-
-  // ── shared subtasks (#636) ──────────────────────────────────────────────
-  // A shared fan-out that stopped before its rows were stored: its posts sit
-  // on a queue another lane may be handed, so each thread says nothing waits.
-  private async notRun(posts: Request[]): Promise<void> {
-    for (const r of posts) await this.reply(r, NOT_RECORDED).catch((e) => this.o.log(`couldn't answer post ${r.id} on #${r.source === "board" ? r.board : "?"}: ${msg(e)}`));
-  }
-
-  // A subtask post on a share board, handed to this lane by the rotation.
-  // Ours (by post id in the store): it runs here after all. Another
-  // factory's: it runs here whole, like a task that can't fan out, and its
-  // outcome goes in its thread for that factory to read. Either way the
-  // first reply acks the claim.
-  private async takeShare(d: Extract<Delivery, { kind: "board" }>, fleet: Fleet): Promise<void> {
-    const key: Key = { source: "board", id: d.postId! };
-    let row = this.store.get(key);
-    // Our own post can arrive while its fan-out is still posting the rest.
-    if (!row && d.from === this.o.poster?.handle && this.sharing.size) {
-      await Promise.allSettled([...this.sharing]);
-      row = this.store.get(key);
-    }
-    if (row && row.parent !== null) {
-      const took = this.store.shareTake(row.seq), hold = took ? this.holdNote(row.seq) : null;
-      const note = took ? `[factory] taken: this factory's own lane runs this subtask${hold ? ` (${hold})` : ""}. Its outcome follows in this thread.`
-        : `[factory] taken: this subtask is already ${row.state === "finished" ? "finished" : "this factory's to run"}; nothing more runs for it.`;
-      if (took) this.o.log(`request ${row.parent}: shared subtask ${row.id} came to our own lane; running it here`);
-      await this.reply(row, note).catch((e) => this.o.log(`couldn't acknowledge shared subtask ${row.id}: ${msg(e)}`));
-      if (took) this.pump();
-      return;
-    }
-    if (row) { this.o.log(`post ${d.postId} on #${d.board} already taken; redelivery ignored`); return; }
-    if (d.from === this.o.poster?.handle) {
-      // Its fan-out failed or was cancelled before the rows were stored: nothing waits on it.
-      await this.reply({ source: "board", board: d.board, id: d.postId!, requester: d.from!, persona: fleet.name, task: d.body }, NOT_RECORDED).catch((e) => this.o.log(`couldn't answer post ${d.postId} on #${d.board}: ${msg(e)}`));
-      return;
-    }
-    const r: Request = { source: "board", board: d.board, id: d.postId!, requester: d.from!, persona: fleet.name, task: d.body };
-    const agent = this.runner.roster().find((a) => a.name === fleet.agent);
-    if (!agent) {
-      this.o.log(`shared subtask ${d.postId} on #${d.board}: fleet ${fleet.name}'s agent \`${fleet.agent}\` isn't in the ${this.runner.harness} roster; passing it on`);
-      await this.release(`queue:${d.board}:${d.postId}`, `factory: fleet ${fleet.name}'s agent isn't in its roster`);
-      return;
-    }
-    await this.admit(r, agent, `a shared subtask of fleet "${fleet.name}"`, { fanout: false });
-  }
-
-  // A reply in a shared subtask's thread, heard by the poster: a listed
-  // lane's outcome finishes the subtask. The factory's own replies are in
-  // its store already; anyone else's, or chatter, is logged or ignored.
-  private async takeShared(d: Delivery): Promise<void> {
-    if (d.kind !== "board" || d.parentId === undefined || !d.from) return;
-    if (d.from === this.bus.handle || d.from === this.o.poster?.handle) return;
-    const verdict = outcomeOf(d.body);
-    if (verdict === null) return; // an ack or a comment
-    // An outcome can come while its fan-out is still posting the rest, before
-    // the rows exist: the fan-outs in flight now are taken before the lookup
-    // awaits, since one may finish (and leave the set) during it.
-    const inFlight = [...this.sharing];
-    let row = await this.sharedRowOf(d.board, d.parentId);
-    if (!row && inFlight.length) {
-      await Promise.allSettled(inFlight);
-      row = await this.sharedRowOf(d.board, d.parentId);
-    }
-    if (!row) return;
-    this.finishShared(row, d.from, d.body, d.postId);
-  }
-
-  // The subtask whose thread `parent` is in: the post itself, or (a reply to
-  // a reply) the thread's root, read from the bus.
-  private async sharedRowOf(board: string, parent: number): Promise<Row | null> {
-    const own = this.store.get({ source: "board", id: parent });
-    if (own) return own.parent !== null && own.source === "board" && own.board === board ? own : null;
-    try {
-      const t = (await this.o.poster!.call("board_read", { board, thread: parent })) as { posts?: { id: number; parent_id: number | null }[] };
-      const root = t.posts?.find((p) => p.parent_id === null);
-      const r = root ? this.store.get({ source: "board", id: root.id }) : null;
-      return r && r.parent !== null && r.source === "board" && r.board === board ? r : null;
-    } catch (e) {
-      this.o.log(`couldn't read the thread of post ${parent} on #${board}: ${msg(e)}`);
-      return null;
-    }
-  }
-
-  private finishShared(row: Row, from: string, body: string, postId?: number): void {
-    const listed = this.fleets().find((f) => f.name === row.persona)?.share?.with ?? [];
-    const at = postId !== undefined ? ` (post ${postId})` : "";
-    if (!listed.includes(from)) { this.o.log(`shared subtask ${row.id}: an outcome from ${from}${at}, who isn't in fleet ${row.persona}'s shareWith; ignored`); return; }
-    if (!this.store.shareFinish(row.seq, clip(body), from)) { this.o.log(`shared subtask ${row.id}: ${from}'s outcome${at} came after it ${row.state === "finished" ? "finished" : "began running here"}; ignored`); return; }
-    this.o.log(`shared subtask ${row.id}: finished by ${from}`);
-    if (row.parent !== null && this.store.synthesizeWhenDone(row.parent)) this.o.log(`request ${row.parent}: every subtask finished; synthesizing`);
-    this.pump();
-  }
-
-  // At start: pushes don't survive a restart, so each subtask still shared
-  // has its thread read for an outcome that came while the factory was down.
-  private async recoverShared(): Promise<void> {
-    const poster = this.o.poster;
-    for (const r of this.store.sharedRows()) {
-      if (!poster || r.source !== "board") continue;
-      try {
-        const t = (await poster.call("board_read", { board: r.board, thread: r.id })) as { posts?: { id: number; author: string; body: string; parent_id: number | null }[] };
-        for (const p of t.posts ?? []) {
-          if (p.parent_id === null || p.author === this.bus.handle || p.author === poster.handle || outcomeOf(p.body) === null) continue;
-          this.finishShared(this.store.bySeq(r.seq) ?? r, p.author, p.body, p.id);
-          if (this.store.bySeq(r.seq)?.state !== "shared") break;
-        }
-      } catch (e) {
-        this.o.log(`couldn't read shared subtask ${r.id}'s thread: ${msg(e)}`);
-      }
-    }
-  }
-
-  // Shared subtasks no listed lane finished in time run here; a late
-  // outside outcome is then ignored.
-  private async shareDue(now: number): Promise<void> {
-    for (const r of this.store.sharedDue(now)) {
-      if (!this.store.shareTake(r.seq)) continue;
-      const w = this.fleets().find((f) => f.name === r.persona)?.share?.timeoutMs ?? this.o.timeoutMs;
-      this.o.log(`shared subtask ${r.id}: no outcome from a listed lane within ${dur(w)}; running it here`);
-      await this.reply(r, `[factory] no outcome from a listed lane within ${dur(w)}; this factory runs the subtask itself, and a later outcome here is ignored.`).catch((e) => this.o.log(`couldn't say so in shared subtask ${r.id}'s thread: ${msg(e)}`));
-    }
   }
 
   // ── asking (#652) ───────────────────────────────────────────────────────
@@ -962,7 +772,6 @@ export class Factory {
       // are renewed inside their TTL.
       const live = this.store.liveBusKeys();
       if (this.mirrorDirty || [...this.mirrorHeld].some((k) => !live.has(k)) || (live.size > 0 && now - this.renewedAt >= (this.o.mirrorRenewMs ?? RENEW_MS))) this.sweepMirror();
-      await this.shareDue(now);
       this.pump();
     } finally {
       this.ticking = false;
@@ -1099,7 +908,7 @@ export class Factory {
   // False when the request had already finished.
   private async stopTree(root: Row, s: Stop): Promise<boolean> {
     const res = this.store.cancel(root.seq, (r) =>
-      r.seq !== root.seq ? `[factory] ${s.sub}, ${r.state === "asking" ? "while it waited for an answer" : r.state === "shared" ? "while it waited for a listed lane: this factory no longer waits for its outcome, and a run already started elsewhere isn't stopped" : "before it ran"}.`
+      r.seq !== root.seq ? `[factory] ${s.sub}, ${r.state === "asking" ? "while it waited for an answer" : "before it ran"}.`
         : r.state === "waiting" ? `[factory] ${s.head} after it fanned out on #${r.fanoutBoard}${this.postsOf(r)}; ${s.after}.`
           : r.state === "asking" ? `[factory] ${s.head} while it waited for an answer.`
             : `[factory] ${s.head} before it ran.`);
@@ -1123,8 +932,7 @@ export class Factory {
   }
 
   private fleetOf(root: Row): Fleet | undefined {
-    // Another factory's shared subtask (#636) runs on its share board's fleet.
-    return root.source === "board" ? this.fleets().find((f) => f.name === root.persona && (fleetBoard(f) === root.board || shareBoard(f.name) === root.board)) : undefined;
+    return root.source === "board" ? this.fleets().find((f) => f.name === root.persona && fleetBoard(f) === root.board) : undefined;
   }
 
   // What a spent daily budget holds: everything (the global cap), or the
@@ -1132,13 +940,8 @@ export class Factory {
   private hold(): Hold {
     const since = Date.now() - DAY_MS, g = this.cfg.limits.dailyBudgetUsd;
     if (g !== undefined && g - this.store.spentSince(since) < MIN_GRANT_USD) return { all: true, boards: [] };
-    const boards = this.fleets().filter((f) => f.limits?.dailyBudgetUsd !== undefined && f.limits.dailyBudgetUsd - this.fleetSpent(f, since) < MIN_GRANT_USD).flatMap((f) => [fleetBoard(f), shareBoard(f.name)]);
+    const boards = this.fleets().filter((f) => f.limits?.dailyBudgetUsd !== undefined && f.limits.dailyBudgetUsd - this.store.spentSince(since, fleetBoard(f)) < MIN_GRANT_USD).map(fleetBoard);
     return { all: false, boards };
-  }
-
-  // A fleet's spend: its own trees', and the outside subtasks (#636) it ran from its share board.
-  private fleetSpent(f: Fleet, since: number): number {
-    return this.store.spentSince(since, fleetBoard(f)) + this.store.spentSince(since, shareBoard(f.name));
   }
 
   // Why a queued row is held, with about when it frees; null when it isn't.
@@ -1163,7 +966,7 @@ export class Factory {
     if (set.policy.budgetUsd !== undefined) caps.push(set.policy.budgetUsd);
     const since = Date.now() - DAY_MS, g = this.cfg.limits.dailyBudgetUsd, f = this.fleetOf(root)?.limits?.dailyBudgetUsd;
     if (g !== undefined) caps.push(g - this.store.spentSince(since));
-    if (f !== undefined && root.source === "board") caps.push(f - this.fleetSpent(this.fleetOf(root)!, since));
+    if (f !== undefined && root.source === "board") caps.push(f - this.store.spentSince(since, root.board));
     if (caps.slice(set.policy.budgetUsd !== undefined ? 1 : 0).some((c) => c < MIN_GRANT_USD)) return HELD;
     if (lim.treeBudgetUsd !== undefined) {
       // A subtask shares what's left with its siblings still to run and the
@@ -1241,8 +1044,8 @@ export class Factory {
     if (row.state === "queued") state = `queued, ${this.holdNote(row.seq) ?? `${this.store.queuedAhead(row)} ahead`}`;
     else if (row.state === "running") state = open.length ? `running: ${this.runner.harness} agent \`${open[0]!.agent}\` for ${ago(open[0]!.started_at)}` : "running: starting";
     else if (row.state === "waiting") {
-      const cur = subs.filter((s) => s.round === row.round), asking = cur.filter((s) => s.state === "asking").length, shared = cur.filter((s) => s.state === "shared").length, m = this.limitsFor(row).maxRounds ?? 1;
-      state = `fanned out on #${row.fanoutBoard}${this.postsOf(row)}${m > 1 ? `, round ${row.round} of ${m}` : ""}: ${cur.filter((s) => s.state === "finished").length} of ${cur.length} subtasks finished${asking ? `, ${asking} asking` : ""}${shared ? `, ${shared} waiting for a listed lane` : ""}`;
+      const cur = subs.filter((s) => s.round === row.round), asking = cur.filter((s) => s.state === "asking").length, m = this.limitsFor(row).maxRounds ?? 1;
+      state = `fanned out on #${row.fanoutBoard}${this.postsOf(row)}${m > 1 ? `, round ${row.round} of ${m}` : ""}: ${cur.filter((s) => s.state === "finished").length} of ${cur.length} subtasks finished${asking ? `, ${asking} asking` : ""}`;
     } else if (row.state === "asking") state = `asking${row.askHuman ? " your user" : ""}: "${oneLine((row.question ?? "").split("\n")[0] ?? "")}", for ${ago(row.askedAt ?? Date.now())}`;
     else state = `finished: ${oneLine((row.reply ?? "").split("\n")[0] ?? "")}`;
     const done = runs.filter((r) => r.ended_at !== null);
