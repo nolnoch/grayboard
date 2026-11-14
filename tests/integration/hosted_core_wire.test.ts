@@ -3,7 +3,7 @@
 // revision, the server's own status and body for a refusal at initialize, and
 // a scope refusal classified for a new sign-in.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, MODEL_META, NativeWire, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
+import { ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
@@ -149,4 +149,33 @@ test("a wire's suggested name reaches the server and is offered first while unbo
   wires.push(plain);
   await plain.connect();
   expect((JSON.parse(((await plain.callTool("whoami", {}, "raw-w")).content as Array<{ text: string }>)[0]!.text) as { candidates: Array<{ name: string }> }).candidates[0]).toMatchObject({ name: "from-subscriber", suggested: true });
+});
+
+// A proxy's error page reaches the agent only capped (#276): at connect (the refusal capture) and on a later
+// call (the SDK puts a failed POST's whole body in its message).
+test("server-supplied error text is capped at connect and on a call", async () => {
+  const page = `<html>${"x".repeat(100_000)}</html>`;
+  let failCalls = false;
+  const proxy = Bun.serve({ port: 0, async fetch(req) {
+    const body = req.method === "POST" ? await req.text() : undefined;
+    if (failCalls && body?.includes('"tools/call"')) return new Response(page, { status: 500, headers: { "Content-Type": "text/html" } });
+    const url = new URL(req.url);
+    const upstream = await fetch(`${srv.base}${url.pathname}${url.search}`, { method: req.method, headers: req.headers, body });
+    return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+  } });
+  try {
+    const token = issue();
+    const proxied = { ...options(), url: `http://127.0.0.1:${proxy.port}/mcp` };
+    const wire = new NativeWire(proxied, { token: async () => token }, new AbortController().signal, "raw-root");
+    wires.push(wire);
+    await wire.connect();
+    failCalls = true;
+    const error = await wire.callTool("whoami", {}, "raw-root").then(() => undefined, e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("more characters cut");
+    expect(error.message.length).toBeLessThan(SERVER_TEXT_LIMIT + 100);
+    const refusal = new ConnectRefused(500, page);
+    expect(refusal.message.length).toBeLessThan(SERVER_TEXT_LIMIT + 100);
+    expect(refusal.message).toContain("more characters cut");
+  } finally { proxy.stop(true); }
 });

@@ -31576,6 +31576,14 @@ class SubscriberError extends Error {
   }
 }
 var shownText = (value) => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f\u202A-\u202E\u2066-\u2069]/.test(value);
+var SERVER_TEXT_LIMIT = 512;
+var serverText = (text) => text.length <= SERVER_TEXT_LIMIT ? text : `${text.slice(0, SERVER_TEXT_LIMIT)}\u2026 (${text.length - SERVER_TEXT_LIMIT} more characters cut)`;
+function capServerText(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof Error && e.message.length > SERVER_TEXT_LIMIT)
+      e.message = serverText(e.message);
+  }
+}
 
 class LeaseUnavailable extends SubscriberError {
   constructor(code = "not_found") {
@@ -31603,7 +31611,7 @@ class ConnectRefused extends SubscriberError {
     super(typeof code === "string" && domainCodes.has(code) ? code : "invalid_response");
     this.status = status;
     this.body = body;
-    this.message = `Server refused the connection (HTTP ${status}): ${body}`;
+    this.message = `Server refused the connection (HTTP ${status}): ${serverText(body)}`;
   }
 }
 
@@ -31752,6 +31760,7 @@ class Connection {
     try {
       return await pending;
     } catch (error) {
+      capServerText(error);
       if (!(error instanceof ConnectRefused) && scopeRefusal(error))
         throw new InsufficientScope(error);
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
@@ -35759,7 +35768,7 @@ class AttachmentRefused extends Error {
   status;
   code;
   constructor(status, code, message) {
-    super(message);
+    super(serverText(message));
     this.status = status;
     this.code = code;
   }

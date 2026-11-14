@@ -794,6 +794,7 @@ program
     const piCli = !!Bun.which("pi");
     if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) await installHarness(PI);
 
+    for (const w of undeliveredEntries()) console.warn(`[grayboard] ${w}`);
     if (failed) return;
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
     console.log(
@@ -807,6 +808,33 @@ program
       ` To bind a name at start, set BUS_IDENTITY in the launch command${server && opencode ? " (OpenCode: grayboard setup-opencode --name)" : ""}.`,
     );
   });
+
+/**
+ * omp, opencode and pi drop MCP notifications, so their grayboard entry must
+ * stay disabled with BUS_PUSH=off and an adapter must deliver (#95). An
+ * enabled push-mode entry with no adapter of either variant runs a delivery
+ * owner whose pushes go nowhere: messages are consumed unseen while senders
+ * see delivered_now. Returns one warning per such harness.
+ */
+function undeliveredEntries(): string[] {
+  const out: string[] = [];
+  const present = (p: string) => { try { lstatSync(p); return true; } catch { return false; } };
+  const harnesses: { name: string; config: HarnessConfig; env: string; adapters: string[] }[] = [
+    { name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] },
+    { name: "opencode", config: OC_CONFIG, env: "environment", adapters: [OC_PLUGIN.path] },
+    { name: "pi", config: PI.config, env: "env", adapters: [PI.local, PI.hosted] },
+  ];
+  for (const h of harnesses) {
+    let e: Entry | undefined;
+    try { e = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})?.[h.config.section]?.grayboard; } catch { continue; }
+    // A remote entry (hosted opencode) runs no `grayboard mcp`.
+    if (!e || typeof e !== "object" || e.enabled === false || e.type === "remote") continue;
+    if ((e[h.env] as Record<string, unknown> | undefined)?.BUS_PUSH === "off") continue;
+    if (h.adapters.some(present)) continue;
+    out.push(`${h.name}: the grayboard entry in ${h.config.path} is enabled with push on, but no grayboard adapter is installed, so ${h.name} drops its pushes and messages to its sessions are consumed unseen. Run \`grayboard setup\` to install the adapter, or remove the entry.`);
+  }
+  return out;
+}
 
 /** A failed adapter refresh step: printed with what to do, and the run fails. */
 function adapterFailed(e: unknown): void {
@@ -937,6 +965,7 @@ program
         for (const note of r.notes) console.log(note);
       } catch (e) { adapterFailed(e); }
     }
+    for (const w of undeliveredEntries()) console.log(`[grayboard] ${w}`);
     refreshClaude();
   });
 

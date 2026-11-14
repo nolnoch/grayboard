@@ -20,6 +20,19 @@ export class SubscriberError extends Error {
 }
 // Server free text the host shows (an alias_held holder, an alias_lost reason): bounded, and no control or bidi characters.
 export const shownText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
+// Server-supplied error text an agent reads (an HTTP error body, a refusal's message): at most
+// SERVER_TEXT_LIMIT characters, with what was cut said, so a misbehaving server or a proxy's HTML
+// page can't flood the agent's context (#276).
+export const SERVER_TEXT_LIMIT = 512;
+export const serverText = (text: string): string =>
+  text.length <= SERVER_TEXT_LIMIT ? text : `${text.slice(0, SERVER_TEXT_LIMIT)}… (${text.length - SERVER_TEXT_LIMIT} more characters cut)`;
+// Caps the message of every error on a cause chain in place: the SDK puts a failed POST's
+// whole response body in its message, and a wrapper can repeat a cause's message.
+export function capServerText(error: unknown): void {
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    if (e instanceof Error && e.message.length > SERVER_TEXT_LIMIT) e.message = serverText(e.message);
+  }
+}
 export class LeaseUnavailable extends SubscriberError {
   constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
 }
@@ -41,7 +54,7 @@ export class ConnectRefused extends SubscriberError {
     let code: unknown;
     try { code = (JSON.parse(body) as { code?: unknown } | null)?.code; } catch {}
     super(typeof code === "string" && domainCodes.has(code) ? code : "invalid_response");
-    this.message = `Server refused the connection (HTTP ${status}): ${body}`;
+    this.message = `Server refused the connection (HTTP ${status}): ${serverText(body)}`;
   }
 }
 
@@ -167,6 +180,7 @@ abstract class Connection {
   protected async reachable<T>(pending: Promise<T>): Promise<T> {
     try { return await pending; }
     catch (error) {
+      capServerText(error);
       if (!(error instanceof ConnectRefused) && scopeRefusal(error)) throw new InsufficientScope(error);
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
     }
