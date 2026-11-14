@@ -34,8 +34,10 @@ export type LoginConfig = {
   // Open or show the authorization URL. The flow takes the browser's answer
   // whether or not this has settled; a rejection before that answer ends it.
   // A session waiting on another's flow gets each distinct URL that flow
-  // shows; a rejection ends its wait the same way.
-  present(url: string): void | Promise<void>;
+  // shows; a rejection ends its wait the same way. `answered` (own flows
+  // only) aborts once the browser's answer is in, before the code exchange:
+  // a prompt sent after that names a used callback (#506).
+  present(url: string, answered?: AbortSignal): void | Promise<void>;
   notify(message: string): void;              // a sign-in already running in another session of this harness
   // Operation "login_link": the shared sign-in link file (#581), the user's
   // concern only; the others may need the model to relay a sign-in.
@@ -438,6 +440,7 @@ export class Login {
     const signal = AbortSignal.any([AbortSignal.timeout(FLOW_MS), ...(outer ? [outer] : [])]);
     const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url");
     const callback = await this.callback(state, signal);
+    const answered = new AbortController();
     let params: URLSearchParams;
     try {
       const url = new URL(meta.authorization_endpoint);
@@ -446,10 +449,11 @@ export class Login {
       await this.share(url.href);
       // A prompt the user never answers (or a host that shows it late) must
       // not hold a browser answer that already came back (#497).
-      const presented = Promise.resolve().then(() => this.config.present(url.href));
+      const presented = Promise.resolve().then(() => this.config.present(url.href, answered.signal));
       presented.catch(() => {});
       params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally {
+      answered.abort();
       // Before the callback closes: only a waiter's read already in flight
       // can still show a link whose callback is gone.
       await this.unlink();

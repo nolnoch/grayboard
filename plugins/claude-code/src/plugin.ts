@@ -140,7 +140,7 @@ export function createPlugin(o: PluginOptions): Plugin {
     // returns. Where it can, Claude Code also asks the user to open it (MCP
     // URL elicitation); a decline ends the flow and the next call starts one.
     // A session waiting on another process's flow gets that flow's URL too.
-    present: async url => {
+    present: async (url, answered) => {
       const flow = signins.flow;
       await testPauseAsync("claude-sign-in-present", o.env);
       try { putSignIn(config.dataDir, o.claude.pid, url); }
@@ -182,6 +182,9 @@ export function createPlugin(o: PluginOptions): Plugin {
         await testPauseAsync("claude-sign-in-resend", o.env);
         // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
         if (signins.flow !== flow || flow.abort.signal.aborted) { say("sign-in ended before the prompt was sent again"); return; }
+        // The browser answered and the code exchange is still running: the
+        // prompt would name a used callback (#506).
+        if (answered?.aborted) { say("the browser answered before the prompt was sent again"); return; }
         // A later URL's prompt replaced this one.
         if (prompts.get(flow) !== prompt) return;
       }

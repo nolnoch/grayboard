@@ -243,6 +243,18 @@ test("the link file is gone once the browser answers, before the code exchange (
   expect(grants()).toBe(1);
 });
 
+test("present's answered signal aborts once the browser answers, before the code exchange (#506)", async () => {
+  let answered: AbortSignal | undefined;
+  const l = login({ present: async (url, signal) => { answered = signal; expect(signal?.aborted).toBe(false); await browse(url); } });
+  let atExchange: boolean | undefined;
+  await withFetch(async (_url, form) => {
+    if (form?.get("grant_type") === "authorization_code") atExchange = answered?.aborted;
+    return undefined;
+  }, () => l.login());
+  expect(atExchange).toBe(true);
+  expect(grants()).toBe(1);
+});
+
 test("a leftover link from a crashed holder is removed by the next holder before its discovery, so a waiter polling then never presents it", async () => {
   let link: string | undefined;
   const holder = login({ present: url => { link = url; return new Promise<void>(() => {}); } });
