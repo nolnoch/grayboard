@@ -29,6 +29,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 type ChannelParams = { content: string; meta?: Record<string, string> };
 type McpEntry = { command?: string; args?: string[]; env?: Record<string, string>; url?: string; type?: string; enabled?: boolean };
@@ -38,7 +39,19 @@ type CallResult = { content?: Content[]; structuredContent?: { instructions?: st
 type Rpc = { id?: number; method?: string; params?: unknown; result?: any; error?: { message: string } };
 
 const SERVER = process.env.GRAYBOARD_MCP_NAME ?? "grayboard";
-const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+// pi's agent directory as pi resolves it (src/shared/pi.ts piAgentDir, which
+// this raw-installed file can't import; a test holds the two equal): an EMPTY
+// PI_CODING_AGENT_DIR is unset to pi, so it must not make this read ./mcp.json
+// from the cwd and run a repo's command (#437).
+export function agentDir(env: Record<string, string | undefined> = process.env, home = homedir()): string {
+  const dir = env.PI_CODING_AGENT_DIR;
+  if (!dir) return join(home, ".pi", "agent");
+  if (dir === "~") return home;
+  if (dir.startsWith("~/")) return join(home, dir.slice(2));
+  if (dir.startsWith("file://")) return fileURLToPath(dir);
+  return dir;
+}
+const AGENT_DIR = agentDir();
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
 // MCP call renderer treat these as they treat any MCP server's tools.
 const PREFIX = `mcp__${SERVER}__`.replace(/[^A-Za-z0-9_]/g, "_");
