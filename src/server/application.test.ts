@@ -187,12 +187,13 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
   expect(() => application.pending(b)).toThrow("an admin signed this user out");
 });
 
+// Judged by the bundler's import scan, not the source text (#385 item 21): comments, strings and erased
+// type-only imports are no runtime dependency.
 test("hosted Slack has no dependency on the transitional wire adapter", async () => {
   const source = await Bun.file(new URL("./slack.ts", import.meta.url)).text();
-  expect(source).not.toContain("shared/protocol");
-  expect(source).not.toContain("JSON.parse");
-  expect(source).not.toContain("HumanConn");
-  expect(source).toContain("application.attachHuman");
+  const imports = new Bun.Transpiler({ loader: "ts" }).scanImports(source).map(i => i.path);
+  expect(imports).toContain("./application.ts");
+  expect(imports.filter(path => /(^|\/)shared\/protocol(\.[jt]s)?$/.test(path))).toEqual([]);
 });
 
 // An unbound hosted session acts as no address (#229): its reads are judged
