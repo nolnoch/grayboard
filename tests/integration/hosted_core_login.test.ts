@@ -78,7 +78,7 @@ beforeEach(async () => {
   app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [],
-  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice" }) } });
+  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }) } });
   target = `http://127.0.0.1:${app.server.port}`;
   resource = app.oauth.resource;
 });
