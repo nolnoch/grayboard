@@ -21,6 +21,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { accessAudits } from "../support/audit.ts";
 import { browse as browseConsent } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
 
@@ -108,7 +109,7 @@ async function seed(options: { scopes?: string[]; access?: string; expiresIn?: n
   await writeJsonAtomic(login({ clientId: store.clientId }).path, store);
   return { ...issued, store };
 }
-const audits = (action: string) => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM access_log WHERE action = ?").get(action)!.n;
+const audits = (action: string) => accessAudits(app.db, action).length;
 const grants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ?").get(CLIENT)!.n;
 const liveGrants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ? AND revoked_at IS NULL").get(CLIENT)!.n;
 // The client's fetch, with the requests `answer` picks answered here: a

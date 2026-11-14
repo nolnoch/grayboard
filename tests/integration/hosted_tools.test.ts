@@ -16,6 +16,7 @@ import type { Config } from "../../src/server/config.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../../src/shared/attachments.ts";
 import type { Pending } from "../../src/shared/notifications.ts";
 import { board, direct } from "../support/events.ts";
+import { accessAudits } from "../support/audit.ts";
 import { HostedToolError, type HostedSession } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
@@ -351,8 +352,7 @@ const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7
 const download = (token: string, identity: string, id: number) =>
   fetch(`${srv.base}/api/attachments/${id}?as=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
 
-const audits = (action: string) =>
-  (srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[]);
+const audits = (action: string) => accessAudits(srv.app.db, action);
 
 test("attachments on a DM: uploaded as your identity, bound by the send, pushed and read, fetched by its two parties", async () => {
   const alice = await login(A);
@@ -376,8 +376,8 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   expect(up.status).toBe(201);
   expect(up.body).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: PNG.length, sha256: expect.any(String) });
   const info = { id: up.body.id, filename: "shot.png", type: "image/png", size: PNG.length, sha256: up.body.sha256 };
-  expect(audits("attachment.uploaded")).toEqual([
-    { actor: A, target: `attachment:${up.body.id}`, detail: expect.stringContaining(`"identity":"${A}/be"`) },
+  expect(audits("attachment.uploaded")).toMatchObject([
+    { actor: A, target: `attachment:${up.body.id}`, detail: { identity: `${A}/be` } },
   ]);
 
   // Only the uploader's identity can send it.
@@ -423,7 +423,7 @@ test("attachments: a failed blob read or write is audited; a swept blob is a 404
   const gone = await download(bob, "fe", up.body.id);
   expect(gone.status).toBe(404);
   expect(await gone.json()).toEqual({ code: "not_found", message: `attachment ${up.body.id}'s bytes are gone` });
-  expect(audits("attachment.download_failed")).toMatchObject([{ actor: B, target: `attachment:${up.body.id}`, detail: expect.stringContaining("are missing") }]);
+  expect(audits("attachment.download_failed")).toMatchObject([{ actor: B, target: `attachment:${up.body.id}`, detail: { error: expect.stringContaining("are missing") } }]);
   expect(audits("attachment.downloaded")).toEqual([]);
 
   // An unwritable blob directory: the client hears nothing of the path or errno.
@@ -434,7 +434,7 @@ test("attachments: a failed blob read or write is audited; a swept blob is a 404
   } finally {
     chmodSync(join(blobDir, "tmp"), 0o700);
   }
-  expect(audits("attachment.upload_failed")).toMatchObject([{ actor: A, target: null, detail: expect.stringMatching(/"filename":"other.png".*EACCES/) }]);
+  expect(audits("attachment.upload_failed")).toMatchObject([{ actor: A, target: null, detail: { filename: "other.png", error: expect.stringContaining("EACCES") } }]);
 });
 
 test("attachments on a team board post follow the board; a retracted DM takes its files; uploads are capped", async () => {
@@ -519,7 +519,7 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
   });
   expect(streamed.status).toBe(411);
 
-  expect(audits("attachment.upload_refused").map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([
+  expect(audits("attachment.upload_refused").map((r): Record<string, unknown> => ({ actor: r.actor, ...r.detail }))).toEqual([
     { actor: A, identity: `${A}/be`, filename: "c.txt", size: 30, reason: over.body.message },
   ]);
 });

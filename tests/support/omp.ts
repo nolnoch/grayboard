@@ -19,7 +19,7 @@ import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
-import { accessAudits } from "./hosted_rows.ts";
+import { accessAudits } from "./audit.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { until } from "./until.ts";

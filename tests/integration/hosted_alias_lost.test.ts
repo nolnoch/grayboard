@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { bindingOf } from "../../adapters/hosted-core/src/model.ts";
-import { accessAudits } from "../support/hosted_rows.ts";
+import { accessAudits } from "../support/audit.ts";
 import { HOSTED_CLIENT, type HostedSession } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -67,8 +67,8 @@ test("the Controller's whoami reports alias_lost until its delivery_open; the na
 
   const row = srv.app.repo.hosted.get(rootId(b))!;
   const detail = { aliases: ["eng/build"], ownership: row.ownership_id, client_id: HOSTED_CLIENT };
-  expect(notified()).toEqual([{ actor: B, target: row.session_id, detail }]);
-  expect(audits("hosted.alias_lost_seen")).toEqual([{ actor: B, target: row.session_id, detail }]);
+  expect(notified()).toMatchObject([{ actor: B, target: row.session_id, detail }]);
+  expect(audits("hosted.alias_lost_seen")).toMatchObject([{ actor: B, target: row.session_id, detail }]);
 });
 
 test("a delivery_open takes only the losses a Controller's whoami reported", async () => {

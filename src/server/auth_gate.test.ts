@@ -41,6 +41,9 @@ test("at the key cap a new address goes uncharged, with an audit row counting th
     expect(rows.length).toBe(1);
     expect(rows[0]!.target).toBeNull();
     expect(JSON.parse(rows[0]!.detail)).toEqual({ tracked: 1, uncharged: 1 });
+    expect(err.mock.calls.map((c) => c[0])).toEqual([
+      "[grayboard] auth-failure limiter is tracking 1 addresses, its cap; 1 failures from new addresses went uncharged",
+    ]);
   } finally {
     err.mockRestore();
   }
