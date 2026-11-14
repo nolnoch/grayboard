@@ -50,14 +50,17 @@ export function shellQuote(s: string): string {
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-/** SessionStart handles rotation and title together; clear runs only its identity barrier. */
+/**
+ * SessionStart handles rotation and title together; clear runs only its identity barrier.
+ * No SubagentStop: locally a child ends with its root (#548), so it would only cost a
+ * process start per subagent end (#555 item 12); an install drops one an older release wrote.
+ */
 export function claudeHooks(argv: string[]): Record<string, HookEntry[]> {
   const cli = argv.map(shellQuote).join(" ");
   const run = (event: string) => [{ type: "command", command: `${cli} hook claude ${event}`, timeout: 10 }];
   return {
     SessionStart: [{ matcher: "startup|resume|clear|fork", hooks: run("session-start") }],
     PreToolUse: [{ matcher: LOCAL_TOOL_MATCHER, hooks: run("pre-tool-use") }],
-    SubagentStop: [{ hooks: run("subagent-stop") }],
     SessionEnd: [{ hooks: run("session-end") }],
   };
 }
