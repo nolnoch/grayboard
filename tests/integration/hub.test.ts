@@ -90,7 +90,8 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
 // hosted twin: #451 (a resume on the session's key)
 test("peer_list shows where the session runs; a reconnect on its key keeps the status, a new session clears it", async () => {
   const alice = await login(A);
-  const watcher = await srv.hosted(B, "fe");
+  // The watcher is alice's own: another user's peer_list shows neither (F-12).
+  const watcher = await srv.hosted(A, "fe");
   const be = async () => (await watcher.call<WhoResult>("peer_list", { include_offline: true })).peers.find((p) => p.handle === `${A}/be`)!;
 
   const key = "c1".repeat(32);
