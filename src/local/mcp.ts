@@ -145,7 +145,8 @@ const LAUNCHER = process.env.BUS_LAUNCHER === "1";
 // BUS_MODEL, BUS_EFFORT: what this session's harness runs on, shown on its
 // peer_list rows (#284 S12). Self-reported, read once, ended with the session.
 // delegate's per-requester bucket (#252): in this process, so per session
-// (a session's children call through it too). A streak is audited once, at
+// (a session's children call through it too). A server's is per user; local
+// mode is one user, and a bucket shared across processes would need a table. A streak is audited once, at
 // its first refusal and when the bucket is full again.
 const delegateLimiter = new RateLimiter(DELEGATE_LIMIT, {
   start: (requester, ctx, retryAfterMs) => writeCoreAudit(db, "delegation.throttled", requester, null, { ...ctx, retry_after_ms: retryAfterMs }),
@@ -855,7 +856,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // The requester's bucket (#252): checked before resolving, spent once the
     // request is written (a re-pick spends nothing more).
     const t = delegateLimiter.check(IDENTITY, byChild);
-    if (!t.ok) return { ...text(`error: ${delegateThrottled(DELEGATE_LIMIT, t.retryAfterMs)}`), isError: true };
+    if (!t.ok) return { ...text(`error: ${delegateThrottled(DELEGATE_LIMIT, t.retryAfterMs, "this session")}`), isError: true };
     // A launcher's open requests, over dm_inbox's default window (#252).
     const since = Date.now() - inboxDays(undefined) * 86_400_000;
     const open = (h: string) => countOpenDelegations(db, "audit_log", h, since);

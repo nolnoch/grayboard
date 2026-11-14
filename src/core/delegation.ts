@@ -78,15 +78,19 @@ export function sameUser(requester: string, candidate: string, db: Database): bo
 }
 
 // Limits (#252). A requester spends one token per fresh delegation (a dedup
-// replay spends none): a burst, then one a minute. A launcher with
-// DELEGATE_OPEN_CAP requests it hasn't taken (the open count below) is
-// skipped by the auto-pick and refused by name.
-export const DELEGATE_LIMIT = { burst: 10, perSec: 1 / 60 };
+// replay spends none): a burst, then one every 10s. On a server the bucket is
+// the user's, shared by all their sessions and children; a local session
+// keeps its own. A launcher with DELEGATE_OPEN_CAP requests it hasn't taken
+// (the open count below) is skipped by the auto-pick and refused by name. A
+// server reads both from GRAYBOARD_DELEGATE_* (src/server/config.ts).
+export const DELEGATE_LIMIT = { burst: 60, perSec: 0.1 };
 export const DELEGATE_OPEN_CAP = 20;
 
-// The refusal when the requester's bucket is empty.
-export function delegateThrottled(limit: { burst: number; perSec: number }, retryAfterMs: number): string {
-  return `too many delegation requests from this address (a burst of ${limit.burst}, then one every ${Math.round(1 / limit.perSec)}s, #252); retry in ${Math.max(1, Math.ceil(retryAfterMs / 1000))}s`;
+// The refusal when the requester's bucket is empty; `from` names whose
+// bucket it is ("your user", "this session").
+export function delegateThrottled(limit: { burst: number; perSec: number }, retryAfterMs: number, from: string): string {
+  const refill = limit.perSec >= 1 ? `${+limit.perSec.toFixed(2)} a second` : `one every ${+(1 / limit.perSec).toFixed(1)}s`;
+  return `too many delegation requests from ${from} (a burst of ${limit.burst}, then ${refill}, #252); retry in ${Math.max(1, Math.ceil(retryAfterMs / 1000))}s`;
 }
 
 // A launcher's open delegations: requests audited as sent to it in the last

@@ -78,7 +78,7 @@ export type ApplicationOptions = {
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
   hostedRequestLimit?: RateLimit;
-  // delegate's limits (#252): per requester address, and the open requests one launcher may hold.
+  // delegate's limits (#252): per user, and the open requests one launcher may hold.
   delegateLimit?: RateLimit;
   delegateOpenCap?: number;
   // The hub's clock: the rate limiters' and the write-dedup window's
@@ -190,7 +190,7 @@ type Hub = {
   humanReach: HumanReach;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
-  // delegate's per-requester bucket and the launcher cap (#252). A streak's
+  // delegate's per-user bucket and the launcher cap (#252). A streak's
   // rows go to delegateRows while a delegate call runs, to be written where
   // its outcome keeps them; otherwise (a sweep) at once.
   delegateLimit: RateLimit;
@@ -409,13 +409,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       },
     }, opts.now),
     delegateLimit: opts.delegateLimit ?? DELEGATE_LIMIT,
-    // Keyed by requester address; capped like the hosted-request limiter's keys would be by users.
+    // Keyed by user email, so a user's sessions, aliases and children share
+    // one bucket and a fresh session can't reset it; capped like the
+    // hosted-request limiter's keys would be by users.
     delegateLimiter: new RateLimiter(opts.delegateLimit ?? DELEGATE_LIMIT, {
-      start: (requester, ctx, retryAfterMs) => {
-        const { actor, ...detail } = ctx as { actor: string | null };
-        delegateRow(() => writeAudit(repo, "delegation.throttled", actor, requester, { ...detail, retry_after_ms: retryAfterMs }));
-      },
-      end: (requester, refused) => delegateRow(() => writeAudit(repo, "delegation.throttle_ended", null, requester, { refused })),
+      start: (email, ctx, retryAfterMs) => delegateRow(() => writeAudit(repo, "delegation.throttled", email, email, { ...ctx, retry_after_ms: retryAfterMs })),
+      end: (email, refused) => delegateRow(() => writeAudit(repo, "delegation.throttle_ended", null, email, { refused })),
     }, opts.now, 10_000),
     delegateRows: undefined,
     delegateOpenCap: opts.delegateOpenCap ?? DELEGATE_OPEN_CAP,
@@ -1289,8 +1288,9 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     out = writeOnce(hub, session, "delegate", session.primary, args, m.resend === true, [], () => {
       // Checked and spent in here, so a dedup replay is neither charged nor
       // refused; resend writes again, so it's charged (#252).
-      const t = hub.delegateLimiter.check(session.primary, { actor: authed.user_email, session_id: session.sessionId, ...byChild });
-      if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs), { retry_after_ms: t.retryAfterMs });
+      // The user's bucket, not the address's (#252): the row names the session that tripped it.
+      const t = hub.delegateLimiter.check(authed.user_email, { requester: session.primary, session_id: session.sessionId, ...byChild });
+      if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
       const d = resolveDelegation(db, session.primary, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h), open, hub.delegateOpenCap);
       picked = d.to;
       const w = writeSend(hub, session, prepareSend(hub, session, session.primary, d.to, d.body, null, true, undefined));
@@ -1301,7 +1301,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
         message_id: w.msg.id,
         ...byChild,
       });
-      hub.delegateLimiter.spend(session.primary);
+      hub.delegateLimiter.spend(authed.user_email);
       return { payload, ref: w.ref, msg: w.msg };
     });
   } catch (e) {
