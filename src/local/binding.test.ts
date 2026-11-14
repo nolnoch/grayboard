@@ -26,6 +26,24 @@ test("a dead row reaped twice logs one release", () => {
   expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id)).toEqual({ ended_at: 2 });
 });
 
+// #330: the id.ended row names the process that ended the session and,
+// for a reap, the dead row it judged and how; a child ended with its root
+// carries the ender, not the root's evidence.
+test("a reap's id.ended names the ender, the dead row and the probe", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const base = { name: null, names: [], harness: null, cwd: null, started_at: 1, attached_pid: null, attached_start: null };
+  const id = "id:0123456789abh";
+  registerSession(db, { ...base, session_id: id, pid: 999999, proc_start: "s1", harness_pid: 999999, harness_rule: "env" });
+  const child = childSessionId(id, "sub-1");
+  registerChild(db, id, child, "sub-1");
+  const rows = db.prepare(`SELECT * FROM bindings WHERE session_id = ?`).all(id) as SessionRow[];
+  db.transaction(() => reap(db, rows, 2)).immediate();
+  const detail = (target: string) => JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended' AND target = ?`).get(target) as { detail: string }).detail);
+  expect(detail(id)).toMatchObject({ by_pid: process.pid, reaped: { pid: 999999, proc_start: "s1", harness_pid: 999999, harness_rule: "env", probe: "pre_lock" } });
+  expect(detail(child)).toMatchObject({ by_pid: process.pid });
+  expect(detail(child).reaped).toBeUndefined();
+});
+
 // #335: a row judged dead before the transaction is reaped without a new
 // probe while it's unchanged, so a pid reused in between can't keep it; a row
 // that changed (a child re-attached) is probed again and kept while it lives.

@@ -3,8 +3,7 @@
 // restart under the live harness is the same session; the harness's exit
 // ends it.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { idAddress, mintSessionKey } from "../../src/core/bindings.ts";
@@ -13,6 +12,7 @@ import { openLocalDb } from "../../src/local/open.ts";
 import { runLocalRetention } from "../../src/local/retention.ts";
 import { closeSessions, localSession, stopSession as stop } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
+import { busRows, pauseEnv as busPauseEnv, releasePause } from "../support/local_bus.ts";
 
 let dir: string;
 
@@ -25,14 +25,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try {
-    return db.prepare(sql).all(...args) as T[];
-  } finally {
-    db.close();
-  }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
 const audit = (action: string, target: string) =>
   rows<{ detail: string | null }>(`SELECT detail FROM audit_log WHERE action = ? AND target = ? ORDER BY rowid`, action, target).map((r) => JSON.parse(r.detail ?? "null"));
@@ -40,8 +33,8 @@ const binding = (id: string) =>
   rows<{ pid: number; harness_rule: string | null; attached_pid: number | null; detached_at: number | null }>(
     `SELECT pid, harness_rule, attached_pid, detached_at FROM bindings WHERE session_id = ?`, id,
   )[0];
-const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
-const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
+const pauseEnv = (point: string) => busPauseEnv(dir, point);
+const release = (point: string) => releasePause(dir, point);
 // A launcher between the harness and grayboard: the harness is found past it.
 // (Restart tests don't use it: the stand-in harness would kill the shell,
 // orphaning grayboard on the harness's own stdin, which never closes.)

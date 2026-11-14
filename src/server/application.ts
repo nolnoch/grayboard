@@ -1361,12 +1361,7 @@ function handleRetract(hub: Hub, session: ApplicationSession, id: number): { not
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  const retracted = repo.atomic(() => {
-    if (!repo.messages.retract(m.sender, id)) return false;
-    writeAudit(repo, "message.retracted", session.authed.user_email, `message:${id}`, { message_id: id, sender: m.sender, recipient: m.recipient });
-    return true;
-  });
-  if (!retracted) return fail("bad_request", retractRefusal.replied(id));
+  if (!repo.messages.retract(m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
   afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs); });
   return {};
 }

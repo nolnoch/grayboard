@@ -174,6 +174,12 @@ fi
 
 # Inside INSTALL_DIR, so each final mv is a rename on one filesystem.
 mkdir -p "$INSTALL_DIR"
+# A killed install skips its EXIT trap and leaves its staging dir (#317).
+# Remove ones untouched for an hour, so an install running alongside keeps its own.
+find "$INSTALL_DIR" -maxdepth 1 -type d -name '.grayboard-install.*' -user "$(id -u)" -mmin +60 2>/dev/null |
+  while IFS= read -r stale; do
+    rm -rf -- "$stale" && echo "grayboard: removed ${stale}, left by an interrupted install"
+  done || true
 tmp="$(mktemp -d "${INSTALL_DIR}/.grayboard-install.XXXXXX")"
 # Deploy files are staged beside their destinations (see plan); a refusal or a
 # crash before the commit leaves those staged copies for this trap to remove.
