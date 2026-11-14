@@ -261,7 +261,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     const call = async (token: string, tool: string, args: Record<string, unknown>) => {
       const response = await fetch(`${base}/api/claims/call`, {
         method: "POST", headers: { Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ identity: "be", tool, args }),
+        body: JSON.stringify({ as: "be", tool, args }),
       });
       return { status: response.status, body: await response.json() as Record<string, unknown> };
     };

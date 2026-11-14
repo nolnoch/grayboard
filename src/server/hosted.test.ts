@@ -561,18 +561,18 @@ test("a refused writes_as declaration through the hosted gate keeps its refused 
   expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused' AND detail LIKE '%human%'").all()).toHaveLength(1);
 });
 
-test("a rate-limited hosted bind keeps its hello.rate_limited row after the transaction rolls back, and the streak's end is written once (#467)", async () => {
+test("a rate-limited hosted bind keeps its bind.rate_limited row after the transaction rolls back, and the streak's end is written once (#467)", async () => {
   const limited = createApplication(database.repo, database.db, { helloLimit: { burst: 1, perSec: 0.01 }, now: () => now });
   const service = createHostedSessions(limited, { now: () => now, isAuthorized: () => true });
   const rows = (action: string) => (database.db.query("SELECT count(*) AS n FROM access_log WHERE action = ?").get(action) as { n: number }).n;
   try {
     await service.bind(principal, context("root"), { name: "fe", create: true });
     await expect(service.bind(principal, context("root"), { name: "be", create: true })).rejects.toHaveProperty("code", "rate_limited");
-    expect(rows("hello.rate_limited")).toBe(1);
+    expect(rows("bind.rate_limited")).toBe(1);
     // The bucket refills; the bind that ends the streak commits, so its row is written there and not again.
     now += 200_000;
     await service.bind(principal, context("other"), { name: "ops", create: true });
-    expect(rows("hello.rate_limit_ended")).toBe(1);
+    expect(rows("bind.rate_limit_ended")).toBe(1);
     expect(service.refusalRowsLost).toBe(0);
   } finally { service.close(); limited.stopExpiry(); }
 });
