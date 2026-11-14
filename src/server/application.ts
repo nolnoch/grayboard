@@ -5,7 +5,7 @@
 // transport and its hello are gone (#282): a hosted session's lifetime is the
 // hosted store's lease, not a connection's grace.
 import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
-import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
@@ -389,8 +389,19 @@ function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m
   return { verified: true, detail: `restored after end of session ${prev}` };
 }
 
+// A refusal's row, written now, or by the session's `afterRollback` when the call runs inside a transaction
+// the refusal's throw rolls back (#452, #467).
+function rowAfterRollback(session: ApplicationSession, write: () => void) {
+  if (session.afterRollback) session.afterRollback(write); else write();
+}
+
 export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
+  // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
+  // is the session's `afterRollback`, and a streak's audit row, written there where a commit keeps it, is handed
+  // to it as well, to be written again if the transaction rolls back. A refused take always rolls it back.
+  let streakAfterRollback: ((write: () => void) => void) | undefined;
+  const streakRow = (write: () => void) => { write(); streakAfterRollback?.(write); };
   const hub: Hub = {
     repo,
     db,
@@ -407,11 +418,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     helloLimiter: new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
       start: (email, ctx, retryAfterMs) => {
         console.error(`[grayboard] rate-limiting hellos from ${email}`);
-        writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
+        streakRow(() => writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
       },
       end: (email, refused) => {
         console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
-        writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
+        streakRow(() => writeAudit(repo, "hello.rate_limit_ended", email, null, { refused }));
       },
     }, opts.now),
     boardChanged(board) {
@@ -640,9 +651,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
     return bindNow(session, m);
   }
-  // `refused`: where a refusal's binding row goes when the caller's transaction will roll it back with the throw
-  // (a hosted bind runs inside one); it writes the row after the rollback.
-  function bindNow(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">, refused?: (address: string, detail: string) => void): BindResult {
+  // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
+  // transaction the refusal's throw rolls back, and the row is written after it.
+  function bindNow(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): BindResult {
     valid(session, true);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
@@ -651,16 +662,18 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Lazy creation is here, after the bind limit: an unlimited create loop
     // would mint aliases without bound. Taken before the held check, so a
     // re-bind loop spends it too.
-    const t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias });
+    streakAfterRollback = session.afterRollback;
+    let t: Take;
+    try { t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAfterRollback = undefined; }
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
     const target = bindTarget(hub, authed, m.alias);
     if ("error" in target) {
-      if (target.address) (refused ?? ((a, d) => logBinding(db, id, a, "refused", d)))(target.address, target.error);
+      if (target.address) { const a = target.address; rowAfterRollback(session, () => logBinding(db, id, a, "refused", target.error)); }
       return fail(target.code, target.error);
     }
     const { address, scope } = target;
     const refuse = (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): never => {
-      (refused ?? ((a, d) => logBinding(db, id, a, "refused", d)))(address, detail);
+      rowAfterRollback(session, () => logBinding(db, id, address, "refused", detail));
       return fail(code, message, extra);
     };
     let meta: AliasMetaSet | undefined;
@@ -1275,7 +1288,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   const { authed } = session;
   // The audit rows name the child that called, beside the routing `via` (#523).
   const byChild = session.via === undefined ? {} : { child: session.via };
-  const refused = (detail: Record<string, unknown>) => (session.afterRollback ?? ((w: () => void) => { w(); }))(() => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
+  const refused = (detail: Record<string, unknown>) => rowAfterRollback(session, () => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
