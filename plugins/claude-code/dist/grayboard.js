@@ -14180,7 +14180,7 @@ var package_default = {
   dependencies: {
     "@modelcontextprotocol/core": "2.4.0",
     "@modelcontextprotocol/server": "2.4.0",
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
     commander: "^12.0.0",
     jose: "^5.0.0",
     "jsonc-parser": "^3.3.1",
