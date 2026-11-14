@@ -110,9 +110,17 @@ export interface Repo {
     create(name: string, createdBy: number): Team;
     findByName(name: string): Team | undefined;
     listForUser(userId: number): Team[];
-    addMember(teamId: number, userId: number): void;
+    // Adds a member with an explicit role; an existing member is left as is
+    // (false). Roles change through setRole.
+    addMember(teamId: number, userId: number, role?: TeamRole): boolean;
+    // Both throw LastOwner rather than leave a team with members and no
+    // owner (security audit F-02); the check and the write share one
+    // transaction. A team that already has no owner isn't guarded.
     removeMember(teamId: number, userId: number): void;
-    listMembers(teamId: number): { user_id: number; email: string }[];
+    // The member's previous role, or null when it isn't a member.
+    setRole(teamId: number, userId: number, role: TeamRole): TeamRole | null;
+    isOwner(teamId: number, userId: number): boolean;
+    listMembers(teamId: number): { user_id: number; email: string; role: TeamRole }[];
     listMemberUserIds(teamId: number): number[];
     isMember(teamId: number, userId: number): boolean;
   };
@@ -531,6 +539,10 @@ function initSchema(db: Database): void {
   // via: the child session (a harness subagent, #523) that wrote it under its
   // root's addresses; null for a root's own write.
   if (!msgCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE messages ADD COLUMN via TEXT`);
+  // role: 'owner' or 'member' (security audit F-02); null on rows from
+  // before it, read through OWNER_SQL.
+  const tmCols = db.prepare(`PRAGMA table_info(team_members)`).all() as { name: string }[];
+  if (!tmCols.some((c) => c.name === "role")) db.exec(`ALTER TABLE team_members ADD COLUMN role TEXT`);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -555,6 +567,19 @@ function seedSchema(db: Database, first: boolean): void {
 }
 
 /** A team's name another principal already has (#284 decision 5). */
+// A team member's role (security audit F-02). Owners (and admins) manage
+// membership; members read. A row written before roles existed has a null
+// role and reads as owner only for the team's creator (OWNER_SQL), so no
+// backfill is needed; every write since stores an explicit role.
+export type TeamRole = "owner" | "member";
+const OWNER_SQL = `(tm.role = 'owner' OR (tm.role IS NULL AND tm.user_id = (SELECT created_by FROM teams WHERE id = tm.team_id)))`;
+
+export class LastOwner extends Error {
+  constructor(readonly team: string) {
+    super(`the last owner of team "${team}" can't leave while others remain; make another member an owner first: grayboard team add ${team} <email> --role owner`);
+  }
+}
+
 export class PrincipalTaken extends Error {
   constructor(readonly name: string) {
     super(`the name "${name}" belongs to another team or service principal`);
@@ -563,6 +588,19 @@ export class PrincipalTaken extends Error {
 
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
+  // Refuses to take `userId`'s ownership away when it is the team's last
+  // owner and other members remain. A sole member may leave; a team with
+  // no owner (its creator left before roles existed) has nothing to guard.
+  const guardLastOwner = (teamId: number, userId: number): void => {
+    const c = db.query<{ owners: number; members: number; me: number }, [number, number]>(
+      `SELECT COALESCE(SUM(${OWNER_SQL}), 0) AS owners, COUNT(*) AS members,
+              COALESCE(SUM(tm.user_id = ? AND ${OWNER_SQL}), 0) AS me
+       FROM team_members tm WHERE tm.team_id = ?`,
+    ).get(userId, teamId)!;
+    if (c.me && c.owners === 1 && c.members > 1) {
+      throw new LastOwner(db.query<{ name: string }, [number]>("SELECT name FROM teams WHERE id = ?").get(teamId)!.name);
+    }
+  };
   const principalByName = (name: string): PrincipalRow | undefined =>
     db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
   const observers = new Set<() => void>();
@@ -720,20 +758,39 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`,
         ).all(userId);
       },
-      addMember(teamId, userId) {
-        db.run(
-          "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at) VALUES (?, ?, ?)",
-          [teamId, userId, clock()],
-        );
+      addMember(teamId, userId, role = "member") {
+        return db.run(
+          "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at, role) VALUES (?, ?, ?, ?)",
+          [teamId, userId, clock(), role],
+        ).changes > 0;
       },
       removeMember(teamId, userId) {
-        db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
+        db.transaction(() => {
+          guardLastOwner(teamId, userId);
+          db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
+        })();
+      },
+      setRole(teamId, userId, role) {
+        return db.transaction(() => {
+          const row = db.query<{ owner: number }, [number, number]>(
+            `SELECT ${OWNER_SQL} AS owner FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ?`,
+          ).get(teamId, userId);
+          if (!row) return null;
+          if (role === "member") guardLastOwner(teamId, userId);
+          db.run("UPDATE team_members SET role = ? WHERE team_id = ? AND user_id = ?", [role, teamId, userId]);
+          return row.owner ? "owner" : "member";
+        })();
+      },
+      isOwner(teamId, userId) {
+        return !!db.query<{ x: number }, [number, number]>(
+          `SELECT 1 AS x FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ? AND ${OWNER_SQL}`,
+        ).get(teamId, userId);
       },
       listMembers(teamId) {
-        return db.query<{ user_id: number; email: string }, [number]>(
-          `SELECT u.id as user_id, u.email FROM users u
+        return db.query<{ user_id: number; email: string; owner: number }, [number]>(
+          `SELECT u.id as user_id, u.email, ${OWNER_SQL} AS owner FROM users u
            JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ?`,
-        ).all(teamId);
+        ).all(teamId).map(({ owner, ...m }) => ({ ...m, role: owner ? "owner" : "member" }));
       },
       listMemberUserIds(teamId) {
         return db.query<{ user_id: number }, [number]>(
