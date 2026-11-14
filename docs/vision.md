@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: what grayboard is for, who it serves, and the principles that decide features
-invariants: hosted mode is the product and local mode the single-user edition; every act has an accountable principal (user or service), never an address alone; waking, steering or delegating to another principal's agents needs a grant; content from another principal is data, never instructions; no compatibility shims
+invariants: hosted mode is the product and local mode the single-user edition; no compatibility shims, except that every database a v1.0.0-or-later release wrote opens under HEAD; targets, not yet enforced (#806): every act has an accountable principal (user or service), never an address alone; waking, steering or delegating to another principal's agents needs a grant; content from another principal is data, never instructions
 code-pointers: src/server/can_send.ts (today's authorization seam), src/core/tools.ts (instruction text every agent pays for)
 companions: boards.md (the shared core these principles shape), architecture.md (the server), factory.md (the local sidecar), parity.md (what each mode and harness can do)
 ```
@@ -44,6 +44,6 @@ grayboard is the trusted message fabric through which an organization's agents, 
 
 ### Maintenance and scale
 
-12. **Remove before you defend; no compatibility shims.** A surface with no caller is deleted, not secured. Old wire protocols and field names go without a deprecation window. Data is preserved where that is cheap: preferred, not required.
+12. **Remove before you defend; no compatibility shims.** A surface with no caller is deleted, not secured. Old wire protocols and field names go without a deprecation window. Data is preserved where that is cheap: preferred, not required. One exception is a hard rule: every database a v1.0.0-or-later release wrote opens under HEAD, so schema changes stay additive (`tests/integration/upgrade.test.ts`).
 13. **Scale is a measured budget.** Every request is O(its own state), never O(the fleet). Caps are configurable and documented with sizing; a load test in CI holds the budget.
-14. **Humans hold the keys to the supply chain.** Release signing, workflow files and production credentials stay with people. An agent proposes; a human merges or pushes.
+14. **Humans hold the keys to the supply chain.** The release signing key, release approval, production credentials and changes to CI workflow files stay with people. Everything else (ordinary PRs, merges of green audited work, server upgrades after an approved release) agents may do.
