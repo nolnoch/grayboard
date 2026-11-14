@@ -57,7 +57,7 @@ export function createTouchQueue(): TouchQueue {
 
 // idleDays: a token unused that long is refused (security audit F-14); 0 never
 // expires one. Use, not age, so an agent that keeps working never loses its token.
-export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue, idleDays = 0): AuthedUser | null {
+export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue, idleDays: number): AuthedUser | null {
   const hash = hashToken(raw);
   const session = repo.sessions.findByTokenHash(hash);
   if (!session) return null;

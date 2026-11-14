@@ -63,7 +63,7 @@ describe("verifySessionToken", () => {
     const u   = repo.users.upsertByEmail("wade@example.com", null);
     const raw = mintToken();
     repo.sessions.create(u.id, hashToken(raw), null);
-    const authed = verifySessionToken(raw, repo, touches);
+    const authed = verifySessionToken(raw, repo, touches, 0);
     expect(authed).not.toBeNull();
     expect(authed!.user_email).toBe("wade@example.com");
   });
@@ -88,7 +88,7 @@ describe("verifySessionToken", () => {
   });
 
   test("missing token returns null", () => {
-    expect(verifySessionToken("gbrd_v1_nonexistent", repo, touches)).toBeNull();
+    expect(verifySessionToken("gbrd_v1_nonexistent", repo, touches, 0)).toBeNull();
   });
 
   test("revoked token returns null", () => {
@@ -96,7 +96,7 @@ describe("verifySessionToken", () => {
     const raw = mintToken();
     const s   = repo.sessions.create(u.id, hashToken(raw), null);
     repo.sessions.revoke(s.id);
-    expect(verifySessionToken(raw, repo, touches)).toBeNull();
+    expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
   });
 
   test("disabled user returns null", () => {
@@ -104,7 +104,7 @@ describe("verifySessionToken", () => {
     const raw = mintToken();
     repo.sessions.create(u.id, hashToken(raw), null);
     repo.users.setDisabled(u.id, true);
-    expect(verifySessionToken(raw, repo, touches)).toBeNull();
+    expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
   });
 
   test("re-enabled user returns authed user", () => {
@@ -113,6 +113,6 @@ describe("verifySessionToken", () => {
     repo.sessions.create(u.id, hashToken(raw), null);
     repo.users.setDisabled(u.id, true);
     repo.users.setDisabled(u.id, false);
-    expect(verifySessionToken(raw, repo, touches)).not.toBeNull();
+    expect(verifySessionToken(raw, repo, touches, 0)).not.toBeNull();
   });
 });
