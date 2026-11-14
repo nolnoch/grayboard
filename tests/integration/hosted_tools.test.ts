@@ -159,6 +159,29 @@ test("org boards are open to everyone; bare @name prefers the author's own ident
   await expect(bs.call("board_create", { name: "x", purpose: "y", team: "eng" })).rejects.toMatchObject({ message: 'no such team "eng"' });
 });
 
+// #635 over hosted MCP: the creator's address, not its user, archives; the
+// team board can't be; a reply still reaches the thread.
+test("board_archive: the creator retires a board; others still read and reply by name", async () => {
+  const alice = await login(A);
+  expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  const a = await srv.hosted(A, "be");
+  const as = await srv.hosted(A, "sim");
+  const bs = await srv.hosted(B, "sim");
+
+  await a.call("board_create", { name: "task-1", purpose: "One task" });
+  const root = (await bs.call<BoardPostResult>("board_post", { board: "task-1", body: "started" })).post_id;
+  await a.next(board());
+  await expect(as.call("board_archive", { board: "task-1" })).rejects.toMatchObject({ message: `only #task-1's creator (${A}/be) or your user can archive or reopen it` });
+  await expect(a.call("board_archive", { board: "eng" })).rejects.toMatchObject({ message: "#eng belongs to the bus itself and can't be archived" });
+  expect(await a.call("board_archive", { board: "task-1" })).toMatchObject({ name: "task-1", archived_by: `${A}/be` });
+
+  expect((await bs.call<{ name: string }[]>("board_list")).map((x) => x.name)).not.toContain("task-1");
+  await expect(bs.call("board_post", { board: "task-1", body: "more" })).rejects.toMatchObject({ message: expect.stringContaining("#task-1 is archived") });
+  await bs.call("board_post", { board: "task-1", body: "done", parent_id: root });
+  expect((await a.next(board())).event.item).toMatchObject({ post: { body: "done", parent_id: root } });
+  expect((await bs.call<ReadResult>("board_read", { board: "task-1", before_id: 999 })).posts.map((p) => p.body)).toEqual(["started", "done"]);
+});
+
 test("claims are org-wide and atomic across users", async () => {
   const a = await srv.hosted(A, "be");
   const b = await srv.hosted(B, "be");

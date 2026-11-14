@@ -35266,6 +35266,27 @@ var native_tools_default = [
     }
   },
   {
+    name: "board_archive",
+    description: "board_archive(board, archived?): retire a board you created once its work is done: it leaves board_list and takes no new top-level posts, while replies, reads by name and subscriptions go on. archived false reopens it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: {
+          type: "string",
+          description: 'Board name, with or without the "#": "e2e" or "#e2e".'
+        },
+        archived: {
+          type: "boolean",
+          description: "Default true; false reopens the board."
+        }
+      },
+      required: [
+        "board"
+      ],
+      additionalProperties: false
+    }
+  },
+  {
     name: "board_post",
     description: "board_post(board, body, parent_id?, attachment_ids?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
     inputSchema: {
