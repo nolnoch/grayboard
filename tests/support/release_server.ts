@@ -8,6 +8,7 @@
 // SHA256SUMS.sig over its assets, signed by test key a (#162); `signed`
 // replaces either file for a tag (null: not served).
 import { signSums } from "./release_keys.ts";
+import { sha256Hex } from "../../src/shared/hash.ts";
 
 export type SignedOverride = { sums?: string | null; sig?: string | null };
 
@@ -58,7 +59,7 @@ export class ReleaseServer {
       Object.entries(served).map(async ([name, file]) => ({
         name,
         size: Bun.file(file).size,
-        digest: this.opts.digests?.[tag]?.[name] ?? `sha256:${new Bun.CryptoHasher("sha256").update(await Bun.file(file).arrayBuffer()).digest("hex")}`,
+        digest: this.opts.digests?.[tag]?.[name] ?? `sha256:${sha256Hex(await Bun.file(file).bytes())}`,
       })),
     );
     // Pretty-printed, like api.github.com serves: hand-rolled parsing in
