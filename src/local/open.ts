@@ -2,7 +2,7 @@
 // db.ts, which opens this process's bus on import, so the Slack bridge can open
 // the bus its child will use.
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, resolve } from "node:path";
 
@@ -12,6 +12,7 @@ import { initCoreSchema } from "../core/schema.ts";
 import { openSqlite } from "../core/sqlite.ts";
 import { conversationSnapshot, liveSessions, type Ended, type SessionRow } from "./binding.ts";
 import { ATTACHMENT_BYTES_SQL } from "./blobs.ts";
+import { privateDbFiles, privateDir } from "./perms.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
   return refuseForbiddenBus(env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`);
@@ -55,8 +56,8 @@ export function readConversationTitle(session: string, env: Record<string, strin
  */
 export function openLocalDb(path = localDbPath()): { db: Database; ended: Ended; live: SessionRow[] } {
   refuseForbiddenBus(path);
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  privateDir(dirname(path));
+  privateDbFiles(path);
   const db = openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
   const { alive, ...ended } = liveSessions(db);
   return { db, ended, live: alive };

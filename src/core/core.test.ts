@@ -1264,3 +1264,14 @@ test("a post written as one alias is not unread, digested or read back on the se
   expect(listBoards(db, ["a"])[0]!.unread).toBe(1);
   expect(pendingFor(db, S, { all: true })).toMatchObject([{ kind: "digest", board: "e2e", unread: 1 }]);
 });
+
+// #76: a board purpose and a claim note are one line of status, not storage.
+test("board purpose and claim notes are capped", () => {
+  expect(() => createBoard(db, "be", "long", "p".repeat(501))).toThrow("purpose must be at most 500 chars");
+  createBoard(db, "be", "long", "p".repeat(500));
+  expect(() => claim(db, "be", "ticket:ENG-1", { note: "n".repeat(1001) })).toThrow("note must be at most 1000 chars");
+  expect(claim(db, "be", "ticket:ENG-1", { note: "n".repeat(1000) }).ok).toBe(true);
+  expect(() => release(db, "be", "ticket:ENG-1", "n".repeat(1001))).toThrow("note must be at most 1000 chars");
+  expect(listClaims(db).map((c) => c.key)).toContain("ticket:ENG-1");
+  release(db, "be", "ticket:ENG-1", "done");
+});

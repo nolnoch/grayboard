@@ -42,6 +42,13 @@ function validKey(key: string): string {
   return k;
 }
 
+// A claim note is a line of status (#76): stored on the claim and every
+// claim_events row, and announced on its board.
+export const MAX_NOTE_CHARS = 1000;
+function validNote(note: string | undefined): void {
+  if (note !== undefined && note.length > MAX_NOTE_CHARS) throw new CoreError(`note must be at most ${MAX_NOTE_CHARS} chars`);
+}
+
 type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
 
 // One claim_events row; callers are inside the claim's transaction.
@@ -85,6 +92,7 @@ export function claim(
   opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } & ClaimCtx = {},
 ): ClaimResult {
   const key = validKey(keyInput);
+  validNote(opts.note);
   // The queue: keyspace is the delivery machinery's: only claimQueuePost
   // mints these keys, against a post that exists on a board the lane can
   // see. A public take would let any handle squat a future post's key - the
@@ -166,6 +174,7 @@ export function release(
   ctx: ClaimCtx = {},
 ): ClaimChanges & { releasedAt?: number } {
   const key = validKey(keyInput);
+  validNote(note);
   const addresses = ctx.addresses ?? [handle];
   return db.transaction(() => {
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;

@@ -15,6 +15,7 @@ export type CoreDb = Database;
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_PURPOSE_CHARS = 500;
 
 // A post's or direct message's body, checked alike in both modes (#75).
 export function checkBody(body: unknown): string {
@@ -378,6 +379,8 @@ export function createBoard(
 ): Board {
   const board = normalizeBoard(name);
   if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  // One line, shown in every board_list (#76).
+  if (purpose.length > MAX_PURPOSE_CHARS) throw new CoreError(`purpose must be at most ${MAX_PURPOSE_CHARS} chars`);
   const kind = opts.kind ?? "broadcast";
   if (kind !== "broadcast" && kind !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
   const denied = access(db).checkCreate(handle, scope);
@@ -1019,7 +1022,7 @@ export function viewers(db: Database): (handle: string) => boolean {
 
 // A live session with no name yet (#182), addressed by its session ID
 // (#284), with the status it set as that ID.
-export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true } & SessionFacts;
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true; launcher?: true } & SessionFacts;
 
 // `you` is left out only for a viewer, which nothing can address.
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
@@ -1186,13 +1189,14 @@ function sessionFacts(r: { harness: string | null; model: string | null; effort:
 // has one user. A change that lists another user's sessions must add the
 // check here, or a scope match probes their principal (#371, #391).
 function unboundRows(db: Database, unbound: UnboundPeer[], match: PeerMatch | undefined): UnboundPeer[] {
-  const q = db.prepare(`SELECT principal, harness, model, effort FROM ids WHERE id = ?`);
+  const q = db.prepare(`SELECT principal, harness, model, effort, launcher FROM ids WHERE id = ?`);
   const out: UnboundPeer[] = [];
   for (const u of unbound) {
-    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null } | null;
+    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null } | null;
     const session = r ? sessionFacts(r) : {};
     if (match && !matches(match, { id: u.session_id, ...session, scope: r?.principal ?? undefined })) continue;
-    out.push({ ...u, ...session });
+    // An unbound launcher is delegable by its ID (#337), so it's marked as a bound one is (#764).
+    out.push({ ...u, ...session, ...(r?.launcher ? { launcher: true as const } : {}) });
   }
   return out;
 }
