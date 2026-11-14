@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -21,9 +21,20 @@ export function busMode(env = process.env): "local" | "server" {
   return existsSync(credentialsPath(env)) ? "server" : "local";
 }
 
+let warnedMode = false;
+
 export function loadCredentials(): Credentials | null {
   const credPath = credentialsPath();
   if (!existsSync(credPath)) return null;
+  // A file another user can read leaks the session token (#88). Writes set
+  // 0600; one made before that, or by hand, gets a warning, once per process.
+  try {
+    const mode = statSync(credPath).mode & 0o777;
+    if (mode & 0o077 && !warnedMode) {
+      warnedMode = true;
+      console.error(`[grayboard] ${credPath} is readable by other users (mode ${mode.toString(8).padStart(4, "0")}); run: chmod 600 ${credPath}`);
+    }
+  } catch {}
   try {
     return JSON.parse(readFileSync(credPath, "utf8")) as Credentials;
   } catch {
