@@ -4,7 +4,7 @@
 // decides what the unit looks like and what /healthz says. Each run uses a copy of
 // install.sh whose key block lists test keys a and b.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "../support/paths.ts";
@@ -636,4 +636,17 @@ test("GRAYBOARD_RELEASES_URL: http only to this machine, trailing slashes droppe
   const empty = install({ releasesUrl: "" });
   expect(empty.code).toBe(0);
   expect(empty.out).toContain("downloading https://github.com/");
+});
+
+test("an install removes staging dirs an interrupted install left, keeping a recent one (#317)", () => {
+  const bin = join(dir, "bin");
+  const stale = join(bin, ".grayboard-install.AAAAAA"), fresh = join(bin, ".grayboard-install.BBBBBB");
+  for (const d of [stale, fresh]) { mkdirSync(d); writeFileSync(join(d, "grayboard"), "partial"); }
+  const old = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+  utimesSync(stale, old, old);
+  const r = install();
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`grayboard: removed ${stale}, left by an interrupted install`);
+  expect(existsSync(stale)).toBe(false);
+  expect(existsSync(join(fresh, "grayboard"))).toBe(true);
 });

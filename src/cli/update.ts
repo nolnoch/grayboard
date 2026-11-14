@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, fchmodSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants, fchmodSync, lstatSync, openSync, readdirSync, renameSync, rmSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LOOPBACK } from "../shared/endpoint.ts";
 import { sha256Hex } from "../shared/hash.ts";
@@ -132,6 +132,7 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
 
   // Beside the binary so the rename stays on one filesystem; a fresh random
   // name opened exclusively, so nothing planted there is written through.
+  for (const path of sweepStaleTemps(dirname(self))) console.error(`[grayboard] removed ${path}, left by an interrupted update`);
   const tmp = join(dirname(self), `.grayboard-${tag}-${randomBytes(8).toString("hex")}`);
   try {
     const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o755);
@@ -162,4 +163,34 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
     throw e;
   }
   return { updated: true, origin: downloads, tag, keyId: signed.keyId };
+}
+
+// An update's temp binary: `.grayboard-<tag>-<16 hex>` (above).
+const UPDATE_TEMP = /^\.grayboard-v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?-[0-9a-f]{16}$/;
+export const STALE_TEMP_MS = 60 * 60 * 1000;
+
+/**
+ * Removes update temp binaries in `dir` that a killed update left (#317): only
+ * regular files of this user, named as update names them, untouched for an
+ * hour, so an update running alongside keeps its own. Returns what it removed;
+ * a file it can't inspect or remove is left.
+ */
+export function sweepStaleTemps(dir: string, now = Date.now()): string[] {
+  const removed: string[] = [];
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return removed; }
+  const uid = process.getuid?.();
+  for (const name of names) {
+    if (!UPDATE_TEMP.test(name)) continue;
+    const path = join(dir, name);
+    try {
+      const st = lstatSync(path);
+      if (!st.isFile() || (uid !== undefined && st.uid !== uid) || now - st.mtimeMs < STALE_TEMP_MS) continue;
+      rmSync(path);
+      removed.push(path);
+    } catch {
+      // Gone already, or not ours to remove.
+    }
+  }
+  return removed;
 }
