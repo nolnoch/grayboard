@@ -321,4 +321,9 @@ export function initCoreSchema(db: Database): void {
   // Queue boards deliver each post to exactly one subscriber (the claim IS the
   // delivery); broadcast (the default) fans out to every push subscriber.
   if (!cols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE boards ADD COLUMN kind TEXT NOT NULL DEFAULT 'broadcast'`);
+
+  // An archived board (#635): out of board_list, closed to new top-level
+  // posts, readable by name. NULL means open.
+  if (!cols.some((c) => c.name === "archived_at")) db.exec(`ALTER TABLE boards ADD COLUMN archived_at INTEGER`);
+  if (!cols.some((c) => c.name === "archived_by")) db.exec(`ALTER TABLE boards ADD COLUMN archived_by TEXT`);
 }

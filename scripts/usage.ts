@@ -115,7 +115,7 @@ const byOrigin = new Map<string, Bucket>(); // "gb:board:coord", "human", …
 type Sides = { coord: Bucket; work: Bucket; silent: Bucket };
 const byBoard = new Map<string, Sides>();
 const byReason = new Map<string, Sides>();
-const GB_WRITES = new Set(["board_post", "dm_send", "dm_ack", "dm_retract", "claim_take", "claim_release", "claim_watch", "board_subscribe", "board_create", "peer_status"].map((t) => `mcp__grayboard__${t}`));
+const GB_WRITES = new Set(["board_post", "dm_send", "dm_ack", "dm_retract", "claim_take", "claim_release", "claim_watch", "board_subscribe", "board_create", "board_archive", "peer_status"].map((t) => `mcp__grayboard__${t}`));
 const byLane = new Map<string, { tokens: Tok; gb_push_tokens: Tok; gb_coord_tokens: Tok; sessions: number }>();
 const wakes: { ctx: number; cold: boolean; origin: string }[] = [];
 const tools = new Map<string, { calls: number; input_chars: number; result_chars: number; results: number }>();

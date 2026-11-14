@@ -4,6 +4,7 @@
 import type { Database } from "bun:sqlite";
 
 import {
+  archiveBoard,
   canSeeBoard,
   createBoard,
   getBoard,
@@ -80,6 +81,19 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
             : {}),
         },
         required: ["name", "purpose"],
+      },
+    },
+    {
+      name: "board_archive",
+      description:
+        "board_archive(board, archived?): retire a board you created once its work is done: it leaves board_list and takes no new top-level posts, while replies, reads by name and subscriptions go on. archived false reopens it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          board: BOARD,
+          archived: { type: "boolean", description: "Default true; false reopens the board." },
+        },
+        required: ["board"],
       },
     },
     {
@@ -397,13 +411,18 @@ export function callBoardTool(
       const name = normalizeBoard(str(a, "name"));
       const mine = ctx.human ? undefined : getBoard(db, name);
       if (
-        mine && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") &&
+        mine && !mine.archived_at && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") &&
         mine.purpose === str(a, "purpose").trim() && canSeeBoard(db, handle, name)
       ) {
         return { result: { ...mine, note: `you created #${name} at ${new Date(mine.created_at).toISOString()}` }, wake: [] };
       }
       const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), scope, { kind });
       return { result: b, wake: [], boards: [b.name] };
+    }
+
+    case "board_archive": {
+      const { board, note } = archiveBoard(db, handle, str(a, "board"), optBool(a, "archived") ?? true, { addresses: ctx.addresses, human: ctx.human });
+      return { result: note ? { ...board, note } : board, wake: [], ...(note ? {} : { boards: [board.name] }) };
     }
 
     case "board_post": {
