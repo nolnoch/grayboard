@@ -248,14 +248,16 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
 
 // ── attachments ──────────────────────────────────────────────────────────────
 
-// The address named by ?as=. The Slack bridge's human stores its files
-// in-process, not here.
+// The address named by ?as=, which the hosted byte routes
+// (src/server/mcp-attachments.ts) set to the session's bound name; no HTTP
+// route takes it from a client (#475). The Slack bridge's human stores its
+// files in-process, not here.
 function queryAs(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): string | Response {
   return ownAddress(url.searchParams.get("as"), authed, repo, db, HUMAN_RESERVED);
 }
 
-// POST /api/attachments?as=&filename=, the file's bytes as the body.
-// The session's MCP process has already checked the path it came from; this
+// An upload (`?as=&filename=`), the file's bytes as the body, for the hosted
+// byte route's POST. The client has already checked the path it came from; this
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
@@ -304,7 +306,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
   }
 }
 
-// GET /api/attachments/<id>?as=: the file, for an identity that can
+// A download (`<id>?as=`), for the hosted byte route's GET: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
@@ -343,7 +345,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   }).immediate();
 }
 
-// DELETE /api/attachments/<id>?as=: drops an upload of that identity's
+// A release (`<id>?as=`), for the hosted byte route's DELETE: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
 export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
@@ -506,7 +508,7 @@ export type SessionHooks = {
 };
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
+  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
   sessions: SessionHooks,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
@@ -531,14 +533,6 @@ export async function handleHttp(
 
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
-
-  if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db, uploads);
-  if (path.startsWith("/api/attachments/") && method === "GET") {
-    return attachmentDownload(path.slice("/api/attachments/".length), url, authed, repo, db);
-  }
-  if (path.startsWith("/api/attachments/") && method === "DELETE") {
-    return attachmentRelease(path.slice("/api/attachments/".length), url, authed, repo, db);
-  }
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);

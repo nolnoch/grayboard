@@ -14,7 +14,6 @@ import { createTouchQueue, type AuthedUser } from "./auth.ts";
 import { runRetention } from "./retention.ts";
 import type { Config } from "./config.ts";
 import { handleHttp } from "./http.ts";
-import { UploadGate } from "./uploads.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -246,11 +245,10 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
     messageRetentionDays: 90, auditRetentionDays: 90, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
   };
-  const uploads = new UploadGate(4 * store.repo.attachmentLimits.total, store.repo.attachmentLimits.total);
   const touches = createTouchQueue();
   const server = Bun.serve({
     port: 0,
-    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, { disconnectUser: application.disconnectUser, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
+    fetch: req => handleHttp(req, store.repo, store.db, config, touches, application.wake, undefined, { disconnectUser: application.disconnectUser, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
   });
   const base = `http://localhost:${server.port}`;
   try {

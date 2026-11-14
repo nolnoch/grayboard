@@ -434,7 +434,7 @@ test("#284 #367: a team alias's unsent upload doesn't pass to the next member wh
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const mine = await connect("eng/api");
-  const up = await srv.upload(alice, "eng/api", "plan.md", "# plan");
+  const up = await srv.uploadAs(alice, "eng/api", "plan.md", "# plan");
   expect(up.status).toBe(201);
   endIt(mine);
 
@@ -442,9 +442,9 @@ test("#284 #367: a team alias's unsent upload doesn't pass to the next member wh
   const refused = `attachment ${up.body.id} isn't an unsent upload of yours`;
   await expect(theirs.send(`${A}/be`, "x", { attachment_ids: [up.body.id] })).rejects.toMatchObject({ code: "bad_request", message: refused });
   await expect(theirs.call("board_post", { board: "eng", body: "x", attachment_ids: [up.body.id] })).rejects.toMatchObject({ message: expect.stringContaining(refused) });
-  // Nor over HTTP, as the alias: the download and the release both refuse.
-  expect(await srv.api(bob, "GET", `/api/attachments/${up.body.id}?as=eng%2Fapi`)).toMatchObject({ status: 404 });
-  expect(await srv.api(bob, "DELETE", `/api/attachments/${up.body.id}?as=eng%2Fapi`)).toMatchObject({ status: 404 });
+  // Nor through the attachment handlers, as the alias: the download and the release both refuse.
+  expect(await srv.downloadAs(bob, "eng/api", up.body.id)).toEqual({ status: 404 });
+  expect(await srv.releaseAs(bob, "eng/api", up.body.id)).toEqual({ status: 404 });
   expect(rows(`SELECT message_id, post_id FROM attachments WHERE id = ?`, up.body.id)).toEqual([{ message_id: null, post_id: null }]);
 
   // #391: the uploader takes the alias back and still sends her own upload.
@@ -461,7 +461,7 @@ test("#367: after an unbind, the next member who binds a team alias can't send i
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const mine = await connect("eng/api");
-  const up = await srv.upload(alice, "eng/api", "plan.md", "# plan");
+  const up = await srv.uploadAs(alice, "eng/api", "plan.md", "# plan");
   expect(up.status).toBe(201);
   expect(await mine.unbind("eng/api")).toMatchObject({ alias: "eng/api", released: true });
 
@@ -747,7 +747,7 @@ test("an upload made as one alias attaches to a send as another, and to a reply 
   expect(await s.bind("b", { create: true })).toMatchObject({ alias: `${A}/b` });
   const peer = await connect("fe", { token: bob });
   const up = async () => {
-    const r = await srv.upload(alice, "a", "shot.png", PNG);
+    const r = await srv.uploadAs(alice, "a", "shot.png", PNG);
     expect(r.status).toBe(201);
     return r.body.id as number;
   };
