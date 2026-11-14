@@ -69,9 +69,12 @@ export function insertMessage(
   ids: number[] = [],
   uploader: Uploader = { addresses: [sender], principal: null },
   via: string | null = null,
+  // Throws to refuse the write, run first in its transaction (#557).
+  guard?: () => void,
 ): { id: number; attachments: AttachmentInfo[] } {
   testPause("send:before-txn");
   return db.transaction(() => {
+    guard?.();
     if (addressParts(recipient)?.kind === "id") assertDeliverableId(db, recipient);
     const now = Date.now();
     const { lastInsertRowid } = db

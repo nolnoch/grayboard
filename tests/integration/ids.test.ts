@@ -12,6 +12,7 @@ import { storeAttachment } from "../../src/core/attachments.ts";
 import { MAX_CHILDREN, childCapacity, mintSessionKey } from "../../src/core/bindings.ts";
 import { GRAYBOARD_AGENT_META } from "../../src/shared/session_meta.ts";
 import { SqliteBlobs } from "../../src/local/blobs.ts";
+import { endLocalSession } from "../../src/local/binding.ts";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
@@ -571,6 +572,37 @@ test("a DM or @mention to a child's ID is refused child_session naming its root'
 // working as the same ID, and neither version lists it.
 const CHILDLESS_SWEEP = "v2.3.1";
 const endWhy = (id: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'id.ended' AND target = ?`, id).map((r) => JSON.parse(r.detail).why);
+
+// #557: a runner child's root is checked live at call start; a write that
+// lands after the root ended (here held at the point just before its
+// transaction) is refused in that transaction, stores nothing, and the next
+// call runs as the runner's own session.
+for (const [point, tool, body] of [["send:before-txn", "dm_send", "dm after the root"], ["board:before-txn", "board_post", "post after the root"]] as const) {
+  test(`a runner child's ${tool} that reaches its transaction after its root ended is refused and stores nothing; its next call is its own session`, async () => {
+    const fe = await runnerRootSession("fe", "pi-1");
+    const root = (await fe.call("whoami")).id as string;
+    await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
+    const be = await localSession(dir, "be");
+    const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1", ...pauseEnv(point) } });
+    const child = ((await runner.call("whoami")) as Who).id;
+    const write = refusal(runner, tool, tool === "dm_send" ? { to: "be", body } : { board: "e2e", body });
+    await until(() => runner.stderr().includes(`test pause hit: ${point}`));
+    // The root's harness here is this test process, which outlives it, so
+    // its end comes as another opener's would: through endLocalSession.
+    await stopSession(fe.c);
+    const w = new Database(join(dir, "bus.db"));
+    try { w.run("PRAGMA busy_timeout = 5000"); endLocalSession(w, root); } finally { w.close(); }
+    expect(endedAt(root)).not.toBeNull();
+    release(point);
+    expect(await write).toBe(`error: child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`);
+    expect(rows(`SELECT id FROM messages WHERE body = ?`, body)).toEqual([]);
+    expect(rows(`SELECT id FROM posts WHERE body = ?`, body)).toEqual([]);
+    const own = (await runner.call("whoami")) as Who;
+    expect(own).toEqual({ id: own.id, primary: own.id, aliases: [], principal: null });
+    expect(own.id).not.toBe(child);
+    expect(be.pushes.filter((p) => p.content === body)).toEqual([]);
+  }, 30_000);
+}
 
 test(`${CHILDLESS_SWEEP} sharing the bus leaves a live root's child live through the root's keyed restart; the root's end ends it and drops its row`, async () => {
   const old = await releaseBinaries(CHILDLESS_SWEEP);
