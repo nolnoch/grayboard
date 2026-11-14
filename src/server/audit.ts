@@ -85,6 +85,7 @@ export type AuditAction =
   | "id.reused"
   | "id.signed_in_local"
   | "message.retracted"
+  | "request.receipt_stale"
   | "request.replayed"
   | "request.resent"
   | "server.started"
