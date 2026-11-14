@@ -9,7 +9,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { bindingOf } from "../../adapters/hosted-core/src/model.ts";
-import type { HostedSession } from "../support/hosted_session.ts";
+import { accessAudits } from "../support/hosted_rows.ts";
+import { HOSTED_CLIENT, type HostedSession } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 
 const A = "alice@example.com";
@@ -31,8 +32,7 @@ const revoke = async () => expect((await srv.api(alice, "POST", "/api/teams/eng/
 const texts = (r: CallToolResult) => r.content.map((c) => (c.type === "text" ? c.text : c.type));
 const json = (r: CallToolResult) => JSON.parse(texts(r)[0]!);
 const lostNotice = (tail: string) => `This session lost its bus name "eng/build": ${REASON}. ${tail}`;
-const audits = (action: string) => srv.app.db.query<{ actor: string; target: string; detail: string }, [string]>("SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY id").all(action)
-  .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
+const audits = (action: string) => accessAudits(srv.app.db, action);
 const notified = () => audits("hosted.alias_lost_notified");
 const LOST = [{ alias: "eng/build", reason: REASON }];
 const rootId = (s: HostedSession) => srv.app.db.query<{ session_id: string }, [string]>("SELECT session_id FROM hosted_sessions WHERE source_session_id = ?").get(s.sessionId)!.session_id;
@@ -66,7 +66,7 @@ test("the Controller's whoami reports alias_lost until its delivery_open; the na
   expect(pending()).toBe(0);
 
   const row = srv.app.repo.hosted.get(rootId(b))!;
-  const detail = { aliases: ["eng/build"], ownership: row.ownership_id, client_id: "grayboard-pi" };
+  const detail = { aliases: ["eng/build"], ownership: row.ownership_id, client_id: HOSTED_CLIENT };
   expect(notified()).toEqual([{ actor: B, target: row.session_id, detail }]);
   expect(audits("hosted.alias_lost_seen")).toEqual([{ actor: B, target: row.session_id, detail }]);
 });
@@ -149,4 +149,35 @@ test("a child's whoami and tool results neither carry nor take its root's notice
   expect(notified()).toEqual([]);
 
   expect(texts(await b.callRaw("board_list")).slice(1)).toEqual([lostNotice(`It still sends as "fe".`)]);
+});
+
+test("a hold lost again before both readers took it is restated: the new reason, and both readers are told afresh", async () => {
+  const b = await srv.hosted(B, "fe");
+  await b.bind("eng/build");
+  await revoke();
+  // The agent took it and the Controller was reported it; neither has finished with it (no delivery_open yet).
+  expect(texts(await b.callRaw("whoami")).slice(1)).toEqual([lostNotice(`It still sends as "fe".`)]);
+  expect(await b.subscriber.call("whoami")).toMatchObject({ alias_lost: LOST });
+
+  // A second loss of the same alias (lose's ON CONFLICT path) replaces the row and clears both readers' marks.
+  const again = "eng/build was revoked again";
+  srv.app.repo.atomic(() => srv.app.repo.hosted.lose(rootId(b), { alias: "eng/build", reason: again, primary: false }, Date.now()));
+  expect(pending()).toBe(1);
+  // The open now takes nothing: the restated row's report was cleared, so the Controller must see it again first.
+  await b.subscriber.call("delivery_open");
+  expect(pending()).toBe(1);
+  expect(texts(await b.callRaw("whoami")).slice(1)).toEqual([`This session lost its bus name "eng/build": ${again}. It still sends as "fe".`]);
+  expect(await b.subscriber.call("whoami")).toMatchObject({ alias_lost: [{ alias: "eng/build", reason: again }] });
+  await b.subscriber.call("delivery_open");
+  expect(pending()).toBe(0);
+});
+
+test("an ownership's end deletes its unread losses (the hosted_sessions cascade)", async () => {
+  const b = await srv.hosted(B, "fe");
+  await b.bind("eng/build");
+  await revoke();
+  expect(pending()).toBe(1);
+
+  await b.end();
+  expect(pending()).toBe(0);
 });

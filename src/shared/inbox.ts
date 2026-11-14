@@ -183,3 +183,10 @@ export const retractRefusal = {
   reached: (id: number, to: string) => `message ${id} already reached ${to}; send a correction instead`,
   replied: (id: number) => `message ${id} has a reply in its thread; send a correction instead`,
 };
+
+// A tool result with notices appended as text items after its own content:
+// the one append both MCP surfaces use (src/local/mcp.ts, src/server/mcp.ts;
+// #479), so they can't drift. No notices: the result itself.
+export function withNotices<R extends { content: unknown[] }>(result: R, notices: readonly string[]): R {
+  return notices.length ? { ...result, content: [...result.content, ...notices.map((text) => ({ type: "text" as const, text }))] } : result;
+}
