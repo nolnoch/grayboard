@@ -1,21 +1,16 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { startServer } from "../../src/server/app.ts";
+import { TestServer } from "../support/server.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
-import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
-import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { type AppSession, type AppSessionOptions, signedIn } from "../support/app_session.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 
-let app: ReturnType<typeof startServer>;
+let srv: TestServer;
+let app: TestServer["app"];
 let base: string;
-let blobDir: string;
 let clock: number | undefined;
 const clients: Client[] = [];
 const appSessions: AppSession[] = [];
@@ -23,16 +18,14 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
 beforeEach(() => {
   clock = undefined;
-  blobDir = mkdtempSync(join(tmpdir(), "gb-http-mcp-"));
-  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock ?? Date.now() } });
+  srv = new TestServer({ publicUrl, admins: ["alice@example.com"] }, { hostname: "127.0.0.1", oauth: { now: () => clock ?? Date.now() } });
+  app = srv.app;
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
   for (const s of appSessions.splice(0)) s.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
-  await app.stop();
-  app.db.close();
-  rmSync(blobDir, { recursive: true, force: true });
+  await srv.stop();
 });
 async function login(email = "alice@example.com", scopes = ["grayboard:tools"]) {
   return issueOAuth(app.repo, app.oauth.resource, email, scopes, Date.now(), OPENCODE_CLIENT).token;

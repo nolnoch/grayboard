@@ -540,3 +540,26 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
   expect(count.n).toBe(2);
 });
+
+// #385 item 23: an attach that fails undoes only its own attempt. Here a second attach for the
+// same user went live while the first was still waiting on attachHuman; the first's failure
+// must not tear the live one down.
+test("an attach that fails after a newer one for the same user went live leaves that one online", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const bridge = srv.app.slack!, application = srv.app.application;
+  const id = srv.app.repo.users.upsertByEmail("alice@example.com", null).id;
+  let fail: ((e: Error) => void) | undefined;
+  const attach = spyOn(application, "attachHuman").mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+  try {
+    const first = bridge.userChanged(id);
+    expect(fail).toBeDefined();
+    await bridge.userChanged(id);
+    fail!(new Error("raced"));
+    await first;
+  } finally { attach.mockRestore(); }
+  const be = await hosted("alice@example.com", "be");
+  const q = await be.call<SendResult>("dm_send", { to: "human", body: "still there?" });
+  expect(q.delivered_now).toBe(true);
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("still there?")));
+}, 30_000);
