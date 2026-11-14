@@ -34965,6 +34965,8 @@ function dmNotification(msg, primary) {
     meta.parent_id = String(msg.parent_id);
   if (msg.kind)
     meta.kind = msg.kind;
+  if (msg.other_user)
+    meta.other_user = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
@@ -34982,6 +34984,8 @@ function boardNotification(item) {
       meta.via = p.via;
     if (p.parent_id !== null)
       meta.parent_id = String(p.parent_id);
+    if (p.other_user)
+      meta.other_user = "true";
     addFiles(meta, p.attachments);
     if (item.deferred)
       meta.deferred = "true";
@@ -34991,7 +34995,7 @@ function boardNotification(item) {
   const from = item.latest.via ? `${item.latest.author} (${viaLabel(item.latest.via)})` : item.latest.author;
   return {
     content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${from}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
-    meta: { board: item.board, kind: "digest", unread: String(item.unread) }
+    meta: { board: item.board, kind: "digest", unread: String(item.unread), ...item.latest.other_user ? { other_user: "true" } : {} }
   };
 }
 

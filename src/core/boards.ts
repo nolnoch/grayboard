@@ -630,6 +630,7 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // carry, bound in the post's transaction under the mode's size caps (send),
 // if the mode's user (send.principal) made them.
 // author_id: the posting session's ID (#284), when the writer is a session.
+// author_user: the writer's signed-in user, on a server.
 // via: the child session writing it (#523), a harness subagent acting under
 // its root's addresses; author_id is then the child's ID too.
 // addresses: the poster's address set (#284 S5), `handle` the one it posts as; a
@@ -638,6 +639,7 @@ export type PostOpts = {
   online?: (handle: string) => boolean;
   addresses?: string[];
   author_id?: string;
+  author_user?: string;
   via?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; send?: FileSend };
@@ -810,10 +812,10 @@ export function post(
     const now = Date.now();
     const p = showPost(db
       .prepare(
-        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
       )
-      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null, opts.via ?? null) as PostRow);
+      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null, opts.via ?? null, opts.author_user ?? null) as PostRow);
     const { send } = files;
     const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
     // Nobody is told of, or handed, their own post: the poster's address set,

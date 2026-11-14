@@ -14,7 +14,7 @@ import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
-import { HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
+import { domainData, HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -757,6 +757,12 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   // marks it, so a host caching this session's instructions fetches them again.
   const said = (result: CallToolResult, notice: string | undefined): CallToolResult => notice
     ? { ...withNotices(result, [notice]), _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
+  // Every tool error carries its code in structuredContent (#806), as the subscriber role's do; the text, which
+  // the agent reads, stays `error: <message>`.
+  const refusal = (e: unknown): CallToolResult => {
+    const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
+    return { ...text(`error: ${message}`), structuredContent: domainData(e), isError: true };
+  };
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
@@ -764,18 +770,19 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     }
     catch (e) {
       report(e, tool);
-      const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
-      return said({ ...text(`error: ${message}`), isError: true }, notice);
+      return said(refusal(e), notice);
     }
   };
   server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
     let notice: string | undefined;
-    return said(text(await timeTool("whoami", () => { const context = current(ctx); return hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }); })), notice);
+    try {
+      return said(text(await timeTool("whoami", () => { const context = current(ctx); return hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }); })), notice);
+    } catch (e) { report(e, "whoami"); return said(refusal(e), notice); }
   });
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
     if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden"].includes(e.code)) refuse(e.code);
-    return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
+    return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), structuredContent: domainData(e), isError: true };
   };
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
@@ -816,7 +823,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
       }
       return ackResult(acked, missing).text;
     });
-    return { ...result, ...(missing.length && !acked.length ? { isError: true } : {}) };
+    return { ...result, ...(missing.length && !acked.length && !result.isError ? { structuredContent: { code: "not_found" }, isError: true } : {}) };
   });
   server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: DM_RETRACT_INPUT },
     (a, ctx) => run(ctx, "dm_retract", session => application.retract(session, a.message_id)));
