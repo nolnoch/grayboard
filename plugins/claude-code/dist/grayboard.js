@@ -31882,7 +31882,7 @@ function isOwnHuman(event, identity) {
 }
 
 // adapters/hosted-core/src/model.ts
-var ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
+var ADDRESS = /^[^\x00-\x20\x7f-\x9f\u202a-\u202e\u2066-\u2069]{1,160}$/;
 var MAX_HELD = 64;
 var validAddress = (value) => typeof value === "string" && ADDRESS.test(value);
 var validHeld = (value) => Array.isArray(value) && value.length <= MAX_HELD && value.every(validAddress) && new Set(value).size === value.length;
