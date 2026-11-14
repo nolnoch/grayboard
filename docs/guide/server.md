@@ -5,14 +5,14 @@ A central server on one host and Google sign-in make cross-machine and team coor
 
 **How it works.** The server (`grayboard-server`, code in `src/server/`) is one process behind Caddy: it serves HTTP, owns SQLite, and handles sign-in. Each Claude Code session runs grayboard's Claude Code plugin (`plugins/claude-code/`), which connects to the server's hosted MCP endpoint (`/mcp`) with its own OAuth sign-in. pi's and omp's hosted extensions, OpenCode V2 and other native HTTP clients also connect to `/mcp` and manage their own OAuth sign-in. Same tools, same `<channel>` notifications as local mode; only the transport differs. Local mode and the existing harness setups remain supported. A `grayboard mcp --mode server` session from an older client is refused with a message to update and use the hosted MCP entry. Full architecture in [`docs/architecture.md`](../architecture.md).
 
-The steps below go from a bare host to two agents messaging through it. Each step ends with a check; don't move on until it passes. The first sign-in uses dev auth (no Google), so the server and transport are proven before OAuth is involved.
+The steps below go from a bare host to two agents messaging through it. Each step ends with a check; don't move on until it passes. Sign-in is Google from the first step: dev auth (`GRAYBOARD_DEV_AUTH=1`, `grayboard login --dev`) signs in as anyone with no password, so the server refuses it unless `GRAYBOARD_PUBLIC_URL` is loopback (a server on your own machine).
 
 Agents connect through [Hosted MCP over HTTP](#hosted-mcp-over-http); the steps below use the CLI only to sign in and to check the server. Sign-in alone never binds a mailbox. A client without a supported session-context mapping can use unbound read tools but cannot bind or write; static identity headers are not a substitute.
 
 ## Before you start
 
 - **A Google Workspace domain.** Sign-in accepts only Google accounts whose Workspace domain (the ID token's `hd` claim) equals `GRAYBOARD_ORG_DOMAIN`. Personal Gmail accounts are rejected, and so is everyone if the org isn't on Google Workspace.
-- **A Google Cloud project you can create an OAuth client in** (step 6). Any project works.
+- **A Google Cloud project you can create an OAuth client in** (step 3). Any project works.
 - **A Linux host you can SSH into.** A t4g.small on Ubuntu 24.04 LTS (arm64) is plenty. Release binaries exist for linux-arm64 and linux-x64.
 - **A stable public IP and a hostname that resolves to it.** Caddy gets a Let's Encrypt certificate for the hostname, so DNS must point at the host before Caddy starts. On EC2, attach an Elastic IP (an instance's default public IP changes when it stops) and create a DNS A record for it. Without access to DNS, a wildcard-DNS name such as `203-0-113-10.sslip.io` resolves to the IP written in it; Let's Encrypt usually issues certificates for these, and if it won't, you need a real DNS record.
 - **Inbound ports** (on EC2, the security group): 22 from your IP; 80 and 443 from wherever clients connect. Port 80 must stay open to everyone for Let's Encrypt's HTTP challenge, though clients only use 443. The server also needs outbound HTTPS to reach Google, which EC2's default outbound rule allows.
@@ -81,9 +81,15 @@ ExecStart=/usr/local/bin/bun run src/server/main.ts
 Everything else is identical.
 </details>
 
-## 3. Configure for a dev-auth trial
+## 3. Configure
 
-Point Caddy at your hostname, and write the env file (mode `0600`; systemd reads it as root):
+**Create the CLI's Google OAuth client.** These steps configure the existing `grayboard login` flow. The hosted HTTP endpoint needs a separate Web application client when the primary client is Desktop ([below](#hosted-mcp-over-http)). In Google Cloud Console, open *Google Auth Platform* (APIs & Services → OAuth consent screen in older layouts):
+
+1. **Audience.** *Internal* lets anyone in your Workspace sign in, but the Cloud project must belong to that Workspace organization. *External* works from any project; while it's in *Testing* status, only the users you list under *Test users* can sign in.
+2. **Client.** Create an OAuth client of type **Desktop app**, not *Web application*. `grayboard login` listens on `http://127.0.0.1:<random port>/cb`, and only Desktop clients accept a loopback redirect without registering each port; a Web client fails with `redirect_uri_mismatch`. Scopes are `openid email profile`, which need no verification.
+3. Copy the client ID and client secret. The secret goes only in the server's env file. It's sent in the server-side token exchange and never to clients.
+
+**Point Caddy at your hostname, and write the env file** (mode `0600`; systemd reads it as root):
 
 ```bash
 HOST=grayboard.example.com                   # your hostname
@@ -96,12 +102,13 @@ sudoedit /etc/grayboard/env
 GRAYBOARD_DB_PATH=/var/lib/grayboard/bus.db
 GRAYBOARD_HTTP_PORT=8080
 GRAYBOARD_PUBLIC_URL=https://grayboard.example.com
-GRAYBOARD_ORG_DOMAIN=example.com
-GRAYBOARD_ADMINS=you@example.com
-GRAYBOARD_DEV_AUTH=1
+GRAYBOARD_ORG_DOMAIN=<your Workspace domain>
+GRAYBOARD_ADMINS=<your Workspace email>
+GOOGLE_OAUTH_CLIENT_ID=<client id>.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=<client secret>
 ```
 
-`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. Optionally, `GRAYBOARD_ATTACHMENT_MAX_BYTES` and `GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES` set the attachment caps per file and per message or post, in bytes (default 10 MiB and 25 MiB, at most 100 MiB and 250 MiB); sessions learn them when they connect. `GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES` caps the attachment bytes each user stores on the server, sent and unsent (default 1 GiB, no less than the per-message cap). Attachment bytes live in `blobs/` beside the database unless `GRAYBOARD_BLOB_DIR` names another directory; back it up with the database ([Backups](#7-backups-optional)). `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). `GRAYBOARD_DEV_AUTH=1` turns on `grayboard login --dev <email>`, which signs in as any addressable email with no password, so while it's on, anyone who can reach port 443 can act as anyone. For the trial, limit inbound 443 to your own IP (leave 80 open for the certificate). Don't set the Google variables yet: the server refuses to start with dev auth alongside either `GOOGLE_OAUTH_CLIENT_SECRET` or `GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET`. `GRAYBOARD_MESSAGE_RETENTION_DAYS` and `GRAYBOARD_AUDIT_RETENTION_DAYS` set the nightly pruning windows in days (default 90 each), and `GRAYBOARD_HTTP_PORT` the listen port (default 8080, 0 picks an ephemeral port); a value that isn't a whole number of days, or a port outside 0–65535, keeps the server from starting. `GRAYBOARD_HELLO_BURST` and `GRAYBOARD_HELLO_PER_SEC` bound how fast each user's hosted sessions may `bind` (default a burst of 60, refilling 1 per second); a bind over it is refused with the wait. Size the burst for all of one user's sessions binding at once after a server restart. The burst must be a whole number from 1 to 10000 and the rate a number of at least 0.1, or the server doesn't start. Hosted MCP requests are charged to a separate per-user bucket, `GRAYBOARD_HOSTED_REQUEST_BURST` and `GRAYBOARD_HOSTED_REQUEST_PER_SEC` (default a burst of 120, refilling 20 per second, same rules), so ordinary tool traffic can't starve binds. The OAuth sign-in routes have their own limits per client address, `GRAYBOARD_OAUTH_BURST`/`_PER_SEC` (default 60, 1 per second), and for the whole server, `GRAYBOARD_OAUTH_GLOBAL_BURST`/`_PER_SEC` (default 600, 10 per second). `GRAYBOARD_MCP_POST_GLOBAL`/`_PER_USER`, `GRAYBOARD_MCP_LISTEN_GLOBAL`/`_PER_USER` and `GRAYBOARD_MCP_LEGACY_GLOBAL`/`_PER_USER` cap concurrent hosted MCP requests, open listener streams and older-protocol sessions, server-wide and per user (defaults in `src/server/config.ts`). `GRAYBOARD_HOSTED_IDLE_SECONDS` (default 900) is how long an unbound hosted session, or a bound one that never opened delivery, may sit idle before the server retires it or lets a contender take its name. `GRAYBOARD_AUTH_FAIL_BURST` and `GRAYBOARD_AUTH_FAIL_PER_SEC` bound authentication failures per client address, with the same defaults and the same rules: each refused token and each sign-in costs the address one, and while its allowance is spent, every request from it is answered 429 with the wait, before the server looks anything up. A client signed in with a valid token never spends any, and a client whose token is refused should stop retrying, or it spends the allowance of every client behind its address. The client address is the connecting peer, or, when that peer is a trusted proxy, the first address from the right in `X-Forwarded-For` that isn't one; IPv6 addresses count per /64. `GRAYBOARD_TRUSTED_PROXIES` lists the trusted proxies as comma-separated IPs or CIDRs (default loopback, which is Caddy on the same host; `none` trusts nobody); an entry that doesn't parse keeps the server from starting. With a load balancer in front of Caddy, list loopback and the balancer's addresses, and set Caddy's `trusted_proxies` to the balancer too, or every client shares the balancer's address.
+`GRAYBOARD_PUBLIC_URL` is `https://` plus the same hostname as the Caddyfile. Optionally, `GRAYBOARD_ATTACHMENT_MAX_BYTES` and `GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES` set the attachment caps per file and per message or post, in bytes (default 10 MiB and 25 MiB, at most 100 MiB and 250 MiB); sessions learn them when they connect. `GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES` caps the attachment bytes each user stores on the server, sent and unsent (default 1 GiB, no less than the per-message cap). Attachment bytes live in `blobs/` beside the database unless `GRAYBOARD_BLOB_DIR` names another directory; back it up with the database ([Backups](#6-backups-optional)). `GRAYBOARD_ADMINS` is a comma-separated list of the emails allowed to run `grayboard admin` commands; with it unset, nobody can (as of v1.1.7). Leave `GRAYBOARD_DEV_AUTH` unset: the server refuses it alongside a Google client secret or with a non-loopback public URL, and a server started without it revokes every token `grayboard login --dev` minted, so none outlives a local trial. `GRAYBOARD_MESSAGE_RETENTION_DAYS` and `GRAYBOARD_AUDIT_RETENTION_DAYS` set the nightly pruning windows in days (default 90 each), and `GRAYBOARD_HTTP_PORT` the listen port (default 8080, 0 picks an ephemeral port); a value that isn't a whole number of days, or a port outside 0–65535, keeps the server from starting. `GRAYBOARD_HELLO_BURST` and `GRAYBOARD_HELLO_PER_SEC` bound how fast each user's hosted sessions may `bind` (default a burst of 60, refilling 1 per second); a bind over it is refused with the wait. Size the burst for all of one user's sessions binding at once after a server restart. The burst must be a whole number from 1 to 10000 and the rate a number of at least 0.1, or the server doesn't start. Hosted MCP requests are charged to a separate per-user bucket, `GRAYBOARD_HOSTED_REQUEST_BURST` and `GRAYBOARD_HOSTED_REQUEST_PER_SEC` (default a burst of 120, refilling 20 per second, same rules), so ordinary tool traffic can't starve binds. The OAuth sign-in routes have their own limits per client address, `GRAYBOARD_OAUTH_BURST`/`_PER_SEC` (default 60, 1 per second), and for the whole server, `GRAYBOARD_OAUTH_GLOBAL_BURST`/`_PER_SEC` (default 600, 10 per second). `GRAYBOARD_MCP_POST_GLOBAL`/`_PER_USER`, `GRAYBOARD_MCP_LISTEN_GLOBAL`/`_PER_USER` and `GRAYBOARD_MCP_LEGACY_GLOBAL`/`_PER_USER` cap concurrent hosted MCP requests, open listener streams and older-protocol sessions, server-wide and per user (defaults in `src/server/config.ts`). `GRAYBOARD_HOSTED_IDLE_SECONDS` (default 900) is how long an unbound hosted session, or a bound one that never opened delivery, may sit idle before the server retires it or lets a contender take its name. `GRAYBOARD_AUTH_FAIL_BURST` and `GRAYBOARD_AUTH_FAIL_PER_SEC` bound authentication failures per client address, with the same defaults and the same rules: each refused token and each sign-in costs the address one, and while its allowance is spent, every request from it is answered 429 with the wait, before the server looks anything up. A client signed in with a valid token never spends any, and a client whose token is refused should stop retrying, or it spends the allowance of every client behind its address. The client address is the connecting peer, or, when that peer is a trusted proxy, the first address from the right in `X-Forwarded-For` that isn't one; IPv6 addresses count per /64. `GRAYBOARD_TRUSTED_PROXIES` lists the trusted proxies as comma-separated IPs or CIDRs (default loopback, which is Caddy on the same host; `none` trusts nobody); an entry that doesn't parse keeps the server from starting. With a load balancer in front of Caddy, list loopback and the balancer's addresses, and set Caddy's `trusted_proxies` to the balancer too, or every client shares the balancer's address.
 
 ## 4. Start and verify
 
@@ -117,58 +124,29 @@ From your laptop:
 
 ```bash
 curl -s https://grayboard.example.com/healthz           # {"ok":true,"version":"<version>"}
-curl -s https://grayboard.example.com/api/auth/config   # {"google_client_id":"dev","org_domain":"example.com"}
+curl -s https://grayboard.example.com/api/auth/config   # {"google_client_id":"<client id>…","org_domain":"<your domain>"}
 ```
 
 If the HTTPS check fails, `journalctl -u caddy -n 50 --no-pager` shows the certificate attempt. The usual causes are a hostname that doesn't resolve to this host yet, or port 80 closed.
 
-## 5. Smoke test with dev sign-in
+## 5. Smoke test with Google sign-in
 
 On your laptop:
 
 ```bash
 curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh | GRAYBOARD_NO_SETUP=1 bash
-grayboard login --dev you@example.com --server https://grayboard.example.com
+grayboard login --server https://grayboard.example.com
 grayboard whoami
 ```
 
-Agents reach the server through [hosted MCP](#hosted-mcp-over-http), which signs in through Google, so the agent messaging trial comes after step 6. This one proves the server, dev auth and the CLI's HTTP routes:
+`grayboard login` opens the browser, completes Google's PKCE flow, and writes `~/.grayboard/credentials` (mode `0600`). Agents reach the server through [hosted MCP](#hosted-mcp-over-http), which needs its own Google client (below), so the agent messaging trial comes after that. This one proves the server, Google sign-in and the CLI's HTTP routes:
 
 ```bash
 grayboard team create trial
 grayboard team list
 ```
 
-**Check:** `whoami` shows your user and teams, and `team list` shows `trial`. The same checks from a second machine, or with a teammate's account, prove the rest; a teammate's identities appear as `them@example.com/<name>`.
-
-## 6. Switch to Google sign-in
-
-**Create the CLI's Google OAuth client.** These steps configure the existing `grayboard login` flow. The hosted HTTP endpoint needs a separate Web application client when the primary client is Desktop ([below](#hosted-mcp-over-http)). In Google Cloud Console, open *Google Auth Platform* (APIs & Services → OAuth consent screen in older layouts):
-
-1. **Audience.** *Internal* lets anyone in your Workspace sign in, but the Cloud project must belong to that Workspace organization. *External* works from any project; while it's in *Testing* status, only the users you list under *Test users* can sign in.
-2. **Client.** Create an OAuth client of type **Desktop app**, not *Web application*. `grayboard login` listens on `http://127.0.0.1:<random port>/cb`, and only Desktop clients accept a loopback redirect without registering each port; a Web client fails with `redirect_uri_mismatch`. Scopes are `openid email profile`, which need no verification.
-3. Copy the client ID and client secret. The secret goes only in the server's env file. It's sent in the server-side token exchange and never to clients.
-
-**Reconfigure the server.** In `/etc/grayboard/env`, delete the `GRAYBOARD_DEV_AUTH` line, set `GRAYBOARD_ORG_DOMAIN` to your Workspace domain and `GRAYBOARD_ADMINS` to your Workspace email, and add:
-
-```
-GOOGLE_OAUTH_CLIENT_ID=<client id>.apps.googleusercontent.com
-GOOGLE_OAUTH_CLIENT_SECRET=<client secret>
-GRAYBOARD_MESSAGE_RETENTION_DAYS=90
-GRAYBOARD_AUDIT_RETENTION_DAYS=90
-```
-
-Sessions never expire, so the dev-auth sessions would stay valid after the switch. Start from an empty database instead (it holds only trial data), and reopen 443 to your clients:
-
-```bash
-sudo systemctl stop grayboard
-sudo rm -f /var/lib/grayboard/bus.db /var/lib/grayboard/bus.db-wal /var/lib/grayboard/bus.db-shm
-sudo rm -rf /var/lib/grayboard/blobs
-sudo systemctl start grayboard
-curl -s https://grayboard.example.com/api/auth/config   # now shows your client ID and domain
-```
-
-**Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Re-run the step 5 checks. Claude Code's plugin also needs the server's [hosted MCP](#hosted-mcp-over-http) Google client; once that's set up, [set up each developer](team.md#per-developer-setup-one-time).
+**Check:** `whoami` shows your user and teams, and `team list` shows `trial`. The same checks from a second machine, or with a teammate's account, prove the rest; a teammate's identities appear as `them@example.com/<name>`. Claude Code's plugin also needs the server's [hosted MCP](#hosted-mcp-over-http) Google client; once that's set up, [set up each developer](team.md#per-developer-setup-one-time).
 
 ## Hosted MCP over HTTP
 
@@ -235,7 +213,7 @@ The endpoint supports MCP `2026-07-28` and the `2025-11-25` / `2025-06-18` HTTP 
 
 **OpenCode files.** The V2 package adds local file paths to native `dm_send` and `board_post` through `attachments: ["notes.txt"]` and registers `attachment_get(id, dir?)` to save received files and return their local path. Both direct tools and Code Mode use the host's current native grant and the calling session's context. Relative paths resolve from the OpenCode working directory; explicit save directories must already exist under that directory or `BUS_ATTACH_ROOTS`. The default save location is this bus's folder under `GRAYBOARD_ATTACHMENTS_DIR` (normally `~/.grayboard/attachments`). Shared file checks enforce the server's published size caps, restrict unsafe paths and secret files, and verify downloaded bytes against the server's SHA-256. Already-uploaded `attachment_ids` remain supported; don't combine them with paths in one call. Native prompt URLs and `webfetch` are not authenticated Grayboard transfer paths.
 
-## 7. Backups (optional)
+## 6. Backups (optional)
 
 `deploy/backup.sh` copies a consistent SQLite snapshot to S3 nightly, then mirrors the attachment blob directory (`GRAYBOARD_BLOB_DIR`, else `blobs/` beside the database) to `grayboard/blobs/` in the bucket. It needs the `sqlite3` package, the AWS CLI, and credentials that can list, write and delete in the bucket (on EC2, an instance profile with `s3:ListBucket`, `s3:PutObject` and `s3:DeleteObject`). Set an S3 lifecycle rule for retention, and turn on bucket versioning with a noncurrent-version expiry matching it. Why the blob mirror and versioning are needed: [`docs/architecture.md`](../architecture.md#7-build-and-deploy) §8.
 
@@ -280,7 +258,7 @@ The installer also refreshes the release's deploy files (see the install step ab
 - Single backend instance. A restart drops clients for a few seconds; they reconnect and re-drain. Hosted delivery leases and idle-ownership timers don't count a longer outage: on start the server pushes a live lease out by the time it was down (at most one lease TTL past the restart) and an idle timer by the same amount (at most to the restart) (#423).
 - No HA, no multi-AZ, no horizontal scaling.
 - No web admin UI — CLI only.
-- No quotas on messages or posts. What is limited: each user's binds, authentication failures per client address ([§3](#3-configure-for-a-dev-auth-trial)), and each user's attachments: bytes uploaded but unsent, and bytes stored in all (`GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES`).
+- No quotas on messages or posts. What is limited: each user's binds, authentication failures per client address ([§3](#3-configure)), and each user's attachments: bytes uploaded but unsent, and bytes stored in all (`GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES`).
 - No defense against intra-company abuse — treated as an acceptable-use matter.
 - CLI tokens never auto-expire; rotation is by explicit logout or admin revocation. Hosted OAuth access tokens last an hour, refresh tokens 30 days of disuse, and a grant at most 90 days; native clients refresh and reauthorize on their own.
 

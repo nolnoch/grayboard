@@ -21,6 +21,8 @@ import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization,
 
 // Row types
 export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
+// The label `grayboard login --dev` sessions carry: a server started without dev auth revokes them (#805 F-04).
+export const DEV_SESSION_LABEL = "dev";
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 // An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
 // ref is the user's email; a team or service scope's is the principal's name.
@@ -85,6 +87,8 @@ export interface Repo {
     findById(sessionId: number): Session | undefined;
     revoke(sessionId: number): void;
     revokeAllForUser(userId: number): void;
+    // Revokes every live dev-auth session (`grayboard login --dev`); returns how many.
+    revokeDev(): number;
     touch(sessionId: number, now: number): void;
   };
   principals: {
@@ -649,6 +653,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         }).immediate();
         changed();
+      },
+      revokeDev() {
+        return db.run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
       },
       touch(sessionId, now) {
         db.run("UPDATE sessions SET last_used_at = ? WHERE id = ?", [now, sessionId]);

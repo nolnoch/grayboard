@@ -12,6 +12,7 @@ export type AuditAction =
   | "attachment.upload_failed"
   | "attachment.upload_refused"
   | "attachment.uploaded"
+  | "auth.dev_sessions_revoked"
   | "auth.login"
   | "auth.logout"
   | "auth.rate_limit_ended"

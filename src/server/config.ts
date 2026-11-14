@@ -1,5 +1,5 @@
 import { dirname, join } from "node:path";
-import { parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
+import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, type RateLimit } from "./rate_limit.ts";
@@ -59,6 +59,12 @@ export function loadConfig(): Config {
 
   const dbPath    = requireEnv("GRAYBOARD_DB_PATH");
   const publicUrl = requireEnv("GRAYBOARD_PUBLIC_URL");
+
+  // Dev sign-in lets anyone who reaches the server act as anyone (#805 F-04): a
+  // public URL means others can reach it, so it's for local development only.
+  if (devAuth && !isLoopback(urlHostname(publicUrl))) {
+    throw new Error(`GRAYBOARD_DEV_AUTH=1 needs a loopback GRAYBOARD_PUBLIC_URL (localhost, 127.0.0.1 or [::1]), not ${publicUrl}: dev sign-in lets anyone who reaches the server act as anyone`);
+  }
 
   const googleClientId     = devAuth ? (process.env.GOOGLE_OAUTH_CLIENT_ID ?? "dev") : requireEnv("GOOGLE_OAUTH_CLIENT_ID");
   const googleClientSecret = devAuth ? "" : requireEnv("GOOGLE_OAUTH_CLIENT_SECRET");
@@ -190,6 +196,10 @@ function slackConfig(): { slack?: Config["slack"] } {
 
 function parseList(raw: string | undefined): string[] {
   return (raw ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+
+function urlHostname(raw: string): string {
+  try { return new URL(raw).hostname; } catch { return ""; }
 }
 
 function requireEnv(name: string): string {

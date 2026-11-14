@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { PrincipalTaken, type Repo, type Team } from "./db.ts";
+import { DEV_SESSION_LABEL, PrincipalTaken, type Repo, type Team } from "./db.ts";
 import { mayActIn } from "./access.ts";
 import type { Config } from "./config.ts";
 import {
@@ -108,7 +108,7 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
   const user  = repo.users.upsertByEmail(email, null);
   const raw   = mintToken();
-  repo.sessions.create(user.id, hashToken(raw), "dev");
+  repo.sessions.create(user.id, hashToken(raw), DEV_SESSION_LABEL);
   writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
