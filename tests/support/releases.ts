@@ -38,7 +38,7 @@ function listAll(): Promise<Release[]> {
     if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
     const all: Release[] = [];
     for (let url: string | undefined = `https://api.github.com/repos/${REPO}/releases?per_page=100`; url; ) {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
+      const r: Response = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
       if (!r.ok) throw new Error(`listing ${REPO} releases (${url}): HTTP ${r.status} ${await r.text()}`);
       all.push(...((await r.json()) as Release[]));
       url = /<([^>]+)>;\s*rel="next"/.exec(r.headers.get("link") ?? "")?.[1];

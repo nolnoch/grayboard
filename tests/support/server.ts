@@ -75,7 +75,7 @@ export class TestServer {
     const r = await fetch(`${this.base}/api/attachments?${q}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },
-      body: data,
+      body: data as string | Uint8Array<ArrayBuffer>,
     });
     return { status: r.status, body: (await r.json()) as Record<string, any> };
   }

@@ -516,7 +516,7 @@ export function ompLocalTaskScenario(dir: string): Promise<void> {
       for (const m of dms) expect(m.via).toBe(m.sender_id);
       expect(dms.map((m) => m.sender_id).sort()).toEqual([...children].sort());
       for (const m of dms) expect(peer.pushes.find((p) => p.content === m.body)!.meta).toMatchObject({ from: "omp-local", via: m.via });
-      const history = (await peer.call("dm_history", { peer: "omp-local" })) as { body: string; via?: string }[];
+      const history = (await peer.call("dm_history", { peer: "omp-local" })) as { body: string; via?: string | null }[];
       expect(history.filter((m) => m.body.startsWith("child ")).map((m) => [m.body, m.via]).sort()).toEqual(dms.map((m) => [m.body, m.via]));
 
       // Only main's requests carry grayboard's instructions.

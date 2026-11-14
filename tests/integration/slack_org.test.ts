@@ -40,7 +40,7 @@ const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
 
 // An agent: a hosted MCP session of `email`'s, bound to `identity`.
-const hosted = (email: string, identity: string) => srv.hosted(email, identity);
+const hosted = (email: string, identity: string | null) => srv.hosted(email, identity);
 
 function tsOf(post: Record<string, any>): string {
   const ts = slack.postTs.get(post);
@@ -420,7 +420,7 @@ test("a bridge that fails at boot records its death for its linked users, via th
 test("a deliberate bridge teardown stays silent (no audit row)", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop();
+  srv.app.slack!.stop();
   expect(srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human")).toBeUndefined();
 });
 
@@ -454,7 +454,7 @@ test("a fatal stop with no linked users writes nothing user-facing", async () =>
 test("a session's human.linked is false while the bridge is down", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "recheck" });
+  srv.app.slack!.stop({ fatal: true, detail: "recheck" });
   const hello = await srv.appSession(alice, "be").connect();
   expect(hello.human?.linked).toBe(false);
   expect(await (await hosted("alice@example.com", "fe")).instructionsNow()).not.toContain('dm_send(to="human")');
@@ -463,7 +463,7 @@ test("a session's human.linked is false while the bridge is down", async () => {
 test("a fatal bridge stop tells the owner on their next bind, once", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
+  srv.app.slack!.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
   await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
 
   const hello = await srv.appSession(alice, "be").connect();
@@ -476,7 +476,7 @@ test("a fatal bridge stop tells the owner on their next bind, once", async () =>
 test("a hosted bind carries the owed bridge notice in its answer, once", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
+  srv.app.slack!.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
   await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
 
   const first = await hosted("alice@example.com", null);
@@ -492,7 +492,7 @@ test("the bridge notice comes before the claims notice, so a cut takes the claim
   await link(alice);
   const { claim } = await import("../../src/core/claims.ts");
   claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142");
-  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
   const notices = (await srv.appSession(alice, "be").connect()).bind?.notices ?? [];
   const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
   const claims = notices.findIndex((n) => n.includes("ticket:ENG-142"));
@@ -504,7 +504,7 @@ test("the bridge notice comes before the claims notice, so a cut takes the claim
 test("a second fatal within the dedup window records the death but doesn't re-notify", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
   const first = await srv.appSession(alice, "be").connect();
   expect((first.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
 
