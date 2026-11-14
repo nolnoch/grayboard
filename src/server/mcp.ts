@@ -273,7 +273,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
     if (live.stopped || !idle(live)) { next.finish(); return; }
     const previous = live.context;
-    live.context = next;
+    live.context = next; live.rows = bindingRows(next);
     if (live.stream) streamContexts.set(live.stream, next);
     previous.finish();
   }

@@ -1199,3 +1199,22 @@ test("one hosted call reads the same rows however many other sessions exist (#39
   const few = await rowsRead(3), many = await rowsRead(40);
   expect(many).toBe(few);
 });
+
+// #399: the timer, not the request, ends idle rows; a request refused at capacity sweeps first (at most once a
+// tick) and is admitted when the sweep freed a row.
+test("a user at capacity with idle rows is admitted after the refusal's re-sweep, at most once per tick (#399)", async () => {
+  for (let i = 0; i < hosted.limits.user; i++) await hosted.whoami(principal, context(`unbound-${i}`));
+  const idle = spyOn(database.repo.hosted, "idle");
+  try {
+    now += 1_000;
+    await expect(hosted.whoami(principal, context("refused-1"))).rejects.toHaveProperty("code", "bad_request");
+    const swept = idle.mock.calls.length;
+    expect(swept).toBeGreaterThan(0);
+    await expect(hosted.whoami(principal, context("refused-2"))).rejects.toHaveProperty("code", "bad_request");
+    expect(idle.mock.calls.length).toBe(swept);
+    now += 900_001;
+    await hosted.whoami(principal, context("admitted"));
+    expect(idle.mock.calls.length).toBeGreaterThan(swept);
+    expect(database.repo.hosted.get(hostedId("admitted"))).toBeDefined();
+  } finally { idle.mockRestore(); }
+});
