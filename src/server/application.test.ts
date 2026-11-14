@@ -279,7 +279,7 @@ test("hold sessions block binding and candidates without push or online presence
   await owner.call("peer_status", { text: "working" });
   const tools = await connect(alice, "held", { push: false });
   const observer = application.hostedSession(alice, "hosted-observer", [], null, null, delivery()).session;
-  expect((application.call(observer, "peer_list", { include_offline: true }) as { peers: unknown[] }).peers).toMatchObject([{ online: false, status: "working" }]);
+  expect((application.call(observer, "peer_list", { include_offline: true }) as { peers: unknown[] }).peers).toMatchObject([{ online: false }]);
   expect(tools.session.toolsOnly).toBe(true);
   expect(tools.session.holds).toEqual([]);
   await expect(connect(alice, "held")).rejects.toMatchObject({ code: "alias_held", extra: { holder: expect.stringContaining(owner.id) } });

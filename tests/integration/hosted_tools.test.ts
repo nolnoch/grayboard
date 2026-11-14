@@ -113,6 +113,48 @@ test("who: live sessions are online; a closed one is offline with last_seen; tea
   await expect(c.call("peer_list", { board: "eng" })).rejects.toMatchObject({ message: "no such board #eng; see board_list" });
 });
 
+// Security audit F-12: another user's agent shows its handle and presence,
+// never where it runs, its status, harness, model, effort or launcher flag,
+// and match can't probe them; a team alias shows them to the team's members.
+test("peer_list shows a session's facts only inside a scope the caller may act in (F-12)", async () => {
+  const alice = await login(A);
+  const bob = await login(B);
+  await login(C);
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: B });
+
+  const a = await srv.hosted(A, "be");
+  const b = await srv.hosted(B, "fe");
+  const c = await srv.hosted(C, "sim");
+  await srv.connected(bob, "eng/deploy");
+  const facts = (address: string, model: string) =>
+    srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = ?, effort = 'high', launcher = 1, status = 'on ENG-142', status_at = ?
+      WHERE id = (SELECT id FROM alias_holds WHERE address = ?)`).run(model, Date.now(), address);
+  facts(`${A}/be`, "model-a");
+  facts(`${B}/fe`, "model-b");
+  facts("eng/deploy", "model-d");
+  const FACTS = ["where", "status", "status_age", "harness", "model", "effort", "launcher"];
+  const row = (r: WhoResult, h: string) => r.peers.find((p) => p.handle === h)! as unknown as Record<string, unknown>;
+  const shown = (r: WhoResult, h: string) => FACTS.filter((k) => row(r, h)[k] !== undefined);
+
+  const byAlice = await a.call<WhoResult>("peer_list");
+  expect(shown(byAlice, `${A}/be`)).toEqual(FACTS);
+  expect(shown(byAlice, `${B}/fe`)).toEqual([]);
+  expect(row(byAlice, `${B}/fe`)).toMatchObject({ handle: `${B}/fe`, online: true });
+  // alice is in eng, so its alias's facts show to her though bob's session holds it.
+  expect(shown(byAlice, "eng/deploy")).toEqual(FACTS);
+  expect(await b.call<WhoResult>("peer_list").then((r) => shown(r, `${B}/fe`))).toEqual(FACTS);
+
+  // carol is in no team: only her own row shows facts.
+  const byCarol = await c.call<WhoResult>("peer_list");
+  expect([`${A}/be`, `${B}/fe`, "eng/deploy"].map((h) => shown(byCarol, h))).toEqual([[], [], []]);
+
+  // A hidden fact can't be probed with match.
+  expect((await c.call<WhoResult>("peer_list", { match: { model: "model-b" } })).peers).toEqual([]);
+  expect((await c.call<WhoResult>("peer_list", { match: { harness: "claude-code" } })).peers).toEqual([]);
+  expect((await b.call<WhoResult>("peer_list", { match: { model: "model-b" } })).peers.map((p) => p.handle)).toEqual([`${B}/fe`]);
+});
+
 test("leaving a team drops its board and pending pushes", async () => {
   const alice = await login(A);
   const carol = await login(C);
