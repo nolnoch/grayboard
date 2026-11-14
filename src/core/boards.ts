@@ -316,9 +316,16 @@ export function setPlace(db: Database, id: string, place: string | null): void {
 
 const MAX_STATUS = 200;
 
-/** Text as one line: whitespace runs to a space, other control characters dropped, trimmed. */
+// Bidi marks, embeddings, overrides and isolates (U+061C, U+200E-F,
+// U+202A-E, U+2066-9) and zero-width characters (U+200B, U+2060, U+FEFF):
+// they reorder or hide what a peer reads (#372). ZWJ (U+200D) builds emoji
+// sequences and ZWNJ (U+200C) is orthographic in Persian and Indic text, so
+// both stay; that's why this isn't all of \p{Cf}.
+const INVISIBLE = /[\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
+
+/** Text as one line: whitespace runs to a space, other control and bidi/zero-width characters dropped, trimmed. */
 export function oneLine(text: string): string {
-  return text.replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
+  return text.replace(INVISIBLE, "").replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
 }
 
 // One line saying what the session holding `handle` is doing; empty clears
