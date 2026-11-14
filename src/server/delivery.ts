@@ -92,7 +92,10 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         hosted.seeLost(p, row);
         previous = bySession.get(row.session_id);
         if (previous && matches(previous, row)) return previous;
-        if (leases.size >= 256 || (perUser.get(p.authed.user_id) ?? 0) >= 32) throw new ApplicationError("bad_request", "delivery lease capacity reached");
+        // A lease this open replaces (another grant's) frees its slot here, not after the check; a
+        // session is one user's, so that slot is this user's.
+        const replaced = previous ? 1 : 0;
+        if (leases.size - replaced >= 256 || (perUser.get(p.authed.user_id) ?? 0) - replaced >= 32) throw new ApplicationError("bad_request", "delivery lease capacity reached");
         const expiresAt = now() + ttl;
         store.update({ ...row, lease_deadline: expiresAt, last_seen_at: now() });
         hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null });
