@@ -172,6 +172,31 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
   }
 });
 
+test("the hosted attachment byte routes charge a refused bearer to the address gate, and a request with none costs nothing (#401)", async () => {
+  let now = 0;
+  const srv = new TestServer({ authFailLimit: { burst: 2, perSec: 1 } }, { now: () => now });
+  try {
+    const token = await srv.login("alice@example.com");
+    now = 10_000;
+    const bytes = (bearer?: string) => fetch(`${srv.base}/mcp/attachments/1?identity=be`, bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : {});
+    for (let n = 0; n < 3; n++) expect((await bytes()).status).toBe(401);
+    // A malformed token and a well-formed one the server never issued.
+    for (const bad of ["not-a-token", "A".repeat(43)]) {
+      const response = await bytes(bad);
+      expect(response.status).toBe(401);
+      expect(await response.text()).not.toContain(bad);
+    }
+    const blocked = await bytes("A".repeat(43));
+    expect(blocked.status).toBe(429);
+    expect((await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(429);
+    expect(srv.app.db.query("SELECT target, detail FROM access_log WHERE action = 'auth.rate_limited'").all()).toEqual([
+      expect.objectContaining({ detail: expect.stringContaining('"path":"/mcp/attachments/1"') }),
+    ]);
+  } finally {
+    await srv.stop();
+  }
+});
+
 test("native HTTP charges only presented invalid tokens in the shared address gate", async () => {
   let now = 0;
   const srv = new TestServer({ authFailLimit: { burst: 2, perSec: 1 } }, { now: () => now });
