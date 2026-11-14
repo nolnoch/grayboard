@@ -468,24 +468,32 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 }, 60_000);
 
-// #282: this tree's server no longer serves `grayboard mcp --mode server` over WebSocket. A 2.x release's
-// process learns that at its first frame and exits with the refusal inside 2 s; a 1.x one is refused the
-// same way but may only time out (older than 1.10.0 never reads the answer), so for it the contract is that
-// no session is registered.
-test(`server: ${FROM}'s \`mcp --mode server\` is refused by this tree's server`, async () => {
+// #282, #475: this tree's server serves no WebSocket. `/ws`, or any path, answers an upgrade with the
+// ordinary 404 and registers nothing. A v2.3.0-or-later release's CLI refuses `mcp --mode server` itself
+// and exits non-zero inside 2 s. An older release dials the removed transport: with no refusal handler
+// it reads the 404 as a dropped connection and retries until killed (the maintainer's call, #475: no
+// shim for it), so for it the contract is that it never exits 0 and no session is registered.
+test(`server: ${FROM}'s \`mcp --mode server\` gets no session from this tree's server`, async () => {
   label = "refusal";
   srv = new TestServer({ dbPath: join(dir, "grayboard.db") });
   const token = await srv.login("alice@example.com");
+  const upgrade = { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version": "13" };
+  for (const path of ["/ws", "/"]) {
+    const res = await fetch(`${srv.base}${path}`, { headers: { ...upgrade, Authorization: `Bearer ${token}` } });
+    expect(res.status, path).toBe(404);
+    expect(res.headers.get("upgrade"), path).toBeNull();
+  }
   const run = (timeoutMs: number) =>
     runCli(["mcp", "--mode", "server"], { bin: rel.cli, cwd: dir, env: serverEnv(dir, srv!.base, token, "be"), holdStdin: true, timeoutMs });
-  if (FROM.startsWith("v1.")) {
-    await run(15_000).catch(() => undefined);
-  } else {
+  if (HOSTED_ONLY) {
     const started = Date.now();
     const r = await run(2_000);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(r.code).not.toBe(0);
     expect(r.err).toContain("no longer serves `grayboard mcp` over WebSocket");
+  } else {
+    const r = await run(5_000).catch((e: Error) => e);
+    if (!(r instanceof Error)) expect(r.code, r.err).not.toBe(0);
   }
   expect((srv.app.db.prepare(`SELECT COUNT(*) AS n FROM ids`).get() as { n: number }).n).toBe(0);
 }, 30_000);
