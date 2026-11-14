@@ -68,6 +68,32 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
   expect(JSON.parse((srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'hello.rate_limit_ended'`).get() as { detail: string }).detail).refused).toBeGreaterThanOrEqual(2);
 });
 
+test("the heartbeat's sweep ends a run nobody binds after, and drops the refilled bucket (#247)", async () => {
+  // The limiter on a clock the test moves; the sweep is what the 30s heartbeat runs.
+  const clock = { t: Date.now() };
+  const srv = new TestServer({ helloLimit: { burst: 2, perSec: 0.1 } }, { now: () => clock.t });
+  cleanup.push(() => srv.stop());
+  const a = srv.appSession(await srv.login(A), null);
+  await a.connect();
+  await a.bind("be");
+  await a.bind("ops");
+  expect((await refusal(a.bind("fe"))).code).toBe("rate_limited");
+  expect((await refusal(a.bind("fe"))).code).toBe("rate_limited");
+  const ended = () => srv.app.db.query(`SELECT actor, detail FROM access_log WHERE action = 'hello.rate_limit_ended'`).all() as { actor: string; detail: string }[];
+  // Not yet full (one token back of two): the run goes on and the bucket stays.
+  clock.t += 10_000;
+  srv.app.sweepLimits();
+  expect(ended()).toEqual([]);
+  expect(srv.app.application.limiterSizes().bind).toBe(1);
+  // Full again: one sweep writes the end and drops the bucket, and a second writes nothing more.
+  clock.t += 10_000;
+  srv.app.sweepLimits();
+  expect(ended().map((r) => [r.actor, JSON.parse(r.detail)])).toEqual([[A, { refused: 2 }]]);
+  expect(srv.app.application.limiterSizes().bind).toBe(0);
+  srv.app.sweepLimits();
+  expect(ended()).toHaveLength(1);
+});
+
 test("the Slack bridge's human connection is exempt", async () => {
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
   cleanup.push(() => slack.stop());

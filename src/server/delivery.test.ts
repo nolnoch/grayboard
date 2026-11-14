@@ -56,6 +56,13 @@ test("stale receipt audit survives rollback exactly once without committing any 
   expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
 });
 
+test("shutdown detaches each accepted lease with one hosted.lease_detached row naming its session (#424)", async () => {
+  const lease = await delivery.open(bob, context(bob)); delivery.accept(lease);
+  delivery.close();
+  const rows = store.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'hosted.lease_detached'").all();
+  expect(rows.map(r => [r.actor, r.target, JSON.parse(r.detail)])).toEqual([[bob.authed.user_email, store.repo.hosted.all()[0]!.session_id, { reason: "shutdown", client_id: OPENCODE_CLIENT }]]);
+});
+
 test("a DM to the session's own ID is pushed unstamped, an alias DM carries its alias (#451: the client checks held addresses only)", async () => {
   const lease = await delivery.open(bob, context(bob));
   const root = context(bob);

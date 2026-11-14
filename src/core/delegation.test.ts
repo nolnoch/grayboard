@@ -4,7 +4,6 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { declareHuman, ensureAlias, registerId, setStatus, touchAlias, who } from "./boards.ts";
 import { dropHold, holdAlias, logBinding, unboundPeer } from "./bindings.ts";
 import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchers, resolveDelegation, DELEGATE_TOOL } from "./delegation.ts";
-import { CoreError } from "./errors.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -110,6 +109,18 @@ describe("resolveDelegation", () => {
   test("explicit to: offline launcher", () => {
     session("a", true);
     expect(() => resolveDelegation(db, "me", { ...args, to: "a" }, (h) => h !== "a")).toThrow(/offline/);
+  });
+
+  test("explicit to: the requester's own address is self-delegation, not an offline launcher (#253)", () => {
+    session("me", true);
+    session("me2", true);
+    expect(() => resolveDelegation(db, "me", { ...args, to: "me" }, (h) => h !== "me")).toThrow(/own address; a session can't delegate to itself/);
+    // Another address the same session holds, by the caller's own set.
+    const mine = (h: string) => h === "me" || h === "me2";
+    expect(() => resolveDelegation(db, "me", { ...args, to: "me2" }, live, undefined, mine)).toThrow(/can't delegate to itself/);
+    // And the auto-pick skips it.
+    session("a", true);
+    expect(resolveDelegation(db, "me", args, live, undefined, mine).to).toBe("a");
   });
 
   test("explicit to: unknown handle", () => {
