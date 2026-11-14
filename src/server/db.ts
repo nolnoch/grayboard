@@ -243,6 +243,8 @@ export const RETRACTABLE_SQL = `SELECT recipient FROM messages WHERE id = ? AND 
                                    WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0) AND delivered_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`;
 
+// audit.last: the newest row for (action, target), searched by idx_access_log_action_target (#295).
+export const ACCESS_LOG_LAST_SQL = `SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1`;
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
   // auto_vacuum must precede the first page write.
@@ -446,6 +448,8 @@ function initSchema(db: Database): void {
       detail TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_at ON access_log(at);
+    -- audit.last's (action, target) lookup, newest first: a repeated dm_retract asks it each time (#295).
+    CREATE INDEX IF NOT EXISTS idx_access_log_action_target ON access_log(action, target, at);
 
     -- The Slack bridge (src/server/slack.ts): who is linked, and which Slack
     -- thread holds which grayboard thread. board is '' for a dm, so the
@@ -928,7 +932,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return (
           db
             .query<AccessLogRow, [string, string]>(
-              "SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1",
+              ACCESS_LOG_LAST_SQL,
             )
             .get(action, target) ?? undefined
         );

@@ -57,12 +57,14 @@ export function writeCoreAudit(
 }
 
 // The newest row for this action and target, or undefined.
+// The newest row for (action, target), searched by idx_audit_log_action_target (#295).
+export const AUDIT_LOG_LAST_SQL = `SELECT at, actor, detail FROM audit_log WHERE action = ? AND target = ? ORDER BY at DESC, rowid DESC LIMIT 1`;
 export function lastCoreAudit(
   db: Database,
   action: CoreAuditAction,
   target: string,
 ): { at: number; actor: string | null; detail: string | null } | undefined {
   return (db
-    .prepare(`SELECT at, actor, detail FROM audit_log WHERE action = ? AND target = ? ORDER BY at DESC, rowid DESC LIMIT 1`)
+    .prepare(AUDIT_LOG_LAST_SQL)
     .get(action, target) as { at: number; actor: string | null; detail: string | null } | null) ?? undefined;
 }
