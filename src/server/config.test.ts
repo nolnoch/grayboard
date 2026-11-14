@@ -11,6 +11,7 @@ const KEYS = [
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS",
+  "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
   "GRAYBOARD_RESOURCE_WATCHES_GLOBAL", "GRAYBOARD_RESOURCE_WATCHES_PER_SESSION",
@@ -215,6 +216,41 @@ describe("loadConfig", () => {
     }
     process.env.GRAYBOARD_HELLO_PER_SEC = "0.1";
     expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 0.1 });
+  });
+
+  test("delegate's per-user limit defaults to 60 and 0.1/s and its open cap to 20; set, they parse like the hello limit (#252)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().delegateLimit).toEqual({ burst: 60, perSec: 0.1 });
+    expect(loadConfig().delegateOpenCap).toBe(20);
+    process.env.GRAYBOARD_DELEGATE_BURST = "200";
+    process.env.GRAYBOARD_DELEGATE_PER_SEC = "0.5";
+    process.env.GRAYBOARD_DELEGATE_OPEN_CAP = "50";
+    expect(loadConfig().delegateLimit).toEqual({ burst: 200, perSec: 0.5 });
+    expect(loadConfig().delegateOpenCap).toBe(50);
+    expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 1 });
+    process.env.GRAYBOARD_DELEGATE_BURST = "";
+    process.env.GRAYBOARD_DELEGATE_PER_SEC = "";
+    process.env.GRAYBOARD_DELEGATE_OPEN_CAP = "";
+    expect(loadConfig().delegateLimit).toEqual({ burst: 60, perSec: 0.1 });
+    expect(loadConfig().delegateOpenCap).toBe(20);
+    for (const bad of ["0", "1.5", "-3", "ten"]) {
+      process.env.GRAYBOARD_DELEGATE_BURST = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_DELEGATE_BURST must be a positive whole number of requests/);
+    }
+    process.env.GRAYBOARD_DELEGATE_BURST = "10001";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_DELEGATE_BURST can be at most 10000/);
+    process.env.GRAYBOARD_DELEGATE_BURST = "";
+    for (const bad of ["0", "0.05", "-1", "1e3", "slow"]) {
+      process.env.GRAYBOARD_DELEGATE_PER_SEC = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_DELEGATE_PER_SEC must be a number of at least 0.1/);
+    }
+    process.env.GRAYBOARD_DELEGATE_PER_SEC = "";
+    for (const bad of ["0", " 20", "1e3", "2.5", "-1", "many"]) {
+      process.env.GRAYBOARD_DELEGATE_OPEN_CAP = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_DELEGATE_OPEN_CAP must be a positive whole number of requests/);
+    }
+    process.env.GRAYBOARD_DELEGATE_OPEN_CAP = "10001";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_DELEGATE_OPEN_CAP can be at most 10000/);
   });
 
   test("the auth-failure limit parses like the hello limit, under its own names", () => {

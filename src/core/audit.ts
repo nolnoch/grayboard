@@ -1,6 +1,7 @@
 // Local mode's audit trail (the server's is src/server/audit.ts through the
 // Repo facade). The delegation slice writes the same actions both modes
-// write: delegation.requested, delegation.refused, handle.launcher_set;
+// write: delegation.requested, delegation.refused, delegation.throttled,
+// delegation.throttle_ended, handle.launcher_set;
 // message.retracted, which a repeated dm_retract is answered from (#254); and
 // id.collision, a session refused because its ID already has a row;
 // id.ended, a session ended (#284 decision 4), detailing what it held;
@@ -20,7 +21,7 @@
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.facts_changed" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "delegation.throttled" | "delegation.throttle_ended" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.facts_changed" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
 
 /**
  * Local mode's own actions beside the shared ones: Claude Code subagent

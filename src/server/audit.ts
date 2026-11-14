@@ -96,6 +96,8 @@ export type AuditAction =
   | "team.member_removed"
   | "delegation.requested"
   | "delegation.refused"
+  | "delegation.throttled"
+  | "delegation.throttle_ended"
   | "handle.launcher_set";
 
 /** A request's user agent as audit rows and sessions carry it: at most 120 characters. */

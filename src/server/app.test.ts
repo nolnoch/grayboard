@@ -240,6 +240,10 @@ test("a start option overrides the config's limit, and an explicit undefined one
   const config = { helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 } };
   expect(startLimits(config, { helloLimit: undefined, hostedRequestLimit: undefined })).toMatchObject(config);
   expect(startLimits(config, { helloLimit: { burst: 9, perSec: 9 } })).toMatchObject({ helloLimit: { burst: 9, perSec: 9 }, hostedRequestLimit: config.hostedRequestLimit });
+  // delegate's limits come from the config too (#252).
+  const delegate = { delegateLimit: { burst: 5, perSec: 0.5 }, delegateOpenCap: 4 };
+  expect(startLimits({ ...config, ...delegate }, { delegateLimit: undefined })).toMatchObject(delegate);
+  expect(startLimits({ ...config, ...delegate }, { delegateOpenCap: 9 })).toMatchObject({ ...delegate, delegateOpenCap: 9 });
 });
 
 test("startLimits hands the configured global watch cap to the application's board observers (#805 F-06)", () => {

@@ -9,7 +9,7 @@ import { DEFAULT_HOSTED_CAPS } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
-import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, delegateOkFields, delegateThrottled, resolveDelegation } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
@@ -79,6 +79,9 @@ export type ApplicationOptions = {
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
   hostedRequestLimit?: RateLimit;
+  // delegate's limits (#252): per user, and the open requests one launcher may hold.
+  delegateLimit?: RateLimit;
+  delegateOpenCap?: number;
   // Board observers server-wide: hosted resource watches are observers, so it is their global cap (#805).
   observerCap?: number;
   // The hub's clock: the rate limiters' and the write-dedup window's
@@ -190,6 +193,13 @@ type Hub = {
   humanReach: HumanReach;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
+  // delegate's per-user bucket and the launcher cap (#252). A streak's
+  // rows go to delegateRows while a delegate call runs, to be written where
+  // its outcome keeps them; otherwise (a sweep) at once.
+  delegateLimit: RateLimit;
+  delegateLimiter: RateLimiter;
+  delegateRows: (() => void)[] | undefined;
+  delegateOpenCap: number;
   now: () => number;
   boardChanged: (board: string) => void;
 };
@@ -379,6 +389,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // to it as well, to be written again if the transaction rolls back. A refused take always rolls it back.
   let streakAfterRollback: ((write: () => void) => void) | undefined;
   const streakRow = (write: () => void) => { write(); streakAfterRollback?.(write); };
+  const delegateRow = (write: () => void) => { if (hub.delegateRows) hub.delegateRows.push(write); else write(); };
   const hub: Hub = {
     repo,
     db,
@@ -400,6 +411,16 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         streakRow(() => writeAudit(repo, "bind.rate_limit_ended", email, null, { refused }));
       },
     }, opts.now),
+    delegateLimit: opts.delegateLimit ?? DELEGATE_LIMIT,
+    // Keyed by user email, so a user's sessions, aliases and children share
+    // one bucket and a fresh session can't reset it; capped like the
+    // hosted-request limiter's keys would be by users.
+    delegateLimiter: new RateLimiter(opts.delegateLimit ?? DELEGATE_LIMIT, {
+      start: (email, ctx, retryAfterMs) => delegateRow(() => writeAudit(repo, "delegation.throttled", email, email, { ...ctx, retry_after_ms: retryAfterMs })),
+      end: (email, refused) => delegateRow(() => writeAudit(repo, "delegation.throttle_ended", null, email, { refused })),
+    }, opts.now, 10_000),
+    delegateRows: undefined,
+    delegateOpenCap: opts.delegateOpenCap ?? DELEGATE_OPEN_CAP,
     boardChanged(board) {
       afterCommit(db, () => {
         for (const observer of [...observers]) {
@@ -1003,9 +1024,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       for (const id of users) application.disconnectUser(id);
       recheckAliases(null, null);
     },
-    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); },
+    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hub.delegateLimiter.sweep(); },
     /** How many users have a bind or hosted-request bucket, for tests. */
-    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size }),
+    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size, delegate: hub.delegateLimiter.size }),
     stopExpiry() {
       expiry.stop();
       for (const observer of [...observers]) removeObserver(observer);
@@ -1272,9 +1293,21 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   // Where a refused send was headed, for its audit row.
   let picked: string | undefined;
   let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
+  // A launcher's open requests: the same window dm_inbox lists by default (#252).
+  const since = hub.now() - inboxDays(undefined) * 86_400_000;
+  const open = (h: string) => repo.messages.openDelegations(h, since);
+  // The limiter's streak rows from this call: written inside the dedup
+  // transaction they'd roll back with it, so they're written after it.
+  const rows: (() => void)[] = [];
+  hub.delegateRows = rows;
   try {
     out = writeOnce(hub, session, "delegate", session.primary, args, m.resend === true, [], () => {
-      const d = resolveDelegation(db, session.primary, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h));
+      // Checked and spent in here, so a dedup replay is neither charged nor
+      // refused; resend writes again, so it's charged (#252).
+      // The user's bucket, not the address's (#252): the row names the session that tripped it.
+      const t = hub.delegateLimiter.check(authed.user_email, { requester: session.primary, session_id: session.sessionId, ...byChild });
+      if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
+      const d = resolveDelegation(db, session.primary, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h), open, hub.delegateOpenCap);
       picked = d.to;
       const w = writeSend(hub, session, prepareSend(hub, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
@@ -1284,19 +1317,27 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
         message_id: w.msg.id,
         ...byChild,
       });
+      hub.delegateLimiter.spend(authed.user_email);
       return { payload, ref: w.ref, msg: w.msg };
     });
   } catch (e) {
+    hub.delegateRows = undefined;
+    for (const row of rows) rowAfterRollback(session, row);
     // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
       refused({ reason: e.message, to: m.to });
       throw coreRefusal(e);
     }
+    // A throttled call is audited once per streak (delegation.throttled), not per call.
+    if (e instanceof ApplicationError && e.code === "rate_limited") throw e;
     // A refused send (canSend, a missing identity, a bad body) is a refusal,
     // not a request (#184 review 4).
     if (e instanceof ApplicationError) refused({ reason: e.message, to: picked });
     throw e;
   }
+  hub.delegateRows = undefined;
+  // Committed with the write: kept, and written again should hosted's outer transaction roll back.
+  for (const row of rows) { row(); session.afterRollback?.(row); }
   if ("replay" in out) return out.replay;
   afterCommit(db, () => {
     testPause("write:after-commit");
