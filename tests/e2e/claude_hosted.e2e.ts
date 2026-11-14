@@ -230,6 +230,10 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call sho
     // prompt up after that (the user dismisses it with Esc, docs/guide/team.md); typing
     // past it in a pty is not asserted here: keys were lost on CI (#497).
     await until(() => debug().includes("Received elicitation completion notification"), 10_000, "the plugin to complete the sign-in prompt");
+    // The plugin's own sign-in lines, which the debug log drops after the first (#506): its stderr, captured through the bun shim.
+    const pluginLog = () => existsSync(h.bunStderr) ? readFileSync(h.bunStderr, "utf8") : "";
+    await until(() => /\[grayboard\] signed in \((offer|startup)\)/.test(pluginLog()), 10_000, `the plugin's signed-in line in ${h.bunStderr}`);
+    expect(pluginLog()).toMatch(/\[grayboard\] sign-in prompt sent \(elicitation /);
     expect(model.unhandled).toEqual([]);
 
     // --resume replays the transcript, the hook's line included: still none of it reaches the model.
