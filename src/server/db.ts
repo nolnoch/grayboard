@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
+import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
 import { testPause } from "../shared/testpause.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -11,7 +11,8 @@ import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
-import type { MailPort } from "../core/session_end.ts";
+import { endSession, type MailPort } from "../core/session_end.ts";
+import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
@@ -131,7 +132,8 @@ export interface Repo {
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
-    bouncesFrom(id: string): MessageRow[];
+    // since: only an end's own bounces, made at or after its time (a reopened ID can end again, #475).
+    bouncesFrom(id: string, since?: number): MessageRow[];
     // A session's direct messages, sent or received by any of its addresses
     // (#284 S8): with peer, only those between the set and peer.
     history(addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
@@ -761,8 +763,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       getById(id) {
         return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
       },
-      bouncesFrom(id) {
-        return db.query<MessageRow, [string]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' ORDER BY id`).all(id);
+      bouncesFrom(id, since = 0) {
+        return db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);
       },
       history(addresses, peer, limit = 20, beforeId) {
         const set = JSON.stringify(addresses);
@@ -880,27 +882,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
-    mail: {
-      unread(id) {
-        return db.query<{ id: number; sender: string }, [string]>(
-          `SELECT m.id, m.sender FROM messages m
-            WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
-              AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                    WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
-            ORDER BY m.id`,
-        ).all(id);
-      },
-      bounce(from, to, parentId, body, now) {
-        db.query(
-          `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
-           VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
-        ).run(from, to, body, parentId, now);
-      },
-      dropReader(id) {
-        db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
-        db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
-      },
-    },
+    mail: mailPort(db),
 
     cursors: {
       get(address, streamType, streamRef) {
@@ -1323,12 +1305,48 @@ function makeOAuthStore(db: Database): OAuthStore {
   };
 }
 
+// The server's mail as core's session end reads it (a MailPort): the repo's, and the hosted store's child ends (#475).
+function mailPort(db: Database): MailPort {
+  return {
+    unread(id) {
+      return db.query<{ id: number; sender: string }, [string]>(
+        `SELECT m.id, m.sender FROM messages m
+          WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
+            AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                  WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
+          ORDER BY m.id`,
+      ).all(id);
+    },
+    bounce(from, to, parentId, body, now) {
+      db.query(
+        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
+         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
+      ).run(from, to, body, parentId, now);
+    },
+    dropReader(id) {
+      db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
+      db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
+    },
+  };
+}
+
 function makeHostedStore(db: Database): HostedStore {
   const get = (id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
   const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
     const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
       WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
     db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
+  };
+  // A released child's ID ends in the release's transaction, with its reason (#475 item 1): left unended,
+  // nothing owns it, and the next start would end it as a WSS leftover. The ends' wakes wait in `ended`
+  // for the application to run after commit (`takeEnded`).
+  const mail = mailPort(db);
+  const coreAudit = (now: number): AuditSink => (action, actor, target, detail) =>
+    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, actor, action, target, detail ? JSON.stringify(detail) : null]);
+  let ended: EndedChild[] = [];
+  const endChild = (child: string, why: string, now: number) => {
+    const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
+    if (end.ended) ended.push({ id: child, at: now, wake: end.wake });
   };
   // The hosted_alias_lost column each reader's take marks (#453).
   const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
@@ -1377,6 +1395,12 @@ function makeHostedStore(db: Database): HostedStore {
       if (!row?.root_session_id) return;
       db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
       audit(row.root_session_id, "hosted.child_released", { child: session, reason }, now);
+      endChild(session, reason, now);
+    },
+    takeEnded() {
+      const taken = ended;
+      ended = [];
+      return taken;
     },
     end(session, reason, now, deadline) {
       const row = get(session);
@@ -1396,7 +1420,10 @@ function makeHostedStore(db: Database): HostedStore {
         dropHold(db, address, session);
         logBinding(db, session, address, "released", reason, now);
       }
-      for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
+      for (const child of children) if (child.root_session_id) {
+        audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
+        endChild(child.session_id, reason, now);
+      }
       if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
       return true;
     },

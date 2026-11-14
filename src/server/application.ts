@@ -493,11 +493,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // start (a leftover) retries it.
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
-    const woken = new Set<string>();
+    const woken = new Set<string>(), bounced: { id: string; at: number }[] = [];
     for (const id of ids) {
       let ended;
+      const at = now();
       try {
-        ended = repo.atomic(() => endSession(db, repo.mail, id, { why, now: now(), audit: serverAuditSink(repo) }));
+        ended = repo.atomic(() => endSession(db, repo.mail, id, { why, now: at, audit: serverAuditSink(repo) }));
       } catch (e) {
         console.error(`[grayboard] ending session ${id} (${why}) failed:`, e);
         writeAudit(repo, "id.end_failed", null, id, { why, error: String(e) });
@@ -506,17 +507,27 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       // An end that found the session already ended sends nothing again.
       if (!ended.ended) continue;
       for (const h of ended.wake) woken.add(h);
-      // A bounce goes to a live sender now, as a send does; a drain would
-      // resend that session's unacked messages too.
-      for (const b of repo.messages.bouncesFrom(id)) {
-        const to = hub.registry.get(b.recipient);
-        if (to?.active) to.sink.deliver({ kind: "direct", message: showMessage(b) });
-      }
+      bounced.push({ id, at });
       if (ended.held.length) console.error(`[grayboard] session ${id} ended (${why}); released ${ended.held.join(", ")}`);
+    }
+    afterEnds(woken, bounced);
+  }
+  // What follows ends, after their commit: a bounce goes to a live sender now, as a send does (a drain would
+  // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go.
+  function afterEnds(woken: Set<string>, ends: { id: string; at: number }[]): void {
+    for (const { id, at } of ends) for (const b of repo.messages.bouncesFrom(id, at)) {
+      const to = hub.registry.get(b.recipient);
+      if (to?.active) to.sink.deliver({ kind: "direct", message: showMessage(b) });
     }
     wake(hub, [...woken]);
     void sweepBlobs(db, repo.blobs);
   }
+  // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
+  // after-commit half for every hosted commit, whichever path released it.
+  const unsubscribeEnds = repo.hosted.subscribe(() => {
+    const ended = repo.hosted.takeEnded();
+    if (ended.length) afterEnds(new Set(ended.flatMap((e) => e.wake)), ended);
+  });
   // The WSS transport is gone (#282): no connection can come back for a
   // session a previous run left unended, because only a hello re-attached one.
   // End each at start, as the grace sweep would have: holds and claims
@@ -780,6 +791,15 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         });
       }
       else {
+        // An ID whose row ended (a released child, or a row a restart ended) is live again (#475 item 7a): revocation
+        // (aliasUses), identity deletion (aliasUser) and retention only see unended rows, so a holder must have one.
+        if (prior.ended_at !== null) {
+          const endedAt = prior.ended_at;
+          repo.atomic(() => {
+            db.prepare(`UPDATE ids SET ended_at = NULL, held_aliases_json = NULL WHERE id = ?`).run(id);
+            writeAudit(repo, "id.reopened", authed.user_email, id, { ended_at: endedAt, harness });
+          });
+        }
         touchId(db, id);
         // A new ownership of the same ID reports its own model and effort: what the last one reported is stale.
         const changed = setIdFacts(db, id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
@@ -998,6 +1018,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size }),
     stopExpiry() {
       expiry.stop();
+      unsubscribeEnds();
       for (const observer of [...observers]) removeObserver(observer);
     },
   };

@@ -10,6 +10,8 @@ export type HostedSession = {
 export type HostedEnd = "idle" | "closed" | "revoked" | "disabled" | "expired";
 // Why a child row ended (#584): its own session_end, or the parked ceiling evicting it.
 export type ChildEnd = "closed" | "evicted";
+// A child ID a release ended (#475 item 1), and the handles its end woke, for the application to run after commit.
+export type EndedChild = { id: string; at: number; wake: string[] };
 // A hold the server took from a hosted root (#453): its address, why, and whether it was the root's primary.
 export type HostedLost = { alias: string; reason: string; primary: boolean };
 // Who reads a lost hold: the agent (the notice, taken once) and the root's Controller (reported by every
@@ -34,7 +36,10 @@ export interface HostedStore {
   // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
   start(session: string, user: number, client: string, now: number, suggested?: string | null): number;
   end(session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
+  // A child's release, or a root's end (each of its children), ends the child's ID in the same transaction.
   childEnd(session: string, now: number, reason: ChildEnd): void;
+  // The child IDs ended since the last take: the application's post-commit wakes and bounce deliveries.
+  takeEnded(): EndedChild[];
   // A root's lost holds `reader` hasn't taken, oldest first (#453). `lose` records one in the revocation's
   // transaction (restating an alias already pending, for both readers); `lost` reads them; `tellLost` takes the
   // agent's; `reportLost` returns the Controller's, marking them reported; `seeLost` takes the reported ones (its
