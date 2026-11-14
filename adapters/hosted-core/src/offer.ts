@@ -63,8 +63,12 @@ export function notify(state: SignInState, message: string): Flow | undefined {
 
 // The pending flow, else a new one. `ifSignedOut` returns at once once the
 // store holds a live grant (an offer, a signed-out start); `/grayboard login`
-// runs a flow regardless. `ended` runs once the flow's end is recorded.
-export function start(state: SignInState, login: Signer, o: { origin: Origin; browser: boolean; ifSignedOut: boolean; ended(flow: Flow, outcome: Outcome): void | Promise<void> }): Flow {
+// runs a flow regardless. `ended` runs once the flow's end is recorded;
+// `current` instead when the flow found that live grant, which another
+// process committed after this one's token read failed: the adapter restarts
+// delivery under it now rather than on its credential watch's next tick
+// (#596).
+export function start(state: SignInState, login: Signer, o: { origin: Origin; browser: boolean; ifSignedOut: boolean; ended(flow: Flow, outcome: Outcome): void | Promise<void>; current?(flow: Flow): void | Promise<void> }): Flow {
   if (state.flow) return state.flow;
   const abort = new AbortController();
   let show!: (url: string | undefined) => void;
@@ -82,14 +86,18 @@ export function start(state: SignInState, login: Signer, o: { origin: Origin; br
     return o.ended(flow, outcome);
   };
   flow.done = login.login(abort.signal, o.ifSignedOut).then(
-    result => result === "signed in" ? settle("signed in") : finish("current"),
+    result => {
+      if (result === "signed in") return settle("signed in");
+      finish("current");
+      return o.current?.(flow);
+    },
     error => {
       if (abort.signal.aborted) return settle("cancelled");
       flow.failed = scrub(flow, message(error));
       return settle(`failed: ${flow.failed}`);
     },
   );
-  // An `ended` hook that throws rejects `done` for whoever awaits it.
+  // An `ended` or `current` hook that throws rejects `done` for whoever awaits it.
   flow.done.catch(() => {});
   return flow;
 }

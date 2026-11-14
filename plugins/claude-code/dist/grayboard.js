@@ -31999,10 +31999,13 @@ class FileRefused extends Error {
 async function readSmallJson(path, maxBytes) {
   let file;
   try {
-    file = await open2(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    file = await open2(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   } catch (error) {
-    if (error.code === "ENOENT")
+    const code = error.code;
+    if (code === "ENOENT")
       return;
+    if (code === "ELOOP")
+      throw new FileRefused("is a symbolic link");
     throw error;
   }
   try {
@@ -34987,7 +34990,7 @@ class DeliveryStopped extends Error {
 var key = "diagnostics:v1";
 var fields = ["state", "message", "sessionID", "time", "held", "ownership", "operation", "code", "failure"];
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions"];
+var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link"];
 var operations = new Set(OPERATIONS);
 var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
@@ -36349,7 +36352,12 @@ function start(state, login, o) {
     finish(outcome);
     return o.ended(flow, outcome);
   };
-  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => result === "signed in" ? settle("signed in") : finish("current"), (error) => {
+  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => {
+    if (result === "signed in")
+      return settle("signed in");
+    finish("current");
+    return o.current?.(flow);
+  }, (error) => {
     if (abort.signal.aborted)
       return settle("cancelled");
     flow.failed = scrub(flow, message(error));
@@ -38219,31 +38227,36 @@ function createPlugin(o) {
       return signins.flow;
     if (!login || !root || !interactive || closed || !initialized)
       return;
-    const flow = start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
-      const prompt = prompts.get(flow);
-      try {
-        if (outcome === "signed in") {
-          if (prompt)
-            await server.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
-          say(`signed in (${origin})`);
-          await root.credentialChanged();
-        } else if (outcome !== "cancelled")
-          say(`sign-in failed (${[origin, ...prompt ? [`elicitation ${prompt.id}`] : []].join(", ")}): ${flow.failed}`);
-      } finally {
-        prompt?.withdraw.abort();
-        if (flow.url && !("error" in config)) {
-          try {
-            dropSignIn(config.dataDir, o.claude.pid, flow.url);
-          } catch (error) {
-            say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+    const flow = start(signins, login, {
+      origin,
+      browser: false,
+      ifSignedOut: true,
+      ended: async (flow, outcome) => {
+        const prompt = prompts.get(flow);
+        try {
+          if (outcome === "signed in") {
+            if (prompt)
+              await server.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
+            say(`signed in (${origin})`);
+            await root.credentialChanged();
+          } else if (outcome !== "cancelled")
+            say(`sign-in failed (${[origin, ...prompt ? [`elicitation ${prompt.id}`] : []].join(", ")}): ${flow.failed}`);
+        } finally {
+          prompt?.withdraw.abort();
+          if (flow.url && !("error" in config)) {
+            try {
+              dropSignIn(config.dataDir, o.claude.pid, flow.url);
+            } catch (error) {
+              say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+            }
           }
         }
-      }
-    } });
-    flow.done.then(() => {
-      if (flow.outcome === "current")
+      },
+      current: async () => {
         say(`sign-in not needed (${origin}): already signed in`);
-    }, () => {});
+        await root.credentialChanged();
+      }
+    });
     return flow;
   };
   const notes = {

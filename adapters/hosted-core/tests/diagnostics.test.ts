@@ -1,5 +1,5 @@
 // #430: the diagnostics vocabulary. The refusals and the busy refresh map to
-// their own codes and messages, and the records a host's login, logout,
+// their own codes and messages, and the records a host's login, login link, logout,
 // refresh and tool-proxy reports write keep their operation and code instead
 // of reading as invalid ("Diagnostic record unavailable").
 import { expect, test } from "bun:test";
@@ -15,7 +15,7 @@ test("failureCode and failureMessage name a delivery held elsewhere, an outdated
   ]);
 });
 
-test("login, logout, refresh and tool-proxy records keep their operation and code, emitted and persisted", async () => {
+test("login, login link, logout, refresh and tool-proxy records keep their operation and code, emitted and persisted", async () => {
   const saved = new Map<string, unknown>();
   const emitted: RecordStatus[] = [];
   const d = new Diagnostics({ get: async key => saved.get(key), set: async (key, value) => { saved.set(key, value); } }, record => { emitted.push(record); });
@@ -26,6 +26,9 @@ test("login, logout, refresh and tool-proxy records keep their operation and cod
     { operation: "refresh", code: "refresh_in_progress", sessionID: "d" },
     { operation: "after", code: "operation_failed", sessionID: "e" },
     { operation: "release_upload", code: "operation_failed", sessionID: "f" },
+    // The shared sign-in link's records (#596): plain callbacks today.
+    { operation: "login_link", code: "refused", sessionID: "g" },
+    { operation: "login_link", code: "operation_failed", sessionID: "h" },
   ];
   for (const w of written) d.record({ state: "degraded", message: `${w.operation} failed`, ...w });
   await d.flush();

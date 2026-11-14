@@ -230,21 +230,26 @@ export function createGrayboard(h: Harness): Grayboard {
   // says it at its start, whose delivery then starts signed in. Success
   // restarts this runtime's delivery and the current root's, at once; any
   // other runtime's credential watch restarts its own.
+  const speakerNow = () => state.voice ?? (done ? undefined : voice);
+  // A restart that fails is said; the credential watch tries again.
+  const restartAll = async (current: Voice | undefined) => {
+    await Promise.all([...new Set([voice, ...(current ? [current] : [])])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
+  };
   const ended = async (_flow: Flow, outcome: Outcome) => {
     const last = state.signins.last!;
     // Cancelled only by a quit, which has nothing left to say it to.
     if (outcome === "cancelled") { last.said = true; return; }
-    const current = state.voice ?? (done ? undefined : voice);
+    const current = speakerNow();
     if (current) { outcomeLine(current, last); last.said = true; }
     if (outcome !== "signed in") return;
-    // A restart that fails is said; the credential watch tries again.
-    await Promise.all([...new Set([voice, ...(current ? [current] : [])])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
+    await restartAll(current);
   };
   // The process's pending flow, else a new one under this runtime's Login.
-  // An offer's returns at once if another process's grant has landed;
-  // /grayboard login always runs a flow.
+  // An offer's returns at once if another process's grant has landed, and
+  // restarts delivery under it then (#596); /grayboard login always runs a
+  // flow.
   const begin = (origin: Origin, browser: boolean): Flow | undefined =>
-    state.signins.flow ?? (!login || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended }));
+    state.signins.flow ?? (!login || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended, current: () => restartAll(speakerNow()) }));
   // Whether this process outlives a browser round trip. A root's own mode;
   // any other runtime takes its process's root's, since omp starts in-process
   // task subagents without a mode (so they read "print"). A pi subagent is its
