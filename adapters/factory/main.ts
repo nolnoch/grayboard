@@ -47,9 +47,6 @@ export type Config = {
 // (#641). Its tool lists, mode and repo fall back to the global ones field by field.
 export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; budgetUsd?: number; busTools?: boolean; mirrorClaims?: boolean; workdir?: WorkdirMode; repo?: string };
 
-// The second bus name a sharing factory (#636) posts its subtasks under.
-export const posterName = (identity: string) => `${identity}-share`;
-
 // The fields a SIGHUP reload can't change: they shape the bus session, the
 // runner or the worker pool, which live as long as the process.
 const RESTART_ONLY = ["identity", "grayboard", "claude", "cwd", "maxConcurrent", "maxSubtasks", "timeoutMs", "retentionMs"] as const;
@@ -195,23 +192,6 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     if (f.fanout !== undefined && typeof f.fanout !== "boolean") throw new Error(`${path}: ${what} ${f.name}: "fanout" must be true or false`);
     return f.fanout === false ? { fanout: false } : {};
   };
-  // Shared subtasks (#636): a fleet's fan-outs posted on its `<name>-share`
-  // queue board for listed lanes to take. Fleets only, scratch only (#677).
-  const shareOf = (f: Record<string, unknown>, fl: Fleet): Fleet => {
-    const at = (k: string) => `${path}: fleet ${fl.name}: "${k}"`;
-    if (f.share === undefined || f.share === false) {
-      for (const k of ["shareWith", "shareTimeoutMs"]) if (f[k] !== undefined) throw new Error(`${at(k)} needs "share": true`);
-      return fl;
-    }
-    if (f.share !== true) throw new Error(`${at("share")} must be true or false`);
-    if (fl.fanout === false) throw new Error(`${at("share")} needs fan-out: a fleet with "fanout": false has no subtasks to share`);
-    if ((fl.workdir ?? workdir).mode !== "scratch") throw new Error(`${at("share")} needs "workdir" "scratch": an outside lane's changes in a worktree or shared directory can't reach the synthesis yet`);
-    const w = f.shareWith;
-    if (!Array.isArray(w) || !w.length || !w.every((h) => typeof h === "string" && /^[a-z0-9_-]{1,32}$/.test(h))) throw new Error(`${at("shareWith")} must list the bus handles whose outcomes count, at least one, each 1-32 characters of a-z 0-9 _ -`);
-    const timeoutMs = f.shareTimeoutMs;
-    if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < 1)) throw new Error(`${at("shareTimeoutMs")} must be a positive integer`);
-    return { ...fl, share: { with: [...new Set(w as string[])], ...(timeoutMs !== undefined ? { timeoutMs: timeoutMs as number } : {}) } };
-  };
   for (const f of rawFleets as Record<string, unknown>[]) {
     // The board name `<name>-tasks` must fit a board name: [a-z0-9_-], max 32.
     if (typeof f !== "object" || f === null || typeof f.name !== "string" || !NAME.test(f.name)) throw new Error(`${path}: each fleet's "name" must be 1-26 characters of a-z 0-9 _ -`);
@@ -222,10 +202,10 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
       if (f.agent !== undefined) throw new Error(`${path}: fleet ${f.name}: give "profile" or "agent", not both`);
       const p = typeof f.profile === "string" ? profiles.get(f.profile) : undefined;
       if (!p) throw new Error(`${path}: fleet ${f.name}: "profile" must name a profile in "profiles"`);
-      fleets.push(shareOf(f, withLimits(fromRoutes(f.name, [routeOf(p)], fanout), f, `fleet ${f.name}`)));
+      fleets.push(withLimits(fromRoutes(f.name, [routeOf(p)], fanout), f, `fleet ${f.name}`));
     } else {
       if (typeof f.agent !== "string" || !f.agent.trim()) throw new Error(`${path}: fleet ${f.name}: "agent" (or "profile") must be a non-empty string`);
-      fleets.push(shareOf(f, withLimits({ name: f.name, agent: f.agent.trim(), ...fanout }, f, `fleet ${f.name}`)));
+      fleets.push(withLimits({ name: f.name, agent: f.agent.trim(), ...fanout }, f, `fleet ${f.name}`));
     }
   }
 
@@ -237,7 +217,6 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     if (typeof j !== "object" || j === null || typeof j.name !== "string" || !NAME.test(j.name)) throw new Error(`${path}: each project's "name" must be 1-26 characters of a-z 0-9 _ -`);
     if (fleets.some((x) => x.name === j.name)) throw new Error(`${path}: project ${j.name}: the name is already a fleet's or another project's (both get the board ${j.name}-tasks)`);
     const fanout = fanoutOf(j, "project");
-    for (const k of ["share", "shareWith", "shareTimeoutMs"]) if (j[k] !== undefined) throw new Error(`${path}: project ${j.name}: "${k}" is for fleets only: a project's subtasks run on its own profiles`);
     const names = list(j.profiles, `project ${j.name}: "profiles"`);
     if (names.length === 0) throw new Error(`${path}: project ${j.name}: "profiles" must name at least one profile`);
     if (new Set(names).size !== names.length) throw new Error(`${path}: project ${j.name}: "profiles" lists a profile twice`);
@@ -252,10 +231,6 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   const identity = str("identity", DEFAULTS.identity);
   // A bus name (boards.md §3); anything else could never be bound.
   if (!/^[a-z0-9_-]{1,32}$/.test(identity)) throw new Error(`${path}: "identity" must be 1-32 characters of a-z 0-9 _ -`);
-  // Sharing (#636) posts as a second name, `<identity>-share`, which must fit a bus name and isn't a taker.
-  const sharing = fleets.filter((f) => f.share);
-  if (sharing.length && identity.length > 26) throw new Error(`${path}: "identity" must be at most 26 characters when a fleet shares its subtasks (it also binds ${identity}-share)`);
-  for (const f of sharing) for (const h of [identity, posterName(identity)]) if (f.share!.with.includes(h)) throw new Error(`${path}: fleet ${f.name}: "shareWith" lists ${h}, the factory's own name: its own outcomes come from its store`);
   const human = raw.human !== undefined ? str("human", "") : undefined;
   if (human !== undefined && !/^[a-z0-9_-]{1,32}$/.test(human)) throw new Error(`${path}: "human" must be a bus handle, 1-32 characters of a-z 0-9 _ -`);
   const limits = limitsIn(raw, "");
@@ -317,20 +292,6 @@ export async function main(env: Record<string, string | undefined> = process.env
     return 1;
   }
   log(`bound ${bus.handle}; ${runner.roster().length} ${runner.harness} agent(s) in ${runner.rosterSource}`);
-  // Shared subtasks (#636): a second session posts them, so the factory's own
-  // lane can be handed them like any other, and hears their thread replies.
-  let poster: LocalBus | undefined;
-  if (cfg.fleets.some((f) => f.share)) {
-    try {
-      poster = await LocalBus.start({ command: cfg.grayboard, identity: posterName(cfg.identity), launcher: false, version: VERSION, env: sessionFree(env) });
-    } catch (e) {
-      log(`couldn't start the poster session for shared subtasks: ${e instanceof Error ? e.message : String(e)}`);
-      await bus.close();
-      store.close();
-      return 1;
-    }
-    log(`bound ${poster.handle} to post shared subtasks`);
-  }
   const workspaces = new Workspaces(join(dataDir, "trees"), cfg.cwd);
   // The bus tools' relay (#669): opens its socket and reader on the first run that has them.
   const childTools = new Relay({
@@ -350,9 +311,9 @@ export async function main(env: Record<string, string | undefined> = process.env
     },
     log,
   });
-  const factory = new Factory(bus, store, runner, { childTools, ...(poster ? { poster } : {}), fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, limits: cfg.limits, log });
+  const factory = new Factory(bus, store, runner, { childTools, fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, limits: cfg.limits, log });
   let signalled = false;
-  const stop = () => { signalled = true; void bus.close(); void poster?.close(); };
+  const stop = () => { signalled = true; void bus.close(); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   // SIGHUP reloads the config (#645): fleets, projects, profiles, the
@@ -366,7 +327,7 @@ export async function main(env: Record<string, string | undefined> = process.env
         log(`reload refused, the running config stays: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
-      const refused = reloadRefusal(cfg, next, poster !== undefined);
+      const refused = reloadRefusal(cfg, next);
       if (refused) { log(`reload refused, the running config stays: ${refused}`); return; }
       const restart = RESTART_ONLY.filter((k) => JSON.stringify(next[k]) !== JSON.stringify(cfg[k]));
       if (restart.length) log(`reload: ${restart.join(", ")} changed, which takes a restart; the running values stay`);
@@ -378,18 +339,15 @@ export async function main(env: Record<string, string | undefined> = process.env
   const why = await factory.run();
   process.off("SIGHUP", reload);
   log(`stopping: ${why}`);
-  await poster?.close();
   await childTools.close();
   store.close();
   return signalled ? 0 : 1;
 }
 
 // Why a config that loads still can't be taken by a reload (#645), or null.
-export function reloadRefusal(running: Config, next: Config, poster: boolean): string | null {
+export function reloadRefusal(running: Config, next: Config): string | null {
   // retentionMs takes a restart, so a daily cap is checked against the running one.
   if (hasDailyCap(next) && running.retentionMs < DAY) return `"dailyBudgetUsd" needs a running "retentionMs" of at least ${DAY} (a day); restart to change it`;
-  // The poster session starts with the factory.
-  if (!poster && next.fleets.some((f) => f.share)) return `a fleet now shares its subtasks ("share"), which needs the poster session a restart starts`;
   return null;
 }
 
