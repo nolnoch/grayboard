@@ -5,10 +5,13 @@ import type { Database } from "bun:sqlite";
 import type { BlobStore } from "../core/attachments.ts";
 import { BlobMissing } from "../core/errors.ts";
 
+// Created with the rest of the local schema, in openSqlite's one schema
+// transaction (src/local/open.ts), not per store: a write outside it would
+// take the lock each time a store is made (#148 item 29).
+export const ATTACHMENT_BYTES_SQL = `CREATE TABLE IF NOT EXISTS attachment_bytes (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL)`;
+
 export class SqliteBlobs implements BlobStore {
-  constructor(private readonly db: Database) {
-    db.exec(`CREATE TABLE IF NOT EXISTS attachment_bytes (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL)`);
-  }
+  constructor(private readonly db: Database) {}
 
   async put(sha256: string, data: Uint8Array): Promise<void> {
     this.db.prepare(`INSERT OR REPLACE INTO attachment_bytes (sha256, data) VALUES (?, ?)`).run(sha256, data);
