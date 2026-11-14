@@ -19,6 +19,7 @@ import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.t
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
+import { permitsOrigin } from "./origin.ts";
 import { RateLimiter } from "./rate_limit.ts";
 import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
 import { writeAudit } from "./audit.ts";
@@ -41,18 +42,9 @@ type Binding = { user: number; email: string; grant: string; role: HostedRole; i
 type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
 type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; idleSeconds?: number }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
-  const permitsOrigin = (origin: string | null): boolean => {
-    if (origin === null) return true;
-    if (!/^https?:\/\/[^\s/@?#,\\]+$/.test(origin)) return false;
-    try {
-      const parsed = new URL(origin);
-      const serialized = origin.replace(parsed.protocol === "https:" ? /:443$/ : /:80$/, "");
-      return serialized === parsed.origin && parsed.origin === trustedOrigin;
-    } catch { return false; }
-  };
   let closed = false, posts = 0, busListeners = 0;
   const limits = opts.limits ?? DEFAULT_MCP_LIMITS;
   // Dormant legacy sessions hold no admission; their own bound reuses the legacy limits (#476).
@@ -111,7 +103,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
     return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorized(principal);
   } });
-  const hosted = createHostedSessions(application, { now, isAuthorized: principal => oauth.isAuthorized(principal) });
+  const hosted = createHostedSessions(application, { now, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: principal => oauth.isAuthorized(principal) });
   const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
@@ -561,7 +553,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     async fetch(original: Request, address = "unknown"): Promise<Response> {
       const boundary: Exchange = { request: original, address, protocol: MCP_PROTOCOL_VERSIONS.includes(original.headers.get("Mcp-Protocol-Version") ?? "") ? original.headers.get("Mcp-Protocol-Version")! : "unspecified" };
       if (closed) return new Response("MCP endpoint is closed", { status: 503 });
-      if (!permitsOrigin(original.headers.get("Origin"))) { logRefusal("origin", boundary); return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 }); }
+      if (!permitsOrigin(original.headers.get("Origin"), trustedOrigin)) { logRefusal("origin", boundary); return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 }); }
       let role: HostedRole;
       try { role = hostedRole(original); } catch { return Response.json({ code: "bad_request", message: "unknown X-Grayboard-Client role" }, { status: 400 }); }
       const post = original.method === "POST";

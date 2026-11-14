@@ -351,6 +351,8 @@ test("registration rejects invalid ownership graphs without moving an existing c
   await expect(hosted.register(principal, context("root"), "root")).rejects.toHaveProperty("code", "invalid_registration");
   await expect(hosted.register(principal, context("child"), "grandchild")).rejects.toHaveProperty("code", "root_is_child");
   await expect(hosted.register(principal, context("root"), "other")).rejects.toHaveProperty("code", "child_bound");
+  // The message names when it bound as a date, not a raw epoch, and leaves out an unknown place (#387 item 17).
+  await expect(hosted.register(principal, context("root"), "other")).rejects.toThrow(/holds "you@example.com\/be" as its own root \(bound \d{4}-\d\d-\d\dT[^,)]*\);/);
   await expect(hosted.register(principal, context("other"), "child")).rejects.toHaveProperty("code", "child_registered_elsewhere");
   await hosted.register(principal, context("unbound"), "grandchild");
   await expect(hosted.register(principal, context("root"), "unbound")).rejects.toHaveProperty("code", "has_children");

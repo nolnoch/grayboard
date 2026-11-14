@@ -34,7 +34,7 @@ async function connect(token: string, version: string) {
   const client = new Client({ name: "attachment-test", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be" } },
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
     fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, "attachment-root")),
   }));
   await bindFixture(client, "be");

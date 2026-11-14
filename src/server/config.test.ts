@@ -10,7 +10,7 @@ const KEYS = [
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
-  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES",
+  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
 ];
 
@@ -164,6 +164,17 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/GRAYBOARD_ATTACHMENT_MAX_BYTES must be a positive whole number of bytes/);
     process.env.GRAYBOARD_ATTACHMENT_MAX_BYTES = "4000";
     expect(() => loadConfig()).toThrow(/can't exceed GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES/);
+  });
+
+  test("the hosted idle window is unset by default; set, it must be plain digits (#387 item 10)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().hostedIdleSeconds).toBeUndefined();
+    process.env.GRAYBOARD_HOSTED_IDLE_SECONDS = "600";
+    expect(loadConfig().hostedIdleSeconds).toBe(600);
+    for (const bad of [" 900 ", "1e3", "0", "1.5", "-3"]) {
+      process.env.GRAYBOARD_HOSTED_IDLE_SECONDS = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive whole number of seconds/);
+    }
   });
 
   test("the hello limit defaults to 60 and 1/s; set, the burst is a whole number up to 10000 and the rate at least 0.1/s", () => {

@@ -26,13 +26,13 @@ test("request cancellation aborts a pending bounded read without a tee", async (
 });
 
 test("malformed JSON is rewound only from bounded bytes for SDK parsing", async () => {
-  const request = new Request("http://localhost/mcp", { method: "POST", body: "{bad", headers: { "X-Grayboard-Identity": "be" } });
+  const request = new Request("http://localhost/mcp", { method: "POST", body: "{bad", headers: { "X-Test": "be" } });
   const read = await readMcpBody(request);
   if (read instanceof Response) throw new Error("unexpected refusal");
   expect(read.parsedBody).toBeUndefined();
   expect(read.request).not.toBe(request);
   expect(await read.request.text()).toBe("{bad");
-  expect(read.request.headers.get("X-Grayboard-Identity")).toBe("be");
+  expect(read.request.headers.get("X-Test")).toBe("be");
 });
 
 for (const kind of ["consumer", "abort", "shutdown"] as const) test(`${kind}: byte forwarding owns source cancellation before cleanup`, async () => {
