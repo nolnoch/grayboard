@@ -16,10 +16,11 @@ import { endLocalSession } from "../../src/local/binding.ts";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
-import { closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
+import { closeSessions, localSession, stopSession, type Session, refusal } from "../support/mcp.ts";
 import { sigkill } from "../support/procs.ts";
 import { releaseBinaries } from "../support/releases.ts";
 import { until } from "../support/until.ts";
+import { busRows, spawnCli as spawnBusCli, pauseEnv as busPauseEnv, releasePause } from "../support/local_bus.ts";
 
 let dir: string;
 
@@ -34,39 +35,19 @@ afterEach(async () => {
 
 const session = (identity?: string): Promise<Session> => localSession(dir, identity);
 
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try {
-    return db.prepare(sql).all(...args) as T[];
-  } finally {
-    db.close();
-  }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
 // An unbound session's own row in peer_list's unbound_sessions.
 const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
 const pidOfId = (id: string) => rows<{ pid: number }>(`SELECT pid FROM bindings WHERE session_id = ?`, id)[0]!.pid;
 const endedAt = (id: string) => rows<{ ended_at: number | null }>(`SELECT ended_at FROM ids WHERE id = ?`, id)[0]?.ended_at ?? null;
 
-async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
-  const r = await s.c.callTool({ name, arguments: args });
-  const text = (r.content as { text: string }[])[0]!.text;
-  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
-}
 
 // A CLI process whose stderr is read as it runs, for a test pause.
-function spawnCli(args: string[], extra: Record<string, string>) {
-  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd: dir, env: localEnv(dir, undefined, extra), stdout: "pipe", stderr: "pipe" });
-  let err = "";
-  (async () => {
-    for await (const chunk of p.stderr) err += new TextDecoder().decode(chunk);
-  })();
-  return { p, stderr: () => err };
-}
+const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
-const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
-const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
+const pauseEnv = (point: string) => busPauseEnv(dir, point);
+const release = (point: string) => releasePause(dir, point);
 
 // #284 AC 1, S13: with no name the session is a full participant as its ID,
 // and what it did as the ID stays its own after it binds.

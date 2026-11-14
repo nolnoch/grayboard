@@ -2,7 +2,6 @@
 // local stdio consumers. A harness-session ID here exercises the local wire
 // contract; actual harness discovery and fresh-process parity live in E2E.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +15,7 @@ import { closeSessions, localSession, stopSession, type Push, type Session } fro
 import { CLI } from "../support/paths.ts";
 import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
+import { busRows, pauseEnv as busPauseEnv, releasePause } from "../support/local_bus.ts";
 
 let dir: string;
 const viewers: Bun.Subprocess[] = [];
@@ -38,14 +38,10 @@ const adapter = async (conversation: string, identity?: string, extra: Record<st
   await ready(s, 0);
   return s;
 };
-const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
-const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
+const pauseEnv = (point: string) => busPauseEnv(dir, point);
+const release = (point: string) => releasePause(dir, point);
 
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try { return db.prepare(sql).all(...args) as T[]; }
-  finally { db.close(); }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
 const WhoSchema = z.object({ id: z.string(), primary: z.string(), aliases: z.array(z.string()), root: z.string().optional(), child: z.boolean().optional(), writes_as: z.string().optional() }).passthrough();
 type Who = z.infer<typeof WhoSchema>;
