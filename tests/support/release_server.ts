@@ -4,7 +4,7 @@
 // digests (what both verifiers check against, #173), the web's latest-release
 // redirect, and asset downloads. The assets are real binaries on disk, and a
 // served digest is the file's own — unless `digests` overrides it, for a test
-// that needs the release to lie. Each tag also serves SHA256SUMS and
+// that needs the release to lie (`sizes` likewise overrides a listed size). Each tag also serves SHA256SUMS and
 // SHA256SUMS.sig over its assets, signed by test key a (#162); `signed`
 // replaces either file for a tag (null: not served).
 import { signSums } from "./release_keys.ts";
@@ -21,7 +21,7 @@ export class ReleaseServer {
     readonly repo: string,
     readonly latest: string,
     private readonly assets: Record<string, Record<string, string>>,
-    private readonly opts: { digests?: Record<string, Record<string, string>>; signed?: Record<string, SignedOverride> } = {},
+    private readonly opts: { digests?: Record<string, Record<string, string>>; sizes?: Record<string, Record<string, number>>; signed?: Record<string, SignedOverride> } = {},
   ) {
     for (const [tag, files] of Object.entries(assets)) {
       const { sums, sig } = signSums(tag, files);
@@ -57,7 +57,7 @@ export class ReleaseServer {
     const assets = await Promise.all(
       Object.entries(served).map(async ([name, file]) => ({
         name,
-        size: Bun.file(file).size,
+        size: this.opts.sizes?.[tag]?.[name] ?? Bun.file(file).size,
         digest: this.opts.digests?.[tag]?.[name] ?? `sha256:${new Bun.CryptoHasher("sha256").update(await Bun.file(file).arrayBuffer()).digest("hex")}`,
       })),
     );

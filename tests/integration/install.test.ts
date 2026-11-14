@@ -4,7 +4,7 @@
 // decides what the unit looks like and what /healthz says. Each run uses a copy of
 // install.sh whose key block lists test keys a and b.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "../support/paths.ts";
@@ -83,17 +83,22 @@ beforeEach(() => {
   publish();
   writeStub("sleep", "exit 0");
   // -w: resolving "latest"; /repos/: the release API (digest lookup); -o: a
-  // download, served from release/ by name (absent: a 404); else the /healthz probe.
+  // download, served from release/ by name (absent: a 404); else the /healthz
+  // probe. --max-filesize is honoured as real curl does: exit 63, nothing written.
   writeStub("curl", `
 args="$*"
+out="" url="" max=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; [ "$1" = "--max-filesize" ] && max="$2"; url="$1"; shift; done
+over() { [ -n "$max" ] && [ "$(wc -c < "$1")" -gt "$max" ]; }
 # " -w " as its own word: the temp dir's random name can hold "-w".
 case " $args " in
   *" -w "*) echo "\${STUB_LATEST:-https://github.com/x/grayboard/releases/tag/v9.9.9}"; exit 0 ;;
-  *"/repos/"*) echo "$args" >> "${dir}/api.log"; cat "${dir}/digests.json"; exit 0 ;;
+  *"/repos/"*) echo "$args" >> "${dir}/api.log"; over "${dir}/digests.json" && exit 63; cat "${dir}/digests.json"; exit 0 ;;
 esac
-out="" url=""
-while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; url="$1"; shift; done
-if [ -n "$out" ]; then echo "$url" >> "${dir}/downloads.log"; [ -f "${dir}/release/\${url##*/}" ] || exit 22; cp "${dir}/release/\${url##*/}" "$out"; exit 0; fi
+if [ -n "$out" ]; then
+  echo "$url" >> "${dir}/downloads.log"; f="${dir}/release/\${url##*/}"
+  [ -f "$f" ] || exit 22; over "$f" && exit 63; cp "$f" "$out"; exit 0
+fi
 echo "$args" >> "${dir}/healthz.log"
 case "$STUB_HEALTH" in
   ok)    echo '{"ok":true,"version":"9.9.9"}' ;;
@@ -252,6 +257,23 @@ test("a release API response far larger than a pipe buffer still yields the dige
   writeFileSync(join(dir, "digests.json"), JSON.stringify({ ...api, body: "x, ".repeat(200_000) }, null, 2));
   const r = install();
   expect(r.code, r.err).toBe(0);
+});
+
+// #316: a broken or hostile origin is refused by name, before it fills memory or disk.
+test("an oversized SHA256SUMS, .sig, release API response or binary is refused by name, with nothing installed", () => {
+  writeFileSync(join(dir, "release", "SHA256SUMS"), "x".repeat(65537));
+  expectRefused(install(), "SHA256SUMS from https://github.com/nolnoch/grayboard/releases/download/v9.9.9 is larger than 65536 bytes");
+  publish();
+  writeFileSync(join(dir, "release", "SHA256SUMS.sig"), "x".repeat(65537));
+  expectRefused(install(), "SHA256SUMS.sig from https://github.com/nolnoch/grayboard/releases/download/v9.9.9 is larger than 65536 bytes");
+  publish();
+  const api = JSON.parse(readFileSync(join(dir, "digests.json"), "utf8"));
+  writeFileSync(join(dir, "digests.json"), JSON.stringify({ ...api, body: "x".repeat(4 * 1024 * 1024) }));
+  expectRefused(install(), "the release API response from https://api.github.com/repos/nolnoch/grayboard/releases/tags/v9.9.9 is larger than 4194304 bytes");
+  publish();
+  // Sparse: its size is all the stub (like curl's Content-Length check) sees.
+  truncateSync(join(dir, "release", `grayboard-server-${target}`), 512 * 1024 * 1024 + 1);
+  expectRefused(install(), `grayboard-server-${target} from https://github.com/nolnoch/grayboard/releases/download/v9.9.9 is larger than 536870912 bytes`);
 });
 
 test("a server binary that can't be backed up refuses before anything is replaced", () => {
