@@ -245,6 +245,19 @@ test("a resumed session whose remembered names can't be read skips the configure
   expect(srv.app.db.query("SELECT 1 FROM alias_holds WHERE address = ?").get(`${EMAIL}/conf-unread-other`)).toBeNull();
 });
 
+test("a configured bind that lands but whose prepare fails says the session is bound, not that it couldn't bind (#544 item 2)", async () => {
+  const prepare = spyOn(Controller.prototype as unknown as { prepare: () => Promise<void> }, "prepare").mockRejectedValueOnce(new Error("whoami unreachable"));
+  const r = rig("conf-prep-1", { configured: "conf-prep" });
+  try { await r.root.start(); } finally { prepare.mockRestore(); }
+  expect(row("conf-prep-1")).toMatchObject({ name: "conf-prep" });
+  expect(r.logs).toEqual([{ level: "warning", message: expect.stringMatching(/^this session is bound as conf-prep, but delivery couldn't start \(Root enrolled; .+\)$/) }]);
+  expect(r.logs[0]!.message).not.toContain("couldn't bind");
+  // Bound for good: a later start takes it back instead of binding it again.
+  await r.root.resume();
+  await active(r, "conf-prep");
+  expect(r.logs).toHaveLength(1);
+});
+
 test("a configured name another session holds is said once and in the next tool result; a later start doesn't try it again", async () => {
   await live("conf-held-1", "conf-held");
   const r = rig("conf-held-2", { configured: "conf-held" });

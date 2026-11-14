@@ -268,6 +268,8 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.save(r, true);
     await this.watch(e);
     this.set(r, "approved", "Root approved; bind a name to receive deliveries");
+    // Past the binds, a failure is prepare's: the server holds every name (#544 item 2).
+    let bound = false;
     try {
       if (names.length) {
         const epoch = r.epoch, signal = new AbortController().signal;
@@ -276,12 +278,13 @@ export class Controller<E extends Enrollment = Enrollment> {
           for (const name of names) await w.call("bind", { name, create, where: this.port.place() });
           await this.guard(r, epoch, signal);
         });
+        bound = true;
       }
       await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
     } catch (error) {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
-      if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+      if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", failureCode(this.expired(error)));
     }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
