@@ -2538,6 +2538,30 @@ test("progress: status shows the running subtasks' notes fenced, not a waiting r
   store.close();
 });
 
+test("progress: a delegation's own run's note shows on status as this request's (#669)", async () => {
+  const runner = new FakeRunner();
+  const store = new Store(":memory:");
+  const relay = new Relay({ dir: join(dir, "relay"), shim: SHIM, reader: fakeReader().reader, progress: (seq, note) => store.setProgress(seq, note), log: () => {} });
+  const gate = Promise.withResolvers<void>();
+  runner.use = async (mcp) => {
+    await relay.answer(JSON.stringify({ token: mcp!.env.FACTORY_RELAY_TOKEN, tool: "progress", args: { note: "halfway" } }));
+    await gate.promise;
+    return "done";
+  };
+  const { bus, done } = loop({ runner, store, childTools: relay, policy: { allowedTools: [], busTools: true } });
+  bus.deliver(ask(50));
+  await until(() => store.get(k(50))?.progress === "halfway", 5000, "the note");
+  bus.deliver(reply(52, 50, "status"));
+  await until(() => bus.replies(52).length === 1, 5000, "status");
+  expect(bus.replies(52)[0]).toMatch(/\. 0 runs finished so far\.\nProgress, in the runs' own words:\n````text\nthis request, \d+s ago: halfway\n````$/);
+  gate.resolve();
+  await until(() => bus.replies(50).length === 2, 5000, "done");
+  await bus.close();
+  await done;
+  await relay.close();
+  store.close();
+});
+
 // ── mirrored tree claims (#675) ──────────────────────────────────────────────
 
 test("mirror: a remote URL in any of its spellings is one repo id; a key's leading ./ is dropped", () => {
