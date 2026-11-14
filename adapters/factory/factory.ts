@@ -48,6 +48,8 @@ export const workBoard = (fleet: string) => `${fleet}-work`;
 // Where a sharing fleet's subtasks go (#636): a queue board of their own,
 // so every post on it is a subtask, and no lane triages one as a fresh task.
 export const shareBoard = (fleet: string) => `${fleet}-share`;
+// The boards a fleet's daily cap counts: its tasks and the outside subtasks it ran.
+const fleetBoards = (f: Fleet) => [fleetBoard(f), shareBoard(f.name)];
 const NOT_RECORDED = "[factory] not run: the fan-out this subtask belongs to stopped before it was recorded; nothing waits for its outcome.";
 // An outside lane's outcome (#636): its reply in the subtask's thread, led
 // by `done:` or `failed:`, after an optional `[tag] ` (the factory's own lane writes `[factory] done:`).
@@ -1132,13 +1134,13 @@ export class Factory {
   private hold(): Hold {
     const since = Date.now() - DAY_MS, g = this.cfg.limits.dailyBudgetUsd;
     if (g !== undefined && g - this.store.spentSince(since) < MIN_GRANT_USD) return { all: true, boards: [] };
-    const boards = this.fleets().filter((f) => f.limits?.dailyBudgetUsd !== undefined && f.limits.dailyBudgetUsd - this.fleetSpent(f, since) < MIN_GRANT_USD).flatMap((f) => [fleetBoard(f), shareBoard(f.name)]);
+    const boards = this.fleets().filter((f) => f.limits?.dailyBudgetUsd !== undefined && f.limits.dailyBudgetUsd - this.fleetSpent(f, since) < MIN_GRANT_USD).flatMap(fleetBoards);
     return { all: false, boards };
   }
 
   // A fleet's spend: its own trees', and the outside subtasks (#636) it ran from its share board.
   private fleetSpent(f: Fleet, since: number): number {
-    return this.store.spentSince(since, fleetBoard(f)) + this.store.spentSince(since, shareBoard(f.name));
+    return this.store.spentSince(since, fleetBoards(f));
   }
 
   // Why a queued row is held, with about when it frees; null when it isn't.
@@ -1146,11 +1148,12 @@ export class Factory {
     const h = this.hold();
     if (!this.store.heldCount(h, seq)) return null;
     const row = this.store.bySeq(seq)!, root = this.rootOf(row), since = Date.now() - DAY_MS;
-    const board = h.all ? undefined : (root.source === "board" ? root.board : undefined);
-    const cap = h.all ? this.cfg.limits.dailyBudgetUsd! : this.fleetOf(root)?.limits?.dailyBudgetUsd;
-    const oldest = this.store.oldestSince(since, board);
+    // A fleet's window counts its share board too (#636), as fleetSpent does.
+    const fleet = h.all ? undefined : this.fleetOf(root), boards = fleet ? fleetBoards(fleet) : undefined;
+    const cap = h.all ? this.cfg.limits.dailyBudgetUsd! : fleet?.limits?.dailyBudgetUsd;
+    const oldest = this.store.oldestSince(since, boards);
     const roll = oldest !== null ? `about ${dur(oldest + DAY_MS - Date.now())}` : "";
-    const when = this.store.openGrants(since, board) ? `; it may free when running work reports what it spent${roll ? `, and frees in ${roll} at most` : ""}` : roll ? `; it frees in ${roll}` : "";
+    const when = this.store.openGrants(since, boards) ? `; it may free when running work reports what it spent${roll ? `, and frees in ${roll} at most` : ""}` : roll ? `; it frees in ${roll}` : "";
     return `held: ${h.all ? "the factory's" : `fleet ${root.persona}'s`} daily budget${cap !== undefined ? ` of $${cap}` : ""} is spent${when}`;
   }
 

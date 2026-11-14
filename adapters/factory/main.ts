@@ -366,16 +366,8 @@ export async function main(env: Record<string, string | undefined> = process.env
         log(`reload refused, the running config stays: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
-      // retentionMs takes a restart, so a daily cap is checked against the running one.
-      if (hasDailyCap(next) && cfg.retentionMs < DAY) {
-        log(`reload refused, the running config stays: "dailyBudgetUsd" needs a running "retentionMs" of at least ${DAY} (a day); restart to change it`);
-        return;
-      }
-      // The poster session starts with the factory.
-      if (!poster && next.fleets.some((f) => f.share)) {
-        log(`reload refused, the running config stays: a fleet now shares its subtasks ("share"), which needs the poster session a restart starts`);
-        return;
-      }
+      const refused = reloadRefusal(cfg, next, poster !== undefined);
+      if (refused) { log(`reload refused, the running config stays: ${refused}`); return; }
       const restart = RESTART_ONLY.filter((k) => JSON.stringify(next[k]) !== JSON.stringify(cfg[k]));
       if (restart.length) log(`reload: ${restart.join(", ")} changed, which takes a restart; the running values stay`);
       await factory.reconfigure({ fleets: next.fleets, policy: policyOf(next), workdir: next.workdir, ask: askOf(next), limits: next.limits });
@@ -390,6 +382,15 @@ export async function main(env: Record<string, string | undefined> = process.env
   await childTools.close();
   store.close();
   return signalled ? 0 : 1;
+}
+
+// Why a config that loads still can't be taken by a reload (#645), or null.
+export function reloadRefusal(running: Config, next: Config, poster: boolean): string | null {
+  // retentionMs takes a restart, so a daily cap is checked against the running one.
+  if (hasDailyCap(next) && running.retentionMs < DAY) return `"dailyBudgetUsd" needs a running "retentionMs" of at least ${DAY} (a day); restart to change it`;
+  // The poster session starts with the factory.
+  if (!poster && next.fleets.some((f) => f.share)) return `a fleet now shares its subtasks ("share"), which needs the poster session a restart starts`;
+  return null;
 }
 
 if (import.meta.main) process.exit(await main());
