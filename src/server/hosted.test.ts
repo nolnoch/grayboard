@@ -678,6 +678,23 @@ test("a root's suggested name is its first request's, offered first among its un
   expect((await hosted.whoami(principal, ctx("root"))).candidates?.map(c => c.name)).not.toContain("grayboard-gb-aux");
   expect(() => ctx("root", 5)).toThrow(`_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
   for (const bad of ["", "a/b", "human", "x".repeat(33)]) expect(ctx("root", bad)).not.toHaveProperty("suggested");
+  // The ownership's start audit records its suggestion (#522), so the trail says why a session was offered a name.
+  const id = (ctx("root") as { id: string }).id;
+  const started = () => database.db.query<{ detail: string }, [string]>("SELECT detail FROM access_log WHERE action = 'hosted.ownership_started' AND target = ? ORDER BY rowid").all(id).map(r => JSON.parse(r.detail) as { suggested?: string });
+  expect(started().map(d => d.suggested)).toEqual(["grayboard-gb-aux"]);
+  // A new ownership of the same source ID takes its own suggestion, and one with none records none.
+  await hosted.end(principal, ctx("root"));
+  await hosted.whoami(principal, ctx("root", "second"));
+  expect(database.repo.hosted.get(id)).toMatchObject({ suggested: "second" });
+  await hosted.end(principal, ctx("root"));
+  await hosted.whoami(principal, ctx("root"));
+  expect(database.repo.hosted.get(id)).toMatchObject({ suggested: null });
+  expect(started().map(d => d.suggested)).toEqual(["grayboard-gb-aux", "second", undefined]);
+  // A child row's is null, whatever its requests suggest: a child never binds.
+  await hosted.register(principal, ctx("root"), "suggest-child");
+  const child = ctx("suggest-child", "kid");
+  await hosted.whoami(principal, child);
+  expect(database.repo.hosted.get((child as { id: string }).id)).toMatchObject({ suggested: null, root_session_id: id });
 });
 
 test("a request's launcher declaration is the ownership's: set by any root request and audited once, restated by a new ownership, cleared and audited at its end, ignored on session_end and for a child, refused unless a boolean (#473, #520, #532)", async () => {

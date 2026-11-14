@@ -31,7 +31,8 @@ export interface HostedStore {
   unpark(session: string, grant: string, now: number): void;
   insert(row: HostedSession): void;
   update(row: HostedSession): void;
-  start(session: string, user: number, client: string, now: number): number;
+  // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
+  start(session: string, user: number, client: string, now: number, suggested?: string | null): number;
   end(session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
   childEnd(session: string, now: number, reason: ChildEnd): void;
   // A root's lost holds `reader` hasn't taken, oldest first (#453). `lose` records one in the revocation's

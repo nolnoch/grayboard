@@ -226,7 +226,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       admit(p.authed.user_id);
       const t = now();
       const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later.push(() => application.hostedRefused(context.id, address, detail)));
-      row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
+      row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
       application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
