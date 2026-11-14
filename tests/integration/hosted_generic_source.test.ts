@@ -133,8 +133,9 @@ async function readResource(c: Conn, uri: string) {
   if (!first || !("text" in first)) throw new Error("expected JSON resource content");
   return JSON.parse(first.text);
 }
-const attachment = (token: string, raw: string, id?: number) => fetch(`${base}/hosted/mcp/attachments${id === undefined ? "?filename=report.txt" : `/${id}`}`, {
-  method: id === undefined ? "POST" : "GET",
+// An upload without `id`; with one, a GET (or `method`) of that attachment.
+const attachment = (token: string, raw: string, id?: number, method = "GET") => fetch(`${base}/hosted/mcp/attachments${id === undefined ? "?filename=report.txt" : `/${id}`}`, {
+  method: id === undefined ? "POST" : method,
   headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(raw), ...(id === undefined ? { "Content-Length": String(bytes.length) } : {}) },
   ...(id === undefined ? { body: bytes } : {}),
 });
@@ -191,6 +192,9 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
   await bind(owner, "owner");
   json(await call(owner, "board_create", { name: "brokered", purpose: "visible to the user" }));
   json(await call(owner, "board_post", { board: "brokered", body: "readable" }));
+  const upload = await attachment(kept, "owner");
+  expect(upload.status).toBe(201);
+  const { id } = await upload.json() as { id: number };
   // De-opt: config is read only at startup, so removing sessionSource takes effect on restart.
   await stop();
   start([operator(BROKER, false)]);
@@ -209,9 +213,11 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
     expect(refused(await call(native, "dm_send", { to: "owner", body: "write" })), label).toBe("unbound");
     expect(refused(await call(sub, "session_register", { child: "child" })), label).toBe("unbound");
     expect(refused(await call(sub, "delivery_open")), label).toBe("unbound");
-    const upload = await attachment(token, "owner");
-    expect(upload.status, label).toBe(403);
-    expect(await upload.json(), label).toMatchObject({ code: "unbound" });
+    for (const [route, response] of [["upload", attachment(token, "owner")], ["GET", attachment(token, "owner", id)], ["DELETE", attachment(token, "owner", id, "DELETE")]] as const) {
+      const r = await response;
+      expect(r.status, `${label} ${route}`).toBe(403);
+      expect(await r.json(), `${label} ${route}`).toMatchObject({ code: "unbound" });
+    }
   }
   expect(app.repo.aliases.find("alice@example.com/intruder")).toBeUndefined();
   expect(app.repo.hosted.all().map(r => r.source_session_id)).toEqual(["owner"]);
