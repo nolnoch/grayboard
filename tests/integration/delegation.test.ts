@@ -255,6 +255,37 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
   }
 }, 30_000);
 
+// Security audit F-01: a team alias is shared by every member, so a
+// requester on `eng/sim` is judged by its signed-in user, not by the
+// `eng/` its handle shares with a teammate's launcher.
+test("server: a team alias doesn't carry delegation to a teammate's launcher", async () => {
+  const srv = serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const bobLauncher = await launcher(srv, bob, "eng/launcher");
+    const aliceSim = await srv.hosted("alice@example.com", "eng/sim");
+
+    // Auto-pick finds no launcher of alice's (bob's is live, and shares the
+    // scope), and alice has no reachable human: refused, nothing sent.
+    await expect(aliceSim.call("delegate", { persona: "a researcher", task: "t" })).rejects.toThrow(/no live launcher session/);
+    // Naming bob's launcher is refused as another user's.
+    await expect(aliceSim.call("delegate", { persona: "p", task: "t", to: "eng/launcher" })).rejects.toThrow(/belongs to another user/);
+    await bobLauncher.none(direct());
+
+    // Alice's own launcher under a team name takes it.
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const r = await aliceSim.call<Delegated>("delegate", { persona: "a researcher", task: "t" });
+    expect(r.to).toBe("eng/builder");
+    expect((await aliceLauncher.next(direct())).message.sender).toBe("eng/sim");
+    await bobLauncher.none(direct());
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
 test("local: a tools-only sidecar leaves the owner's launcher flag alone (review 5)", async () => {
   const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
   const sim = await localSession(dir, "sim");

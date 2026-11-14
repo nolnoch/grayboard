@@ -862,7 +862,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const open = (h: string) => countOpenDelegations(db, "audit_log", h, since);
     let d;
     try {
-      d = resolveDelegation(db, IDENTITY, args, online, undefined, (h) => ADDRS.includes(h), open);
+      d = resolveDelegation(db, IDENTITY, null, args, online, undefined, (h) => ADDRS.includes(h), open);
     } catch (e) {
       if (e instanceof CoreError) {
         writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
@@ -890,7 +890,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       // proceeds when the retraction wins; otherwise the request stays
       // queued for the first pick, which the catch below treats as fine.
       try {
-        const d2 = resolveDelegation(db, IDENTITY, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h), open);
+        const d2 = resolveDelegation(db, IDENTITY, null, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h), open);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
           const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via, rootLive)).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
