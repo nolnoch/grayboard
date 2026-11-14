@@ -14,7 +14,7 @@ import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
-import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
+import { HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -749,13 +749,13 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden"].includes(e.code)) refuse(e.code);
     return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
   };
-  // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), plus hosted's `where`: the place this session reports.
+  // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
-    inputSchema: z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
+    inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
     try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.declared); }
     catch (e) { return bindRefusal(e, "bind"); }
   });
-  server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: z.strictObject({ name: z.string().max(160) }) }, async (args, ctx) => {
+  server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: HOSTED_UNBIND_INPUT }, async (args, ctx) => {
     try { const context = current(ctx); return await hosted.unbind(context.principal, context.sessionContext, args, context.declared); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
