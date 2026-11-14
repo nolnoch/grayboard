@@ -489,8 +489,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Ends sessions, each in its own transaction (bounces, claim releases,
   // holds released), then wakes what that changed and sweeps the freed
   // upload bytes. One end that throws is logged and audited id.end_failed
-  // and leaves the others ended; the next revalidate (a revoked alias) or
-  // start (a leftover) retries it.
+  // and leaves the others ended. Only a revoked alias's end is retried while
+  // the server runs (revalidate re-checks it); a startup leftover's is
+  // retried at the next start, and its holds stay until then (#475 item 2).
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
     const woken = new Set<string>();
