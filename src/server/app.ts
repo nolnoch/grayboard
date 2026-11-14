@@ -22,13 +22,16 @@ export type StartOptions = ApplicationOptions & {
   oauth?: OAuthOptions;
 };
 
+// A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
+export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit">, opts: StartOptions) {
+  return { ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit };
+}
+
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
-  const application = createApplication(repo, db, {
-    humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, hostedRequestLimit: config.hostedRequestLimit, ...opts,
-  });
+  const application = createApplication(repo, db, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
   const refusal = createWsRefusal();
 
