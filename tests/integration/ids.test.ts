@@ -771,3 +771,56 @@ test("a child's post and claim announcement are its root's own: none of the root
   await be.call("board_post", { board: "ops", body: "from be" });
   expect(await unread()).toEqual({ e2e: 0, ops: 1 });
 }, 30_000);
+
+// #557 item 2: the runner paths #556 left untested.
+test("a runner child's unbind is refused child_session; a bind refused for a held name leaves it its root's child", async () => {
+  const fe = await runnerRootSession("fe", "pi-1");
+  const root = (await fe.call("whoami")).id as string;
+  await localSession(dir, "be");
+  const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1" } });
+  const who = (await runner.call("whoami")) as Who;
+  expect(await refusal(runner, "unbind", { name: "fe" })).toBe(`error: child_session: this session acts under its root ${root}; unbind is the root's; bind(name) makes this process its own session.`);
+  // be is live: the promotion's bind is refused, and nothing about the runner changes.
+  expect(await refusal(runner, "bind", { name: "be" })).toStartWith("error: ");
+  expect(await runner.call("whoami")).toEqual(who);
+  expect(rows(`SELECT 1 FROM audit_log WHERE action = 'id.promoted'`)).toEqual([]);
+  expect(rows(`SELECT ended_at FROM ids WHERE id = ?`, who.id)).toEqual([{ ended_at: null }]);
+}, 30_000);
+
+test("BUS_PARENT_SESSION with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY refuses to start", async () => {
+  const why = "[grayboard] BUS_PARENT_SESSION makes this process a subagent of the session that recorded it, in place of a session that owns its delivery; it can't be combined with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY";
+  for (const extra of [{ BUS_PUSH: "off" }, { BUS_HUMAN: "1" }, { BUS_SESSION_KEY: mintSessionKey() }]) {
+    const r = await runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, undefined, { BUS_PARENT_SESSION: "pi-1", ...extra }) });
+    expect({ extra, code: r.code, said: r.err.includes(why) }).toEqual({ extra, code: 1, said: true });
+  }
+}, 30_000);
+
+test("a BUS_HARNESS_SESSION or BUS_PARENT_SESSION that is too long or has a control character refuses to start", async () => {
+  for (const key of ["BUS_HARNESS_SESSION", "BUS_PARENT_SESSION"]) {
+    for (const bad of ["x".repeat(1025), "pi\u0001one"]) {
+      const r = await runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, undefined, { [key]: bad }) });
+      expect({ key, code: r.code, err: r.err.trim() }).toEqual({ key, code: 1, err: `[grayboard] ${key} must be 1 to 1024 characters with no control characters` });
+    }
+  }
+}, 30_000);
+
+test("race: a runner whose root ends between the lookup and its registration runs as its own session, audited with the reason", async () => {
+  const fe = await runnerRootSession("fe", "pi-1");
+  const root = (await fe.call("whoami")).id as string;
+  // Held after it found its live root, before registerChild's transaction.
+  const runner = spawnCli(["mcp", "--mode", "local"], { BUS_PARENT_SESSION: "pi-1", ...pauseEnv("runner:before-register") });
+  await until(() => runner.stderr().includes("test pause hit: runner:before-register"));
+  // The root's harness is this test process: its end comes as another opener's would.
+  await stopSession(fe.c);
+  const w = new Database(join(dir, "bus.db"));
+  try { w.run("PRAGMA busy_timeout = 5000"); endLocalSession(w, root); } finally { w.close(); }
+  release("runner:before-register");
+  await until(() => runner.stderr().includes("this process runs as its own session"), 10_000, "the runner's fallback");
+  runner.p.kill();
+  const line = runner.stderr().split("\n").find((l) => l.includes("this process runs as its own session"))!;
+  expect(line).toStartWith(`[grayboard] BUS_PARENT_SESSION pi-1: id_ended: session ${root} has ended`);
+  const audited = rows<{ actor: string; detail: string }>(`SELECT actor, detail FROM audit_log WHERE action = 'id.child_fallback'`);
+  expect(audited).toHaveLength(1);
+  expect(JSON.parse(audited[0]!.detail)).toMatchObject({ parent_session: "pi-1", why: line.slice("[grayboard] BUS_PARENT_SESSION pi-1: ".length, -"; this process runs as its own session".length) });
+  expect(rows(`SELECT root_id FROM ids WHERE id = ?`, audited[0]!.actor)).toEqual([{ root_id: null }]);
+}, 30_000);

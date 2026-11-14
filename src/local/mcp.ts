@@ -242,6 +242,7 @@ if (PARENT_SESSION !== undefined) {
   if ("why" in found) ownWhy = found.why;
   else {
     const self = thisSession(SESSION_ID);
+    testPause("runner:before-register");
     try {
       registerChild(db, found.root, SESSION_ID, HARNESS_SESSION ?? null, Date.now(), {
         harness: self.harness, cwd: self.cwd, harnessSession: HARNESS_SESSION, detail: { parent_session: PARENT_SESSION },
