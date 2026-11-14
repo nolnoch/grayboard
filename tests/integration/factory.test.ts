@@ -247,6 +247,36 @@ test("config: defaults, the file's fields, FACTORY_GRAYBOARD, and type errors", 
   }
 });
 
+test("config (#638): each bad fleet is refused with the reason; the name's edges and a padded agent are accepted", () => {
+  const cases: [unknown, string][] = [
+    [{}, '"fleets" must be an array'],
+    [[1], `each fleet's "name" must be 1-26 characters`],
+    [[null], `each fleet's "name" must be 1-26 characters`],
+    [[{ agent: "x" }], `each fleet's "name" must be 1-26 characters`],
+    [[{ name: "", agent: "x" }], `each fleet's "name" must be 1-26 characters`],
+    [[{ name: "Sim", agent: "x" }], `each fleet's "name" must be 1-26 characters`],
+    [[{ name: "s.m", agent: "x" }], `each fleet's "name" must be 1-26 characters`],
+    [[{ name: "a".repeat(27), agent: "x" }], `each fleet's "name" must be 1-26 characters`],
+    [[{ name: 7, agent: "x" }], `each fleet's "name" must be 1-26 characters`],
+    [[{ name: "a" }], 'fleet a: "agent" (or "profile") must be a non-empty string'],
+    [[{ name: "a", agent: 7 }], 'fleet a: "agent" (or "profile") must be a non-empty string'],
+    [[{ name: "a", agent: "  " }], 'fleet a: "agent" (or "profile") must be a non-empty string'],
+    [[{ name: "a", agent: "x", fanout: "yes" }], 'fleet a: "fanout" must be true or false'],
+    [[{ name: "a", agent: "x", fanout: 0 }], 'fleet a: "fanout" must be true or false'],
+    [[{ name: "a", agent: "x", fanout: null }], 'fleet a: "fanout" must be true or false'],
+    [[{ name: "a", agent: "x", profile: "p" }], 'fleet a: give "profile" or "agent", not both'],
+    [[{ name: "a", profile: 7 }], 'fleet a: "profile" must name a profile in "profiles"'],
+  ];
+  for (const [fleets, why] of cases) {
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ profiles: [{ name: "p", agent: "x" }], fleets }));
+    expect(() => loadConfig(dir, {})).toThrow(why);
+  }
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ fleets: [{ name: "a", agent: "x" }, { name: "b", agent: "y" }, { name: "a", agent: "z" }] }));
+  expect(() => loadConfig(dir, {})).toThrow("fleet a is listed twice");
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ fleets: [{ name: "a".repeat(26), agent: " x " }, { name: "0_-", agent: "y", fanout: true }] }));
+  expect(loadConfig(dir, {}).fleets).toEqual([{ name: "a".repeat(26), agent: "x" }, { name: "0_-", agent: "y" }]); // fanout true is the default, so it isn't kept
+});
+
 test("child envs carry no session of the harness the factory was launched from", () => {
   const env = sessionFree({ PATH: "/bin", CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "s", BUS_IDENTITY: "x", BUS_HARNESS_SESSION: "h", BUS_DB_PATH: "/d", BUS_SOCK_DIR: "/s", UNSET: undefined });
   expect(env).toEqual({ PATH: "/bin", BUS_DB_PATH: "/d", BUS_SOCK_DIR: "/s" });
@@ -313,6 +343,7 @@ class FakeRunner implements Runner {
   gates = new Map<number, PromiseWithResolvers<Outcome>>();
   // A run's text when it returns one (a plan, say); otherwise `result for <id>`.
   script: (r: Request) => string | undefined = () => undefined;
+  fails: (r: Request) => string | undefined = () => undefined; // a run that fails, with this error (#638)
   broken = false; // roster() throws, as a filesystem error would
   abortLagMs = 0; // how long a held run takes to end once aborted, as a child's SIGTERM grace
   constructor(public names = ["researcher"], private readonly hold = false) {}
@@ -340,6 +371,8 @@ class FakeRunner implements Runner {
     writeFileSync(transcript, `{"type":"result","id":${r.id}}\n`, { mode: 0o600 });
     const m = this.meta(r);
     if (m?.stop === "budget") return Promise.resolve({ ok: false, error: "stopped at its budget", run: m });
+    const failed = this.fails(r);
+    if (failed !== undefined) return Promise.resolve({ ok: false, error: failed });
     if (!this.hold) return Promise.resolve({ ok: true, text: this.script(r) ?? `result for ${r.id}`, ...(m ? { run: m } : {}) });
     const g = Promise.withResolvers<Outcome>();
     this.gates.set(r.id, g);
@@ -786,6 +819,47 @@ test("fan-out: an unusable plan fails the task; a fleet with fanout off never ge
   expect(bus.replies(8)[1]).toStartWith("[factory] done: fake agent `researcher`\n\n````factory-plan"); // just text, without fan-out
   expect(runner.inputs[1]).toBe("do 8");
   expect(bus.sent.some((c) => c.tool === "board_create" && String(c.args.name).endsWith("-work"))).toBe(false);
+  await bus.close();
+  await done;
+});
+
+test("fan-out (#638): a post that fails midway fails the task, naming the posts already made; none of them runs", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 || r.id === 8 ? PLAN(3) : undefined);
+  const bus = new FakeBus();
+  let subPosts = 0;
+  bus.refuse = (tool, args) => {
+    if (tool !== "board_post" || args.board !== "sim-work" || args.parent_id !== undefined) return false;
+    subPosts++;
+    return subPosts === 3 || subPosts === 4 ? "board_post: bus down" : false; // 7's third post, then 8's first
+  };
+  const { done } = loop({ runner, bus, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 2, 5000, "7 failed");
+  expect(bus.replies(7)[1]).toBe("[factory] failed: couldn't post subtask 3 of 3 on #sim-work (2 posted: posts 1001, 1002; none run): board_post: bus down");
+  bus.deliver(task(8));
+  await until(() => bus.replies(8).length === 2, 5000, "8 failed");
+  expect(bus.replies(8)[1]).toBe("[factory] failed: couldn't post subtask 1 of 3 on #sim-work (none posted; none run): board_post: bus down");
+  expect(runner.runs.map((r) => r.id)).toEqual([7, 8]); // no subtask and no synthesis ran
+  expect(bus.replies(1001)).toEqual([]);
+  await bus.close();
+  await done;
+});
+
+test("fan-out (#638): a subtask whose run fails still reaches the synthesis, which is told of the failure", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  runner.fails = (r) => (r.id === 1001 ? "the agent crashed" : undefined);
+  const { bus, done } = loop({ runner, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "taken, fanned out, combined");
+  expect(bus.replies(1001)).toEqual(["[factory] failed: fake agent `researcher`: the agent crashed"]);
+  expect(bus.replies(1002)).toEqual(["[factory] done: fake agent `researcher`\n\nresult for 1002"]);
+  expect(runner.runs.map((r) => r.id)).toEqual([7, 1001, 1002, 7]);
+  expect(runner.inputs[3]).toContain("### 1. part 1\n\n[factory] failed: fake agent `researcher`: the agent crashed");
+  expect(runner.inputs[3]).toContain("### 2. part 2\n\n[factory] done: fake agent `researcher`\n\nresult for 1002");
+  expect(runner.inputs[3]).toContain("Say plainly where a subtask failed");
+  expect(bus.replies(7)[2]).toBe("[factory] done: fake agent `researcher`, combining 2 subtasks on #sim-work\n\nresult for 7");
   await bus.close();
   await done;
 });
