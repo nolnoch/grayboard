@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 
 export type Claim = {
@@ -64,9 +64,11 @@ export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Par
 // `user` the signed-in user on a server, recorded as the post's author_user.
 export type ClaimCtx = { addresses?: string[]; session?: string; via?: string; user?: string };
 
-function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}): ClaimChanges {
+// A new claim can't announce on an archived board (#635); its update, release
+// or expiry, ending what's already there, can (`ending`).
+function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true): ClaimChanges {
   if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user });
+  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending });
   return { wake: result.wake, boards: [result.post.board] };
 }
 
@@ -137,9 +139,14 @@ export function claim(
          RETURNING *`,
       )
       .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
+    // A renewal that moves the claim onto an archived board would start new
+    // business there (#635), like a fresh [claim]; it rolls back instead.
+    if (renewed && row.board && row.board !== cur.board && getBoard(db, row.board)?.archived_at) {
+      throw new CoreError(`#${row.board} is archived; a claim can't move onto it`);
+    }
     logEvent(db, renewed ? "renew" : "take", as, row, now);
     const changed = !renewed
-      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts)
+      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts, false)
       : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, as, row.board)
         ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`, opts)
         : { wake: [], boards: [] };

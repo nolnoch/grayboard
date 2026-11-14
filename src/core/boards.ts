@@ -44,7 +44,21 @@ export type Board = {
   created_by: string;
   created_at: number;
   kind?: string;
+  // Set only on an archived board (#635); open boards carry neither.
+  archived_at?: number;
+  archived_by?: string;
 };
+
+// A boards row as callers see it: an open board's NULL archive columns are
+// dropped, so every board_list row doesn't pay for them.
+function showBoard<T extends Board>(b: T): T {
+  const row = b as T & { archived_at?: number | null; archived_by?: string | null };
+  if (row.archived_at == null) {
+    delete row.archived_at;
+    delete row.archived_by;
+  }
+  return b;
+}
 
 // A post's columns as readers see them. author_id (#284) is the writing
 // session's provenance, kept in the database and left out of reads and pushes;
@@ -391,9 +405,42 @@ export function createBoard(
        ON CONFLICT(name) DO NOTHING`,
     )
     .run(board, purpose.trim(), scope, handle, Date.now(), kind);
-  if (res.changes === 0) throw new CoreError(`board #${board} already exists`);
+  if (res.changes === 0) {
+    const old = getBoard(db, board);
+    throw new CoreError(old?.archived_at && sees(db, handle, old) ? `board #${board} already exists, archived; board_archive(board, false) reopens it` : `board #${board} already exists`);
+  }
   subscribe(db, handle, board, "push");
   return getBoard(db, board)!;
+}
+
+// Archive or reopen a board (#635). An archived board leaves board_list,
+// refuses new top-level posts (replies still land, so open threads finish) and
+// stays readable by name; subscriptions, cursors and claims are untouched.
+// Archiving isn't an edit (principle 5): no post changes, and it reverses.
+// Only the board's creator (any of the caller's addresses) or a human may;
+// a mode's own boards (#announce, a team's board) never archive.
+export function archiveBoard(
+  db: Database,
+  handle: string,
+  boardInput: string,
+  archived: boolean,
+  opts: { addresses?: string[]; human?: boolean } = {},
+): { board: Board; note?: string } {
+  const b = visibleBoard(db, handle, boardInput);
+  if (b.name === access(db).announceBoard || b.scope === `team:${b.name}`) {
+    throw new CoreError(`#${b.name} belongs to the bus itself and can't be archived`);
+  }
+  const addresses = opts.addresses ?? [handle];
+  if (!opts.human && !isHuman(db, handle) && !addresses.includes(b.created_by)) {
+    throw new CoreError(`only #${b.name}'s creator (${b.created_by}) or your user can archive or reopen it`);
+  }
+  // A repeat is answered from state (#254), never written twice.
+  if (archived && b.archived_at) {
+    return { board: b, note: `#${b.name} was already archived at ${new Date(b.archived_at).toISOString()} by ${b.archived_by}` };
+  }
+  if (!archived && !b.archived_at) return { board: b, note: `#${b.name} isn't archived` };
+  db.prepare(`UPDATE boards SET archived_at = ?, archived_by = ? WHERE name = ?`).run(archived ? Date.now() : null, archived ? handle : null, b.name);
+  return { board: getBoard(db, b.name)! };
 }
 
 // For a mode's own bookkeeping (e.g. a team's board), not agent requests:
@@ -416,7 +463,8 @@ export function ensureBoard(
 
 // Unchecked lookup, for modes and policies. Tools go through visibleBoard.
 export function getBoard(db: Database, name: string): Board | undefined {
-  return db.prepare(`SELECT * FROM boards WHERE name = ?`).get(name) as Board | undefined;
+  const b = db.prepare(`SELECT * FROM boards WHERE name = ?`).get(name) as Board | null;
+  return b ? showBoard(b) : undefined;
 }
 
 // A board you can't see reads as missing, so its existence doesn't leak.
@@ -492,7 +540,7 @@ function boardViews(db: Database, handles: string[], board: string | null): { ha
       ORDER BY b.name`,
   );
   const a = access(db);
-  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row })));
+  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row: showBoard(row) })));
 }
 
 // The view a use acts as, from one board's views in address order.
@@ -508,7 +556,7 @@ export function boardAddress(db: Database, board: string, handles: string[], use
 }
 
 /**
- * The boards `handles` can see: each row is the view of the address
+ * The open boards `handles` can see (an archived one is read by name, #635): each row is the view of the address
  * board_read without `as` would act as (boardAddress's "read"), so its mode
  * and unread count are that address's subscription's. A predicate (an
  * addressless reader) sees rows with no mode and nothing unread.
@@ -517,12 +565,12 @@ export function listBoards(db: Database, handles: string[] | BoardPredicate): Bo
   if (typeof handles === "function") {
     const rows = db.prepare(
       `SELECT ${BOARD_COLUMNS}, NULL AS mode, 0 AS unread
-         FROM boards b ORDER BY b.name`,
+         FROM boards b WHERE b.archived_at IS NULL ORDER BY b.name`,
     ).all() as BoardSummary[];
-    return rows.filter(handles);
+    return rows.map(showBoard).filter(handles);
   }
   const byBoard = new Map<string, { handle: string; row: BoardSummary }[]>();
-  for (const v of boardViews(db, handles, null)) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
+  for (const v of boardViews(db, handles, null)) if (v.row.archived_at === undefined) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
   return [...byBoard.values()].map((views) => pickView(views, "read")!.row).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 }
 
@@ -646,6 +694,9 @@ export type PostOpts = {
   // An author's own words: an @id: that can't receive refuses the post.
   // Unset (system posts), it goes unresolved.
   strictIds?: boolean;
+  // A system post ending something already announced on the board (a claim's
+  // release, update or expiry) still lands once the board is archived (#635).
+  allowArchived?: boolean;
 };
 
 // Eligible lanes for a queue board's rotation, least-recently-woken first
@@ -755,10 +806,15 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
 }
 
 // What decides whether `handle` may post (or reply) on a board now: it can see
-// it, the parent is a post on it, and only a human starts an announcement.
+// it, the parent is a post on it, only a human starts an announcement, and an
+// archived board takes replies only, unless the caller is the system ending
+// something already on it (`allowArchived`: a claim's release or expiry).
 // Throws CoreError; writes nothing.
-function postGate(db: Database, handle: string, boardInput: string, parentId: number | null) {
+function postGate(db: Database, handle: string, boardInput: string, parentId: number | null, allowArchived = false) {
   const b = visibleBoard(db, handle, boardInput);
+  if (b.archived_at && parentId === null && !allowArchived) {
+    throw new CoreError(`#${b.name} is archived; reply in one of its threads, or reopen it with board_archive(board, false) if you created it`);
+  }
   if (parentId !== null) {
     const parent = getPost(db, parentId);
     if (!parent || parent.board !== b.name) {
@@ -797,7 +853,7 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId);
+  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived);
   const board = b.name;
   checkBody(body);
   if (announcement && !opts.online) throw new CoreError(`posting on #${board} needs live sessions from the mode`);
@@ -842,7 +898,9 @@ export function post(
     // least-recently-woken eligible subscriber and claims the post (TTL
     // takeover releases it to the next wake). Replies follow thread semantics
     // and release the claimer's claim.
-    const queue = !announcement && parentId === null && (b.kind ?? "broadcast") === "queue";
+    // An archived queue board takes no new work (#635): a claim's [release]
+    // or [expired] post landing there is a broadcast, never a delivery.
+    const queue = !announcement && parentId === null && !b.archived_at && (b.kind ?? "broadcast") === "queue";
     let unresolved: string[] = [];
     if (queue) {
       const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
@@ -1262,7 +1320,7 @@ export function boardCatalog(db: Database, handle: Viewer, after?: string): { bo
   while (boards.length <= 100) {
     const rows = db.prepare(`SELECT * FROM boards WHERE name > ? ORDER BY name LIMIT 100`).all(cursor) as Board[];
     for (const board of rows) {
-      if (sees(db, handle, board)) boards.push(board);
+      if (sees(db, handle, board)) boards.push(showBoard(board));
       if (boards.length > 100) return { boards: boards.slice(0, 100), next_after: boards[99]!.name };
     }
     if (rows.length < 100) break;
