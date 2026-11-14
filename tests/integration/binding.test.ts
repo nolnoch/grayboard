@@ -601,6 +601,8 @@ test("#211: a name record whose session the name's history doesn't show restores
   expect((await s.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
   expect(statusOf("api")).toBeNull();
+  // The recorded session has no status to lose, so no note (#260).
+  expect(s.c.getInstructions()).not.toContain("peer status wasn't carried over");
 }, 30_000);
 
 test("audit S7: a name record past MAX_HOLDS restores the first names and reports the rest untried", async () => {
@@ -659,6 +661,7 @@ test("#211: a restore is verified in the transaction that binds: a bind that lan
   await until(() => s.stderr().includes("test pause hit: bind:before-txn"));
   release("bind:before-txn");
   await bind;
+  await s.call("peer_status", { text: "mid-task" });
   const prior = events("api").at(-1)!.session_id;
   rmSync(join(dir, "go-bind:before-txn"));
   // The restart parks just before its transaction; another session binds the
@@ -676,6 +679,8 @@ test("#211: a restore is verified in the transaction that binds: a bind that lan
   expect((await next.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${prior} not verified: latest bound by ${theirs}` });
   expect(statusOf("api")).toBeNull();
+  // Its earlier status was dropped, and the session is told why (#260).
+  expect(next.c.getInstructions()).toContain(`This grayboard process restarted and took back "api", but another session bound it in between, so the earlier peer status wasn't carried over; peer_status sets it again.`);
 }, 30_000);
 
 test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {

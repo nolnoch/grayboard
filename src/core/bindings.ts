@@ -459,6 +459,15 @@ export function restoreNote(name: string, why: string, holdsOthers = false): str
 }
 
 /**
+ * A restart took back `names` from its record, but the names' history
+ * didn't show the recorded session as their latest binder (#211), so its
+ * peer status wasn't carried over (#260). Said only when it had one.
+ */
+export function unverifiedRestoreNote(names: string[]): string {
+  return `This grayboard process restarted and took back ${names.map((n) => `"${n}"`).join(", ")}, but another session bound ${names.length > 1 ? "them" : "it"} in between, so the earlier peer status wasn't carried over; peer_status sets it again.`;
+}
+
+/**
  * The parent is a launcher (npx, a shell), not the harness: each restart gets
  * a new parent, so the name record never matches it.
  */
