@@ -196,9 +196,11 @@ test("a team alias in use by one member's session refuses another member's write
 });
 
 // #284 PR 4: a revocation takes only the alias it revokes. A session holding
-// two team aliases keeps the other, and the oldest hold left is its primary.
+// two team aliases keeps the other's hold and its mail. The primary switch isn't asserted here: an application
+// session's in-memory holds keep the revoked alias (#475 item 7c; only the Slack bridge is non-hosted), while a hosted
+// root reads its holds from the database (tests/integration/hosted_alias_lost.test.ts).
 // hosted twin: #451 (team aliases on a session, multi-alias holds, alias_lost)
-test("losing one of two team aliases keeps the other, which becomes the primary", async () => {
+test("losing one of two team aliases keeps the other's hold and its mail", async () => {
   expect((await srv.api(alice, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/ops/add", { email: B })).status).toBe(200);
   const s = srv.appSession(bob, "eng/build");

@@ -284,9 +284,9 @@ export function idRow(db: Database, id: string): IdRow | undefined {
   return r ? { ...r, viewer: r.viewer === 1 } : undefined;
 }
 
-/** The sessions not yet ended (viewers aside), every principal's or one's. */
-export function unendedIds(db: Database, principal: string | null = null): string[] {
-  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0 AND (?1 IS NULL OR principal = ?1)`).all(principal) as { id: string }[]).map((r) => r.id);
+/** The sessions not yet ended (viewers aside). */
+export function unendedIds(db: Database): string[] {
+  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0`).all() as { id: string }[]).map((r) => r.id);
 }
 
 /** The statuses set on these sessions, by ID. */

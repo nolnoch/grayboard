@@ -1,22 +1,5 @@
 import type { AttachmentInfo } from "./attachments.ts";
 
-export type Message = {
-  id: number;
-  sender: string;
-  recipient_type: "user" | "team";
-  recipient: string;
-  body: string;
-  parent_id: number | null;
-  created_at: number;
-  // Only when set: the sender marked it as owing a follow-up.
-  pending?: true;
-  // Only when it carries files.
-  attachments?: AttachmentInfo[];
-  // Only when set: "bounce", returned by a session that ended before reading it (#284 S12).
-  kind?: "bounce";
-};
-
-
 // Add an alias to this session's holds (#284 PR 4 S1): a bare name in the
 // caller's own person scope, or scope/name. One already held answers ok and
 // only applies meta. create: false refuses a name that has never existed
@@ -58,10 +41,8 @@ export type SendResult  = {
 // (or the human fallback).
 export type DelegateResult = SendResult & { to: string; human_fallback?: true };
 
-// known: with identity_unknown, the user's names closest to the one asked for.
-// holder: with alias_held, the session that holds the alias.
-// retry_after_ms: on a rate_limited bind, the wait until one is accepted again.
-export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string; known?: string[]; holder?: string; retry_after_ms?: number };
+// The frame src/server/ws_refusal.ts answers a WebSocket hello with (#282).
+export type ErrorMessage = { type: "error"; req_id?: string; code: ErrorCode; message: string };
 
 export type ErrorCode =
   | "unauthenticated" | "forbidden" | "bad_request" | "not_found"
@@ -83,10 +64,11 @@ export type ErrorCode =
   // childStateRefusal in src/core/bindings.ts); or a send or mention named a child's ID, which is
   // never an address (both modes)
   | "child_session"
+  // ws_refusal's answer to a current-protocol WebSocket hello: the transport is gone (#282)
+  | "upgrade_required"
   // Hosted MCP only (src/server/hosted.ts): a hosted
   // call that needs a bound name, and the hosted child-session registration refusals.
   | "unbound"
-  | "upgrade_required"
   | "invalid_registration"
   | "root_is_child"
   | "child_bound"
