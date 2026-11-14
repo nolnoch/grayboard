@@ -231,6 +231,20 @@ test("a configured name binds at a fresh root's first start, created and said no
   expect(srv.app.db.query("SELECT 1 FROM alias_holds WHERE address = ?").get(`${EMAIL}/conf-other`)).toBeNull();
 });
 
+test("a resumed session whose remembered names can't be read skips the configured bind: the resume takes them back (#544 item 1)", async () => {
+  const before = await live("conf-unread-1", "kept");
+  await before.root.shutdown("detach");
+  // One storage read fails: the start's own look at what it would take back.
+  const remembered = spyOn(Controller.prototype as unknown as { remembered: () => Promise<string[] | undefined> }, "remembered").mockRejectedValueOnce(new Error("EIO: storage read failed"));
+  try {
+    const resumed = rig("conf-unread-1", { configured: "conf-unread-other" });
+    await resumed.root.start();
+    await active(resumed, "kept");
+  } finally { remembered.mockRestore(); }
+  expect(row("conf-unread-1")).toMatchObject({ name: "kept" });
+  expect(srv.app.db.query("SELECT 1 FROM alias_holds WHERE address = ?").get(`${EMAIL}/conf-unread-other`)).toBeNull();
+});
+
 test("a configured name another session holds is said once and in the next tool result; a later start doesn't try it again", async () => {
   await live("conf-held-1", "conf-held");
   const r = rig("conf-held-2", { configured: "conf-held" });

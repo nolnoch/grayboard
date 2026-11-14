@@ -281,12 +281,14 @@ export class RootDelivery {
       this.begun = await this.epoch();
       // Taking back what this session held, or a /new's carried names, comes
       // before BUS_IDENTITY, as a local restart's names do (#443).
-      const remembered = carried ? undefined : await controller.carried(id);
+      const back = carried ? undefined : await controller.takeBack(id);
+      const remembered = back === "unreadable" ? undefined : back;
       // Only a session with nothing to take back binds it, and only until it
       // first lands: a later restart (a sign-in, an unpause) after the agent
-      // unbound never brings it back.
+      // unbound never brings it back. Remembered holds that couldn't be read
+      // may exist, so this start resumes instead and a later one decides.
       if (carried || remembered) this.configuring = undefined;
-      const configured = this.configuring;
+      const configured = back === "unreadable" ? undefined : this.configuring;
       const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
       const status = carried ? await controller.enroll(id, carried, false)
         : configured ? await controller.enroll(id, [configured], true)
