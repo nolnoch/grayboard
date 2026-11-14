@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import {
   cleanPlace,
+  oneLine,
   parseAliasMeta,
   acknowledge,
   activeAnnouncements,
@@ -1162,6 +1163,20 @@ test("a place and an unknown meta key are single bounded lines", () => {
   expect(cleanPlace(" \u0000 ")).toBeNull();
   const key = `k\n${"x".repeat(500)}`;
   expect(() => parseAliasMeta({ [key]: "v" })).toThrow(`unknown meta key "k ${"x".repeat(38)}"; known:`);
+});
+
+// #372: bidi controls and zero-width characters go; ZWJ and ZWNJ stay.
+test("oneLine drops bidi controls and zero-width characters but keeps ZWJ and ZWNJ", () => {
+  for (const c of ["\u061c", "\u200e", "\u200f"]) expect(oneLine(`a${c}b`), "bidi mark").toBe("ab");
+  for (const c of ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e"]) expect(oneLine(`a${c}b`), "embedding/override").toBe("ab");
+  for (const c of ["\u2066", "\u2067", "\u2068", "\u2069"]) expect(oneLine(`a${c}b`), "isolate").toBe("ab");
+  for (const c of ["\u200b", "\u2060", "\ufeff"]) expect(oneLine(`a${c}b`), "zero-width").toBe("ab");
+  expect(oneLine("evil\u202eexe.txt")).toBe("evilexe.txt");
+  expect(oneLine(" \u200b a \u200b  b \u2066")).toBe("a b");
+  const family = "\u{1f468}\u200d\u{1f469}\u200d\u{1f467}";
+  expect(oneLine(`team ${family}`)).toBe(`team ${family}`);
+  expect(oneLine("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645")).toBe("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645");
+  expect(cleanPlace("\u202e\u200b")).toBeNull();
 });
 
 // #284 S5 (audit P2): a session's own post is not unread on any of its
