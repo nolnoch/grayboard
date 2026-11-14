@@ -527,6 +527,34 @@ test("a refused writes_as declaration through the hosted gate keeps its refused 
   expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused' AND detail LIKE '%human%'").all()).toHaveLength(1);
 });
 
+test("a rate-limited hosted bind keeps its hello.rate_limited row after the transaction rolls back, and the streak's end is written once (#467)", async () => {
+  const limited = createApplication(database.repo, database.db, { helloLimit: { burst: 1, perSec: 0.01 }, now: () => now });
+  const service = createHostedSessions(limited, { now: () => now, isAuthorized: () => true });
+  const rows = (action: string) => (database.db.query("SELECT count(*) AS n FROM access_log WHERE action = ?").get(action) as { n: number }).n;
+  try {
+    await service.bind(principal, context("root"), { name: "fe", create: true });
+    await expect(service.bind(principal, context("root"), { name: "be", create: true })).rejects.toHaveProperty("code", "rate_limited");
+    expect(rows("hello.rate_limited")).toBe(1);
+    // The bucket refills; the bind that ends the streak commits, so its row is written there and not again.
+    now += 200_000;
+    await service.bind(principal, context("other"), { name: "ops", create: true });
+    expect(rows("hello.rate_limit_ended")).toBe(1);
+    expect(service.refusalRowsLost).toBe(0);
+  } finally { service.close(); limited.stopExpiry(); }
+});
+
+test("a refusal row whose write after the rollback fails is counted, and the refusal is still what the caller sees (#467)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-human", [GRAYBOARD_WRITES_AS_META]: "human" });
+  const write = spyOn(application, "hostedRefused").mockImplementation(() => { throw new Error("disk full"); });
+  const quiet = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await expect(hosted.whoami(generic, ctx)).rejects.toHaveProperty("code", "forbidden");
+    expect(hosted.refusalRowsLost).toBe(1);
+    expect(quiet.mock.calls.some(([line]) => String(line).includes('"operation":"hosted.refusal_row"'))).toBe(true);
+  } finally { write.mockRestore(); quiet.mockRestore(); }
+});
+
 test("ending a tools-only hosted root frees its alias for other users and restores writes_as when the same ID starts again (#451)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "fe" });
