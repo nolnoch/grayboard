@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import { declareHuman, ensureAlias, registerId, setStatus, touchAlias, who } from "./boards.ts";
-import { dropHold, holdAlias, logBinding } from "./bindings.ts";
+import { dropHold, holdAlias, logBinding, unboundPeer } from "./bindings.ts";
 import { delegateNote, delegateOkFields, delegationBody, humanFallbackBody, isLauncher, launchers, resolveDelegation, DELEGATE_TOOL } from "./delegation.ts";
 import { CoreError } from "./errors.ts";
 import { initCoreSchema } from "./schema.ts";
@@ -191,6 +191,13 @@ describe("unbound launchers (#337)", () => {
     session("zed", true);
     expect(launchers(db)).toEqual(["zed", u]);
     expect(isLauncher(db, u)).toBe(true);
+  });
+
+  test("peer_list marks an unbound launcher's row launcher: true, and not a non-launcher's (#764)", () => {
+    const u = unbound(true);
+    const n = unbound(false);
+    const rows = who(db, "me", {}, () => true, { unbound: [unboundPeer(u, null, false), unboundPeer(n, null, false)] }).unbound_sessions!;
+    expect(rows.map((r) => [r.session_id, r.launcher])).toEqual([[u, true], [n, undefined]]);
   });
 
   test("a bound launcher is listed by its alias, never also by its ID", () => {
