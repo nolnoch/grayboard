@@ -94,6 +94,33 @@ test("a member who isn't an owner can't add, remove or change roles; the creator
   expect((await api(bob, "POST", "/api/teams/eng/leave")).status).toBe(200);
 });
 
+// Security audit F-02 (TOCTOU): the ownership check runs after the body is
+// read, so an owner demoted while their request body is still arriving
+// can't finish the add on the stale check.
+test("an owner demoted while their add's body streams in is refused", async () => {
+  const alice = await login("alice@example.com");
+  const bob = await login("bob@example.com");
+  await login("carol@example.com");
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" });
+
+  const body = JSON.stringify({ email: "carol@example.com" });
+  let push!: ReadableStreamDefaultController<Uint8Array>;
+  const stream = new ReadableStream<Uint8Array>({ start: (c) => { push = c; } });
+  const pending = fetch(`${srv.base}/api/teams/eng/add`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${bob}`, "Content-Type": "application/json" },
+    body: stream,
+  });
+  push.enqueue(new TextEncoder().encode(body.slice(0, 5)));
+  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "member" })).status).toBe(200);
+  push.enqueue(new TextEncoder().encode(body.slice(5)));
+  push.close();
+  expect((await pending).status).toBe(403);
+  const members = (await api(alice, "GET", "/api/teams/eng/members")).body.map((m: { email: string }) => m.email).sort();
+  expect(members).toEqual(["alice@example.com", "bob@example.com"]);
+});
+
 test("owners promote and demote; the last owner can't leave, be removed or demoted while others remain", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");

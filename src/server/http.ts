@@ -438,10 +438,12 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb,
 }
 
 async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+  // Read the body before the ownership check (security audit F-02): an owner
+  // demoted while a slow body trickles in must not act on a stale check.
+  const body = await parseBody<{ email: string; role?: unknown }>(req);
   const managed = ownedTeam(teamName, authed, repo, config);
   if (managed instanceof Response) return managed;
   const { team } = managed;
-  const body = await parseBody<{ email: string; role?: unknown }>(req);
   if (!body?.email) return badRequest("email required");
   if (body.role !== undefined && body.role !== "owner" && body.role !== "member") return badRequest(`role must be "owner" or "member"`);
   const role = body.role as TeamRole | undefined;
@@ -467,10 +469,10 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
 }
 
 async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config, sessions: SessionHooks): Promise<Response> {
+  const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
   const managed = ownedTeam(teamName, authed, repo, config);
   if (managed instanceof Response) return managed;
   const { team } = managed;
-  const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   const user  = repo.users.findByEmail(email);
