@@ -128,6 +128,31 @@ test("a keyed attach is refused when the held handle and BUS_HUMAN disagree", as
   expect(await attachSession(db, self, true)).toMatchObject({ ok: false, error: expect.stringContaining(`holds "fe", which isn't the declared human handle`) });
 });
 
+// #365: a keyed restart under another model or effort replaces the stored
+// facts, audited with the before and after; the same facts write nothing.
+test("a keyed attach records the new child's model and effort", async () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const id = "id:0123456789abf";
+  const self = thisSession(id, { pid: process.pid, proc_start: procStart(process.pid) ?? null, rule: "env" });
+  registerSession(db, self, { model: "opus", effort: "high" });
+  const facts = () => db.prepare(`SELECT model, effort FROM ids WHERE id = ?`).get(id);
+  const audits = () => (db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.facts_changed' AND target = ?`).all(id) as { detail: string }[]).map((r) => JSON.parse(r.detail));
+  const restart = () => db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
+
+  restart();
+  expect(await attachSession(db, self, false, { model: "sonnet", effort: "low" })).toEqual({ ok: true, held: [] });
+  expect(facts()).toEqual({ model: "sonnet", effort: "low" });
+  expect(audits()).toEqual([{ before: { model: "opus", effort: "high" }, after: { model: "sonnet", effort: "low" }, why: "reattach" }]);
+  restart();
+  expect(await attachSession(db, self, false, { model: "sonnet", effort: "low" })).toMatchObject({ ok: true });
+  expect(audits()).toHaveLength(1);
+  // A child that reports none clears them: the old ones were the last child's.
+  restart();
+  expect(await attachSession(db, self, false)).toMatchObject({ ok: true });
+  expect(facts()).toEqual({ model: null, effort: null });
+  expect(audits()).toHaveLength(2);
+});
+
 // #210: a retry loop refused for the same reason is one row with a count.
 test("a session's identical refusals within the window share a row; anything else inserts", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
