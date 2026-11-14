@@ -983,7 +983,7 @@ describe("with a scoped access policy", () => {
   });
 
   // #284 S13: an alias's labels reach only a principal that may act in its
-  // scope, and match runs after that cut. ID facts follow the row.
+  // scope, and match runs after that cut; so do its session's facts (F-12).
   test("a team alias's labels are hidden from a non-member's peer_list and its match", () => {
     db.prepare(
       `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task, source_board) VALUES ('eng/x', 'team', 'eng', 'x', 1, 1, 'ENG-142', 'eng')`,
@@ -996,7 +996,9 @@ describe("with a scoped access policy", () => {
     expect(row("be", "id:00000000000be", { task: "eng-142" })).toBeDefined();
     expect(row("be", "id:00000000000be", { scope: "eng" })).toBeDefined();
     const outsider = row("fe", "id:00000000000fe")!;
-    expect(outsider).toMatchObject({ handle: "eng/x", model: "opus" });
+    expect(outsider).toMatchObject({ handle: "eng/x" });
+    expect(outsider.model).toBeUndefined();
+    expect(row("fe", "id:00000000000fe", { model: "opus" })).toBeUndefined();
     expect(outsider.task).toBeUndefined();
     expect(outsider.source_board).toBeUndefined();
     expect(row("fe", "id:00000000000fe", { task: "ENG-142" })).toBeUndefined();

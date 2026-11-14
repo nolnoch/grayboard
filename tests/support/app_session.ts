@@ -57,7 +57,7 @@ export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
 // An AppSession of the server `app`, signed in with the session token
 // `token` as an API request resolves it; connect() it. The caller closes it.
 export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-  const authed = verifySessionToken(token, app.repo, app.touches);
+  const authed = verifySessionToken(token, app.repo, app.touches, 0);
   if (!authed) throw new Error("appSession: the token doesn't authenticate");
   return new AppSession(app.application, authed, identity, opts);
 }
@@ -260,6 +260,8 @@ export class AppSession {
   }
 
   // The session closes (application.close). Later operations are refused.
+  // Its holds stay: a closed session no longer ends after a grace (#282), so
+  // a test that needs the hold released ends or unbinds it (#475 item 7e).
   close(): void {
     this.drop("closed");
   }

@@ -92,7 +92,7 @@ test("a claim announcement is marked by the user who took it, over MCP or the CL
   const announced = (key: string) => board((i) => i.kind === "push" && i.post.body.includes(key));
   await bfe.call("claim_take", { key: "ticket:ENG-1", board: "e2e" });
   expect(marked((await abe.next(announced("ticket:ENG-1"))).event)).toBe(true);
-  const cli = await srv.api(bob, "POST", "/api/claims/call", { identity: "fe", tool: "claim_take", args: { key: "ticket:ENG-2", board: "e2e" } });
+  const cli = await srv.api(bob, "POST", "/api/claims/call", { as: "fe", tool: "claim_take", args: { key: "ticket:ENG-2", board: "e2e" } });
   expect(cli.status).toBe(200);
   expect(marked((await abe.next(announced("ticket:ENG-2"))).event)).toBe(true);
   await abe.call("claim_take", { key: "ticket:ENG-3", board: "e2e" });

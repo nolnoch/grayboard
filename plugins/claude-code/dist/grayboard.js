@@ -35565,7 +35565,7 @@ var native_tools_default = [
       properties: {
         to: {
           type: "string",
-          description: "The peer's exact handle, as peer_list shows it, or a bare identity name."
+          description: "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
         },
         body: {
           type: "string",

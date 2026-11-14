@@ -163,7 +163,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 ## Maintaining parity
 
 - A feature or fix PR names the cells it changes (row number and column) and updates this doc in the same change.
-- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply.
+- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply. Local mode is the single-user edition (`vision.md` §1): a capability that only means something with more than one principal (roles, grants, service principals, cross-user policy) is n/a in every local cell, not a gap.
 - Parity by addition: moving a cell to supported never removes a capability from another cell.
 
 ## Not covered
