@@ -58,7 +58,8 @@ export function openLocalDb(path = localDbPath()): { db: Database; ended: Ended;
   refuseForbiddenBus(path);
   privateDir(dirname(path));
   privateDbFiles(path);
-  const db = openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
+  // auto_vacuum must precede the first page write, so it takes only on a new bus (#148).
+  const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
   const { alive, ...ended } = liveSessions(db);
   return { db, ended, live: alive };
 }

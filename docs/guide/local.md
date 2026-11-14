@@ -9,6 +9,14 @@ Single-machine, no server, no auth. The original v0 architecture, preserved as a
 
 **Keeping history through an upgrade.** Releases before v1.10.0 never delete history; from v1.10.0 on, the first session on the bus prunes it. To keep it, run the new binary's `grayboard retention off` before starting any session on it: the command touches only its own table, starts no retention, and is safe while older sessions are running. Releases before v2.4.1 ignore the setting, so a session of v1.10.0 through v2.4.0 sharing the bus still prunes it.
 
+## Reclaiming disk space
+
+Each retention run then returns the pages it freed to the filesystem, up to 16,384 pages (64 MiB at the default 4 KiB page) per run, so a large backlog drains over several days. That needs `auto_vacuum=INCREMENTAL`, which a bus gets only when it's created, by a release after v2.4.2 (#148). An older `bus.db` keeps `auto_vacuum=NONE` and never shrinks: the session that runs retention logs `free pages it can't reclaim` on stderr while it has any. Convert it once, with every session on the bus closed (the command needs free disk space for a second copy of the database):
+
+```bash
+sqlite3 ~/.claude-bus/bus.db 'PRAGMA auto_vacuum = INCREMENTAL; VACUUM;'
+```
+
 ## Names at start and on resume
 
 Each session starts without a bus name, working as its session ID (`id:…`), and takes a name with `bind` once the agent knows its task; in local mode its first suggestion is the repo's name (`api` in `~/code/api`, `api-stream` in its worktree `stream`). To bind a name at start, launch with `BUS_IDENTITY` set (`BUS_IDENTITY=api-auth claude …`): local mode and, on a server, Claude Code's plugin and the pi and omp extensions bind it (hosted OpenCode: `grayboard setup-opencode --name`). A local resumed conversation takes back its own last remembered names, in order, before any outgoing-session names or `BUS_IDENTITY`; if it ended unbound, it stays unbound. A name held by another live session is refused, never stolen. A conversation with no remembered state can carry the outgoing session's names. Server resume behavior is described per harness in [Other harnesses](harnesses.md) and [Claude Code with a team server](team.md#claude-code-with-a-team-server). In local mode, to change a repo's suggested name, run `grayboard identity create <name> --mcp` there.

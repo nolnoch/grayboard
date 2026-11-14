@@ -107,3 +107,35 @@ export function openSqlite(path: string, pragmas: string, schema: (db: Database)
   if (retries) console.error(`[grayboard] opened ${path} after ${retries} busy retries (${Date.now() - start} ms)`);
   return db;
 }
+
+// Free pages returned to the filesystem per retention run: 64 MiB at the default
+// 4 KiB page, so one run is bounded; a larger backlog drains over later runs (#137).
+export const RECLAIM_PAGES_PER_RUN = 16_384;
+
+export type Reclaimed = { reclaimed: number; remaining: number; incremental: boolean };
+
+// Returns up to `maxPages` (> 0) free pages to the filesystem with
+// `PRAGMA incremental_vacuum`. auto_vacuum=INCREMENTAL is set only when a file
+// is created, before its first page write; a file created without it
+// reclaims nothing until a one-time VACUUM converts it. Both modes (#137, #148).
+export function reclaimFreePages(db: Database, maxPages: number): Reclaimed {
+  // incremental_vacuum(0) would mean every free page: never unbounded.
+  const pages = Math.floor(maxPages);
+  if (!(pages > 0)) throw new RangeError(`reclaimFreePages needs a positive page count, not ${maxPages}`);
+  const free = () => db.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count;
+  const incremental = db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()!.auto_vacuum === 2;
+  const before = free();
+  if (incremental && before > 0) db.run(`PRAGMA incremental_vacuum(${pages})`);
+  const remaining = free();
+  return { reclaimed: before - remaining, remaining, incremental };
+}
+
+// A retention run's log of what `reclaimFreePages` did: the pages reclaimed,
+// and, while a file that can't reclaim has free pages, the fix (`guide`, the
+// doc section that gives it).
+export function logReclaimed(r: Reclaimed, guide: string): void {
+  if (r.reclaimed) console.error(`[grayboard] retention: reclaimed ${r.reclaimed} free database pages (${r.remaining} left)`);
+  if (!r.incremental && r.remaining) {
+    console.error(`[grayboard] retention: the database has ${r.remaining} free pages it can't reclaim (auto_vacuum is not INCREMENTAL); a one-time VACUUM converts it (${guide})`);
+  }
+}
