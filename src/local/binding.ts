@@ -438,9 +438,10 @@ function merge(into: Ended, id: string, r: EndedSession): void {
 // it everything deliverable against its ID. A 1.x process's name is its
 // bindings row's. endSession ends its child sessions too, so their copies of
 // its liveness row (registerChild) go with it. Callers are inside a transaction.
-function end(db: Database, sessionId: string, why: string | null, now: number): EndedSession {
+// The id.ended row names the process that ended it, and a reap what it saw (#330).
+function end(db: Database, sessionId: string, why: string | null, now: number, evidence?: Record<string, unknown>): EndedSession {
   const row = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(sessionId) as { name: string | null } | null;
-  const r = endSession(db, localMail(db), sessionId, { why, legacyNames: row?.name ? [row.name] : [], now });
+  const r = endSession(db, localMail(db), sessionId, { why, legacyNames: row?.name ? [row.name] : [], now, by: { by_pid: process.pid }, ...(evidence ? { evidence } : {}) });
   db.prepare(`DELETE FROM bindings WHERE session_id IN (SELECT id FROM ids WHERE root_id = ?)`).run(sessionId);
   return r;
 }
@@ -455,12 +456,15 @@ function end(db: Database, sessionId: string, why: string | null, now: number): 
 export function reap(db: Database, rows: SessionRow[], now: number): Ended {
   const out: Ended = { ended: [], wake: [] };
   for (const r of rows) {
-    const cur = db.prepare(`SELECT pid, proc_start, harness_rule FROM bindings WHERE session_id = ?`).get(r.session_id) as
-      { pid: number; proc_start: string | null; harness_rule: string | null } | null;
+    const cur = db.prepare(`SELECT pid, proc_start, harness_pid, harness_rule FROM bindings WHERE session_id = ?`).get(r.session_id) as
+      { pid: number; proc_start: string | null; harness_pid: number | null; harness_rule: string | null } | null;
     if (!cur) continue;
     const unchanged = cur.pid === r.pid && cur.proc_start === r.proc_start;
     if (!unchanged && isAlive(cur.pid, cur.proc_start)) continue;
-    merge(out, r.session_id, end(db, r.session_id, `reaped: ${pidText(cur)} is gone`, now));
+    // `probe`: whether the row was judged dead before the write lock and
+    // left unchanged, or changed and probed again inside it.
+    const reaped = { ...cur, probe: unchanged ? "pre_lock" : "re_probed" };
+    merge(out, r.session_id, end(db, r.session_id, `reaped: ${pidText(cur)} is gone`, now, { reaped }));
   }
   return out;
 }
