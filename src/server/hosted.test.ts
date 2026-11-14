@@ -1179,22 +1179,47 @@ test("a failed heartbeat write is reported and retried on the next tick", async 
 
 // #399: a request's hosted bookkeeping reads O(its own rows), not O(the fleet). The row lists the store hands back
 // during one call are counted with 3 and with 40 unrelated bound roots; the totals must match.
-test("one hosted call reads the same rows however many other sessions exist (#399)", async () => {
+async function rowsReadDuring(call: () => Promise<unknown>) {
   const store = database.repo.hosted;
   const listing = ["all", "expired", "idle", "disabled", "children"] as const;
+  let read = 0;
+  const spies = listing.map(name => spyOn(store, name).mockImplementation(((original: (...a: unknown[]) => unknown[]) => (...a: unknown[]) => {
+    const rows = original(...a); read += rows.length; return rows;
+  })((store[name] as (...a: unknown[]) => unknown[]).bind(store)) as never));
+  try { await call(); }
+  finally { for (const spy of spies) spy.mockRestore(); }
+  return read;
+}
+async function withOthers(others: number, tag: string, measure: () => Promise<number>) {
+  for (let i = 0; i < others; i++) await hosted.bind(principal, context(`${tag}-${others}-${i}`), { name: `${tag}-${others}-${i}`, create: true });
+  const read = await measure();
+  for (let i = 0; i < others; i++) await hosted.end(principal, context(`${tag}-${others}-${i}`));
+  return read;
+}
+test("one hosted call reads the same rows however many other sessions exist (#399)", async () => {
   async function rowsRead(others: number) {
-    for (let i = 0; i < others; i++) await hosted.bind(principal, context(`other-${others}-${i}`), { name: `other-${others}-${i}`, create: true });
-    const caller = context(`caller-${others}`);
-    await hosted.bind(principal, caller, { name: `caller-${others}`, create: true });
-    let read = 0;
-    const spies = listing.map(name => spyOn(store, name).mockImplementation(((original: (...a: unknown[]) => unknown[]) => (...a: unknown[]) => {
-      const rows = original(...a); read += rows.length; return rows;
-    })((store[name] as (...a: unknown[]) => unknown[]).bind(store)) as never));
-    try { await hosted.run(principal, caller, "dm_history", session => session.identityFull); }
-    finally { for (const spy of spies) spy.mockRestore(); }
-    for (let i = 0; i < others; i++) await hosted.end(principal, context(`other-${others}-${i}`));
-    await hosted.end(principal, caller);
-    return read;
+    return withOthers(others, "other", async () => {
+      const caller = context(`caller-${others}`);
+      await hosted.bind(principal, caller, { name: `caller-${others}`, create: true });
+      const read = await rowsReadDuring(() => hosted.run(principal, caller, "dm_history", session => session.identityFull));
+      await hosted.end(principal, caller);
+      return read;
+    });
+  }
+  const few = await rowsRead(3), many = await rowsRead(40);
+  expect(many).toBe(few);
+});
+
+// #805: admitting a new session counts the user's and the server's rows rather than listing them.
+test("admitting a new session reads the same rows however many other sessions exist (#805)", async () => {
+  async function rowsRead(others: number) {
+    return withOthers(others, "admit", async () => {
+      const caller = context(`fresh-${others}`);
+      const read = await rowsReadDuring(() => hosted.whoami(principal, caller));
+      expect(database.repo.hosted.get(hostedId(`fresh-${others}`))).toBeDefined();
+      await hosted.end(principal, caller);
+      return read;
+    });
   }
   const few = await rowsRead(3), many = await rowsRead(40);
   expect(many).toBe(few);

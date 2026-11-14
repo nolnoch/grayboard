@@ -204,7 +204,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (full(() => store.children(root).filter(r => r.parked_at === null).length >= limits.children, own)) throw new ApplicationError("bad_request", childCapacity(root));
   }
   function admit(user: number, own: string[], root?: string) {
-    if (full(() => { const rows = store.all(); return rows.length >= limits.global || rows.filter(r => r.user_id === user).length >= limits.user; }, own)) {
+    if (full(() => { const n = store.counts(user); return n.total >= limits.global || n.user >= limits.user; }, own)) {
       throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
     }
     if (root) admitChild(root, own);
@@ -475,7 +475,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (fresh.grant_id === p.grantId) return fresh;
     testPause("hosted:attach:in-txn");
     authorized(p);
-    for (const child of store.all().filter(r => r.ownership_id === fresh.ownership_id)) store.update({ ...child, grant_id: p.grantId });
+    for (const child of store.ofOwnership(fresh.ownership_id)) store.update({ ...child, grant_id: p.grantId });
     audit(row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
     // The lease is tied to the grant (delivery.ts), so a reattach closes one only if it was open.
     if (fresh.lease_deadline !== null) audit(row.session_id, "hosted.lease_closed", { reason: "reattached" });
