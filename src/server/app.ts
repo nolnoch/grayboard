@@ -1,6 +1,5 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
-import { createWsRefusal, type RefusalData } from "./ws_refusal.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate } from "./auth_gate.ts";
@@ -24,8 +23,12 @@ export type StartOptions = ApplicationOptions & {
 };
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
-export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit">, opts: StartOptions) {
-  return { ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit };
+export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps">, opts: StartOptions) {
+  return {
+    ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit,
+    delegateLimit: opts.delegateLimit ?? config.delegateLimit, delegateOpenCap: opts.delegateOpenCap ?? config.delegateOpenCap,
+    observerCap: opts.observerCap ?? config.hostedCaps?.watches.global,
+  };
 }
 
 export function startServer(config: Config, opts: StartOptions = {}) {
@@ -40,7 +43,6 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   }
   const application = createApplication(repo, db, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
-  const refusal = createWsRefusal();
 
   const authGate = new AuthGate(repo, {
     trustedProxies: config.trustedProxies, limit: config.authFailLimit,
@@ -52,7 +54,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
   const oauth = createOAuthServer(repo, config, opts.oauth);
-  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
@@ -72,7 +74,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
   const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
 
-  const server = Bun.serve<RefusalData>({
+  const server = Bun.serve({
     hostname: opts.hostname,
     port: config.httpPort,
     idleTimeout: 75,
@@ -96,13 +98,6 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       const attachmentResponse = attachments.fetch(req);
       if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
       if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
-      // A pre-removal `grayboard mcp --mode server` (#282): no auth, no session; the handler answers its hello with a refusal.
-      if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-        if (!refusal.admit(caller.key)) return Response.json({ code: "rate_limited", message: "too many open connections from this address" }, { status: 429 });
-        if (server.upgrade(req, { data: { key: caller.key } })) return;
-        refusal.release(caller.key);
-        return new Response("WebSocket upgrade failed", { status: 500 });
-      }
 
       // A sign-in costs a token up front: the exchange awaits Google. Only a
       // JSON body is accepted, uncharged otherwise: a cross-origin page can
@@ -111,10 +106,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
         authGate.charge(caller, req, path, "sign-in");
       }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return handleHttp(req, repo, db, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
-
-    websocket: refusal.handlers,
 
     // A route that throws something other than a refusal it maps itself. Bun's
     // default answer, without NODE_ENV=production, is a dev page carrying the
@@ -143,7 +136,6 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     oauth,
     repo,
     db,
-    refusal,
     // Exposed for tests: the bridge instance, to drive fatal stops directly.
     slack,
     // The auth re-check and limiter sweep, for tests that run without it.

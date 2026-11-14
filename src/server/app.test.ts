@@ -241,6 +241,34 @@ test("a start option overrides the config's limit, and an explicit undefined one
   const config = { helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 } };
   expect(startLimits(config, { helloLimit: undefined, hostedRequestLimit: undefined })).toMatchObject(config);
   expect(startLimits(config, { helloLimit: { burst: 9, perSec: 9 } })).toMatchObject({ helloLimit: { burst: 9, perSec: 9 }, hostedRequestLimit: config.hostedRequestLimit });
+  // delegate's limits come from the config too (#252).
+  const delegate = { delegateLimit: { burst: 5, perSec: 0.5 }, delegateOpenCap: 4 };
+  expect(startLimits({ ...config, ...delegate }, { delegateLimit: undefined })).toMatchObject(delegate);
+  expect(startLimits({ ...config, ...delegate }, { delegateOpenCap: 9 })).toMatchObject({ ...delegate, delegateOpenCap: 9 });
+});
+
+test("startLimits hands the configured global watch cap to the application's board observers (#805 F-06)", () => {
+  const hostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 5000, perSession: 64 } };
+  expect(startLimits({ helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedCaps }, {})).toMatchObject({ observerCap: 5000 });
+});
+
+test("a started server's hosted MCP surface takes its session caps from the config (#805 F-06)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-caps-"));
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    const hostedCaps = { sessions: { global: 5000, perUser: 300 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
+    app = startServer({ ...restartConfig(dir), hostedCaps }, { hostname, background: false });
+    expect(app.mcp.sessions.limits).toMatchObject({ user: 300, global: 5000 });
+  } finally {
+    await app?.stop();
+    app?.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit observerCap start option overrides the configured watch cap (#805 F-06)", () => {
+  const hostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 5000, perSession: 64 } };
+  expect(startLimits({ helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedCaps }, { observerCap: 5 })).toMatchObject({ observerCap: 5 });
 });
 
 // F-04: a dev sign-in token must not outlive dev auth. A restart without it
