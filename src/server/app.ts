@@ -73,7 +73,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     async fetch(req, server) {
       // First, before anything reads the database (#240).
       const caller = authGate.caller(req, server.requestIP(req)?.address);
-      const path = new URL(req.url).pathname;
+      const url = new URL(req.url);
+      const path = url.pathname;
       const limited = authGate.refuse(caller, path);
       if (limited) return limited;
 
@@ -100,7 +101,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
         authGate.charge(caller, req, path, "sign-in");
       }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
 
     websocket: refusal.handlers,

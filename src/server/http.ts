@@ -511,8 +511,10 @@ export async function handleHttp(
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
+  // The request's URL when the caller already parsed it (the server's fetch does, #278).
+  parsed?: URL,
 ): Promise<Response> {
-  const url    = new URL(req.url);
+  const url    = parsed ?? new URL(req.url);
   const path   = url.pathname;
   const method = req.method;
 
