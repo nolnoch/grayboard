@@ -376,23 +376,26 @@ export class Store {
   }
 
   // Spend on runs started since `since`: every run, or a fleet's (its root
-  // a post on one of `boards`). Rows pruned by retention drop out, so a daily cap
+  // a post on `board`). Rows pruned by retention drop out, so a daily cap
   // needs retention of at least a day (main.ts refuses less).
-  spentSince(since: number, boards?: string[]): number {
-    const [scope, args] = boardScope(since, boards);
+  spentSince(since: number, board?: string): number {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
     return (this.db.query(`SELECT COALESCE(SUM(COALESCE(r.cost_usd, r.granted_usd, 0)), 0) AS n FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ?${scope}`).get(...args) as { n: number }).n;
   }
 
   // When the oldest charge in the window leaves it: the earliest a held fleet may run again.
-  oldestSince(since: number, boards?: string[]): number | null {
-    const [scope, args] = boardScope(since, boards);
+  oldestSince(since: number, board?: string): number | null {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
     return (this.db.query(`SELECT MIN(r.started_at) AS t FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ? AND COALESCE(r.cost_usd, r.granted_usd, 0) > 0${scope}`).get(...args) as { t: number | null }).t;
   }
 
   // Whether a run still open holds a grant in the window: the hold may end
   // when it reports a cost under its grant, well before the window rolls.
-  openGrants(since: number, boards?: string[]): boolean {
-    const [scope, args] = boardScope(since, boards);
+  openGrants(since: number, board?: string): boolean {
+    const scope = board === undefined ? "" : ` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) = ?`;
+    const args: (number | string)[] = board === undefined ? [since] : [since, board];
     return this.db.query(`SELECT 1 FROM runs r JOIN requests q ON q.seq = r.seq LEFT JOIN requests p ON p.seq = q.parent WHERE r.started_at >= ? AND r.ended_at IS NULL AND r.granted_usd > 0${scope} LIMIT 1`).get(...args) !== null;
   }
 
@@ -528,11 +531,4 @@ function toRow(r: Raw): Row {
   const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, shared_until, shared_by, ...rest } = r;
   const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board, askHuman: ask_human === 1, askedAt: asked_at, escalatedAt: escalated_at, resume: resume === 1, sharedUntil: shared_until, sharedBy: shared_by };
   return source === "board" ? { ...base, source: "board", board: board ?? "" } : { ...base, source: "dm" };
-}
-
-// A spend-window query's board filter: none, or roots posted on one of
-// `boards` (a fleet's task board and its share board, #636).
-function boardScope(since: number, boards?: string[]): [string, (number | string)[]] {
-  if (boards === undefined) return ["", [since]];
-  return [` AND COALESCE(p.source, q.source) = 'board' AND COALESCE(p.board, q.board) IN (${boards.map(() => "?").join(", ")})`, [since, ...boards]];
 }
