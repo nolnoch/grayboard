@@ -464,6 +464,35 @@ test("a cancelled unbind that completes is reported in the next result", async (
   expect((again.content as { text: string }[]).map((c) => c.text).join(" ")).not.toContain("completed after it was cancelled");
 }, 30_000);
 
+// #292: a cancelled write that landed is reported in the next result once, with its id, so the agent doesn't repeat it.
+for (const [tool, point, args, id] of [
+  ["dm_send", "send:before-txn", { to: "be", body: "landed anyway" }, "message_id"],
+  ["board_post", "board:before-txn", { board: "e2e", body: "landed anyway" }, "post_id"],
+] as const) {
+  test(`a cancelled ${tool} that lands is reported in the next result`, async () => {
+    const be = await session("be");
+    const s = await session("fe", { extra: pauseEnv(point) });
+    // Every board tool passes board:before-txn, so the unpaused session creates the board.
+    if (tool === "board_post") await be.call("board_create", { name: "e2e", purpose: "test" });
+    const abort = new AbortController();
+    const writing = s.c.callTool({ name: tool, arguments: args }, undefined, { signal: abort.signal });
+    await until(() => s.stderr().includes(`test pause hit: ${point}`));
+    abort.abort();
+    await expect(writing).rejects.toThrow();
+    release(point);
+    const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+    const notice = (r.content as { text: string }[]).slice(1).map((c) => c.text).find((t) => t.startsWith(`${tool} completed after it was cancelled`));
+    expect(notice).toBeDefined();
+    const landedAs = JSON.parse(notice!.slice(notice!.indexOf("{")))[id];
+    expect(landedAs).toEqual(expect.any(Number));
+    if (tool === "dm_send") await until(() => contents(be).includes("landed anyway"));
+    else expect((await be.call("board_read", { board: "e2e" })).posts.map((p: any) => p.id)).toEqual([landedAs]);
+    // Told once.
+    const again = await s.c.callTool({ name: "peer_list", arguments: {} });
+    expect((again.content as { text: string }[]).map((c) => c.text).join(" ")).not.toContain("completed after it was cancelled");
+  }, 30_000);
+}
+
 test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
   const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
   const abort = new AbortController();

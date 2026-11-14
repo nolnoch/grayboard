@@ -525,6 +525,11 @@ let missedBindNotice: string | null = null;
 let instructionsStale = false;
 // What a result the client dropped carried, for the next one.
 const requeued: string[] = [];
+// A write the client cancelled whose result says it landed (#292): the agent
+// never saw that, and might send it again.
+const LANDING_WRITES = new Set(["dm_send", "board_post", "delegate"]);
+const landed = (name: string, r: { isError?: boolean; content: { text: string }[] }): string | null =>
+  !r.isError && LANDING_WRITES.has(name) ? `${name} completed after it was cancelled; it landed, so don't repeat it. ${r.content[0]?.text ?? ""}` : null;
 const notices = (): string[] => {
   const out = requeued.splice(0);
   if (channelsNoticePending && CHANNELS_OFF_NOTICE) out.push(CHANNELS_OFF_NOTICE);
@@ -745,7 +750,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   expiry.arm();
   // A cancelled call's result is dropped: its notices wait for the next one.
   // Notices and fresh instructions are the root's: they never go to a child.
-  if (signal.aborted || agent !== undefined || (ORDINARY && (callSession !== SESSION_ID || callEpoch !== adapterEpoch))) return r;
+  const mine = agent === undefined && !(ORDINARY && (callSession !== SESSION_ID || callEpoch !== adapterEpoch));
+  if (signal.aborted) {
+    const l = mine ? landed(name, r) : null;
+    if (l) requeued.push(l);
+    return r;
+  }
+  if (!mine) return r;
   const extra = notices();
   let out = withNotices(r, extra);
   if (instructionsStale && !out.structuredContent) {
@@ -755,6 +766,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
     if (name === "unbind" && r.structuredContent) requeued.push(unbindMissed(String(args.name), "it was cancelled", r.content[0]!.text));
+    const l = landed(name, r);
+    if (l) requeued.push(l);
     requeued.push(...extra);
     if (out.structuredContent) instructionsStale = true;
   });
