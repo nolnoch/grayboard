@@ -250,6 +250,9 @@ export function aliasUser(db: Database, address: string, exceptPrincipal: string
     `SELECT i.id FROM ids i
       WHERE i.ended_at IS NULL AND (?2 IS NULL OR i.principal IS NOT ?2)
         AND (i.id IN (SELECT id FROM alias_holds WHERE address = ?1) OR i.writes_as = ?1)
+      -- The holder before a tools-only writer, then the oldest: the refusal
+      -- names one session, so the pick can't ride on the plan's row order (#338).
+      ORDER BY i.id IN (SELECT id FROM alias_holds WHERE address = ?1) DESC, i.started_at, i.rowid
       LIMIT 1`,
   ).get(address, exceptPrincipal) as { id: string } | null)?.id ?? null;
 }
