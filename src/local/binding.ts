@@ -440,16 +440,21 @@ function end(db: Database, sessionId: string, why: string | null, now: number): 
   return r;
 }
 
-// Reap rows whose process is gone. Callers are inside a transaction. The
-// rows were judged before it, so each is re-read and re-probed here: another
+// Reap rows whose process is gone. Callers are inside a transaction and pass
+// rows already judged dead on evidence, so each is re-read here: another
 // process may have reaped it already (only the one whose delete removed the
 // row ends the session), or a keyed session's child may have re-attached.
+// An unchanged row needs no new probe, since a process that's gone never
+// comes back; only a changed one is probed again, so the write lock isn't held
+// across a start-time read (a ps spawn on macOS) per candidate (#335).
 export function reap(db: Database, rows: SessionRow[], now: number): Ended {
   const out: Ended = { ended: [], wake: [] };
   for (const r of rows) {
     const cur = db.prepare(`SELECT pid, proc_start, harness_rule FROM bindings WHERE session_id = ?`).get(r.session_id) as
       { pid: number; proc_start: string | null; harness_rule: string | null } | null;
-    if (!cur || isAlive(cur.pid, cur.proc_start)) continue;
+    if (!cur) continue;
+    const unchanged = cur.pid === r.pid && cur.proc_start === r.proc_start;
+    if (!unchanged && isAlive(cur.pid, cur.proc_start)) continue;
     merge(out, r.session_id, end(db, r.session_id, `reaped: ${pidText(cur)} is gone`, now));
   }
   return out;

@@ -26,6 +26,26 @@ test("a dead row reaped twice logs one release", () => {
   expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(id)).toEqual({ ended_at: 2 });
 });
 
+// #335: a row judged dead before the transaction is reaped without a new
+// probe while it's unchanged, so a pid reused in between can't keep it; a row
+// that changed (a child re-attached) is probed again and kept while it lives.
+test("reap trusts the judgement for an unchanged row and re-probes a changed one", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const base = { name: null, names: [], harness: null, harness_pid: null, cwd: null, started_at: 1, harness_rule: null, attached_pid: null, attached_start: null };
+  // Judged dead while pid 999999 was gone; by the transaction, a live process (this one) has that pid.
+  const reused = "id:0123456789abd";
+  registerSession(db, { ...base, session_id: reused, pid: process.pid, proc_start: null });
+  const judged = db.prepare(`SELECT * FROM bindings WHERE session_id = ?`).all(reused) as SessionRow[];
+  db.transaction(() => reap(db, judged, 2)).immediate();
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(reused)).toEqual({ ended_at: 2 });
+  // Judged dead as pid 999999, then re-attached as this live process: kept.
+  const moved = "id:0123456789abe";
+  registerSession(db, { ...base, session_id: moved, pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const stale = [{ ...(db.prepare(`SELECT * FROM bindings WHERE session_id = ?`).get(moved) as SessionRow), pid: 999999 }];
+  db.transaction(() => reap(db, stale, 3)).immediate();
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(moved)).toEqual({ ended_at: null });
+});
+
 // #284 S7: a session holding two aliases is one live row, its primary the
 // one it bound first, and a bind of either by another session is refused.
 test("a session with two holds is one live row; neither name is offered or free", async () => {
