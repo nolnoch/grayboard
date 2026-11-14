@@ -43,9 +43,10 @@ test("attachment tools extend only the configured native namespace and declare s
   expect((get.output as z.ZodType).safeParse({ path: "/work/1-file.txt", filename: "file.txt", type: "text/plain", size: 2, sha256: "hash" }).success).toBe(true);
   await expect(get.execute({ id: 1 }, {} as never)).rejects.toThrow("Permission denied");
   expect(permissionActions).toEqual(["bus_dm_send", "bus_board_post", "bus_attachment_get"]);
-  expect(nativeDescriptions.find(t => t.name === "dm_send")!.description).toEndWith(" Attachments are uploaded IDs, not paths.");
+  expect(nativeDescriptions.find(t => t.name === "dm_send")!.description).toContain("attachment_ids?");
   expect(nativeDescriptions.find(t => t.name === "board_post")!.description).toContain("attachment_ids?");
-  expect(tools.find(t => t.id === "bus_dm_send")!.description).toContain("Attachments are local file paths.");
+  expect(tools.find(t => t.id === "bus_dm_send")!.description).toContain("attachments?, attachment_ids?");
+  expect(tools.find(t => t.id === "bus_dm_send")!.description).toContain("attachments takes local file paths");
 });
 
 test("V2 transfers reuse the native connection and published limits, check permission once and retain each caller's source", async () => {

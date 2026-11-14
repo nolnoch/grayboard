@@ -26,10 +26,10 @@ import { addressParts } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
 import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
 import { attachmentIds, type FileSend } from "./attachments.ts";
-import { ATTACHMENTS_PARAM, type AttachmentInfo } from "../shared/attachments.ts";
+import { ATTACHMENTS_PARAM, ATTACHMENT_IDS_PARAM, type AttachmentInfo } from "../shared/attachments.ts";
 import type { Post } from "../shared/notifications.ts";
 import { WRITE_DEDUP_WINDOW_TEXT } from "../shared/dedup.ts";
-import { DM_INBOX_INSTRUCTION } from "../shared/inbox.ts";
+import { DM_INBOX_INSTRUCTION, PENDING_PARAM } from "../shared/inbox.ts";
 
 export type ToolDef = {
   name: string;
@@ -48,7 +48,75 @@ export const RESEND_PARAM = { type: "boolean", description: `true sends again ev
 // On the writes a session can make as another of its addresses (#284 S3).
 export const AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: an alias you hold, or your session ID." };
 
-export function boardTools(opts: { teams: boolean }): ToolDef[] {
+// How a write names its files: local paths it reads (local mode), or the IDs
+// of files already uploaded over the attachment HTTP API (a server's hosted MCP).
+export type AttachmentForm = "paths" | "ids";
+const attachmentParam = (form: AttachmentForm) =>
+  form === "ids" ? { attachment_ids: ATTACHMENT_IDS_PARAM } : { attachments: ATTACHMENTS_PARAM };
+
+// A message ID: hosted MCP validates arguments against the schema, so 0, -1
+// or 1.5 is refused before it reaches a handler.
+const messageId = (description: string) => ({ type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER, description });
+
+// dm_send, dm_history and dm_thread, served by both modes (#385); dm_inbox,
+// dm_ack and dm_retract are in src/shared/inbox.ts. Each surface implements them.
+export function dmTools(opts: { attachments: AttachmentForm }): ToolDef[] {
+  const files = opts.attachments === "ids" ? "attachment_ids" : "attachments";
+  return [
+    {
+      name: "dm_send",
+      // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
+      // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
+      _meta: { "anthropic/alwaysLoad": true },
+      description: `dm_send(to, body, parent_id?, pending?, ${files}?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          to: {
+            type: "string",
+            description: opts.attachments === "ids"
+              ? "The peer's exact handle, as peer_list shows it, or a bare identity name."
+              : "The peer's exact handle, as peer_list shows it.",
+          },
+          body: { type: "string", description: "Message body. Plain text or markdown." },
+          parent_id: messageId("Optional. message_id this is replying to; sets the thread parent."),
+          pending: PENDING_PARAM,
+          ...attachmentParam(opts.attachments),
+          resend: RESEND_PARAM,
+          as: AS_PARAM,
+        },
+        required: ["to", "body"],
+      },
+    },
+    {
+      name: "dm_history",
+      description:
+        "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          peer: { type: "string", description: "Optional. Only return messages between you and this peer identity." },
+          limit: { type: "number", description: "Max messages to return (default 20, max 200)." },
+          before_id: messageId("Return messages with id strictly less than this; use for pagination."),
+        },
+      },
+    },
+    {
+      name: "dm_thread",
+      _meta: { "anthropic/alwaysLoad": true },
+      description:
+        "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
+      inputSchema: {
+        type: "object",
+        properties: { thread: messageId("Any message_id in the thread.") },
+        required: ["thread"],
+      },
+    },
+  ];
+}
+
+export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }): ToolDef[] {
+  const files = opts.attachments === "ids" ? "attachment_ids" : "attachments";
   return [
     {
       name: "board_list",
@@ -86,14 +154,14 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
       name: "board_post",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        "board_post(board, body, parent_id?, attachments?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
+        `board_post(board, body, parent_id?, ${files}?, resend?, as?): ` + "post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
       inputSchema: {
         type: "object",
         properties: {
           board: BOARD,
           body: { type: "string", description: "Plain text or markdown." },
           parent_id: { type: "number", description: "Optional. post_id to reply to." },
-          attachments: ATTACHMENTS_PARAM,
+          ...attachmentParam(opts.attachments),
           resend: RESEND_PARAM,
           as: AS_PARAM,
         },
@@ -219,7 +287,7 @@ export function boardTools(opts: { teams: boolean }): ToolDef[] {
   ];
 }
 
-const NAMES = new Set(boardTools({ teams: true }).map((t) => t.name));
+const NAMES = new Set(boardTools({ teams: true, attachments: "paths" }).map((t) => t.name));
 
 export function isBoardTool(name: string): boolean {
   return NAMES.has(name);

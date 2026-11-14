@@ -197,7 +197,7 @@ export function boardActor(
 // boards.ts -> session_end.ts -> this module is an import cycle, so when
 // tools.ts loads first, boardTools isn't ready at this module's load.
 let asTools: Set<string> | undefined;
-const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
+const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true, attachments: "paths" }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
 
 const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
 

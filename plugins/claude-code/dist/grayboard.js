@@ -34907,6 +34907,11 @@ var ATTACHMENTS_PARAM = {
   items: { type: "string" },
   description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`
 };
+var ATTACHMENT_IDS_PARAM = {
+  type: "array",
+  items: { type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+};
 var ATTACHMENT_GET_TOOL = {
   name: "attachment_get",
   description: "attachment_get(id, dir?): save a file attached to a message or post you can read (ids are in its attachments) and return the saved path.",
@@ -35319,16 +35324,7 @@ var native_tools_default = [
           type: "number",
           description: "Optional. post_id to reply to."
         },
-        resend: {
-          type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes."
-        },
-        as: {
-          type: "string",
-          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
-        },
         attachment_ids: {
-          $schema: "https://json-schema.org/draft/2020-12/schema",
           type: "array",
           items: {
             type: "integer",
@@ -35336,6 +35332,14 @@ var native_tools_default = [
             maximum: 9007199254740991
           },
           description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+        },
+        resend: {
+          type: "boolean",
+          description: "true sends again even if an identical call landed in the last 10 minutes."
+        },
+        as: {
+          type: "string",
+          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
         }
       },
       required: [
@@ -35553,20 +35557,23 @@ var native_tools_default = [
   },
   {
     name: "dm_send",
-    description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
+    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
     inputSchema: {
       type: "object",
       properties: {
         to: {
-          type: "string"
+          type: "string",
+          description: "The peer's exact handle, as peer_list shows it, or a bare identity name."
         },
         body: {
-          type: "string"
+          type: "string",
+          description: "Message body. Plain text or markdown."
         },
         parent_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Optional. message_id this is replying to; sets the thread parent."
         },
         pending: {
           type: "boolean",
@@ -35594,7 +35601,6 @@ var native_tools_default = [
         "to",
         "body"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     },
     _meta: {
@@ -35637,42 +35643,44 @@ var native_tools_default = [
   },
   {
     name: "dm_history",
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
+    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: {
       type: "object",
       properties: {
         peer: {
-          type: "string"
+          type: "string",
+          description: "Optional. Only return messages between you and this peer identity."
         },
         limit: {
-          type: "number"
+          type: "number",
+          description: "Max messages to return (default 20, max 200)."
         },
         before_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Return messages with id strictly less than this; use for pagination."
         }
       },
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     }
   },
   {
     name: "dm_thread",
-    description: "A whole direct-message thread you participate in.",
+    description: "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     inputSchema: {
       type: "object",
       properties: {
         thread: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Any message_id in the thread."
         }
       },
       required: [
         "thread"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     },
     _meta: {
@@ -35929,7 +35937,7 @@ function hostTools(native) {
 }
 function withPaths(tool) {
   const properties = Object.fromEntries(Object.entries(tool.inputSchema.properties ?? {}).map(([key, value]) => key === "attachment_ids" ? ["attachments", ATTACHMENTS_PARAM] : [key, value]));
-  const description = tool.description?.replace("attachment_ids?", "attachments?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.");
+  const description = tool.description?.replace("attachment_ids?", "attachments?");
   return { ...tool, ...description === undefined ? {} : { description }, inputSchema: { ...tool.inputSchema, properties } };
 }
 var text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
