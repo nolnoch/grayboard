@@ -44,13 +44,15 @@ const NOT_ENDED: EndedSession = { ended: false, held: [], wake: [] };
  * poke `wake` and sweep the freed upload bytes after it commits. `why` details the release events (a reap names the dead pid).
  * `legacyNames`: a name a 1.x process holds through its bindings row.
  * `audit`: where the id.ended row goes (the server's access_log); audit_log when absent.
+ * `by`: who ended it (local: `by_pid`), on its row and its children's; `evidence`:
+ * what an ender saw (a reap's dead row and probe), on its row only (#330).
  * A session already ended is left alone.
  */
 export function endSession(
   db: Database,
   mail: MailPort,
   id: string,
-  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink } = {},
+  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink; by?: Record<string, unknown>; evidence?: Record<string, unknown> } = {},
 ): EndedSession {
   const now = opts.now ?? Date.now();
   const row = db.prepare(`SELECT ended_at, principal FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; principal: string | null } | null;
@@ -109,7 +111,7 @@ export function endSession(
   // Its child sessions (#523) act under its addresses, so they end with it, each audited.
   const children = (db.prepare(`SELECT id FROM ids WHERE root_id = ? AND ended_at IS NULL ORDER BY id`).all(id) as { id: string }[]).map((r) => r.id);
   for (const child of children) {
-    for (const h of endSession(db, mail, child, { why: `its root ${id} ended`, now, ...(opts.audit ? { audit: opts.audit } : {}) }).wake) wake.add(h);
+    for (const h of endSession(db, mail, child, { why: `its root ${id} ended`, now, ...(opts.audit ? { audit: opts.audit } : {}), ...(opts.by ? { by: opts.by } : {}) }).wake) wake.add(h);
   }
   (opts.audit ?? coreAuditSink(db))("id.ended", id, id, {
     principal: row?.principal ?? null,
@@ -119,6 +121,8 @@ export function endSession(
     ...(unbounced ? { unbounced } : {}),
     ...(releaseFailed.length ? { release_failed: releaseFailed } : {}),
     ...(children.length ? { children } : {}),
+    ...opts.by,
+    ...opts.evidence,
   });
   wake.delete(id);
   return { ended: true, held, wake: [...wake] };
