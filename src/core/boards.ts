@@ -15,6 +15,7 @@ export type CoreDb = Database;
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_PURPOSE_CHARS = 500;
 
 // A post's or direct message's body, checked alike in both modes (#75).
 export function checkBody(body: unknown): string {
@@ -378,6 +379,8 @@ export function createBoard(
 ): Board {
   const board = normalizeBoard(name);
   if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  // One line, shown in every board_list (#76).
+  if (purpose.length > MAX_PURPOSE_CHARS) throw new CoreError(`purpose must be at most ${MAX_PURPOSE_CHARS} chars`);
   const kind = opts.kind ?? "broadcast";
   if (kind !== "broadcast" && kind !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
   const denied = access(db).checkCreate(handle, scope);
