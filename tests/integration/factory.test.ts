@@ -372,6 +372,7 @@ class FakeRunner implements Runner {
   meta: (r: Request) => RunMeta | undefined = () => undefined; // what a run reports about itself (#649)
   mcps: (McpServer | undefined)[] = []; // each run's MCP server (#669), in run order
   use?: (mcp: McpServer | undefined) => Promise<string>; // what a run does with it; its text is the run's
+  work?: (r: Request, place: Place) => void; // what a run does in its directory (#683), before it returns
   async run(agent: Agent, r: Request, signal: AbortSignal, policy: Policy, place: Place, transcript: string, resume?: Resume, mcp?: McpServer): Promise<Outcome> {
     this.mcps.push(mcp);
     if (this.use) {
@@ -382,6 +383,7 @@ class FakeRunner implements Runner {
     this.runs.push({ agent: agent.name, id: r.id });
     this.policies.push(policy);
     this.places.push(place);
+    this.work?.(r, place);
     const suffix = `\n\n${askInstruction()}`;
     this.raw.push(r.task);
     this.inputs.push(r.task.endsWith(suffix) ? r.task.slice(0, -suffix.length) : r.task);
@@ -2862,6 +2864,7 @@ test("limits (#657): a deadline that fires on a running subtask stops its waitin
   // No tick ran it (the question clock's is 30 s): the subtasks' clamped timers did.
   expect(bus.replies(7)[2]).toBe("[factory] stopped: the task passed its deadline of 1s after it fanned out on #sim-work (posts 1001, 1002); its subtasks stop and nothing is combined.");
   for (const id of [1001, 1002]) {
+    await until(() => bus.replies(id).length > 0, 5000, `subtask ${id}'s stop reply`); // each aborted run's reply is sent after the root's
     expect(bus.replies(id)).toEqual(["[factory] stopped: the task passed its deadline of 1s while fake agent `researcher` ran."]);
     expect(store.runs(store.get({ source: "board", id })!.seq).map((r) => r.outcome)).toEqual(["deadline"]);
   }
@@ -2903,4 +2906,78 @@ test("limits (#657): a reload that adds a day cap is refused while the running r
   expect(reloadRefusal({ ...running, retentionMs: 60_000 }, capped)).toBe('"dailyBudgetUsd" needs a running "retentionMs" of at least 86400000 (a day); restart to change it');
   expect(reloadRefusal({ ...running, retentionMs: 86_400_000 }, capped)).toBeNull();
   expect(reloadRefusal({ ...running, retentionMs: 60_000 }, running)).toBeNull();
+});
+
+// ── result handback (#683) ───────────────────────────────────────────────────
+
+function gitRepo(): { repo: string; git: (cwd: string, ...args: string[]) => string } {
+  const env = repositoryGitEnv();
+  const git = (cwd: string, ...args: string[]) => {
+    const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+    return r.stdout.toString().trim();
+  };
+  const repo = join(dir, "repo");
+  mkdirSync(repo);
+  git(repo, "init", "-q", "-b", "master");
+  writeFileSync(join(repo, "a.txt"), "a\n");
+  git(repo, "add", "a.txt");
+  git(repo, "commit", "-qm", "a");
+  return { repo, git };
+}
+
+test("handback (#683): a tree's main HEAD with new commits becomes a branch, a taken name gets the short id, and a sweep leaves it", async () => {
+  const { repo, git } = gitRepo();
+  const wt: Workdir = { mode: "worktree", repo };
+  const ws = new Workspaces(join(dir, "trees"), join(dir, "work"));
+  expect(await ws.handBack({ mode: "scratch" }, 3, "factory/x/1")).toBeNull();
+  expect(await ws.handBack(wt, 3, "factory/x/1")).toBeNull(); // no worktree yet
+  const main = await ws.place(wt, { tree: 3, sub: null, synthesis: false });
+  expect(await ws.handBack(wt, 3, "factory/x/1")).toBeNull(); // HEAD is master's: nothing new
+  writeFileSync(join(main.cwd, "b.txt"), "b\n");
+  git(main.cwd, "add", "b.txt");
+  git(main.cwd, "commit", "-qm", "b");
+  const sha = git(main.cwd, "rev-parse", "HEAD");
+  git(repo, "branch", "factory/x/1", "master"); // the name is taken
+  expect(await ws.handBack(wt, 3, "factory/x/1")).toEqual({ branch: `factory/x/1-${sha.slice(0, 7)}`, sha });
+  expect(await ws.handBack(wt, 3, "factory/x/1")).toBeNull(); // now on a branch: nothing new
+  writeFileSync(join(main.cwd, "c.txt"), "c\n");
+  git(main.cwd, "add", "c.txt");
+  git(main.cwd, "commit", "-qm", "c");
+  const c = git(main.cwd, "rev-parse", "HEAD");
+  git(repo, "branch", `factory/x/1-${c.slice(0, 7)}`, "master"); // both names taken
+  await expect(ws.handBack(wt, 3, "factory/x/1")).rejects.toThrow(`branches factory/x/1 and factory/x/1-${c.slice(0, 7)} both exist`);
+  git(repo, "branch", "-D", `factory/x/1-${c.slice(0, 7)}`);
+  git(main.cwd, "reset", "-q", "--hard", sha);
+  expect(await ws.sweep(() => false)).toBe(1);
+  expect(git(repo, "rev-parse", `factory/x/1-${sha.slice(0, 7)}`)).toBe(sha);
+  expect(git(repo, "rev-parse", "factory/x/1")).toBe(git(repo, "rev-parse", "master"));
+});
+
+test("handback (#683): a worktree fleet's combined reply names its branch in its first line; subtasks and a commitless task don't get one", async () => {
+  const { repo, git } = gitRepo();
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  runner.work = (r, place) => {
+    if (r.id !== 7 || !r.task.includes("## Subtask results")) return;
+    writeFileSync(join(place.cwd, "combined.txt"), "c\n");
+    git(place.cwd, "add", "combined.txt");
+    git(place.cwd, "commit", "-qm", "combined");
+  };
+  const { bus, store, done } = loop({ runner, fleets: [{ name: "sim", agent: "researcher", workdir: { mode: "worktree", repo } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5000, "fan-out and synthesis");
+  const seq = store.get({ source: "board", id: 7 })!.seq;
+  const sha = git(join(dir, "trees", String(seq), "main"), "rev-parse", "HEAD");
+  expect(git(repo, "rev-parse", "factory/sim-tasks/7")).toBe(sha);
+  const [head, ...rest] = bus.replies(7)[2]!.split("\n\n");
+  expect(head).toBe(`[factory] done: fake agent \`researcher\`, combining 2 subtasks on #sim-work; the result is on branch \`factory/sim-tasks/7\` at ${sha.slice(0, 12)} in ${repo}.`);
+  expect(rest.join("\n\n")).toBe("result for 7");
+  for (const id of [1001, 1002]) expect(bus.replies(id).some((b) => b.includes("branch"))).toBe(false);
+  runner.script = () => undefined;
+  bus.deliver(task(8));
+  await until(() => bus.replies(8).length === 2, 5000, "8 done");
+  expect(bus.replies(8)[1]!.split("\n\n")[0]).toBe("[factory] done: fake agent `researcher`; no new commits, so no branch.");
+  await bus.close();
+  await done;
 });

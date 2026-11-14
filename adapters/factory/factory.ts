@@ -379,11 +379,31 @@ export class Factory {
     // Decided once per run: the prompt and the grant must agree.
     const lead = row.parent === null && row.fanout, maxRounds = this.limitsFor(row).maxRounds ?? 1, plans = this.canPlan(row);
     if (plans && synth) this.planning.add(row.seq);
+    let body: string | null;
     try {
-      return await this.outcomeOf(row, set, { synth, max, ownDir, profiles, lead, maxRounds, plans });
+      body = await this.outcomeOf(row, set, { synth, max, ownDir, profiles, lead, maxRounds, plans });
     } finally {
       this.planning.delete(row.seq);
     }
+    return body !== null && row.parent === null ? this.handBack(row, set.workdir, body) : body;
+  }
+
+  // A worktree-mode request's last reply names the branch its result is on
+  // (#683), in the reply's first line so a clipped reply keeps it.
+  private async handBack(row: Row, w: Workdir, body: string): Promise<string> {
+    if (w.mode !== "worktree") return body;
+    const name = `factory/${row.source === "board" ? row.board : "dm"}/${row.id}`;
+    let note: string | null;
+    try {
+      const b = await this.o.workspaces.handBack(w, row.seq, name);
+      note = b ? `the result is on branch \`${b.branch}\` at ${b.sha.slice(0, 12)} in ${w.repo}` : body.startsWith("[factory] done:") ? "no new commits, so no branch" : null;
+    } catch (e) {
+      this.o.log(`request ${row.id}: couldn't hand back a branch: ${msg(e)}`);
+      note = `couldn't make its branch (${msg(e)}); its worktree stays until the store prunes the request`;
+    }
+    if (note === null) return body;
+    const cut = body.indexOf("\n\n");
+    return cut < 0 ? `${body.replace(/\.$/, "")}; ${note}.` : `${body.slice(0, cut)}; ${note}.${body.slice(cut)}`;
   }
 
   private async outcomeOf(row: Row, set: Settings, c: { synth: boolean; max: number; ownDir: (s: Settings | string) => boolean; profiles: { name: string; agent: string; tools: string }[]; lead: boolean; maxRounds: number; plans: boolean }): Promise<string | null> {
