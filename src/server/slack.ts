@@ -229,7 +229,6 @@ export class SlackBridge implements SlackLinker {
     const application = this.o.application;
     let session!: ApplicationSession;
     const sink: DeliverySink = {
-      probe: async () => true,
       closed: () => this.detach(link.user_id),
       deliver(m) {
         if (m.kind === "direct") relay.notify(dmNotification(m.message));

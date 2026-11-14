@@ -15,7 +15,7 @@ let blobDir: string;
 let alice: AuthedUser;
 let bob: AuthedUser;
 function delivery(): DeliverySink {
-  return { deliver: () => {}, probe: async () => true, closed: () => {} };
+  return { deliver: () => {}, closed: () => {} };
 }
 // A connected AppSession: it registers like a hosted session and binds `alias`.
 async function connect(user: AuthedUser, alias: string | null, opts: ConstructorParameters<typeof AppSession>[3] = {}): Promise<AppSession> {
@@ -229,12 +229,18 @@ test("unbound hosted reads never use the human address and still list and read b
   application.close(bobBe);
 });
 
-test("a hosted session whose hello facts throw is left unregistered (#385 item 9)", () => {
+test("a hosted session whose hello facts throw is left unregistered (#385 item 9)", async () => {
+  const pushed: unknown[] = [];
   const teams = spyOn(store.repo.teams, "listForUser").mockImplementation(() => { throw new Error("db gone"); });
   try {
-    expect(() => application.hostedSession(alice, "id:2222222222222", ["alice@example.com/be"], null, null, delivery(), true, true)).toThrow("db gone");
+    expect(() => application.hostedSession(alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).toThrow("db gone");
   } finally { teams.mockRestore(); }
-  expect(application.hostedHolder("alice@example.com/be")).toBeUndefined();
+  // An unheld "be": a DM to it is pushed only to a session the hub routes it to.
+  store.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
+  const sender = await connect(alice, "sender");
+  await sender.send("alice@example.com/be", "no route left behind");
+  expect(pushed).toEqual([]);
+  sender.close();
 });
 
 test("unbound hosted sessions cannot use named operations or persist synthetic handles", async () => {

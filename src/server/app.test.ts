@@ -135,7 +135,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
       }
     }
     expect(released()).toBe(0);
-    expect(app.application.hostedHolder("you@example.com/be")).toBeDefined();
+    expect(app.application.aliasHolderId("you@example.com/be")).not.toBeNull();
     expect(app.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='bound'").get()?.count).toBe(1);
     if (scenario !== "idle") expect((await app.mcp.delivery.open(principal, context)).ownership).toBe(lease.ownership);
   } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }

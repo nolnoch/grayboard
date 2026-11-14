@@ -288,7 +288,7 @@ test("G2 ordinary writes do not attach, G1 revoke releases atomically including 
   database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "revoked" }]);
-  expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
+  expect(application.aliasHolderId("you@example.com/fe")).toBeNull();
   await hosted.bind(second.principal, context(second.principal), { name: "fe" });
   expect(await hosted.whoami(second.principal, context(second.principal, "child"))).toHaveProperty("unbound", true);
 });
@@ -319,7 +319,7 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   database.repo.users.setDisabled(second.authed.user_id, true);
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "disabled" }]);
-  expect(application.hostedHolder("you@example.com/fe")).toBeUndefined();
+  expect(application.aliasHolderId("you@example.com/fe")).toBeNull();
 });
 
 test("opening a pre-hosted SQLite schema adds tables without changing users, messages or OAuth", async () => {

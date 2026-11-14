@@ -10,9 +10,9 @@ import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./w
 import { testPause } from "../shared/testpause.ts";
 import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
+  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
-  type AliasUse, type Candidate, type Continuity,
+  type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
@@ -22,7 +22,7 @@ import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
-  setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, inheritStatus, normalizeBoard, getBoard,
+  setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
@@ -54,7 +54,6 @@ export type DeliveryEvent =
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
-  probe(ms: number): Promise<boolean>;
   closed(error: ApplicationError): void;
 };
 // A hosted session's facts, for its MCP instructions (src/server/mcp.ts).
@@ -67,7 +66,6 @@ export type SessionFacts = {
 export type IdentityInfo = SessionFacts & {
   candidates?: Candidate[];
   identity_full: string;
-  notices?: string[];
 };
 export type SendResult = WireSendResult;
 export type InboxResult = {
@@ -76,7 +74,6 @@ export type InboxResult = {
   undelivered_from_you?: { to: string; n: number; oldest_id: number; last_seen?: string }[];
 };
 export type ApplicationOptions = {
-  probeMs?: number;
   humanReach?: HumanReach;
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
@@ -87,7 +84,7 @@ export type ApplicationOptions = {
 };
 // What a session's user facts are: the bridge's human attach answers them.
 export type HelloResult = { id: string } & SessionFacts;
-export type BindResult = { alias: string; held: string[]; notices?: string[]; restored?: Continuity };
+export type BindResult = { alias: string; held: string[]; notices?: string[] };
 export type UnbindResult = { alias: string; released: boolean; held: string[]; left?: string[] };
 
 /**
@@ -134,8 +131,6 @@ export class ApplicationSession {
   holds: string[] = [];
   // A tools-only session (S7): writes as writes_as, binds nothing.
   toolsOnly = false;
-  // Ended by its `end` (S4): any later call is refused.
-  ended = false;
   // Why it closed, when the server closed it: what a later call is told.
   closedBy?: ApplicationError;
   // Set by a caller that runs the call inside an outer transaction (hosted's
@@ -188,10 +183,7 @@ type Hub = {
   // address -> the session pushes go to: a push session's ID and its bound
   // aliases, a Slack bridge human's email/human, a hosted lease's name.
   registry: Map<string, ApplicationSession>;
-  // session ID -> the hosted session holding its name (hosted.ts reconcile).
-  hostedHolders: Map<string, ApplicationSession>;
   sessions: Set<ApplicationSession>;
-  probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
@@ -371,27 +363,6 @@ function describeHolder(hub: Hub, id: string, asker: string): string {
   return `the session ${id}${place ? `, in ${place}` : ""}`;
 }
 
-// A bind's claim to continue an earlier session on the alias (#211), checked
-// against the alias's history in the bind's transaction. restored_from names
-// a public ID, which any client of the principal can present, so it proves
-// nothing (PR 4 S11, #259): kept as audit, carrying no status. previous_key
-// is the ended session's secret, so it proves descent after a reconnect
-// past the grace (PR 3 S4); a verified one carries the status over.
-function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m: Omit<BindRequest, "type" | "req_id">): Continuity | undefined {
-  const { db } = hub;
-  if (m.restored_from !== undefined) return { verified: false, detail: `restore claimed from ${m.restored_from}, not verified` };
-  if (m.previous_key === undefined) return undefined;
-  const prev = idAddress(m.previous_key);
-  const row = idRow(db, prev);
-  if (!row || row.principal !== authed.user_email || row.ended_at === null) {
-    return { verified: false, detail: `restore after end not verified: ${prev} isn't an ended session of yours` };
-  }
-  const c = continuityOf(db, address, prev);
-  if (!c.verified) return c;
-  inheritStatus(db, id, prev);
-  return { verified: true, detail: `restored after end of session ${prev}` };
-}
-
 // A refusal's row, written now, or by the session's `afterRollback` when the call runs inside a transaction
 // the refusal's throw rolls back (#452, #467).
 function rowAfterRollback(session: ApplicationSession, write: () => void) {
@@ -409,9 +380,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     repo,
     db,
     registry: new Map(),
-    hostedHolders: new Map(),
     sessions: new Set(),
-    probeMs: opts.probeMs ?? 2000,
     humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
     now,
@@ -486,7 +455,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
     const id = session.sessionId;
     detach(session);
-    if (hub.hostedHolders.get(id) === session) hub.hostedHolders.delete(id);
     if (session.writerId) touchId(db, session.writerId);
   }
   // The server closes the session: it leaves the hub, and its transport is
@@ -498,7 +466,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     session.sink.closed(error);
   }
   function valid(session: ApplicationSession, allowUnbound = false) {
-    if (session.ended) fail("id_ended", `session ${session.sessionId} has ended`);
     if (!session.active || !hub.sessions.has(session)) {
       // A superseded bridge connection is told so, a revoked tools-only
       // one why it may not write as its alias (S9); any other closed session
@@ -638,22 +605,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
   // already holds answers ok and applies only `meta`; the others stay held,
   // and the primary changes only when the session held nothing.
-  // A hosted holder of the alias answers a probe before the bind decides
-  // (#402); bindNow is the rest, synchronous, which a hosted bind needs inside its
-  // transaction (hosted.ts clears a stale hosted contender itself first, so any hosted
-  // holder bindNow sees is live).
-  async function bind(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
-    valid(session, true);
-    const target = bindTarget(hub, session.authed, m.alias);
-    const holder = "error" in target ? null : holderOf(db, target.address);
-    const hosted = holder === null ? undefined : hub.hostedHolders.get(holder);
-    if (hosted && hosted.sessionId !== session.sessionId) {
-      const responding = await hosted.sink.probe(hub.probeMs).catch(() => false);
-      valid(session, true);
-      if (!responding && hub.hostedHolders.get(hosted.sessionId) === hosted) close(hosted);
-    }
-    return bindNow(session, m);
-  }
   // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
   // transaction the refusal's throw rolls back, and the row is written after it.
   function bindNow(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): BindResult {
@@ -703,9 +654,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const message = unknownNameError(scope.name, known);
       return refuse("identity_unknown", message, message, { known });
     }
-    // Another session's hold is never taken over. A hosted
-    // holder was probed by bind (#402), or cleared by the hosted service: one idle
-    // past the hosted window ended and freed the alias; a live one refuses the bind.
+    // Another session's hold is never taken over. The hosted service clears a stale
+    // hosted holder first (#402): one idle past the hosted window ended and freed the
+    // alias; a live one refuses the bind.
     const holder = holderOf(db, address);
     if (holder !== null && holder !== id) {
       const who = describeHolder(hub, holder, authed.user_email);
@@ -723,21 +674,19 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       return refuse("bad_request", why, why);
     }
 
-    const restored = repo.atomic(() => {
+    repo.atomic(() => {
       createLazily(hub, authed, target, id);
-      const c = continuity(hub, authed, id, address, m);
       holdAlias(db, address, id, now());
-      logBinding(db, id, address, "bound", c?.detail ?? null);
+      logBinding(db, id, address, "bound", null);
       if (meta) setAliasMeta(db, address, meta, id, audit);
       touchAlias(db, address);
-      return c;
     });
 
     setHolds(hub, session, holdsOf(db, id));
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = owedBridgeNotice(repo, authed.user_email);
     const notices = noticesFor(hub, session.addresses, owed ? [owed] : []);
-    return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}), ...(restored ? { restored } : {}) };
+    return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
 
   // unbind (#284 PR 4 S2): release one hold. Its mail queues and its claims
@@ -765,13 +714,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
   const application = {
     repo,
-    // The live session holding `full`: the hub's view, which
-    // a transaction changes only after it commits (the hosted store's
-    // reconcile), as master's holder map did.
-    hostedHolder(full: string): ApplicationSession | undefined {
-      for (const s of hub.hostedHolders.values()) if (s.active && s.holds.includes(full)) return s;
-      return undefined;
-    },
     admitHosted,
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
     hostedCandidates(authed: AuthedUser, suggested: string | null) { return candidates(hub, authed, suggested); },
@@ -783,7 +725,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // place and suggested name (#443), null with no row. `root`: set for a child session (#523),
     // which acts under its root's addresses, never its own ID (not an address), and whose writes
     // carry its ID as `via`.
-    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, hold = false, push = false, root: string | null = null) {
+    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, push = false, root: string | null = null) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
@@ -809,7 +751,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         ...(session.readOnly && session.via === undefined ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
       };
       hub.sessions.add(session);
-      if (hold && holds.length) hub.hostedHolders.set(id, session);
       if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
       return { session, info };
     },
@@ -901,7 +842,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
-    bind,
     bindNow,
     hostedRefused(id: string, address: string, detail: string) { logBinding(db, id, address, "refused", detail); },
     hostedCollided(authed: AuthedUser, id: string, why: string) { writeAudit(repo, "id.collision", authed.user_email, id, { why }); },

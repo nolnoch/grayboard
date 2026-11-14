@@ -470,8 +470,8 @@ test("bind publishes its new hold before the after-commit pause and the first ho
   await sender.connect();
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     await sender.send("you@example.com/fe", "not for be");
-    expect(application.hostedHolder("you@example.com/fe")).toBeDefined();
-    expect(application.hostedHolder("you@example.com/be")).toBe(application.hostedHolder("you@example.com/fe"));
+    expect(application.aliasHolderId("you@example.com/fe")).not.toBeNull();
+    expect(application.aliasHolderId("you@example.com/be")).toBe(application.aliasHolderId("you@example.com/fe"));
   });
   const lease = await delivery.open(principal, context("root"));
   expect(await delivery.pending(principal, context("root"), lease.capability)).toHaveLength(1);

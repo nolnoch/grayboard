@@ -91,9 +91,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         let lease!: Lease;
         const selected = application.hostedSession(p.authed, row.session_id, application.hostedHolds(row.session_id), null, row, {
           deliver() { if (lease && matches(lease, store.get(lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
-          probe: async () => true,
           closed() { if (lease) finish(lease); },
-        }, false, true);
+        }, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
           ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
         leases.set(lease.capability, lease);
