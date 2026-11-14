@@ -174,6 +174,32 @@ test("top-level @handle and #board start conversations; mistakes get an answer",
   await until(() => slack.acks.includes(stray.envelope));
 }, 30_000);
 
+// #332: a post whose @id: names a session that can't receive is refused whole (#284 S9); the human sees why in the
+// Slack thread, both for a new #board post and for a reply in a mapped board thread.
+test("a post mentioning an ended @id: is refused, and the refusal reaches the Slack thread", async () => {
+  const be = await agent("be");
+  const sim = await agent("sim");
+  const { id } = await call(sim.c, "whoami");
+  await stopSession(sim.c);
+  await startBridge();
+  await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
+  const ended = new RegExp(`^⚠️ not posted: id_ended: ${id} ended at \\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z; it held \`sim\`$`);
+
+  const top = slack.say(`#e2e ping @${id}`);
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === top.ts))).markdown_text).toMatch(ended);
+  await until(() => slack.acks.includes(top.envelope));
+
+  const root = await call(be.c, "board_post", { board: "e2e", body: "@alex who owns the soak?" });
+  const p1 = await until(() => slack.posts().find((p) => p.markdown_text?.includes("who owns the soak")));
+  slack.say(`ask @${id}`, { thread_ts: slackTsOf(p1) });
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === slackTsOf(p1) && p.markdown_text?.startsWith("⚠️")))).markdown_text).toMatch(ended);
+
+  // Nothing reached the board.
+  const thread = await call(be.c, "board_read", { board: "e2e", thread: root.post_id });
+  expect(thread.posts.map((p: any) => p.body)).toEqual(["@alex who owns the soak?"]);
+  expect((await call(be.c, "board_read", { board: "e2e" })).posts.some((p: any) => p.body.includes("@id:"))).toBe(false);
+}, 30_000);
+
 test("only the owner's new messages are relayed; duplicates once; every envelope acked", async () => {
   const be = await agent("be");
   await startBridge();

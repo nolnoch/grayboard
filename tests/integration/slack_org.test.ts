@@ -307,6 +307,21 @@ function postId(s: HostedSession, body: string): Promise<number> {
 
 const posted = (text: string) => slack.posts().some((p) => p.markdown_text?.includes(text));
 
+// #332: the org bridge's refusal for an @id: that can't receive reaches the Slack thread, and nothing is posted. A
+// hosted session_end keeps its ID (#451 decision 7), so the undeliverable ID here is one that never existed.
+test("a Slack post mentioning an @id: that can't receive is refused in its thread", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+
+  const top = slack.say("#e2e ping @id:0123456789abz");
+  const reply = await until(() => slack.posts().find((p) => p.thread_ts === top.ts));
+  expect(reply.markdown_text).toBe("⚠️ not posted: no session id:0123456789abz");
+  await until(() => slack.acks.includes(top.envelope));
+  expect((await be.call<ReadResult>("board_read", { board: "e2e" })).posts).toEqual([]);
+}, 30_000);
+
 test("a thread reply reaches a human only as a DM could", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
