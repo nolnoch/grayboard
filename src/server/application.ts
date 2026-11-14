@@ -360,8 +360,11 @@ function createLazily(hub: Hub, authed: AuthedUser, { address, scope }: Exclude<
 }
 
 // Who holds an alias, for an alias_held refusal: its ID and where it runs.
-function describeHolder(hub: Hub, id: string): string {
-  const place = idRow(hub.db, id)?.place;
+// `place` describes the holder's machine, so only its own principal sees it
+// (#349): a team alias's asker can be another member.
+function describeHolder(hub: Hub, id: string, asker: string): string {
+  const row = idRow(hub.db, id);
+  const place = row?.principal === asker ? row.place : null;
   // A hosted root has no connection to disconnect: it is last seen when its client last called (#402).
   const hosted = hub.repo.hosted.get(id);
   if (hosted) return `the hosted session ${id}${place ? `, in ${place}` : ""}, last seen ${Math.floor((hub.now() - hosted.last_seen_at) / 1000)}s ago`;
@@ -705,7 +708,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // past the hosted window ended and freed the alias; a live one refuses the bind.
     const holder = holderOf(db, address);
     if (holder !== null && holder !== id) {
-      const who = describeHolder(hub, holder);
+      const who = describeHolder(hub, holder, authed.user_email);
       return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who });
     }
     // Another user's tools-only session writing as it holds nothing, but the

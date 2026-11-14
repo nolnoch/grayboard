@@ -126,6 +126,22 @@ test("a lazily created team alias follows only its team's board", async () => {
   expect(rows(`SELECT created_by FROM boards WHERE name = 'eng'`)).toEqual([{ created_by: "alice@example.com" }]);
 });
 
+// #349: an alias_held refusal names the holder's place (its machine and
+// directory) only to the holder's own principal.
+test("an alias_held refusal shows the holder's place to its own principal, not to another member", async () => {
+  const build = srv.appSession(bob, "eng/build");
+  expect((await build.connect()).bind?.alias).toBe("eng/build");
+  srv.app.db.query(`UPDATE ids SET place = 'bob-box:~/src/secret-project' WHERE id = ?`).run(build.id);
+
+  const other = srv.appSession(alice, "eng/build");
+  const refusal = await other.connect().then(() => { throw new Error("alice's bind was not refused"); }, (e: { code: string; message: string }) => e);
+  expect(refusal.code).toBe("alias_held");
+  expect(refusal.message).toContain(build.id);
+  expect(refusal.message).not.toContain("secret-project");
+
+  await expect(srv.appSession(bob, "eng/build").connect()).rejects.toMatchObject({ code: "alias_held", message: expect.stringContaining(`${build.id}, in bob-box:~/src/secret-project`) });
+});
+
 // #284 S8 (decided): an alias in use is exclusive across principals. While
 // bob's session holds eng/build, alice can't write as it (tools-only
 // writes_as, ?as=) or bind it; while alice's tools-only session writes as
