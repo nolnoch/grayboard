@@ -265,6 +265,15 @@ test("a bind result follows the declared delivery: push has no lease note, poll 
   for (const line of ["<channel", "Pushes don't survive /clear", "delivery_open", "other_user"]) expect(texts["poll-run"]).not.toContain(line);
   for (const name of ["push-run", "absent-run"]) expect(texts[name]).toContain(OTHER_USER_NOTE);
   for (const line of COORDINATION_INSTRUCTIONS) expect(texts["poll-run"]).toContain(line);
+  // Unbind's result under a remaining name carries the same general lines: a pushed session keeps the other_user line, a poll one never gets it.
+  for (const [name, declared, source] of cases) {
+    const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: name });
+    await hosted.bind(generic, ctx, { name: `${name}-2`, create: true }, declared);
+    const released = await hosted.unbind(generic, ctx, { name }, declared);
+    const text = (released.structuredContent as { instructions: string[] }).instructions.join(" ");
+    if (source === null) expect(text).not.toContain("other_user");
+    else expect(text).toContain(OTHER_USER_NOTE);
+  }
 });
 
 test("unbound context cannot write or implicitly create names", async () => {
