@@ -262,9 +262,13 @@ export function createPlugin(o: PluginOptions): Plugin {
           catch (error) { say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60_000} minutes after it was written`); }
         }
       }
+    },
+    // Ends without `ended` when the store was already signed in (#592):
+    // another process's grant, which delivery restarts under now (#596).
+    current: async () => {
+      say(`sign-in not needed (${origin}): already signed in`);
+      await root.credentialChanged();
     } });
-    // Ends without `ended` when the store was already signed in (#592).
-    void flow.done.then(() => { if (flow.outcome === "current") say(`sign-in not needed (${origin}): already signed in`); }, () => {});
     return flow;
   };
   // What a signed-out call's result says about its sign-in (hosted-core

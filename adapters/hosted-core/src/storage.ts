@@ -23,14 +23,21 @@ export async function readJson(path: string): Promise<unknown> {
 // A file readSmallJson won't read; the message says why, never its content.
 export class FileRefused extends Error {}
 // readJson for a file another process may have planted: opened without
-// blocking (a FIFO's open would wait for a writer), refused unless it is a
-// regular file of at most `maxBytes`, and read with one bounded read, so the
-// caller never stalls on what it finds. Undefined when the file doesn't
-// exist; a file that isn't JSON throws SyntaxError.
+// following a symbolic link (one to a device would open it, and some
+// devices' opens have side effects) or blocking (a FIFO's open would wait
+// for a writer), refused unless it is a regular file of at most `maxBytes`,
+// and read with one bounded read, so the caller never stalls on what it
+// finds. Undefined when the file doesn't exist; a file that isn't JSON
+// throws SyntaxError. Windows has neither flag.
 export async function readSmallJson(path: string, maxBytes: number): Promise<unknown> {
   let file;
-  try { file = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)); }
-  catch (error) { if ((error as { code?: unknown }).code === "ENOENT") return undefined; throw error; }
+  try { file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); }
+  catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === "ENOENT") return undefined;
+    if (code === "ELOOP") throw new FileRefused("is a symbolic link");
+    throw error;
+  }
   try {
     if (!(await file.stat()).isFile()) throw new FileRefused("isn't a regular file");
     const buffer = Buffer.alloc(maxBytes + 1);
