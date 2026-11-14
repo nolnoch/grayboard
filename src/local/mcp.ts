@@ -9,7 +9,7 @@ import {
 
 import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
-import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
+import { delegateOkFields, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -829,7 +829,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // this mode's DM, pending: the promise shows in dm_inbox until the
     // requester settles the thread (#184). Same result fields as dm_send, via
     // the shared builder, so the modes can't drift.
-    const live = await liveHandles(ADDRS);
+    // Only the launchers (and an explicit `to`) are probed: a probe is a
+    // wakeup, so probing the whole roster would wake every peer's drain (#253).
+    const live = await liveHandles(ADDRS, [...launchers(db), ...(typeof a.to === "string" ? [localRecipient(a.to.trim())] : [])]);
     // A name just released (an unbind, or a 1.x rebind sharing the file) can
     // still answer on its socket: filter it like dm_send does (a released
     // name's socket isn't the session).
@@ -840,7 +842,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const args = typeof a.to === "string" ? { ...a, to: localRecipient(a.to.trim()) } : a;
     let d;
     try {
-      d = resolveDelegation(db, IDENTITY, args, online);
+      d = resolveDelegation(db, IDENTITY, args, online, undefined, (h) => ADDRS.includes(h));
     } catch (e) {
       if (e instanceof CoreError) {
         writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
@@ -867,7 +869,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       // proceeds when the retraction wins; otherwise the request stays
       // queued for the first pick, which the catch below treats as fine.
       try {
-        const d2 = resolveDelegation(db, IDENTITY, args, (h) => online(h) && h !== d!.to);
+        const d2 = resolveDelegation(db, IDENTITY, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h));
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
           const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via, rootLive)).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
@@ -1047,8 +1049,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
 
 // Which addresses have a live session, by probing each wakeup socket. A probe
 // is also a wakeup, so each live peer runs a drain; that's harmless (idempotent).
-async function liveHandles(self: string[]): Promise<(h: string) => boolean> {
-  const others = liveAddresses(db).filter((h) => !self.includes(h));
+async function liveHandles(self: string[], among?: string[]): Promise<(h: string) => boolean> {
+  const candidates = liveAddresses(db);
+  const others = (among ? candidates.filter((h) => among.includes(h)) : candidates).filter((h) => !self.includes(h));
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
   return (h) => live.has(h);

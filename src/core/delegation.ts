@@ -134,6 +134,8 @@ export function resolveDelegation(
   args: { persona?: unknown; task?: unknown; context?: unknown; to?: unknown },
   online: (handle: string) => boolean,
   humanReachable?: (humanHandle: string) => boolean,
+  // The requester session's own addresses: never a delegation target (#253).
+  self: (handle: string) => boolean = (h) => h === requester,
 ): Delegation {
   const persona = field(args.persona, "persona", MAX_PERSONA_CHARS);
   const task = field(args.task, "task", MAX_TASK_CHARS, true);
@@ -148,11 +150,12 @@ export function resolveDelegation(
     }
     if (!everConnected(db, to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
+    if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
     return { to, body: delegationBody(brief) };
   }
 
-  const live = launchers(db).filter((h) => sameUser(requester, h, db) && h !== requester && online(h));
+  const live = launchers(db).filter((h) => sameUser(requester, h, db) && !self(h) && online(h));
   if (live.length) return { to: live[0]!, body: delegationBody(brief) };
 
   const human = humanFallbackHandle(db, requester, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
