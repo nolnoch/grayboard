@@ -32,6 +32,8 @@ export class FakeSlack {
   /** users.info's profile.email per Slack user; null answers missing_scope (no users:read.email). */
   readonly emails = new Map<string, string>();
   emailScope = true;
+  /** users.info answers HTTP 500 (Slack unreachable) while set. */
+  usersInfoDown = false;
   /** The ts each successful chat.postMessage got. */
   readonly postTs = new WeakMap<Record<string, any>, string>();
   private sockets: ServerWebSocket<unknown>[] = [];
@@ -75,6 +77,7 @@ export class FakeSlack {
         case "reactions.add":
           return Response.json({ ok: true });
         case "users.info": {
+          if (this.usersInfoDown) return new Response("down", { status: 500 });
           if (!this.emailScope) return Response.json({ ok: false, error: "missing_scope" });
           const email = this.emails.get(String(body.user));
           if (email === undefined) return Response.json({ ok: false, error: "user_not_found" });

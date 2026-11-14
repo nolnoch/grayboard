@@ -597,4 +597,18 @@ test("without the email scope, a link is refused with what the admin must add", 
   slack.say(`link ${r.body.code}`);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("users:read.email")));
   expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
+}, 30_000);
+
+// An unreachable Slack isn't a missing scope: the user is told to retry, not
+// to ask the admin, and the refusal is audited.
+test("when Slack can't be reached to check the email, the link is refused with a retry", async () => {
+  const alice = await login("alice@example.com");
+  slack.usersInfoDown = true;
+  const r = await api(alice, "POST", "/api/slack/link");
+  slack.say(`link ${r.body.code}`);
+  const reply = await until(() => slack.posts().find((p) => p.markdown_text?.includes("couldn't reach Slack")));
+  expect(reply.markdown_text).not.toContain("users:read.email");
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);

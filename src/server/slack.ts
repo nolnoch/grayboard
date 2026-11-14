@@ -14,7 +14,7 @@ import { boardNotification, dmNotification } from "../shared/notifications.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
-import { SlackWeb } from "../bridge/web.ts";
+import { SlackError, SlackWeb } from "../bridge/web.ts";
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -23,6 +23,9 @@ import { onAliasCreated } from "./teams.ts";
 import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
 import { failureDiagnostic } from "./diagnostics.ts";
+
+/** users.info errors that mean Slack won't give this account's email, as opposed to Slack being unreachable. */
+const NO_EMAIL = new Set(["missing_scope", "user_not_found", "user_not_visible"]);
 
 const CODE_TTL_MS = 10 * 60_000;
 // Wrong codes a Slack account may send per CODE_TTL_MS; 8 chars from 31 make
@@ -195,7 +198,12 @@ export class SlackBridge implements SlackLinker {
     // A code proves the CLI's token, not who sends it: only the Slack account
     // with the user's own email may redeem it (#805 F-05).
     const email = await this.slackEmail(slackUser);
+    if (email === "unavailable") {
+      writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" });
+      return this.say(channel, ts, "grayboard couldn't reach Slack to check this account's email, and the code is used up. Run `grayboard slack link` for a new one and try again.");
+    }
     if (email === null) {
+      writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "no_email" });
       return this.say(channel, ts, "grayboard can't read your Slack account's email, so it can't check this link. Ask the server's admin to add the users:read and users:read.email scopes to the Slack app and reinstall it.");
     }
     if (email !== user.email) {
@@ -206,11 +214,8 @@ export class SlackBridge implements SlackLinker {
     const previous = repo.slack.linkFor(user.id);
     this.detach(user.id);
     repo.slack.link(user.id, slackUser, channel);
-    if (previous && previous.slack_user !== slackUser) {
-      // Moving a link is never silent: the account it leaves hears so.
-      writeAudit(repo, "slack.relinked", user.email, slackUser, { from: previous.slack_user });
-      await this.say(previous.dm_channel, undefined, `\`${user.email}\` is now linked to another Slack account; this one no longer gets its agents' messages.`);
-    }
+    const moved = previous && previous.slack_user !== slackUser ? previous : undefined;
+    if (moved) writeAudit(repo, "slack.relinked", user.email, slackUser, { from: moved.slack_user });
     const handle = `${user.email}/${HUMAN_NAME}`;
     if (!repo.aliases.find(handle)) {
       // Start from now: drop what queued for an earlier link's alias.
@@ -223,7 +228,13 @@ export class SlackBridge implements SlackLinker {
     }
     markHuman(db, handle, true);
     writeAudit(repo, "slack.linked", user.email, slackUser);
+    // No await between link() and here: a concurrent unlink can't leave
+    // attach() without its link.
     await this.attach(repo.slack.linkFor(user.id)!);
+    if (moved) {
+      // Moving a link is never silent: the account it leaves hears so.
+      await this.say(moved.dm_channel, undefined, `\`${user.email}\` is now linked to another Slack account; this one no longer gets its agents' messages.`);
+    }
     await this.say(
       channel,
       ts,
@@ -231,15 +242,19 @@ export class SlackBridge implements SlackLinker {
     );
   }
 
-  /** The Slack account's email, lowercased; null if Slack won't say (missing scope, no email). */
-  private async slackEmail(slackUser: string): Promise<string | null> {
+  /**
+   * The Slack account's email, lowercased; null if Slack won't say (missing
+   * scope, unknown user, no email); "unavailable" if Slack couldn't be asked.
+   */
+  private async slackEmail(slackUser: string): Promise<string | null | "unavailable"> {
     try {
       const r = await this.web.call<{ user?: { profile?: { email?: string } } }>("users.info", { user: slackUser }, { form: true });
       const email = r.user?.profile?.email?.trim().toLowerCase();
       return email ? email : null;
     } catch (e) {
       this.log(`users.info for ${slackUser} failed: ${e instanceof Error ? e.message : String(e)}`);
-      return null;
+      if (e instanceof SlackError && NO_EMAIL.has(e.code)) return null;
+      return "unavailable";
     }
   }
 
