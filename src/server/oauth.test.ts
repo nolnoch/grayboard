@@ -15,6 +15,7 @@ import type { Config } from "./config.ts";
 import { BUILTIN_CLIENT_IDS, type OAuthClient } from "./oauth-config.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_browser.ts";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -308,17 +309,6 @@ test("CIMD outage during refresh or revocation returns retryable 503 without bur
   expect(principal(await refreshed.json() as Tokens).grantId).toBe(grant);
 });
 
-class Browser {
-  jar = new Map<string, string>();
-  get cookie() { return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; "); }
-  async request(url: string, init: RequestInit = {}) {
-    const h = new Headers(init.headers);
-    if (this.cookie) h.set("Cookie", this.cookie);
-    const response = await fetch(url, { ...init, headers: h, redirect: "manual" });
-    for (const value of response.headers.getSetCookie()) { const pair = value.split(";")[0]!; const i = pair.indexOf("="); this.jar.set(pair.slice(0, i), pair.slice(i + 1)); }
-    return response;
-  }
-}
 function authorization(clientId = "native", verifier = random(), redirectUri = "http://127.0.0.1:34567/callback", scope = "grayboard:tools") {
   const state = random();
   const url = base + "/oauth/authorize?" + new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", resource: service.resource,
@@ -338,10 +328,10 @@ async function loginConsent(browser: Browser, url: string) {
   const page = await browser.request(next.href);
   expect(page.status).toBe(200);
   const content = await page.text();
-  return { request: /name="request" value="([^"]+)"/.exec(content)![1]!, csrf: /name="csrf" value="([^"]+)"/.exec(content)![1]!, content };
+  return { ...consentForm(content), content };
 }
 async function decide(browser: Browser, data: { request: string; csrf: string }, decision = "approve", origin = base) {
-  return browser.request(base + "/oauth/consent", { method: "POST", headers: { Origin: origin }, body: new URLSearchParams({ request: data.request, csrf: data.csrf, decision }) });
+  return submitConsent(browser, base + "/oauth/consent", data, decision, origin);
 }
 async function issue(clientId = "native", scope = "grayboard:tools", browser = new Browser(), redirectUri?: string) {
   const a = authorization(clientId, undefined, redirectUri, scope);
@@ -621,7 +611,7 @@ test("browser state, cookies, Origin, one-use CSRF, denial and restart invalidat
   const login = await browser.request(callback); expect(login.status).toBe(303);
   expect((await browser.request(callback)).status).toBe(400); expect(exchanges).toBe(1);
   const page = await browser.request(login.headers.get("location")!); const content = await page.text();
-  const data = { request: /name="request" value="([^"]+)"/.exec(content)![1]!, csrf: /name="csrf" value="([^"]+)"/.exec(content)![1]! };
+  const data = consentForm(content);
   expect(page.headers.get("Cache-Control")).toBe("no-store"); expect(page.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
   expect((await decide(browser, data, "approve", "https://evil.example")).status).toBe(403);
   expect((await browser.request(base + "/oauth/consent", { method: "POST", body: new URLSearchParams({ ...data, decision: "approve" }) })).status).toBe(403);
@@ -959,7 +949,7 @@ test("official SDK binds one canonical default-port resource while preserving ex
   const callback = await browser.request(mapURL(publicUrl + "/oauth/google/callback?" + new URLSearchParams({ code: "fake-google-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" })));
   expect(callback.status).toBe(303);
   const page = await browser.request(mapURL(callback.headers.get("Location")!)), content = await page.text();
-  const data = { request: /name="request" value="([^"]+)"/.exec(content)![1]!, csrf: /name="csrf" value="([^"]+)"/.exec(content)![1]! };
+  const data = consentForm(content);
   const approved = await browser.request(base + "/hosted/oauth/consent", { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ ...data, decision: "approve" }) });
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("iss")).toBe(publicUrl); expect(returned.searchParams.get("state")).toBe(provider.stateValue);
