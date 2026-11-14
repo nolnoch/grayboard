@@ -6923,7 +6923,7 @@ var require_dist2 = __commonJS(function(exports, module) {
 
 // plugins/claude-code/src/main.ts
 import { readdirSync as readdirSync3 } from "fs";
-import { join as join8 } from "path";
+import { join as join9 } from "path";
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js
 import process2 from "process";
@@ -33090,7 +33090,7 @@ function parentCommandLine() {
 // plugins/claude-code/src/plugin.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdirSync as mkdirSync3, watch } from "fs";
-import { join as join7 } from "path";
+import { join as join8 } from "path";
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-compat.js
 function isZ4Schema(s) {
   const schema = s;
@@ -37899,8 +37899,8 @@ async function testPauseAsync(point, env = process.env) {
 }
 
 // src/shared/identity.ts
-import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
-import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve4 } from "path";
+import { existsSync as existsSync3, readFileSync as readFileSync6, statSync as statSync4 } from "fs";
+import { basename as basename3, dirname as dirname5, join as join7, resolve as resolve5 } from "path";
 
 // src/core/session_id.ts
 var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -37934,7 +37934,9 @@ function normalizeAliasName(raw) {
   return { ok: false, error: `invalid identity name "${raw}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
 }
 
-// src/shared/identity.ts
+// src/shared/naming.ts
+import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve4 } from "path";
 var MAX_LEN = 32;
 function gitLocation(cwd) {
   for (let dir = cwd;; dir = dirname4(dir)) {
@@ -37952,35 +37954,6 @@ function gitLocation(cwd) {
     }
     if (dirname4(dir) === dir)
       return null;
-  }
-}
-function gitBranch(cwd) {
-  for (let dir = cwd;; dir = dirname4(dir)) {
-    const dotGit = join6(dir, ".git");
-    if (existsSync2(dotGit)) {
-      let gitdir = dotGit;
-      if (!statSync3(dotGit).isDirectory()) {
-        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
-        if (!m)
-          return null;
-        gitdir = resolve4(dir, m[1].trim());
-      }
-      const head = readFileSync5(join6(gitdir, "HEAD"), "utf8").trim();
-      return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
-    }
-    if (dirname4(dir) === dir)
-      return null;
-  }
-}
-function describeLocation(cwd) {
-  try {
-    const loc = gitLocation(cwd);
-    if (!loc)
-      return basename2(cwd);
-    const branch = gitBranch(cwd);
-    return `${basename2(loc.repo)}${loc.worktree ? ` worktree ${loc.worktree}` : ""}${branch ? ` on ${branch}` : ""}`;
-  } catch {
-    return null;
   }
 }
 function linkedWorktreeName(cwd) {
@@ -38034,6 +38007,37 @@ function sessionIdentity(env = process.env, cwd = process.cwd()) {
   if (isExplicitIdentity(env, cwd))
     return env.BUS_IDENTITY;
   return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd, env)?.name || defaultIdentity(cwd), cwd);
+}
+
+// src/shared/identity.ts
+function gitBranch(cwd) {
+  for (let dir = cwd;; dir = dirname5(dir)) {
+    const dotGit = join7(dir, ".git");
+    if (existsSync3(dotGit)) {
+      let gitdir = dotGit;
+      if (!statSync4(dotGit).isDirectory()) {
+        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync6(dotGit, "utf8"));
+        if (!m)
+          return null;
+        gitdir = resolve5(dir, m[1].trim());
+      }
+      const head = readFileSync6(join7(gitdir, "HEAD"), "utf8").trim();
+      return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
+    }
+    if (dirname5(dir) === dir)
+      return null;
+  }
+}
+function describeLocation(cwd) {
+  try {
+    const loc = gitLocation(cwd);
+    if (!loc)
+      return basename3(cwd);
+    const branch = gitBranch(cwd);
+    return `${basename3(loc.repo)}${loc.worktree ? ` worktree ${loc.worktree}` : ""}${branch ? ` on ${branch}` : ""}`;
+  } catch {
+    return null;
+  }
 }
 function configuredIdentity(env = process.env, cwd = process.cwd()) {
   try {
@@ -38287,7 +38291,7 @@ function createPlugin(o) {
   const watchEnded = () => {
     if (endWatch || "error" in config || closed)
       return;
-    const dir = join7(sessionDir(config.dataDir, o.claude.pid), "ended");
+    const dir = join8(sessionDir(config.dataDir, o.claude.pid), "ended");
     try {
       mkdirSync3(dir, { recursive: true, mode: 448 });
       endWatch = watch(dir, () => drainEnded());
@@ -38398,7 +38402,7 @@ async function logout(args) {
   }
   let names;
   try {
-    names = readdirSync3(join8(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
+    names = readdirSync3(join9(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
   } catch (error) {
     if (error.code !== "ENOENT")
       throw error;
@@ -38409,7 +38413,7 @@ async function logout(args) {
   for (const name of names) {
     let store;
     try {
-      store = await readJson(join8(dataDir, "grants", name));
+      store = await readJson(join9(dataDir, "grants", name));
     } catch (error) {
       unreadable.push(`${name}: ${error.message}`);
       continue;
