@@ -561,6 +561,53 @@ test("revoking one hosted hold releases only it, bumps the generation and closes
   await expect(delivery.receipt(principal, context("root"), lease.capability, [])).rejects.toHaveProperty("code", "not_found");
 });
 
+test("a revoked tools-only hosted root's ownership ends, audited once: a later recheck finds nothing to revoke again (#454)", async () => {
+  const team = database.repo.teams.create("ops", principal.authed.user_id);
+  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "ops/lead" });
+  const id = (meta as { id: string }).id;
+  await application.hostedWritesAs(generic.authed, "id:probe", "ops/lead", true);
+  expect(await hosted.whoami(generic, meta)).toMatchObject({ held: [], writes_as: "ops/lead" });
+  const before = database.repo.hosted.get(id)!;
+  const audits = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked'").all().map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
+  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  application.accessChanged(principal.authed.user_email, "admin@example.com");
+  const revoked = [{ actor: "admin@example.com", target: "ops/lead", detail: { session: id, principal: "you@example.com", writes_as: true, reason: expect.any(String) } }];
+  expect(audits()).toEqual(revoked);
+  expect(database.repo.hosted.get(id)).toBeUndefined();
+  expect(database.db.query("SELECT ended_at, end_reason FROM hosted_ownerships WHERE id = ?").get(before.ownership_id)).toMatchObject({ end_reason: "revoked" });
+  expect(database.db.query("SELECT writes_as FROM ids WHERE id = ?").get(id)).toEqual({ writes_as: null });
+  expect(aliasUser(database.db, "ops/lead")).toBeNull();
+  // Both rechecks, the principal's and the server's sweep, find the use gone.
+  application.accessChanged(principal.authed.user_email, "admin@example.com");
+  application.revalidate();
+  expect(audits()).toEqual(revoked);
+});
+
+test("a hosted root holding two names sends as either with as:, its ID too, and is refused any other address (#454)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.bind(principal, context("peer"), { name: "peer", create: true });
+  const id = (context("root") as { id: string }).id;
+  const send = (as: string | undefined, body: string) => hosted.run(principal, context("root"), "dm_send", s => application.send(s, "peer", body, as === undefined ? {} : { as }));
+  await send(undefined, "primary");
+  await send("be", "second");
+  await send("you@example.com/fe", "full");
+  await send(id, "by id");
+  const senders = database.db.query("SELECT body, sender FROM messages WHERE body IN ('primary', 'second', 'full', 'by id') ORDER BY id").all();
+  expect(senders).toEqual([
+    { body: "primary", sender: "you@example.com/fe" },
+    { body: "second", sender: "you@example.com/be" },
+    { body: "full", sender: "you@example.com/fe" },
+    { body: "by id", sender: id },
+  ]);
+  for (const other of ["peer", "you@example.com/qa"]) {
+    await expect(send(other, "refused")).rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("isn't one of this session's addresses") });
+  }
+  expect(database.db.query("SELECT count(*) AS n FROM messages WHERE body = 'refused'").get()).toEqual({ n: 0 });
+});
+
 test("a root whose last hold is revoked or unbound has no lease, so the sweep leaves it owning instead of expiring it (#451)", async () => {
   const team = database.repo.teams.create("ops", principal.authed.user_id);
   database.repo.teams.addMember(team.id, principal.authed.user_id);
