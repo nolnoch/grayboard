@@ -14184,7 +14184,7 @@ var package_default = {
     commander: "^12.0.0",
     jose: "^5.0.0",
     "jsonc-parser": "^3.3.1",
-    zod: "^4.0.0"
+    zod: "^4.2.0"
   },
   devDependencies: {
     "@earendil-works/pi-coding-agent": "1.4.0",
