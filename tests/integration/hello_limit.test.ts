@@ -106,6 +106,7 @@ test("the Slack bridge's human connection is exempt", async () => {
   expect((await refusal(a.bind("fe"))).code).toBe("rate_limited");
 
   const r = await srv.api(alice, "POST", "/api/slack/link");
+  slack.emails.set("U0ALICE", A);
   slack.say(`link ${r.body.code}`);
   await until(() => count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ? AND event = 'bound'`, `${A}/human`) === 1);
 });

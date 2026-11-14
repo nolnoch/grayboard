@@ -192,9 +192,25 @@ export class SlackBridge implements SlackLinker {
     if (other && other.user_id !== user.id) {
       return this.say(channel, ts, `This Slack account is linked to \`${other.email}\`. Send \`unlink\` first.`);
     }
+    // A code proves the CLI's token, not who sends it: only the Slack account
+    // with the user's own email may redeem it (#805 F-05).
+    const email = await this.slackEmail(slackUser);
+    if (email === null) {
+      return this.say(channel, ts, "grayboard can't read your Slack account's email, so it can't check this link. Ask the server's admin to add the users:read and users:read.email scopes to the Slack app and reinstall it.");
+    }
+    if (email !== user.email) {
+      writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" });
+      return this.say(channel, ts, `This Slack account's email isn't \`${user.email}\`; link from that account. The code is used up.`);
+    }
 
+    const previous = repo.slack.linkFor(user.id);
     this.detach(user.id);
     repo.slack.link(user.id, slackUser, channel);
+    if (previous && previous.slack_user !== slackUser) {
+      // Moving a link is never silent: the account it leaves hears so.
+      writeAudit(repo, "slack.relinked", user.email, slackUser, { from: previous.slack_user });
+      await this.say(previous.dm_channel, undefined, `\`${user.email}\` is now linked to another Slack account; this one no longer gets its agents' messages.`);
+    }
     const handle = `${user.email}/${HUMAN_NAME}`;
     if (!repo.aliases.find(handle)) {
       // Start from now: drop what queued for an earlier link's alias.
@@ -213,6 +229,18 @@ export class SlackBridge implements SlackLinker {
       ts,
       `Linked to \`${user.email}\`. Your agents reach you here as "${HUMAN_NAME}"; each conversation gets its own thread, and your reply in it goes back to that conversation. To start one, begin a message with "@agent" or "#board". \`unlink\` stops it.`,
     );
+  }
+
+  /** The Slack account's email, lowercased; null if Slack won't say (missing scope, no email). */
+  private async slackEmail(slackUser: string): Promise<string | null> {
+    try {
+      const r = await this.web.call<{ user?: { profile?: { email?: string } } }>("users.info", { user: slackUser }, { form: true });
+      const email = r.user?.profile?.email?.trim().toLowerCase();
+      return email ? email : null;
+    } catch (e) {
+      this.log(`users.info for ${slackUser} failed: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
   }
 
   // ── a linked user's human ──────────────────────────────────────────────────
@@ -392,7 +420,7 @@ export class SlackBridge implements SlackLinker {
     await l.relay.onEvent(payload);
   }
 
-  private async say(channel: string, threadTs: string, text: string): Promise<void> {
+  private async say(channel: string, threadTs: string | undefined, text: string): Promise<void> {
     try {
       await this.web.call("chat.postMessage", { channel, thread_ts: threadTs, markdown_text: text });
     } catch (e) {

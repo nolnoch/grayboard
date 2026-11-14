@@ -5,7 +5,7 @@ import type { ServerWebSocket } from "bun";
 type Call = { method: string; body: Record<string, any> };
 
 // Just enough Slack: auth.test, apps.connections.open, chat.postMessage,
-// reactions.add, the external file upload (get URL, send bytes, complete),
+// reactions.add, users.info (emails), the external file upload (get URL, send bytes, complete),
 // files.info (hosted files, and uploaded ones with their shares) and file
 // downloads, and a Socket Mode WebSocket that says hello and records acks.
 export class FakeSlack {
@@ -29,6 +29,9 @@ export class FakeSlack {
   /** Files the owner can share: what say() sends in an event's files. */
   private readonly hosted = new Map<string, { name: string; data: Uint8Array; forbidden?: boolean }>();
   private fileN = 0;
+  /** users.info's profile.email per Slack user; null answers missing_scope (no users:read.email). */
+  readonly emails = new Map<string, string>();
+  emailScope = true;
   /** The ts each successful chat.postMessage got. */
   readonly postTs = new WeakMap<Record<string, any>, string>();
   private sockets: ServerWebSocket<unknown>[] = [];
@@ -71,6 +74,12 @@ export class FakeSlack {
           return Response.json({ ok: true, channel: body.channel, ts });
         case "reactions.add":
           return Response.json({ ok: true });
+        case "users.info": {
+          if (!this.emailScope) return Response.json({ ok: false, error: "missing_scope" });
+          const email = this.emails.get(String(body.user));
+          if (email === undefined) return Response.json({ ok: false, error: "user_not_found" });
+          return Response.json({ ok: true, user: { id: body.user, profile: { email } } });
+        }
         case "files.getUploadURLExternal": {
           if (this.refuseUploads) return Response.json({ ok: false, error: this.refuseUploads });
           if (!body.filename || !(Number(body.length) > 0)) return Response.json({ ok: false, error: "missing_argument" });
