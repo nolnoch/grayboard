@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { refOf, type PendingRef } from "../core/boards.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ApplicationError, type ApplicationSession, type DeliveryEvent, type IdentityInfo } from "./application.ts";
@@ -12,7 +13,7 @@ export type DeliveryLease = { capability: string; identity: IdentityInfo; expire
 // `address`: the alias a direct item was sent to, which the client checks against its hold set (#451); a DM to the session's own ID and a board item have none (canReceiveBoard checks boards).
 export type PendingDelivery = { id: string; actionable: boolean; event: DeliveryEvent; ownership: number; bind_gen: number; address?: string };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
-export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; now?: () => number };
+export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; now?: () => number; caps?: HostedCaps["leases"] };
 type Issued = { item: PendingDelivery; ref?: PendingRef; acked: boolean };
 type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number;
@@ -30,7 +31,7 @@ function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
 }
 export function createDelivery(hosted: HostedSessions, options: DeliveryOptions) {
   const application = hosted.application, store = application.repo.hosted;
-  const ttl = hosted.leaseTtl, now = options.now ?? hosted.now;
+  const ttl = hosted.leaseTtl, now = options.now ?? hosted.now, caps = options.caps ?? DEFAULT_HOSTED_CAPS.leases;
   const leases = new Map<string, Lease>();
   // A session holds at most one lease (a reopen finishes the previous first): looked up and counted without a
   // scan (#805).
@@ -95,7 +96,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         // A lease this open replaces (another grant's) frees its slot here, not after the check; a
         // session is one user's, so that slot is this user's.
         const replaced = previous ? 1 : 0;
-        if (leases.size - replaced >= 256 || (perUser.get(p.authed.user_id) ?? 0) - replaced >= 32) throw new ApplicationError("bad_request", "delivery lease capacity reached");
+        if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) throw new ApplicationError("bad_request", "delivery lease capacity reached");
         const expiresAt = now() + ttl;
         store.update({ ...row, lease_deadline: expiresAt, last_seen_at: now() });
         hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null });

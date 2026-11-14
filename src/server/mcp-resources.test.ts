@@ -353,3 +353,29 @@ test("the subscriber role's whoami carries the session's id and principal beside
   // The subscriber names its holds `held`, as the native role does; local whoami calls them `aliases`.
   expect(body).not.toHaveProperty("aliases");
 });
+
+// #805 F-06: the configured caps reach the hosted sessions and delivery the MCP surface builds.
+test("configured hosted caps reach the session and lease limits the MCP surface enforces", async () => {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, caps: { sessions: { global: 5000, perUser: 300 }, leases: { global: 256, perUser: 1 }, watches: { global: 1024, perSession: 32 } } });
+  expect(hosted.sessions.limits).toMatchObject({ user: 300, global: 5000 });
+  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const first = sessionContext(principal, meta), second = sessionContext(principal, { "ai.opencode/sessionID": "resource-second" });
+  await hosted.sessions.bind(principal, second, { name: "fe", create: true });
+  await hosted.delivery.open(principal, first);
+  await expect(hosted.delivery.open(principal, second)).rejects.toThrow("delivery lease capacity reached");
+});
+
+test("a configured per-session watch cap bounds a listen's resource subscriptions (#805 F-06)", async () => {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, caps: { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 1 } } });
+  const headers = new Headers();
+  const sub = await connect("2026-07-28", "subscriber", undefined, headers);
+  const opened = await sub.callTool({ name: "delivery_open", arguments: {} });
+  headers.set("X-Grayboard-Lease", JSON.parse((opened.content as { text: string }[])[0]!.text).capability);
+  // Both URIs are valid, so only the cap refuses; the refusal reaches the client as a generic bad request.
+  await expect(sub.listen({ resourceSubscriptions: ["grayboard://inbox", "grayboard://inbox"] })).rejects.toThrow("bad_request");
+  const listen = await sub.listen({ resourceSubscriptions: ["grayboard://inbox"] });
+  await listen.close();
+});

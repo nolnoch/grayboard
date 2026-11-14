@@ -5,6 +5,7 @@
 // transport and its hello are gone (#282): a hosted session's lifetime is the
 // hosted store's lease, not a connection's grace.
 import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
+import { DEFAULT_HOSTED_CAPS } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
@@ -78,6 +79,8 @@ export type ApplicationOptions = {
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
   hostedRequestLimit?: RateLimit;
+  // Board observers server-wide: hosted resource watches are observers, so it is their global cap (#805).
+  observerCap?: number;
   // The hub's clock: the rate limiters' and the write-dedup window's
   // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
@@ -916,7 +919,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const board = normalizeBoard(boardInput);
       // Snapshot performs the same concealed access check as content reads.
       snapshot(db, reader(session, board), board, { limit: 1 });
-      if (observers.size >= 1024) fail("bad_request", "board observer capacity reached");
+      if (observers.size >= (opts.observerCap ?? DEFAULT_HOSTED_CAPS.watches.global)) fail("bad_request", "board observer capacity reached");
       const observer = { session, board, hooks };
       observers.add(observer);
       return () => removeObserver(observer);

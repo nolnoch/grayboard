@@ -1243,3 +1243,12 @@ test("a user at capacity with idle rows is admitted after the refusal's re-sweep
     expect(database.repo.hosted.get(hostedId("admitted"))).toBeDefined();
   } finally { idle.mockRestore(); }
 });
+
+test("a configured per-user session cap admits past the default and refuses at its size (#805 F-06)", async () => {
+  hosted.close();
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 300 } });
+  expect(hosted.limits).toMatchObject({ user: 300, global: 4096 });
+  for (let i = 0; i < 300; i++) await hosted.whoami(principal, context(`unbound-${i}`));
+  expect(hostedRowCount(database.db)).toBe(300);
+  await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
+});

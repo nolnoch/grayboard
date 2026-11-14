@@ -23,8 +23,9 @@ export type StartOptions = ApplicationOptions & {
 };
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
-export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit">, opts: StartOptions) {
-  return { ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit };
+export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedCaps">, opts: StartOptions) {
+  return { ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit,
+    ...(config.hostedCaps ? { observerCap: config.hostedCaps.watches.global } : {}) };
 }
 
 export function startServer(config: Config, opts: StartOptions = {}) {
@@ -45,7 +46,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
   const oauth = createOAuthServer(repo, config, opts.oauth);
-  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
