@@ -82,6 +82,19 @@ test("an agent's DM becomes a Slack thread; the reply reaches only that agent, m
   expect(follow.thread_ts).toBe(threadTs);
 }, 30_000);
 
+// #428: the thread maps to a session ID with no alias; once that session ends, a reply in its thread is told so in plain
+// words, not in the bus's ID-and-alias refusal.
+test("a reply in the thread of a session that ended with no alias says the reply wasn't sent, in plain words", async () => {
+  const anon = await localSession(dir, undefined, { extra: slackVars() });
+  await startBridge();
+  await call(anon.c, "dm_send", { to: "alex", body: "anyone?" });
+  const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("anyone?")));
+  await stopSession(anon.c);
+  slack.say("still there?", { thread_ts: slackTsOf(top) });
+  const bounce = await until(() => slack.posts().find((p) => p.thread_ts === slackTsOf(top) && p.markdown_text?.startsWith("⚠️")));
+  expect(bounce.markdown_text).toMatch(/^⚠️ Your reply wasn't sent: the agent session this thread was with has ended \(\d{4}-\d\d-\d\dT[\d:.]+Z\), so replies here reach nobody\. Start a new message to a named agent instead\.$/);
+}, 30_000);
+
 test("two agents asking at once get separate threads that don't cross", async () => {
   const be = await agent("be");
   const fe = await agent("fe");
