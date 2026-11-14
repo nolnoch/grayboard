@@ -163,6 +163,11 @@ const HEARTBEAT_MS = 1000;
 // (and event-loop delay); a gap within this bound is no measurable downtime.
 const LIVE_STALENESS_MS = 2 * HEARTBEAT_MS;
 const DELIVERY_TTL_MS = 30_000;
+// The sweep timer ticks every 250 ms: lapsed leases each tick, the idle and disabled passes every 5 s, and a full
+// reconcile every 30 s (#399).
+const TICK_MS = 250;
+const IDLE_EVERY = 20;
+const RECONCILE_EVERY = 120;
 export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
@@ -183,16 +188,29 @@ export function createHostedSessions(application: Application, options: { now?: 
   const busy = (id: string) => inflight.has(id);
   const idleAt = (row: HostedSession) => row.last_seen_at < now() - idle && !busy(row.session_id);
   // A root's active children at the limit refuse a new or returning one with local mode's text (#584).
-  function admitChild(root: string, rows = store.all()) {
-    if (rows.filter(r => r.root_session_id === root).length >= limits.children) throw new ApplicationError("bad_request", childCapacity(root));
+  // Rows the timer hasn't ended or parked yet count against capacity, so a refusal first runs the sweep and
+  // counts again (#399): it costs nothing when there is room. `own`: the caller's rows, held busy so that sweep
+  // never ends or evicts the session being admitted. At most one such sweep per tick: a refusal rolls its sweep
+  // back, so a caller retrying at capacity would otherwise pay a fleet sweep per request.
+  let sweptAt = -Infinity;
+  const full = (over: () => boolean, own: string[]) => {
+    if (!over()) return false;
+    if (now() - sweptAt < TICK_MS) return true;
+    for (const id of own) inflight.set(id, (inflight.get(id) ?? 0) + 1);
+    try { sweep(); } finally { for (const id of own) { const n = inflight.get(id)! - 1; if (n) inflight.set(id, n); else inflight.delete(id); } }
+    return over();
+  };
+  function admitChild(root: string, own: string[]) {
+    if (full(() => store.children(root).filter(r => r.parked_at === null).length >= limits.children, own)) throw new ApplicationError("bad_request", childCapacity(root));
   }
-  function admit(user: number, root?: string) {
-    const rows = store.all();
-    if (rows.length >= limits.global || rows.filter(r => r.user_id === user).length >= limits.user) throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
-    if (root) admitChild(root, rows);
+  function admit(user: number, own: string[], root?: string) {
+    if (full(() => { const rows = store.all(); return rows.length >= limits.global || rows.filter(r => r.user_id === user).length >= limits.user; }, own)) {
+      throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
+    }
+    if (root) admitChild(root, own);
   }
   const holders = new Map<string, { row: HostedSession; session: ApplicationSession }>();
-  const listeners = new Set<() => void>();
+  const listeners = new Set<(changed: string | null) => void>();
   let stopped = false;
   const gate = (id: string) => {
     const enter = async <T>(writer: boolean, fn: () => Promise<T>): Promise<T> => {
@@ -223,7 +241,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (row && (row.user_id !== p.authed.user_id || row.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
     if (row && row.parked_at !== null && wake) row = unpark(p, row);
     if (!row && create) {
-      admit(p.authed.user_id);
+      admit(p.authed.user_id, []);
       const t = now();
       const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)));
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
@@ -257,8 +275,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   function touch(row: HostedSession) {
     const root = rootOf(row), t = now();
-    store.update({ ...root, last_seen_at: t });
-    if (row.session_id !== root.session_id) store.update({ ...row, last_seen_at: t });
+    store.touch(root.session_id, t);
+    if (row.session_id !== root.session_id) store.touch(row.session_id, t);
   }
   // A call's end is activity too (#584), so the idle window runs from it. Only a row still as the call found it,
   // under the same root ownership: a call that ended its own session or whose root was replaced touches nothing.
@@ -270,22 +288,37 @@ export function createHostedSessions(application: Application, options: { now?: 
       const current = store.get(row.session_id), root = row.root_session_id ? store.get(row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
       const t = now();
-      store.update({ ...root, last_seen_at: t });
-      if (current !== root) store.update({ ...current, last_seen_at: t });
+      store.touch(root.session_id, t);
+      if (current !== root) store.touch(current.session_id, t);
     }); } catch (failure) { console.error(`hosted ${row.session_id}: end-of-call touch not written: ${failure instanceof Error ? failure.message : String(failure)}`); }
   }
   // A parked child acts again (#566): admitted against its root's child capacity and the user's and global rows,
   // as a registration is (a refusal leaves it parked), under the root's grant, which `attach` moved past it.
   function unpark(p: OAuthPrincipal, row: HostedSession): HostedSession {
     const root = rootOf(row), t = now();
-    admit(p.authed.user_id, root.session_id);
+    admit(p.authed.user_id, [root.session_id, row.session_id], root.session_id);
     store.unpark(row.session_id, root.grant_id, t);
     audit(root.session_id, "hosted.child_unparked", { child: row.session_id, ownership: row.ownership_id, parked_ms: t - row.parked_at! }, p);
     return { ...row, parked_at: null, grant_id: root.grant_id, last_seen_at: t };
   }
   // Whether the root holds a name or writes as one; a root with neither reads and nothing else.
   const named = (root: HostedSession, held = application.hostedHolds(root.session_id)) => held.length > 0 || root.writes_as !== null;
-  function reconcile() {
+  // A root that holds a name has a holder session, rebuilt when its ownership or generation changes. `changed`:
+  // the one row a commit changed (#399); null (startup, the backstop timer, a grant or user change) checks every
+  // root.
+  function reconcile(changed: string | null = null) {
+    if (changed !== null) {
+      const row = store.get(changed), holder = holders.get(changed);
+      const held = row && !row.root_session_id && row.parked_at === null ? application.hostedHolds(changed) : [];
+      if (holder && (!row || !held.length || row.ownership_id !== holder.row.ownership_id || row.bind_gen !== holder.row.bind_gen)) {
+        application.close(holder.session);
+        holders.delete(changed);
+      }
+      const user = row && held.length && !holders.has(changed) ? repo.users.findById(row.user_id) : undefined;
+      if (row && user) holders.set(changed, { row, session: application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, changed, held, null, row, quietSink).session });
+      for (const listener of listeners) listener(changed);
+      return;
+    }
     const held = application.holdsByOwner();
     const rows = store.all().filter(r => !r.root_session_id && held.has(r.session_id));
     const live = new Map(rows.map(r => [r.session_id, r]));
@@ -302,33 +335,62 @@ export function createHostedSessions(application: Application, options: { now?: 
       const { session } = application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row, quietSink);
       holders.set(row.session_id, { row, session });
     }
-    for (const listener of listeners) listener();
+    for (const listener of listeners) listener(null);
   }
-  function sweep() {
+  // The sweep finds its rows by query (#399); a request settles only its own (`settle`). `full`: the idle and
+  // disabled passes too, which the timer runs every IDLE_EVERY ticks (the idle window is minutes, and
+  // setDisabled ends a disabled user's rows itself, so that pass is a backstop). A test's injected clock calls
+  // it directly. The commits tell reconcile which rows changed.
+  function sweep(full = true) {
     if (stopped) return;
+    if (full) sweptAt = now();
     store.atomic(() => {
-      const held = application.holdsByOwner();
-      for (const row of store.all()) if (!row.root_session_id) {
-        if (repo.users.findById(row.user_id)?.disabled_at != null) store.end(row.session_id, "disabled", now());
-        else if (row.lease_deadline !== null && row.lease_deadline <= now()) store.end(row.session_id, "expired", now(), row.lease_deadline);
-        else if (!held.has(row.session_id) && row.lease_deadline === null && idleAt(row)) store.end(row.session_id, "idle", now());
-      }
+      const t = now();
+      if (full) for (const row of store.disabled()) store.end(row.session_id, "disabled", t);
+      for (const row of store.expired(t)) store.end(row.session_id, "expired", t, row.lease_deadline!);
+      if (!full) return;
+      for (const row of store.idle(t - idle)) if (!row.root_session_id && !busy(row.session_id)) store.end(row.session_id, "idle", t);
       // A child idle past the window is parked (#566): it stops counting against its root's capacity and the
       // user's rows, and its next request makes it active again. Roots ended above took their children with them.
       const parkedUnder = new Set<string>();
-      for (const row of store.all()) if (row.root_session_id && idleAt(row)) {
-        store.park(row.session_id, now());
-        audit(row.root_session_id, "hosted.child_parked", { child: row.session_id, ownership: row.ownership_id, idle_ms: now() - row.last_seen_at });
-        parkedUnder.add(row.root_session_id);
+      for (const row of store.idle(t - idle)) if (row.root_session_id && !busy(row.session_id)) park(row, parkedUnder);
+      evictParked(parkedUnder);
+    });
+  }
+  function park(row: HostedSession, parkedUnder: Set<string>) {
+    store.park(row.session_id, now());
+    audit(row.root_session_id!, "hosted.child_parked", { child: row.session_id, ownership: row.ownership_id, idle_ms: now() - row.last_seen_at });
+    parkedUnder.add(row.root_session_id!);
+  }
+  // Past the parked ceiling, the oldest parked children are released (#584): one returning starts as a root.
+  function evictParked(parkedUnder: Set<string>) {
+    for (const root of parkedUnder) {
+      const parked = store.children(root).filter(r => r.parked_at !== null && !busy(r.session_id))
+        .sort((a, b) => a.parked_at! - b.parked_at! || a.last_seen_at - b.last_seen_at || (a.session_id < b.session_id ? -1 : 1));
+      for (const row of parked.slice(0, Math.max(0, parked.length - limits.parked))) store.childEnd(row.session_id, now(), "evicted");
+    }
+  }
+  // The sweep's rules for one request's own rows (#399): its root (disabled, lease lapsed, idle with no hold and
+  // no lease) and, for a child, itself (idle: parked, its request waking it again).
+  function settle(id: string) {
+    if (stopped) return;
+    store.atomic(() => {
+      const row = store.get(id);
+      if (!row) return;
+      const root = row.root_session_id ? store.get(row.root_session_id) : row;
+      if (root && !root.root_session_id) {
+        const t = now();
+        if (repo.users.findById(root.user_id)?.disabled_at != null) store.end(root.session_id, "disabled", t);
+        else if (root.lease_deadline !== null && root.lease_deadline <= t) store.end(root.session_id, "expired", t, root.lease_deadline);
+        else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(root.session_id).length) store.end(root.session_id, "idle", t);
       }
-      // Past the parked ceiling, the oldest parked children are released (#584): one returning starts as a root.
-      for (const root of parkedUnder) {
-        const parked = store.children(root).filter(r => r.parked_at !== null)
-          .sort((a, b) => a.parked_at! - b.parked_at! || a.last_seen_at - b.last_seen_at || (a.session_id < b.session_id ? -1 : 1));
-        for (const row of parked.slice(0, Math.max(0, parked.length - limits.parked))) store.childEnd(row.session_id, now(), "evicted");
+      const child = row.root_session_id ? store.get(row.session_id) : undefined;
+      if (child && child.parked_at === null && idleAt(child)) {
+        const parkedUnder = new Set<string>();
+        park(child, parkedUnder);
+        evictParked(parkedUnder);
       }
     });
-    reconcile();
   }
   // The lease and idle clocks stop while the server is down (#423). A root
   // whose lease was still live at the last heartbeat gets its deadline pushed
@@ -389,7 +451,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const id = before?.root_session_id ?? context.id;
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
         authorized(p);
-        sweep();
+        settle(context.id);
         const later = refusalRows();
         const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later.defer, true, wake, declare)!; touch(r); return r; }); } catch (e) { later.flush(); throw e; } })();
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
@@ -437,7 +499,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // delivery_open (`seeLost`). A child's call takes none: bind is the root's, and an adapter's own probe from a
   // child (pi's) would swallow the notice.
   function takeLost(p: OAuthPrincipal, row: HostedSession | undefined, reader: LostReader): HostedLost[] {
-    // The read first, so a call with nothing pending opens no transaction (whose commit wakes the observers).
+    // The read first, so a call with nothing pending opens no transaction.
     if (!row || row.root_session_id || !store.lost(row.session_id, reader).length) return [];
     return store.atomic(() => {
       if (reader === "controller") return store.reportLost(row.session_id, now());
@@ -475,7 +537,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     },
     reconcile,
     sweep,
-    listen(fn: () => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    settle,
+    listen(fn: (changed: string | null) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
     // Every MCP exchange's selection, before its tool runs: it doesn't wake a parked child (#566). The tool's own
     // gate does, except session_end's, so ending a parked child is never refused for capacity.
     async snapshot(p: OAuthPrincipal, context: SessionContext) { return withGate(p, context, false, async row => snapshot(p, row), false); },
@@ -534,7 +597,6 @@ export function createHostedSessions(application: Application, options: { now?: 
         const late = refusalRows();
         let result: T;
         try { result = store.atomic(() => fn(attach(p, row), late.defer)); } catch (error) { late.flush(); throw error; }
-        reconcile();
         return committed ? committed(result) : result as unknown as R;
       });
     },
@@ -665,14 +727,14 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
           const descendants = store.children(childId);
           if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);
-          if (!existing) admit(p.authed.user_id, root.session_id);
-          else if (!existing.root_session_id) admitChild(root.session_id);
+          if (!existing) admit(p.authed.user_id, [root.session_id, childId], root.session_id);
+          else if (!existing.root_session_id) admitChild(root.session_id, [root.session_id, childId]);
           const attached = attach(p, root);
           touch(attached);
           // A registration is the child's activity too (#566): the call that follows never meets it parked.
           if (existing?.root_session_id === root.session_id) {
             const current = store.get(childId)!;
-            if (current.parked_at !== null) unpark(p, current); else store.update({ ...current, last_seen_at: now() });
+            if (current.parked_at !== null) unpark(p, current); else store.touch(current.session_id, now());
             return { message: "already registered" };
           }
           if (existing) store.end(existing.session_id, "closed", now());
@@ -684,9 +746,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           return { message: "registered", child: childId, root: root.session_id };
         }); } catch (e) { later.flush(); throw e; }
       };
-      const result = await locked(0);
-      reconcile();
-      return result;
+      return locked(0);
     },
     async end(p: OAuthPrincipal, context: SessionContext, session?: string) {
       if (!("id" in context)) throw new ApplicationError("unbound", "session_end requires session context");
@@ -701,13 +761,11 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (!candidate || candidate.user_id !== p.authed.user_id || candidate.client_id !== p.clientId || candidate.ownership_id !== row.ownership_id || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
           candidate.root_session_id ? store.childEnd(target, now(), "closed") : store.end(target, "closed", now());
         });
-        reconcile();
         return { ended: true };
       }, false, false);
     },
     release(id: string, reason: HostedEnd, deadline?: number) {
       store.atomic(() => store.end(id, reason, now(), deadline));
-      reconcile();
     },
     close() {
       stopped = true;
@@ -722,16 +780,20 @@ export function createHostedSessions(application: Application, options: { now?: 
     instructions: hostedUnboundInstruction,
   };
   // Subscribed after the credit: its transaction would otherwise reconcile once before the sweep, opening
-  // holder sessions for roots the sweep then ends (#424 item 7). The sweep reconciles what's left.
+  // holder sessions for roots the sweep then ends (#424 item 7). The full reconcile after the sweep opens the rest.
   creditDowntime();
   const unsubscribe = store.subscribe(reconcile);
   sweep();
-  let beat = now();
+  reconcile();
+  let beat = now(), tick = 0;
   const timer = setInterval(() => {
-    try { sweep(); } catch (e) { hostedFailure("hosted.sweep", e); }
+    tick++;
+    try { sweep(tick % IDLE_EVERY === 0); } catch (e) { hostedFailure("hosted.sweep", e); }
+    // The backstop: holds can change outside the hosted store's commits (#399).
+    if (tick % RECONCILE_EVERY === 0) try { reconcile(); } catch (e) { hostedFailure("hosted.reconcile", e); }
     const t = now();
     if (t - beat >= HEARTBEAT_MS || t < beat) try { store.heartbeat(t); beat = t; } catch (e) { hostedFailure("hosted.heartbeat", e); }
-  }, 250);
+  }, TICK_MS);
   timer.unref();
   return service;
 }
