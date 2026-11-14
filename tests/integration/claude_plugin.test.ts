@@ -266,6 +266,26 @@ test("a call whose PreToolUse record is missing or from a recycled pid is refuse
   expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'unattributed'").get()).toEqual({ n: 0 });
 }, 40_000);
 
+test("a subagent whose child id would pass the server's 1024 characters is refused client-side with the length, and writes nothing (#555 item 15)", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const id = "sess-sub-long";
+  const root = await plugin(id);
+  runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
+  expect((await modelCall(root, "bind", { name: "longroot", create: true })).error).toBe(false);
+  // 1024 - "sess-sub-long/agent/".length = 1004 fits exactly; one more is over.
+  const fits = "a".repeat(1024 - `${id}/agent/`.length), over = `${fits}b`;
+  const ok = await modelCall(root, "dm_send", { to: "longroot", body: "at the limit" }, { agent: fits });
+  expect(ok.error).toBe(false);
+  const refused = await modelCall(root, "dm_send", { to: "longroot", body: "over the limit" }, { agent: over });
+  expect(refused.error).toBe(true);
+  expect(refused.texts.join("\n")).toContain("is 1025 characters, over the server's 1024-character limit");
+  expect(root.stderr()).toContain("subagent child id is 1025 characters");
+  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'over the limit'").get()).toEqual({ n: 0 });
+  expect(childRow(id, over)).toBeNull();
+  // The main agent's calls still work.
+  expect((await modelCall(root, "whoami", {})).error).toBe(false);
+}, 40_000);
+
 test("the root reports the model and effort its hooks wrote (#545); a subagent's call reports none, and a bad fact file sends none", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const id = "sess-facts";

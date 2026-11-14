@@ -38305,8 +38305,10 @@ function createPlugin(o) {
   const drainEnded = () => {
     if ("error" in config || closed)
       return;
-    for (const agent of takeEnded(config.dataDir, o.claude.pid))
-      root?.endChild(childOf(agent));
+    for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      if (validSourceId(childOf(agent)))
+        root?.endChild(childOf(agent));
+    }
   };
   const watchEnded = () => {
     if (endWatch || "error" in config || closed)
@@ -38338,9 +38340,14 @@ function createPlugin(o) {
     }
     if (taken.agent === null)
       return root.call(name, args, before);
+    const child = childOf(taken.agent), length = child.length;
+    if (!validSourceId(child)) {
+      say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
+      return failure2(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
+    }
     watchEnded();
     drainEnded();
-    return root.call(name, args, before, { child: childOf(taken.agent) });
+    return root.call(name, args, before, { child });
   };
   const tools = () => root?.tools() ?? hostTools(snapshotTools());
   const serve = (instructions) => {
