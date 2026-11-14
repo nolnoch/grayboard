@@ -4,7 +4,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { capsEnv, options, parseMetrics, perUserRate } from "../../scripts/loadtest.ts";
+import { capsEnv, options, parseMetrics, perUserRate, slope } from "../../scripts/loadtest.ts";
+import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
+import { runCli } from "../support/cli.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 
@@ -18,6 +20,28 @@ describe("loadtest sizing", () => {
     // The caps cover the fleet with headroom, never below the shipped floors.
     expect(Number(capsEnv(full).GRAYBOARD_DELIVERY_LEASES_GLOBAL)).toBe(1250);
     expect(Number(capsEnv(quick).GRAYBOARD_DELIVERY_LEASES_GLOBAL)).toBe(256);
+  });
+
+  test("capsEnv never lowers a shipped default, and no per-user cap exceeds its global", () => {
+    const floors: Record<string, { global: number; perUser: number }> = {
+      GRAYBOARD_HOSTED_SESSIONS: DEFAULT_HOSTED_CAPS.sessions, GRAYBOARD_DELIVERY_LEASES: DEFAULT_HOSTED_CAPS.leases,
+      GRAYBOARD_MCP_LISTEN: DEFAULT_MCP_LIMITS.listen, GRAYBOARD_MCP_POST: DEFAULT_MCP_LIMITS.post,
+    };
+    for (const argv of [[], ["--quick"], ["--users", "1", "--sessions", "400"], ["--sessions", "2", "--users", "2", "--drivers", "1"]]) {
+      const env = capsEnv(options(argv));
+      for (const [prefix, d] of Object.entries(floors)) {
+        const global = Number(env[`${prefix}_GLOBAL`]), perUser = Number(env[`${prefix}_PER_USER`]);
+        expect({ argv, prefix, global: global >= d.global, perUser: perUser >= Math.min(d.perUser, global), within: perUser <= global })
+          .toEqual({ argv, prefix, global: true, perUser: true, within: true });
+      }
+    }
+  });
+
+  test("slope is least squares in units per second", () => {
+    expect(slope([[0, 10], [10, 30], [20, 50]])).toBeCloseTo(2);
+    expect(slope([[0, 50], [10, 30], [20, 10]])).toBeCloseTo(-2);
+    expect(slope([[0, 7], [60, 7]])).toBe(0);
+    expect(slope([[5, 1]])).toBe(0);
   });
 
   test("--env overrides parse, and a malformed one is refused", () => {
@@ -38,13 +62,11 @@ describe("loadtest sizing", () => {
 async function run(extra: string[]): Promise<{ code: number; out: string; summary: any }> {
   const dir = mkdtempSync(join(tmpdir(), "gb-loadtest-test-"));
   try {
-    const proc = Bun.spawn([process.execPath, join(ROOT, "scripts/loadtest.ts"),
-      "--sessions", "6", "--users", "2", "--drivers", "2", "--duration", "6", "--warmup", "2", "--window", "2",
+    // runCli kills the whole process group on timeout: the coordinator, its drivers and the server.
+    const { code, out, err } = await runCli([join(ROOT, "scripts/loadtest.ts"),
+      "--sessions", "6", "--users", "2", "--drivers", "2", "--duration", "8", "--warmup", "2", "--window", "2",
       "--period", "1", "--boards", "2", "--post-share", "0.3", "--churn", "0.5", "--churn-every", "3", "--grace", "1",
-      "--out", dir, ...extra], { cwd: ROOT, stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "" } });
-    const timer = setTimeout(() => proc.kill("SIGKILL"), 60_000);
-    const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-    clearTimeout(timer);
+      "--out", dir, ...extra], { bin: process.execPath, cwd: ROOT, env: { PATH: process.env.PATH ?? "" }, timeoutMs: 60_000 });
     let summary: any;
     try { summary = JSON.parse(readFileSync(join(dir, "summary.json"), "utf8")); } catch { summary = undefined; }
     return { code, out: out + err, summary };
@@ -59,6 +81,7 @@ describe("loadtest run", () => {
     expect({ code: r.code, failures: r.summary?.failures }, r.out).toEqual({ code: 0, failures: [] });
     expect(r.summary.dms.sent).toBeGreaterThan(0);
     expect(r.summary.dms.lost).toBe(0);
+    expect(r.summary.misdelivered).toBe(0);
     expect(r.summary.boardDeliveries).toBeGreaterThan(0);
     expect(Object.values(r.summary.drained)).toEqual([0, 0, 0, 0, 0, 0]);
     expect(r.summary.hostedRowsAfter).toBe(0);

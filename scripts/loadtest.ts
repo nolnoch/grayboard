@@ -8,9 +8,15 @@
 //
 // Exit bar (#805): every session leased throughout; each steady window's native tool calls at
 // p99 < 100 ms (at least 99% at or under the 0.1 s bucket edge: no interpolation); RSS flat over
-// the steady hour; zero refusals, zero client errors, zero DM loss; and every gauge back to zero
-// once the fleet has closed. The run writes windows.jsonl, server.log, drivers' stderr and
-// summary.json to its run dir (.e2e-runs/loadtest-<time>/ unless --out) and exits 1 on any miss.
+// the steady period (the duration less its warm-up: an hour in the full profile); zero refusals,
+// zero client errors, zero DM loss or misdelivery; and every gauge back to zero once the fleet has
+// closed. A gate whose metric is missing fails rather than passes. The run writes windows.jsonl,
+// server.log, drivers' stderr and summary.json to its run dir (.e2e-runs/loadtest-<time>/ unless
+// --out), exits 1 on any miss and 2 when the run itself broke.
+//
+// The server runs with GRAYBOARD_DEV_AUTH=1 (tests/support/server.ts) on every interface, for as
+// long as the run: anyone who can reach this host's port can sign in to the scratch database.
+// Run it on a machine whose ports aren't reachable from untrusted networks.
 //
 // The caps the default config ships with are below this fleet (256 leases, 128 listens): the run
 // raises only what N forces and prints the effective env, which is part of the result.
@@ -19,6 +25,7 @@ import { cpus, loadavg, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { Database } from "bun:sqlite";
+import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../src/server/config.ts";
 import { openDatabase } from "../src/server/db.ts";
 import { OAUTH_TTL } from "../src/server/oauth-types.ts";
 import { issueOAuth } from "../tests/helpers/oauth.ts";
@@ -53,7 +60,8 @@ export function options(argv: string[]): Options {
     if (!Number.isFinite(x) || x < 0) throw new Error(`--${name} must be a non-negative number, not "${raw}"`);
     return x;
   };
-  const durationS = n("duration", 3600, 40);
+  // The full profile's steady period is the bar's hour, after its 10 min warm-up.
+  const durationS = n("duration", 4200, 40);
   const o: Options = {
     sessions: n("sessions", 1000, 40), users: n("users", 100, 4), drivers: n("drivers", 8, 2),
     durationS, warmupS: n("warmup", 600, 15), periodS: n("period", 30, 3), boards: n("boards", 20, 2),
@@ -113,7 +121,7 @@ const fastShare = (h: { buckets: number[]; count: number }) => h.count ? h.bucke
 const mergeHist = (into: Hist, h: Hist) => { h.buckets.forEach((b, i) => into.buckets[i]! += b); into.count += h.count; into.sum += h.sum; into.errors += h.errors; };
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
 // Least-squares slope, units per second.
-function slope(points: [number, number][]): number {
+export function slope(points: [number, number][]): number {
   const n = points.length;
   if (n < 2) return 0;
   const mx = points.reduce((a, p) => a + p[0], 0) / n, my = points.reduce((a, p) => a + p[1], 0) / n;
@@ -125,15 +133,19 @@ function slope(points: [number, number][]): number {
 // What N forces, at a quarter's headroom: sessions, leases and listens are one per session; a
 // session's POSTs overlap its listen and each other (a renew, a read and an agent call at once:
 // at twice sessions per user the default cadence drew rate_limited). The per-user caps follow
-// sessions per user.
+// sessions per user. Never below a shipped default, and a per-user cap never above its global
+// (the server refuses to start on that).
 export function capsEnv(o: Options): Record<string, string> {
   const n = Math.ceil(o.sessions * 1.25), perUser = Math.ceil(Math.ceil(o.sessions / o.users) * 1.25);
-  const pair = (prefix: string, scope = "PER_USER", scoped = perUser) => ({ [`${prefix}_GLOBAL`]: String(Math.max(n, 256)), [`${prefix}_${scope}`]: String(Math.max(scoped, 32)) });
+  const pair = (prefix: string, d: { global: number; perUser: number }, scoped = perUser) => {
+    const global = Math.max(n, d.global);
+    return { [`${prefix}_GLOBAL`]: String(global), [`${prefix}_PER_USER`]: String(Math.min(global, Math.max(scoped, d.perUser))) };
+  };
   return {
-    ...pair("GRAYBOARD_HOSTED_SESSIONS"), ...pair("GRAYBOARD_DELIVERY_LEASES"),
-    ...pair("GRAYBOARD_MCP_LISTEN"), ...pair("GRAYBOARD_MCP_POST", "PER_USER", perUser * 4),
-    // Board watches: one per session at most here; the per-session default (32) stands.
-    GRAYBOARD_RESOURCE_WATCHES_GLOBAL: String(Math.max(n, 1024)),
+    ...pair("GRAYBOARD_HOSTED_SESSIONS", DEFAULT_HOSTED_CAPS.sessions), ...pair("GRAYBOARD_DELIVERY_LEASES", DEFAULT_HOSTED_CAPS.leases),
+    ...pair("GRAYBOARD_MCP_LISTEN", DEFAULT_MCP_LIMITS.listen), ...pair("GRAYBOARD_MCP_POST", DEFAULT_MCP_LIMITS.post, perUser * 4),
+    // Board watches: one per session at most here; the per-session default stands.
+    GRAYBOARD_RESOURCE_WATCHES_GLOBAL: String(Math.max(n, DEFAULT_HOSTED_CAPS.watches.global)),
     // The per-user request bucket, raised only when the estimate needs it, at twice the estimate.
     ...(perUserRate(o) * 2 > 20 ? { GRAYBOARD_HOSTED_REQUEST_PER_SEC: String(Math.ceil(perUserRate(o) * 2)), GRAYBOARD_HOSTED_REQUEST_BURST: String(Math.max(120, Math.ceil(perUserRate(o) * 12))) } : {}),
   };
@@ -168,94 +180,98 @@ async function main() {
   const env = { ...caps, ...o.env, GRAYBOARD_METRICS_ADDR: "127.0.0.1:0", HOME: join(scratch, "home") };
   mkdirSync(env.HOME, { recursive: true });
   log(`server env: ${Object.entries(env).filter(([k]) => k !== "HOME").map(([k, v]) => `${k}=${v}`).join(" ")} (about ${perUserRate(o).toFixed(1)} hosted requests/s per user)`);
-  const srv = await ServerProcess.start(o.server, dbPath, env);
-  let metricsUrl: string | undefined;
-  for (const deadline = Date.now() + 10_000; !metricsUrl; await Bun.sleep(50)) {
-    const m = /metrics on ([^\s]+):(\d+)/.exec(srv.log());
-    if (m) metricsUrl = `http://${m[1]}:${m[2]}/metrics`;
-    else if (Date.now() > deadline) throw new Error(`the server never logged its metrics address within 10 s:\n${srv.log()}`);
-  }
-  log(`server ${srv.base}, metrics ${metricsUrl}, pid ${srv.proc.pid}`);
-  // Tokens, seeded once the server has opened the file: its first open revokes any grant issued
-  // under a built-in client ID before it had built-in clients. A HostedSession never refreshes, so each
-  // token's hour starts late enough to outlast the run: issuance takes `now` and stamps every row
-  // from it, and the server checks only expiry against its clock.
-  const runMs = (o.durationS + o.graceS + 600) * 1000;
-  const issuedAt = Date.now() + Math.max(0, runMs - OAUTH_TTL.access);
-  const { db, repo } = openDatabase(dbPath, { blobDir: join(scratch, "blobs") });
-  const resource = "http://localhost/mcp";
-  const users = Array.from({ length: o.users }, (_, u) => {
-    const email = `load${u}@example.com`;
-    return { email, token: issueOAuth(repo, resource, email, HOSTED_SCOPES, issuedAt, HOSTED_CLIENT).token };
-  });
-  db.close();
-
-  const scrape = async () => parseMetrics(await (await fetch(metricsUrl!)).text());
-
-  // Sessions: index i belongs to user i % U and driver i % K, binds load-<i>, subscribes board i % B.
-  const specs: DriverSession[] = Array.from({ length: o.sessions }, (_, i) => {
-    const u = users[i % o.users]!, name = `load-${i}`;
-    return { index: i, email: u.email, token: u.token, name, address: `${u.email}/${name}`, board: `load-${i % o.boards}` };
-  });
-  const addresses = specs.map(s => s.address);
-
   type Driver = { proc: ReturnType<typeof Bun.spawn>; windows: DriverWindow[]; ready?: { live: number; want: number }; final?: DriverFinal; churned: number; quiesced: boolean; read: Promise<void> };
   const drivers: Driver[] = [];
-  for (let k = 0; k < o.drivers; k++) {
-    const config: DriverConfig = {
-      driver: k, url: `${srv.base}/mcp`, sessions: specs.filter(s => s.index % o.drivers === k), addresses,
-      periodMs: o.periodS * 1000, postShare: o.postShare, burst: Math.max(1, Math.ceil(o.burst / o.drivers)), reportMs: o.windowS * 1000,
-    };
-    const proc = Bun.spawn([process.execPath, join(ROOT, "scripts/loadtest_driver.ts")], {
-      cwd: ROOT, stdin: "pipe", stdout: "pipe", stderr: Bun.file(join(o.out, `driver-${k}.stderr`)),
-      env: { PATH: process.env.PATH ?? "", HOME: env.HOME },
-    });
-    const d: Driver = { proc, windows: [], churned: 0, quiesced: false, read: Promise.resolve() };
-    drivers.push(d);
-    d.read = (async () => {
-      const decoder = new TextDecoder();
-      let buf = "";
-      for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
-        buf += decoder.decode(chunk, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-          let msg: any;
-          try { msg = JSON.parse(line); } catch { log(`driver ${k}: ${line}`); continue; }
-          if (msg.type === "window") d.windows.push(msg);
-          else if (msg.type === "ready") d.ready = msg;
-          else if (msg.type === "churned") d.churned++;
-          else if (msg.type === "quiesced") d.quiesced = true;
-          else if (msg.type === "final") d.final = msg;
-        }
-      }
-    })();
-    (proc.stdin as import("bun").FileSink).write(JSON.stringify(config) + "\n");
-  }
-  const send = (cmd: string) => { for (const d of drivers) (d.proc.stdin as import("bun").FileSink).write(cmd + "\n"); };
-  // Every wait sleeps between checks. (Racing the drivers' exits instead spun once one had exited:
-  // its settled promise won every race, and the microtask loop starved timers and ate memory.)
-  const waitAll = async (what: string, ok: (d: Driver) => boolean, ms: number) => {
-    const deadline = Date.now() + ms;
-    while (!drivers.every(ok)) {
-      if (Date.now() > deadline) throw new Error(`${what}: not every driver got there within ${ms / 1000} s (${drivers.map((d, k) => `${k}:${ok(d)}`).join(" ")})`);
-      for (const [k, d] of drivers.entries()) {
-        if (d.proc.exitCode === null || ok(d)) continue;
-        // An exited driver's last lines may still be in its pipe.
-        await d.read;
-        if (!ok(d)) throw new Error(`${what}: driver ${k} exited (${d.proc.exitCode}); see driver-${k}.stderr`);
-      }
-      await Bun.sleep(100);
-    }
-  };
-
-  // Every process's RSS once a second, to stderr: the run's scope caps the whole tree.
-  const rssOf = (pid: number | undefined) => { try { return Number(/VmRSS:\s+(\d+)/.exec(readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 0) >> 10; } catch { return -1; } };
-  if (process.env.LOADTEST_MEMLOG) setInterval(() => console.error(`memlog ${new Date().toISOString()} coord=${rssOf(process.pid)}MB server=${rssOf(srv.proc.pid)}MB drivers=${drivers.map(d => rssOf(d.proc.pid)).join(",")}MB win=${drivers.map(d => d.windows.length).join(",")}`), 1000).unref();
   const failures: string[] = [];
   const windows: Window[] = [];
   let exitCode = 0;
+  let srv: ServerProcess | undefined;
+  // A driver killed by a signal (the scope's OOM killer) keeps a null exitCode.
+  const exited = (d: Driver) => d.proc.exitCode !== null || d.proc.signalCode !== null;
   try {
+    srv = await ServerProcess.start(o.server, dbPath, env);
+    const server = srv;
+    let metricsUrl: string | undefined;
+    for (const deadline = Date.now() + 10_000; !metricsUrl; await Bun.sleep(50)) {
+      const m = /metrics on ([^\s]+):(\d+)/.exec(server.log());
+      if (m) metricsUrl = `http://${m[1]}:${m[2]}/metrics`;
+      else if (Date.now() > deadline) throw new Error(`the server never logged its metrics address within 10 s:\n${server.log()}`);
+    }
+    log(`server ${server.base}, metrics ${metricsUrl}, pid ${server.proc.pid}`);
+    // Tokens, seeded once the server has opened the file: its first open revokes any grant issued
+    // under a built-in client ID before it had built-in clients. A HostedSession never refreshes, so each
+    // token's hour starts late enough to outlast the run: issuance takes `now` and stamps every row
+    // from it, and the server checks only expiry against its clock.
+    const runMs = (o.durationS + o.graceS + 600) * 1000;
+    const issuedAt = Date.now() + Math.max(0, runMs - OAUTH_TTL.access);
+    const { db, repo } = openDatabase(dbPath, { blobDir: join(scratch, "blobs") });
+    const resource = "http://localhost/mcp";
+    const users = Array.from({ length: o.users }, (_, u) => {
+      const email = `load${u}@example.com`;
+      return { email, token: issueOAuth(repo, resource, email, HOSTED_SCOPES, issuedAt, HOSTED_CLIENT).token };
+    });
+    db.close();
+
+    const scrape = async () => parseMetrics(await (await fetch(metricsUrl!)).text());
+
+    // Sessions: index i belongs to user i % U and driver i % K, binds load-<i>, subscribes board i % B.
+    const specs: DriverSession[] = Array.from({ length: o.sessions }, (_, i) => {
+      const u = users[i % o.users]!, name = `load-${i}`;
+      return { index: i, email: u.email, token: u.token, name, address: `${u.email}/${name}`, board: `load-${i % o.boards}` };
+    });
+    const addresses = specs.map(s => s.address);
+
+    for (let k = 0; k < o.drivers; k++) {
+      const config: DriverConfig = {
+        driver: k, url: `${server.base}/mcp`, sessions: specs.filter(s => s.index % o.drivers === k), addresses,
+        periodMs: o.periodS * 1000, postShare: o.postShare, burst: Math.max(1, Math.ceil(o.burst / o.drivers)),
+      };
+      const proc = Bun.spawn([process.execPath, join(ROOT, "scripts/loadtest_driver.ts")], {
+        cwd: ROOT, stdin: "pipe", stdout: "pipe", stderr: Bun.file(join(o.out, `driver-${k}.stderr`)),
+        env: { PATH: process.env.PATH ?? "", HOME: env.HOME },
+      });
+      const d: Driver = { proc, windows: [], churned: 0, quiesced: false, read: Promise.resolve() };
+      drivers.push(d);
+      d.read = (async () => {
+        const decoder = new TextDecoder();
+        let buf = "";
+        for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+          buf += decoder.decode(chunk, { stream: true });
+          let nl: number;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+            let msg: any;
+            try { msg = JSON.parse(line); } catch { log(`driver ${k}: ${line}`); continue; }
+            if (msg.type === "window") d.windows.push(msg);
+            else if (msg.type === "ready") d.ready = msg;
+            else if (msg.type === "churned") d.churned++;
+            else if (msg.type === "quiesced") d.quiesced = true;
+            else if (msg.type === "final") d.final = msg;
+          }
+        }
+      })();
+      (proc.stdin as import("bun").FileSink).write(JSON.stringify(config) + "\n");
+    }
+    const send = (cmd: string) => { for (const d of drivers) (d.proc.stdin as import("bun").FileSink).write(cmd + "\n"); };
+    // Every wait sleeps between checks. (Racing the drivers' exits instead spun once one had exited:
+    // its settled promise won every race, and the microtask loop starved timers and ate memory.)
+    const waitAll = async (what: string, ok: (d: Driver) => boolean, ms: number) => {
+      const deadline = Date.now() + ms;
+      while (!drivers.every(ok)) {
+        if (Date.now() > deadline) throw new Error(`${what}: not every driver got there within ${ms / 1000} s (${drivers.map((d, k) => `${k}:${ok(d)}`).join(" ")})`);
+        for (const [k, d] of drivers.entries()) {
+          if (!exited(d) || ok(d)) continue;
+          // An exited driver's last lines may still be in its pipe.
+          await d.read;
+          if (!ok(d)) throw new Error(`${what}: driver ${k} exited (${d.proc.exitCode ?? d.proc.signalCode}); see driver-${k}.stderr`);
+        }
+        await Bun.sleep(100);
+      }
+    };
+
+    // Every process's RSS once a second, to stderr: the run's scope caps the whole tree.
+    const rssOf = (pid: number | undefined) => { try { return Number(/VmRSS:\s+(\d+)/.exec(readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 0) >> 10; } catch { return -1; } };
+    if (process.env.LOADTEST_MEMLOG) setInterval(() => console.error(`memlog ${new Date().toISOString()} coord=${rssOf(process.pid)}MB server=${rssOf(server.proc.pid)}MB drivers=${drivers.map(d => rssOf(d.proc.pid)).join(",")}MB win=${drivers.map(d => d.windows.length).join(",")}`), 1000).unref();
     const t0 = Date.now();
     await waitAll("connect", d => d.ready !== undefined, Math.max(120_000, o.sessions * 200));
     const connected = drivers.reduce((a, d) => a + d.ready!.live, 0);
@@ -266,10 +282,18 @@ async function main() {
     const start = Date.now(), end = start + o.durationS * 1000;
     let prev = await scrape(), prevTools = toolCumulative(prev), prevRef = refusalsTotal(prev);
     let nextChurn = start + o.churnEveryS * 1000, churnUntil = 0, churnsSent = 0;
-    let consumed = drivers.map(d => d.windows.length);
+    // Each scrape asks every driver for its window since the last ask, so the two cover one span.
+    // Report 0 opens the first window: what drivers did before the load started is dropped.
+    let seq = 0;
+    send(`report ${seq}`);
+    const reported = (n: number) => (d: Driver) => d.windows.some(w => w.seq === n);
+    await waitAll("report", reported(seq), o.windowS * 1000);
     for (let next = start + o.windowS * 1000; next <= end; next += o.windowS * 1000) {
       await Bun.sleep(Math.max(0, next - Date.now()));
       const s = await scrape(), now = Date.now();
+      send(`report ${++seq}`);
+      // A driver that can't answer within a window is saturated or dead: the run can't vouch for it.
+      await waitAll(`window ${seq}`, reported(seq), o.windowS * 1000);
       const tools: Window["tools"] = {};
       for (const [tool, c] of toolCumulative(s)) {
         const p = prevTools.get(tool) ?? { count: 0, fast: 0 };
@@ -281,20 +305,17 @@ async function main() {
       const client: Record<string, Hist> = {}, clientErrors: Record<string, number> = {};
       let driverLagP99 = 0, live = 0;
       drivers.forEach((d, k) => {
-        const fresh = d.windows.slice(consumed[k]);
-        consumed[k] = d.windows.length;
-        for (const w of fresh) {
-          for (const [op, h] of Object.entries(w.ops)) mergeHist(client[op] ??= newHist(), h);
-          for (const [c, n] of Object.entries(w.errors)) clientErrors[c] = (clientErrors[c] ?? 0) + n;
-          for (const e of w.firstErrors) log(`driver ${k} error: ${e}`);
-          driverLagP99 = Math.max(driverLagP99, w.lagP99);
-        }
-        live += fresh.at(-1)?.live ?? d.windows.at(-1)?.live ?? 0;
+        const w = d.windows.find(x => x.seq === seq)!;
+        for (const [op, h] of Object.entries(w.ops)) mergeHist(client[op] ??= newHist(), h);
+        for (const [c, n] of Object.entries(w.errors)) clientErrors[c] = (clientErrors[c] ?? 0) + n;
+        for (const e of w.firstErrors) log(`driver ${k} error: ${e}`);
+        driverLagP99 = Math.max(driverLagP99, w.lagP99);
+        live += w.live;
       });
       const lagSamples = ["0.5", "0.99", "1"].map(q => one(s, "grayboard_event_loop_lag_seconds", { quantile: q }));
       const w: Window = {
         at: now, t: (now - start) / 1000, steady: now - start >= o.warmupS * 1000, churning: now < churnUntil,
-        rss: one(s, "grayboard_process_resident_memory_bytes") ?? 0, heap: one(s, "grayboard_process_heap_used_bytes") ?? 0,
+        rss: one(s, "grayboard_process_resident_memory_bytes") ?? -1, heap: one(s, "grayboard_process_heap_used_bytes") ?? -1,
         ...(lagSamples.every(x => x !== undefined) ? { lag: { p50: lagSamples[0]!, p99: lagSamples[1]!, max: lagSamples[2]! } } : {}),
         leases: one(s, "grayboard_delivery_leases") ?? -1, listens: one(s, "grayboard_mcp_admissions", { kind: "listen" }) ?? -1,
         holding: one(s, "grayboard_hosted_sessions_holding") ?? -1, live, refusals, tools, client, clientErrors, driverLagP99,
@@ -311,7 +332,8 @@ async function main() {
         // The churn's windows and the next are exempt from the lease-count gate.
         churnUntil = Infinity;
       }
-      if (churnUntil === Infinity && drivers.every(d => d.churned >= churnsSent)) churnUntil = now + o.windowS * 1000;
+      // Half a window's slack: the next scrape lands about a window from this one, either side.
+      if (churnUntil === Infinity && drivers.every(d => d.churned >= churnsSent)) churnUntil = now + o.windowS * 1500;
     }
 
     // Quiesce: no new sends; the fleet drains what's in flight. Then close and account.
@@ -330,17 +352,26 @@ async function main() {
     // Gates.
     const steady = windows.filter(w => w.steady);
     if (!steady.length) failures.push("no steady window");
+    const target = o.sessions * o.windowS / o.periodS;
     for (const w of steady) {
       if (!w.churning && (w.leases !== o.sessions || w.listens !== o.sessions)) failures.push(`t=${w.t.toFixed(0)}s: ${w.leases} leases, ${w.listens} listens; want ${o.sessions} of each`);
       const all = Object.values(w.tools).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
-      if (all.count && all.fast / all.count < 0.99) failures.push(`t=${w.t.toFixed(0)}s: ${(100 * all.fast / all.count).toFixed(2)}% of ${all.count} tool calls at ≤ 100 ms; want ≥ 99%`);
-      const target = o.sessions * o.windowS / o.periodS;
-      if (!w.churning && w.ops < 0.8 * target) failures.push(`t=${w.t.toFixed(0)}s: ${w.ops} ops; want ≥ 80% of ${target.toFixed(0)}`);
+      // A missing metric must not read as a pass.
+      if (!all.count) failures.push(`t=${w.t.toFixed(0)}s: no server tool-call samples (is grayboard_tool_call_duration_seconds scraped?)`);
+      if (w.rss <= 0 || w.heap <= 0) failures.push(`t=${w.t.toFixed(0)}s: no RSS or heap sample`);
+      // Per window only with enough calls for a 1% tail to mean something; the steady pool below covers the rest.
+      if (all.count >= 100 && all.fast / all.count < 0.99) failures.push(`t=${w.t.toFixed(0)}s: ${(100 * all.fast / all.count).toFixed(2)}% of ${all.count} tool calls at ≤ 100 ms; want ≥ 99%`);
+      // Per window only at a size where 80% isn't inside the schedule's own noise; the pool below covers small runs.
+      if (!w.churning && target >= 100 && w.ops < 0.8 * target) failures.push(`t=${w.t.toFixed(0)}s: ${w.ops} ops; want ≥ 80% of ${target.toFixed(0)}`);
     }
+    const opsWindows = steady.filter(w => !w.churning), opsPool = opsWindows.reduce((a, w) => a + w.ops, 0);
+    if (opsWindows.length && opsPool < 0.8 * target * opsWindows.length) failures.push(`${opsPool} ops over ${opsWindows.length} steady windows; want ≥ 80% of ${(target * opsWindows.length).toFixed(0)}`);
     // Per tool over the steady period: a rare tool's tail can hide in the per-window total.
     const toolSteady: Record<string, { count: number; fast: number }> = {};
     for (const w of steady) for (const [t, x] of Object.entries(w.tools)) { const a = toolSteady[t] ??= { count: 0, fast: 0 }; a.count += x.count; a.fast += x.fast; }
     for (const [t, x] of Object.entries(toolSteady)) if (x.count >= 100 && x.fast / x.count < 0.99) failures.push(`${t}: ${(100 * x.fast / x.count).toFixed(2)}% of ${x.count} at ≤ 100 ms over the steady period`);
+    const toolPool = Object.values(toolSteady).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
+    if (toolPool.count && toolPool.fast / toolPool.count < 0.99) failures.push(`all tools: ${(100 * toolPool.fast / toolPool.count).toFixed(2)}% of ${toolPool.count} at ≤ 100 ms over the steady period`);
     // The client's view of the hot path the server histogram doesn't time (inbox reads, renews,
     // receipts), only from windows where no driver was saturated.
     const clean = steady.filter(w => w.driverLagP99 < 0.05);
@@ -349,6 +380,7 @@ async function main() {
     for (const w of clean) for (const [op, h] of Object.entries(w.client)) mergeHist(clientSteady[op] ??= newHist(), h);
     for (const op of ["inbox", "renew", "receipt", "dm_send", "board_post"]) {
       const h = clientSteady[op];
+      if (!h && clean.length && (op !== "board_post" || o.postShare > 0)) failures.push(`client ${op}: no samples in the clean steady windows`);
       if (h && h.count >= 100 && fastShare(h) < 0.99) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows)`);
     }
     // Refusals since the server started, connect and close included: the windows see only the load.
@@ -363,6 +395,8 @@ async function main() {
     const lost = [...sent].filter(id => !recv.has(id));
     if (!sent.size) failures.push("no DM was sent");
     if (lost.length) failures.push(`${lost.length} of ${sent.size} DMs never reached their recipient (e.g. ${lost.slice(0, 5).join(", ")})`);
+    const misdelivered = drivers.reduce((a, d) => a + d.final!.misdelivered, 0);
+    if (misdelivered) failures.push(`${misdelivered} deliveries reached the wrong session (e.g. ${drivers.flatMap(d => d.final!.misdeliveredFirst).slice(0, 5).join("; ")})`);
     const posts = drivers.reduce((a, d) => a + d.final!.posts, 0), boardRecv = drivers.reduce((a, d) => a + d.final!.boardRecv, 0);
     if (o.postShare > 0 && !boardRecv) failures.push(`${posts} board posts, none delivered`);
     // RSS and heap over the steady period.
@@ -378,7 +412,7 @@ async function main() {
       options: { ...o, server: o.server.join(" ") }, env, connected, windows: windows.length, steadyWindows: steady.length, cleanWindows: clean.length,
       toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
       clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
-      dms: { sent: sent.size, received: recv.size, lost: lost.length }, posts, boardDeliveries: boardRecv,
+      dms: { sent: sent.size, received: recv.size, lost: lost.length }, misdelivered, posts, boardDeliveries: boardRecv,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
       drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, failures,
@@ -391,9 +425,8 @@ async function main() {
     log(`loadtest aborted: ${e instanceof Error ? e.stack ?? e.message : e}`);
     exitCode = 2;
   } finally {
-    for (const d of drivers) if (d.proc.exitCode === null) d.proc.kill("SIGKILL");
-    await srv.stop();
-    writeFileSync(join(o.out, "server.log"), srv.log());
+    for (const d of drivers) if (!exited(d)) d.proc.kill("SIGKILL");
+    if (srv) { await srv.stop(); writeFileSync(join(o.out, "server.log"), srv.log()); }
     if (!o.keepDb) rmSync(scratch, { recursive: true, force: true });
     else log(`database kept: ${dbPath}`);
   }

@@ -2,8 +2,10 @@
 // hosted-core's controller runs one (adapters/hosted-core/src/controller.ts: a lease renewed
 // every 10 s and the inbox read after it, a read on every hint, two renews per item, one receipt
 // per batch), plus agent traffic on a wall-clock schedule. Started by scripts/loadtest.ts, which
-// writes its config as one JSON line on stdin and then sends commands, one per line: "churn <f>",
-// "quiesce" (stop sending, keep draining), "close" (release every session, report, exit).
+// writes its config as one JSON line on stdin and then sends commands, one per line: "report <n>"
+// (emit window n: everything since the last report, so driver and coordinator windows cover the
+// same span), "churn <f>", "quiesce" (stop sending, keep draining), "close" (release every
+// session, report, exit).
 // Reports are JSON lines on stdout. Bun runs this on one thread, like a C program with one event
 // loop: the driver's own loop lag is reported so a saturated driver's window is discarded, not
 // blamed on the server.
@@ -20,20 +22,20 @@ export type DriverConfig = {
   periodMs: number;
   postShare: number;
   burst: number;
-  reportMs: number;
 };
 // Client-side latency buckets, seconds: the server's (src/server/metrics.ts LATENCY_BUCKETS).
 export const BUCKETS = [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
 export type Hist = { buckets: number[]; count: number; sum: number; errors: number };
 export type DriverWindow = {
-  type: "window"; driver: number; at: number; live: number; inflight: number; inflightMax: number;
+  type: "window"; driver: number; seq: number; at: number; live: number; inflight: number; inflightMax: number;
   lagP99: number; ops: Record<string, Hist>; errors: Record<string, number>; firstErrors: string[];
 };
-export type DriverFinal = { type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; errors: Record<string, number> };
+// misdelivered: a DM read by a session it wasn't sent to, or a post by one off its board.
+export type DriverFinal = { type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[]; errors: Record<string, number> };
 
 const RENEW_MS = 10_000;
-// Body marker: lt|<kind>|<sender index>|<seq>|<sent at ms>.
-const MARK = /lt\|(dm|post)\|(\d+)\|(\d+)\|(\d+)/g;
+// Body marker: lt|<kind>|<sender index>|<seq>|<to: the target index, or the board>|<sent at ms>.
+const MARK = /lt\|(dm|post)\|(\d+)\|(\d+)\|([\w-]+)\|(\d+)/g;
 
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
 let ops: Record<string, Hist> = {};
@@ -91,7 +93,8 @@ type Live = {
 
 const sentDm = new Set<string>();
 const recvDm = new Set<string>();
-let posts = 0, boardRecv = 0;
+let posts = 0, boardRecv = 0, misdelivered = 0;
+const misdeliveredFirst: string[] = [];
 let sending = true;
 
 function itemsOf(read: unknown): { id: string; event: unknown }[] {
@@ -109,12 +112,18 @@ async function drain(l: Live) {
   for (const item of items) {
     const text = JSON.stringify(item.event);
     for (const m of text.matchAll(MARK)) {
+      const meant = m[1] === "dm" ? m[4] === String(l.spec.index) : m[4] === l.spec.board;
+      if (!meant) {
+        misdelivered++;
+        if (misdeliveredFirst.length < 5) misdeliveredFirst.push(`${m[0]} read by session ${l.spec.index} (${l.spec.board})`);
+        continue;
+      }
       if (m[1] === "dm") {
         recvDm.add(`${m[2]}:${m[3]}`);
-        observe("dm_e2e", (Date.now() - Number(m[4])) / 1000, false);
+        observe("dm_e2e", (Date.now() - Number(m[5])) / 1000, false);
       } else {
         boardRecv++;
-        observe("post_e2e", (Date.now() - Number(m[4])) / 1000, false);
+        observe("post_e2e", (Date.now() - Number(m[5])) / 1000, false);
       }
     }
     await timed("renew", () => l.s.subscriber.call("delivery_renew"));
@@ -200,11 +209,11 @@ async function main() {
   const lag = monitorEventLoopDelay({ resolution: 10 });
   lag.enable();
   const live = new Map<number, Live>();
-  const report = setInterval(() => {
-    const w: DriverWindow = { type: "window", driver: config.driver, at: Date.now(), live: live.size, inflight, inflightMax, lagP99: lag.count ? lag.percentile(99) / 1e9 : 0, ops, errors, firstErrors };
+  const report = (seq: number) => {
+    const w: DriverWindow = { type: "window", driver: config.driver, seq, at: Date.now(), live: live.size, inflight, inflightMax, lagP99: lag.count ? lag.percentile(99) / 1e9 : 0, ops, errors, firstErrors };
     emit(w);
     ops = {}; errors = {}; firstErrors = []; inflightMax = inflight; lag.reset();
-  }, config.reportMs);
+  };
 
   // Burst creation: `burst` sessions connecting at once, wave after wave.
   for (let i = 0; i < config.sessions.length; i += config.burst) {
@@ -227,13 +236,13 @@ async function main() {
       const seq = ++l.seq;
       if (Math.random() < config.postShare) {
         posts++;
-        void timed("board_post", () => l.s.call("board_post", { board: l.spec.board, body: `lt|post|${l.spec.index}|${seq}|${Date.now()}` }));
+        void timed("board_post", () => l.s.call("board_post", { board: l.spec.board, body: `lt|post|${l.spec.index}|${seq}|${l.spec.board}|${Date.now()}` }));
       } else {
         let to = Math.floor(Math.random() * (config.addresses.length - 1));
         if (to >= l.spec.index) to++;
         const id = `${l.spec.index}:${seq}`;
         void timed("dm_send", async () => {
-          const r = await l.s.call("dm_send", { to: config.addresses[to]!, body: `lt|dm|${l.spec.index}|${seq}|${Date.now()}` });
+          const r = await l.s.call("dm_send", { to: config.addresses[to]!, body: `lt|dm|${l.spec.index}|${seq}|${to}|${Date.now()}` });
           sentDm.add(id);
           return r;
         });
@@ -260,7 +269,9 @@ async function main() {
 
   for await (const line of lines) {
     const [cmd, arg] = line.trim().split(/\s+/);
-    if (cmd === "churn") {
+    if (cmd === "report") {
+      report(Number(arg));
+    } else if (cmd === "churn") {
       churning = churning.then(() => churn(Number(arg)));
     } else if (cmd === "quiesce") {
       sending = false;
@@ -270,8 +281,7 @@ async function main() {
       await churning;
       await Promise.all([...live.values()].map(l => timed("close", () => close(l))));
       live.clear();
-      clearInterval(report);
-      const f: DriverFinal = { type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, errors: totalErrors };
+      const f: DriverFinal = { type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst, errors: totalErrors };
       emit(f);
       break;
     }
