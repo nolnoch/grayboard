@@ -113,20 +113,18 @@ describe("resolveMention", () => {
     expect(access.resolveMention("deploy", "eng/other", OPEN, true)).toBe("eng/deploy");
   });
 
-  test("else the one roster match the board can see", () => {
-    expect(access.resolveMention("qa", AUTHOR, OPEN, true)).toBe("bob@example.com/qa");
-    expect(access.resolveMention("deploy", AUTHOR, ENG, true)).toBe("eng/deploy");
-    // bob isn't in ops, so his qa isn't on the ops roster.
-    expect(access.resolveMention("qa", "eve@example.com/be", OPS, true)).toBeNull();
-  });
-
-  test("an ambiguous bare name refuses a strict post with the candidates, and is unresolved otherwise", () => {
+  test("never another scope's: a strict post refuses naming the roster's matches, a system post leaves it unresolved (F-08)", () => {
+    expect(() => access.resolveMention("qa", AUTHOR, OPEN, true)).toThrow("@qa isn't in your scope; name it in full: bob@example.com/qa");
+    expect(access.resolveMention("qa", AUTHOR, OPEN, false)).toBeNull();
+    expect(() => access.resolveMention("deploy", AUTHOR, ENG, true)).toThrow("@deploy isn't in your scope; name it in full: eng/deploy");
     expect(() => access.resolveMention("be", "eng/deploy", OPEN, true)).toThrow(
-      "@be matches bob@example.com/be, eve@example.com/be, wade@example.com/be; name one",
+      "@be isn't in your scope; name it in full: bob@example.com/be, eve@example.com/be, wade@example.com/be",
     );
     expect(access.resolveMention("be", "eng/deploy", OPEN, false)).toBeNull();
-    // Only the board's roster counts: on eng, eve's be can't see it.
-    expect(() => access.resolveMention("be", "eng/deploy", ENG, true)).toThrow("@be matches bob@example.com/be, wade@example.com/be; name one");
+    // Only the board's roster is named: on eng, eve's be can't see it.
+    expect(() => access.resolveMention("be", "eng/deploy", ENG, true)).toThrow("@be isn't in your scope; name it in full: bob@example.com/be, wade@example.com/be");
+    // bob isn't in ops, so his qa isn't on the ops roster: nothing to name.
+    expect(access.resolveMention("qa", "eve@example.com/be", OPS, true)).toBeNull();
   });
 
   test("a bare @human is only ever your own", () => {

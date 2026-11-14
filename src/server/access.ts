@@ -75,10 +75,12 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
 
     // The grammar of #284 decision 16 (S13): @id:… is the session itself (a
     // strict post refuses one that can't receive); @scope/name is that alias
-    // exactly; a bare @name is the author's own scope's first, then the one
-    // alias of that name on the board's roster. A strict post refuses an
-    // ambiguous bare name, naming the candidates; a system post leaves it
-    // unresolved. A bare @human is only ever your own.
+    // exactly; a bare @name is the author's own scope's alias of that name,
+    // and only that: another user's or team's is named in full, so a bare
+    // name never wakes someone else's agent by accident (security audit F-08).
+    // A strict post with a bare name only others have refuses, naming the
+    // ones on the board's roster; a system post leaves it unresolved. A bare
+    // @human is only ever your own.
     resolveMention(token, author, board, strict) {
       const t = addressParts(token);
       if (!t || t.kind === "team") return null;
@@ -93,9 +95,9 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
       const own = scope ? `${scope}/${t.name}` : null;
       if (own && repo.aliases.find(own)) return own;
       if (t.name === HUMAN_NAME) return null;
+      if (!strict) return null;
       const roster = repo.aliases.findAllByName(t.name).map((i) => i.address).filter(reach);
-      if (roster.length === 1) return roster[0]!;
-      if (roster.length > 1 && strict) throw new CoreError(`@${t.name} matches ${roster.join(", ")}; name one`);
+      if (roster.length) throw new CoreError(`@${t.name} isn't in your scope; name it in full: ${roster.join(", ")}`);
       return null;
     },
 

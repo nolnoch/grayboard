@@ -61,14 +61,14 @@ test("team board: members see it and get pushes; non-members can't see or be men
   const b = await srv.hosted(B, "fe");
   const c = await srv.hosted(C, "sim");
 
-  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: "@sim @bob/fe secret plan" });
+  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: `@${C}/sim @bob/fe secret plan` });
   expect(posted.unresolved).toEqual(["bob/fe"]);
 
   const pushed = await c.next(board());
   expect(pushed.event.item).toMatchObject({
     kind: "push",
     reason: "mention",
-    post: { board: "eng", author: `${A}/be`, body: "@sim @bob/fe secret plan" },
+    post: { board: "eng", author: `${A}/be`, body: `@${C}/sim @bob/fe secret plan` },
   });
   await b.none(board());
 
@@ -192,22 +192,27 @@ test("a receipt that fails inside answers an internal error and keeps the sessio
   await fe.call("board_list");
 });
 
-test("a bare DM recipient is your own identity of that name, else the only one with it", async () => {
+test("a bare DM recipient is only ever your own identity of that name (F-08)", async () => {
   const a = await srv.hosted(A, "be");
   const a2 = await srv.hosted(A, "be-stream");
-  await srv.hosted(B, "be-stream");
+  const b = await srv.hosted(B, "be-stream");
   await srv.hosted(B, "fe");
   const c = await srv.hosted(C, "fe");
 
   // alice and bob both have be-stream: alice's bare name means her own.
   await a.call("dm_send", { to: "be-stream", body: "mine" });
   expect((await a2.next(direct())).event.message.body).toBe("mine");
-  // carol has no be: the only be is alice's.
-  await c.call("dm_send", { to: "be", body: "only one" });
-  expect((await a.next(direct())).event.message.body).toBe("only one");
-  // alice has no fe, and bob and carol each have one: ambiguous.
+  await b.none(direct());
+  // carol has no be: alice's, the only one, is named in full, never woken by the bare name.
+  await expect(c.call("dm_send", { to: "be", body: "only one" })).rejects.toMatchObject({
+    message: `"be" isn't in your scope; name it in full: ${A}/be; peer_list shows exact handles`,
+  });
+  await a.none(direct());
+  await c.call("dm_send", { to: `${A}/be`, body: "in full" });
+  expect((await a.next(direct())).event.message.body).toBe("in full");
+  // alice has no fe, and bob and carol each have one.
   await expect(a.call("dm_send", { to: "fe", body: "?" })).rejects.toMatchObject({
-    message: `several identities are named "fe": ${B}/fe, ${C}/fe; peer_list shows exact handles`,
+    message: `"fe" isn't in your scope; name it in full: ${B}/fe, ${C}/fe; peer_list shows exact handles`,
   });
   await expect(a.call("dm_send", { to: "nobody", body: "?" })).rejects.toMatchObject({
     message: `no identity is named "nobody"; peer_list shows exact handles`,
@@ -217,15 +222,15 @@ test("a bare DM recipient is your own identity of that name, else the only one w
 test("dm_history: peer resolves like dm_send's recipient, oldest first, limit clamped; empty bodies refused", async () => {
   const a = await srv.hosted(A, "be");
   await srv.hosted(B, "fe");
-  for (const body of ["one", "two", "three"]) await a.call("dm_send", { to: "fe", body });
-  await expect(a.call("dm_send", { to: "fe", body: "  " })).rejects.toMatchObject({ message: "body is required" });
+  for (const body of ["one", "two", "three"]) await a.call("dm_send", { to: `${B}/fe`, body });
+  await expect(a.call("dm_send", { to: `${B}/fe`, body: "  " })).rejects.toMatchObject({ message: "body is required" });
 
   const bodies = async (peer: string, limit?: number) =>
     (await a.call<HistoryMessage[]>("dm_history", { peer, ...(limit !== undefined ? { limit } : {}) })).map((m) => m.body);
-  expect(await bodies("fe")).toEqual(["one", "two", "three"]);
+  expect(await bodies(`${B}/fe`)).toEqual(["one", "two", "three"]);
   expect(await bodies("Bob@Example.com/FE")).toEqual(["one", "two", "three"]);
-  expect(await bodies("fe", 2)).toEqual(["two", "three"]);
-  expect(await bodies("fe", 0)).toEqual(["three"]);
+  expect(await bodies(`${B}/fe`, 2)).toEqual(["two", "three"]);
+  expect(await bodies(`${B}/fe`, 0)).toEqual(["three"]);
   await expect(a.call("dm_history", { peer: "nobody" })).rejects.toMatchObject({
     message: `no identity is named "nobody"; peer_list shows exact handles`,
   });
@@ -474,7 +479,7 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   // A client can't name paths for the server to read: the hosted board_post
   // has no attachments field (attachment_ids only), and refuses one.
   await expect(a.call("board_post", { board: "eng", body: "x", attachments: ["/etc/hosts"] })).rejects.toMatchObject({ message: "Input validation error: Invalid arguments for tool board_post: data must NOT have additional properties" });
-  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: "@sim plan attached", attachment_ids: [up.body.id] });
+  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: `@${C}/sim plan attached`, attachment_ids: [up.body.id] });
   const info = { id: up.body.id, filename: "plan.md", type: "text/markdown", size: 6, sha256: up.body.sha256 };
   expect(posted.attachments).toEqual([info]);
   expect(postOf((await c.next(board())).event.item).attachments).toEqual([info]);

@@ -193,9 +193,9 @@ test("attachments: a DM and a post carry uploaded files to their readers, and th
 
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
   const file = await be.upload("shot.png", png);
-  const posted = await be.call<BoardPostResult>("board_post", { board: "e2e", body: "@sim shot", attachment_ids: [file] });
+  const posted = await be.call<BoardPostResult>("board_post", { board: "e2e", body: `@${C}/sim shot`, attachment_ids: [file] });
   expect(posted.attachments).toEqual([shotInfo(file)]);
-  const pushed = await sim.next(board((i) => i.kind === "push" && i.post.body === "@sim shot"));
+  const pushed = await sim.next(board((i) => i.kind === "push" && i.post.body === `@${C}/sim shot`));
   expect(pushed.event.item.kind === "push" && pushed.event.item.post.attachments).toEqual([shotInfo(file)]);
   expect(await sim.download(file)).toEqual(png);
 
