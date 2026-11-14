@@ -638,6 +638,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           }
           const byEmail = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email);
           if (byEmail?.idp_subject) return { status: "subject_mismatch", user: byEmail };
+          // A disabled account is refused by the caller: a refused sign-in
+          // must not bind it to whoever tried (security audit F-13).
+          if (byEmail && byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
           const user = this.upsertByEmail(email, displayName);
           db.run("UPDATE users SET idp_subject = ? WHERE id = ?", [subject, user.id]);
           return { status: "ok", user: { ...user, idp_subject: subject }, linked: byEmail !== null && byEmail !== undefined };

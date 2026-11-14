@@ -42,7 +42,7 @@ const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "bl
 const admissionCase = process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission");
 let admissionNow: number | undefined;
 let admissionGate: SubscriberAdmission | undefined;
-const start = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
+const start = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture", subject: "google-" + email }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
 let app = start();
 // The transaction races run the server as its own process (#383), so a pause inside one of its
 // transactions holds the server alone; this process's in-process server stops before anything uses it.

@@ -104,6 +104,7 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   const signedIn = googleSignIn(repo, identity, { ip: ip ?? undefined });
   if ("refused" in signedIn) return jsonErr("forbidden", signedIn.refused, 403);
   const { user } = signedIn;
+  if (user.disabled_at !== null) return jsonErr("forbidden", `${email} is disabled on this server`, 403);
   const raw  = mintToken();
   const ua   = userAgent(req);
   repo.sessions.create(user.id, hashToken(raw), ua);

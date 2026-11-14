@@ -308,6 +308,14 @@ test("signIn: a subject owns its user; a reassigned or changed email is refused;
   expect(() => db.run("UPDATE users SET idp_subject = 's-new' WHERE id = ?", [legacy.id])).toThrow(/UNIQUE/);
 });
 
+test("signIn: a disabled account without a subject isn't bound to whoever signs in", () => {
+  const { repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const departed = repo.users.upsertByEmail("gone@example.com", null);
+  repo.users.setDisabled(departed.id, true);
+  expect(repo.users.signIn("gone@example.com", "s-hire", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
+  expect(repo.users.findById(departed.id)!.idp_subject).toBeNull();
+});
+
 // ── #130: the undeliveredFrom plan ────────────────────────────────────────────
 
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", () => {
