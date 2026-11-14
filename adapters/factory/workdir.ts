@@ -58,6 +58,27 @@ export class Workspaces {
     await git(w.repo, ["worktree", "add", "--detach", own, base]);
   }
 
+  // Hands a worktree-mode tree's result back as a branch in its repository
+  // (#683): `name` at the tree's main worktree's HEAD, when that HEAD has
+  // commits no branch holds. A name already taken gets the commit's short id
+  // appended. The branch is the requester's: nothing here deletes it.
+  // Null when there's no worktree or nothing new; throws why it couldn't.
+  async handBack(w: Workdir, tree: number, name: string): Promise<{ branch: string; sha: string } | null> {
+    if (w.mode !== "worktree") return null;
+    const main = join(this.root, String(tree), "main");
+    if (!existsSync(join(main, ".git"))) return null;
+    return this.serial(async () => {
+      const sha = (await git(main, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      if ((await git(main, ["rev-list", "--count", sha, "--not", "--branches"])).trim() === "0") return null;
+      for (const branch of [name, `${name}-${sha.slice(0, 7)}`]) {
+        if (await git(main, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).then(() => true, () => false)) continue;
+        await git(main, ["branch", branch, sha]);
+        return { branch, sha };
+      }
+      throw new Error(`branches ${name} and ${name}-${sha.slice(0, 7)} both exist`);
+    });
+  }
+
   // Removes every tree whose request the store no longer holds, worktrees
   // included (their repository forgets them). Returns how many went.
   async sweep(keep: (tree: number) => boolean): Promise<number> {
