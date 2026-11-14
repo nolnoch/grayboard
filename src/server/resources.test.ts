@@ -1,4 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { refusalCount } from "./metrics.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
@@ -493,7 +494,9 @@ test("per-session watch capacity counts only that session's watches and frees on
   application.call(a, "board_create", { name: "cap", purpose: "capacity" });
   application.call(b, "board_create", { name: "other", purpose: "capacity" });
   const ids = Array.from({ length: 32 }, () => resources.watch(a, "grayboard://boards/cap", hooks()));
+  const counted = refusalCount("resource_watch");
   expect(() => resources.watch(a, "grayboard://boards/cap", hooks())).toThrow("resource watch capacity reached");
+  expect(refusalCount("resource_watch")).toBe(counted + 1);
   const theirs = resources.watch(b, "grayboard://boards/other", hooks());
   resources.unwatch(a, ids[0]!);
   ids[0] = resources.watch(a, "grayboard://boards/cap", hooks());

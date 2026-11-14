@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { refusalCount } from "./metrics.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
@@ -125,7 +126,9 @@ test("child quota refusal leaves grant, lease and graph unchanged; ending a chil
   for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
   const lease = await delivery.open(principal, context("root"));
   const otherGrant = { ...principal, grantId: "G2" };
+  const counted = refusalCount("hosted_child");
   await expect(hosted.register(otherGrant, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
+  expect(refusalCount("hosted_child")).toBe(counted + 1);
   expect(database.repo.hosted.all().every(row => row.grant_id === "G1")).toBe(true);
   expect(delivery.describe(principal, context("root"), lease.capability).capability).toBe(lease.capability);
   await hosted.end(principal, context("child-0"));
@@ -1232,7 +1235,9 @@ test("a user at capacity with idle rows is admitted after the refusal's re-sweep
   const idle = spyOn(database.repo.hosted, "idle");
   try {
     now += 1_000;
+    const counted = refusalCount("hosted_session");
     await expect(hosted.whoami(principal, context("refused-1"))).rejects.toHaveProperty("code", "bad_request");
+    expect(refusalCount("hosted_session")).toBe(counted + 1);
     const swept = idle.mock.calls.length;
     expect(swept).toBeGreaterThan(0);
     await expect(hosted.whoami(principal, context("refused-2"))).rejects.toHaveProperty("code", "bad_request");

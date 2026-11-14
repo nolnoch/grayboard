@@ -54,6 +54,8 @@ export type Config = {
   hostedCaps?: HostedCaps;
   // How long an unbound, or bound but never-delivering, hosted session may idle (src/server/hosted.ts); default 900.
   hostedIdleSeconds?: number;
+  // GRAYBOARD_METRICS_ADDR (#805): where the metrics listener binds; unset, there is none.
+  metricsAddr?: { hostname: string; port: number };
   trustedProxies: readonly string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
@@ -102,6 +104,7 @@ export function loadConfig(): Config {
     hostedCaps: parseHostedCaps(process.env),
     ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
+    ...(process.env.GRAYBOARD_METRICS_ADDR ? { metricsAddr: parseMetricsAddr(process.env.GRAYBOARD_METRICS_ADDR) } : {}),
     ...slackConfig(),
   };
 }
@@ -235,6 +238,16 @@ function retentionDays(name: string, raw: string | undefined, fallback: number):
   const days = parseRetentionDays(raw, fallback);
   if (days === null) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
   return days;
+}
+
+// GRAYBOARD_METRICS_ADDR: `host:port`, `[v6]:port`, or a bare port (binds 127.0.0.1). Unset: no listener.
+export function parseMetricsAddr(raw: string | undefined): { hostname: string; port: number } | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const m = /^(?:(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+):)?(\d+)$/.exec(raw);
+  const port = m ? Number(m[2]) : NaN;
+  if (!m || port > 65535) throw new Error(`GRAYBOARD_METRICS_ADDR must be host:port or a port, not "${raw}"`);
+  const host = m[1] ?? "127.0.0.1";
+  return { hostname: host.startsWith("[") ? host.slice(1, -1) : host, port };
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so

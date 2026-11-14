@@ -6,6 +6,7 @@ import { attachmentDownload, attachmentRelease, attachmentUpload } from "./http.
 import type { createOAuthServer } from "./oauth.ts";
 import type { UploadGate } from "./uploads.ts";
 import { permitsOrigin } from "./origin.ts";
+import { countRefusal } from "./metrics.ts";
 
 class Refusal extends Error {
   constructor(readonly response: Response) { super("attachment request refused"); }
@@ -30,7 +31,7 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
       if (!permitsOrigin(req.headers.get("Origin"), origin)) return error("forbidden", "invalid origin", 403);
       const principal = oauth.authenticate(req, ["grayboard:tools"]);
       if (principal instanceof Response) return principal;
-      if (pending.size >= 128) return error("unavailable", "too many attachment requests", 503);
+      if (pending.size >= 128) { countRefusal("attachment_requests"); return error("unavailable", "too many attachment requests", 503); }
       if (url.hash || url.search.length > 2048 || /%(?![0-9a-f]{2})/i.test(url.search)) return error("bad_request", "invalid query", 400);
       const allowed = req.method === "POST" ? ["identity", "filename"] : ["identity"];
       const seen = new Set<string>();
