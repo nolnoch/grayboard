@@ -124,6 +124,21 @@ test("agent files: frontmatter name or filename; later directories override by n
 const req = (id: number, persona = "researcher"): Request => ({ id, source: "dm", requester: "sim", persona, task: `task ${id}` });
 const k = (id: number) => ({ source: "dm" as const, id });
 
+test("store (#636): a store the removed shared-subtasks build wrote opens, and its columns stay out of rows", () => {
+  const path = join(dir, "shared.db");
+  new Store(path).close();
+  const db = new Database(path);
+  db.run("ALTER TABLE requests ADD COLUMN shared_until INTEGER");
+  db.run("ALTER TABLE requests ADD COLUMN shared_by TEXT");
+  db.close();
+  const s = new Store(path);
+  expect(s.admit(req(2), "researcher")).toBe(true);
+  const row = s.get(k(2))!;
+  expect(row.state).toBe("queued");
+  expect(Object.keys(row).filter((key) => key.startsWith("shared"))).toEqual([]);
+  s.close();
+});
+
 test("store: a message id is admitted once; queued rows run in arrival order", () => {
   const s = new Store(":memory:");
   expect(s.admit(req(2), "researcher")).toBe(true);

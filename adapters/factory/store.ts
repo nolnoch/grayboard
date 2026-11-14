@@ -497,7 +497,7 @@ function held(boards: string[], within: boolean): string {
 
 type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number };
 function toRow(r: Raw): Row {
-  const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, ...rest } = r;
+  const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, shared_until: _su, shared_by: _sb, ...rest } = r as Raw & { shared_until?: unknown; shared_by?: unknown };
   const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board, askHuman: ask_human === 1, askedAt: asked_at, escalatedAt: escalated_at, resume: resume === 1 };
   return source === "board" ? { ...base, source: "board", board: board ?? "" } : { ...base, source: "dm" };
 }
