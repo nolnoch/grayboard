@@ -507,19 +507,16 @@ const staleNotice = updateNotice();
 // The channels warning also goes in the first tool result, in case the
 // instructions went unread.
 let channelsNoticePending = CHANNELS_OFF;
-// A bind that completed after it was cancelled, for the next tool result; it
-// carries the instructions too, as the bind's result would have, for adapters
-// that keep them in the system prompt.
-let missedBindNotice: string | null = null;
 let instructionsStale = false;
-// What a result the client dropped carried, for the next one.
+// What a result the client dropped carried, for the next one, in order: its
+// notices, and a bind or unbind that completed after it was cancelled (whose
+// result carries the instructions too, for adapters that keep them in the
+// system prompt). A list, so a second cancelled call doesn't overwrite the first's (#375).
 const requeued: string[] = [];
 const notices = (): string[] => {
   const out = requeued.splice(0);
   if (channelsNoticePending && CHANNELS_OFF_NOTICE) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
-  if (missedBindNotice) out.push(missedBindNotice);
-  missedBindNotice = null;
   const stale = staleNotice();
   return stale ? [...out, stale] : out;
 };
@@ -594,7 +591,6 @@ async function rotateRoot(session: string): Promise<void> {
     restoredFrom = null;
     startNotes.length = 0;
     bindHinted = false;
-    missedBindNotice = null;
     requeued.length = 0;
     ROOT_KIND.harnessSession = session;
     registerSession(db, thisSession(SESSION_ID), ROOT_KIND);
@@ -743,7 +739,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   }
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
-    if (name === "unbind" && r.structuredContent) requeued.push(unbindMissed(String(args.name), "it was cancelled", r.content[0]!.text));
+    if (name === "unbind" && r.structuredContent) {
+      // The name the unbind resolved (lowercased), not the raw argument (#375).
+      const n = bareName(String(args.name), "unbind");
+      requeued.push(unbindMissed(n.ok ? n.name : String(args.name), "it was cancelled", r.content[0]!.text));
+    }
     requeued.push(...extra);
     if (out.structuredContent) instructionsStale = true;
   });
@@ -1281,7 +1281,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     const ok = bindOk(n.name, held, (general) => localInstructions(general));
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
-      missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      requeued.push(bindMissed(n.name, "it was cancelled", ok.content[0]!.text));
       instructionsStale = true;
     }
     return ok;
@@ -1325,7 +1325,7 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
     const left = listClaims(db).filter((c) => c.holder === n.name).map((c) => c.key);
     const ok = unbindOk(n.name, before, primary(), left, (general) => localInstructions(general));
     if (signal.aborted) {
-      missedBindNotice = unbindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      requeued.push(unbindMissed(n.name, "it was cancelled", ok.content[0]!.text));
       instructionsStale = true;
     }
     return ok;
