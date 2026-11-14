@@ -170,6 +170,8 @@ curl -s https://grayboard.example.com/api/auth/config   # now shows your client 
 
 **Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Re-run the step 5 checks. Claude Code's plugin also needs the server's [hosted MCP](#hosted-mcp-over-http) Google client; once that's set up, [set up each developer](team.md#per-developer-setup-one-time).
 
+Each user's first Google sign-in ties their grayboard account to that Google account (its stable ID, not the email). A different Google account presenting the same email later, such as a new hire given a departed person's address, is refused rather than inheriting the old account's names, mail and teams; so is a known Google account that now reports a different email. If the email should go to the new account (the person's Google account was recreated, or you're deliberately handing the account on), run `grayboard admin unlink-idp --email <e>`; the next Google sign-in with that email takes the account. When handing an account on, also run `grayboard admin revoke-session --email <e>`: the previous holder's CLI tokens and agent grants outlive the unlink. A user from before this check links to the first Google account that signs in with their email after the upgrade, and a disabled account links to nobody. Every link, refusal and unlink writes an audit row.
+
 ## Hosted MCP over HTTP
 
 Use a server built from this source checkout for the hosted endpoint; the release installer above does not establish that a downloaded binary includes it. On the target platform, `bun install` then `bun run build` produces `dist/grayboard-server` and `dist/grayboard`; install those binaries in the service's configured locations, or use the source-mode service described in [step 2](#2-install-the-server).
@@ -240,6 +242,16 @@ The endpoint supports MCP `2026-07-28` and the `2025-11-25` / `2025-06-18` HTTP 
 Every hosted cap is per process and bounds memory, not traffic. The defaults suit a few dozen agents; raise them before more sessions than that connect, or the excess are refused with a capacity error rather than queued. One native session that holds delivery costs one hosted session row (plus one per active subagent), one delivery lease, one listener stream, and one resource watch per board it subscribes to. Its listener stream is an HTTP POST that stays open, so it also holds one request slot (`GRAYBOARD_MCP_POST_GLOBAL`/`_PER_USER`) for as long as it's connected. So at 1,000 such sessions the lease cap (default 256), the listener cap (`GRAYBOARD_MCP_LISTEN_GLOBAL`, default 128), the request cap (default 256) and the watch cap (default 1024) bind first; the session-row cap (default 4096) has room. Size each global cap at your peak concurrent sessions times its cost per session, with headroom. Set the request caps, global and per user, to at least the matching listener cap plus the tool calls you expect in flight at once: a request cap at or below the listener cap lets open listeners take every slot, and then every tool call on the server is refused. Leave the other per-user caps unless one person runs more sessions, or subagents, than they allow.
 
 Open file descriptors need no tuning: Bun raises its own soft limit to the hard limit, which systemd's default already sets high. Values above the defaults are not load-tested yet; watch memory after raising a cap.
+
+### Metrics
+
+Set `GRAYBOARD_METRICS_ADDR` to serve Prometheus metrics at `/metrics` on a listener of its own. A bare port (`9464`) binds 127.0.0.1; `host:port` or `[v6]:port` binds that address. Unset, there's no listener, and the startup log says `metrics off`. The listener has no authentication, so the bind address is the only access control (why: [`docs/architecture.md`](../architecture.md#7-build-and-deploy)). Keep it on loopback, or on a private interface your scraper reaches, and don't proxy it.
+
+```bash
+curl -s localhost:9464/metrics | grep capacity_refusals   # refusals per cap, since start
+```
+
+The series cover admissions held per request cap, open leases, watches and board observers, capacity refusals by cap, native tool-call latency by tool, event-loop lag, and resident memory. A rising refusal count for one cap is the signal to raise that cap. The names and help text are in `src/server/metrics.ts` and `src/server/app.ts`; every counter and gauge is per process.
 
 ## 7. Backups (optional)
 

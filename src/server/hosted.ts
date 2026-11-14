@@ -15,6 +15,7 @@ import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { countRefusal } from "./metrics.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
 // an empty string clears it (#558).
@@ -203,10 +204,11 @@ export function createHostedSessions(application: Application, options: { now?: 
     return over();
   };
   function admitChild(root: string, own: string[]) {
-    if (full(() => store.children(root).filter(r => r.parked_at === null).length >= limits.children, own)) throw new ApplicationError("bad_request", childCapacity(root));
+    if (full(() => store.children(root).filter(r => r.parked_at === null).length >= limits.children, own)) { countRefusal("hosted_child"); throw new ApplicationError("bad_request", childCapacity(root)); }
   }
   function admit(user: number, own: string[], root?: string) {
     if (full(() => { const n = store.counts(user); return n.total >= limits.global || n.user >= limits.user; }, own)) {
+      countRefusal("hosted_session");
       throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
     }
     if (root) admitChild(root, own);
@@ -522,6 +524,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     get inflightCount() { return inflight.size; },
     // Refusal rows whose write after the rollback failed (#467).
     get refusalRowsLost() { return refusalRowsLost; },
+    // Bound sessions this process holds a name for: O(1), for the metrics scrape (#805).
+    get holderCount() { return holders.size; },
     now,
     leaseTtl,
     gate,
