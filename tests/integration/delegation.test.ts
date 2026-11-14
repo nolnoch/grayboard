@@ -28,11 +28,7 @@ const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestS
 
 // A connected application session declared a launcher, as a hosted
 // request's launcher declaration does (#473).
-async function launcher(srv: TestServer, token: string, identity: string): Promise<AppSession> {
-  const s = srv.appSession(token, identity, { launcher: true });
-  await s.connect();
-  return s;
-}
+const launcher = (srv: TestServer, token: string, identity: string): Promise<AppSession> => srv.connected(token, identity, { launcher: true });
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-delegate-"));

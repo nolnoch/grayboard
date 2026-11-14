@@ -9,9 +9,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ApplicationError } from "../../src/server/application.ts";
 import { runRetention } from "../../src/server/retention.ts";
-import type { AppSession, AppSessionOptions } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -37,17 +35,6 @@ const holder = (address: string) => (srv.app.db.prepare(`SELECT id FROM alias_ho
 const lastEvent = (address: string) => srv.app.db.prepare(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id DESC LIMIT 1`).get(address);
 const ended = (id: string) => srv.app.db.prepare(`SELECT detail FROM access_log WHERE action = 'id.ended' AND target = ?`).all(id).map((r: any) => JSON.parse(r.detail));
 
-async function connect(token: string, identity: string | null, opts: AppSessionOptions = {}): Promise<AppSession> {
-  const s = srv.appSession(token, identity, opts);
-  await s.connect();
-  return s;
-}
-// A connect's refusal (of the hello, or of the identity's bind).
-async function refused(token: string, identity: string | null, opts: AppSessionOptions = {}): Promise<ApplicationError> {
-  const e = await srv.appSession(token, identity, opts).connect().then(() => undefined, (e: unknown) => e);
-  if (!(e instanceof ApplicationError)) throw new Error(`expected a refusal, got ${e}`);
-  return e;
-}
 // The server restarts on its database: every session the hosted store doesn't
 // own, which nothing can reattach, is ended as it starts.
 async function restart(): Promise<void> {
@@ -61,8 +48,8 @@ test("a restart ends a leftover session: holds released, claims of its ID releas
   srv = start(join(dbDir, "bus.db"));
   let alice = await srv.login(A);
   let bob = await srv.login("bob@example.com");
-  const a = await connect(alice, "be");
-  const b = await connect(bob, "fe");
+  const a = await srv.connected(alice, "be");
+  const b = await srv.connected(bob, "fe");
   // A claim taken as the alias stays with it (S6); an unbound session can take none (#229).
   await a.call("claim_take", { key: "ticket:ENG-142" });
   // Pushed to the ID and never acked: unread when it ends.
@@ -82,7 +69,7 @@ test("a restart ends a leftover session: holds released, claims of its ID releas
   expect(ended(a.id)).toEqual([{ principal: A, held: [`${A}/be`], why: "wss_removed", bounced: 1 }]);
 
   // The bounce waits for the sender's alias, and its next holder gets it.
-  const b2 = await connect(bob, "fe");
+  const b2 = await srv.connected(bob, "fe");
   expect((await b2.call<{ key: string; holder: string }[]>("claim_list")).map((c) => [c.key, c.holder])).toEqual([["ticket:ENG-142", `${A}/be`]]);
   const bounce = await b2.next(direct());
   expect(bounce.message).toMatchObject({ sender: a.id, parent_id: sent.message_id, kind: "bounce" });
@@ -101,8 +88,8 @@ test("a session whose end fails is audited and retried at the next revalidate; t
   const bob = await srv.login("bob@example.com");
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
-  const bad = await connect(bob, "eng/deploy", { push: false });
-  const good = await connect(bob, "eng/ops", { push: false });
+  const bad = await srv.connected(bob, "eng/deploy", { push: false });
+  const good = await srv.connected(bob, "eng/ops", { push: false });
   const mail = srv.app.repo.mail;
   const unread = mail.unread.bind(mail);
   mail.unread = (id) => {
@@ -133,11 +120,11 @@ test("retention prunes ended sessions, never a live one, and leaves no tombstone
   await srv.stop();
   srv = start(join(dbDir, "bus.db"));
   let alice = await srv.login(A);
-  const first = await connect(alice, "be");
-  const second = await connect(alice, "fe");
+  const first = await srv.connected(alice, "be");
+  const second = await srv.connected(alice, "fe");
   await restart();
   alice = await srv.login(A);
-  const live = await connect(alice, "api");
+  const live = await srv.connected(alice, "api");
 
   const db = srv.app.db;
   const tombstones = () => db.prepare(`SELECT id, ended_at, pruned_at FROM pruned_ids`).all();
@@ -162,11 +149,11 @@ test("a send or @id: mention to an ID that can't receive carries its code: not_f
   await srv.stop();
   srv = start(join(dbDir, "bus.db"));
   let alice = await srv.login(A);
-  const gone = await connect(alice, null);
+  const gone = await srv.connected(alice, null);
   await restart();
   alice = await srv.login(A);
-  const a = await connect(alice, "be");
-  const tools = await connect(alice, "be", { push: false });
+  const a = await srv.connected(alice, "be");
+  const tools = await srv.connected(alice, "be", { push: false });
   await a.call("board_create", { name: "e2e", purpose: "test" });
 
   const at = new Date(clock).toISOString();
@@ -189,8 +176,8 @@ test("a send or @id: mention to an ID that can't receive carries its code: not_f
 // hosted twin: #451 (hold session)
 test("a hold session registers delivery push: a send to its ID is accepted and waits", async () => {
   const alice = await srv.login(A);
-  const a = await connect(alice, "be");
-  const held = await connect(alice, "fe", { push: false, hold: true });
+  const a = await srv.connected(alice, "be");
+  const held = await srv.connected(alice, "fe", { push: false, hold: true });
   expect(srv.app.db.prepare(`SELECT delivery FROM ids WHERE id = ?`).get(held.id)).toEqual({ delivery: "push" });
 
   expect(await a.send(held.id, "for later")).toMatchObject({ delivered_now: false });
@@ -205,9 +192,9 @@ test("a two-hold session is delivered to on each hold; a restart ends it and rel
   await srv.stop();
   srv = start(join(dbDir, "bus.db"));
   const alice = await srv.login(A);
-  const s = await connect(alice, "be");
+  const s = await srv.connected(alice, "be");
   expect(await s.bind("be2", { create: true })).toMatchObject({ held: [`${A}/be`, `${A}/be2`] });
-  const peer = await connect(alice, "fe");
+  const peer = await srv.connected(alice, "fe");
   for (const alias of ["be", "be2"]) {
     await peer.send(alias, `to ${alias}`);
     expect(await s.next(direct((m) => m.body === `to ${alias}`), 3000)).toBeDefined();

@@ -5,7 +5,7 @@
 import { afterEach, expect, test } from "bun:test";
 
 import { FakeSlack } from "./fake_slack.ts";
-import { ApplicationError } from "../../src/server/application.ts";
+import { refusal } from "../support/app_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
@@ -26,12 +26,6 @@ function serve(o: ConstructorParameters<typeof TestServer>[0]): TestServer {
 
 const count = (srv: TestServer, sql: string, ...args: string[]) => (srv.app.db.query(sql).get(...args) as { n: number }).n;
 
-// The ApplicationError a bind is refused with.
-async function refusal(p: Promise<unknown>): Promise<ApplicationError> {
-  const e = await p.then(() => undefined, (e: unknown) => e);
-  if (!(e instanceof ApplicationError)) throw new Error(`expected a refusal, got ${e}`);
-  return e;
-}
 
 test("a bind over the user's bucket is refused with a wait, writes nothing about the name, and passes after the wait", async () => {
   // Each bind takes a token (#284: binds create aliases).
