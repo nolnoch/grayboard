@@ -47,16 +47,26 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 
 // ── route handlers ────────────────────────────────────────────────────────────
 
-async function healthz(repo: Repo): Promise<Response> {
-  try {
-    repo.users.findByEmail("__healthz__");
-    // The version lets a deploy check tell a restarted server from a stale one.
-    return json({ ok: true, version: pkg.version });
-  } catch (e) {
-    // A deploy check that sees this 503 needs the cause in the journal.
-    console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
-    return jsonErr("internal", "db not reachable", 503);
+// /healthz is unauthenticated, so its database probe is cached per repo for HEALTH_TTL_MS, success and failure
+// alike (#275): a flood costs one probe a second, and a down database logs one line a second. The probe is a
+// synchronous read, so no request can arrive while one is in flight and the cache alone is single-flight.
+export const HEALTH_TTL_MS = 1000;
+const health = new WeakMap<Repo, { at: number; ok: boolean }>();
+export function healthz(repo: Repo, now = performance.now()): Response {
+  let cached = health.get(repo);
+  if (!cached || now - cached.at >= HEALTH_TTL_MS) {
+    let ok = true;
+    try {
+      repo.users.findByEmail("__healthz__");
+    } catch (e) {
+      // A deploy check that sees this 503 needs the cause in the journal.
+      console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
+      ok = false;
+    }
+    health.set(repo, cached = { at: now, ok });
   }
+  // The version lets a deploy check tell a restarted server from a stale one.
+  return cached.ok ? json({ ok: true, version: pkg.version }) : jsonErr("internal", "db not reachable", 503);
 }
 
 function authConfig(config: Config): Response {
