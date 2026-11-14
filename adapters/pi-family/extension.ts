@@ -131,6 +131,25 @@ export interface Grayboard {
   idle(): Promise<void>;                       // a subagent's run ended: its child slot goes back until its next call
 }
 
+/**
+ * A harness's facts read one at a time (#547): a reader that throws leaves its
+ * key out, so the server keeps that fact's stored value, and the other fact
+ * still goes. Each failure is said once per session and fact through `warn`.
+ */
+export function factReader(warn: (message: string) => void) {
+  const said = new Set<string>();
+  return (sessionID: string, read: Record<keyof SessionFacts & string, () => string | null>): SessionFacts => {
+    const facts: SessionFacts = {};
+    for (const [fact, get] of Object.entries(read) as [keyof SessionFacts, () => string | null][]) {
+      try { facts[fact] = get(); } catch (error) {
+        const key = `${sessionID}\0${fact}`;
+        if (!said.has(key)) { said.add(key); warn(`grayboard: couldn't read session ${sessionID}'s ${fact}; the server keeps its last one: ${message(error)}`); }
+      }
+    }
+    return facts;
+  };
+}
+
 export function createGrayboard(h: Harness): Grayboard {
   const stateDir = join(h.agentDir, "grayboard");
   const config = readHostedConfig(stateDir);
