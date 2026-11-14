@@ -74,17 +74,18 @@ test("installed hook commands quote a CLI path the shell would split", () => {
 
 test("install replaces its own hooks, keeps everyone else's, and leaves an unchanged file alone", () => {
   const path = tmpSettings();
-  // A pre-#551 install: the title hook alone, at an old path.
-  writeFileSync(path, JSON.stringify({ model: "x", hooks: { SessionStart: [other, { matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/old/grayboard session-start", timeout: 10 }] }], PreToolUse: [otherTool], Stop: [] } }));
+  // A pre-#551 install: the title hook alone, at an old path; and an older release's
+  // SubagentStop, which local mode no longer installs (#555 item 12).
+  writeFileSync(path, JSON.stringify({ model: "x", hooks: { SessionStart: [other, { matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/old/grayboard session-start", timeout: 10 }] }], PreToolUse: [otherTool], Stop: [], SubagentStop: [{ hooks: [{ type: "command", command: "/old/grayboard hook claude subagent-stop", timeout: 10 }] }] } }));
   expect(installClaudeHooks(BIN, path)).toBe(true);
   const ours = claudeHooks(BIN);
+  expect(ours).not.toHaveProperty("SubagentStop");
   const cfg = JSON.parse(readFileSync(path, "utf8"));
   expect(cfg.model).toBe("x");
   expect(cfg.hooks).toEqual({
     SessionStart: [other, ...ours.SessionStart!],
     PreToolUse: [otherTool, ...ours.PreToolUse!],
     Stop: [],
-    SubagentStop: ours.SubagentStop,
     SessionEnd: ours.SessionEnd,
   });
   expect(installClaudeHooks(BIN, path)).toBe(false);
