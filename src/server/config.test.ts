@@ -24,7 +24,7 @@ describe("loadConfig", () => {
     saved = Object.fromEntries(KEYS.map(k => [k, process.env[k]]));
     for (const k of KEYS) delete process.env[k];
     process.env.GRAYBOARD_DB_PATH = ":memory:";
-    process.env.GRAYBOARD_PUBLIC_URL = "https://grayboard.example.com";
+    process.env.GRAYBOARD_PUBLIC_URL = "http://localhost:8080";
   });
 
   afterEach(() => {
@@ -38,6 +38,18 @@ describe("loadConfig", () => {
     process.env.GRAYBOARD_DEV_AUTH = "1";
     process.env.GOOGLE_OAUTH_CLIENT_SECRET = "secret";
     expect(() => loadConfig()).toThrow(/GRAYBOARD_DEV_AUTH=1/);
+  });
+
+  test("dev auth needs a loopback public URL (#805 F-04)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    for (const url of ["https://grayboard.example.com", "http://10.0.0.5:8080", "http://localhost.example.com", "not a url"]) {
+      process.env.GRAYBOARD_PUBLIC_URL = url;
+      expect(() => loadConfig()).toThrow(/needs a loopback GRAYBOARD_PUBLIC_URL/);
+    }
+    for (const url of ["http://localhost", "http://127.0.0.1:8080", "http://[::1]:8080"]) {
+      process.env.GRAYBOARD_PUBLIC_URL = url;
+      expect(loadConfig().devAuth).toBe(true);
+    }
   });
 
   function primary() {
