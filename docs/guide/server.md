@@ -253,6 +253,16 @@ ssh -t -L 4777:127.0.0.1:4777 <host> 'sudo -u grayboard grayboard-inspect --db /
 
 Then open http://127.0.0.1:4777; Ctrl-C closes both the viewer and the tunnel. It runs as `grayboard` because the database and its WAL files belong to the service user. It shows every DM and every team board, including teams you aren't in. It reads a backup snapshot the same way, if you'd rather browse a copy.
 
+## Reclaiming disk space
+
+The nightly retention run returns the pages it freed to the filesystem, up to 16,384 pages (64 MiB at the default 4 KiB page) per night, so a large backlog drains over several nights. That needs `auto_vacuum=INCREMENTAL`, which a database gets only when it's created (v2.0.0 and later; #170). An older database file keeps `auto_vacuum=NONE` and never shrinks: the server logs `free pages it can't reclaim` after each retention run while it has any. Convert it once, with the service stopped, a snapshot taken (§7) and free disk space for a second copy of the database:
+
+```bash
+sudo systemctl stop grayboard
+sudo -u grayboard sqlite3 /var/lib/grayboard/bus.db 'PRAGMA auto_vacuum = INCREMENTAL; VACUUM;'
+sudo systemctl start grayboard
+```
+
 ## Updating the server
 
 ```bash
