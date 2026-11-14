@@ -57,8 +57,8 @@ describe("retention pruning", () => {
     const quota = { principal: "a@example.com", unsent: 1_000_000, stored: 1_000_000 };
     const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file, { quota })).id;
     const from = { addresses: ["a@example.com/fe"], principal: "a@example.com" };
-    const old = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, [await up("a@example.com/fe")], null, from);
-    const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, [await up("a@example.com/fe")], null, from);
+    const old = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, { ids: [await up("a@example.com/fe")], uploader: from }, null);
+    const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [await up("a@example.com/fe")], uploader: from }, null);
     db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
     await runRetention(r, db, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);

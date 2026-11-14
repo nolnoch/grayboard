@@ -499,6 +499,30 @@ test("#284 #367: a team alias's unsent upload doesn't pass to the next member wh
   expect(await srv.api(bob, "GET", `/api/attachments/${up.body.id}?as=eng%2Fapi`)).toMatchObject({ status: 404 });
   expect(await srv.api(bob, "DELETE", `/api/attachments/${up.body.id}?as=eng%2Fapi`)).toMatchObject({ status: 404 });
   expect(rows(`SELECT message_id, post_id FROM attachments WHERE id = ?`, up.body.id)).toEqual([{ message_id: null, post_id: null }]);
+
+  // #391: the uploader takes the alias back and still sends her own upload.
+  endIt(theirs);
+  await connect("be");
+  const again = await connect("eng/api");
+  const sent = await again.send(`${A}/be`, "the plan", { attachment_ids: [up.body.id] });
+  expect(rows(`SELECT message_id FROM attachments WHERE id = ?`, up.body.id)).toEqual([{ message_id: sent.message_id }]);
+});
+
+// #391: #367's case as written: an explicit unbind, not an end, passes the
+// alias on, and the next member still can't send the upload.
+test("#367: after an unbind, the next member who binds a team alias can't send its unsent upload", async () => {
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
+  const mine = await connect("eng/api");
+  const up = await srv.upload(alice, "eng/api", "plan.md", "# plan");
+  expect(up.status).toBe(201);
+  expect(await mine.unbind("eng/api")).toMatchObject({ alias: "eng/api", released: true });
+
+  const theirs = await connect("eng/api", { token: bob });
+  expect(theirs.session.holds).toEqual(["eng/api"]);
+  await expect(theirs.send(`${A}/be`, "x", { attachment_ids: [up.body.id] }))
+    .rejects.toMatchObject({ code: "bad_request", message: `attachment ${up.body.id} isn't an unsent upload of yours` });
+  expect(rows(`SELECT message_id, post_id FROM attachments WHERE id = ?`, up.body.id)).toEqual([{ message_id: null, post_id: null }]);
 });
 
 // hosted twin: #451 (key resume, previous_key descent)
