@@ -176,6 +176,8 @@ export function initCoreSchema(db: Database): void {
       detail  TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at);
+    -- lastCoreAudit's (action, target) lookup, newest first (#295).
+    CREATE INDEX IF NOT EXISTS idx_audit_log_action_target ON audit_log(action, target, at);
 
     -- File attachments (src/core/attachments.ts). The catalog of stored
     -- blobs, one per content hash; the bytes are in the mode's BlobStore. A

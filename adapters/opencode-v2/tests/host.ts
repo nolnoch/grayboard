@@ -709,7 +709,7 @@ try {
   await host.close(); host = undefined; await app.stop(); await Bun.sleep(31_000); app = start();
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
   await wait(() => app.mcp.activeLeases, n => n === 1, "server restart past the TTL"); assert.equal(row(a.id)!.ownership_id, timelyOwnership);
-  const credits = app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.lease_restart_credit'").all().map(r => JSON.parse(r.detail));
+  const credits = app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.lease_restart_credit' ORDER BY id").all().map(r => JSON.parse(r.detail));
   assert.ok(credits.some(c => c.ownership === timelyOwnership && c.field === "lease_deadline" && c.downtime_ms >= 31_000), "restart credited the lease");
   console.log("REAL_SERVER_RESTART_DEADLINES_OK", { ownership: timelyOwnership, credits: credits.length });
   await rpc.pause({}, { location }); await rpc.enroll({ sessionID: a.id, name: "does-not-exist" }, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
