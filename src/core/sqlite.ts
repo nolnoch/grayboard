@@ -50,6 +50,18 @@ function trackCommits(db: Database): void {
 // `code` names the extended code, the primary code is errno's low byte.
 const isBusy = (e: unknown) => e instanceof SQLiteError && (e.errno & 0xff) === 5;
 
+// `PRAGMA journal_mode = WAL` doesn't throw when it can't switch: it returns
+// the mode the file stayed in (#178). Rollback-journal mode still works, but
+// readers then block a writer, so an open that asked for WAL and didn't get it
+// says so. An in-memory or temporary database reports `memory` or `delete`
+// and has no other process to share with.
+export function journalModeWarning(path: string, pragmas: string, actual: string | undefined): string | undefined {
+  const wanted = /journal_mode\s*=\s*(\w+)/i.exec(pragmas)?.[1]?.toLowerCase();
+  if (!wanted || path === "" || path === ":memory:") return undefined;
+  if (actual?.toLowerCase() === wanted) return undefined;
+  return `${path} is in journal_mode ${actual ?? "unknown"}, not ${wanted}: SQLite couldn't switch it (a filesystem without shared-memory locking, such as a network mount, can't use WAL)`;
+}
+
 // Opens a SQLite file that other processes may be opening at the same moment
 // (a session and the Slack bridge starting together, sessions after an
 // upgrade), creating or upgrading its schema (#170):
@@ -84,6 +96,8 @@ export function openSqlite(path: string, pragmas: string, schema: (db: Database)
         Bun.sleepSync(5 + Math.random() * 20);
       }
     }
+    const warning = journalModeWarning(path, pragmas, db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode);
+    if (warning) console.error(`[grayboard] ${warning}`);
     step = "schema";
     db.transaction(() => schema(db)).immediate();
   } catch (e) {
