@@ -38,7 +38,6 @@ export function createWsRefusal(max = MAX_REFUSAL_SOCKETS, idleSeconds = 10) {
     },
     // An upgrade `server.upgrade` did not take: give the slot back.
     release,
-    get openAddresses() { return open.size; },
     handlers: {
       idleTimeout: idleSeconds,
       // Bun's default pings keep a silent client's socket alive past idleTimeout (measured on 1.4.4); without them a socket that sends no hello closes at the deadline.
