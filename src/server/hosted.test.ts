@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { until } from "../../tests/support/until.ts";
-import { AppSession } from "../../tests/support/app_session.ts";
+import { AppSession, refusal } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -484,6 +484,29 @@ test("a hosted contender releases a never-leased hosted owner only after the idl
   now += 900_001;
   await hosted.bind(principal, context("contender"), { name: "fe" });
   expect(database.repo.hosted.all().map(row => row.session_id)).toEqual([(context("contender") as { id: string }).id]);
+});
+
+test("an application-level bind probes a hosted holder: a live one keeps its name, one idle past the window is ended and loses it (#469)", async () => {
+  const rootId = (context("root") as { id: string }).id, fe = "you@example.com/fe";
+  const holderOfFe = () => database.db.query("SELECT id FROM alias_holds WHERE address = ?").get(fe);
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const ownership = database.repo.hosted.get(rootId)!.ownership_id;
+  const taker = new AppSession(application, principal.authed, null);
+  await taker.connect();
+  try {
+    // Live: the probe answers true, so the bind is refused and the hold stays.
+    expect((await refusal(taker.bind("fe"))).code).toBe("alias_held");
+    // Just inside the window it still answers.
+    now += 900_000;
+    expect((await refusal(taker.bind("fe"))).code).toBe("alias_held");
+    expect(holderOfFe()).toEqual({ id: rootId });
+    // Past the window the probe answers false: the holder is ended idle and the bind takes the name.
+    now += 1;
+    expect(await taker.bind("fe")).toMatchObject({ alias: fe });
+    expect(database.repo.hosted.get(rootId)).toBeUndefined();
+    expect(holderOfFe()).toEqual({ id: taker.id });
+    expect(database.db.query("SELECT end_reason FROM hosted_ownerships WHERE id = ?").get(ownership)).toEqual({ end_reason: "idle" });
+  } finally { taker.close(); }
 });
 
 test("a hosted root holds several names: bind adds, unbind releases one and promotes the oldest, the last leaves it owning but unbound (#451)", async () => {
