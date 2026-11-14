@@ -99,6 +99,9 @@ export function claim(
   const addresses = opts.addresses ?? [handle];
 
   return db.transaction((): ClaimResult => {
+    // A board that doesn't exist, or that `handle` can't see, refuses as a
+    // post to it would (#81), not as the claims row's foreign key failing.
+    if (board && !canSeeBoard(db, handle, board)) throw new CoreError(`no such board #${board}; see board_list`);
     const now = Date.now();
     let expires = expiresAt(now, opts.ttl_minutes, opts.until);
     // Announce a lapsed claim before anyone takes it over.
