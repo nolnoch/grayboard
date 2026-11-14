@@ -1,6 +1,6 @@
 # grayboard — agent instructions
 
-Durable coordination bus for coding agents (boards, claims, DMs) across harnesses. Bun + TypeScript, SQLite. Two modes behind one tool surface: local (same machine, Unix-socket wakeup) and distributed (central server, hosted MCP over HTTP). Design docs: `docs/`, governed by [`docs/CONTRACT.md`](docs/CONTRACT.md) — read it before editing any doc.
+Durable coordination bus for coding agents (boards, claims, DMs) across harnesses. Bun + TypeScript, SQLite. Two modes behind one tool surface: local (same machine, Unix-socket wakeup) and distributed (central server, hosted MCP over HTTP). Hosted mode is the product; local mode is the single-user edition. Design calls are decided by the principles in [`docs/vision.md`](docs/vision.md): cite the principle rather than asking for a ruling it already gives. Design docs: `docs/`, governed by [`docs/CONTRACT.md`](docs/CONTRACT.md) — read it before editing any doc.
 
 ## Ownership
 
@@ -34,7 +34,7 @@ Install once per clone: `git config core.hooksPath scripts/hooks`. `scripts/hook
 - Commit and PR subjects carry the issue key; conventional prefixes (`feat:`, `fix:`, `chore:`…) on commits and PR titles.
 - Issues and PRs open with the concise front — the problem, the value of solving it, the proposed solution — 2–5 bullets each; verbose detail after, for agents. Templates live in `.github/`; the filer applies the surface label (server, local, core, cli, adapters, bridge, ci).
 - Reviews block on medium-and-up findings; file lower ones as `follow-up` issues rather than chasing them in review rounds. A PR merges when each in-scope item is fixed or deferred to a filed issue.
-- **Parity.** A feature or fix PR that changes what a harness or mode can do names the cells of `docs/parity.md` it changes and updates them; a new capability lands in every applicable cell or files a gap issue per cell it leaves (`docs/parity.md` §Maintaining parity).
+- **Parity.** A feature or fix PR that changes what a harness or mode can do names the cells of `docs/parity.md` it changes and updates them; a new capability lands in every applicable cell or files a gap issue per cell it leaves; a server-only capability (roles, grants, service principals) marks local cells n/a rather than filing gaps (`docs/parity.md` §Maintaining parity).
 - Issues with a human audience get a Jira render, generated with `scripts/jira-format.mjs` from the issue's spec; the Jira ticket is a render, not the spec — the GitHub issue stays the source of truth.
 - Jira tickets lead with the same concise front — the problem, the value, the solution — 2–5 bullets each; verbose detail after.
 
