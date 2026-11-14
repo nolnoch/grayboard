@@ -298,6 +298,17 @@ const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...holds(), rootId
 // The first successful write of a session acting as its ID says how to get a
 // readable name, once per session (#470). A root's notice: never a child's (#523).
 let bindHinted = false;
+// A recipient as the server reads one (#272): a session ID, or a handle
+// matched without regard to case. Handles are lowercase since #181; a
+// database from before then may hold a mixed-case one, so the exact input
+// is tried first.
+function localRecipient(to: string): string {
+  const parsed = addressParts(to);
+  if (parsed?.kind === "id") return parsed.address;
+  if (parsed?.kind !== "bare" || rosterHandles(db).includes(to)) return to;
+  return parsed.address;
+}
+
 function bindHint(child: string | undefined): { bind_hint?: string } {
   if (child !== undefined || bindHinted || WRITES_AS || held.length) return {};
   bindHinted = true;
@@ -812,9 +823,11 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const online = (h: string) => live(h) && !lastWasRelease(db, h);
     // The audit rows name the child that called, beside the routing `via` (#523).
     const byChild = child === undefined ? {} : { child };
+    // `to` resolved as dm_send resolves a recipient, as the server does (#272).
+    const args = typeof a.to === "string" ? { ...a, to: localRecipient(a.to.trim()) } : a;
     let d;
     try {
-      d = resolveDelegation(db, IDENTITY, a, online);
+      d = resolveDelegation(db, IDENTITY, args, online);
     } catch (e) {
       if (e instanceof CoreError) {
         writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
@@ -841,7 +854,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       // proceeds when the retraction wins; otherwise the request stays
       // queued for the first pick, which the catch below treats as fine.
       try {
-        const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
+        const d2 = resolveDelegation(db, IDENTITY, args, (h) => online(h) && h !== d!.to);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
           const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via, rootLive)).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
@@ -881,9 +894,8 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, holds()) : null) ?? IDENTITY;
     checkBody(body);
     // A session ID is checked where the message is written (insertMessage).
-    const parsed = addressParts(to);
-    const recipient = parsed?.kind === "id" ? parsed.address : to;
-    if (parsed?.kind !== "id" && !rosterHandles(db).includes(recipient)) {
+    const recipient = localRecipient(to);
+    if (addressParts(recipient)?.kind !== "id" && !rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
         isError: true,
