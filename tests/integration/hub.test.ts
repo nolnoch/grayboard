@@ -51,7 +51,6 @@ afterEach(async () => {
 
 const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
-const upload = (token: string, identity: string, filename: string, data: Uint8Array | string) => srv.upload(token, identity, filename, data);
 
 
 const closed = (e: AppEvent): e is Extract<AppEvent, { kind: "closed" }> => e.kind === "closed";
@@ -62,8 +61,6 @@ const postOf = (item: Pending) => {
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
 
-const download = (token: string, identity: string, id: number) =>
-  fetch(`${srv.base}/api/attachments/${id}?as=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
 
 // hosted twin: #451 (a reconnect on the session's key)
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {
@@ -254,32 +251,32 @@ test("a tools-only connection works beside the live owner without taking its pus
 });
 
 // Audits W1, W4 (#345): after a bind, the session still reads as its ID:
-// it replies in a thread it received as the ID, and downloads a file DM'd to
-// the ID with ?as= its alias. Another user's session's ID never joins the
-// set: bob acting as his own alias can't read alice's ID's file. A session
-// the server ended (here by a restart, the only thing that ends one now) is
-// not acted as, even by its own user (S11). An unbound session no longer acts
-// as its ID at all (#229), so the session is bound from the start.
+// it replies in a thread it received as the ID. Another user's session's ID
+// never joins the set: bob acting as his own alias can't read the file DM'd
+// to alice's ID. A session the server ended (here by a restart, the only
+// thing that ends one now) is not acted as over HTTP, even by its own user
+// (S11): `/api/claims/call` takes the check the `?as=` attachment routes
+// took before they went (#475). An unbound session no longer acts as its ID
+// at all (#229), so the session is bound from the start.
 // hosted twin: #451 (a hosted session that reads as its ID)
-test("a bound session replies to a thread and reads a file it received as its ID; once ended, nothing acts as it", async () => {
+test("a bound session replies to a thread it received as its ID; once ended, nothing acts as it", async () => {
   const dbPath = fileDb();
   await restart({ dbPath: dbPath });
   let alice = await login(A);
-  const bob = await login(B);
   const a = await srv.connected(alice, "be");
   const b = await srv.hosted(B, "fe");
-  const up = await upload(bob, "fe", "shot.png", PNG);
-  const sent = await b.call<SendResult>("dm_send", { to: a.id, body: "for your ID", attachment_ids: [up.body.id] });
+  const up = await b.upload("shot.png", PNG);
+  const sent = await b.call<SendResult>("dm_send", { to: a.id, body: "for your ID", attachment_ids: [up] });
 
   await a.send(`${B}/fe`, "got it", { parent_id: sent.message_id });
-  expect((await download(alice, `${A}/be`, up.body.id)).status).toBe(200);
-  expect((await download(alice, a.id, up.body.id)).status).toBe(200);
-  await srv.hosted(B, "ops");
-  expect((await download(bob, `${B}/ops`, up.body.id)).status).toBe(404);
+  const ops = await srv.hosted(B, "ops");
+  expect((await ops.attachmentRaw("GET", `/${up}`)).status).toBe(404);
+  const take = { tool: "claim_take", args: { key: "ticket:ENG-142" } };
+  expect((await api(alice, "POST", "/api/claims/call", { identity: a.id, ...take })).status).toBe(200);
 
   // The restart ends the session the WSS transport can no longer reattach.
   await restart({ dbPath: dbPath });
   alice = await login(A);
-  const gone = await download(alice, a.id, up.body.id);
-  expect({ status: gone.status, body: await gone.json() }).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });
+  const gone = await api(alice, "POST", "/api/claims/call", { identity: a.id, ...take });
+  expect(gone).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });
 });
