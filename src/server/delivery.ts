@@ -50,8 +50,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     return !!row && row.session_id === lease.sessionId && row.ownership_id === lease.ownership && row.bind_gen === lease.generation &&
       row.grant_id === lease.principal.grantId && row.lease_deadline !== null && row.lease_deadline > now();
   }
-  const unlisten = hosted.listen(() => {
-    for (const lease of [...leases.values()]) if (!matches(lease, store.get(lease.sessionId))) finish(lease);
+  // `changed`: the one row a commit changed (#399), so only its leases are checked; null checks them all.
+  const unlisten = hosted.listen(changed => {
+    for (const lease of [...leases.values()]) {
+      if (changed !== null && lease.sessionId !== changed) continue;
+      if (!matches(lease, store.get(lease.sessionId))) finish(lease);
+    }
   });
   function stale(p: DeliveryPrincipal, context: SessionContext, capability: string): never {
     throw new StaleCapability();
@@ -174,7 +178,6 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           get(p, context, capability, store.get(row.session_id));
           store.end(row.session_id, "closed", now());
         });
-        hosted.reconcile();
       }).catch(error => refused(p, context, error));
     },
     async cancel(result: DeliveryLease) {
@@ -190,7 +193,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         store.atomic(() => {
           if (matches(lease, store.get(lease.sessionId))) store.end(lease.sessionId, "closed", now());
         });
-        hosted.sweep();
+        hosted.settle(lease.sessionId);
         finish(lease);
       });
     },
