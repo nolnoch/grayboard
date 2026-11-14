@@ -42,7 +42,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 14 | Setup | yes | yes | yes | yes | yes | yes | yes | yes |
 | 15 | Delegation launcher declaration | yes | yes | yes | yes | yes | yes | yes | yes |
 | 16 | Update | yes | yes | yes | yes | yes | n/a | yes | yes |
-| 17 | Repo-name suggestion while unbound | yes | yes | yes | yes | yes | gap #696 | yes | yes |
+| 17 | Repo-name suggestion while unbound | yes | yes | yes | yes | yes | yes | yes | yes |
 
 ## Evidence by row
 
@@ -174,4 +174,4 @@ Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only
 
 - Local (all four): `grayboard mcp` offers `sessionIdentity` first among an unbound session's candidates (boards.md §3). Proof: `tests/integration/binding.test.ts`.
 - pi H, omp H, CC H: the adapter's `HostedClient` sends `sessionIdentity(env, cwd)` for its root on every wire (#522); the server offers it first while free (architecture.md §Hosted MCP). Proof: `tests/integration/hosted_core_wire.test.ts` ("a wire's suggested name reaches the server"), `src/server/hosted.test.ts` (suggested name).
-- OC V2: gap #696, no `HostPort.suggested`; its roots offer only the user's free names.
+- OC V2: its `HostPort.suggested` sends `sessionIdentity({}, directory)` for the plugin's directory on every wire, from a generated copy of `src/shared/naming.ts` (#696; the `name` plugin option, not `BUS_IDENTITY`, is its explicit name). Proof: `adapters/opencode-v2/tests/instructions.test.ts` ("the suggested name is local mode's", and the native fetcher's meta), with the server half above.

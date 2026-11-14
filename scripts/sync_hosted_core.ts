@@ -15,6 +15,7 @@ const SHARED = {
   "../../../src/shared/addressing.ts": ["addressing", "src/shared/addressing.ts"],
   "../../../src/shared/attachments.ts": ["attachment-files", "src/shared/attachments.ts"],
   "../../../src/shared/http.ts": ["http", "src/shared/http.ts"],
+  "../../../src/shared/naming.ts": ["naming", "src/shared/naming.ts"],
   "../core/errors.ts": ["attachment-errors", "src/core/errors.ts"],
   "./hash.ts": ["attachment-hash", "src/shared/hash.ts"],
 } as const;

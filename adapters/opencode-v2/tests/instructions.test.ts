@@ -2,8 +2,11 @@ import { expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { RootInstructions, rebuild, rewrite } from "../src/instructions.js";
-import { OpenCodeController, nativeFetcher, setup, watchRoots } from "../src/lifecycle.js";
-import { EFFORT_META, LAUNCHER_META, MODEL_META, NativeWire, ServerUnreachable, type Wire } from "../src/core/wire.js";
+import { OpenCodeController, nativeFetcher, setup, suggestion, watchRoots } from "../src/lifecycle.js";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { EFFORT_META, LAUNCHER_META, MODEL_META, NativeWire, SUGGESTED_META, ServerUnreachable, type Wire } from "../src/core/wire.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import type { RecordStatus } from "../src/core/diagnostics.js";
 import { fixture, until } from "./native-fixture.js";
@@ -159,11 +162,12 @@ test("the native fetcher names the root on a native connection with the launcher
     expect(await fetch("R", new AbortController().signal)).toBeUndefined();
     expect((await controller.enroll("R")).state).toBe("approved");
     expect(await fetch("R", new AbortController().signal)).toBe(bound);
-    expect(seen).toEqual([{ meta: { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true }, headers: [] }]);
+    // "/worktree" is outside git: local mode's name is the directory's (#696).
+    expect(seen).toEqual([{ meta: { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true, [SUGGESTED_META]: "worktree" }, headers: [] }]);
     // The root's noted model rides its next native connection (#364).
     controller.noteModel("R", { providerID: "anthropic", id: "claude-opus-5-5", variant: "high" });
     await fetch("R", new AbortController().signal);
-    expect(seen[1]).toEqual({ meta: { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true, [MODEL_META]: "anthropic/claude-opus-5-5", [EFFORT_META]: "high" }, headers: [] });
+    expect(seen[1]).toEqual({ meta: { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true, [MODEL_META]: "anthropic/claude-opus-5-5", [EFFORT_META]: "high", [SUGGESTED_META]: "worktree" }, headers: [] });
     const changed: string[] = [];
     controller.bindingChanged = id => { changed.push(id); };
     for (const tool of ["grayboard_bind", "grayboard_unbind", "grayboard_whoami", "other_bind"]) await controller.after({ sessionID: "R", tool, id: "c", status: "error" });
@@ -193,6 +197,27 @@ test("the controller keeps each session's latest model for its wires, for the 25
     expect(facts("S")).toBeUndefined();
     expect(facts("R")).toEqual({ model: "anthropic/claude-sonnet-5-5", effort: null });
   } finally { await controller.close(); }
+});
+
+// Local mode's name for the plugin's directory (#696): the repo's, with a linked worktree's suffix; the repo's `.mcp.json`
+// pin over the directory; nothing where none derives. Read once per directory, again when the directory changes.
+test("the suggested name is local mode's for the plugin's directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "gb-oc-suggest-"));
+  try {
+    const repo = join(root, "My Repo"), wt = join(root, "wt", "stream");
+    mkdirSync(join(repo, ".git", "worktrees", "stream"), { recursive: true });
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, ".git"), `gitdir: ${join(repo, ".git", "worktrees", "stream")}\n`);
+    let dir = repo;
+    const name = suggestion(() => dir);
+    expect(name()).toBe("my-repo");
+    dir = wt;
+    expect(name()).toBe("my-repo-stream");
+    writeFileSync(join(repo, ".mcp.json"), JSON.stringify({ mcpServers: { grayboard: { env: { BUS_IDENTITY: "be" } } } }));
+    expect(name()).toBe("my-repo-stream");
+    expect(suggestion(() => wt)()).toBe("be-stream");
+    expect(suggestion(() => "/")()).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("setup's context hook leaves unenrolled sessions as built, never rejects, and shuts down before the controller", async () => {
@@ -275,7 +300,7 @@ test("the native fetcher registers a subagent under its enrolled root before nam
     expect(await controller.childRoot("R")).toBeUndefined();
     expect(await controller.childRoot("G")).toEqual({ sessionID: "G", root: "R", via: ["C"] });
     expect(await fetch("G", new AbortController().signal)).toBe("child text");
-    expect(order).toEqual([`register R {"child":"G","via":["C"]}`, `initialize {"ai.opencode/sessionID":"G"}`]);
+    expect(order).toEqual([`register R {"child":"G","via":["C"]}`, `initialize {"ai.opencode/sessionID":"G","${SUGGESTED_META}":"worktree"}`]);
     // A refused registration names no wire: unregistered, the key would start an ownership of its own.
     order.length = 0;
     await expect(fetch("X", new AbortController().signal)).rejects.toThrow("child_bound");

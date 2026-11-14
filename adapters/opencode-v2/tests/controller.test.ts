@@ -7,7 +7,7 @@ import { Controller as CoreController } from "../src/core/controller.js";
 import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
 import { observeEvents } from "../src/core/events.js";
-import { Wire, LAUNCHER_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
+import { Wire, LAUNCHER_META, SUGGESTED_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
 import { Approval, METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
@@ -1010,7 +1010,7 @@ test.each([[true, true], ["true", false], [1, false], [undefined, false]])("plug
       } },
     } as unknown as Context, () => {});
     await bound;
-    expect(seen).toEqual([declared ? { "ai.opencode/sessionID": "R", [LAUNCHER_META]: true } : { "ai.opencode/sessionID": "R" }]);
+    expect(seen).toEqual([{ "ai.opencode/sessionID": "R", ...(declared ? { [LAUNCHER_META]: true } : {}), [SUGGESTED_META]: "worktree" }]);
   } finally {
     await cleanup?.(); await r.controller.close();
     call.mockRestore(); connect.mockRestore(); close.mockRestore();
