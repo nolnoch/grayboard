@@ -468,7 +468,7 @@ describe("dedup and state answers (in process)", () => {
     const user = srv.app.repo.users.findByEmail("you@example.com")!;
     const { session } = await srv.app.application.attachHuman(
       { user_id: user.id, user_email: user.email, session_id: 0 },
-      { deliver() {}, probe: async () => true, closed() {} },
+      { deliver() {}, closed() {} },
     );
     const a = srv.app.application.send(session, "you@example.com/be", "yes");
     const b = srv.app.application.send(session, "you@example.com/be", "yes") as SendResult & Replayed;

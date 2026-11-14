@@ -112,18 +112,20 @@ test("postcommit sink failure cannot fail or roll back a committed native messag
 test("nested savepoint success waits for outer transaction commit; outer rollback discards payload and invalidation", () => {
   let invalidations = 0;
   const unsubscribe = database.repo.hosted.subscribe(() => { invalidations++; });
+  // The hub's view of the session (its live holder) changes only after a commit: reconcile closes it then.
+  const closed = spyOn(application, "close");
   try {
     expect(() => database.db.transaction(() => {
       database.repo.hosted.atomic(() => {
         application.send(recipient.session, "launcher", "rolled back nested");
         database.repo.hosted.end(context().id!, "closed", Date.now());
       });
-      expect(application.hostedHolder("you@example.com/fe")?.active).toBe(true);
+      expect(closed).not.toHaveBeenCalled();
       expect(events).toEqual([]); expect(invalidations).toBe(0);
       throw new Error("outer rollback");
     }).immediate()).toThrow("outer rollback");
     expect(events).toEqual([]); expect(invalidations).toBe(0);
-    expect(application.hostedHolder("you@example.com/fe")?.active).toBe(true);
+    expect(closed).not.toHaveBeenCalled();
     expect(database.repo.hosted.get(context().id!)).toBeDefined();
     expect(application.history(recipient.session)).toEqual([]);
     database.db.transaction(() => {
@@ -131,7 +133,7 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
       expect(events).toEqual([]); expect(invalidations).toBe(0);
     }).exclusive();
     expect(events).toHaveLength(1); expect(invalidations).toBe(1);
-  } finally { unsubscribe(); }
+  } finally { unsubscribe(); closed.mockRestore(); }
 });
 
 test("caught inner rollback discards only inner effects and preserves outer effect ordering", () => {

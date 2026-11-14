@@ -1,6 +1,6 @@
 // An application-level session: no socket, no frames, no hosted store (#282).
 // It is a session the way application.hostedSession builds one, registered
-// with hostedRegister and given its aliases by application.bind, so tests
+// with hostedRegister and given its aliases by application.bindNow, so tests
 // drive the application's own operations (send, bind, call, replay...) with
 // no transport in between. It is not a hosted-store root: it has no lease, no
 // ownership and no generation, and nothing in the hosted service sees it. A
@@ -40,9 +40,7 @@ export type AppEvent =
 // identity is the alias it writes as; key: the session key its ID derives
 // from, minted when absent. harness: what hostedRegister records. bind:
 // further fields for the identity's bind. launcher: the declaration a hosted
-// request's `_meta` carries (#473), declared as `rowFor` does. The session
-// answers a bind's probe of its alias while it's open; it is never a hosted
-// holder (hostedSession registers it with no holds), so no bind probes it.
+// request's `_meta` carries (#473), declared as `rowFor` does.
 export type AppSessionOptions = {
   push?: boolean;
   launcher?: boolean;
@@ -105,7 +103,6 @@ export class AppSession {
         this.arrive({ kind: "closed", code: error.code, message: error.message });
         this.drop(`closed by the server (${error.code}: ${error.message})`);
       },
-      probe: () => Promise.resolve(!this.closed),
     };
   }
 
@@ -150,7 +147,7 @@ export class AppSession {
       const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
       this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
       if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
-      ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.hold === true, this.opts.push !== false));
+      ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false));
     } catch (e) {
       this.drop(`connect refused: ${(e as Error).message}`);
       throw e;
@@ -163,9 +160,9 @@ export class AppSession {
 
   // bind, then the new alias's mail and boards. The first bind makes the
   // session a writer, as a rebuilt hosted session is.
-  async bind(alias: string, extra: { create?: boolean; meta?: unknown; restored_from?: string; previous_key?: string } = {}): Promise<BindResult> {
+  async bind(alias: string, extra: { create?: boolean; meta?: unknown } = {}): Promise<BindResult> {
     const session = this.live();
-    const ok = await this.application.bind(session, { alias, ...extra } as Parameters<Application["bind"]>[1]);
+    const ok = this.application.bindNow(session, { alias, ...extra } as Parameters<Application["bindNow"]>[1]);
     if (session.readOnly) {
       session.readOnly = false;
       session.writerId = this.id;

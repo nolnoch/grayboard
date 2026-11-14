@@ -129,7 +129,7 @@ export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDe
       : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, declared ? POLL_NOTE : noLeaseNote(info.identity_full), ...COORDINATION_INSTRUCTIONS]),
     ...(info.teams.length ? [TEAM_BOARDS_NOTE] : []),
     ...(launcher ? launcherInstruction() : []),
-    ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []), ...(info.notices ?? []),
+    ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []),
   ].join(" ");
 }
 // A hosted child's `initialize` text (#523), in place of its root's: it acts as the root's primary, and
@@ -154,7 +154,7 @@ function childUnbound(root: string): string {
 const shortOf = (email: string) => (address: string) => address.startsWith(`${email}/`) ? address.slice(email.length + 1) : address;
 // The alias_lost notice's last sentence for a root left holding nothing: unbound, it only reads.
 const LOST_ALL = "It has no bus name now, so it only reads: bind(name) to take another.";
-const quietSink: DeliverySink = { deliver() {}, probe: async () => true, closed() {} };
+const quietSink: DeliverySink = { deliver() {}, closed() {} };
 const writeReads = new Set([...UNBOUND_READS, "whoami", "dm_history", "dm_thread", "dm_inbox"]);
 // How often the sweep timer records the server's liveness; after a crash the
 // restart credit can overshoot the real downtime by at most this (#423).
@@ -299,17 +299,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     for (const row of rows) if (!holders.has(row.session_id)) {
       const user = repo.users.findById(row.user_id);
       if (!user) continue;
-      const { session } = application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row,
-        { ...quietSink, probe: async () => gate(row.session_id).bind(async () => {
-          sweep();
-          const current = store.get(row.session_id);
-          if (!current || current.ownership_id !== row.ownership_id || current.bind_gen !== row.bind_gen) return false;
-          if (current.lease_deadline === null && current.last_seen_at < now() - idle) {
-            store.atomic(() => store.end(current.session_id, "idle", now()));
-            return false;
-          }
-          return true;
-        }) }, true);
+      const { session } = application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row, quietSink);
       holders.set(row.session_id, { row, session });
     }
     for (const listener of listeners) listener();
@@ -433,7 +423,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     const root = row ? rootOf(row) : undefined;
     // A child acts under its root's addresses, and its writes carry its own ID as `via` (#523).
     const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
-    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
+    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
   function fence(p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
     authorized(p);

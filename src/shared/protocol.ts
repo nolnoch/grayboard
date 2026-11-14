@@ -21,13 +21,9 @@ export type Message = {
 // caller's own person scope, or scope/name. One already held answers ok and
 // only applies meta. create: false refuses a name that has never existed
 // (identity_unknown); absent, it's created lazily. meta: the alias's labels
-// (S12, core parseAliasMeta). restored_from: the public ID of the process
-// this one restarted from, kept as audit only (S11: it proves nothing, so
-// no status carries over). previous_key: the key of this process's own
-// ended session, after a reconnect (PR 3 S4): a secret, so it
-// proves descent where a public ID can't (#259), and the status carries over.
+// (S12, core parseAliasMeta).
 export type BindRequest = {
-  type: "bind"; req_id: string; alias: string; create?: boolean; meta?: Record<string, unknown>; restored_from?: string; previous_key?: string;
+  type: "bind"; req_id: string; alias: string; create?: boolean; meta?: Record<string, unknown>;
 };
 
 // Hand work to a launcher session (#184): the server resolves the launcher
