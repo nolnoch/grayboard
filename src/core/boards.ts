@@ -1116,17 +1116,26 @@ export function who(
   }
   const now = Date.now();
   const all: Peer[] = [];
+  // One scope check per alias scope, not one per row (#373).
+  const viewer = ctx.session ?? handle;
+  const seen = new Map<string, boolean>();
+  const sees = (scope: Omit<AliasScope, "name">): boolean => {
+    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+    let v = seen.get(key);
+    if (v === undefined) seen.set(key, v = acc.seesAliasMeta(viewer, scope));
+    return v;
+  };
   for (const r of rows) {
     if (isViewer(r.handle)) continue;
     const where = r.cwd ? describeLocation(r.cwd) : r.place;
-    const seesMeta = r.scope_kind !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
     const session = sessionFacts(r);
     const meta: AliasMeta = {};
     if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
     // An ID row's scope is its principal, which the row doesn't show: it
     // matches only for a caller that may act in that principal's scope (#371).
     if (opts.match) {
-      const idScope = opts.match.scope !== undefined && r.principal !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: "person", scope_ref: r.principal });
+      const idScope = opts.match.scope !== undefined && r.principal !== null && sees({ scope_kind: "person", scope_ref: r.principal });
       const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
       if (!matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
     }

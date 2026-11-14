@@ -226,12 +226,23 @@ export function replyPeerError(parentId: number, peer: string): string {
 
 /**
  * The address set a caller acting as `address` reads as (#284 S8), for a
- * request that names one address (HTTP `?as=`, `grayboard claim`): `address`
- * first, then the rest of the address set of the session it is or that holds
- * it, when that session is `principal`'s (null: local mode's one implicit
- * scope), so another principal's session's addresses never join the set.
+ * server request that names one address (HTTP `?as=`, an attachment read):
+ * `address` first, then the rest of the address set of the session it is or
+ * that holds it, when that session is `principal`'s, so another principal's
+ * session's addresses never join the set. A null principal (the Slack bridge's
+ * humans, which have no session) reads as `address` alone, never as a session's
+ * whole set (#373).
  */
 export function addressSet(db: Database, address: string, principal: string | null): string[] {
+  return principal === null ? [address] : sessionSet(db, address, principal);
+}
+
+/** addressSet for local mode's one implicit scope (`grayboard claim`), where sessions have no principal. */
+export function localAddressSet(db: Database, address: string): string[] {
+  return sessionSet(db, address, null);
+}
+
+function sessionSet(db: Database, address: string, principal: string | null): string[] {
   const id = addressParts(address)?.kind === "id" ? address : holderOf(db, address);
   const row = id === null ? undefined : idRow(db, id);
   if (id === null || !row || row.principal !== principal) return [address];

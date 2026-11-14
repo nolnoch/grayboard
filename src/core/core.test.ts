@@ -949,6 +949,18 @@ describe("with a scoped access policy", () => {
     expect(row("fe", "id:00000000000fe", { task: "ENG-142" })).toBeUndefined();
   });
 
+  // #373 (S10): one scope check per alias scope in a roster, not one per row.
+  test("peer_list checks each alias scope once per call", () => {
+    for (const n of ["x", "y", "z"]) {
+      db.prepare(`INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task) VALUES (?, 'team', 'eng', ?, 1, 1, 'ENG-142')`).run(`eng/${n}`, n);
+    }
+    const checks: string[] = [];
+    setAccess(db, { ...policy, seesAliasMeta: (h, scope) => { checks.push(`${scope.scope_kind}:${scope.scope_ref}`); return policy.seesAliasMeta(h, scope); } });
+    const peers = who(db, "be", { include_offline: true }, () => true, { session: "id:00000000000be" }).peers.filter((p) => p.handle.startsWith("eng/"));
+    expect(peers.map((p) => [p.handle, p.task])).toEqual([["eng/x", "ENG-142"], ["eng/y", "ENG-142"], ["eng/z", "ENG-142"]]);
+    expect(checks.filter((c) => c === "team:eng")).toHaveLength(1);
+  });
+
   test("claims hide a board the viewer can't see", () => {
     claim(db, "be", "ticket:ENG-1", { board: "eng" });
     expect(listClaims(db, "ticket:", "fe")[0]!.board).toBeNull();
