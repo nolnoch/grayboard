@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 
 import { FakeSlack } from "./fake_slack.ts";
 import { direct } from "../support/events.ts";
+import { accessAudits } from "../support/audit.ts";
 import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
@@ -138,20 +139,19 @@ test("attachments cross the org bridge both ways for a hosted session, and the a
   const id = got.attachments![0]!.id;
   expect(new TextDecoder().decode(await be.download(id))).toBe("ok\n");
 
-  const audit = (action: string) =>
-    srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[];
+  const audit = (action: string) => accessAudits(srv.app.db, action);
   const sent = await until(() => audit("attachment.sent_to_slack")[0]);
   expect(sent.actor).toBe("alice@example.com");
   const sha256 = createHash("sha256").update(png).digest("hex");
-  expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
+  expect(sent.detail).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
   // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
-  const bound = audit("attachment.bound").map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+  const bound = audit("attachment.bound").map((r): Record<string, unknown> => ({ target: r.target, ...r.detail }));
   expect(bound).toEqual([
     { target: `attachment:${q.attachments![0]!.id}`, identity: "alice@example.com/be", message_id: q.message_id, recipient: "alice@example.com/human" },
     { target: `attachment:${id}`, identity: "alice@example.com/human", message_id: got.id, recipient: "alice@example.com/be" },
   ]);
   const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
-  expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
+  expect(fromSlack.detail).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
 }, 30_000);
 
 test("a file Slack refuses goes back to its sender, and the text carries the warning", async () => {
