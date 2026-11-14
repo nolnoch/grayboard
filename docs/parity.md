@@ -158,12 +158,13 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
 - On a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus, and prints the `setup-opencode` command that reaches the server, with the URL's credentials stripped (#474); the entry's `grayboard mcp` already says on stderr that it serves the local bus (#491). Proof: `src/cli/opencode-setup.test.ts` ("(#474)").
+- #475: an ID whose session ended comes back differently per mode, on purpose: hosted reopens its row (the ID is the harness's own and can't change), local refuses it `id_collision` (`registerId`).
 - #427: pi's `pi update --extensions` doesn't refresh the loose-file adapter; only `grayboard update` does.
 
 ## Maintaining parity
 
 - A feature or fix PR names the cells it changes (row number and column) and updates this doc in the same change.
-- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply.
+- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply. Local mode is the single-user edition (`vision.md` §1): a capability that only means something with more than one principal (roles, grants, service principals, cross-user policy) is n/a in every local cell, not a gap.
 - Parity by addition: moving a cell to supported never removes a capability from another cell.
 
 ## Not covered

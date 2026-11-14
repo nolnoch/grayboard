@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { exchangeGoogleCode, hashToken, type AuthedUser } from "./auth.ts";
+import { exchangeGoogleCode, googleSignIn, hashToken, type AuthedUser, type GoogleIdentity } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
@@ -20,7 +20,7 @@ export type OAuthOptions = {
   now?: () => number;
   cimd?: CimdOptions;
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
-  exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<{ email: string; displayName: string | null }>;
+  exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<GoogleIdentity>;
 };
 export type OAuthNetworkContext = { key: string };
 const random = () => randomBytes(32).toString("base64url");
@@ -338,12 +338,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       upstream.delete(stateHash);
       delete f.upstream;
       if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); flows.delete(r.requestHash); return returnToClient(r, f, { error: "access_denied" }); }
-      let identity: { email: string; displayName: string | null };
+      let identity: GoogleIdentity;
       try { identity = await exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint("/oauth/google/callback") }); }
       catch (e) { hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email) || identity!.email.split("@")[1] !== config.orgDomain) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
-      const user = repo.users.upsertByEmail(identity!.email, identity!.displayName);
+      const signedIn = googleSignIn(repo, identity!, { client_id: r.clientId });
+      if ("refused" in signedIn) fail("access_denied", 403);
+      const { user } = signedIn;
       if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); fail("access_denied", 403); }
       const session = random(), t = now();
       const created = repo.oauth.createBrowserSession({ sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,

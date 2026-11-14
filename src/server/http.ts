@@ -3,7 +3,7 @@ import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, type Repo, type Team, typ
 import { mayActIn } from "./access.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
-  verifySessionToken, extractBearer, exchangeGoogleCode,
+  verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
@@ -91,17 +91,20 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {
     return badRequest("code, code_verifier, redirect_uri required");
   }
-  let email: string, displayName: string | null;
+  let identity: GoogleIdentity;
   try {
-    ({ email, displayName } = await exchangeGoogleCode(
+    identity = await exchangeGoogleCode(
       body.code, body.code_verifier, body.redirect_uri,
       config.googleClientId, config.googleClientSecret, config.orgDomain,
-    ));
+    );
   } catch (e) {
     return jsonErr("forbidden", String(e), 403);
   }
+  const email = identity.email;
   if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
-  const user = repo.users.upsertByEmail(email, displayName ?? null);
+  const signedIn = googleSignIn(repo, identity, { ip: ip ?? undefined });
+  if ("refused" in signedIn) return jsonErr("forbidden", signedIn.refused, 403);
+  const { user } = signedIn;
   const disabled = refuseDisabled(repo, user, { ip: ip ?? undefined });
   if (disabled) return disabled;
   const raw  = mintToken();
@@ -569,6 +572,19 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
   return json({ ok: true });
 }
 
+// Forgets a user's Google account (security audit F-13), so the next Google
+// sign-in with the email takes the account over: for a person whose Google
+// account was recreated, or an email an admin chooses to hand on.
+async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+  const body = await parseBody<{ email: string }>(req);
+  if (!body?.email) return badRequest("email required");
+  const target = repo.users.findByEmail(body.email.toLowerCase());
+  if (!target) return notFound();
+  repo.users.clearSubject(target.id);
+  writeAudit(repo, "auth.subject_cleared", authed.user_email, target.email, { had_subject: target.idp_subject !== null });
+  return json({ ok: true });
+}
+
 // ── main router ──────────────────────────────────────────────────────────────
 
 // What the server does when an HTTP action changes who a user's
@@ -645,6 +661,7 @@ export async function handleHttp(
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
+  if (path === "/api/admin/unlink-idp"     && method === "POST") return adminUnlinkIdp(req, authed, repo);
 
   return notFound();
 }
