@@ -221,6 +221,16 @@ Every hosted cap is per process and bounds memory, not traffic. The defaults sui
 
 Open file descriptors need no tuning: Bun raises its own soft limit to the hard limit, which systemd's default already sets high. Values above the defaults are not load-tested yet; watch memory after raising a cap.
 
+### Metrics
+
+Set `GRAYBOARD_METRICS_ADDR` to serve Prometheus metrics at `/metrics` on a listener of its own. A bare port (`9464`) binds 127.0.0.1; `host:port` or `[v6]:port` binds that address. Unset, there's no listener, and the startup log says `metrics off`. The listener has no authentication, so the bind address is the only access control (why: [`docs/architecture.md`](../architecture.md#7-build-and-deploy)). Keep it on loopback, or on a private interface your scraper reaches, and don't proxy it.
+
+```bash
+curl -s localhost:9464/metrics | grep capacity_refusals   # refusals per cap, since start
+```
+
+The series cover admissions held per request cap, open leases, watches and board observers, capacity refusals by cap, native tool-call latency by tool, event-loop lag, and resident memory. A rising refusal count for one cap is the signal to raise that cap. The names and help text are in `src/server/metrics.ts` and `src/server/app.ts`; every counter and gauge is per process.
+
 ## 6. Backups (optional)
 
 `deploy/backup.sh` copies a consistent SQLite snapshot to S3 nightly, then mirrors the attachment blob directory (`GRAYBOARD_BLOB_DIR`, else `blobs/` beside the database) to `grayboard/blobs/` in the bucket. It needs the `sqlite3` package, the AWS CLI, and credentials that can list, write and delete in the bucket (on EC2, an instance profile with `s3:ListBucket`, `s3:PutObject` and `s3:DeleteObject`). Set an S3 lifecycle rule for retention, and turn on bucket versioning with a noncurrent-version expiry matching it. Why the blob mirror and versioning are needed: [`docs/architecture.md`](../architecture.md#7-build-and-deploy) §8.
@@ -241,7 +251,7 @@ Then open http://127.0.0.1:4777; Ctrl-C closes both the viewer and the tunnel. I
 
 ## Reclaiming disk space
 
-The nightly retention run returns the pages it freed to the filesystem, up to 16,384 pages (64 MiB at the default 4 KiB page) per night, so a large backlog drains over several nights. That needs `auto_vacuum=INCREMENTAL`, which a database gets only when it's created (v2.0.0 and later; #170). An older database file keeps `auto_vacuum=NONE` and never shrinks: the server logs `free pages it can't reclaim` after each retention run while it has any. Convert it once, with the service stopped, a snapshot taken (§7) and free disk space for a second copy of the database:
+The nightly retention run returns the pages it freed to the filesystem, up to 16,384 pages (64 MiB at the default 4 KiB page) per night, so a large backlog drains over several nights. That needs `auto_vacuum=INCREMENTAL`, which a database gets only when it's created (v2.0.0 and later; #170). An older database file keeps `auto_vacuum=NONE` and never shrinks: the server logs `free pages it can't reclaim` after each retention run while it has any. Convert it once, with the service stopped, a snapshot taken (§6) and free disk space for a second copy of the database:
 
 ```bash
 sudo systemctl stop grayboard
