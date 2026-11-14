@@ -54,7 +54,7 @@ import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
 import { z } from "zod";
-import { hooksDisabledBy, recordHookInstalled } from "../cli/claude_hooks.ts";
+import { hooksDisabledBy, recordHookInstalled } from "../shared/claude_settings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
 import { isAlive, launcherName, procStart } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";

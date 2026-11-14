@@ -1,5 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isExplicitIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
@@ -7,6 +6,10 @@ import { localDbPath, readConversationTitle } from "../local/open.ts";
 import { freshRecord } from "../shared/namerecord.ts";
 import { validSourceId } from "../shared/session_meta.ts";
 import { sockDir } from "../shared/sockdir.ts";
+import { claudeSettingsPath, LOCAL_TOOL_MATCHER } from "../shared/claude_settings.ts";
+
+// The settings readers `grayboard mcp` uses live in src/shared (#555); re-exported for the CLI and tests.
+export { claudeSettingsPath, hooksDisabledBy, LOCAL_TOOL_MATCHER, managedSettingsDir, recordHookInstalled } from "../shared/claude_settings.ts";
 
 export type SessionStartOutput = { hookSpecificOutput: { hookEventName: "SessionStart"; sessionTitle: string } };
 
@@ -37,21 +40,14 @@ export function sessionStartOutput(stdin: string, env = process.env): SessionSta
 type HookEntry = { matcher?: string; hooks: { type: string; command: string; timeout?: number }[] };
 type Settings = { hooks?: Record<string, HookEntry[]>; [k: string]: unknown };
 
-// Recognize current commands and the old title-only command when replacing
-// installed user settings; only the authoritative record hook is installed.
-const OURS = /grayboard.*\s(session-start|hook claude [a-z-]+)$/;
-// The PreToolUse entry, whose presence is what "installed" means to `grayboard mcp`.
-const RECORD = /grayboard.*\shook claude pre-tool-use$/;
-/** The tools whose calls the PreToolUse hook records: the user-scope `grayboard` entry's. */
-export const LOCAL_TOOL_MATCHER = "mcp__grayboard__.*";
+// Recognize current commands by their `hook claude <event>` tail, wherever the
+// CLI lives (a from-source setup's path needn't contain "grayboard", #555), and
+// the old title-only command when replacing installed user settings.
+const OURS = /\shook claude [a-z-]+$|grayboard.*\ssession-start$/;
 
 /** `s` quoted for a POSIX shell, bare where that's safe: Claude Code runs a hook command through one. */
 export function shellQuote(s: string): string {
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-export function claudeSettingsPath(env = process.env): string {
-  return join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "settings.json");
 }
 
 /** SessionStart handles rotation and title together; clear runs only its identity barrier. */
@@ -95,52 +91,6 @@ export function removeClaudeHooks(path = claudeSettingsPath()): boolean {
   else delete cfg.hooks;
   writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
   return true;
-}
-
-/**
- * Whether user settings hold grayboard's PreToolUse record hook, read by
- * `grayboard mcp` once at start (#551). Only user settings: the one layer setup
- * writes. Unreadable settings count as installed, so calls fail visibly with
- * the missing-record error rather than silently act as the root.
- */
-export function recordHookInstalled(path = claudeSettingsPath()): boolean {
-  let cfg: Settings;
-  try { cfg = JSON.parse(readFileSync(path, "utf8")); } catch (e) {
-    return (e as NodeJS.ErrnoException).code !== "ENOENT";
-  }
-  return (cfg?.hooks?.PreToolUse ?? []).some((m) => m?.matcher === LOCAL_TOOL_MATCHER && m.hooks?.some((h) => RECORD.test(h?.command ?? "")));
-}
-
-/** Claude Code's managed-settings directory (2.1.316: macOS and Linux; others have none here). */
-export function managedSettingsDir(platform = process.platform): string | null {
-  return platform === "darwin" ? "/Library/Application Support/ClaudeCode" : platform === "linux" ? "/etc/claude-code" : null;
-}
-
-/**
- * The first settings file that stops user hooks from running in a session in
- * `cwd` (`disableAllHooks`, or managed `allowManagedHooksOnly`), or null. Read
- * only when a record is missing, to name the cause (#551 §3): managed
- * settings and their drop-ins, then user settings, then the project's local
- * and shared settings.
- */
-export function hooksDisabledBy(cwd: string, managed = managedSettingsDir(), user: string | null = claudeSettingsPath()): string | null {
-  const files: string[] = [];
-  if (managed) {
-    files.push(join(managed, "managed-settings.json"));
-    try {
-      const d = join(managed, "managed-settings.d");
-      files.push(...readdirSync(d).filter((f) => f.endsWith(".json")).sort().map((f) => join(d, f)));
-    } catch { /* no drop-ins */ }
-  }
-  if (user) files.push(user);
-  files.push(join(cwd, ".claude", "settings.local.json"), join(cwd, ".claude", "settings.json"));
-  for (const f of files) {
-    let cfg: { disableAllHooks?: unknown; allowManagedHooksOnly?: unknown } | null;
-    try { cfg = JSON.parse(readFileSync(f, "utf8")); } catch { continue; }
-    if (cfg?.disableAllHooks === true) return `${f} sets disableAllHooks`;
-    if (managed && f.startsWith(managed) && cfg?.allowManagedHooksOnly === true) return `${f} sets allowManagedHooksOnly`;
-  }
-  return null;
 }
 
 function withoutOurs(path: string): { cfg: Settings; kept: Record<string, HookEntry[]>; found: boolean; before: string | undefined } {
