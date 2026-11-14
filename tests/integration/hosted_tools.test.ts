@@ -332,13 +332,16 @@ test("only a message's sender and recipient can read its thread or reply to it",
     message: `parent_id ${root.message_id} is not a message you sent or received`,
   });
   // #524: a reply goes to the parent's other party; to anyone else it would thread where that party can't read it.
+  // A native tool's refusal is text only, so its `bad_request` code is asserted in src/server/application.test.ts (#530).
   await expect(b.call("dm_send", { to: `${C}/sim`, body: "x", parent_id: root.message_id })).rejects.toMatchObject({
     message: `parent_id ${root.message_id} is a thread with ${A}/be, so a reply goes to ${A}/be; to write to someone else, send without parent_id`,
   });
   await expect(a.call("dm_send", { to: `${C}/sim`, body: "x", parent_id: reply.message_id })).rejects.toMatchObject({
     message: `parent_id ${reply.message_id} is a thread with ${B}/fe, so a reply goes to ${B}/fe; to write to someone else, send without parent_id`,
   });
-  expect((await b.call<DirectMessage[]>("dm_thread", { thread: root.message_id })).map((m) => m.id)).toEqual([root.message_id, reply.message_id]);
+  // Neither refusal wrote anything (#530): not in the thread from either party's view, nor anywhere c can see.
+  for (const party of [a, b]) expect((await party.call<DirectMessage[]>("dm_thread", { thread: root.message_id })).map((m) => m.id)).toEqual([root.message_id, reply.message_id]);
+  expect((await c.call<{ unanswered: unknown[] }>("dm_inbox", {})).unanswered).toEqual([]);
   await b.call("dm_send", { to: `${C}/sim`, body: "new thread" });
   await expect(a.call("dm_send", { to: `${B}/fe`, body: "x", parent_id: 99999 })).rejects.toBeInstanceOf(HostedToolError);
 });

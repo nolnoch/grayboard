@@ -1326,10 +1326,10 @@ function makeHostedStore(db: Database): HostedStore {
     unpark(session, grant, now) {
       db.run("UPDATE hosted_sessions SET parked_at = NULL, grant_id = ?, last_seen_at = ? WHERE session_id = ?", [grant, now, session]);
     },
-    start(session, user, client, now) {
+    start(session, user, client, now, suggested) {
       const r = db.run("INSERT INTO hosted_ownerships(session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?)", [session, user, client, now]);
       const id = Number(r.lastInsertRowid);
-      audit(session, "hosted.ownership_started", { ownership: id }, now);
+      audit(session, "hosted.ownership_started", { ownership: id, ...(suggested ? { suggested } : {}) }, now);
       return id;
     },
     insert(row) {
@@ -1354,8 +1354,11 @@ function makeHostedStore(db: Database): HostedStore {
       db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
       // A hosted ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
       // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it. The
-      // launcher flag (#473) is the ownership's too: a resumed session that no longer declares one isn't one.
+      // launcher flag (#473) is the ownership's too: a resumed session that no longer declares one isn't one. Clearing
+      // it is audited as its setting is (#532), so the trail shows when a hosted launcher stopped being one.
+      const launcher = db.query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(session)?.launcher === 1;
       db.run("UPDATE ids SET writes_as = NULL, launcher = 0 WHERE id = ?", [session]);
+      if (launcher) audit(session, "handle.launcher_set", { on: false, ownership: row.ownership_id, reason }, now);
       // Every hold the ownership has, not one name's (#451): ending it releases them all.
       for (const { address } of db.query<{ address: string }, [string]>("DELETE FROM alias_holds WHERE id = ? RETURNING address").all(session)) {
         db.run("INSERT INTO binding_events(session_id, name, event, at, detail) VALUES (?, ?, 'released', ?, ?)", [session, address, now, reason]);
