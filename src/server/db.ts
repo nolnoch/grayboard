@@ -1326,10 +1326,10 @@ function makeHostedStore(db: Database): HostedStore {
     unpark(session, grant, now) {
       db.run("UPDATE hosted_sessions SET parked_at = NULL, grant_id = ?, last_seen_at = ? WHERE session_id = ?", [grant, now, session]);
     },
-    start(session, user, client, now) {
+    start(session, user, client, now, suggested) {
       const r = db.run("INSERT INTO hosted_ownerships(session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?)", [session, user, client, now]);
       const id = Number(r.lastInsertRowid);
-      audit(session, "hosted.ownership_started", { ownership: id }, now);
+      audit(session, "hosted.ownership_started", { ownership: id, ...(suggested ? { suggested } : {}) }, now);
       return id;
     },
     insert(row) {
