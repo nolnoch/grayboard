@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
  * audit row written while handling it carries. It follows the request through
  * awaits and the timers it schedules; a timer that outlives the request and
  * does other callers' work is armed through `detached` instead. Work with no
- * request (boot, retention, the hosted sweeps, the Slack bridge) writes null.
+ * request (boot, retention, the timer-driven hosted sweeps, the Slack bridge's relay) writes null.
  */
 export type RequestOrigin = { ip: string | null; ua: string | null };
 
