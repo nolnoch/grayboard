@@ -113,6 +113,7 @@ case "$1 $2 $3" in
   "show -p ActiveState") echo "$STUB_STATE" ;;
   "show -p EnvironmentFiles") echo "${dir}/env (ignore_errors=no)" ;;
   "restart grayboard "*) echo restart >> "${dir}/systemctl.log"; exit "$STUB_RESTART_RC" ;;
+  "is-system-running  ") echo "\${STUB_SYSTEM_STATE:-running}" ;;
   "daemon-reload  ") echo reload >> "${dir}/reload.log"; exit "$STUB_RELOAD_RC" ;;
   *) echo "unexpected systemctl $*" >&2; exit 2 ;;
 esac`);
@@ -520,6 +521,29 @@ test("a failed daemon-reload leaves the binaries old and says so; a rerun reload
   expect(reloads()).toBe(2);
   expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe(STUB_BIN);
   expect(restarts()).toBe(1);
+});
+
+// #396 item 16: systemctl present, systemd not running (a container).
+test("a new unit on a host where systemd isn't running is written without a reload, and the binaries install", () => {
+  const r = install({ unit: false, reloadRc: 1, env: { STUB_SYSTEM_STATE: "offline" } });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain("systemd isn't running here");
+  expect(reloads()).toBe(0);
+  expect(readFileSync(UNIT(), "utf8")).toBe(DEPLOY["deploy-grayboard.service"]);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe(STUB_BIN);
+});
+
+// #396 nits: a directory at a deploy file's path is left alone, not taken as a differing file or filled.
+test("a directory at the Caddyfile or backup script path is kept and said so", () => {
+  mkdirSync(CADDYFILE(), { recursive: true });
+  mkdirSync(BACKUP(), { recursive: true });
+  const r = install({ unit: false, env: { GRAYBOARD_DEPLOY_REPLACE: "1" } });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`kept ${CADDYFILE()}: it is a directory`);
+  expect(r.out).toContain(`kept ${BACKUP()}: it is a directory`);
+  expect(r.out).not.toContain(`installed ${BACKUP()}`);
+  expect(readdirSync(CADDYFILE())).toEqual([]);
+  expect(readdirSync(BACKUP())).toEqual([]);
 });
 
 test("an unchanged unit systemd has already loaded isn't reloaded", () => {
