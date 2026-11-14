@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  An always-on hosted pi under launchd (docs/guide/harnesses.md, Always-on pi).
+  Replace each /path/to/… and the handle, then:
+    cp pi-agent.plist ~/Library/LaunchAgents/com.example.pi-agent.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.pi-agent.plist
+  launchd starts it at login and again whenever it exits; ExitTimeOut gives pi
+  time to shut down in order before launchd kills it.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.pi-agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/path/to/node</string>
+		<string>--disable-warning=ExperimentalWarning</string>
+		<string>/path/to/grayboard/adapters/pi-family/always-on/always-on.ts</string>
+		<string>--handle</string>
+		<string>pi-agent</string>
+		<string>--dir</string>
+		<string>/path/to/pi-agent</string>
+		<string>--</string>
+		<string>--model</string>
+		<string>provider/model</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Where node and pi are: launchd's own PATH has neither. -->
+		<key>PATH</key>
+		<string>/path/to/node/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/path/to/pi-agent</string>
+	<key>StandardOutPath</key>
+	<string>/path/to/pi-agent/always-on.log</string>
+	<key>StandardErrorPath</key>
+	<string>/path/to/pi-agent/always-on.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>ExitTimeOut</key>
+	<integer>20</integer>
+</dict>
+</plist>

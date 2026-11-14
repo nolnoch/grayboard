@@ -1,0 +1,22 @@
+# An always-on hosted pi as a systemd user unit (docs/guide/harnesses.md,
+# Always-on pi). Replace each /path/to/… and the handle, then:
+#   cp pi-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now pi-agent
+#   loginctl enable-linger "$USER"   # keeps it running while you're logged out
+# systemd restarts it whenever it exits; its log is `journalctl --user -u pi-agent`.
+[Unit]
+Description=Always-on hosted pi for grayboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/path/to/node --disable-warning=ExperimentalWarning /path/to/grayboard/adapters/pi-family/always-on/always-on.ts --handle pi-agent --dir %h/pi-agent -- --model provider/model
+# Where node and pi are.
+Environment=PATH=/path/to/node/bin:/usr/bin:/bin
+Restart=always
+RestartSec=30
+# Time for pi to shut down in order before systemd kills it.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
