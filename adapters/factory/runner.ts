@@ -21,8 +21,9 @@ export type Outcome = ({ ok: true; text: string } | { ok: false; error: string }
 // restricted default) and those that run without a prompt; `budgetUsd`, the
 // most one run may spend (#649; absent, no cap). From the run's profile,
 // else the config's global ones; never from the request. `busTools` (#669):
-// the run gets the factory's read-only bus tools (relay.ts).
-export type Policy = { tools?: string[]; allowedTools: string[]; budgetUsd?: number; busTools?: boolean };
+// the run gets the factory's read-only bus tools (relay.ts). `mirrorClaims`
+// (#675): a subtask's tree claims are also held on the bus (mirror.ts).
+export type Policy = { tools?: string[]; allowedTools: string[]; budgetUsd?: number; busTools?: boolean; mirrorClaims?: boolean };
 // `priorUsd`: what the session's earlier runs cost. Claude Code's
 // `total_cost_usd` is the session's running total across `--resume`, while
 // its budget and turn count are per invocation, so a runner subtracts it.

@@ -16,8 +16,9 @@ import { askOf, DEFAULTS, hasDailyCap, loadConfig, policyOf } from "../../adapte
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
 import { askInstruction, NO_ANSWER, NO_MORE, parseAsk } from "../../adapters/factory/ask.ts";
 import { humanInstruction } from "../../src/core/tools.ts";
-import { DATA_NOTE, MAX_RESULT_CHARS, Relay, RELAY_TOOLS, shimCommand, TREE_TOOLS, type ChildTools, type McpServer, type Reader, type Scope } from "../../adapters/factory/relay.ts";
+import { DATA_NOTE, MAX_RESULT_CHARS, Relay, RELAY_TOOLS, shimCommand, TREE_TOOLS, treeCall, type ChildTools, type McpServer, type Reader, type Scope } from "../../adapters/factory/relay.ts";
 import { Store } from "../../adapters/factory/store.ts";
+import { busKey, mirrorPrefix, normalizeRemote, repoId, type BusMirror } from "../../adapters/factory/mirror.ts";
 import { Workspaces, type Place, type Workdir } from "../../adapters/factory/workdir.ts";
 import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 import { delegationBody } from "../../src/core/delegation.ts";
@@ -294,6 +295,7 @@ class FakeBus implements FactoryBus {
   private nextPost = 1000;
   private nextMsg = 5000;
   delayMs = 0;
+  answer: (tool: string, args: Record<string, unknown>) => unknown = () => undefined; // a call's own result; undefined, the default one
   pause: Promise<void> | null = null; // every call waits on it while set
   private q: Delivery[] = [];
   private wake: (() => void) | null = null;
@@ -307,6 +309,8 @@ class FakeBus implements FactoryBus {
     if (this.delayMs) await Bun.sleep(this.delayMs);
     if (this.pause) await this.pause;
     this.sent.push({ tool, args });
+    const own = this.answer(tool, args);
+    if (own !== undefined) return own;
     if (tool === "board_post") return { post_id: this.nextPost++ };
     if (tool === "dm_send") return { message_id: this.nextMsg++ };
     return tool === "board_list" ? this.boards : { ok: true };
@@ -381,10 +385,10 @@ class FakeRunner implements Runner {
   }
 }
 
-function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; timeoutMs?: number; fleets?: Fleet[]; bus?: FakeBus; workdir?: Workdir; ask?: AskPolicy; askTickMs?: number; limits?: Limits; policy?: Policy; childTools?: ChildTools } = {}) {
+function loop(o: { runner?: FakeRunner; store?: Store; maxConcurrent?: number; timeoutMs?: number; fleets?: Fleet[]; bus?: FakeBus; workdir?: Workdir; ask?: AskPolicy; askTickMs?: number; limits?: Limits; policy?: Policy; childTools?: ChildTools; mirrorRenewMs?: number } = {}) {
   const bus = o.bus ?? new FakeBus(), runner = o.runner ?? new FakeRunner(), store = o.store ?? new Store(":memory:");
   const logs: string[] = [];
-  const f = new Factory(bus, store, runner, { policy: o.policy ?? GLOBAL, ...(o.childTools ? { childTools: o.childTools } : {}), ...wd(o.workdir), fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m), ...(o.ask ? { ask: o.ask } : {}), ...(o.askTickMs ? { askTickMs: o.askTickMs } : {}), ...(o.limits ? { limits: o.limits } : {}) });
+  const f = new Factory(bus, store, runner, { policy: o.policy ?? GLOBAL, ...(o.childTools ? { childTools: o.childTools } : {}), ...wd(o.workdir), fleets: o.fleets ?? [], maxConcurrent: o.maxConcurrent ?? 2, timeoutMs: o.timeoutMs ?? 60_000, retentionMs: 60_000, log: (m) => logs.push(m), ...(o.ask ? { ask: o.ask } : {}), ...(o.askTickMs ? { askTickMs: o.askTickMs } : {}), ...(o.mirrorRenewMs ? { mirrorRenewMs: o.mirrorRenewMs } : {}), ...(o.limits ? { limits: o.limits } : {}) });
   const done = f.run();
   return { bus, runner, store, logs, done, f };
 }
@@ -2447,4 +2451,290 @@ test("tree claims: through the factory, subtasks get the tree's scope and the tr
   await done;
   await relay.close();
   store.close();
+});
+
+// ── mirrored tree claims (#675) ──────────────────────────────────────────────
+
+test("mirror: a remote URL in any of its spellings is one repo id; a key's leading ./ is dropped", () => {
+  for (const u of ["git@github.com:o/r.git", "https://github.com/o/r", "https://user@github.com/o/r.git", "ssh://git@github.com:22/o/r.git", "https://github.com/o/r/", "ssh://git@github.com/o/r"]) expect(normalizeRemote(u)).toBe("github.com/o/r");
+  expect(normalizeRemote("/srv/git/r.git")).toBe("/srv/git/r");
+  expect(normalizeRemote("file:///srv/git/r.git")).toBe("/srv/git/r");
+  expect(busKey(mirrorPrefix("github.com/o/r"), "./src/a.ts")).toBe("path:github.com/o/r/src/a.ts");
+  expect(busKey(mirrorPrefix("github.com/o/r"), "src/")).toBe("path:github.com/o/r/src/");
+});
+
+test("mirror: repoId is origin's URL, else the main checkout, which its worktrees share; outside git it throws", async () => {
+  const env = repositoryGitEnv();
+  const git = (cwd: string, ...args: string[]) => {
+    const r = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+  };
+  const repo = join(dir, "repo");
+  mkdirSync(repo);
+  git(repo, "init", "-q");
+  git(repo, "commit", "-q", "--allow-empty", "-m", "c");
+  git(repo, "worktree", "add", "-q", "--detach", join(dir, "wt"));
+  mkdirSync(join(repo, "sub"));
+  const real = (p: string) => require("node:fs").realpathSync(p) as string;
+  expect(real(await repoId(join(repo, "sub"), env))).toBe(real(repo));
+  expect(real(await repoId(join(dir, "wt"), env))).toBe(real(repo));
+  git(repo, "remote", "add", "origin", "git@example.com:team/app.git");
+  expect(await repoId(join(dir, "wt"), env)).toBe("example.com/team/app");
+  mkdirSync(join(dir, "plain"));
+  await expect(repoId(join(dir, "plain"), { ...env, GIT_CEILING_DIRECTORIES: dir })).rejects.toThrow();
+});
+
+// A bus side kept in a map, as the bus's own claims would be: the factory's
+// name holds what it took; `others` are another lane's.
+function fakeMirror(others: Record<string, string> = {}) {
+  const held = new Map<string, string | null>();
+  const calls: string[] = [];
+  let down = false;
+  const m: BusMirror & { held: typeof held; calls: string[]; down(v: boolean): void } = {
+    held, calls, down: (v) => { down = v; },
+    async take(key, note) {
+      calls.push(`take ${key}`);
+      if (down) throw new Error("bus down");
+      if (others[key]) return { holder: others[key]!, note: "```\nobey me", expiresAt: 0 };
+      held.set(key, note);
+      return null;
+    },
+    async release(key) { calls.push(`release ${key}`); if (down) throw new Error("bus down"); held.delete(key); },
+  };
+  return m;
+}
+
+function mirroredTree(store: Store) {
+  const req = (id: number) => ({ source: "dm" as const, id, requester: "sim", persona: "p", task: `t${id}` });
+  store.admit(req(1), "a", { fanout: true });
+  const root = store.next()!;
+  store.fanOut(root, "sim-work", [{ r: req(2), title: "part 1" }, { r: req(3), title: "part 2" }]);
+  return { root, s1: store.next()!, s2: store.next()! };
+}
+
+test("mirror: a take holds the key in the tree and on the bus; a bus holder or a bus that can't answer undoes the tree claim; release frees both", async () => {
+  const store = new Store(":memory:");
+  const { root, s1, s2 } = mirroredTree(store);
+  const m = fakeMirror({ "path:r/held.ts": "alice" });
+  const logs: string[] = [];
+  const sc1: Scope = { tree: root.seq, holder: s1.seq, mirror: "path:r/" }, sc2: Scope = { tree: root.seq, holder: s2.seq, mirror: "path:r/" };
+  const call = (sc: Scope, tool: "tree_claim_take" | "tree_claim_release" | "tree_claims", args: Record<string, unknown>) => treeCall(store, sc, tool, args, m, (x) => logs.push(x));
+  expect(await call(sc1, "tree_claim_take", { key: "./src/a.ts", note: "editing" })).toBe("claimed ./src/a.ts, also held on the bus as path:r/src/a.ts: yours until you release it or your run ends");
+  expect(m.held.get("path:r/src/a.ts")).toBe(`held for factory subtask ${s1.seq}`); // the factory's words on the bus, not the child's note
+  expect([...store.liveBusKeys()]).toEqual([["path:r/src/a.ts", s1.seq]]);
+  // A sibling's other spelling of the same key is the same bus key: the store refuses it, the bus isn't asked.
+  const calls = m.calls.length;
+  expect(await call(sc2, "tree_claim_take", { key: "src/a.ts" })).toStartWith("not claimed: another run of this factory holds path:r/src/a.ts.");
+  expect(m.calls.length).toBe(calls);
+  // Held on the bus by another lane: refused, the holder's words fenced, the tree claim undone.
+  const refused = await call(sc1, "tree_claim_take", { key: "held.ts" });
+  expect(refused).toStartWith("not claimed: path:r/held.ts is held on the bus outside this request.");
+  expect(refused).toContain(DATA_NOTE);
+  expect(refused).toContain('"holder": "alice"');
+  expect(store.claims(root.seq).map((c) => c.key)).toEqual(["./src/a.ts"]);
+  // The bus can't answer: the take fails and the tree claim is undone.
+  m.down(true);
+  await expect(call(sc1, "tree_claim_take", { key: "src/b.ts" })).rejects.toThrow("not claimed: the bus couldn't be checked for path:r/src/b.ts: bus down");
+  expect(store.claims(root.seq).map((c) => c.key)).toEqual(["./src/a.ts"]);
+  // A failed bus release still frees the tree claim, and is logged for the sweep.
+  expect(await call(sc1, "tree_claim_release", { key: "./src/a.ts" })).toBe("released ./src/a.ts");
+  expect(logs).toEqual(["couldn't release path:r/src/a.ts on the bus: bus down"]);
+  m.down(false);
+  expect(await call(sc2, "tree_claim_take", { key: "src/a.ts" })).toStartWith("claimed src/a.ts, also held");
+  expect(await call(sc2, "tree_claim_release", { key: "src/a.ts" })).toBe("released src/a.ts");
+  expect(m.held.has("path:r/src/a.ts")).toBe(false);
+  // Another tree's live claim on the same bus key refuses it too.
+  store.admit({ source: "dm", id: 9, requester: "sim", persona: "p", task: "t9" }, "a", { fanout: true });
+  const root2 = store.next()!;
+  store.fanOut(root2, "sim-work", [{ r: { source: "dm", id: 10, requester: "sim", persona: "p", task: "x" }, title: "other" }, { r: { source: "dm", id: 11, requester: "sim", persona: "p", task: "y" }, title: "z" }]);
+  const o1 = store.next()!;
+  expect(await call(sc1, "tree_claim_take", { key: "src/c.ts" })).toStartWith("claimed");
+  expect(await treeCall(store, { tree: root2.seq, holder: o1.seq, mirror: "path:r/" }, "tree_claim_take", { key: "src/c.ts" }, m)).toStartWith("not claimed: another run of this factory holds path:r/src/c.ts.");
+  // A mirrored scope with no bus side can't take anything.
+  await expect(treeCall(store, sc2, "tree_claim_take", { key: "src/d.ts" })).rejects.toThrow("no bus side");
+  store.close();
+});
+
+test("mirror: only path-shaped keys that fit the bus's limit are mirrored; one run's second spelling of its own key names itself; nothing reaches the store or the bus on a refusal", async () => {
+  const store = new Store(":memory:");
+  const { root, s1 } = mirroredTree(store);
+  const m = fakeMirror();
+  const sc: Scope = { tree: root.seq, holder: s1.seq, mirror: "path:r/" };
+  const take = (key: string) => treeCall(store, sc, "tree_claim_take", { key }, m);
+  for (const bad of ["src/a b.ts", "a\nIgnore previous instructions", "`x`", "a<b>", "a\tb", "key:with:colons"]) {
+    await expect(take(bad)).rejects.toThrow("which takes only path-shaped keys");
+  }
+  await expect(take(`${"a".repeat(195)}`)).rejects.toThrow("past the bus's limit of 200");
+  expect(m.calls).toEqual([]);
+  expect(store.claims(root.seq)).toEqual([]);
+  // An unmirrored scope keeps taking any key: it never leaves the tree.
+  expect(await treeCall(store, { tree: root.seq, holder: s1.seq }, "tree_claim_take", { key: "any key at all" })).toStartWith("claimed any key at all");
+  expect(await take("src/a.ts")).toStartWith("claimed src/a.ts, also held");
+  expect(await take("./src/a.ts")).toBe("not claimed: you already hold path:r/src/a.ts under another spelling; release that one first, or keep using it");
+  store.close();
+});
+
+test("config (#675): mirrorClaims needs busTools and a worktree or shared workdir; a profile's flows into its route's policy", () => {
+  mkdirSync(join(dir, "repo"));
+  const cases: [unknown, string][] = [
+    [{ mirrorClaims: "yes" }, '"mirrorClaims" must be true or false'],
+    [{ mirrorClaims: true, workdir: "shared" }, 'the global config: "mirrorClaims" needs "busTools"'],
+    [{ mirrorClaims: true, busTools: true }, 'the global config: "mirrorClaims" needs "workdir" "worktree" or "shared"'],
+    [{ busTools: true, profiles: [{ name: "p", agent: "x", mirrorClaims: true }] }, 'profile p: "mirrorClaims" needs "workdir" "worktree" or "shared"'],
+    [{ workdir: "shared", profiles: [{ name: "p", agent: "x", mirrorClaims: true }] }, 'profile p: "mirrorClaims" needs "busTools"'],
+    [{ mirrorClaims: true, busTools: true, workdir: "shared", profiles: [{ name: "p", agent: "x", workdir: "scratch" }] }, 'profile p: "mirrorClaims" needs "workdir" "worktree" or "shared"'],
+  ];
+  for (const [c, why] of cases) {
+    writeFileSync(join(dir, "config.json"), JSON.stringify(c));
+    expect(() => loadConfig(dir, {})).toThrow(why);
+  }
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ busTools: true, profiles: [{ name: "p", agent: "x", workdir: "worktree", repo: "repo", mirrorClaims: true }, { name: "q", agent: "y" }], fleets: [{ name: "a", profile: "p" }, { name: "b", profile: "q" }] }));
+  const c = loadConfig(dir, {});
+  expect(c.fleets.map((f) => f.policy)).toEqual([{ allowedTools: [], busTools: true, mirrorClaims: true }, { allowedTools: [], busTools: true }]);
+  expect(policyOf(c)).toEqual({ allowedTools: [], busTools: true });
+  writeFileSync(join(dir, "config.json"), JSON.stringify({ busTools: true, mirrorClaims: true, workdir: "shared" }));
+  expect(policyOf(loadConfig(dir, {}))).toEqual({ allowedTools: [], busTools: true, mirrorClaims: true });
+});
+
+// The bus's claims for the factory's name, kept by a FakeBus.
+function busClaims(bus: FakeBus, start: { key: string; holder: string }[] = []) {
+  const claims = new Map(start.map((c) => [c.key, c.holder]));
+  bus.answer = (tool, a) => {
+    const key = String(a.key);
+    if (tool === "claim_list") return [...claims].filter(([k]) => k.startsWith(String(a.prefix ?? ""))).map(([k, holder]) => ({ key: k, holder, note: null, board: null, acquired_at: 0, expires_at: 0 }));
+    if (tool === "claim_take") {
+      const h = claims.get(key);
+      if (h && h !== bus.handle) return { ok: false, held_by: h, note: null, expires_at: 0 };
+      claims.set(key, bus.handle);
+      return { ok: true, renewed: h !== undefined };
+    }
+    if (tool === "claim_release") { if (claims.get(key) === bus.handle) claims.delete(key); return `released ${key}`; }
+    return undefined;
+  };
+  return claims;
+}
+
+test("mirror sweep: at start the factory releases the path claims its name holds that no live tree claim does, and leaves others' alone", async () => {
+  const bus = new FakeBus();
+  const claims = busClaims(bus, [{ key: "path:r/stale.ts", holder: "factory" }, { key: "path:r/theirs.ts", holder: "alice" }, { key: "ticket:1", holder: "factory" }]);
+  // A factory that mirrors nothing doesn't list claims at start.
+  const plain = loop({ bus: new FakeBus() });
+  await until(() => plain.bus.sent.some((s) => s.tool === "board_list"), 5_000, "the plain factory started");
+  expect(plain.bus.sent.some((s) => s.tool === "claim_list")).toBe(false);
+  await plain.bus.close();
+  await plain.done;
+  const { done, logs } = loop({ bus, policy: { allowedTools: [], busTools: true, mirrorClaims: true } });
+  await until(() => !claims.has("path:r/stale.ts"), 5_000, "the stale key released");
+  expect([...claims.keys()]).toEqual(["path:r/theirs.ts", "ticket:1"]);
+  expect(logs).toContain("released path:r/stale.ts on the bus: no subtask holds it now");
+  expect(bus.sent.filter((s) => s.tool === "claim_list")).toEqual([{ tool: "claim_list", args: { prefix: "path:" } }]);
+  await bus.close();
+  await done;
+});
+
+test("mirror through the factory: a subtask's scope names its repository; what it leaves held is released once its run ends; a non-git directory fails the run unspawned", async () => {
+  const work = join(dir, "work");
+  mkdirSync(work, { recursive: true });
+  Bun.spawnSync(["git", "init", "-q"], { cwd: work, env: repositoryGitEnv() });
+  const prefix = mirrorPrefix(await repoId(work));
+  const store = new Store(":memory:");
+  const bus = new FakeBus();
+  const claims = busClaims(bus);
+  const mirror: BusMirror = {
+    take: async (key, note) => { const r = (await bus.call("claim_take", { key, note })) as { ok: boolean; held_by?: string }; return r.ok ? null : { holder: r.held_by!, note: null, expiresAt: 0 }; },
+    release: async (key) => { await bus.call("claim_release", { key }); },
+  };
+  const relay = new Relay({ dir: join(dir, "relay"), shim: SHIM, reader: fakeReader().reader, claims: store, mirror, log: () => {} });
+  const scopes: (Scope | undefined)[] = [];
+  const tools: ChildTools = { grant: (s) => { scopes.push(s); return relay.grant(s); }, close: () => relay.close() };
+  const runner = new FakeRunner();
+  let n = 0;
+  let seen: boolean[] = [];
+  runner.use = async (mcp) => {
+    n++;
+    if (n === 1) return PLAN();
+    if (n === 2) {
+      const a = await relay.answer(JSON.stringify({ token: mcp!.env.FACTORY_RELAY_TOKEN, tool: "tree_claim_take", args: { key: "src/a.ts" } }));
+      seen.push(a.ok && a.text.includes(`also held on the bus as ${prefix}src/a.ts`), claims.get(`${prefix}src/a.ts`) === "factory");
+    }
+    return n === 4 ? "combined" : `sub ${n}`;
+  };
+  const { done, logs } = loop({ bus, runner, store, maxConcurrent: 1, childTools: tools, fleets: [{ name: "sim", agent: "researcher", policy: { allowedTools: [], busTools: true, mirrorClaims: true } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 3, 5_000, "taken, fanned out, done");
+  await until(() => !claims.has(`${prefix}src/a.ts`), 5_000, "the finished subtask's key released on the bus");
+  expect(seen).toEqual([true, true]);
+  const root = store.get({ source: "board", id: 7 })!;
+  const subs = store.subtasks(root.seq).map((r) => r.seq);
+  expect(scopes).toEqual([undefined, { tree: root.seq, holder: subs[0], mirror: prefix }, { tree: root.seq, holder: subs[1], mirror: prefix }, undefined]);
+  expect(logs).toContain(`released ${prefix}src/a.ts on the bus: no subtask holds it now`);
+  rmSync(join(work, ".git"), { recursive: true });
+  n = 0;
+  const ran = runner.runs.length;
+  bus.deliver(task(8));
+  await until(() => bus.replies(8).length === 3, 5_000, "taken, fanned out, done");
+  expect(runner.runs.length - ran).toBe(2); // the triage and the synthesis: neither subtask spawned
+  expect(bus.sent.filter((s) => String(s.args.body ?? "").includes(`working directory ${work} isn't in a git repository`)).length).toBe(2);
+  await bus.close();
+  await done;
+  await relay.close();
+  store.close();
+}, 20_000);
+
+test("mirror sweep: a parked subtask's key is renewed on the bus while it asks, and released once a cancel ends it off the run path", async () => {
+  const work = join(dir, "work");
+  mkdirSync(work, { recursive: true });
+  Bun.spawnSync(["git", "init", "-q"], { cwd: work, env: repositoryGitEnv() });
+  const key = `${mirrorPrefix(await repoId(work))}src/a.ts`;
+  const store = new Store(":memory:");
+  const bus = new FakeBus();
+  const claims = busClaims(bus);
+  const mirror: BusMirror = { take: async (k) => { await bus.call("claim_take", { key: k }); return null; }, release: async (k) => { await bus.call("claim_release", { key: k }); } };
+  const relay = new Relay({ dir: join(dir, "relay"), shim: SHIM, reader: fakeReader().reader, claims: store, mirror, log: () => {} });
+  const runner = new FakeRunner();
+  let n = 0;
+  runner.use = async (mcp) => {
+    n++;
+    if (n === 1) return PLAN();
+    if (n === 2) {
+      await relay.answer(JSON.stringify({ token: mcp!.env.FACTORY_RELAY_TOKEN, tool: "tree_claim_take", args: { key: "src/a.ts" } }));
+      return ASK("which file?");
+    }
+    return `sub ${n}`;
+  };
+  const { done, logs } = loop({ bus, runner, store, maxConcurrent: 1, askTickMs: 20, mirrorRenewMs: 50, childTools: { grant: (s) => relay.grant(s), close: () => relay.close() }, fleets: [{ name: "sim", agent: "researcher", policy: { allowedTools: [], busTools: true, mirrorClaims: true } }] });
+  bus.deliver(task(7));
+  await until(() => store.asking().length === 1, 5_000, "the subtask parked on its question");
+  const takes = () => bus.sent.filter((s) => s.tool === "claim_take" && s.args.key === key).length;
+  const before = takes();
+  await until(() => takes() >= before + 2, 5_000, "the parked key renewed");
+  expect(claims.get(key)).toBe("factory");
+  // It lapsed and another lane took it: the renewal says so and leaves theirs alone.
+  claims.set(key, "alice");
+  await until(() => logs.some((l) => l === `${key} lapsed on the bus and alice holds it now; the subtask still holds it in its tree`), 5_000, "the lapsed renewal logged");
+  expect(claims.get(key)).toBe("alice");
+  claims.set(key, "factory");
+  bus.deliver({ ...task(8, { parentId: bus.replyId(7), from: "fe" }), body: "cancel" });
+  await until(() => !claims.has(key), 5_000, "the cancelled subtask's key released");
+  await bus.close();
+  await done;
+  await relay.close();
+  store.close();
+}, 20_000);
+
+test("mirror sweep: a release the bus refused is retried on a later tick", async () => {
+  const bus = new FakeBus();
+  const claims = busClaims(bus, [{ key: "path:r/stale.ts", holder: "factory" }]);
+  const own = bus.answer;
+  let refuse = 2;
+  bus.answer = (tool, a) => {
+    if (tool === "claim_release" && refuse > 0) { refuse--; throw new Error("bus busy"); }
+    return own(tool, a);
+  };
+  const { done, logs } = loop({ bus, askTickMs: 20, policy: { allowedTools: [], busTools: true, mirrorClaims: true } });
+  await until(() => !claims.has("path:r/stale.ts"), 5_000, "the stale key released after its failures");
+  expect(logs.filter((l) => l === "couldn't release path:r/stale.ts on the bus: bus busy").length).toBe(2);
+  expect(logs).toContain("released path:r/stale.ts on the bus: no subtask holds it now");
+  await bus.close();
+  await done;
 });
