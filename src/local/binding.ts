@@ -11,7 +11,7 @@
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, touchAlias, touchId, viewers, type AliasMetaSet } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, cleanFact, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, touchAlias, touchId, viewers, type AliasMetaSet } from "../core/boards.ts";
 import { coreAuditSink, writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
 import { aliasHeldText, childCapacity, childSessionId, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, DEFAULT_IDLE_SECONDS, MAX_CANDIDATES, MAX_CHILDREN, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
@@ -157,11 +157,14 @@ function registerRows(db: Database, s: SessionRow, kind: SessionKind): void {
   db.prepare(
     `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
+  const facts = { harness: cleanFact(s.harness), model: cleanFact(model), effort: cleanFact(effort) };
   writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
     delivery: writesAs === undefined ? "push" : "none", ...(writesAs === undefined ? {} : { writes_as: writesAs }),
     ...(viewer ? { viewer: true } : {}),
     keyed, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
     ...(harnessSession === undefined ? {} : { harness_session: harnessSession }),
+    // The session's self-reported facts, as the server's id.registered records them (#373).
+    ...(facts.harness ? { harness: facts.harness } : {}), ...(facts.model ? { model: facts.model } : {}), ...(facts.effort ? { effort: facts.effort } : {}),
   });
 }
 
@@ -370,7 +373,7 @@ export async function attachSession(db: Database, s: SessionRow, human: boolean,
     }
     db.prepare(`UPDATE bindings SET attached_pid = ?, attached_start = ?, detached_at = NULL WHERE session_id = ?`)
       .run(s.attached_pid, s.attached_start, s.session_id);
-    writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid });
+    writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid, held });
     return { ok: true, held };
   }).immediate();
 }
