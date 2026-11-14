@@ -34,9 +34,18 @@ function notify(operation: "resources.changed" | "resources.closed", callback?: 
 
 export function createResources(application: Application, options: ResourceOptions) {
   const watches = new Map<string, Watch>();
+  // Each session's watches, so a session's close and its capacity check don't scan every watch (#805).
+  const bySession = new Map<ApplicationSession, Set<Watch>>();
   let stopped = false;
+  function drop(watch: Watch): boolean {
+    if (!watches.delete(watch.id)) return false;
+    const own = bySession.get(watch.session);
+    own?.delete(watch);
+    if (own && !own.size) bySession.delete(watch.session);
+    return true;
+  }
   function finish(watch: Watch) {
-    if (!watches.delete(watch.id)) return;
+    if (!drop(watch)) return;
     try { watch.unsubscribe?.(); } finally { notify("resources.closed", watch.hooks.closed); }
   }
   function finishQuietly(watch: Watch) {
@@ -54,7 +63,7 @@ export function createResources(application: Application, options: ResourceOptio
   }
   function requireSession(session: ApplicationSession, allowUnbound = false) {
     if (authorized(session, allowUnbound)) return;
-    for (const watch of [...watches.values()]) if (watch.session === session) finishQuietly(watch);
+    for (const watch of [...bySession.get(session) ?? []]) finishQuietly(watch);
     throw new ApplicationError("unauthenticated", "resource session is closed or unauthorized");
   }
   function live(watch: Watch): boolean {
@@ -81,17 +90,20 @@ export function createResources(application: Application, options: ResourceOptio
     watch(session: ApplicationSession, uri: string, hooks: ResourceHooks): string {
       requireSession(session);
       const board = parseBoardResourceUri(uri);
-      if (watches.size >= 1024 || [...watches.values()].filter(w => w.session === session).length >= 32) {
+      if (watches.size >= 1024 || (bySession.get(session)?.size ?? 0) >= 32) {
         throw new ApplicationError("bad_request", "resource watch capacity reached");
       }
       const watch: Watch = { id: randomBytes(32).toString("base64url"), session, board, hooks };
       watches.set(watch.id, watch);
+      let own = bySession.get(session);
+      if (!own) bySession.set(session, own = new Set());
+      own.add(watch);
       try {
         watch.unsubscribe = application.observeBoard(session, board, {
           changed: () => { if (live(watch)) notify("resources.changed", () => hooks.changed()); },
           closed: () => finishQuietly(watch),
         });
-      } catch (error) { watches.delete(watch.id); throw error; }
+      } catch (error) { drop(watch); throw error; }
       return watch.id;
     },
     unwatch(session: ApplicationSession, id: string): void {

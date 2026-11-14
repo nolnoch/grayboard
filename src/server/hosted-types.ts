@@ -27,6 +27,10 @@ export interface HostedStore {
   // Every row but parked children (#566): what the limits count and the sweeps scan. `get` still returns a
   // parked row, and `children` lists a root's children, parked or not.
   all(): HostedSession[];
+  // What admission counts, by index rather than by row (#805): unparked rows on the server and the user's.
+  counts(user: number): { total: number; user: number };
+  // An ownership's unparked rows (idx_hosted_ownership): what a grant re-attach moves.
+  ofOwnership(ownership: number): HostedSession[];
   children(root: string): HostedSession[];
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
   park(session: string, now: number): void;

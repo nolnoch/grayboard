@@ -284,6 +284,29 @@ test("per-user delivery capacity refuses without attaching another grant or drop
   expect(delivery.describe(bob, context(bob), first.capability).capability).toBe(first.capability);
 });
 
+test("the per-user lease count frees a slot on release and never double-counts a reopen (#805)", async () => {
+  const contexts = [context(bob)];
+  for (let i = 1; i < 32; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    contexts.push(c);
+  }
+  const leases = [];
+  for (const c of contexts) leases.push(await delivery.open(bob, c));
+  // Reopening a held lease reuses its slot.
+  for (const c of contexts.slice(0, 4)) await delivery.open(bob, c);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+  await delivery.release(bob, contexts[5]!, leases[5]!.capability);
+  expect(delivery.activeLeaseCount).toBe(31);
+  await delivery.open(bob, contender);
+  expect(delivery.activeLeaseCount).toBe(32);
+  const another = context(bob, "another");
+  await hosted.bind(bob, another, { name: "another", create: true });
+  await expect(delivery.open(bob, another)).rejects.toThrow("delivery lease capacity reached");
+});
+
 test("one lease admits more than 1000 deliveries with bounded idempotent receipt history", async () => {
   const lease = await delivery.open(bob, context(bob));
   for (let i = 0; i < 1100; i++) await send(`message ${i}`);
