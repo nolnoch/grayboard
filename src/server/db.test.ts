@@ -284,6 +284,38 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
   ]);
 });
 
+// Security audit F-13: users are matched by IdP subject first, so a reassigned
+// email can't inherit an account.
+test("signIn: a subject owns its user; a reassigned or changed email is refused; clearSubject hands the email on", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const legacy = repo.users.upsertByEmail("old@example.com", null);
+  expect(legacy.idp_subject).toBeNull();
+  // A user from before the column links on its next sign-in.
+  expect(repo.users.signIn("old@example.com", "s-old", "Old")).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_subject: "s-old" } });
+  expect(repo.users.signIn("old@example.com", "s-old", "Old 2")).toMatchObject({ status: "ok", linked: false, user: { id: legacy.id, display_name: "Old 2" } });
+  // A new user is created with its subject.
+  const fresh = repo.users.signIn("new@example.com", "s-new", null);
+  expect(fresh).toMatchObject({ status: "ok", linked: false, user: { email: "new@example.com", idp_subject: "s-new" } });
+  // Another IdP account presenting the email is refused, and nothing changes.
+  expect(repo.users.signIn("old@example.com", "s-intruder", null)).toMatchObject({ status: "subject_mismatch", user: { id: legacy.id } });
+  // The same IdP account reporting another email is refused, and no user is created.
+  expect(repo.users.signIn("renamed@example.com", "s-old", null)).toMatchObject({ status: "email_changed", user: { id: legacy.id } });
+  expect(repo.users.findByEmail("renamed@example.com")).toBeUndefined();
+  expect(repo.users.findById(legacy.id)!.idp_subject).toBe("s-old");
+  // An admin's unlink lets the next account to present the email take it.
+  repo.users.clearSubject(legacy.id);
+  expect(repo.users.signIn("old@example.com", "s-intruder", null)).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_subject: "s-intruder" } });
+  expect(() => db.run("UPDATE users SET idp_subject = 's-new' WHERE id = ?", [legacy.id])).toThrow(/UNIQUE/);
+});
+
+test("signIn: a disabled account without a subject isn't bound to whoever signs in", () => {
+  const { repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const departed = repo.users.upsertByEmail("gone@example.com", null);
+  repo.users.setDisabled(departed.id, true);
+  expect(repo.users.signIn("gone@example.com", "s-hire", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
+  expect(repo.users.findById(departed.id)!.idp_subject).toBeNull();
+});
+
 // ── #130: the undeliveredFrom plan ────────────────────────────────────────────
 
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", () => {

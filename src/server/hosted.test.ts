@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { refusalCount } from "./metrics.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
@@ -125,7 +126,9 @@ test("child quota refusal leaves grant, lease and graph unchanged; ending a chil
   for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
   const lease = await delivery.open(principal, context("root"));
   const otherGrant = { ...principal, grantId: "G2" };
+  const counted = refusalCount("hosted_child");
   await expect(hosted.register(otherGrant, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
+  expect(refusalCount("hosted_child")).toBe(counted + 1);
   expect(database.repo.hosted.all().every(row => row.grant_id === "G1")).toBe(true);
   expect(delivery.describe(principal, context("root"), lease.capability).capability).toBe(lease.capability);
   await hosted.end(principal, context("child-0"));
@@ -1177,6 +1180,47 @@ test("a failed heartbeat write is reported and retried on the next tick", async 
   } finally { write.mockRestore(); errors.mockRestore(); }
 });
 
+// #475 items 1 and 7a: a released child's ID ends with the release's own reason, and an ID that comes back
+// as a root reopens its row, so every session holding an alias has an unended row (revocation,
+// deletion and retention all filter on ended_at IS NULL).
+const idEnd = (id: string) => database.db.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(id)?.ended_at ?? null;
+const endedWhy = (id: string) => childAudits("id.ended").filter(a => a.target === id).map(a => a.why);
+test("a released child's ID ends with the release's reason, not at the next start (#475 item 1)", async () => {
+  hosted.limits.parked = 1;
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  for (const raw of ["closed", "evicted", "kept"]) { await hosted.register(principal, context("root"), raw); now += 1000; }
+  await hosted.end(principal, context("closed"));
+  expect(idEnd(hostedId("closed"))).toBe(now);
+  expect(endedWhy(hostedId("closed"))).toEqual(["closed"]);
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.get(hostedId("evicted"))).toBeUndefined();
+  expect(endedWhy(hostedId("evicted"))).toEqual(["evicted"]);
+  // A root's end takes its children with it, each ended with the root's reason.
+  await hosted.end(principal, context("root"));
+  expect(endedWhy(hostedId("kept"))).toEqual(["closed"]);
+  expect(idEnd(hostedId("root"))).toBeNull();
+  // Nothing is left for the startup sweep to label a WSS leftover.
+  hosted.close(); application.stopExpiry();
+  application = createApplication(database.repo, database.db);
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  expect(childAudits("id.ended").filter(a => a.why === "wss_removed")).toEqual([]);
+});
+
+test("an ended ID that comes back as a root reopens its row, audited, and its alias is revocable (#475 item 7a)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  await hosted.end(principal, context("child"));
+  // A row an earlier release ended at a restart (`wss_removed`) reopens the same way.
+  const endedAt = now - 60_000;
+  database.db.run("UPDATE ids SET ended_at = ? WHERE id = ?", [endedAt, hostedId("child")]);
+  now += 1000;
+  await hosted.bind(principal, context("child"), { name: "fe", create: true });
+  expect(idEnd(hostedId("child"))).toBeNull();
+  expect(database.db.query("SELECT held_aliases_json, root_id FROM ids WHERE id = ?").get(hostedId("child"))).toEqual({ held_aliases_json: null, root_id: null });
+  expect(childAudits("id.reopened")).toEqual([expect.objectContaining({ target: hostedId("child"), ended_at: endedAt })]);
+  expect(aliasUser(database.db, "you@example.com/fe")).toBe(hostedId("child"));
+});
+
 // #399: a request's hosted bookkeeping reads O(its own rows), not O(the fleet). The row lists the store hands back
 // during one call are counted with 3 and with 40 unrelated bound roots; the totals must match.
 async function rowsReadDuring(call: () => Promise<unknown>) {
@@ -1232,7 +1276,9 @@ test("a user at capacity with idle rows is admitted after the refusal's re-sweep
   const idle = spyOn(database.repo.hosted, "idle");
   try {
     now += 1_000;
+    const counted = refusalCount("hosted_session");
     await expect(hosted.whoami(principal, context("refused-1"))).rejects.toHaveProperty("code", "bad_request");
+    expect(refusalCount("hosted_session")).toBe(counted + 1);
     const swept = idle.mock.calls.length;
     expect(swept).toBeGreaterThan(0);
     await expect(hosted.whoami(principal, context("refused-2"))).rejects.toHaveProperty("code", "bad_request");

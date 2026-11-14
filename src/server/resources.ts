@@ -3,6 +3,7 @@ import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { BOARD_NAME_RE, type SnapshotOptions } from "../core/boards.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { countRefusal } from "./metrics.ts";
 
 export function boardResourceUri(board: string): string {
   if (!BOARD_NAME_RE.test(board) || board.trim() !== board) throw new ApplicationError("bad_request", "invalid board resource name");
@@ -94,6 +95,7 @@ export function createResources(application: Application, options: ResourceOptio
       requireSession(session);
       const board = parseBoardResourceUri(uri);
       if (watches.size >= caps.global || (bySession.get(session)?.size ?? 0) >= caps.perSession) {
+        countRefusal("resource_watch");
         throw new ApplicationError("bad_request", "resource watch capacity reached");
       }
       const watch: Watch = { id: randomBytes(32).toString("base64url"), session, board, hooks };
