@@ -201,6 +201,13 @@ export interface Repo {
     pruneSession(session: string, before: number): number;
     prune(before: number): number;
   };
+  // The database file's free pages (#137).
+  storage: {
+    // Returns up to `maxPages` (> 0) free pages to the filesystem with
+    // `PRAGMA incremental_vacuum`. A file without auto_vacuum=INCREMENTAL
+    // (created before #170) reclaims nothing until a one-time VACUUM converts it.
+    reclaimFreePages(maxPages: number): { reclaimed: number; remaining: number; incremental: boolean };
+  };
   // Attachment bytes, by sha256; the attachment rows are metadata in this database.
   blobs: BlobStore;
   // The server's per-file and per-message caps; insert binds files under them.
@@ -1034,6 +1041,20 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       prune(before) {
         return db.run("DELETE FROM write_receipts WHERE at <= ?", [before]).changes;
+      },
+    },
+
+    storage: {
+      reclaimFreePages(maxPages) {
+        // incremental_vacuum(0) would mean every free page: never unbounded.
+        const pages = Math.floor(maxPages);
+        if (!(pages > 0)) throw new RangeError(`reclaimFreePages needs a positive page count, not ${maxPages}`);
+        const free = () => db.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count;
+        const incremental = db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()!.auto_vacuum === 2;
+        const before = free();
+        if (incremental && before > 0) db.run(`PRAGMA incremental_vacuum(${pages})`);
+        const remaining = free();
+        return { reclaimed: before - remaining, remaining, incremental };
       },
     },
 

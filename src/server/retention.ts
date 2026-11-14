@@ -21,14 +21,25 @@ function msUntilMidnightUTC(): number {
   return midnight.getTime() - Date.now();
 }
 
-function isFirstSundayOfMonth(d: Date): boolean {
-  return d.getUTCDay() === 0 && d.getUTCDate() <= 7;
+// Free pages returned to the filesystem per nightly run: 64 MiB at the default
+// 4 KiB page, so one run is bounded; a larger backlog drains over later nights.
+export const RECLAIM_PAGES_PER_RUN = 16_384;
+
+// Shrinks the file by the pages retention freed (#137). A database created
+// before #170 has auto_vacuum=NONE and reclaims nothing: say so, with the fix,
+// while it has free pages to reclaim.
+export function reclaimFreePages(repo: Repo, maxPages = RECLAIM_PAGES_PER_RUN): void {
+  const r = repo.storage.reclaimFreePages(maxPages);
+  if (r.reclaimed) console.error(`[grayboard] retention: reclaimed ${r.reclaimed} free database pages (${r.remaining} left)`);
+  if (!r.incremental && r.remaining) {
+    console.error(`[grayboard] retention: the database has ${r.remaining} free pages it can't reclaim (auto_vacuum is not INCREMENTAL); a one-time VACUUM converts it (docs/guide/server.md §Reclaiming disk space)`);
+  }
 }
 
 // The nightly job: messages, posts, ended sessions and audit rows past retention, uploads
 // left unbound, write receipts past the dedup window (each write prunes its
 // own session's; this is the backstop for sessions that stopped writing),
-// then the bytes nothing names any more.
+// then the bytes nothing names any more, then the free pages that left.
 type BoardsChanged = (boards: string[]) => void | Promise<void>;
 export async function runRetention(repo: Repo, db: CoreDb, config: Config, now = Date.now(), onBoardsChanged?: BoardsChanged): Promise<void> {
   try {
@@ -50,18 +61,15 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
   // Also finishes any sweep a crash or a failed delete left.
   const swept = await sweepBlobs(db, repo.blobs);
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
+  try {
+    reclaimFreePages(repo);
+  } catch (e) {
+    console.error("[grayboard] retention: reclaiming free pages failed:", e);
+  }
 }
 
 export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, opts: { firstDelayMs?: number } = {}, onBoardsChanged?: BoardsChanged): () => void {
   const runNightly = () => void runRetention(repo, db, config, Date.now(), onBoardsChanged);
-
-  const runVacuumIfNeeded = () => {
-    const d = new Date();
-    if (d.getUTCHours() === 4 && isFirstSundayOfMonth(d)) {
-      // VACUUM requires direct DB access; skipped in v1 POC.
-      // Future: expose incremental_vacuum via Repo and call it here.
-    }
-  };
 
   let nightly: ReturnType<typeof setTimeout> | undefined;
   let daily: ReturnType<typeof setInterval> | undefined;
@@ -71,11 +79,7 @@ export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, opts:
     nightly = setTimeout(() => {
       nightly = undefined;
       runNightly();
-      runVacuumIfNeeded();
-      daily = setInterval(() => {
-        runNightly();
-        runVacuumIfNeeded();
-      }, 86_400_000);
+      daily = setInterval(runNightly, 86_400_000);
     }, delay);
   };
 
