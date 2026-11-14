@@ -962,21 +962,19 @@ export function parseAliasMeta(v: unknown): AliasMetaSet {
 /**
  * Set an alias's labels from a parsed `meta`, as `session` binding it.
  * Only the fields whose value changes are written, and audited as one
- * alias.meta_set; those fields are returned (empty: nothing changed). Call
- * inside the bind's write transaction.
+ * alias.meta_set. Call inside the bind's write transaction.
  */
-export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink): AliasMetaSet {
+export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink): void {
   const keys = Object.keys(meta) as (keyof AliasMetaSet)[];
-  if (!keys.length) return {};
+  if (!keys.length) return;
   const cur = db.prepare(`SELECT ${ALIAS_META_KEYS.join(", ")} FROM aliases WHERE address = ?`).get(address) as Record<string, string | null> | null;
   if (!cur) throw new Error(`grayboard: no alias "${address}" to label`);
   const fields: AliasMetaSet = {};
   for (const k of keys) if ((meta[k] ?? null) !== cur[k]) fields[k] = meta[k] ?? null;
   const changed = Object.keys(fields) as (keyof AliasMetaSet)[];
-  if (!changed.length) return {};
+  if (!changed.length) return;
   db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => fields[k] ?? null), address);
   audit("alias.meta_set", session, address, { address, fields, session });
-  return fields;
 }
 
 // A session's self-reported facts (#284 S12), shown on its rows.

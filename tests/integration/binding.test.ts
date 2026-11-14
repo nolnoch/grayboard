@@ -431,6 +431,24 @@ test("9: a DM sent mid-unbind is queued for the name's next holder, never consum
   await until(() => contents(third).includes("mid-unbind"));
 }, 30_000);
 
+// #375 (W11): a cancel that crosses an unbind's result names the alias the
+// unbind resolved, not the raw argument.
+test("a cancelled unbind's notice names the resolved alias", async () => {
+  const s = await session("old", { extra: pauseEnv("unbind:before-txn") });
+  await s.call("bind", { name: "fe", create: true });
+  const abort = new AbortController();
+  const unbinding = s.c.callTool({ name: "unbind", arguments: { name: "FE" } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: unbind:before-txn"));
+  abort.abort();
+  await expect(unbinding).rejects.toThrow();
+  release("unbind:before-txn");
+  await until(() => holderOf("fe") === undefined);
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text).slice(1).join(" ");
+  expect(texts).toContain(`unbind("fe") completed after it was cancelled.`);
+  expect(texts).not.toContain(`unbind("FE")`);
+}, 30_000);
+
 test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
   const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
   const abort = new AbortController();
