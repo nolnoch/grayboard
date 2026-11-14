@@ -230,3 +230,28 @@ test("setup upgrades an existing raw local omp adapter in place to the bundle", 
   f.run("setup", "--local", "-y");
   expectLocal(f);
 }, 60_000);
+
+// #95: an enabled push-mode entry with no adapter consumes pushes into a void.
+for (const h of HARNESSES) test(`setup and refresh-adapters warn when ${h}'s grayboard entry is enabled with push on and no adapter is installed`, () => {
+  const f = fixture(h);
+  const warning = `${h}: the grayboard entry in ${f.paths.mcp} is enabled with push on, but no grayboard adapter is installed`;
+  mkdirSync(f.dir, { recursive: true });
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: { command: "bun", args: [cli, "mcp"] } } }));
+  const refresh = f.exec(["refresh-adapters"]);
+  expect(refresh.exitCode, refresh.stderr).toBe(0);
+  expect(refresh.stdout).toContain(warning);
+  // Declining every harness at setup (--no-register) still warns.
+  const setup = f.exec(["setup", "--local", "-y", "--no-register"]);
+  expect(setup.exitCode, setup.stderr).toBe(0);
+  expect(setup.stderr).toContain(warning);
+  // BUS_PUSH=off, a disabled entry, or an installed adapter: no warning.
+  for (const e of [{ env: { BUS_PUSH: "off" } }, { enabled: false }]) {
+    writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: { command: "bun", args: [cli, "mcp"], ...e } } }));
+    expect(f.run("refresh-adapters")).not.toContain(warning);
+  }
+  writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: { command: "bun", args: [cli, "mcp"] } } }));
+  const fixed = f.exec(["setup", "--local", "-y"]);
+  expect(fixed.exitCode, fixed.stderr).toBe(0);
+  expect(fixed.stderr + fixed.stdout).not.toContain(warning);
+  expect(f.entry()).toEqual(localEntry);
+}, 60_000);
