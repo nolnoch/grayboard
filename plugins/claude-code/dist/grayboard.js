@@ -36766,11 +36766,22 @@ class Controller {
     return saved.approval;
   }
   async carried(sessionID) {
+    const back = await this.takeBack(sessionID);
+    return back === "unreadable" ? undefined : back;
+  }
+  async takeBack(sessionID) {
+    let approval;
     try {
-      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined);
+      approval = await this.approvalFor(sessionID);
     } catch {
       return;
+    }
+    const live = this.roots.get(sessionID);
+    const held = live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined;
+    try {
+      return await this.remembered(sessionID, approval) ?? held;
+    } catch {
+      return held ?? "unreadable";
     }
   }
   names(e) {
@@ -37529,10 +37540,11 @@ class RootDelivery {
     const id = this.o.sessionID, carried = this.carrying;
     try {
       this.begun = await this.epoch();
-      const remembered = carried ? undefined : await controller.carried(id);
+      const back = carried ? undefined : await controller.takeBack(id);
+      const remembered = back === "unreadable" ? undefined : back;
       if (carried || remembered)
         this.configuring = undefined;
-      const configured = this.configuring;
+      const configured = back === "unreadable" ? undefined : this.configuring;
       const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
       const status = carried ? await controller.enroll(id, carried, false) : configured ? await controller.enroll(id, [configured], true) : await controller.resume(id);
       if (this.closed)

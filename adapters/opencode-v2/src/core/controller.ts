@@ -322,10 +322,18 @@ export class Controller<E extends Enrollment = Enrollment> {
   // the current approval only), so a hold a new sign-in dropped never
   // carries. Undefined when there are none or they can't be read (signed out).
   async carried(sessionID: string): Promise<string[] | undefined> {
-    try {
-      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined);
-    } catch { return undefined; }
+    const back = await this.takeBack(sessionID);
+    return back === "unreadable" ? undefined : back;
+  }
+  // carried()'s holds for a start (#544 item 1): "unreadable" when the
+  // remembered holds couldn't be read (a storage error) and no live root
+  // answers, so the start binds nothing over them.
+  async takeBack(sessionID: string): Promise<string[] | "unreadable" | undefined> {
+    let approval: E;
+    try { approval = await this.approvalFor(sessionID); } catch { return undefined; }
+    const live = this.roots.get(sessionID);
+    const held = live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined;
+    try { return await this.remembered(sessionID, approval) ?? held; } catch { return held ?? "unreadable"; }
   }
   // A root's holds as its user writes them, for a status line.
   private names(e: E) { return (e.held ?? []).map(display).join(", "); }
