@@ -110,11 +110,16 @@ test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev
     expect(await r.json()).toEqual({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" });
   }
   expect(srv.app.authGate.size).toBe(0);
-  for (let i = 0; i < 3; i++) expect((await devLogin(X)).status).toBe(200);
+  // A remote client (behind the trusted loopback proxy) is refused dev
+  // sign-in (security audit F-04), and each refusal is still charged.
+  for (let i = 0; i < 3; i++) expect((await devLogin(X)).status).toBe(403);
   expect((await devLogin(X)).status).toBe(429);
   // The audit's address is the resolved one, not the raw header.
-  const logins = audit(srv, "auth.login").map((r) => r.detail.ip);
-  expect(logins.slice(-3)).toEqual([X, X, X]);
+  expect(audit(srv, "auth.dev_login_refused").map((r) => r.detail.ip)).toEqual([X, X, X]);
+  expect(audit(srv, "auth.login")).toEqual([]);
+  // A client on the host signs in, its address audited.
+  expect((await devLogin("127.0.0.5")).status).toBe(200);
+  expect(audit(srv, "auth.login").map((r) => r.detail.ip)).toEqual(["127.0.0.5"]);
 
   const off = serve({ devAuth: false, googleClientSecret: "s", publicUrl: "https://grayboard.example.com" });
   const r = (from: string) => fetch(`${off.srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from }, body: "{}" });

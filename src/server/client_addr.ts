@@ -88,6 +88,11 @@ export function clientAddress(peer: string | null | undefined, xff: string | nul
   return addr;
 }
 
+/** A normalised client address on the loopback net (127.0.0.0/8 or ::1). */
+export function isLoopbackIp(ip: string): boolean {
+  return ip === "::1" || (isIP(ip) === 4 && ip.startsWith("127."));
+}
+
 /** The limiter's key for an address: IPv4 as is, IPv6 by its /64, so one
  *  host can't rotate through its prefix. */
 export function rateKey(ip: string): string {
