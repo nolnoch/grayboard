@@ -62,7 +62,7 @@ export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue)
   const user = repo.users.findById(session.user_id);
   if (session.revoked_at !== null || !user || user.disabled_at !== null) return null;
   // Off the request path: last-used is a stamp, not a result the caller waits on.
-  touches.schedule(() => repo.sessions.touch(session.id, Date.now()));
+  touches.schedule(() => repo.sessions.touch(session.id, repo.now()));
   return { user_id: session.user_id, user_email: user!.email, session_id: session.id };
 }
 

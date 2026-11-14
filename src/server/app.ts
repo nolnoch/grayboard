@@ -24,7 +24,7 @@ export type StartOptions = ApplicationOptions & {
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
-  const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota });
+  const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   const application = createApplication(repo, db, {
     humanReach, slackRunning: () => slack?.running ?? false, helloLimit: config.helloLimit, hostedRequestLimit: config.hostedRequestLimit, ...opts,

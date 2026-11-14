@@ -387,6 +387,21 @@ describe("dedup and state answers (in process)", () => {
     expect(q("SELECT ref_id FROM write_receipts")).toEqual([{ ref_id: later.message_id }]);
   });
 
+  // #297: rows, audit and receipts read the one clock, so a replay's first_at is its row's own created_at.
+  test("under a moved clock, first_at, the row's created_at and the audit's at agree", async () => {
+    clock -= 86_400_000;
+    await offline("fe");
+    const be = await session("be");
+    const sentAt = clock;
+    const first = await dm(be, "clocked");
+    clock += 1_000;
+    const again = await dm(be, "clocked");
+    expect(again.replayed!.ref.id).toBe(first.message_id);
+    expect(q("SELECT created_at FROM messages WHERE id = ?", first.message_id)).toEqual([{ created_at: sentAt }]);
+    expect(again.replayed!.first_at).toBe(new Date(sentAt).toISOString());
+    expect(q("SELECT at FROM access_log WHERE action = 'request.replayed'")).toEqual([{ at: clock }]);
+  });
+
   test("delegate's inner send isn't a dm_send: the same body sent plainly afterwards sends", async () => {
     const lx = srv.appSession(you, "lx", { launcher: true });
     await lx.connect();

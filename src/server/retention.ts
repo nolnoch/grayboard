@@ -69,7 +69,7 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
 }
 
 export function startRetentionJobs(repo: Repo, db: CoreDb, config: Config, opts: { firstDelayMs?: number } = {}, onBoardsChanged?: BoardsChanged): () => void {
-  const runNightly = () => void runRetention(repo, db, config, Date.now(), onBoardsChanged);
+  const runNightly = () => void runRetention(repo, db, config, repo.now(), onBoardsChanged);
 
   let nightly: ReturnType<typeof setTimeout> | undefined;
   let daily: ReturnType<typeof setInterval> | undefined;
