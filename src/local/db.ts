@@ -69,9 +69,12 @@ export function insertMessage(
   ids: number[] = [],
   uploader: Uploader = { addresses: [sender], principal: null },
   via: string | null = null,
+  // Throws to refuse the write, run first in its transaction (#557).
+  guard?: () => void,
 ): { id: number; attachments: AttachmentInfo[] } {
   testPause("send:before-txn");
   return db.transaction(() => {
+    guard?.();
     if (addressParts(recipient)?.kind === "id") assertDeliverableId(db, recipient);
     const now = Date.now();
     const { lastInsertRowid } = db
@@ -118,7 +121,7 @@ export function deliveredTo(reader: string, id: number, at = Date.now()): void {
        ON CONFLICT(reader) DO UPDATE SET last_seen_id = excluded.last_seen_id
        WHERE excluded.last_seen_id > cursors.last_seen_id`,
     ).run(reader, id);
-  })();
+  }).immediate();
 }
 
 export function getMessage(id: number): Message | undefined {

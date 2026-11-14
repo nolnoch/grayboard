@@ -114,6 +114,21 @@ describe("session lifecycle", () => {
     expect(existsSync(sessionDir(base, pid))).toBe(false);
   });
 
+  // Claude Code's SessionEnd reasons: clear, resume, logout, prompt_input_exit, other; /resume sends `resume` in a process that lives on (#588).
+  test("hosted: SessionEnd on /resume keeps the dir and its sign-in link; local's resume and hosted's exit remove it", () => {
+    const url = "https://gb.example.com/authorize?client_id=x&state=s";
+    hook("session-start", {}, true);
+    putSignIn(base, pid, url);
+    hook("session-end", { reason: "resume" }, true);
+    hook("session-start", { source: "resume" }, true);
+    expect(JSON.parse(hook("post-tool-use", { tool_use_id: id(1) }, true)!).systemMessage).toBe(`grayboard: open ${url} to sign in`);
+    hook("session-end", { reason: "prompt_input_exit" }, true);
+    expect(existsSync(sessionDir(base, pid))).toBe(false);
+    hook("session-start", {});
+    hook("session-end", { reason: "resume" });
+    expect(existsSync(sessionDir(base, pid))).toBe(false);
+  });
+
   test("SessionStart prunes a dead session's dir and keeps a live one's", () => {
     const dead = join(base, "claude-agents", "999999");
     mkdirSync(dead, { recursive: true });
@@ -309,9 +324,37 @@ describe("sign-in link (#500)", () => {
     dropSignIn(base, pid, url);
     expect(existsSync(file)).toBe(true);
     rmSync(file);
+    // A directory is no flow's link: a flow's removal leaves it; an unconditional one fails and throws.
     mkdirSync(join(file, "x"), { recursive: true });
-    expect(() => dropSignIn(base, pid, url)).toThrow();
+    dropSignIn(base, pid, url);
+    expect(existsSync(file)).toBe(true);
     expect(() => dropSignIn(base, pid)).toThrow();
+  });
+
+  // A same-user writer is outside #229's trust boundary, but a planted file must not stall or redirect the hook (#588).
+  test("a planted symlink, FIFO or oversized file is no link: never followed or waited on, and a flow's removal leaves it", () => {
+    const file = join(sessionDir(base, pid), SIGN_IN);
+    const target = join(base, "elsewhere");
+    writeFileSync(target, JSON.stringify({ url, at: Date.now() }));
+    mkdirSync(sessionDir(base, pid), { recursive: true });
+    symlinkSync(target, file);
+    expect(post()).toBeUndefined();
+    dropSignIn(base, pid, url);
+    expect(existsSync(target)).toBe(true);
+    rmSync(file);
+    execFileSync("mkfifo", [file]);
+    const t0 = Date.now();
+    expect(post()).toBeUndefined();
+    dropSignIn(base, pid, url);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    rmSync(file);
+    writeFileSync(file, JSON.stringify({ url, at: Date.now(), pad: "x".repeat(20_000) }));
+    expect(post()).toBeUndefined();
+    // The next flow's link replaces whatever is there.
+    rmSync(file);
+    execFileSync("mkfifo", [file]);
+    putSignIn(base, pid, url);
+    expect(JSON.parse(post()!).systemMessage).toBe(`grayboard: open ${url} to sign in`);
   });
 
   test("the link file is private: 0600 in a 0700 dir", () => {

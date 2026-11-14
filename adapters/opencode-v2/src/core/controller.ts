@@ -221,7 +221,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     check();
   }
   private wireOptions(e: E): WireOptions {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...(this.port.delivery ? { delivery: this.port.delivery } : {}), ...(this.port.launcher ? { launcher: true as const } : {}), ...(this.port.facts ? { facts: (id: string) => this.port.facts!(id) } : {}) };
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...(this.port.delivery ? { delivery: this.port.delivery } : {}), ...(this.port.launcher ? { launcher: true as const } : {}), ...(this.port.facts ? { facts: (id: string) => this.port.facts!(id) } : {}), ...(this.port.suggested ? { suggested: (id: string) => this.port.suggested!(id) } : {}) };
   }
   private async wire(e: E, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000), beforeRetry?: () => Promise<void>) {
     let current: string | undefined;
@@ -270,6 +270,8 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.save(r, true);
     await this.watch(e);
     this.set(r, "approved", "Root approved; bind a name to receive deliveries");
+    // Past the binds, a failure is prepare's: the server holds every name (#544 item 2).
+    let bound = false;
     try {
       if (names.length) {
         const epoch = r.epoch, signal = new AbortController().signal;
@@ -278,12 +280,13 @@ export class Controller<E extends Enrollment = Enrollment> {
           for (const name of names) await w.call("bind", { name, create, where: this.port.place() });
           await this.guard(r, epoch, signal);
         });
+        bound = true;
       }
       await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
     } catch (error) {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
-      if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+      if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", failureCode(this.expired(error)));
     }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
@@ -322,10 +325,18 @@ export class Controller<E extends Enrollment = Enrollment> {
   // the current approval only), so a hold a new sign-in dropped never
   // carries. Undefined when there are none or they can't be read (signed out).
   async carried(sessionID: string): Promise<string[] | undefined> {
-    try {
-      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined);
-    } catch { return undefined; }
+    const back = await this.takeBack(sessionID);
+    return back === "unreadable" ? undefined : back;
+  }
+  // carried()'s holds for a start (#544 item 1): "unreadable" when the
+  // remembered holds couldn't be read (a storage error) and no live root
+  // answers, so the start binds nothing over them.
+  async takeBack(sessionID: string): Promise<string[] | "unreadable" | undefined> {
+    let approval: E;
+    try { approval = await this.approvalFor(sessionID); } catch { return undefined; }
+    const live = this.roots.get(sessionID);
+    const held = live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined;
+    try { return await this.remembered(sessionID, approval) ?? held; } catch { return held ?? "unreadable"; }
   }
   // A root's holds as its user writes them, for a status line.
   private names(e: E) { return (e.held ?? []).map(display).join(", "); }

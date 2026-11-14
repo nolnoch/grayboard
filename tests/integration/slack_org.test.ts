@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 
 import { FakeSlack } from "./fake_slack.ts";
 import { direct } from "../support/events.ts";
+import { accessAudits } from "../support/audit.ts";
 import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
@@ -26,6 +27,7 @@ const serve = (apiUrl: string) =>
 
 beforeEach(async () => {
   slack = new FakeSlack({ channel: DM, owner: ALICE_SLACK, channelType: "im" });
+  slack.emails.set(ALICE_SLACK, "alice@example.com");
   srv = serve(slack.api);
   await srv.app.slackReady;
 });
@@ -40,7 +42,7 @@ const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
 
 // An agent: a hosted MCP session of `email`'s, bound to `identity`.
-const hosted = (email: string, identity: string) => srv.hosted(email, identity);
+const hosted = (email: string, identity: string | null) => srv.hosted(email, identity);
 
 function tsOf(post: Record<string, any>): string {
   const ts = slack.postTs.get(post);
@@ -138,20 +140,19 @@ test("attachments cross the org bridge both ways for a hosted session, and the a
   const id = got.attachments![0]!.id;
   expect(new TextDecoder().decode(await be.download(id))).toBe("ok\n");
 
-  const audit = (action: string) =>
-    srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY at`).all(action) as { actor: string; target: string; detail: string }[];
+  const audit = (action: string) => accessAudits(srv.app.db, action);
   const sent = await until(() => audit("attachment.sent_to_slack")[0]);
   expect(sent.actor).toBe("alice@example.com");
   const sha256 = createHash("sha256").update(png).digest("hex");
-  expect(JSON.parse(sent.detail)).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
+  expect(sent.detail).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
   // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
-  const bound = audit("attachment.bound").map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+  const bound = audit("attachment.bound").map((r): Record<string, unknown> => ({ target: r.target, ...r.detail }));
   expect(bound).toEqual([
     { target: `attachment:${q.attachments![0]!.id}`, identity: "alice@example.com/be", message_id: q.message_id, recipient: "alice@example.com/human" },
     { target: `attachment:${id}`, identity: "alice@example.com/human", message_id: got.id, recipient: "alice@example.com/be" },
   ]);
   const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
-  expect(JSON.parse(fromSlack.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
+  expect(fromSlack.detail).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
 }, 30_000);
 
 test("a file Slack refuses goes back to its sender, and the text carries the warning", async () => {
@@ -307,6 +308,21 @@ function postId(s: HostedSession, body: string): Promise<number> {
 
 const posted = (text: string) => slack.posts().some((p) => p.markdown_text?.includes(text));
 
+// #332: the org bridge's refusal for an @id: that can't receive reaches the Slack thread, and nothing is posted. A
+// hosted session_end keeps its ID (#451 decision 7), so the undeliverable ID here is one that never existed.
+test("a Slack post mentioning an @id: that can't receive is refused in its thread", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+
+  const top = slack.say("#e2e ping @id:0123456789abz");
+  const reply = await until(() => slack.posts().find((p) => p.thread_ts === top.ts));
+  expect(reply.markdown_text).toBe("⚠️ not posted: no session id:0123456789abz");
+  await until(() => slack.acks.includes(top.envelope));
+  expect((await be.call<ReadResult>("board_read", { board: "e2e" })).posts).toEqual([]);
+}, 30_000);
+
 test("a thread reply reaches a human only as a DM could", async () => {
   const alice = await login("alice@example.com");
   const bob = await login("bob@example.com");
@@ -344,16 +360,20 @@ test("thread replies while unlinked don't flood in at relink", async () => {
   expect(posted("while away")).toBe(false);
 }, 30_000);
 
-test("relinking from another Slack account starts new threads there", async () => {
+test("relinking from another Slack account with the same email starts new threads there, and tells the old one", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   const be = await hosted("alice@example.com", "be");
   const q = await be.call<SendResult>("dm_send", { to: "human", body: "first" });
   await until(() => posted("first"));
 
+  slack.emails.set("U0OTHER", "Alice@Example.com");
   const r = await api(alice, "POST", "/api/slack/link");
   slack.say(`link ${r.body.code}`, { user: "U0OTHER", channel: "D0OTHER" });
   await until(() => slack.posts().find((p) => p.channel === "D0OTHER" && p.markdown_text?.startsWith("Linked to")));
+  // #805 F-05: a link never moves silently.
+  expect(slack.posts().find((p) => p.channel === DM && p.markdown_text?.includes("now linked to another Slack account"))).toBeDefined();
+  expect(accessAudits(srv.app.db, "slack.relinked").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0OTHER", { from: ALICE_SLACK }]]);
   await be.call("dm_send", { to: "human", body: "second", parent_id: q.message_id });
   const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** second"));
   expect(post.channel).toBe("D0OTHER");
@@ -373,6 +393,29 @@ test("disabling a user takes their human offline; enabling brings it back", asyn
   expect(posted("while disabled")).toBe(false);
   expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
   await until(() => posted("while disabled"));
+}, 30_000);
+
+// #533: a relink starts the new human past what queued for the old one, and
+// that skipped mail is never stamped delivered_at: it never reached Slack.
+test("a relink skips mail queued for the earlier link's human without stamping it delivered", async () => {
+  const [alice, , root] = await Promise.all(["alice", "bob", "root"].map((n) => login(`${n}@example.com`)));
+  await link(alice);
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
+  const fe = await hosted("bob@example.com", "fe");
+  expect((await api(root, "POST", "/api/admin/disable-user", { email: "alice@example.com" })).status).toBe(200);
+  const queued = await fe.call<SendResult>("dm_send", { to: "alice@example.com/human", body: "while disabled" });
+  expect(queued.delivered_now).toBe(false);
+  slack.say("unlink");
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from")));
+  expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
+  // Disabling revoked alice's CLI tokens (security audit F-14), so she signs in again.
+  await link(await login("alice@example.com"));
+  expect((await fe.call<SendResult>("dm_send", { to: "alice@example.com/human", body: "after relink" })).delivered_now).toBe(true);
+  await until(() => posted("after relink"));
+  expect(posted("while disabled")).toBe(false);
+  const row = srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(queued.message_id) as { delivered_at: number | null };
+  expect(row.delivered_at).toBeNull();
 }, 30_000);
 
 // The notice the owner used to get on their next WSS hello is gone with it
@@ -398,7 +441,7 @@ test("a bridge that fails at boot records its death for its linked users, via th
 test("a deliberate bridge teardown stays silent (no audit row)", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop();
+  srv.app.slack!.stop();
   expect(srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human")).toBeUndefined();
 });
 
@@ -432,7 +475,7 @@ test("a fatal stop with no linked users writes nothing user-facing", async () =>
 test("a session's human.linked is false while the bridge is down", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "recheck" });
+  srv.app.slack!.stop({ fatal: true, detail: "recheck" });
   const hello = await srv.appSession(alice, "be").connect();
   expect(hello.human?.linked).toBe(false);
   expect(await (await hosted("alice@example.com", "fe")).instructionsNow()).not.toContain('dm_send(to="human")');
@@ -441,7 +484,7 @@ test("a session's human.linked is false while the bridge is down", async () => {
 test("a fatal bridge stop tells the owner on their next bind, once", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
+  srv.app.slack!.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
   await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
 
   const hello = await srv.appSession(alice, "be").connect();
@@ -454,7 +497,7 @@ test("a fatal bridge stop tells the owner on their next bind, once", async () =>
 test("a hosted bind carries the owed bridge notice in its answer, once", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
+  srv.app.slack!.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
   await until(() => !!srv.app.repo.audit.last("bridge.stopped", "alice@example.com/human"));
 
   const first = await hosted("alice@example.com", null);
@@ -470,7 +513,7 @@ test("the bridge notice comes before the claims notice, so a cut takes the claim
   await link(alice);
   const { claim } = await import("../../src/core/claims.ts");
   claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142");
-  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
   const notices = (await srv.appSession(alice, "be").connect()).bind?.notices ?? [];
   const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
   const claims = notices.findIndex((n) => n.includes("ticket:ENG-142"));
@@ -482,7 +525,7 @@ test("the bridge notice comes before the claims notice, so a cut takes the claim
 test("a second fatal within the dedup window records the death but doesn't re-notify", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  srv.app.slack.stop({ fatal: true, detail: "first fatal" });
+  srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
   const first = await srv.appSession(alice, "be").connect();
   expect((first.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"))).toHaveLength(1);
 
@@ -503,3 +546,70 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
   expect(count.n).toBe(2);
 });
+
+// #385 item 23: an attach that fails undoes only its own attempt. Here a second attach for the
+// same user went live while the first was still waiting on attachHuman; the first's failure
+// must not tear the live one down.
+test("an attach that fails after a newer one for the same user went live leaves that one online", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const bridge = srv.app.slack!, application = srv.app.application;
+  const id = srv.app.repo.users.upsertByEmail("alice@example.com", null).id;
+  let fail: ((e: Error) => void) | undefined;
+  const attach = spyOn(application, "attachHuman").mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+  try {
+    const first = bridge.userChanged(id);
+    expect(fail).toBeDefined();
+    await bridge.userChanged(id);
+    fail!(new Error("raced"));
+    await first;
+  } finally { attach.mockRestore(); }
+  const be = await hosted("alice@example.com", "be");
+  const q = await be.call<SendResult>("dm_send", { to: "human", body: "still there?" });
+  expect(q.delivered_now).toBe(true);
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("still there?")));
+}, 30_000);
+
+// #805 F-05: a link code proves the CLI's token, not who sends it. Only the
+// Slack account whose email is the user's may redeem it; a stolen code sent
+// from another account is refused, used up, and leaves the link as it was.
+test("a link code redeemed from a Slack account with another email is refused and used up", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  slack.emails.set("U0MALLORY", "mallory@example.com");
+  const r = await api(alice, "POST", "/api/slack/link");
+  const seen = slack.posts().length;
+  slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
+  await until(() => slack.posts().slice(seen).find((p) => p.channel === "D0MALLORY" && p.markdown_text?.includes("email isn't `alice@example.com`")));
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0MALLORY", { reason: "email_mismatch" }]]);
+
+  // Used up: the right account can't redeem it after the refusal.
+  slack.emails.set("U0MALLORY", "alice@example.com");
+  const again = slack.posts().length;
+  slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
+  await until(() => slack.posts().slice(again).find((p) => p.markdown_text?.includes("isn't valid or has expired")));
+}, 30_000);
+
+test("without the email scope, a link is refused with what the admin must add", async () => {
+  const alice = await login("alice@example.com");
+  slack.emailScope = false;
+  const r = await api(alice, "POST", "/api/slack/link");
+  slack.say(`link ${r.body.code}`);
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("users:read.email")));
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
+}, 30_000);
+
+// An unreachable Slack isn't a missing scope: the user is told to retry, not
+// to ask the admin, and the refusal is audited.
+test("when Slack can't be reached to check the email, the link is refused with a retry", async () => {
+  const alice = await login("alice@example.com");
+  slack.usersInfoDown = true;
+  const r = await api(alice, "POST", "/api/slack/link");
+  slack.say(`link ${r.body.code}`);
+  const reply = await until(() => slack.posts().find((p) => p.markdown_text?.includes("couldn't reach Slack")));
+  expect(reply.markdown_text).not.toContain("users:read.email");
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
+}, 30_000);

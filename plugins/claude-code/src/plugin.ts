@@ -38,7 +38,8 @@ import { dropSignIn, MISSING_TEXT, putSignIn, readFacts, sessionDir, takeEnded, 
 import { SIGN_IN_FLOW_MS } from "../../../src/shared/signin.ts";
 import { testPauseAsync } from "../../../src/shared/testpause.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
-import { configuredIdentity, describeLocation } from "../../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation, sessionIdentity } from "../../../src/shared/identity.ts";
+import { validSourceId } from "../../../src/shared/session_meta.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
 
 export const HARNESS = "Claude Code";
@@ -104,6 +105,9 @@ export function createPlugin(o: PluginOptions): Plugin {
   const place = describeLocation(o.cwd) ?? HARNESS;
   // An explicit BUS_IDENTITY: this session binds it at its first start (#443).
   const configured = configuredIdentity(o.env, o.cwd);
+  // The name local mode would suggest here (#522): the pin or the repo's, with the worktree suffix. None when the
+  // directory gives no name (defaultIdentity throws).
+  const suggestion = (() => { try { return sessionIdentity(o.env, o.cwd); } catch { return undefined; } })();
   // Attachments come from and go to the session's directory and the project's.
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...(project ? attachRoots({}, project) : [])])];
@@ -137,7 +141,7 @@ export function createPlugin(o: PluginOptions): Plugin {
     // returns. Where it can, Claude Code also asks the user to open it (MCP
     // URL elicitation); a decline ends the flow and the next call starts one.
     // A session waiting on another process's flow gets that flow's URL too.
-    present: async url => {
+    present: async (url, answered) => {
       const flow = signins.flow;
       await testPauseAsync("claude-sign-in-present", o.env);
       try { putSignIn(config.dataDir, o.claude.pid, url); }
@@ -146,16 +150,20 @@ export function createPlugin(o: PluginOptions): Plugin {
       say(`open ${url} to sign in to grayboard`);
       // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation): the link alone.
       if (!server!.getClientCapabilities()?.elicitation?.url) return;
+      // Login calls present only inside login(), which begin()'s signIns.start
+      // runs after setting the flow, so there always is one (#506).
+      if (!flow) return;
       for (let sent = 0; ; sent++) {
         const prompt: Prompt = { id: randomUUID(), withdraw: new AbortController() };
-        if (flow) { prompts.get(flow)?.withdraw.abort(); prompts.set(flow, prompt); }
+        prompts.get(flow)?.withdraw.abort();
+        prompts.set(flow, prompt);
         say(`sign-in prompt sent (elicitation ${prompt.id})`);
         const start = Date.now();
         let result;
         try {
           result = await server!.elicitInput(
             { mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
-            { timeout: SIGN_IN_FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
+            { timeout: SIGN_IN_FLOW_MS, signal: AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) },
           );
         } catch (error) {
           // Withdrawn: the browser answered first, and the flow went on without it.
@@ -168,12 +176,16 @@ export function createPlugin(o: PluginOptions): Plugin {
         // Only a decline ends the flow: Esc (cancel) may just free the keyboard
         // from a prompt Claude Code keeps up while the user finishes the link.
         if (result.action === "decline") throw new LoginFailed("sign-in declined");
-        if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow) return;
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS) return;
         if (sent >= RESENDS) { say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`); return; }
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
+        await testPauseAsync("claude-sign-in-resend", o.env);
         // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
         if (signins.flow !== flow || flow.abort.signal.aborted) { say("sign-in ended before the prompt was sent again"); return; }
+        // The browser answered and the code exchange is still running: the
+        // prompt would name a used callback (#506).
+        if (answered?.aborted) { say("the browser answered before the prompt was sent again"); return; }
         // A later URL's prompt replaced this one.
         if (prompts.get(flow) !== prompt) return;
       }
@@ -204,6 +216,8 @@ export function createPlugin(o: PluginOptions): Plugin {
     // The root's model and effort as the hooks last wrote them (#545), read per
     // request; a child session reports none (no hook names a subagent's model).
     facts: sessionID => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined,
+    // The root's suggested name, local mode's (#522); a child's is the server's to ignore, so it sends none.
+    ...(suggestion ? { suggested: (sessionID: string) => sessionID === config.id ? suggestion : undefined } : {}),
   });
 
   // Resolves at `initialized`; rejects once `signal` (the run loop's) aborts.
@@ -257,9 +271,13 @@ export function createPlugin(o: PluginOptions): Plugin {
           catch (error) { say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60_000} minutes after it was written`); }
         }
       }
+    },
+    // Ends without `ended` when the store was already signed in (#592):
+    // another process's grant, which delivery restarts under now (#596).
+    current: async () => {
+      say(`sign-in not needed (${origin}): already signed in`);
+      await root.credentialChanged();
     } });
-    // Ends without `ended` when the store was already signed in (#592).
-    void flow.done.then(() => { if (flow.outcome === "current") say(`sign-in not needed (${origin}): already signed in`); }, () => {});
     return flow;
   };
   // What a signed-out call's result says about its sign-in (hosted-core
@@ -314,7 +332,10 @@ export function createPlugin(o: PluginOptions): Plugin {
   let endWatch: FSWatcher | undefined;
   const drainEnded = () => {
     if ("error" in config || closed) return;
-    for (const agent of takeEnded(config.dataDir, o.claude.pid)) void root?.endChild(childOf(agent));
+    for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      // A child id over the server's limit was refused at its call, so it has no session to end.
+      if (validSourceId(childOf(agent))) void root?.endChild(childOf(agent));
+    }
   };
   const watchEnded = () => {
     if (endWatch || "error" in config || closed) return;
@@ -339,9 +360,16 @@ export function createPlugin(o: PluginOptions): Plugin {
       return failure(`grayboard couldn't tell which Claude Code agent made this call (${cause}), so it didn't run. Restart Claude Code so the grayboard plugin's hooks run; hooks turned off (disableAllHooks, or managed settings that allow only managed hooks) stop every grayboard call.`);
     }
     if (taken.agent === null) return root!.call(name, args, before);
+    // The server takes a session id of at most 1024 characters (#555 item 15);
+    // a long session id plus a long agent id can pass that, so say why here.
+    const child = childOf(taken.agent), length = child.length;
+    if (!validSourceId(child)) {
+      say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
+      return failure(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
+    }
     watchEnded();
     drainEnded();
-    return root!.call(name, args, before, { child: childOf(taken.agent) });
+    return root!.call(name, args, before, { child });
   };
 
   const tools = (): NativeTool[] => root?.tools() ?? hostTools(snapshotTools());
@@ -355,6 +383,10 @@ export function createPlugin(o: PluginOptions): Plugin {
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() as ListedTool[] }));
     s.setRequestHandler(CallToolRequestSchema, async req => await call(req.params.name, req.params.arguments ?? {}, req.params._meta) as ServerResult);
     s.oninitialized = () => {
+      // Spends JSON-RPC request id 0 (the SDK numbers requests synchronously):
+      // the SDK's cancel handler, which Claude Code 2.1.316 bundles, ignores a
+      // cancel of id 0, so a sign-in prompt given it could never be withdrawn (#713).
+      void s.ping().catch(() => {});
       initialized = true;
       markInitialized();
       // A session without a grant offers the sign-in at once.

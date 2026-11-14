@@ -243,7 +243,7 @@ export class RootDelivery {
     const c = this.client.options, id = this.o.sessionID, wire = this.client.wireOptions("push");
     return {
       harness: c.harness, resumeHint: c.resumeHint, loginAction: c.loginAction, sessionKey: wire.sessionKey,
-      client: wire.client, delivery: wire.delivery!, ...(wire.launcher ? { launcher: true as const } : {}), ...(wire.facts ? { facts: wire.facts } : {}),
+      client: wire.client, delivery: wire.delivery!, ...(wire.launcher ? { launcher: true as const } : {}), ...(wire.facts ? { facts: wire.facts } : {}), ...(wire.suggested ? { suggested: wire.suggested } : {}),
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
       // This root, or a child a host call passed (Claude Code's subagents, #551);
@@ -281,12 +281,14 @@ export class RootDelivery {
       this.begun = await this.epoch();
       // Taking back what this session held, or a /new's carried names, comes
       // before BUS_IDENTITY, as a local restart's names do (#443).
-      const remembered = carried ? undefined : await controller.carried(id);
+      const back = carried ? undefined : await controller.takeBack(id);
+      const remembered = back === "unreadable" ? undefined : back;
       // Only a session with nothing to take back binds it, and only until it
       // first lands: a later restart (a sign-in, an unpause) after the agent
-      // unbound never brings it back.
+      // unbound never brings it back. Remembered holds that couldn't be read
+      // may exist, so this start resumes instead and a later one decides.
       if (carried || remembered) this.configuring = undefined;
-      const configured = this.configuring;
+      const configured = back === "unreadable" ? undefined : this.configuring;
       const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
       const status = carried ? await controller.enroll(id, carried, false)
         : configured ? await controller.enroll(id, [configured], true)
@@ -299,14 +301,22 @@ export class RootDelivery {
       // enroll's and resume's failures record operation "enroll"; a resume
       // names its root before the rebind, so the name alone proves nothing.
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      // An enroll whose binds landed but whose prepare failed records "prepare" with the
+      // failure's code (#544 item 2; prepare's own progress records carry none): the
+      // server holds what it asked for, though delivery didn't start.
+      const landed = (carried || configured) && root?.operation === "prepare" && root.code !== undefined ? expected : undefined;
       if (carried && bound?.length && this.carrying === carried) this.carrying = undefined;
       // Bound, or refused by the server (held, the user's handle): tried for
       // good. Unreachable or signed out: the next start tries again.
       // The configured name is bare; holds are qualified (`<email>/<name>`).
-      const holds = (address: string) => !!bound?.some(b => b === address || b.endsWith(`/${address}`));
+      const holds = (address: string) => !![...bound ?? [], ...landed ?? []].some(b => b === address || b.endsWith(`/${address}`));
       if (configured && (holds(configured) || REFUSED.has(root?.code ?? ""))) this.configuring = undefined;
       const missing = (expected ?? []).filter(address => !holds(address));
-      if (missing.length && root?.state !== "paused") {
+      if (landed && root?.state !== "paused") {
+        const text = `this session is bound as ${landed.join(", ")}, but delivery couldn't start (${root?.message ?? status.message})`;
+        this.notices.set("start", text);
+        this.log(text, "warning");
+      } else if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
         const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}`
           : carried ?`this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}`

@@ -10,6 +10,7 @@ import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -67,22 +68,12 @@ class Provider implements OAuthClientProvider {
   saveDiscoveryState(discovery: OAuthDiscoveryState) { this.discovery = discovery; }
   discoveryState() { return this.discovery; }
 }
-class Browser {
-  cookies = new Map<string, string>();
-  async request(url: string, init: RequestInit = {}) {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(mapped(url), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [key, value] = cookie.split(";")[0]!.split("=");
-      this.cookies.set(key!, value!);
-      expect(cookie).toContain("HttpOnly");
-      expect(cookie).toContain("Secure");
-      expect(cookie).toContain("Path=/hosted/oauth");
-    }
-    return res;
-  }
-}
+// Every cookie the OAuth pages set is HttpOnly, Secure and scoped to them.
+const checkCookie = (raw: string) => {
+  expect(raw).toContain("HttpOnly");
+  expect(raw).toContain("Secure");
+  expect(raw).toContain("Path=/hosted/oauth");
+};
 
 test("AS metadata is mounted on the single production listener with canonical resource and exact issuer", async () => {
   const challenge = await fetch(base + "/hosted/mcp", { headers: { "X-Forwarded-Host": "evil.example.com", "X-Real-IP": "192.0.2.1" } });
@@ -106,7 +97,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   expect(provider.authorization!.searchParams.get("code_challenge_method")).toBe("S256");
   expect(provider.authorization!.searchParams.get("state")).toBe(provider.stateValue);
   expect(provider.authorization!.searchParams.get("scope")).toBe("grayboard:delivery grayboard:tools");
-  const browser = new Browser();
+  const browser = new Browser({ rewrite: mapped, onSetCookie: checkCookie });
   const begin = await browser.request(provider.authorization!.href);
   expect(begin.status).toBe(303);
   const google = new URL(begin.headers.get("Location")!);
@@ -117,9 +108,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth co
   expect(page.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
   expect(page.headers.get("Cache-Control")).toContain("no-store");
   const html = await page.text();
-  const request = /name="request" value="([^"]+)"/.exec(html)![1]!;
-  const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1]!;
-  const approved = await browser.request(issuer + "/oauth/consent", { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ request, csrf, decision: "approve" }) });
+  const approved = await submitConsent(browser, issuer + "/oauth/consent", consentForm(html), "approve", "https://grayboard.example.com");
   expect(approved.status).toBe(303);
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("state")).toBe(provider.stateValue);

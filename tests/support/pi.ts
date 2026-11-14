@@ -775,7 +775,7 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
 // adapter's next write fails with EPIPE, and it waits for that process to
 // exit before the replacement starts, so the replacement takes the name back
 // and no stale delivery owner remains (#599, omp's #580).
-export function piLocalStopsReadingScenario(dir: string): Promise<void> {
+export function piLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?: boolean } = {}): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
@@ -803,7 +803,7 @@ export function piLocalStopsReadingScenario(dir: string): Promise<void> {
         entry: {
           command: process.execPath,
           args: [join(ROOT, "tests/support/stops_reading.ts"), process.execPath, CLI, "mcp", "--mode", "local"],
-          env: { BUS_PUSH: "off", BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING },
+          env: { BUS_PUSH: "off", BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING, ...(opts.ignoreSigterm ? { BUS_TEST_IGNORE_SIGTERM: "1" } : {}) },
         },
       });
       const session = pi;
@@ -830,6 +830,13 @@ export function piLocalStopsReadingScenario(dir: string): Promise<void> {
       await until(() => { const h = holder(); return h !== undefined && h !== first; }, 15_000, "pi-599 held by the replacement");
       const replacement = grayboards(session.pid);
       expect(replacement).toHaveLength(2);
+      if (opts.ignoreSigterm) {
+        // Only the SIGKILL ended the relay, and the replacement waited for it.
+        const sigterm = Number(readFileSync(join(dir, "stopped.sigterm"), "utf8"));
+        const started = Number(readFileSync(join(dir, "stopped.started"), "utf8"));
+        expect(started - sigterm).toBeGreaterThanOrEqual(1_400);
+        await until(() => session.notices().some((n) => n.includes("sent SIGKILL")), 5_000, "the SIGKILL reported");
+      }
       expect(db.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(first)?.ended_at).not.toBeNull();
 
       await session.command({ type: "prompt", message: "who" });
@@ -842,7 +849,7 @@ export function piLocalStopsReadingScenario(dir: string): Promise<void> {
       await until(() => !replacement.some(alive), 5_000, "the replacement ended with pi");
     } finally {
       for (const p of seen) {
-        try { process.kill(p, "SIGKILL"); } catch {}
+        if (alive(p)) try { process.kill(p, "SIGKILL"); } catch {}
       }
       await stopAll(procs);
       model.stop();

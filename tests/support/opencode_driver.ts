@@ -43,13 +43,13 @@ ChildProcess.prototype.emit = function (event: string | symbol, ...args: unknown
     children.push(this);
     spawnOwners.push(processDescendants(process.pid).filter(p => children.some(c => c.pid === p.pid)).map(p => p.pid));
     const write = this.stdin!.write;
-    this.stdin!.write = function (...args: Parameters<typeof write>) {
+    this.stdin!.write = function (this: unknown, ...args: Parameters<typeof write>) {
       for (const line of String(args[0]).split("\n").filter(Boolean)) {
         const request = RequestSchema.parse(JSON.parse(line));
         if (request.id !== undefined) rpcRequests.push(request);
       }
       return write.apply(this, args);
-    };
+    } as typeof write;
     const stdout = this.stdout!;
     const streamEmit = stdout.emit;
     let buffered = "";
@@ -168,7 +168,7 @@ async function run(msg: any): Promise<unknown> {
       return;
     }
     case "releasePrompt": {
-      if (promptGate?.key !== msg.key) throw new Error("no held prompt admission");
+      if (!promptGate || promptGate.key !== msg.key) throw new Error("no held prompt admission");
       const gate = promptGate;
       promptGate = undefined;
       gate.resolve();

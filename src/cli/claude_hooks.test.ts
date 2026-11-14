@@ -74,17 +74,18 @@ test("installed hook commands quote a CLI path the shell would split", () => {
 
 test("install replaces its own hooks, keeps everyone else's, and leaves an unchanged file alone", () => {
   const path = tmpSettings();
-  // A pre-#551 install: the title hook alone, at an old path.
-  writeFileSync(path, JSON.stringify({ model: "x", hooks: { SessionStart: [other, { matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/old/grayboard session-start", timeout: 10 }] }], PreToolUse: [otherTool], Stop: [] } }));
+  // A pre-#551 install: the title hook alone, at an old path; and an older release's
+  // SubagentStop, which local mode no longer installs (#555 item 12).
+  writeFileSync(path, JSON.stringify({ model: "x", hooks: { SessionStart: [other, { matcher: "startup|resume|fork", hooks: [{ type: "command", command: "/old/grayboard session-start", timeout: 10 }] }], PreToolUse: [otherTool], Stop: [], SubagentStop: [{ hooks: [{ type: "command", command: "/old/grayboard hook claude subagent-stop", timeout: 10 }] }] } }));
   expect(installClaudeHooks(BIN, path)).toBe(true);
   const ours = claudeHooks(BIN);
+  expect(ours).not.toHaveProperty("SubagentStop");
   const cfg = JSON.parse(readFileSync(path, "utf8"));
   expect(cfg.model).toBe("x");
   expect(cfg.hooks).toEqual({
     SessionStart: [other, ...ours.SessionStart!],
     PreToolUse: [otherTool, ...ours.PreToolUse!],
     Stop: [],
-    SubagentStop: ours.SubagentStop,
     SessionEnd: ours.SessionEnd,
   });
   expect(installClaudeHooks(BIN, path)).toBe(false);
@@ -104,6 +105,20 @@ test("remove drops only its own hooks and reports whether they were there", () =
   installClaudeHooks(["grayboard"], path);
   expect(removeClaudeHooks(path)).toBe(true);
   expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ model: "x" });
+});
+
+test("a from-source CLI whose path doesn't say grayboard: install replaces, remove removes, and the record hook counts as installed (#555)", () => {
+  const path = tmpSettings();
+  const src = ["/usr/local/bin/bun", "/home/me/dev/bus/src/cli/main.ts"];
+  installClaudeHooks(src, path);
+  expect(installClaudeHooks(src, path)).toBe(false);
+  // A move of the checkout replaces the old entries rather than adding to them.
+  installClaudeHooks(["/usr/local/bin/bun", "/srv/bus2/src/cli/main.ts"], path);
+  const hooks = JSON.parse(readFileSync(path, "utf8")).hooks;
+  for (const event of Object.keys(claudeHooks(src))) expect(hooks[event]).toHaveLength(1);
+  expect(recordHookInstalled(path)).toBe(true);
+  expect(removeClaudeHooks(path)).toBe(true);
+  expect(JSON.parse(readFileSync(path, "utf8")).hooks).toBeUndefined();
 });
 
 test("install creates the settings file when there is none", () => {

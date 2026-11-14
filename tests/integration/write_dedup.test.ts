@@ -99,7 +99,7 @@ describe("a lost answer, then the same call from the same session", () => {
     expect(srv.app.db.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
     expect(srv.app.db.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
     const events = await pushedBefore(lane, () => again.send("bob@example.com/lane", "sentinel 2"), "sentinel 2");
-    expect(events.filter(board((i) => i.post?.id === id)).length).toBe(1);
+    expect(events.filter(board((i) => i.kind === "push" && i.post.id === id)).length).toBe(1);
   });
 
   test("delegate: one pending DM, one delegation.requested, one launcher push", async () => {
@@ -225,7 +225,7 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
       expect(retry.note).toStartWith(`already posted to #work at ${retry.replayed!.first_at} as post ${id}; this repeat was not posted.`);
       expect(d.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
       expect(d.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
-      await lane.next(board((i) => i.post?.id === id), 5000);
+      await lane.next(board((i) => i.kind === "push" && i.post.id === id), 5000);
     } finally {
       d.close();
     }
@@ -293,7 +293,7 @@ describe("dedup and state answers (in process)", () => {
     const row = q("SELECT at, actor, target, detail FROM access_log WHERE action = 'message.retracted'") as { at: number; actor: string; target: string; detail: string }[];
     expect(row.length).toBe(1);
     expect(row[0]).toMatchObject({ actor: "you@example.com", target: `message:${first.message_id}` });
-    expect(JSON.parse(row[0]!.detail)).toEqual({ message_id: first.message_id, sender: "you@example.com/be", recipient: "you@example.com/fe" });
+    expect(JSON.parse(row[0]!.detail)).toEqual({ message_id: first.message_id, sender: "you@example.com/be", recipient: "you@example.com/fe", session: be.id });
     expect(await be.retract(first.message_id)).toMatchObject({ note: `already retracted by you at ${new Date(row[0]!.at).toISOString()}` });
     // Another sender's repeat is still refused.
     const sim = await session("sim");
@@ -301,6 +301,8 @@ describe("dedup and state answers (in process)", () => {
     const again = await dm(be, "oops");
     expect(again.replayed).toBeUndefined();
     expect(again.message_id).not.toBe(first.message_id);
+    const stale = q("SELECT detail FROM access_log WHERE action = 'request.receipt_stale'") as { detail: string }[];
+    expect(stale.map((r) => JSON.parse(r.detail))).toEqual([expect.objectContaining({ tool: "dm_send", ref_kind: "message", ref_id: first.message_id, session: be.id })]);
   });
 
   test("resolved spellings and re-uploaded files collide; other files and another session don't", async () => {
@@ -312,7 +314,7 @@ describe("dedup and state answers (in process)", () => {
     expect(((await be.send("FE", "hello")) as Sent).replayed!.ref.id).toBe(first.message_id);
 
     const up = async (bytes: string) => {
-      const r = await srv.upload(you, "be", "notes.md", bytes);
+      const r = await srv.uploadAs(you, "be", "notes.md", bytes);
       expect(r.status).toBe(201);
       return r.body.id as number;
     };
@@ -344,7 +346,7 @@ describe("dedup and state answers (in process)", () => {
   test("board_post: a replay releases the retry's upload; a non-string body is a bad request", async () => {
     const be = await session("be");
     await be.call("board_create", { name: "e2e", purpose: "files" });
-    const up = async () => (await srv.upload(you, "be", "notes.md", "v1")).body.id as number;
+    const up = async () => (await srv.uploadAs(you, "be", "notes.md", "v1")).body.id as number;
     type Post = { post_id: number } & Replayed;
     const first = await be.call<Post>("board_post", { board: "e2e", body: "see file", attachment_ids: [await up()] });
     const retryUpload = await up();
@@ -385,6 +387,21 @@ describe("dedup and state answers (in process)", () => {
     expect(q("SELECT ref_id FROM write_receipts")).toEqual([{ ref_id: later.message_id }]);
   });
 
+  // #297: rows, audit and receipts read the one clock, so a replay's first_at is its row's own created_at.
+  test("under a moved clock, first_at, the row's created_at and the audit's at agree", async () => {
+    clock -= 86_400_000;
+    await offline("fe");
+    const be = await session("be");
+    const sentAt = clock;
+    const first = await dm(be, "clocked");
+    clock += 1_000;
+    const again = await dm(be, "clocked");
+    expect(again.replayed!.ref.id).toBe(first.message_id);
+    expect(q("SELECT created_at FROM messages WHERE id = ?", first.message_id)).toEqual([{ created_at: sentAt }]);
+    expect(again.replayed!.first_at).toBe(new Date(sentAt).toISOString());
+    expect(q("SELECT at FROM access_log WHERE action = 'request.replayed'")).toEqual([{ at: clock }]);
+  });
+
   test("delegate's inner send isn't a dm_send: the same body sent plainly afterwards sends", async () => {
     const lx = srv.appSession(you, "lx", { launcher: true });
     await lx.connect();
@@ -399,6 +416,35 @@ describe("dedup and state answers (in process)", () => {
     await expect(be.delegate({ persona: "a researcher", task: "t", to: "sim" })).rejects.toMatchObject({ message: expect.stringContaining("isn't a launcher") });
     expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.refused'")).toBe(1);
     expect(n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'")).toBe(1);
+  });
+
+  // #302 (#254 AC3): delegate takes resend like the other append writes, in
+  // process and over hosted MCP: a second pending DM, a second
+  // delegation.requested, and a request.resent row.
+  test("delegate with resend: true delegates again, in process and over hosted MCP", async () => {
+    const lx = srv.appSession(you, "lx", { launcher: true });
+    await lx.connect();
+    const be = await session("be");
+    const req = { persona: "a researcher", task: "survey", to: "lx" };
+    const first = await be.delegate(req);
+    const forced = (await be.delegate({ ...req, resend: true })) as typeof first & Replayed;
+    expect(forced.replayed).toBeUndefined();
+    expect(forced.message_id).not.toBe(first.message_id);
+
+    const hosted = await srv.hosted("you@example.com", "qa");
+    const h1 = await hosted.call<typeof first & Replayed>("delegate", req);
+    expect((await hosted.call<typeof first & Replayed>("delegate", req)).replayed!.ref.id).toBe(h1.message_id);
+    const h2 = await hosted.call<typeof first & Replayed>("delegate", { ...req, resend: true });
+    expect(h2.replayed).toBeUndefined();
+    expect(h2.message_id).not.toBe(h1.message_id);
+
+    expect(n("SELECT COUNT(*) AS n FROM messages WHERE recipient = 'you@example.com/lx' AND pending = 1")).toBe(4);
+    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested'")).toBe(4);
+    const resent = (q("SELECT detail FROM access_log WHERE action = 'request.resent'") as { detail: string }[]).map((r) => JSON.parse(r.detail));
+    expect(resent).toEqual([
+      expect.objectContaining({ tool: "delegate", ref_kind: "message", ref_id: forced.message_id }),
+      expect.objectContaining({ tool: "delegate", ref_kind: "message", ref_id: h2.message_id }),
+    ]);
   });
 
   test("claim_release and board_create repeats answer from state", async () => {
@@ -422,7 +468,7 @@ describe("dedup and state answers (in process)", () => {
     const user = srv.app.repo.users.findByEmail("you@example.com")!;
     const { session } = await srv.app.application.attachHuman(
       { user_id: user.id, user_email: user.email, session_id: 0 },
-      { deliver() {}, probe: async () => true, closed() {} },
+      { deliver() {}, closed() {} },
     );
     const a = srv.app.application.send(session, "you@example.com/be", "yes");
     const b = srv.app.application.send(session, "you@example.com/be", "yes") as SendResult & Replayed;

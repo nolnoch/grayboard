@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, fchmodSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants, fchmodSync, lstatSync, openSync, readdirSync, renameSync, rmSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { LOOPBACK } from "../shared/endpoint.ts";
 import { sha256Hex } from "../shared/hash.ts";
@@ -33,18 +33,57 @@ export function releasesOrigin(raw = process.env.GRAYBOARD_RELEASES_URL): string
   return origin;
 }
 
+// What a release origin may send, so a broken or hostile one is refused by
+// name instead of exhausting memory (#316). The binary's own bound is the
+// API's size for it, which may itself be at most MAX_BINARY.
+export const MAX_API = 4 * 1024 * 1024;
+export const MAX_SUMS = 64 * 1024;
+export const MAX_BINARY = 512 * 1024 * 1024;
+
 // A fetch and its body, under one deadline, whose failure names the URL, so a
-// stale or wrong origin, or a stalled one, shows.
-async function get(url: string, what: string, ms: number, init?: RequestInit): Promise<Uint8Array<ArrayBuffer>> {
-  let status: number;
+// stale or wrong origin, or a stalled one, shows. A body over `max` bytes is
+// refused, by its Content-Length when it states one, else as it streams.
+export async function get(url: string, what: string, ms: number, max: number, init?: RequestInit): Promise<Uint8Array<ArrayBuffer>> {
+  let got: { status: number } | { body: Uint8Array<ArrayBuffer> | null };
   try {
     const res = await fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
-    if (res.ok) return new Uint8Array(await res.arrayBuffer());
-    status = res.status;
+    got = res.ok ? { body: await capped(res, max) } : { status: res.status };
   } catch (e) {
     throw new Error(`couldn't fetch ${what} from ${url}: ${describeFetchError(e, ms)}`);
   }
-  throw new Error(`couldn't fetch ${what} from ${url} (HTTP ${status})`);
+  if ("status" in got) throw new Error(`couldn't fetch ${what} from ${url} (HTTP ${got.status})`);
+  if (got.body === null) throw new Error(`${what} from ${url} is larger than ${max} bytes; not updating`);
+  return got.body;
+}
+
+/** The body, or null once it's over `max` bytes (stated or streamed), having stopped reading. */
+async function capped(res: Response, max: number): Promise<Uint8Array<ArrayBuffer> | null> {
+  if (Number(res.headers.get("content-length") ?? NaN) > max) {
+    await res.body?.cancel();
+    return null;
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (res.body) {
+    const reader = res.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
 }
 
 /** A release version, `X.Y.Z[-pre]` with an optional leading `v`: a release tag or a `package.json` version. */
@@ -85,7 +124,7 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
   const mirror = releasesOrigin();
   const api = mirror ?? "https://api.github.com";
   const downloads = mirror ?? "https://github.com";
-  const res = await get(`${api}/repos/${REPO}/releases/latest`, "the latest release", HTTP_TIMEOUT_MS, {
+  const res = await get(`${api}/repos/${REPO}/releases/latest`, "the latest release", HTTP_TIMEOUT_MS, MAX_API, {
     headers: { accept: "application/vnd.github+json" },
   });
   const release = JSON.parse(new TextDecoder().decode(res)) as {
@@ -104,8 +143,8 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
   try {
     // A release without either file is refused like a bad signature.
     const [sums, sig] = await Promise.all([
-      get(`${base}/${SUMS}`, `the ${tag} ${SUMS}`, HTTP_TIMEOUT_MS),
-      get(`${base}/${SIG}`, `the ${tag} ${SIG}`, HTTP_TIMEOUT_MS),
+      get(`${base}/${SUMS}`, `the ${tag} ${SUMS}`, HTTP_TIMEOUT_MS, MAX_SUMS),
+      get(`${base}/${SIG}`, `the ${tag} ${SIG}`, HTTP_TIMEOUT_MS, MAX_SUMS),
     ]);
     signed = await verifySums(tag, sums, new TextDecoder().decode(sig));
   } catch (e) {
@@ -117,7 +156,8 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
   if (!listed) throw new Error(`the ${tag} ${SUMS} lists no ${asset}; not updating`);
   const meta = release.assets?.find((a) => a.name === asset);
   if (typeof meta?.size !== "number") throw new Error(`the release API lists no size for ${asset}; not updating`);
-  const body = await get(`${base}/${asset}`, `the ${tag} binary for ${TARGET}`, transferTimeoutMs(meta.size));
+  if (meta.size > MAX_BINARY) throw new Error(`the release API lists ${asset} at ${meta.size} bytes, over ${MAX_BINARY}; not updating`);
+  const body = await get(`${base}/${asset}`, `the ${tag} binary for ${TARGET}`, transferTimeoutMs(meta.size), meta.size);
 
   // Verified before it's ever written, let alone run.
   const got = sha256Hex(body);
@@ -132,6 +172,7 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
 
   // Beside the binary so the rename stays on one filesystem; a fresh random
   // name opened exclusively, so nothing planted there is written through.
+  for (const path of sweepStaleTemps(dirname(self))) console.error(`[grayboard] removed ${path}, left by an interrupted update`);
   const tmp = join(dirname(self), `.grayboard-${tag}-${randomBytes(8).toString("hex")}`);
   try {
     const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o755);
@@ -162,4 +203,34 @@ export async function selfUpdate(current: string): Promise<UpdateResult> {
     throw e;
   }
   return { updated: true, origin: downloads, tag, keyId: signed.keyId };
+}
+
+// An update's temp binary: `.grayboard-<tag>-<16 hex>` (above).
+const UPDATE_TEMP = /^\.grayboard-v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?-[0-9a-f]{16}$/;
+export const STALE_TEMP_MS = 60 * 60 * 1000;
+
+/**
+ * Removes update temp binaries in `dir` that a killed update left (#317): only
+ * regular files of this user, named as update names them, untouched for an
+ * hour, so an update running alongside keeps its own. Returns what it removed;
+ * a file it can't inspect or remove is left.
+ */
+export function sweepStaleTemps(dir: string, now = Date.now()): string[] {
+  const removed: string[] = [];
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return removed; }
+  const uid = process.getuid?.();
+  for (const name of names) {
+    if (!UPDATE_TEMP.test(name)) continue;
+    const path = join(dir, name);
+    try {
+      const st = lstatSync(path);
+      if (!st.isFile() || (uid !== undefined && st.uid !== uid) || now - st.mtimeMs < STALE_TEMP_MS) continue;
+      rmSync(path);
+      removed.push(path);
+    } catch {
+      // Gone already, or not ours to remove.
+    }
+  }
+  return removed;
 }

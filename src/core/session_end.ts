@@ -44,13 +44,15 @@ const NOT_ENDED: EndedSession = { ended: false, held: [], wake: [] };
  * poke `wake` and sweep the freed upload bytes after it commits. `why` details the release events (a reap names the dead pid).
  * `legacyNames`: a name a 1.x process holds through its bindings row.
  * `audit`: where the id.ended row goes (the server's access_log); audit_log when absent.
+ * `by`: who ended it (local: `by_pid`), on its row and its children's; `evidence`:
+ * what an ender saw (a reap's dead row and probe), on its row only (#330).
  * A session already ended is left alone.
  */
 export function endSession(
   db: Database,
   mail: MailPort,
   id: string,
-  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink } = {},
+  opts: { why?: string | null; legacyNames?: string[]; now?: number; audit?: AuditSink; by?: Record<string, unknown>; evidence?: Record<string, unknown> } = {},
 ): EndedSession {
   const now = opts.now ?? Date.now();
   const row = db.prepare(`SELECT ended_at, principal FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; principal: string | null } | null;
@@ -63,18 +65,27 @@ export function endSession(
   testPause("end:in-txn");
 
   const wake = new Set<string>();
-  const body = bounceBody(id, now, held);
+  // One bounce per sender (#334), threaded under its latest unread message
+  // and naming the others. `bounced` and `unbounced` count messages.
+  const bySender = new Map<string, number[]>();
+  for (const m of mail.unread(id)) {
+    const ids = bySender.get(m.sender);
+    if (ids) ids.push(m.id);
+    else bySender.set(m.sender, [m.id]);
+  }
   let bounced = 0;
   let unbounced = 0;
-  for (const m of mail.unread(id)) {
-    // A bounce to an ID that has itself ended would only bounce back.
-    if (isEndedId(db, m.sender)) {
-      unbounced++;
+  for (const [sender, ids] of bySender) {
+    // A bounce to an ID that has ended would only bounce back, and one whose
+    // row is gone (pruned) can never be read.
+    if (!liveIdOrAlias(db, sender)) {
+      unbounced += ids.length;
       continue;
     }
-    mail.bounce(id, m.sender, m.id, body, now);
-    bounced++;
-    wake.add(m.sender);
+    const latest = Math.max(...ids);
+    mail.bounce(id, sender, latest, bounceBody(id, now, held, ids.filter((x) => x !== latest).sort((a, b) => a - b)), now);
+    bounced += ids.length;
+    wake.add(sender);
   }
 
   // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.
@@ -109,7 +120,7 @@ export function endSession(
   // Its child sessions (#523) act under its addresses, so they end with it, each audited.
   const children = (db.prepare(`SELECT id FROM ids WHERE root_id = ? AND ended_at IS NULL ORDER BY id`).all(id) as { id: string }[]).map((r) => r.id);
   for (const child of children) {
-    for (const h of endSession(db, mail, child, { why: `its root ${id} ended`, now, ...(opts.audit ? { audit: opts.audit } : {}) }).wake) wake.add(h);
+    for (const h of endSession(db, mail, child, { why: `its root ${id} ended`, now, ...(opts.audit ? { audit: opts.audit } : {}), ...(opts.by ? { by: opts.by } : {}) }).wake) wake.add(h);
   }
   (opts.audit ?? coreAuditSink(db))("id.ended", id, id, {
     principal: row?.principal ?? null,
@@ -119,23 +130,28 @@ export function endSession(
     ...(unbounced ? { unbounced } : {}),
     ...(releaseFailed.length ? { release_failed: releaseFailed } : {}),
     ...(children.length ? { children } : {}),
+    ...opts.by,
+    ...opts.evidence,
   });
   wake.delete(id);
   return { ended: true, held, wake: [...wake] };
 }
 
-function isEndedId(db: Database, address: string): boolean {
-  if (addressParts(address)?.kind !== "id") return false;
+/** False for an ID sender that has ended or whose row is gone; an alias is durable, so always true. */
+function liveIdOrAlias(db: Database, address: string): boolean {
+  if (addressParts(address)?.kind !== "id") return true;
   const r = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(address) as { ended_at: number | null } | null;
-  return r?.ended_at != null;
+  return r != null && r.ended_at == null;
 }
 
 function heldText(held: string[]): string {
   return held.length ? `it held ${held.map((a) => `\`${a}\``).join(", ")}` : "it held no alias";
 }
 
-export function bounceBody(id: string, endedAt: number, held: string[]): string {
-  return `${id} ended at ${new Date(endedAt).toISOString()} before reading this; ${heldText(held)}.`;
+/** A bounce's text. `earlier`: the sender's other unread message ids, ascending; the bounce threads under the latest. */
+export function bounceBody(id: string, endedAt: number, held: string[], earlier: number[] = []): string {
+  const also = earlier.length ? ` or your earlier ${earlier.length === 1 ? "message" : "messages"} ${earlier.join(", ")}` : "";
+  return `\`${id}\` ended at ${new Date(endedAt).toISOString()} before reading this${also}; ${heldText(held)}.`;
 }
 
 /**

@@ -9,6 +9,7 @@ import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-c
 import { writeAudit } from "./audit.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { isTrustedOrigin } from "./origin.ts";
 
 // `sourceKey` is the `_meta` key that maps this client's hosted session source, or null
 // (unmapped: reads only). A pure function of the client ID and the startup config.
@@ -181,11 +182,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const sameOrigin = (req: Request, mandatory = false) => {
     const origin = req.headers.get("origin");
     if (origin === null && !mandatory) return;
-    if (!origin || !/^https?:\/\/[^\s/@?#,\\]+$/.test(origin)) fail("invalid_request", 403);
-    let parsed: URL;
-    try { parsed = new URL(origin); } catch { fail("invalid_request", 403); }
-    const serialized = origin.replace(parsed.protocol === "https:" ? /:443$/ : /:80$/, "");
-    if (serialized !== parsed.origin || parsed.origin !== base.origin) fail("invalid_request", 403);
+    if (origin === null || !isTrustedOrigin(origin, base.origin)) fail("invalid_request", 403);
   };
   const getFlow = (req: Request, id: string) => {
     if (!secret(id)) fail();
@@ -262,6 +259,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!path.startsWith("/oauth/")) return undefined;
     if (closed) return json({ error: "temporarily_unavailable" }, 503);
     const tokenRoute = req.method === "POST" && (path === "/oauth/token" || path === "/oauth/revoke");
+    // A browser GET that isn't a top-level navigation (an <img>, a no-cors
+    // fetch from another site's page) is refused uncharged and unaudited,
+    // before any client lookup (#404): every visitor behind one address could
+    // otherwise drain its bucket and block that address's sign-ins. A client
+    // that sends no Sec-Fetch-Mode (not a browser) is charged as before.
+    const mode = req.headers.get("sec-fetch-mode");
+    if (req.method === "GET" && mode !== null && mode !== "navigate") return json({ error: "invalid_request" }, 403);
     const checks = buckets(context, tokenRoute);
     const limited = rate(checks, path);
     if (limited) return limited;

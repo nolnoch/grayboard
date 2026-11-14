@@ -6,9 +6,10 @@ type Msg = { id: number; sender: string; recipient: string; body: string; parent
 
 // via (#523): the child session that wrote the message under its root's address.
 export type InboxItem = { id: number; from: string; via?: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
-export type PromiseItem = { id: number; to: string; via?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
+// No kind: a bounce is stored pending = 0, so it is never a promise.
+export type PromiseItem = { id: number; to: string; via?: string; parent_id?: number; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
 
-export const INBOX_DAYS = 3;
+const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
 // Promises don't age out with the days argument; they stay until kept or acked.
 export const PROMISE_DAYS = MAX_INBOX_DAYS;
@@ -155,7 +156,7 @@ export function undeliveredInstruction(
 
 // A queued message to a handle idle this long is likely a misaddress (a live
 // peer under another handle), so the send result says so and names the undo.
-export const STALE_RECIPIENT_MS = 3_600_000;
+const STALE_RECIPIENT_MS = 3_600_000;
 
 export function queuedNote(recipient: string, seen: number | null, now = Date.now()): string {
   if (seen !== null && now - seen < STALE_RECIPIENT_MS) return "Recipient offline; will be delivered on their next session.";
@@ -183,3 +184,10 @@ export const retractRefusal = {
   reached: (id: number, to: string) => `message ${id} already reached ${to}; send a correction instead`,
   replied: (id: number) => `message ${id} has a reply in its thread; send a correction instead`,
 };
+
+// A tool result with notices appended as text items after its own content:
+// the one append both MCP surfaces use (src/local/mcp.ts, src/server/mcp.ts;
+// #479), so they can't drift. No notices: the result itself.
+export function withNotices<R extends { content: unknown[] }>(result: R, notices: readonly string[]): R {
+  return notices.length ? { ...result, content: [...result.content, ...notices.map((text) => ({ type: "text" as const, text }))] } : result;
+}

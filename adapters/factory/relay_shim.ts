@@ -45,6 +45,12 @@ export const SHIM_TOOLS = [
   },
   { name: "tree_claim_release", description: "tree_claim_release(key): give back a claim you hold.", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
   { name: "tree_claims", description: `tree_claims(): what the runs of this request hold now, and who holds each. ${DATA}`, inputSchema: { type: "object", properties: {} } },
+  // Progress (#669): every run the factory gives it to.
+  {
+    name: "progress",
+    description: "progress(note): one line on where you are, shown to whoever asks this request's status; never posted otherwise. Each call replaces the last.",
+    inputSchema: { type: "object", properties: { note: { type: "string", description: 'E.g. "tests pass; writing the docs".' } }, required: ["note"] },
+  },
 ];
 
 // One connection, requests answered in order.

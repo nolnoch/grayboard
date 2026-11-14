@@ -19,6 +19,7 @@ import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
+import { accessAudits } from "./audit.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
@@ -98,9 +99,7 @@ const serverId = (srv: HostedServer, raw: string): string | undefined => srv.app
 const idle = (omp: Pi, ms = 30_000) => until(async () => (await omp.command({ type: "get_state" })).isSettled === true, ms, "omp settled");
 
 // The hosted audit rows of `action`, oldest first.
-type Audit = { target: string; detail: Record<string, unknown> };
-const audits = (srv: HostedServer, action: string): Audit[] => srv.app.db.query<{ target: string; detail: string }, [string]>(
-  "SELECT target, detail FROM access_log WHERE action = ? ORDER BY id").all(action).map((r) => ({ target: r.target, detail: JSON.parse(r.detail) }));
+const audits = (srv: HostedServer, action: string) => accessAudits(srv.app.db, action);
 // The server sessions registered as children of `root` right now.
 const liveChildren = (srv: HostedServer, root: string): string[] => srv.app.db.query<{ session_id: string }, [string]>(
   "SELECT session_id FROM hosted_sessions WHERE root_session_id = ?").all(root).map((r) => r.session_id);
@@ -517,7 +516,7 @@ export function ompLocalTaskScenario(dir: string): Promise<void> {
       for (const m of dms) expect(m.via).toBe(m.sender_id);
       expect(dms.map((m) => m.sender_id).sort()).toEqual([...children].sort());
       for (const m of dms) expect(peer.pushes.find((p) => p.content === m.body)!.meta).toMatchObject({ from: "omp-local", via: m.via });
-      const history = (await peer.call("dm_history", { peer: "omp-local" })) as { body: string; via?: string }[];
+      const history = (await peer.call("dm_history", { peer: "omp-local" })) as { body: string; via?: string | null }[];
       expect(history.filter((m) => m.body.startsWith("child ")).map((m) => [m.body, m.via]).sort()).toEqual(dms.map((m) => [m.body, m.via]));
 
       // Only main's requests carry grayboard's instructions.
@@ -751,7 +750,7 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
 // (tests/support/stops_reading.ts): the adapter's next write fails with EPIPE,
 // and it kills that process before the replacement starts, so the replacement
 // takes the name back and no stale delivery owner remains (#580).
-export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
+export function ompLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?: boolean } = {}): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
@@ -774,7 +773,7 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
     try {
       installLocal(dir, model.port, [process.execPath, join(ROOT, "tests/support/stops_reading.ts")]);
       peer = await localSession(dir, "peer");
-      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING });
+      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING, ...(opts.ignoreSigterm ? { BUS_TEST_IGNORE_SIGTERM: "1" } : {}) });
       await omp.command({ type: "get_state" }, 30_000);
       const holder = () => localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-580'")[0]?.id;
       await omp.command({ type: "prompt", message: "bind" });
@@ -796,6 +795,13 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       await until(() => { const h = holder(); return h !== undefined && h !== first ? h : undefined; }, 15_000, "omp-580 held by the replacement");
       const replacement = grayboards(omp.pid);
       expect(replacement).toHaveLength(2);
+      if (opts.ignoreSigterm) {
+        // Only the SIGKILL ended the relay, and the replacement waited for it.
+        const sigterm = Number(readFileSync(join(dir, "stopped.sigterm"), "utf8"));
+        const started = Number(readFileSync(join(dir, "stopped.started"), "utf8"));
+        expect(started - sigterm).toBeGreaterThanOrEqual(1_400);
+        await until(() => ompLog(dir).includes("sent SIGKILL"), 5_000, "the SIGKILL reported");
+      }
       expect(localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id = ?", first)[0]?.ended_at).not.toBeNull();
 
       await omp.command({ type: "prompt", message: "who" });
@@ -806,7 +812,7 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       await omp.quit();
       await until(() => !replacement.some(alive), 5_000, "the replacement ended with omp");
     } finally {
-      for (const p of seen) { try { process.kill(p, "SIGKILL"); } catch {} }
+      for (const p of seen) { if (alive(p)) try { process.kill(p, "SIGKILL"); } catch {} }
       await stopAll(procs);
       if (peer) await stopSession(peer.c);
       model.stop();

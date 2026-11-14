@@ -1,11 +1,11 @@
 import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
-import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE, RESEND_PARAM } from "../core/tools.ts";
+import { boardTools, DEFAULT_CHANNEL_SOURCE, dmTools, type ToolDef } from "../core/tools.ts";
 import { BIND_TOOL, UNBIND_TOOL } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
-import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult } from "../shared/inbox.ts";
+import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, ackResult, withNotices } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
 import { GRAYBOARD_ALIAS_LOST_META } from "../shared/session_meta.ts";
@@ -14,13 +14,14 @@ import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
-import { hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
+import { HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
+import { permitsOrigin } from "./origin.ts";
 import { RateLimiter } from "./rate_limit.ts";
-import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
+import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimits } from "./config.ts";
 import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -28,7 +29,6 @@ export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
 const ids = z.array(id);
-const attachmentIds = ids.describe("IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths.");
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
@@ -39,32 +39,24 @@ type Binding = { user: number; email: string; grant: string; role: HostedRole; i
 // authenticated request re-admits it. `dormant` holds the separate dormant bound.
 // `controls`: the tail of this protocol session's subscribe/unsubscribe chain; each runs after the previous settles (#431).
 type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
-type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
+type Live = { context: Context; rows: Set<string>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
-  const permitsOrigin = (origin: string | null): boolean => {
-    if (origin === null) return true;
-    if (!/^https?:\/\/[^\s/@?#,\\]+$/.test(origin)) return false;
-    try {
-      const parsed = new URL(origin);
-      const serialized = origin.replace(parsed.protocol === "https:" ? /:443$/ : /:80$/, "");
-      return serialized === parsed.origin && parsed.origin === trustedOrigin;
-    } catch { return false; }
-  };
   let closed = false, posts = 0, busListeners = 0;
-  const limits = opts.limits ?? DEFAULT_MCP_LIMITS;
+  const limits = opts.limits ?? DEFAULT_MCP_LIMITS, caps = opts.caps ?? DEFAULT_HOSTED_CAPS;
   // Dormant legacy sessions hold no admission; their own bound reuses the legacy limits (#476).
   type CapacityKind = keyof McpLimits | "dormant";
   const capacity: Record<CapacityKind, Map<number, number>> = { listen: new Map(), legacy: new Map(), post: new Map(), dormant: new Map() };
   const used: Record<CapacityKind, number> = { listen: 0, legacy: 0, post: 0, dormant: 0 };
-  function reserve(kind: CapacityKind, principal: OAuthPrincipal): (() => void) | undefined {
+  // `detail` adds to the refusal row; a dormant session's rehydration names its `ref` (#494).
+  function reserve(kind: CapacityKind, principal: OAuthPrincipal, detail: Record<string, unknown> = {}): (() => void) | undefined {
     const counts = capacity[kind], user = principal.authed.user_id, limit = limits[kind === "dormant" ? "legacy" : kind];
     const count = counts.get(user) ?? 0;
     const scope = used[kind] >= limit.global ? "global" : count >= limit.perUser ? "user" : undefined;
     if (scope) {
-      writeAudit(application.repo, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId });
+      writeAudit(application.repo, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId, ...detail });
       return undefined;
     }
     used[kind]++; counts.set(user, count + 1);
@@ -89,6 +81,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const contexts = new Set<Context>();
   const shutdown = new AbortController();
   const pendingRequests = new Set<Promise<void>>();
+  // In-flight handlers (a listen stream's ends when its response starts): kept above the POST cap it contains.
+  const exchangeCap = Math.max(512, 2 * limits.post.global);
   const bodyReads = new Set<Promise<unknown>>();
   async function readBody(request: Request) {
     const reading = readMcpBody(request, shutdown.signal);
@@ -107,12 +101,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const settled = promise.catch(() => {}).finally(() => closing.delete(settled));
     closing.add(settled);
   };
-  const resources = createResources(application, { isAuthorized: session => {
+  const resources = createResources(application, { caps: caps.watches, isAuthorized: session => {
     const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
     return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorized(principal);
   } });
-  const hosted = createHostedSessions(application, { now, isAuthorized: principal => oauth.isAuthorized(principal) });
-  const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now });
+  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: principal => oauth.isAuthorized(principal) });
+  const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now, caps: caps.leases });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
@@ -145,7 +139,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if ("id" in context.sessionContext) {
       const row = hosted.row(context.sessionContext.id);
       const root = row && hosted.rootOf(row);
-      if (root && root.lease_deadline !== null && root.lease_deadline <= now()) hosted.sweep();
+      if (root && root.lease_deadline !== null && root.lease_deadline <= now()) hosted.settle(root.session_id);
     }
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
@@ -222,8 +216,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const root = hosted.rootOf(row);
     return hosted.named(root) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
   }
-  const unlistenHosted = hosted.listen(() => {
+  // The rows a live's binding reads: its own and its root's, fixed at creation (#399). A commit names the one
+  // row it changed, so only the lives reading it are checked; null checks them all.
+  function bindingRows(context: Context): Set<string> {
+    if (!("id" in context.sessionContext)) return new Set();
+    const row = hosted.row(context.sessionContext.id);
+    return new Set([context.sessionContext.id, ...(row?.root_session_id ? [row.root_session_id] : [])]);
+  }
+  const unlistenHosted = hosted.listen(changed => {
     for (const live of [...lives]) {
+      if (changed !== null && live.rows.size && !live.rows.has(changed)) continue;
       try { if (!idle(live) && !bindingLive(live.context)) live.stop(); }
       catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
     }
@@ -273,12 +275,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
     if (live.stopped || !idle(live)) { next.finish(); return; }
     const previous = live.context;
-    live.context = next;
+    live.context = next; live.rows = bindingRows(next);
     if (live.stream) streamContexts.set(live.stream, next);
     previous.finish();
   }
   function makeLive(context: Context, uris: Map<string, string | null>, handler?: McpHttpHandler, legacy?: Legacy): Live {
-    const live: Live = { context, uris, watches: [], handler, legacy, stopped: false,
+    const live: Live = { context, rows: bindingRows(context), uris, watches: [], handler, legacy, stopped: false,
       hint(uri) {
         if (live.stopped || !live.uris.has(uri)) return;
         try {
@@ -359,7 +361,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         try {
           authorize(context, ctx.mcpReq.signal);
           if (subscribe) {
-            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= 32) throw new ApplicationError("bad_request", "resource watch capacity reached");
+            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
             const cap = watchable(context, uri);
             const previous = sessionContext(context.principal, legacy.meta);
             if (legacy.subscriptions.size && (!("id" in previous) || !("id" in context.sessionContext) || previous.id !== context.sessionContext.id)) {
@@ -499,9 +501,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
     legacyAudit(legacy, "hosted.legacy_dormant", { subscriptions: legacy.subscriptions.size });
   }
-  function drop(legacy: Legacy, reason: string, failed = false) {
+  function drop(legacy: Legacy, reason: string, failed = false, detail: Record<string, unknown> = {}) {
     if (legacy.stopped) return;
-    legacyAudit(legacy, "hosted.legacy_dropped", { reason, dormant_ms: legacy.dormant ? now() - legacy.dormant.since : 0 });
+    legacyAudit(legacy, "hosted.legacy_dropped", { reason, dormant_ms: legacy.dormant ? now() - legacy.dormant.since : 0, ...detail });
     retire(legacy, failed);
   }
   const timer = setInterval(() => {
@@ -520,8 +522,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         } else if (!legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
       } catch { retire(legacy, true); }
     }
-    for (const live of [...lives]) { try { valid(live); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(live.context, e); live.stop(); } }
-    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { hostedFailure("mcp.stream", e); streamClosed(context, e); track(stream.stop()); } }
+    // An access expiry or revoke is an expected close, audited by streamClosed; only other failures are logged (#494 item 10).
+    const unexpected = (e: unknown) => { if (!(e instanceof ApplicationError && e.code === "unauthenticated")) hostedFailure("mcp.stream", e); };
+    for (const live of [...lives]) { try { valid(live); } catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); } }
+    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); } }
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {
@@ -561,7 +565,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     async fetch(original: Request, address = "unknown"): Promise<Response> {
       const boundary: Exchange = { request: original, address, protocol: MCP_PROTOCOL_VERSIONS.includes(original.headers.get("Mcp-Protocol-Version") ?? "") ? original.headers.get("Mcp-Protocol-Version")! : "unspecified" };
       if (closed) return new Response("MCP endpoint is closed", { status: 503 });
-      if (!permitsOrigin(original.headers.get("Origin"))) { logRefusal("origin", boundary); return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 }); }
+      if (!permitsOrigin(original.headers.get("Origin"), trustedOrigin)) { logRefusal("origin", boundary); return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 }); }
       let role: HostedRole;
       try { role = hostedRole(original); } catch { return Response.json({ code: "bad_request", message: "unknown X-Grayboard-Client role" }, { status: 400 }); }
       const post = original.method === "POST";
@@ -581,7 +585,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (legacyPost) { legacyPost.posts--; legacyPost.lastUsed = now(); legacyPost = undefined; }
       };
       if (post) posts++;
-      if (pendingRequests.size >= 512) { releasePost(); return new Response("MCP exchange capacity reached", { status: 429 }); }
+      if (pendingRequests.size >= exchangeCap) { releasePost(); return new Response("MCP exchange capacity reached", { status: 429 }); }
       let finishRequest!: () => void;
       const pendingRequest = new Promise<void>(resolve => { finishRequest = resolve; });
       pendingRequests.add(pendingRequest);
@@ -609,7 +613,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); }
                 const context = exchange.context = await select(req);
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
-                if (uris.length > 32) throw new ApplicationError("bad_request", "resource watch capacity reached");
+                if (uris.length > caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
                 const authorized = new Map(uris.map(uri => [uri, watchable(context, uri)]));
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
                 live = makeLive(context, authorized, ownHandler);
@@ -632,12 +636,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 // Only its own user under a new grant drops it; a stranger's guess leaves it to the idle reclaim.
                 if (!matches(legacy.binding, binding(context))) {
                   const own = legacy.binding.user === principal.authed.user_id && legacy.binding.email === principal.authed.user_email;
-                  if (own && legacy.binding.grant !== principal.grantId) drop(legacy, "grant_changed");
+                  if (own && legacy.binding.grant !== principal.grantId) drop(legacy, "grant_changed", false, { new_grant: principal.grantId });
                   context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 });
                 }
                 // Teardown needs no admission.
                 if (req.method === "DELETE") { drop(legacy, "deleted"); context.finish(); releasePost(); return new Response(null, { status: 200 }); }
-                const release = reserve("legacy", principal);
+                const release = reserve("legacy", principal, { ref: legacy.ref });
                 if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
                 const since = legacy.dormant.since;
                 legacy.dormant.release();
@@ -727,11 +731,27 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
 }
 
+// Built once per process, not per request (#811): `fromJsonSchema` compiles through the SDK's process-wide
+// ajv validator, which caches by schema object identity and never evicts, so a fresh object per
+// registration retained a compiled validator on every hosted request. The wrapper is stateless.
+const sharedTool = (tool: ToolDef) => ({
+  description: tool.description,
+  ...(tool._meta ? { _meta: tool._meta } : {}),
+  inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
+});
+const NATIVE_BOARD_TOOLS = boardTools({ teams: true, attachments: "ids" }).map(tool => ({ name: tool.name, config: sharedTool(tool) }));
+const NATIVE_DM_TOOLS = Object.fromEntries(dmTools({ attachments: "ids" }).map(t => [t.name, sharedTool(t)])) as Record<"dm_send" | "dm_history" | "dm_thread", ReturnType<typeof sharedTool>>;
+const NATIVE_DELEGATE_INPUT = fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]);
+const DM_INBOX_INPUT = z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() });
+const DM_ACK_INPUT = z.strictObject({ message_id: z.union([id, ids.min(1)]) });
+const DM_RETRACT_INPUT = z.strictObject({ message_id: id });
+const WHOAMI_INPUT = z.strictObject({});
+
 function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
   // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do; `_meta`
   // marks it, so a host caching this session's instructions fetches them again.
   const said = (result: CallToolResult, notice: string | undefined): CallToolResult => notice
-    ? { ...result, content: [...result.content, { type: "text", text: notice }], _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
+    ? { ...withNotices(result, [notice]), _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
@@ -744,7 +764,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
       return said({ ...text(`error: ${message}`), isError: true }, notice);
     }
   };
-  server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: z.strictObject({}) }, async (_, ctx) => {
+  server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
     const context = current(ctx);
     let notice: string | undefined;
     return said(text(await hosted.whoami(context.principal, context.sessionContext, n => { notice = n; })), notice);
@@ -754,43 +774,34 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden"].includes(e.code)) refuse(e.code);
     return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
   };
-  // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), plus hosted's `where`: the place this session reports.
+  // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
-    inputSchema: z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() }) }, async (args, ctx) => {
+    inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
     try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.declared); }
     catch (e) { return bindRefusal(e, "bind"); }
   });
-  server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: z.strictObject({ name: z.string().max(160) }) }, async (args, ctx) => {
+  server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: HOSTED_UNBIND_INPUT }, async (args, ctx) => {
     try { const context = current(ctx); return await hosted.unbind(context.principal, context.sessionContext, args, context.declared); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
-  for (const tool of boardTools({ teams: true })) {
-    const properties = { ...tool.inputSchema.properties };
-    if (tool.name === "board_post") { delete properties.attachments; properties.attachment_ids = z.toJSONSchema(attachmentIds); }
-    server.registerTool(tool.name, {
-      description: tool.name === "board_post" ? tool.description.replace("attachments?", "attachment_ids?") : tool.description,
-      ...(tool._meta ? { _meta: tool._meta } : {}),
-      inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, properties, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
-    }, (args, ctx) => run(ctx, tool.name, session => application.call(session, tool.name, args)));
+  // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
+  for (const { name, config } of NATIVE_BOARD_TOOLS) {
+    server.registerTool(name, config, (args, ctx) => run(ctx, name, session => application.call(session, name, args)));
   }
-  server.registerTool("dm_send", {
-    description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
-    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), resend: z.boolean().describe(RESEND_PARAM.description).optional(), as: z.string().describe(AS_PARAM.description).optional() }),
-  }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
+  const dm = NATIVE_DM_TOOLS;
+  server.registerTool("dm_send", dm.dm_send,
+    (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to as string, a.body as string, a as Parameters<typeof application.send>[3])));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,
-    inputSchema: fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
+    inputSchema: NATIVE_DELEGATE_INPUT,
   }, (a, ctx) => run(ctx, "delegate", session => application.delegate(session, a)));
-  server.registerTool("dm_history", {
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
-    inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),
-  }, (a, ctx) => run(ctx, "dm_history", session => application.history(session, a)));
-  server.registerTool("dm_thread", { description: "A whole direct-message thread you participate in.", inputSchema: z.strictObject({ thread: id }) },
-    (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread)));
-  server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() }) },
+  server.registerTool("dm_history", dm.dm_history,
+    (a, ctx) => run(ctx, "dm_history", session => application.history(session, a as Parameters<typeof application.history>[1])));
+  server.registerTool("dm_thread", dm.dm_thread, (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread as number)));
+  server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: DM_INBOX_INPUT },
     (a, ctx) => run(ctx, "dm_inbox", session => application.inbox(session, a.days)));
   server.registerTool(DM_ACK_TOOL.name, {
-    description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta, inputSchema: z.strictObject({ message_id: z.union([id, ids.min(1)]) }),
+    description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta, inputSchema: DM_ACK_INPUT,
   }, async (a, ctx) => {
     const acked: number[] = [], missing: number[] = [];
     const result = await run(ctx, "dm_ack", session => {
@@ -804,6 +815,6 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     });
     return { ...result, ...(missing.length && !acked.length ? { isError: true } : {}) };
   });
-  server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: z.strictObject({ message_id: id }) },
+  server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: DM_RETRACT_INPUT },
     (a, ctx) => run(ctx, "dm_retract", session => application.retract(session, a.message_id)));
 }

@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitationCompleteNotificationSchema, ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
+import { CancelledNotificationSchema, ElicitationCompleteNotificationSchema, ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Diagnostics } from "../../adapters/hosted-core/src/diagnostics.ts";
 import { tryAcquire } from "../../adapters/hosted-core/src/lock.ts";
@@ -74,7 +74,10 @@ const leaseClosed = (id: string) => srv.app.db.query<{ n: number }, [string]>(
   "SELECT count(*) AS n FROM access_log WHERE action = 'hosted.lease_closed' AND target = ?").get(hostedSessionId(user(), CLIENT_ID, id))!.n;
 
 type Elicit = { url: string; message: string };
-type Plugin = Session & { elicits: Elicit[]; completed: string[] };
+// completed: elicitation ids the plugin completed; withdrawn: ids whose request it
+// cancelled (notifications/cancelled), recorded by request id (#713).
+// aborted: ids whose handler the SDK's own cancel handler aborted, as Claude Code's does.
+type Plugin = Session & { elicits: Elicit[]; completed: string[]; withdrawn: string[]; aborted: string[] };
 
 // One Claude Code session's plugin server. `flags` are Claude Code's own;
 // `answer` answers each URL elicitation (default: accept and complete the
@@ -82,7 +85,8 @@ type Plugin = Session & { elicits: Elicit[]; completed: string[] };
 async function plugin(id: string, o: {
   flags?: string[]; answer?: (e: Elicit) => Promise<ElicitResult["action"]>; elicit?: boolean; before?: ClientShape["before"]; env?: Record<string, string>;
 } = {}): Promise<Plugin> {
-  const elicits: Elicit[] = [], completed: string[] = [];
+  const elicits: Elicit[] = [], completed: string[] = [], withdrawn: string[] = [], aborted: string[] = [];
+  const ids = new Map<string | number, string>(); // JSON-RPC request id → elicitation id
   const answer = o.answer ?? (async (e) => { void browse(srv.issuer, e.url, "Claude Code"); return "accept"; });
   const s = await mcpSession({
     env: {
@@ -98,18 +102,29 @@ async function plugin(id: string, o: {
       before: o.before,
       setup: (c: Client) => {
         if (o.elicit === false) return;
-        c.setRequestHandler(ElicitRequestSchema, async (req) => {
-          const p = req.params as { mode?: string; url: string; message: string };
+        c.setRequestHandler(ElicitRequestSchema, async (req, extra) => {
+          const p = req.params as { mode?: string; url: string; message: string; elicitationId: string };
           expect(p.mode).toBe("url");
+          ids.set(extra.requestId, p.elicitationId);
+          extra.signal.addEventListener("abort", () => aborted.push(p.elicitationId), { once: true });
           const e = { url: p.url, message: p.message };
           elicits.push(e);
           return { action: await answer(e) };
+        });
+        // Recorded by request id, not through the handler's abort signal: the
+        // SDK's own cancel handler (Claude Code 2.1.316 bundles the same) skips
+        // request id 0, which is the plugin's first prompt (#713).
+        const builtin = (c as unknown as { _notificationHandlers: Map<string, (n: unknown) => Promise<void>> })._notificationHandlers.get("notifications/cancelled")!;
+        c.setNotificationHandler(CancelledNotificationSchema, async (n) => {
+          const id = n.params.requestId === undefined ? undefined : ids.get(n.params.requestId);
+          if (id) withdrawn.push(id);
+          await builtin(n);
         });
         c.setNotificationHandler(ElicitationCompleteNotificationSchema, async (n) => { completed.push(n.params.elicitationId); });
       },
     },
   });
-  return Object.assign(s, { elicits, completed });
+  return Object.assign(s, { elicits, completed, withdrawn, aborted });
 }
 
 // A tool result's text blocks, error or not.
@@ -264,6 +279,26 @@ test("a call whose PreToolUse record is missing or from a recycled pid is refuse
   const recycled = await modelCall(root, "dm_send", { to: "solo", body: "unattributed" });
   expect(recycled.texts.join("\n")).toContain("an earlier process with the same pid");
   expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'unattributed'").get()).toEqual({ n: 0 });
+}, 40_000);
+
+test("a subagent whose child id would pass the server's 1024 characters is refused client-side with the length, and writes nothing (#555 item 15)", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const id = "sess-sub-long";
+  const root = await plugin(id);
+  runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
+  expect((await modelCall(root, "bind", { name: "longroot", create: true })).error).toBe(false);
+  // 1024 - "sess-sub-long/agent/".length = 1004 fits exactly; one more is over.
+  const fits = "a".repeat(1024 - `${id}/agent/`.length), over = `${fits}b`;
+  const ok = await modelCall(root, "dm_send", { to: "longroot", body: "at the limit" }, { agent: fits });
+  expect(ok.error).toBe(false);
+  const refused = await modelCall(root, "dm_send", { to: "longroot", body: "over the limit" }, { agent: over });
+  expect(refused.error).toBe(true);
+  expect(refused.texts.join("\n")).toContain("is 1025 characters, over the server's 1024-character limit");
+  expect(root.stderr()).toContain("subagent child id is 1025 characters");
+  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'over the limit'").get()).toEqual({ n: 0 });
+  expect(childRow(id, over)).toBeNull();
+  // The main agent's calls still work.
+  expect((await modelCall(root, "whoami", {})).error).toBe(false);
 }, 40_000);
 
 test("the root reports the model and effort its hooks wrote (#545); a subagent's call reports none, and a bad fact file sends none", async () => {
@@ -451,11 +486,28 @@ test("a prompt left unanswered (#497, #500): every signed-out call shows the use
   expect(linkFile(s)).toBe(false);
   expect(shown(s)).toBeUndefined();
   await until(() => s.completed.length === 1, 10_000, "the elicitation's completion notice");
+  // Completed, then its request withdrawn: Claude Code keeps no pending prompt (#501).
+  await until(() => s.withdrawn.length === 1, 10_000, "the prompt's withdrawal");
+  expect(s.withdrawn).toEqual(s.completed);
   expect(s.elicits).toHaveLength(1);
   const said = s.stderr();
   expect(said).toContain("sign-in prompt sent (elicitation ");
-  expect(said).not.toContain("sign-in prompt ended without an answer");
+  expect(said).not.toMatch(/sign-in prompt \(elicitation [^)]+\) ended without an answer/);
   expect(said).not.toContain("sign-in failed");
+}, 40_000);
+
+test("a sign-in denied in the browser: the flow fails, its unanswered prompt is withdrawn and never completed (#501)", async () => {
+  const s = await plugin("sess-denied", { answer: () => new Promise(() => {}) });
+  await until(() => s.elicits.length === 1, 10_000, "the startup sign-in prompt");
+  await browse(srv.issuer, s.elicits[0]!.url, "Claude Code", "deny");
+  await until(() => s.stderr().includes("sign-in failed (startup"), 15_000, "the failed flow");
+  await until(() => s.withdrawn.length === 1, 10_000, "the prompt's withdrawal");
+  // The SDK's handler, which skips request id 0, aborted it too: the plugin spent id 0 on a ping (#713).
+  await until(() => s.aborted.length === 1, 5_000, "the SDK's cancel handler to abort the prompt");
+  expect(s.completed).toEqual([]);
+  expect(linkFile(s)).toBe(false);
+  // The withdrawal isn't an unanswered prompt: the flow's failure is the one line.
+  expect(s.stderr()).not.toMatch(/sign-in prompt \(elicitation [^)]+\) ended without an answer/);
 }, 40_000);
 
 test("a prompt Claude Code cancels unshown (its connection-setup handler) is sent again; a cancel after it was shown is not", async () => {
@@ -479,6 +531,92 @@ test("a prompt Claude Code cancels unshown (its connection-setup handler) is sen
   expect(s.elicits).toHaveLength(2);
   expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
   await signedIn(s);
+}, 40_000);
+
+test("unshown cancels are re-sent at most RESENDS times: four instant cancels, four prompts, then the cap line (#506)", async () => {
+  const s = await plugin("sess-cap", { answer: async () => "cancel" });
+  await until(() => s.stderr().includes("sign-in prompt cancelled unshown 4 times; the link Claude Code shows under each grayboard call remains"), 15_000, "the cap line");
+  expect(s.elicits).toHaveLength(4);
+  expect(s.stderr().match(/sending it again \(\d\/3\)/g)).toEqual(["sending it again (1/3)", "sending it again (2/3)", "sending it again (3/3)"]);
+  // The flow and its link stay; the user can still open it.
+  const call = await texts(s, "whoami");
+  expect(call.texts[0]).toBe(STARTED);
+  expect(s.elicits).toHaveLength(4);
+  expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
+  await signedIn(s);
+}, 40_000);
+
+test("a flow that ends during the re-send wait sends no prompt (#506)", async () => {
+  // Held after the RESEND_MS wait while the browser signs in.
+  const release = join(dir, "resend.release");
+  const s = await plugin("sess-resend-ended", {
+    answer: async () => "cancel",
+    env: { BUS_TEST_PAUSE: "claude-sign-in-resend", BUS_TEST_PAUSE_FILE: release },
+  });
+  await until(() => s.stderr().includes("test pause hit: claude-sign-in-resend"), 10_000, "the re-send wait");
+  expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
+  await until(() => s.stderr().includes("signed in (startup)"), 10_000, "the flow's end");
+  writeFileSync(release, "");
+  await until(() => s.stderr().includes("sign-in ended before the prompt was sent again"), 10_000, "the re-send skipped");
+  expect(s.elicits).toHaveLength(1);
+  await signedIn(s);
+}, 40_000);
+
+test("a re-send wait that ends after the browser answered, with the code exchange still running, sends no prompt (#506)", async () => {
+  // Held after the RESEND_MS wait; the server holds the code exchange.
+  const release = join(dir, "resend.release");
+  const s = await plugin("sess-resend-answered", {
+    answer: async () => "cancel",
+    env: { BUS_TEST_PAUSE: "claude-sign-in-resend", BUS_TEST_PAUSE_FILE: release },
+  });
+  await until(() => s.stderr().includes("test pause hit: claude-sign-in-resend"), 10_000, "the re-send wait");
+  const oauth = srv.app.oauth, fetch = oauth.fetch.bind(oauth);
+  const exchange = Promise.withResolvers<void>();
+  let held = false;
+  oauth.fetch = async (req, context) => {
+    if (req.method === "POST" && new URL(req.url).pathname === "/oauth/token" && new URLSearchParams(await req.clone().text()).get("grant_type") === "authorization_code") {
+      held = true;
+      await exchange.promise;
+    }
+    return fetch(req, context);
+  };
+  try {
+    const browsed = browse(srv.issuer, s.elicits[0]!.url, "Claude Code");
+    await until(() => held, 10_000, "the code exchange at the server");
+    writeFileSync(release, "");
+    await until(() => s.stderr().includes("the browser answered before the prompt was sent again"), 10_000, "the re-send skipped");
+    expect(s.elicits).toHaveLength(1);
+    expect(s.stderr()).not.toContain("sign-in ended before the prompt was sent again");
+    exchange.resolve();
+    expect(await browsed).toContain("Signed in to grayboard");
+  } finally {
+    exchange.resolve();
+    oauth.fetch = fetch;
+  }
+  await until(() => s.stderr().includes("signed in (startup)"), 10_000, "the flow's end");
+  expect(s.elicits).toHaveLength(1);
+  await signedIn(s);
+}, 40_000);
+
+test("a decline on a re-sent prompt ends the flow, and the next call starts another (#506)", async () => {
+  let n = 0;
+  const s = await plugin("sess-resend-decline", {
+    answer: async (e) => {
+      n++;
+      if (n === 1) return "cancel";
+      if (n === 2) return "decline";
+      void browse(srv.issuer, e.url, "Claude Code");
+      return "accept";
+    },
+  });
+  await until(() => /sign-in failed \((?:startup|offer), elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the decline");
+  expect(s.elicits).toHaveLength(2);
+  expect(s.stderr()).toContain("sending it again (1/3)");
+  await until(() => !linkFile(s), 5_000, "the declined flow's link removed");
+  expect((await texts(s, "whoami")).error).toBe(true);
+  await signedIn(s);
+  expect(s.elicits).toHaveLength(3);
+  expect(s.elicits[2]!.url).not.toBe(s.elicits[0]!.url);
 }, 40_000);
 
 test("a sign-in that can't reach the server says why in the next result", async () => {
@@ -521,6 +659,10 @@ test("a refused link file of another session's sign-in is said in the log only, 
   try {
     s = await plugin("sess-refused", { answer: () => new Promise<ElicitResult["action"]>(() => {}) });
     await until(() => s.stderr().includes("sign-in link isn't shown here: not on this server's origin"), 15_000, "the refusal in the log");
+    // With no link to show, a call waits LINK_MS (20 s), then names the other session's sign-in (#501).
+    const waiting = await texts(s, "whoami");
+    expect(waiting.error).toBe(true);
+    expect(waiting.texts[0]).toBe("grayboard: sign-in in progress in another Claude Code session; finish it there, then call a grayboard tool again");
   } finally { held.release(); }
   // The waited-on sign-in ended without a grant; the next call starts this session's own.
   await until(() => s.stderr().includes("sign-in failed (startup): "), 15_000, "the startup flow's end");

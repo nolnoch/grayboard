@@ -46,24 +46,32 @@ function warnOnce(key, text) {
 function procStarts(pids) {
   const out = new Map;
   if (process.platform !== "linux") {
-    const starts = ps("lstart", pids);
+    const lines = ps("stat=,lstart", pids);
     for (const pid of pids) {
-      const start = starts ? starts.get(pid) : null;
-      if (start !== undefined)
-        out.set(pid, start);
+      const m = lines?.get(pid)?.match(/^(\S+)\s+(.*)$/);
+      if (m && exited(m[1]))
+        continue;
+      if (m)
+        out.set(pid, m[2]);
       else if (pidExists(pid))
         out.set(pid, null);
     }
     return out;
   }
   for (const pid of pids) {
-    const start = statFields(pid)?.[19];
+    const fields = statFields(pid);
+    if (fields && exited(fields[0]))
+      continue;
+    const start = fields?.[19];
     if (start)
       out.set(pid, start);
     else if (pidExists(pid))
       out.set(pid, null);
   }
   return out;
+}
+function exited(state) {
+  return state.startsWith("Z") || state.startsWith("X");
 }
 function procStart(pid) {
   const starts = procStarts([pid]);
@@ -150,9 +158,10 @@ function put(path, text) {
   writeFileSync(tmp, text, { mode: 384 });
   renameSync(tmp, path);
 }
+var SIGN_IN_MAX = 16384;
 function readSignIn(dir, now = Date.now()) {
   try {
-    const value = JSON.parse(readFileSync2(join(dir, SIGN_IN), "utf8"));
+    const value = JSON.parse(readSmall(join(dir, SIGN_IN), SIGN_IN_MAX));
     if (typeof value.url !== "string" || typeof value.at !== "number")
       return;
     const age = now - value.at;
@@ -232,7 +241,7 @@ function runHook(event, stdin, o) {
       put(join(ended, `${now}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`), agent);
       pruneEnded(ended);
     } else if (event === "session-end") {
-      if (input.reason === "clear") {
+      if (input.reason === "clear" || o.hosted && input.reason === "resume") {
         if (!o.hosted)
           rmSync(join(dir, "current"), { force: true });
         return;

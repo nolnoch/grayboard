@@ -30,7 +30,7 @@ import { failure, hostTools, snapshotTools, type CallHooks, type NativeTool, typ
 import { outputOf } from "../hosted-core/src/results.ts";
 import { RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
-import { configuredIdentity, describeLocation } from "../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation, sessionIdentity } from "../../src/shared/identity.ts";
 
 export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
@@ -131,6 +131,25 @@ export interface Grayboard {
   idle(): Promise<void>;                       // a subagent's run ended: its child slot goes back until its next call
 }
 
+/**
+ * A harness's facts read one at a time (#547): a reader that throws leaves its
+ * key out, so the server keeps that fact's stored value, and the other fact
+ * still goes. Each failure is said once per session and fact through `warn`.
+ */
+export function factReader(warn: (message: string) => void) {
+  const said = new Set<string>();
+  return (sessionID: string, read: Record<keyof SessionFacts & string, () => string | null>): SessionFacts => {
+    const facts: SessionFacts = {};
+    for (const [fact, get] of Object.entries(read) as [keyof SessionFacts, () => string | null][]) {
+      try { facts[fact] = get(); } catch (error) {
+        const key = `${sessionID}\0${fact}`;
+        if (!said.has(key)) { said.add(key); warn(`grayboard: couldn't read session ${sessionID}'s ${fact}; the server keeps its last one: ${message(error)}`); }
+      }
+    }
+    return facts;
+  };
+}
+
 export function createGrayboard(h: Harness): Grayboard {
   const stateDir = join(h.agentDir, "grayboard");
   const config = readHostedConfig(stateDir);
@@ -165,6 +184,8 @@ export function createGrayboard(h: Harness): Grayboard {
   // An explicit BUS_IDENTITY: each new root binds it at its first start (#443),
   // which also says one the naming rule refuses (the host has no UI at load).
   const configured = configuredIdentity(process.env, process.cwd());
+  // The name local mode would suggest here (#522); none when the directory gives no name.
+  const suggestion = (() => { try { return sessionIdentity(process.env, process.cwd()); } catch { return undefined; } })();
 
   const login = "url" in config ? new Login({
     resource: config.url, clientId: h.clientId, stateDir, harness: h.name, loginAction: LOGIN_ACTION,
@@ -199,6 +220,7 @@ export function createGrayboard(h: Harness): Grayboard {
     loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, get launcher() { return role.kind === "root" && process.env.BUS_LAUNCHER === "1"; }, log,
     // Only this process's own session: the harness's model is that session's.
     ...(h.facts ? { facts: (id: string) => session?.id === id ? h.facts!(id) : undefined } : {}),
+    ...(suggestion ? { suggested: (id: string) => session?.id === id ? suggestion : undefined } : {}),
   }) : undefined;
 
   // ---- sign-in ----
@@ -227,21 +249,26 @@ export function createGrayboard(h: Harness): Grayboard {
   // says it at its start, whose delivery then starts signed in. Success
   // restarts this runtime's delivery and the current root's, at once; any
   // other runtime's credential watch restarts its own.
+  const speakerNow = () => state.voice ?? (done ? undefined : voice);
+  // A restart that fails is said; the credential watch tries again.
+  const restartAll = async (current: Voice | undefined) => {
+    await Promise.all([...new Set([voice, ...(current ? [current] : [])])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
+  };
   const ended = async (_flow: Flow, outcome: Outcome) => {
     const last = state.signins.last!;
     // Cancelled only by a quit, which has nothing left to say it to.
     if (outcome === "cancelled") { last.said = true; return; }
-    const current = state.voice ?? (done ? undefined : voice);
+    const current = speakerNow();
     if (current) { outcomeLine(current, last); last.said = true; }
     if (outcome !== "signed in") return;
-    // A restart that fails is said; the credential watch tries again.
-    await Promise.all([...new Set([voice, ...(current ? [current] : [])])].map(v => v.restart().catch(error => v.log(`couldn't restart after the sign-in: ${message(error)}`, "warning"))));
+    await restartAll(current);
   };
   // The process's pending flow, else a new one under this runtime's Login.
-  // An offer's returns at once if another process's grant has landed;
-  // /grayboard login always runs a flow.
+  // An offer's returns at once if another process's grant has landed, and
+  // restarts delivery under it then (#596); /grayboard login always runs a
+  // flow.
   const begin = (origin: Origin, browser: boolean): Flow | undefined =>
-    state.signins.flow ?? (!login || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended }));
+    state.signins.flow ?? (!login || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended, current: () => restartAll(speakerNow()) }));
   // Whether this process outlives a browser round trip. A root's own mode;
   // any other runtime takes its process's root's, since omp starts in-process
   // task subagents without a mode (so they read "print"). A pi subagent is its

@@ -2,7 +2,7 @@
 import type { AuthProvider } from "@modelcontextprotocol/client";
 import { z } from "zod";
 import { AccessExpired } from "./model.js";
-import { ServerUnreachable, unreachable } from "./wire.js";
+import { ServerUnreachable, serverText, unreachable } from "./wire.js";
 import {
   checkAttachmentId, downloadAttachment, formatSize, readAttachmentFiles, saveTarget, sendWithUploads, serverBusDir,
   type AttachmentLimits, type AttachmentTransport, type SavedAttachment,
@@ -10,7 +10,7 @@ import {
 import { describeFetchError, HTTP_TIMEOUT_MS, transferTimeoutMs } from "../../../src/shared/http.ts";
 
 export class AttachmentRefused extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) { super(message); }
+  constructor(readonly status: number, readonly code: string, message: string) { super(serverText(message)); }
 }
 
 export type HostedAttachmentOptions = {

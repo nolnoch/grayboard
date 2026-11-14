@@ -9,12 +9,13 @@ import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
-import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
+import { call, closeSessions, localSession, stopSession as stop, type Session, refusal } from "../support/mcp.ts";
 import { latestV1Release, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
 import { crockford13 } from "../../src/core/session_id.ts";
 import { poke } from "../../src/local/wakeup.ts";
+import { busRows, spawnCli as spawnBusCli, pauseEnv as busPauseEnv, releasePause } from "../support/local_bus.ts";
 
 let dir: string;
 
@@ -31,14 +32,7 @@ const session = (identity?: string, o: { cwd?: string; extra?: Record<string, st
   localSession(dir, identity, { cwd: o.cwd, extra: o.extra });
 
 // The bus file, read beside the sessions (WAL: readers don't block them).
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try {
-    return db.prepare(sql).all(...args) as T[];
-  } finally {
-    db.close();
-  }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
 const events = (name: string) => rows<{ session_id: string; event: string; detail: string | null }>(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id`, name);
 const contents = (s: Session) => s.pushes.map((p) => p.content);
@@ -50,12 +44,6 @@ const holderOf = (name: string) => rows<{ id: string }>(`SELECT id FROM alias_ho
 const statusOf = (name: string) => rows<{ status: string | null }>(`SELECT i.status FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`, name)[0]!.status;
 
 // A tool call's error text; a call that succeeds fails the test.
-async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
-  const r = await s.c.callTool({ name, arguments: args });
-  const text = (r.content as { text: string }[])[0]!.text;
-  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
-}
 
 // Every cell in the bus that equals `value`, as "table.column".
 function cellsEqual(value: string): string[] {
@@ -74,17 +62,10 @@ function cellsEqual(value: string): string[] {
 }
 
 // A CLI process whose stderr is read as it runs, for a test pause.
-function spawnCli(args: string[], extra: Record<string, string>) {
-  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd: dir, env: localEnv(dir, undefined, extra), stdout: "pipe", stderr: "pipe" });
-  let err = "";
-  (async () => {
-    for await (const chunk of p.stderr) err += new TextDecoder().decode(chunk);
-  })();
-  return { p, stderr: () => err };
-}
+const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
-const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
-const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
+const pauseEnv = (point: string) => busPauseEnv(dir, point);
+const release = (point: string) => releasePause(dir, point);
 
 test("1, 3, 14, 18: an unbound session acts as its ID, offers its default with its mail, and binds", async () => {
   const repo = join(dir, "api");
@@ -431,6 +412,87 @@ test("9: a DM sent mid-unbind is queued for the name's next holder, never consum
   await until(() => contents(third).includes("mid-unbind"));
 }, 30_000);
 
+// #374 (the #284 PR 4 audit's A4 fix): an unbind whose release transaction
+// fails leaves the hold, so the session answers on the name's socket again;
+// a DM sent after is delivered now, and a retried unbind releases it.
+test("an unbind whose release fails listens on the name again; a retry releases it", async () => {
+  const s = await session("fe", { extra: pauseEnv("unbind:before-txn") });
+  await s.call("bind", { name: "fe2", create: true });
+  const be = await session("be");
+  const unbinding = s.c.callTool({ name: "unbind", arguments: { name: "fe2" } });
+  await until(() => s.stderr().includes("test pause hit: unbind:before-txn"));
+  expect(existsSync(join(dir, "sock.fe2"))).toBe(false);
+  // The writer lock, held past the session's busy timeout, fails releaseName's BEGIN IMMEDIATE.
+  const lock = new Database(join(dir, "bus.db"));
+  lock.exec("BEGIN IMMEDIATE");
+  try {
+    release("unbind:before-txn");
+    const failed = await unbinding.then((r) => r, (e: unknown) => ({ isError: true, thrown: String(e) }));
+    expect(failed.isError).toBe(true);
+  } finally {
+    lock.exec("ROLLBACK");
+    lock.close();
+  }
+  expect(holderOf("fe2")).toBeDefined();
+  expect(existsSync(join(dir, "sock.fe2"))).toBe(true);
+  expect(await be.call("dm_send", { to: "fe2", body: "after the failure" })).toMatchObject({ delivered_now: true });
+  await until(() => contents(s).includes("after the failure"));
+  // The pause file stays, so the retry passes the point at once.
+  expect((await s.c.callTool({ name: "unbind", arguments: { name: "fe2" } })).isError).toBeFalsy();
+  expect(holderOf("fe2")).toBeUndefined();
+  expect(existsSync(join(dir, "sock.fe2"))).toBe(false);
+}, 30_000);
+
+// #374 (W4): a cancel that crosses an unbind's result on the wire (the process
+// is paused past its last cancel check) still gets the unbind into the next
+// result once, as a cancelled bind's does (audit 7).
+test("a cancelled unbind that completes is reported in the next result", async () => {
+  const s = await session("fe", { extra: pauseEnv("unbind:before-txn") });
+  const abort = new AbortController();
+  const unbinding = s.c.callTool({ name: "unbind", arguments: { name: "fe" } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: unbind:before-txn"));
+  abort.abort();
+  await expect(unbinding).rejects.toThrow();
+  release("unbind:before-txn");
+  await until(() => holderOf("fe") === undefined);
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text);
+  expect(texts.slice(1).join(" ")).toContain(`unbind("fe") completed after it was cancelled.`);
+  expect(texts.slice(1).join(" ").length).toBeGreaterThan(`unbind("fe") completed after it was cancelled.`.length);
+  // Told once.
+  const again = await s.c.callTool({ name: "peer_list", arguments: {} });
+  expect((again.content as { text: string }[]).map((c) => c.text).join(" ")).not.toContain("completed after it was cancelled");
+}, 30_000);
+
+// #292: a cancelled write that landed is reported in the next result once, with its id, so the agent doesn't repeat it.
+for (const [tool, point, args, id] of [
+  ["dm_send", "send:before-txn", { to: "be", body: "landed anyway" }, "message_id"],
+  ["board_post", "board:before-txn", { board: "e2e", body: "landed anyway" }, "post_id"],
+] as const) {
+  test(`a cancelled ${tool} that lands is reported in the next result`, async () => {
+    const be = await session("be");
+    const s = await session("fe", { extra: pauseEnv(point) });
+    // Every board tool passes board:before-txn, so the unpaused session creates the board.
+    if (tool === "board_post") await be.call("board_create", { name: "e2e", purpose: "test" });
+    const abort = new AbortController();
+    const writing = s.c.callTool({ name: tool, arguments: args }, undefined, { signal: abort.signal });
+    await until(() => s.stderr().includes(`test pause hit: ${point}`));
+    abort.abort();
+    await expect(writing).rejects.toThrow();
+    release(point);
+    const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+    const notice = (r.content as { text: string }[]).slice(1).map((c) => c.text).find((t) => t.startsWith(`${tool} completed after it was cancelled`));
+    expect(notice).toBeDefined();
+    const landedAs = JSON.parse(notice!.slice(notice!.indexOf("{")))[id];
+    expect(landedAs).toEqual(expect.any(Number));
+    if (tool === "dm_send") await until(() => contents(be).includes("landed anyway"));
+    else expect((await be.call("board_read", { board: "e2e" })).posts.map((p: any) => p.id)).toEqual([landedAs]);
+    // Told once.
+    const again = await s.c.callTool({ name: "peer_list", arguments: {} });
+    expect((again.content as { text: string }[]).map((c) => c.text).join(" ")).not.toContain("completed after it was cancelled");
+  }, 30_000);
+}
+
 test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
   const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
   const abort = new AbortController();
@@ -528,7 +590,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
 }, 30_000);
 
 test("#211: a name record whose session the name's history doesn't show restores the name unverified, with a fresh status", async () => {
-  let s = await session(null);
+  let s = await session();
   await s.call("bind", { name: "api", create: true });
   await s.call("peer_status", { text: "mid-task" });
   const path = join(dir, `bind.${s.harnessPid}`);
@@ -539,10 +601,12 @@ test("#211: a name record whose session the name's history doesn't show restores
   expect((await s.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${stranger} not verified: latest bound by ${prior}` });
   expect(statusOf("api")).toBeNull();
+  // The recorded session has no status to lose, so no note (#260).
+  expect(s.c.getInstructions()).not.toContain("peer status wasn't carried over");
 }, 30_000);
 
 test("audit S7: a name record past MAX_HOLDS restores the first names and reports the rest untried", async () => {
-  let s = await session(null);
+  let s = await session();
   await s.call("bind", { name: "api", create: true });
   const path = join(dir, `bind.${s.harnessPid}`);
   const extra = Array.from({ length: 9 }, (_, i) => `n${i}`);
@@ -577,7 +641,7 @@ test("#259: a stray refused while the holder lived binds the name after its deat
 // #284: a 1.x name record and binding history carry a 16-hex session ID, the
 // same 64 bits; a restart across the upgrade still matches its history.
 test("#284: a restart from a 1.x name record is verified against 1.x binding history", async () => {
-  let s = await session(null);
+  let s = await session();
   await s.call("bind", { name: "api", create: true });
   await s.call("peer_status", { text: "mid-task" });
   const legacy = "0123456789abcdef";
@@ -592,11 +656,12 @@ test("#284: a restart from a 1.x name record is verified against 1.x binding his
 }, 30_000);
 
 test("#211: a restore is verified in the transaction that binds: a bind that lands while it waits makes it unverified", async () => {
-  const s = await session(null, { extra: pauseEnv("bind:before-txn") });
+  const s = await session(undefined, { extra: pauseEnv("bind:before-txn") });
   const bind = s.call("bind", { name: "api", create: true });
   await until(() => s.stderr().includes("test pause hit: bind:before-txn"));
   release("bind:before-txn");
   await bind;
+  await s.call("peer_status", { text: "mid-task" });
   const prior = events("api").at(-1)!.session_id;
   rmSync(join(dir, "go-bind:before-txn"));
   // The restart parks just before its transaction; another session binds the
@@ -614,6 +679,8 @@ test("#211: a restore is verified in the transaction that binds: a bind that lan
   expect((await next.call("peer_list", {})).you).toBe("api");
   expect(events("api").at(-1)).toMatchObject({ event: "bound", detail: `restored_from ${prior} not verified: latest bound by ${theirs}` });
   expect(statusOf("api")).toBeNull();
+  // Its earlier status was dropped, and the session is told why (#260).
+  expect(next.c.getInstructions()).toContain(`This grayboard process restarted and took back "api", but another session bound it in between, so the earlier peer status wasn't carried over; peer_status sets it again.`);
 }, 30_000);
 
 test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {
@@ -820,7 +887,7 @@ test("#284 S4: a reply goes as the held alias its parent reached or was sent as;
     const a = s.pushes.find((p) => p.meta.message_id === String(toA.message_id));
     return a && b ? { a, b } : undefined;
   }, 10_000, "both DMs pushed");
-  expect([pushed.b.meta.to, pushed.a.meta.to]).toEqual(["b", undefined]);
+  expect([pushed.b.meta.to, pushed.a.meta.to] as (string | undefined)[]).toEqual(["b", undefined]);
   const inbox = (await s.call("dm_inbox", {})).unanswered as { id: number; to?: string }[];
   expect(inbox.find((m) => m.id === toB.message_id)?.to).toBe("b");
   expect(inbox.find((m) => m.id === toA.message_id)?.to).toBeUndefined();
@@ -833,7 +900,10 @@ test("#284 S4: a reply goes as the held alias its parent reached or was sent as;
   const r3 = await s.call("dm_send", { to: "peer", body: "r3", parent_id: r1.message_id });
   expect(senderOf(r3.message_id as number)).toBe("b");
   // #524: a reply goes to the parent's other party, never a third.
+  const written = rows<{ n: number }>(`SELECT count(*) AS n FROM messages`)[0]!.n;
   expect(await refusal(s, "dm_send", { to: "a", body: "x", parent_id: toB.message_id })).toBe(`error: parent_id ${toB.message_id} is a thread with peer, so a reply goes to peer; to write to someone else, send without parent_id`);
+  // The refusal writes nothing (#530).
+  expect(rows<{ n: number }>(`SELECT count(*) AS n FROM messages`)[0]!.n).toBe(written);
 
   // b unbound and taken by t: a reply to mail that reached b is refused, not sent as a.
   const toB2 = await peer.call("dm_send", { to: "b", body: "to b again" });

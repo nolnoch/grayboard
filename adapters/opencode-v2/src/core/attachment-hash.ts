@@ -2,4 +2,4 @@
 // Do not edit: change the source, then run `bun scripts/sync_hosted_core.ts`.
 import { createHash } from "node:crypto";
 
-export const sha256Hex = (data: Uint8Array): string => createHash("sha256").update(data).digest("hex");
+export const sha256Hex = (data: string | Uint8Array): string => createHash("sha256").update(data).digest("hex");

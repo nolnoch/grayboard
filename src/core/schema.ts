@@ -176,6 +176,8 @@ export function initCoreSchema(db: Database): void {
       detail  TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at);
+    -- lastCoreAudit's (action, target) lookup, newest first (#295).
+    CREATE INDEX IF NOT EXISTS idx_audit_log_action_target ON audit_log(action, target, at);
 
     -- File attachments (src/core/attachments.ts). The catalog of stored
     -- blobs, one per content hash; the bytes are in the mode's BlobStore. A
@@ -273,6 +275,8 @@ export function initCoreSchema(db: Database): void {
       pruned_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_ids_ended ON ids(ended_at) WHERE ended_at IS NOT NULL;
+    -- Live rows only: every local open's orphan and tools-only probes (liveSessions) read just these (#338).
+    CREATE INDEX IF NOT EXISTS idx_ids_live ON ids(id) WHERE ended_at IS NULL;
   `);
 
   // The 1.x roster's later columns, which each mode's alias seed reads.

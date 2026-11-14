@@ -197,7 +197,7 @@ export function boardActor(
 // boards.ts -> session_end.ts -> this module is an import cycle, so when
 // tools.ts loads first, boardTools isn't ready at this module's load.
 let asTools: Set<string> | undefined;
-const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
+const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true, attachments: "paths" }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
 
 const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
 
@@ -226,12 +226,23 @@ export function replyPeerError(parentId: number, peer: string): string {
 
 /**
  * The address set a caller acting as `address` reads as (#284 S8), for a
- * request that names one address (HTTP `?as=`, `grayboard claim`): `address`
- * first, then the rest of the address set of the session it is or that holds
- * it, when that session is `principal`'s (null: local mode's one implicit
- * scope), so another principal's session's addresses never join the set.
+ * server request that names one address (HTTP `?as=`, an attachment read):
+ * `address` first, then the rest of the address set of the session it is or
+ * that holds it, when that session is `principal`'s, so another principal's
+ * session's addresses never join the set. A null principal (the Slack bridge's
+ * humans, which have no session) reads as `address` alone, never as a session's
+ * whole set (#373).
  */
 export function addressSet(db: Database, address: string, principal: string | null): string[] {
+  return principal === null ? [address] : sessionSet(db, address, principal);
+}
+
+/** addressSet for local mode's one implicit scope (`grayboard claim`), where sessions have no principal. */
+export function localAddressSet(db: Database, address: string): string[] {
+  return sessionSet(db, address, null);
+}
+
+function sessionSet(db: Database, address: string, principal: string | null): string[] {
   const id = addressParts(address)?.kind === "id" ? address : holderOf(db, address);
   const row = id === null ? undefined : idRow(db, id);
   if (id === null || !row || row.principal !== principal) return [address];
@@ -250,6 +261,9 @@ export function aliasUser(db: Database, address: string, exceptPrincipal: string
     `SELECT i.id FROM ids i
       WHERE i.ended_at IS NULL AND (?2 IS NULL OR i.principal IS NOT ?2)
         AND (i.id IN (SELECT id FROM alias_holds WHERE address = ?1) OR i.writes_as = ?1)
+      -- The holder before a tools-only writer, then the oldest: the refusal
+      -- names one session, so the pick can't ride on the plan's row order (#338).
+      ORDER BY i.id IN (SELECT id FROM alias_holds WHERE address = ?1) DESC, i.started_at, i.rowid
       LIMIT 1`,
   ).get(address, exceptPrincipal) as { id: string } | null)?.id ?? null;
 }
@@ -270,9 +284,9 @@ export function idRow(db: Database, id: string): IdRow | undefined {
   return r ? { ...r, viewer: r.viewer === 1 } : undefined;
 }
 
-/** The sessions not yet ended (viewers aside), every principal's or one's. */
-export function unendedIds(db: Database, principal: string | null = null): string[] {
-  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0 AND (?1 IS NULL OR principal = ?1)`).all(principal) as { id: string }[]).map((r) => r.id);
+/** The sessions not yet ended (viewers aside). */
+export function unendedIds(db: Database): string[] {
+  return (db.prepare(`SELECT id FROM ids WHERE ended_at IS NULL AND viewer = 0`).all() as { id: string }[]).map((r) => r.id);
 }
 
 /** The statuses set on these sessions, by ID. */
@@ -442,6 +456,15 @@ export function heldNote(name: string, holder: string): string {
  */
 export function restoreNote(name: string, why: string, holdsOthers = false): string {
   return `This grayboard process restarted; the one before it held "${name}", but ${why}, so ${holdsOthers ? "this session doesn't hold it" : "this one started without a name"}.`;
+}
+
+/**
+ * A restart took back `names` from its record, but the names' history
+ * didn't show the recorded session as their latest binder (#211), so its
+ * peer status wasn't carried over (#260). Said only when it had one.
+ */
+export function unverifiedRestoreNote(names: string[]): string {
+  return `This grayboard process restarted and took back ${names.map((n) => `"${n}"`).join(", ")}, but another session bound ${names.length > 1 ? "them" : "it"} in between, so the earlier peer status wasn't carried over; peer_status sets it again.`;
 }
 
 /**

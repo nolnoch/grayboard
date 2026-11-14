@@ -44,8 +44,10 @@ beforeEach(() => {
 // server's env file and database) and the server's log.
 afterEach(async () => {
   try {
-    await closeSessions();
-    await Promise.all(hosted.splice(0).map((h) => h.close()));
+    // Every session closes, and the list empties, whichever close fails.
+    const closed = await Promise.allSettled([closeSessions(), ...hosted.splice(0).map((h) => h.close())]);
+    const failed = closed.find((r) => r.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   } finally {
     const s = server;
     server = undefined;

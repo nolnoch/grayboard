@@ -10,6 +10,11 @@ import { parseBoardResourceUri, type Resources } from "./resources.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 
+// bind and unbind inputs for both hosted roles, the native agent's and the subscriber's (#454): BIND_TOOL's and
+// UNBIND_TOOL's fields (src/core/bindings.ts) plus hosted's `where`, the place the session reports.
+export const HOSTED_BIND_INPUT = z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() });
+export const HOSTED_UNBIND_INPUT = z.strictObject({ name: z.string().max(160) });
+
 export type HostedRole = "native" | "subscriber";
 export function hostedRole(request: Request): HostedRole {
   const role = request.headers.get("X-Grayboard-Client");
@@ -155,13 +160,13 @@ export function registerHostedResources(server: McpServer, context: {
   server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: z.strictObject({}) }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
   server.registerTool("bind", {
     description: "Add a name to this root's holds; never enrolls it for host admission.",
-    inputSchema: z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() }),
+    inputSchema: HOSTED_BIND_INPUT,
   }, async (args, ctx) => {
     try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
     catch (error) { return toolError(error); }
   });
   server.registerTool("unbind", {
-    description: "Release one of this root's holds.", inputSchema: z.strictObject({ name: z.string().max(160) }),
+    description: "Release one of this root's holds.", inputSchema: HOSTED_UNBIND_INPUT,
   }, async (args, ctx) => {
     try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.unbind(context.current().principal, context.current().sessionContext, args); }
     catch (error) { return toolError(error); }

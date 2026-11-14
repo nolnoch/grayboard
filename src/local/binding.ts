@@ -11,7 +11,7 @@
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, touchAlias, touchId, viewers, type AliasMetaSet } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, cleanFact, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, setIdFacts, touchAlias, touchId, viewers, type AliasMetaSet, type IdSessionFacts } from "../core/boards.ts";
 import { coreAuditSink, writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
 import { aliasHeldText, childCapacity, childSessionId, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, DEFAULT_IDLE_SECONDS, MAX_CANDIDATES, MAX_CHILDREN, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
@@ -157,11 +157,14 @@ function registerRows(db: Database, s: SessionRow, kind: SessionKind): void {
   db.prepare(
     `INSERT INTO bindings (session_id, pid, proc_start, harness_pid, started_at, harness_rule, attached_pid, attached_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(s.session_id, s.pid, s.proc_start, s.harness_pid, s.started_at, s.harness_rule, s.attached_pid, s.attached_start);
+  const facts = { harness: cleanFact(s.harness), model: cleanFact(model), effort: cleanFact(effort) };
   writeCoreAudit(db, "id.registered", s.session_id, s.session_id, {
     delivery: writesAs === undefined ? "push" : "none", ...(writesAs === undefined ? {} : { writes_as: writesAs }),
     ...(viewer ? { viewer: true } : {}),
     keyed, harness_rule: s.harness_rule, harness_pid: s.harness_pid, pid: s.attached_pid ?? s.pid,
     ...(harnessSession === undefined ? {} : { harness_session: harnessSession }),
+    // The session's self-reported facts, as the server's id.registered records them (#373).
+    ...(facts.harness ? { harness: facts.harness } : {}), ...(facts.model ? { model: facts.model } : {}), ...(facts.effort ? { effort: facts.effort } : {}),
   });
 }
 
@@ -330,8 +333,9 @@ const ATTACH_WAIT_MS = 5000;
  * outside the lock, then re-reads the row inside one. Refused, and audited as
  * id.collision, when the session has ended, another live child is attached,
  * or the row isn't this harness's. `held` is every name the session holds, oldest first.
+ * `facts`: this child's model and effort, which replace the stored ones.
  */
-export async function attachSession(db: Database, s: SessionRow, human: boolean, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
+export async function attachSession(db: Database, s: SessionRow, human: boolean, facts: IdSessionFacts = { model: null, effort: null }, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
   // Only a child of this harness is worth waiting for; any other refuses.
   const predecessor = () => {
     const b = db.prepare(`SELECT pid, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
@@ -370,7 +374,11 @@ export async function attachSession(db: Database, s: SessionRow, human: boolean,
     }
     db.prepare(`UPDATE bindings SET attached_pid = ?, attached_start = ?, detached_at = NULL WHERE session_id = ?`)
       .run(s.attached_pid, s.attached_start, s.session_id);
-    writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid });
+    writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid, held });
+    // The new child reports its own model and effort (#365): what the last
+    // one reported is stale, as for a hosted session's new ownership.
+    const changed = setIdFacts(db, s.session_id, facts);
+    if (changed) writeCoreAudit(db, "id.facts_changed", s.session_id, s.session_id, { before: changed.before, after: changed.after, why: "reattach" });
     return { ok: true, held };
   }).immediate();
 }
@@ -418,7 +426,8 @@ function noRowHolder(db: Database, name: string, deadRow: boolean): string {
  */
 export type Ended = { ended: string[]; wake: string[] };
 
-export const NOTHING_ENDED: Ended = { ended: [], wake: [] };
+// A fresh empty result each call: callers push into what they get back.
+export const nothingEnded = (): Ended => ({ ended: [], wake: [] });
 
 function merge(into: Ended, id: string, r: EndedSession): void {
   into.ended.push(id);
@@ -429,24 +438,33 @@ function merge(into: Ended, id: string, r: EndedSession): void {
 // it everything deliverable against its ID. A 1.x process's name is its
 // bindings row's. endSession ends its child sessions too, so their copies of
 // its liveness row (registerChild) go with it. Callers are inside a transaction.
-function end(db: Database, sessionId: string, why: string | null, now: number): EndedSession {
+// The id.ended row names the process that ended it, and a reap what it saw (#330).
+function end(db: Database, sessionId: string, why: string | null, now: number, evidence?: Record<string, unknown>): EndedSession {
   const row = db.prepare(`DELETE FROM bindings WHERE session_id = ? RETURNING name`).get(sessionId) as { name: string | null } | null;
-  const r = endSession(db, localMail(db), sessionId, { why, legacyNames: row?.name ? [row.name] : [], now });
+  const r = endSession(db, localMail(db), sessionId, { why, legacyNames: row?.name ? [row.name] : [], now, by: { by_pid: process.pid }, ...(evidence ? { evidence } : {}) });
   db.prepare(`DELETE FROM bindings WHERE session_id IN (SELECT id FROM ids WHERE root_id = ?)`).run(sessionId);
   return r;
 }
 
-// Reap rows whose process is gone. Callers are inside a transaction. The
-// rows were judged before it, so each is re-read and re-probed here: another
+// Reap rows whose process is gone. Callers are inside a transaction and pass
+// rows already judged dead on evidence, so each is re-read here: another
 // process may have reaped it already (only the one whose delete removed the
 // row ends the session), or a keyed session's child may have re-attached.
+// An unchanged row needs no new probe, since a process that's gone never
+// comes back; only a changed one is probed again, so the write lock isn't held
+// across a start-time read (a ps spawn on macOS) per candidate (#335).
 export function reap(db: Database, rows: SessionRow[], now: number): Ended {
   const out: Ended = { ended: [], wake: [] };
   for (const r of rows) {
-    const cur = db.prepare(`SELECT pid, proc_start, harness_rule FROM bindings WHERE session_id = ?`).get(r.session_id) as
-      { pid: number; proc_start: string | null; harness_rule: string | null } | null;
-    if (!cur || isAlive(cur.pid, cur.proc_start)) continue;
-    merge(out, r.session_id, end(db, r.session_id, `reaped: ${pidText(cur)} is gone`, now));
+    const cur = db.prepare(`SELECT pid, proc_start, harness_pid, harness_rule FROM bindings WHERE session_id = ?`).get(r.session_id) as
+      { pid: number; proc_start: string | null; harness_pid: number | null; harness_rule: string | null } | null;
+    if (!cur) continue;
+    const unchanged = cur.pid === r.pid && cur.proc_start === r.proc_start;
+    if (!unchanged && isAlive(cur.pid, cur.proc_start)) continue;
+    // `probe`: whether the row was judged dead before the write lock and
+    // left unchanged, or changed and probed again inside it.
+    const reaped = { ...cur, probe: unchanged ? "pre_lock" : "re_probed" };
+    merge(out, r.session_id, end(db, r.session_id, `reaped: ${pidText(cur)} is gone`, now, { reaped }));
   }
   return out;
 }
@@ -474,7 +492,7 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   const silent = new Set((db.prepare(`SELECT id FROM ids WHERE (delivery = 'none' OR viewer = 1) AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
   const alive = live.filter((r) => !silent.has(r.session_id));
   const orphans = db.prepare(`SELECT id FROM ids WHERE ${ORPHAN_WHERE}`).all() as { id: string }[];
-  if (!dead.length && !orphans.length) return { alive, ...NOTHING_ENDED };
+  if (!dead.length && !orphans.length) return { alive, ...nothingEnded() };
   testPause("end:before-txn");
   // Each candidate ends in its own transaction (#284 S3): one end that fails
   // is logged and audited, and leaves the others ended and this opener
@@ -572,7 +590,7 @@ export async function acquireName(
   testPause("bind:before-txn");
   return db.transaction((): AcquireResult => {
     const now = Date.now();
-    let ended = NOTHING_ENDED;
+    let ended = nothingEnded();
     const refuse = (error: string, extra: { holder?: string; known?: string[] } = {}): AcquireResult => {
       logBinding(db, opts.promote?.child ?? sessionId, name, "refused", extra.holder ?? error, now);
       return { ok: false, error, ...extra, ended };

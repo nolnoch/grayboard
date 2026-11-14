@@ -12,8 +12,7 @@ import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
-import { issueOAuth } from "../../tests/helpers/oauth.ts";
-import { randomBytes } from "node:crypto";
+import { issueOAuth, rotateOAuth } from "../../tests/helpers/oauth.ts";
 import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import { sessionContext } from "./hosted.ts";
@@ -89,7 +88,7 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "X-Grayboard-Where": "tools" } },
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
     fetch: async (input, init) => {
       let request = new Request(input, init);
       if (request.method === "POST" && request.body) {
@@ -107,9 +106,13 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   return client;
 }
 
-// #410: tool reads with no session key judge visibility by the user's
-// principal (own and team boards, never another team's) and change nothing.
-for (const mapped of [true, false]) test(`unbound native resource catalog and snapshots match nonconsuming tools, mapped=${mapped}`, async () => {
+// Subscriptions and outbox rows: what a consuming read would change.
+const deliveryState = () => store.db.prepare(`SELECT (SELECT json_group_array(json_array(board, handle, mode, cursor)) FROM subscriptions) AS subs, (SELECT json_group_array(json_array(handle, post_id, delivered_at)) FROM outbox) AS outbox`).get();
+
+// An owner's general and team-only boards, each with a post and a board
+// claim, and an unbound reader: the owner's own principal when mapped, an
+// unrelated user's otherwise.
+async function unboundReader(mapped: boolean) {
   const owner = await connect();
   expect((await owner.callTool({ name: "board_create", arguments: { name: "general", purpose: "visible catalog" } })).isError).not.toBe(true);
   expect((await owner.callTool({ name: "board_post", arguments: { board: "general", body: "open hello" } })).isError).not.toBe(true);
@@ -125,15 +128,27 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
     requestInit: { headers: { Authorization: `Bearer ${access}` } },
     fetch: (input, init) => hosted.fetch(new Request(input, init)),
   }));
-  const state = () => store.db.prepare(`SELECT (SELECT json_group_array(json_array(board, handle, mode, cursor)) FROM subscriptions) AS subs, (SELECT json_group_array(json_array(handle, post_id, delivered_at)) FROM outbox) AS outbox`).get();
-  const before = state();
+  return client;
+}
+
+for (const mapped of [true, false]) test(`unbound native resource catalog lists and reads a visible board, mapped=${mapped}`, async () => {
+  const client = await unboundReader(mapped);
+  const before = deliveryState();
+  const resources = await client.listResources();
+  expect(resources.resources.some(resource => resource.uri === "grayboard://boards/general")).toBe(true);
+  expect((await client.readResource({ uri: "grayboard://boards/general" })).contents.length).toBeGreaterThan(0);
+  expect(deliveryState()).toEqual(before);
+});
+
+// #410: tool reads with no session key judge visibility by the user's
+// principal (own and team boards, never another team's) and change nothing.
+for (const mapped of [true, false]) test(`#410: unbound tool reads judge visibility by principal and change nothing, mapped=${mapped}`, async () => {
+  const client = await unboundReader(mapped);
+  const before = deliveryState();
   const text = (r: { isError?: boolean; content: unknown }) => {
     expect(r.isError).not.toBe(true);
     return JSON.parse((r.content as { text: string }[])[0]!.text);
   };
-  const resources = await client.listResources();
-  expect(resources.resources.some(resource => resource.uri === "grayboard://boards/general")).toBe(true);
-  expect((await client.readResource({ uri: "grayboard://boards/general" })).contents.length).toBeGreaterThan(0);
   const listed = text(await client.callTool({ name: "board_list", arguments: {} })) as { name: string; mode: unknown; unread: number }[];
   const names = listed.map(b => b.name);
   expect(names).toContain("general");
@@ -147,7 +162,7 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
   const claims = text(await client.callTool({ name: "claim_list", arguments: { prefix: "lane:" } })) as { key: string; board: string | null }[];
   expect(claims.map(c => [c.key, c.board])).toEqual([["lane:general", "general"], ["lane:secret", mapped ? "secret" : null]]);
   expect(text(await client.callTool({ name: "peer_list", arguments: { board: "general" } }))).toHaveProperty("peers");
-  expect(state()).toEqual(before);
+  expect(deliveryState()).toEqual(before);
   expect((await client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "unbound" } })).isError).toBe(true);
   expect((await client.callTool({ name: "bind", arguments: { name: "refused", create: true } })).isError).toBe(true);
 });
@@ -167,7 +182,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   expect(peers.peers).toContainEqual(expect.objectContaining({ handle: "alice@example.com/fe", online: true, status: "working", where: "owner" }));
   expect(store.repo.cursors.directFor(owner.session.identityFull)).toBe(0);
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  await expect(new AppSession(application, user, "fe", { probe: "silent" }).connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
+  await expect(new AppSession(application, user, "fe").connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
 });
 
 test("Origin policy precedes authentication and context creation on every HTTP method", async () => {
@@ -185,7 +200,7 @@ test("Origin policy precedes authentication and context creation on every HTTP m
     for (const origin of forbidden) {
       for (const authorization of [undefined, `Bearer ${token}`]) {
         const response = await hosted.fetch(new Request("http://localhost/mcp", {
-          method, headers: { Origin: origin, "X-Grayboard-Identity": "refused", ...(authorization ? { Authorization: authorization } : {}) },
+          method, headers: { Origin: origin, ...(authorization ? { Authorization: authorization } : {}) },
         }));
         expect(response.status).toBe(403);
       }
@@ -513,7 +528,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
   const abort = new AbortController();
   const params = { name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" }, _meta: { ...meta }, ...(version === "2026-07-28" ? { _meta: { ...meta, "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientInfo": { name: "barrier", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } : {}) };
   try {
-    const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params }) }));
+    const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params }) }));
     await selection;
     store.repo.sessions.revokeAllForUser(user.user_id);
     if (stop === "abort") abort.abort(); else await hosted.close();
@@ -575,10 +590,8 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
   await Bun.sleep(0);
   let refreshToken = grant.refreshToken;
   function rotate() {
-    const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();
-    expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
-      ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-    } }, now).status).toBe("ok");
+    const { access, refresh, status } = rotateOAuth(store.repo, grant, refreshToken);
+    expect(status).toBe("ok");
     refreshToken = refresh;
     return access;
   }
@@ -806,10 +819,8 @@ async function dormantFixture(limits?: McpLimits) {
     client, gets, hints, sids, uri, grant, headers, time, tick, sid: [...sids][0]!,
     // Rotates the refresh token on the same grant and sends the new access token from then on.
     refresh() {
-      const access = randomBytes(32).toString("base64url"), next = randomBytes(32).toString("base64url");
-      expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refresh), tokens: {
-        ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(next), accessExpiresAt: time.now + OAUTH_TTL.access, refreshExpiresAt: time.now + OAUTH_TTL.refresh,
-      } }, time.now).status).toBe("ok");
+      const { access, refresh: next, status } = rotateOAuth(store.repo, grant, refresh, time.now);
+      expect(status).toBe("ok");
       refresh = next;
       headers.set("Authorization", `Bearer ${access}`);
       return access;
@@ -824,6 +835,7 @@ const rawLegacy = (method: string, sid: string, access: string) => hosted.fetch(
 
 test("a legacy session idle past access expiry sleeps without admission and resumes on the same sid after refresh", async () => {
   const f = await dormantFixture();
+  const logged = spyOn(console, "error");
   const hostedId = sessionContext(oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${f.grant.token}` } })) as OAuthPrincipal, meta);
   f.time.now += OAUTH_TTL.access + 1;
   f.refresh();
@@ -848,6 +860,9 @@ test("a legacy session idle past access expiry sleeps without admission and resu
   expect(JSON.stringify(rows)).not.toContain(f.sid);
   const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
   expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired"]);
+  // The expected close is audited above, not logged as a stream failure (#494 item 10).
+  expect(logged.mock.calls.filter(args => String(args[0]).includes("mcp.stream"))).toEqual([]);
+  logged.mockRestore();
 });
 
 test("a dormant sid answers 404 to another binding and only its own user's new grant drops it", async () => {
@@ -858,15 +873,17 @@ test("a dormant sid answers 404 to another binding and only its own user's new g
   const stranger = issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
   expect((await rawLegacy("GET", f.sid, stranger)).status).toBe(404);
   expect(hosted.dormantLegacySessions).toBe(1);
-  const regranted = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
-  expect((await rawLegacy("GET", f.sid, regranted)).status).toBe(404);
+  const regranted = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT);
+  expect((await rawLegacy("GET", f.sid, regranted.token)).status).toBe(404);
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "grant_changed"]]);
+  // The drop row names both grants: the one the session had and the one that dropped it (#494 item 9).
+  expect(legacyRows()[1]).toMatchObject({ grant: f.grant.grantId, new_grant: regranted.grantId });
   // Dropped is never resurrected, even for the original grant.
   expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
 });
 
-for (const ending of ["idle", "grant_ended", "deleted"] as const) test(`a dormant legacy session is dropped: ${ending}`, async () => {
+for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) test(`a dormant legacy session is dropped: ${ending}`, async () => {
   const f = await dormantFixture();
   f.time.now += OAUTH_TTL.access + 1;
   f.tick();
@@ -878,6 +895,8 @@ for (const ending of ["idle", "grant_ended", "deleted"] as const) test(`a dorman
   } else if (ending === "grant_ended") {
     store.repo.oauth.revokeToken(hashToken(f.grant.refreshToken), OPENCODE_CLIENT, f.time.now);
     f.tick();
+  } else if (ending === "shutdown") {
+    await hosted.close();
   } else {
     // Teardown reserves no admission.
     expect((await rawLegacy("DELETE", f.sid, f.refresh())).status).toBe(200);
@@ -885,7 +904,28 @@ for (const ending of ["idle", "grant_ended", "deleted"] as const) test(`a dorman
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activeLegacySessions).toBe(0);
   expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", ending]]);
-  if (ending !== "grant_ended") expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
+  if (ending !== "grant_ended" && ending !== "shutdown") expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
+});
+
+test("a full legacy limit refuses rehydration with the session's ref, keeps it dormant, and still lets DELETE drop it (#494 items 1, 3, 7)", async () => {
+  const f = await dormantFixture({ ...DEFAULT_MCP_LIMITS, legacy: { global: 1, perUser: 1 } });
+  f.time.now += OAUTH_TTL.access + 1;
+  f.tick();
+  expect(hosted.dormantLegacySessions).toBe(1);
+  // Another legacy session takes the only admission.
+  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
+  await connect("2025-11-25");
+  expect(hosted.activeLegacySessions).toBe(1);
+  const access = f.refresh();
+  expect((await rawLegacy("GET", f.sid, access)).status).toBe(429);
+  expect(hosted.dormantLegacySessions).toBe(1);
+  const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all().map(row => JSON.parse(row.detail));
+  expect(refused).toEqual([expect.objectContaining({ kind: "legacy", ref: legacyRows()[0]!.ref })]);
+  // Teardown needs no admission, even with the limit full.
+  expect((await rawLegacy("DELETE", f.sid, access)).status).toBe(200);
+  expect(hosted.dormantLegacySessions).toBe(0);
+  expect(hosted.activeLegacySessions).toBe(1);
+  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "deleted"]]);
 });
 
 test("the dormant registry is bounded by the legacy limits", async () => {
@@ -966,7 +1006,7 @@ test("shutdown awaits pending original request source cancellation", async () =>
   let release!: () => void, cancelStarted = false, closed = false;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const body = new ReadableStream<Uint8Array>({ cancel: async () => { cancelStarted = true; await gate; } });
-  const request = new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "Content-Type": "application/json" }, body });
+  const request = new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body });
   const pending = hosted.fetch(request);
   await Bun.sleep(0);
   const closing = hosted.close().then(() => { closed = true; });
@@ -1036,10 +1076,8 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
   // A watched resource keeps the GET attached, so the next subscribe checks it with its old token.
   expect((await client.callTool({ name: "board_create", arguments: { name: "watched", purpose: "keeps the GET attached" } })).isError).not.toBe(true);
   expect(await client.subscribeResource({ uri: "grayboard://boards/watched" })).toEqual({});
-  const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();
-  expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(grant.refreshToken), tokens: {
-    ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-  } }, now).status).toBe("ok");
+  const { access, status } = rotateOAuth(store.repo, grant, grant.refreshToken);
+  expect(status).toBe("ok");
   headers.set("Authorization", `Bearer ${access}`);
   const original = store.repo.oauth.findActiveAccess;
   const fault = kind === "internal" ? new ApplicationError("internal", "SELECT secret FROM private_storage") : new Error("SELECT secret FROM private_storage");
@@ -1113,7 +1151,7 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
   const original = store.repo.oauth.findActiveAccess;
   store.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); };
   try {
-    const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } }));
+    const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
     expect(store.repo.aliases.find(`${user.user_email}/unselected`)).toBeUndefined();
@@ -1245,4 +1283,38 @@ for (const { label, initMeta } of UNBOUND_GETS) test(`peer_list doesn't show an 
     expect(listed.text).not.toContain("unbound_sessions");
     expect(hosted.activeGetStreams).toBe(1);
   } finally { await raw.close(); }
+});
+
+test("an unbound native hosted session lists itself once in peer_list's unbound_sessions (#489)", async () => {
+  const raw = await rawLegacyGet(token);
+  const fresh = { "ai.opencode/sessionID": "lone-root" };
+  try {
+    const listed = await raw.call("peer_list", {}, fresh);
+    const data = JSON.parse(listed.text.split("\n").find(line => line.startsWith("data: "))!.slice(6));
+    const unbound = JSON.parse(data.result.content[0].text).unbound_sessions as { session_id: string; self?: true }[];
+    expect(unbound).toHaveLength(1);
+    expect(unbound[0]).toMatchObject({ self: true });
+  } finally { await raw.close(); }
+});
+
+// #399: a hosted commit names the row it changed, and only the listens reading that row re-check their binding.
+test("an unbind stops only its own session's listen, through the per-row notice (#399)", async () => {
+  const first = await connect(), second = await otherClient();
+  expect((await first.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
+  expect((await first.callTool({ name: "board_create", arguments: { name: "mine", purpose: "first's watch" } })).isError).not.toBe(true);
+  expect((await second.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).not.toBe(true);
+  expect((await second.callTool({ name: "board_create", arguments: { name: "theirs", purpose: "second's watch" } })).isError).not.toBe(true);
+  const kept = await first.listen({ resourceSubscriptions: ["grayboard://boards/mine"] });
+  await second.listen({ resourceSubscriptions: ["grayboard://boards/theirs"] });
+  expect(hosted.activeListens).toBe(2);
+  // A binding change committed outside any request of either session, so only the notice can reach the listens.
+  const rebind = (email: string) => store.repo.hosted.atomic(() => {
+    const row = store.repo.hosted.all().find(r => store.repo.users.findById(r.user_id)?.email === email)!;
+    store.repo.hosted.update({ ...row, bind_gen: row.bind_gen + 1 });
+  });
+  rebind("bob@example.com");
+  await untilHosted(() => hosted.activeListens === 1);
+  rebind("alice@example.com");
+  await untilHosted(() => hosted.activeListens === 0);
+  await kept.close();
 });

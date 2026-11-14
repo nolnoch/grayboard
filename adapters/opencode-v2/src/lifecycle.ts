@@ -4,6 +4,7 @@ import { failureCode, type DiagnosticSink } from "./core/diagnostics.js";
 import type { HostPort, SessionFacts } from "./core/port.js";
 import { Refusal, render } from "./core/model.js";
 import { resolveRoot, type SessionPath } from "./core/sessions.js";
+import { sessionIdentity } from "./core/naming.js";
 import { NativeWire, type Wire } from "./core/wire.js";
 import { observeEvents } from "./core/events.js";
 import { Approval, type OpenCodeEnrollment } from "./approval.js";
@@ -20,6 +21,18 @@ const FACTS_LIMIT = 256;
 // OpenCode's own root session IDs: restored diagnostics for them skip the root lookup.
 export const OPENCODE_SESSION = /^ses_[a-f0-9]{64}$/;
 
+// The name local mode would give a session in the plugin's directory, read once
+// per directory: no BUS_IDENTITY (the plugin's `name` option is the explicit one).
+// Undefined where none derives (the root directory).
+export function suggestion(directory: () => string): () => string | undefined {
+  let at: string | undefined, name: string | undefined;
+  return () => {
+    const dir = directory();
+    if (dir !== at) { at = dir; try { name = sessionIdentity({}, dir); } catch { name = undefined; } }
+    return name;
+  };
+}
+
 // The OpenCode host behind the HostPort: its location, plugin storage,
 // session tree, native MCP grant, metadata approval and synthetic admission.
 function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<string, SessionFacts>): HostPort<OpenCodeEnrollment> {
@@ -30,6 +43,8 @@ function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<s
     ...(options.launcher ? { launcher: true as const } : {}),
     storage: ctx.storage,
     facts: sessionID => facts.get(sessionID),
+    // Local mode's name for this directory (repo or pin, worktree suffix), offered first to an unbound root (#696).
+    suggested: suggestion(() => ctx.location.directory),
     place: () => ctx.location.directory,
     ancestry: sessionID => resolveRoot(sessionID, id => ctx.session.get({ sessionID: id })),
     credential: binding,
@@ -144,7 +159,7 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
     }
     const port = controller.port, enrollment = e;
     let current: string | undefined;
-    const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(launcher ? { launcher: true as const } : {}), ...(port.facts ? { facts: (id: string) => port.facts!(id) } : {}) }, {
+    const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(launcher ? { launcher: true as const } : {}), ...(port.facts ? { facts: (id: string) => port.facts!(id) } : {}), ...(port.suggested ? { suggested: (id: string) => port.suggested!(id) } : {}) }, {
       token: async () => (current = await controller.binding.token(enrollment)),
       onUnauthorized: async () => controller.binding.unauthorized(enrollment, current ?? ""),
     }, signal, sessionID);

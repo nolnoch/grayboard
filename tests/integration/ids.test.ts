@@ -12,13 +12,15 @@ import { storeAttachment } from "../../src/core/attachments.ts";
 import { MAX_CHILDREN, childCapacity, mintSessionKey } from "../../src/core/bindings.ts";
 import { GRAYBOARD_AGENT_META } from "../../src/shared/session_meta.ts";
 import { SqliteBlobs } from "../../src/local/blobs.ts";
+import { endLocalSession } from "../../src/local/binding.ts";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
-import { closeSessions, localSession, stopSession, type Session } from "../support/mcp.ts";
+import { closeSessions, localSession, stopSession, type Session, refusal } from "../support/mcp.ts";
 import { sigkill } from "../support/procs.ts";
 import { releaseBinaries } from "../support/releases.ts";
 import { until } from "../support/until.ts";
+import { busRows, spawnCli as spawnBusCli, pauseEnv as busPauseEnv, releasePause } from "../support/local_bus.ts";
 
 let dir: string;
 
@@ -33,39 +35,19 @@ afterEach(async () => {
 
 const session = (identity?: string): Promise<Session> => localSession(dir, identity);
 
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try {
-    return db.prepare(sql).all(...args) as T[];
-  } finally {
-    db.close();
-  }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
 // An unbound session's own row in peer_list's unbound_sessions.
 const sessionId = async (s: Session): Promise<string> => (((await s.call("peer_list", {})).unbound_sessions as { session_id: string; self?: true }[]).find((u) => u.self)!.session_id);
 const pidOfId = (id: string) => rows<{ pid: number }>(`SELECT pid FROM bindings WHERE session_id = ?`, id)[0]!.pid;
 const endedAt = (id: string) => rows<{ ended_at: number | null }>(`SELECT ended_at FROM ids WHERE id = ?`, id)[0]?.ended_at ?? null;
 
-async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
-  const r = await s.c.callTool({ name, arguments: args });
-  const text = (r.content as { text: string }[])[0]!.text;
-  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
-}
 
 // A CLI process whose stderr is read as it runs, for a test pause.
-function spawnCli(args: string[], extra: Record<string, string>) {
-  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd: dir, env: localEnv(dir, undefined, extra), stdout: "pipe", stderr: "pipe" });
-  let err = "";
-  (async () => {
-    for await (const chunk of p.stderr) err += new TextDecoder().decode(chunk);
-  })();
-  return { p, stderr: () => err };
-}
+const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
-const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
-const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
+const pauseEnv = (point: string) => busPauseEnv(dir, point);
+const release = (point: string) => releasePause(dir, point);
 
 // #284 AC 1, S13: with no name the session is a full participant as its ID,
 // and what it did as the ID stays its own after it binds.
@@ -280,7 +262,7 @@ test("race: a send that commits before the end's transaction is bounced to its s
   await until(() => be.pushes.some((p) => p.meta.kind === "bounce"));
   const bounce = be.pushes.find((p) => p.meta.kind === "bounce")!;
   expect(bounce.meta.parent_id).toBe(String(sent.message_id));
-  expect(bounce.content).toContain(`${id} ended at`);
+  expect(bounce.content).toContain(`\`${id}\` ended at`);
   expect((await be.call("dm_inbox", {})).unanswered).toContainEqual(expect.objectContaining({ id: Number(bounce.meta.message_id), from: id, kind: "bounce" }));
 }, 30_000);
 
@@ -339,7 +321,7 @@ async function asChild<T = unknown>(s: Session, raw: unknown, name: string, args
     return text as T;
   }
 }
-type Who = { id: string; root?: string; child?: true };
+type Who = { id: string; primary?: string; aliases?: string[]; principal?: string | null; root?: string; child?: true };
 type Sent = { message_id: number; delivered_now: boolean };
 async function childRefusal(s: Session, raw: unknown, name: string, args: Record<string, unknown> = {}): Promise<string> {
   const r = await childCall(s, raw, name, args);
@@ -347,7 +329,7 @@ async function childRefusal(s: Session, raw: unknown, name: string, args: Record
   if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
   return text;
 }
-const childSeen = () => rows<{ actor: string; target: string; detail: string }>(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen'`)
+const childSeen = () => rows<{ actor: string; target: string; detail: string }>(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen' ORDER BY rowid`)
   .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
 
 test("a subagent's call is its root's child: its DM and post are stored with its ID and shown as via in pushes and reads; the root's carry none", async () => {
@@ -572,6 +554,37 @@ test("a DM or @mention to a child's ID is refused child_session naming its root'
 const CHILDLESS_SWEEP = "v2.3.1";
 const endWhy = (id: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'id.ended' AND target = ?`, id).map((r) => JSON.parse(r.detail).why);
 
+// #557: a runner child's root is checked live at call start; a write that
+// lands after the root ended (here held at the point just before its
+// transaction) is refused in that transaction, stores nothing, and the next
+// call runs as the runner's own session.
+for (const [point, tool, body] of [["send:before-txn", "dm_send", "dm after the root"], ["board:before-txn", "board_post", "post after the root"]] as const) {
+  test(`a runner child's ${tool} that reaches its transaction after its root ended is refused and stores nothing; its next call is its own session`, async () => {
+    const fe = await runnerRootSession("fe", "pi-1");
+    const root = (await fe.call("whoami")).id as string;
+    await fe.call("board_create", { name: "e2e", purpose: "fixtures" });
+    const be = await localSession(dir, "be");
+    const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1", ...pauseEnv(point) } });
+    const child = ((await runner.call("whoami")) as Who).id;
+    const write = refusal(runner, tool, tool === "dm_send" ? { to: "be", body } : { board: "e2e", body });
+    await until(() => runner.stderr().includes(`test pause hit: ${point}`));
+    // The root's harness here is this test process, which outlives it, so
+    // its end comes as another opener's would: through endLocalSession.
+    await stopSession(fe.c);
+    const w = new Database(join(dir, "bus.db"));
+    try { w.run("PRAGMA busy_timeout = 5000"); endLocalSession(w, root); } finally { w.close(); }
+    expect(endedAt(root)).not.toBeNull();
+    release(point);
+    expect(await write).toBe(`error: child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`);
+    expect(rows(`SELECT id FROM messages WHERE body = ?`, body)).toEqual([]);
+    expect(rows(`SELECT id FROM posts WHERE body = ?`, body)).toEqual([]);
+    const own = (await runner.call("whoami")) as Who;
+    expect(own).toEqual({ id: own.id, primary: own.id, aliases: [], principal: null });
+    expect(own.id).not.toBe(child);
+    expect(be.pushes.filter((p) => p.content === body)).toEqual([]);
+  }, 30_000);
+}
+
 test(`${CHILDLESS_SWEEP} sharing the bus leaves a live root's child live through the root's keyed restart; the root's end ends it and drops its row`, async () => {
   const old = await releaseBinaries(CHILDLESS_SWEEP);
   let fe = await localSession(dir, "fe", { extra: { BUS_SESSION_KEY: mintSessionKey(), ...pauseEnv("attach:before-txn") } });
@@ -738,4 +751,57 @@ test("a child's post and claim announcement are its root's own: none of the root
   // Another session's post is the root's to read, as before.
   await be.call("board_post", { board: "ops", body: "from be" });
   expect(await unread()).toEqual({ e2e: 0, ops: 1 });
+}, 30_000);
+
+// #557 item 2: the runner paths #556 left untested.
+test("a runner child's unbind is refused child_session; a bind refused for a held name leaves it its root's child", async () => {
+  const fe = await runnerRootSession("fe", "pi-1");
+  const root = (await fe.call("whoami")).id as string;
+  await localSession(dir, "be");
+  const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1" } });
+  const who = (await runner.call("whoami")) as Who;
+  expect(await refusal(runner, "unbind", { name: "fe" })).toBe(`error: child_session: this session acts under its root ${root}; unbind is the root's; bind(name) makes this process its own session.`);
+  // be is live: the promotion's bind is refused, and nothing about the runner changes.
+  expect(await refusal(runner, "bind", { name: "be" })).toStartWith("error: ");
+  expect(await runner.call("whoami")).toEqual(who);
+  expect(rows(`SELECT 1 FROM audit_log WHERE action = 'id.promoted'`)).toEqual([]);
+  expect(rows(`SELECT ended_at FROM ids WHERE id = ?`, who.id)).toEqual([{ ended_at: null }]);
+}, 30_000);
+
+test("BUS_PARENT_SESSION with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY refuses to start", async () => {
+  const why = "[grayboard] BUS_PARENT_SESSION makes this process a subagent of the session that recorded it, in place of a session that owns its delivery; it can't be combined with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY";
+  for (const extra of [{ BUS_PUSH: "off" }, { BUS_HUMAN: "1" }, { BUS_SESSION_KEY: mintSessionKey() }] as Record<string, string>[]) {
+    const r = await runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, undefined, { BUS_PARENT_SESSION: "pi-1", ...extra }) });
+    expect({ extra, code: r.code, said: r.err.includes(why) }).toEqual({ extra, code: 1, said: true });
+  }
+}, 30_000);
+
+test("a BUS_HARNESS_SESSION or BUS_PARENT_SESSION that is too long or has a control character refuses to start", async () => {
+  for (const key of ["BUS_HARNESS_SESSION", "BUS_PARENT_SESSION"]) {
+    for (const bad of ["x".repeat(1025), "pi\u0001one"]) {
+      const r = await runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, undefined, { [key]: bad }) });
+      expect({ key, code: r.code, err: r.err.trim() }).toEqual({ key, code: 1, err: `[grayboard] ${key} must be 1 to 1024 characters with no control characters` });
+    }
+  }
+}, 30_000);
+
+test("race: a runner whose root ends between the lookup and its registration runs as its own session, audited with the reason", async () => {
+  const fe = await runnerRootSession("fe", "pi-1");
+  const root = (await fe.call("whoami")).id as string;
+  // Held after it found its live root, before registerChild's transaction.
+  const runner = spawnCli(["mcp", "--mode", "local"], { BUS_PARENT_SESSION: "pi-1", ...pauseEnv("runner:before-register") });
+  await until(() => runner.stderr().includes("test pause hit: runner:before-register"));
+  // The root's harness is this test process: its end comes as another opener's would.
+  await stopSession(fe.c);
+  const w = new Database(join(dir, "bus.db"));
+  try { w.run("PRAGMA busy_timeout = 5000"); endLocalSession(w, root); } finally { w.close(); }
+  release("runner:before-register");
+  await until(() => runner.stderr().includes("this process runs as its own session"), 10_000, "the runner's fallback");
+  runner.p.kill();
+  const line = runner.stderr().split("\n").find((l) => l.includes("this process runs as its own session"))!;
+  expect(line).toStartWith(`[grayboard] BUS_PARENT_SESSION pi-1: id_ended: session ${root} has ended`);
+  const audited = rows<{ actor: string; detail: string }>(`SELECT actor, detail FROM audit_log WHERE action = 'id.child_fallback'`);
+  expect(audited).toHaveLength(1);
+  expect(JSON.parse(audited[0]!.detail)).toMatchObject({ parent_session: "pi-1", why: line.slice("[grayboard] BUS_PARENT_SESSION pi-1: ".length, -"; this process runs as its own session".length) });
+  expect(rows(`SELECT root_id FROM ids WHERE id = ?`, audited[0]!.actor)).toEqual([{ root_id: null }]);
 }, 30_000);

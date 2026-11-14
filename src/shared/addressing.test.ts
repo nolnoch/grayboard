@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { formatDirectAddress, formatTeamAddress, isValidIdentityName, normalizeIdentityName } from "./addressing.ts";
+import { normalizeAliasName } from "../core/addresses.ts";
 
 describe("formatDirectAddress", () => {
   test("produces correct canonical string", () => {
@@ -50,4 +51,16 @@ describe("normalizeIdentityName", () => {
       if (!r.ok) expect(r.error).toContain(`"${raw}"`);
     }
   });
+});
+
+test("a refused name is quoted without control characters and cut at 64 characters (#544 item 3)", () => {
+  const raw = "bad\x1b[2J\nname\x07";
+  for (const r of [normalizeIdentityName(raw), normalizeAliasName(raw)]) {
+    expect(r.ok).toBe(false);
+    const error = (r as { error: string }).error;
+    expect(error).toStartWith('invalid identity name "bad[2Jname"');
+    expect(error).not.toMatch(/\p{Cc}/u);
+  }
+  const long = normalizeIdentityName(`${"x".repeat(70)}!`);
+  expect((long as { error: string }).error).toStartWith(`invalid identity name "${"x".repeat(64)}…"`);
 });

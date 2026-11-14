@@ -20,6 +20,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { reprDigest } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { withMeta } from "../helpers/hosted.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -64,23 +65,10 @@ afterEach(async () => {
 });
 
 const mapped = (url: string) => { const u = new URL(url); return base + u.pathname + u.search; };
-class Browser {
-  cookies = new Map<string, string>();
-  async request(url: string, init: RequestInit = {}) {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(mapped(url), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [key, value] = cookie.split(";")[0]!.split("=");
-      this.cookies.set(key!, value!);
-    }
-    return res;
-  }
-}
 // The full authorization code flow with PKCE S256 a native client runs; only the upstream
 // identity provider is stubbed (`exchangeGoogle`).
 async function grant(clientId: string): Promise<string> {
-  const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url"), browser = new Browser();
+  const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url"), browser = new Browser({ rewrite: mapped });
   const begin = await browser.request(`${issuer}/oauth/authorize?` + new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: redirectUrl, scope: SCOPES, resource, state,
     code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }));
   expect(begin.status).toBe(303);
@@ -88,8 +76,7 @@ async function grant(clientId: string): Promise<string> {
   const callback = await browser.request(`${issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" }));
   expect(callback.status).toBe(303);
   const page = await (await browser.request(callback.headers.get("Location")!)).text();
-  const request = /name="request" value="([^"]+)"/.exec(page)![1]!, csrf = /name="csrf" value="([^"]+)"/.exec(page)![1]!;
-  const approved = await browser.request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ request, csrf, decision: "approve" }) });
+  const approved = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page), "approve", "https://grayboard.example.com");
   expect(approved.status).toBe(303);
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("state")).toBe(state);
@@ -132,7 +119,8 @@ function json(result: CallToolResult) {
 // Native tools answer `error: <message>`, native bind a JSON body, the subscriber role a structured code.
 function refused(result: CallToolResult): unknown {
   expect(result.isError).toBe(true);
-  if (result.structuredContent && "code" in result.structuredContent) return result.structuredContent.code;
+  const structured = result.structuredContent as Record<string, unknown> | undefined;
+  if (structured && "code" in structured) return structured.code;
   const text = textOf(result);
   return text.startsWith("error: ") ? /^error: (\w+)/.exec(text)?.[1] : JSON.parse(text).code;
 }
@@ -146,8 +134,9 @@ async function readResource(c: Conn, uri: string) {
   if (!first || !("text" in first)) throw new Error("expected JSON resource content");
   return JSON.parse(first.text);
 }
-const attachment = (token: string, raw: string, id?: number) => fetch(`${base}/hosted/mcp/attachments${id === undefined ? "?filename=report.txt" : `/${id}`}`, {
-  method: id === undefined ? "POST" : "GET",
+// An upload without `id`; with one, a GET (or `method`) of that attachment.
+const attachment = (token: string, raw: string, id?: number, method = "GET") => fetch(`${base}/hosted/mcp/attachments${id === undefined ? "?filename=report.txt" : `/${id}`}`, {
+  method: id === undefined ? "POST" : method,
   headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": encodeURIComponent(raw), ...(id === undefined ? { "Content-Length": String(bytes.length) } : {}) },
   ...(id === undefined ? { body: bytes } : {}),
 });
@@ -204,6 +193,9 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
   await bind(owner, "owner");
   json(await call(owner, "board_create", { name: "brokered", purpose: "visible to the user" }));
   json(await call(owner, "board_post", { board: "brokered", body: "readable" }));
+  const upload = await attachment(kept, "owner");
+  expect(upload.status).toBe(201);
+  const { id } = await upload.json() as { id: number };
   // De-opt: config is read only at startup, so removing sessionSource takes effect on restart.
   await stop();
   start([operator(BROKER, false)]);
@@ -222,9 +214,11 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
     expect(refused(await call(native, "dm_send", { to: "owner", body: "write" })), label).toBe("unbound");
     expect(refused(await call(sub, "session_register", { child: "child" })), label).toBe("unbound");
     expect(refused(await call(sub, "delivery_open")), label).toBe("unbound");
-    const upload = await attachment(token, "owner");
-    expect(upload.status, label).toBe(403);
-    expect(await upload.json(), label).toMatchObject({ code: "unbound" });
+    for (const [route, response] of [["upload", attachment(token, "owner")], ["GET", attachment(token, "owner", id)], ["DELETE", attachment(token, "owner", id, "DELETE")]] as const) {
+      const r = await response;
+      expect(r.status, `${label} ${route}`).toBe(403);
+      expect(await r.json(), `${label} ${route}`).toMatchObject({ code: "unbound" });
+    }
   }
   expect(app.repo.aliases.find("alice@example.com/intruder")).toBeUndefined();
   expect(app.repo.hosted.all().map(r => r.source_session_id)).toEqual(["owner"]);

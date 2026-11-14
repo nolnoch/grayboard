@@ -34,7 +34,7 @@ export type Caller = { ip: string | null; key: string };
 
 // Why a request cost its address a token, kept for the audit row of the
 // run of refusals it leads to.
-export type FailureReason = "invalid token" | "refused token" | "sign-in";
+export type FailureReason = "refused token" | "sign-in";
 
 export class AuthGate {
   private readonly limiter: RateLimiter;

@@ -15,6 +15,7 @@ import type { Config } from "./config.ts";
 import { BUILTIN_CLIENT_IDS, type OAuthClient } from "./oauth-config.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_browser.ts";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -308,17 +309,6 @@ test("CIMD outage during refresh or revocation returns retryable 503 without bur
   expect(principal(await refreshed.json() as Tokens).grantId).toBe(grant);
 });
 
-class Browser {
-  jar = new Map<string, string>();
-  get cookie() { return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; "); }
-  async request(url: string, init: RequestInit = {}) {
-    const h = new Headers(init.headers);
-    if (this.cookie) h.set("Cookie", this.cookie);
-    const response = await fetch(url, { ...init, headers: h, redirect: "manual" });
-    for (const value of response.headers.getSetCookie()) { const pair = value.split(";")[0]!; const i = pair.indexOf("="); this.jar.set(pair.slice(0, i), pair.slice(i + 1)); }
-    return response;
-  }
-}
 function authorization(clientId = "native", verifier = random(), redirectUri = "http://127.0.0.1:34567/callback", scope = "grayboard:tools") {
   const state = random();
   const url = base + "/oauth/authorize?" + new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", resource: service.resource,
@@ -338,10 +328,10 @@ async function loginConsent(browser: Browser, url: string) {
   const page = await browser.request(next.href);
   expect(page.status).toBe(200);
   const content = await page.text();
-  return { request: /name="request" value="([^"]+)"/.exec(content)![1]!, csrf: /name="csrf" value="([^"]+)"/.exec(content)![1]!, content };
+  return { ...consentForm(content), content };
 }
 async function decide(browser: Browser, data: { request: string; csrf: string }, decision = "approve", origin = base) {
-  return browser.request(base + "/oauth/consent", { method: "POST", headers: { Origin: origin }, body: new URLSearchParams({ request: data.request, csrf: data.csrf, decision }) });
+  return submitConsent(browser, base + "/oauth/consent", data, decision, origin);
 }
 async function issue(clientId = "native", scope = "grayboard:tools", browser = new Browser(), redirectUri?: string) {
   const a = authorization(clientId, undefined, redirectUri, scope);
@@ -621,7 +611,7 @@ test("browser state, cookies, Origin, one-use CSRF, denial and restart invalidat
   const login = await browser.request(callback); expect(login.status).toBe(303);
   expect((await browser.request(callback)).status).toBe(400); expect(exchanges).toBe(1);
   const page = await browser.request(login.headers.get("location")!); const content = await page.text();
-  const data = { request: /name="request" value="([^"]+)"/.exec(content)![1]!, csrf: /name="csrf" value="([^"]+)"/.exec(content)![1]! };
+  const data = consentForm(content);
   expect(page.headers.get("Cache-Control")).toBe("no-store"); expect(page.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
   expect((await decide(browser, data, "approve", "https://evil.example")).status).toBe(403);
   expect((await browser.request(base + "/oauth/consent", { method: "POST", body: new URLSearchParams({ ...data, decision: "approve" }) })).status).toBe(403);
@@ -866,6 +856,31 @@ test("a drained browser-route bucket doesn't block token refresh from the same a
   expect(await tokenPost("/oauth/token", { grant_type: "refresh_token", client_id: "native", refresh_token: tokens.refresh_token, resource: service.resource })).toBe(200);
 });
 
+// A page on another site can make every visitor's browser GET the browser
+// routes as subresources (#404); only a top-level navigation, or a client that
+// sends no Sec-Fetch-Mode, spends the address bucket.
+test("browser-route GETs that aren't navigations cost nothing and reach no client lookup; navigations still spend and 429", async () => {
+  service.close(); config = { ...config, oauthClients: [] }; config.oauthLimit = { burst: 2, perSec: 1 };
+  const clientId = "https://opencode.ai/oauth/opencode/client.json";
+  let reads = 0;
+  service = makeService({ resolve: async () => [{ address: "93.184.216.34", family: 4 }], read: async () => { reads++; return JSON.stringify({ client_id: clientId, client_name: "OpenCode", redirect_uris: ["http://127.0.0.1/callback"], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"] }); } });
+  const url = authorization(clientId).url;
+  const get = (target: string, mode?: string) => service.fetch(new Request(target, mode ? { headers: { "Sec-Fetch-Mode": mode } } : {}), { key: "office" }).then(r => r!.status);
+  const rows = () => storage.db.query("SELECT 1 FROM access_log").all().length;
+  const before = rows();
+  for (let i = 0; i < 50; i++) for (const mode of ["no-cors", "cors", "same-origin", "websocket"]) {
+    expect(await get(url, mode)).toBe(403);
+    expect(await get(base + "/oauth/unknown", mode)).toBe(403);
+  }
+  expect(reads).toBe(0);
+  expect(rows()).toBe(before);
+  // The bucket is untouched: two navigations pass, the third is refused.
+  expect(await get(url, "navigate")).toBe(303);
+  expect(reads).toBe(1);
+  expect(await get(url)).toBe(303);
+  expect(await get(url, "navigate")).toBe(429);
+});
+
 test("expired upstream/consent/code never mints; browser pending capacity and trusted address rate limits bounded", async () => {
   const browser = new Browser(); const a = authorization();
   const r = await browser.request(a.url), google = new URL(r.headers.get("location")!);
@@ -959,7 +974,7 @@ test("official SDK binds one canonical default-port resource while preserving ex
   const callback = await browser.request(mapURL(publicUrl + "/oauth/google/callback?" + new URLSearchParams({ code: "fake-google-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" })));
   expect(callback.status).toBe(303);
   const page = await browser.request(mapURL(callback.headers.get("Location")!)), content = await page.text();
-  const data = { request: /name="request" value="([^"]+)"/.exec(content)![1]!, csrf: /name="csrf" value="([^"]+)"/.exec(content)![1]! };
+  const data = consentForm(content);
   const approved = await browser.request(base + "/hosted/oauth/consent", { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ ...data, decision: "approve" }) });
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("iss")).toBe(publicUrl); expect(returned.searchParams.get("state")).toBe(provider.stateValue);

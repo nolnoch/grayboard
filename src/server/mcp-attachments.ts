@@ -5,6 +5,7 @@ import type { Repo } from "./db.ts";
 import { attachmentDownload, attachmentRelease, attachmentUpload } from "./http.ts";
 import type { createOAuthServer } from "./oauth.ts";
 import type { UploadGate } from "./uploads.ts";
+import { permitsOrigin } from "./origin.ts";
 
 class Refusal extends Error {
   constructor(readonly response: Response) { super("attachment request refused"); }
@@ -22,20 +23,11 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
   const pending = new Set<Promise<Response>>();
   const shutdown = new AbortController();
   let closed = false;
-  // Match MCP's serialized-origin policy; its validator is private to that router.
-  const permitsOrigin = (value: string | null) => {
-    if (value === null) return true;
-    if (!/^https?:\/\/[^\s/@?#,\\]+$/.test(value)) return false;
-    try {
-      const parsed = new URL(value);
-      return value.replace(parsed.protocol === "https:" ? /:443$/ : /:80$/, "") === parsed.origin && parsed.origin === origin;
-    } catch { return false; }
-  };
 
   async function handle(req: Request, url: URL, id: string | undefined): Promise<Response> {
     try {
       if (closed) return error("unavailable", "server closing", 503);
-      if (!permitsOrigin(req.headers.get("Origin"))) return error("forbidden", "invalid origin", 403);
+      if (!permitsOrigin(req.headers.get("Origin"), origin)) return error("forbidden", "invalid origin", 403);
       const principal = oauth.authenticate(req, ["grayboard:tools"]);
       if (principal instanceof Response) return principal;
       if (pending.size >= 128) return error("unavailable", "too many attachment requests", 503);

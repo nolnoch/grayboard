@@ -1,12 +1,13 @@
 // The per-address limit on authentication failures (#240), and the plugin
 // client's side of it: it stops retrying a refused token, and waits out a
 // limited address instead of hammering it.
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY } from "@modelcontextprotocol/client";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
+import { accessAudits } from "../support/audit.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
@@ -49,8 +50,7 @@ const mcpList = (srv: TestServer, token: string, from: string) =>
     }),
   });
 const hostedToken = (srv: TestServer) => issueOAuth(srv.app.repo, srv.app.oauth.resource, A, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT).token;
-const audit = (srv: TestServer, action: string) =>
-  srv.app.db.query(`SELECT actor, target, detail FROM access_log WHERE action = ?`).all(action) as { actor: string | null; target: string; detail: string }[];
+const audit = (srv: TestServer, action: string) => accessAudits(srv.app.db, action);
 
 const X = "198.51.100.1";
 const Y = "198.51.100.2";
@@ -113,7 +113,7 @@ test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev
   for (let i = 0; i < 3; i++) expect((await devLogin(X)).status).toBe(200);
   expect((await devLogin(X)).status).toBe(429);
   // The audit's address is the resolved one, not the raw header.
-  const logins = audit(srv, "auth.login").map((r) => JSON.parse(r.detail).ip);
+  const logins = audit(srv, "auth.login").map((r) => r.detail.ip);
   expect(logins.slice(-3)).toEqual([X, X, X]);
 
   const off = serve({ devAuth: false, googleClientSecret: "s", publicUrl: "https://grayboard.example.com" });
@@ -140,14 +140,21 @@ test("behind the trusted loopback each X-Forwarded-For has its own bucket, trust
 
 test("a run of refusals writes one row and one log line at its start and one at its end", async () => {
   const { srv, clock } = serve();
+  // The limiter's own lines, out of everything else the server logs (#277).
+  const err = spyOn(console, "error");
+  cleanup.push(() => err.mockRestore());
+  const logged = () => err.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("rate-limit"));
   for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", "bad", X);
   for (let i = 0; i < 4; i++) expect((await get(srv, "/api/claims", "bad", X)).status).toBe(429);
+  expect(logged()).toEqual([`[grayboard] rate-limiting ${X} after repeated authentication failures`]);
   const started = audit(srv, "auth.rate_limited");
   expect(started.length).toBe(1);
   expect(started[0]!.actor).toBeNull();
   expect(started[0]!.target).toBe(X);
+  // Stamped by the server's clock, the one the limiter runs on (#297).
+  expect(started[0]!.at).toBe(clock.t);
   // What tripped the limit, and the failure that drained the bucket (#240 audit item 8).
-  expect(JSON.parse(started[0]!.detail)).toEqual({
+  expect(started[0]!.detail).toEqual({
     addr: X, path: "/api/claims", retry_after_ms: 10_000,
     last_failure: { addr: X, path: "/api/whoami", reason: "refused token", ua: expect.any(String) },
   });
@@ -158,7 +165,12 @@ test("a run of refusals writes one row and one log line at its start and one at 
   const ended = audit(srv, "auth.rate_limit_ended");
   expect(ended.length).toBe(1);
   expect(ended[0]!.target).toBe(X);
-  expect(JSON.parse(ended[0]!.detail)).toEqual({ refused: 4 });
+  expect(ended[0]!.at).toBe(clock.t);
+  expect(logged()).toEqual([
+    `[grayboard] rate-limiting ${X} after repeated authentication failures`,
+    `[grayboard] ${X} no longer rate-limited; 4 refused`,
+  ]);
+  expect(ended[0]!.detail).toEqual({ refused: 4 });
   expect(srv.app.authGate.size).toBe(0);
 });
 

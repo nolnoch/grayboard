@@ -1,7 +1,7 @@
 // #430 adapter storage: atomic 0600 files in 0700 dirs, the per-root
 // KeyValueStorage, and the per-root delivery lock.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { deliveryPath, FileRefused, FileStorage, readSmallJson, rootKey, sessionPath, tryDelivery, waitDelivery, writeJsonAtomic } from "../src/storage.ts";
@@ -59,7 +59,7 @@ test("the delivery lock admits one holder; a waiter wins once it is released and
   won.release();
 });
 
-test("readSmallJson: a missing file is undefined; a FIFO, a directory and a file over the cap are refused without blocking; a small file parses (#592)", async () => {
+test("readSmallJson: a missing file is undefined; a FIFO, a directory, a symbolic link and a file over the cap are refused without blocking; a small file parses (#592, #596)", async () => {
   const at = (name: string) => join(dir, name);
   expect(await readSmallJson(at("missing"), 64)).toBeUndefined();
   writeFileSync(at("small"), JSON.stringify({ url: "u" }));
@@ -73,5 +73,7 @@ test("readSmallJson: a missing file is undefined; a FIFO, a directory and a file
   if (process.platform === "win32") return;
   // No writer ever opens it: a blocking open would hang here.
   expect(Bun.spawnSync(["mkfifo", at("fifo")]).exitCode).toBe(0);
-  await expect(readSmallJson(at("fifo"), 64)).rejects.toThrow(new FileRefused("isn't a regular file"));
+  await expect(readSmallJson(at("fifo"), 64)).rejects.toThrow(new FileRefused("isn't a regular file"));  // A link is refused unopened, even to a regular file (#596).
+  symlinkSync(at("small"), at("link"));
+  await expect(readSmallJson(at("link"), 64)).rejects.toThrow(new FileRefused("is a symbolic link"));
 });

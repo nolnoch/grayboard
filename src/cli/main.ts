@@ -11,7 +11,8 @@ import { syncIdentity } from "../shared/claude_identity.ts";
 import type { SessionStartOutput } from "./claude_hooks.ts";
 
 if (process.argv[2] === "hook" && process.argv[3] === "claude") {
-  // Locally a child ends with its root (#548), so SubagentStop writes no marker,
+  // Locally a child ends with its root (#548), so setup installs no SubagentStop (an older
+  // release's entry still lands here and writes no marker),
   // and local mode stores no model or effort, so no facts (#545).
   const event = process.argv[4] ?? "";
   const input = await Bun.stdin.text();

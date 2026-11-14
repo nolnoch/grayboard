@@ -12,7 +12,11 @@
 # Bypass everything (sparingly): git push --no-verify
 set -u
 
-HOOK_SCRIPTS="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# readlink -f follows a symlinked install (.git/hooks/pre-push -> scripts/hooks/pre-push). BSD
+# readlink before macOS 12.3 has no -f and prints nothing: fall back to $0, which core.hooksPath
+# (the documented install) runs directly (#93).
+self="$(readlink -f "$0" 2>/dev/null)" || self=""
+HOOK_SCRIPTS="$(cd "$(dirname "${self:-$0}")/.." && pwd -P)"
 
 # One line per ref on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>.
 # An all-zero local_sha is a deletion; skip it.

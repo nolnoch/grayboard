@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { version } from "../../package.json" with { type: "json" };
 import { piAgentDir } from "../../src/shared/pi.ts";
 import type { Level } from "../hosted-core/src/client.ts";
-import { COMMAND, createGrayboard, toolArgs, toolResult } from "./extension.ts";
+import { COMMAND, createGrayboard, factReader, toolArgs, toolResult } from "./extension.ts";
 import { modelName } from "./omp-instructions.ts";
 
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
@@ -16,6 +16,7 @@ const PREFIX = `mcp__${SERVER}__`;
 
 export default function grayboard(pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
+  const readFacts = factReader(message => { if (ctx?.hasUI) ctx.ui.notify(message, "warning"); else console.error(message); });
   const ext = createGrayboard({
     name: "pi",
     clientId: "grayboard-pi",
@@ -49,7 +50,10 @@ export default function grayboard(pi: ExtensionAPI) {
     record: data => pi.appendEntry("grayboard-delivery", data),
     // tui and rpc outlive a sign-in's browser round trip; print and json exit after one run.
     interactive: () => ctx?.mode === "tui" || ctx?.mode === "rpc",
-    facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? { model: ctx.model ? modelName(ctx.model) : null, effort: pi.getThinkingLevel() } : undefined,
+    facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? readFacts(sessionID, {
+      model: () => ctx?.model ? modelName(ctx.model) : null,
+      effort: () => pi.getThinkingLevel(),
+    }) : undefined,
   });
 
   pi.on("session_start", async (event, context) => {

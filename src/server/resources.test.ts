@@ -14,7 +14,6 @@ import { createTouchQueue, type AuthedUser } from "./auth.ts";
 import { runRetention } from "./retention.ts";
 import type { Config } from "./config.ts";
 import { handleHttp } from "./http.ts";
-import { UploadGate } from "./uploads.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -246,11 +245,10 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
     messageRetentionDays: 90, auditRetentionDays: 90, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
   };
-  const uploads = new UploadGate(4 * store.repo.attachmentLimits.total, store.repo.attachmentLimits.total);
   const touches = createTouchQueue();
   const server = Bun.serve({
     port: 0,
-    fetch: req => handleHttp(req, store.repo, store.db, config, touches, uploads, application.wake, undefined, { disconnectUser: application.disconnectUser, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
+    fetch: req => handleHttp(req, store.repo, store.db, config, touches, application.wake, undefined, { disconnectUser: application.disconnectUser, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
   });
   const base = `http://localhost:${server.port}`;
   try {
@@ -263,7 +261,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     const call = async (token: string, tool: string, args: Record<string, unknown>) => {
       const response = await fetch(`${base}/api/claims/call`, {
         method: "POST", headers: { Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ identity: "be", tool, args }),
+        body: JSON.stringify({ as: "be", tool, args }),
       });
       return { status: response.status, body: await response.json() as Record<string, unknown> };
     };
@@ -486,4 +484,37 @@ test("resource background session storage faults fail closed, but authoritative 
   try { expect(() => resources.list(a)).toThrow("unauthorized"); }
   finally { application.revalidateSession = validate; }
   for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
+});
+
+// #805: a session's watches are counted per session, not by scanning every watch; closing one frees its slot, and
+// a revoked session's watches all close.
+test("per-session watch capacity counts only that session's watches and frees on unwatch and revoke", async () => {
+  const a = await select(alice), b = await select(bob);
+  application.call(a, "board_create", { name: "cap", purpose: "capacity" });
+  application.call(b, "board_create", { name: "other", purpose: "capacity" });
+  const ids = Array.from({ length: 32 }, () => resources.watch(a, "grayboard://boards/cap", hooks()));
+  expect(() => resources.watch(a, "grayboard://boards/cap", hooks())).toThrow("resource watch capacity reached");
+  const theirs = resources.watch(b, "grayboard://boards/other", hooks());
+  resources.unwatch(a, ids[0]!);
+  ids[0] = resources.watch(a, "grayboard://boards/cap", hooks());
+  expect(resources.activeWatchCount).toBe(33);
+  revoked.add(a);
+  expect(() => resources.list(a)).toThrow("resource session is closed or unauthorized");
+  expect(resources.activeWatchCount).toBe(1);
+  resources.unwatch(b, theirs);
+  expect(resources.activeWatchCount).toBe(0);
+});
+
+// #805 F-06: raised watch caps reach both the resource registry and the application's board observers, whose own
+// cap was a hard-coded 1024 that would bind first.
+test("configured watch caps admit past the defaults and refuse at the configured size", async () => {
+  resources.close();
+  application.stopExpiry();
+  application = createApplication(store.repo, store.db, { observerCap: 1100 });
+  resources = createResources(application, { isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
+  const a = await select(alice);
+  application.call(a, "board_create", { name: "wide", purpose: "capacity" });
+  for (let i = 0; i < 1100; i++) resources.watch(a, "grayboard://boards/wide", hooks());
+  expect(resources.activeWatchCount).toBe(1100);
+  expect(() => resources.watch(a, "grayboard://boards/wide", hooks())).toThrow("resource watch capacity reached");
 });

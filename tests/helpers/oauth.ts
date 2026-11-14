@@ -26,3 +26,12 @@ export function issueOAuth(repo: Repo, resource: string, email = "alice@example.
   const authed: AuthedUser = { user_id: user.id, user_email: user.email, session_id: 0 };
   return { token, refreshToken, grantId, authed, tokens, binding, now };
 }
+
+/** Rotates `refreshToken` on the issued grant, as a client's refresh does; the new tokens' lifetimes start at `now`. */
+export function rotateOAuth(repo: Repo, grant: Pick<ReturnType<typeof issueOAuth>, "binding" | "tokens">, refreshToken: string, now = Date.now()) {
+  const access = random(), refresh = random();
+  const status = repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
+    ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
+  } }, now).status;
+  return { access, refresh, status };
+}

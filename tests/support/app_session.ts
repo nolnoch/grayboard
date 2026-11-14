@@ -1,6 +1,6 @@
 // An application-level session: no socket, no frames, no hosted store (#282).
 // It is a session the way application.hostedSession builds one, registered
-// with hostedRegister and given its aliases by application.bind, so tests
+// with hostedRegister and given its aliases by application.bindNow, so tests
 // drive the application's own operations (send, bind, call, replay...) with
 // no transport in between. It is not a hosted-store root: it has no lease, no
 // ownership and no generation, and nothing in the hosted service sees it. A
@@ -11,6 +11,7 @@ import { expect } from "bun:test";
 import { idAddress, mintSessionKey } from "../../src/core/bindings.ts";
 import type { PendingRef } from "../../src/core/boards.ts";
 import {
+  ApplicationError,
   type Application,
   type ApplicationSession,
   type BindResult,
@@ -23,9 +24,12 @@ import {
   type SendResult,
   type UnbindResult,
 } from "../../src/server/application.ts";
-import type { AuthedUser } from "../../src/server/auth.ts";
+import type { startServer } from "../../src/server/app.ts";
+import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
 import type { DelegateRequest, DelegateResult, ErrorCode } from "../../src/shared/protocol.ts";
 import { until } from "./until.ts";
+
+type StartedServer = ReturnType<typeof startServer>;
 
 export type AppEvent =
   | DeliveryEvent
@@ -35,11 +39,8 @@ export type AppEvent =
 // push/hold/key: a session with push: false and no hold is tools-only, whose
 // identity is the alias it writes as; key: the session key its ID derives
 // from, minted when absent. harness: what hostedRegister records. bind:
-// further fields for the identity's bind. probe: how the session answers a
-// bind's probe of its alias (a contender asking whether the holder is alive):
-// "answer" (the default), "silent" (no answer: false after the probe's ms), or
-// a function of the ms. launcher: the declaration a hosted request's
-// `_meta` carries (#473), declared as `rowFor` does.
+// further fields for the identity's bind. launcher: the declaration a hosted
+// request's `_meta` carries (#473), declared as `rowFor` does.
 export type AppSessionOptions = {
   push?: boolean;
   launcher?: boolean;
@@ -47,12 +48,26 @@ export type AppSessionOptions = {
   key?: string;
   harness?: string;
   bind?: Record<string, unknown>;
-  probe?: "answer" | "silent" | ((ms: number) => Promise<boolean>);
 };
 
 // What connect() answers: the session's ID and what its user's instructions
 // would carry, and the bind's result when the identity was bound.
 export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
+
+// An AppSession of the server `app`, signed in with the session token
+// `token` as an API request resolves it; connect() it. The caller closes it.
+export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
+  const authed = verifySessionToken(token, app.repo, app.touches, 0);
+  if (!authed) throw new Error("appSession: the token doesn't authenticate");
+  return new AppSession(app.application, authed, identity, opts);
+}
+
+// The ApplicationError `p` (a connect, a bind, a call) is refused with.
+export async function refusal(p: Promise<unknown>): Promise<ApplicationError> {
+  const e = await p.then(() => undefined, (e: unknown) => e);
+  if (!(e instanceof ApplicationError)) throw new Error(`expected an ApplicationError, got ${e}`);
+  return e;
+}
 
 type Waiter = { pred: (e: AppEvent) => boolean; resolve: (e: AppEvent) => void; reject: (e: Error) => void };
 
@@ -87,14 +102,6 @@ export class AppSession {
       closed: (error) => {
         this.arrive({ kind: "closed", code: error.code, message: error.message });
         this.drop(`closed by the server (${error.code}: ${error.message})`);
-      },
-      probe: (ms) => {
-        const probe = this.opts.probe ?? "answer";
-        if (probe === "answer") return Promise.resolve(!this.closed);
-        if (typeof probe === "function") return probe(ms);
-        const { promise, resolve } = Promise.withResolvers<boolean>();
-        setTimeout(() => resolve(false), ms);
-        return promise;
       },
     };
   }
@@ -140,7 +147,7 @@ export class AppSession {
       const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
       this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
       if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
-      ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.hold === true, this.opts.push !== false));
+      ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false));
     } catch (e) {
       this.drop(`connect refused: ${(e as Error).message}`);
       throw e;
@@ -153,9 +160,9 @@ export class AppSession {
 
   // bind, then the new alias's mail and boards. The first bind makes the
   // session a writer, as a rebuilt hosted session is.
-  async bind(alias: string, extra: { create?: boolean; meta?: unknown; restored_from?: string; previous_key?: string } = {}): Promise<BindResult> {
+  async bind(alias: string, extra: { create?: boolean; meta?: unknown } = {}): Promise<BindResult> {
     const session = this.live();
-    const ok = await this.application.bind(session, { alias, ...extra } as Parameters<Application["bind"]>[1]);
+    const ok = this.application.bindNow(session, { alias, ...extra } as Parameters<Application["bindNow"]>[1]);
     if (session.readOnly) {
       session.readOnly = false;
       session.writerId = this.id;
@@ -253,6 +260,8 @@ export class AppSession {
   }
 
   // The session closes (application.close). Later operations are refused.
+  // Its holds stay: a closed session no longer ends after a grace (#282), so
+  // a test that needs the hold released ends or unbinds it (#475 item 7e).
   close(): void {
     this.drop("closed");
   }

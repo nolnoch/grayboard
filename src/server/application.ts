@@ -5,14 +5,15 @@
 // transport and its hello are gone (#282): a hosted session's lifetime is the
 // hosted store's lease, not a connection's grace.
 import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
-import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
+import { DEFAULT_HOSTED_CAPS } from "./config.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
-import { delegateOkFields, resolveDelegation } from "../core/delegation.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, delegateOkFields, delegateThrottled, resolveDelegation } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, continuityOf, dropHold, holdAlias, holderOf, holdsOf, idAddress, idRow,
+  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
-  type AliasUse, type Candidate, type Continuity,
+  type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
@@ -22,7 +23,7 @@ import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
-  setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, inheritStatus, normalizeBoard, getBoard,
+  setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
@@ -54,7 +55,6 @@ export type DeliveryEvent =
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
-  probe(ms: number): Promise<boolean>;
   closed(error: ApplicationError): void;
 };
 // A hosted session's facts, for its MCP instructions (src/server/mcp.ts).
@@ -67,7 +67,6 @@ export type SessionFacts = {
 export type IdentityInfo = SessionFacts & {
   candidates?: Candidate[];
   identity_full: string;
-  notices?: string[];
 };
 export type SendResult = WireSendResult;
 export type InboxResult = {
@@ -76,18 +75,22 @@ export type InboxResult = {
   undelivered_from_you?: { to: string; n: number; oldest_id: number; last_seen?: string }[];
 };
 export type ApplicationOptions = {
-  probeMs?: number;
   humanReach?: HumanReach;
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
   hostedRequestLimit?: RateLimit;
+  // delegate's limits (#252): per user, and the open requests one launcher may hold.
+  delegateLimit?: RateLimit;
+  delegateOpenCap?: number;
+  // Board observers server-wide: hosted resource watches are observers, so it is their global cap (#805).
+  observerCap?: number;
   // The hub's clock: the rate limiters' and the write-dedup window's
   // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
 };
 // What a session's user facts are: the bridge's human attach answers them.
 export type HelloResult = { id: string } & SessionFacts;
-export type BindResult = { alias: string; held: string[]; notices?: string[]; restored?: Continuity };
+export type BindResult = { alias: string; held: string[]; notices?: string[] };
 export type UnbindResult = { alias: string; released: boolean; held: string[]; left?: string[] };
 
 /**
@@ -134,8 +137,6 @@ export class ApplicationSession {
   holds: string[] = [];
   // A tools-only session (S7): writes as writes_as, binds nothing.
   toolsOnly = false;
-  // Ended by its `end` (S4): any later call is refused.
-  ended = false;
   // Why it closed, when the server closed it: what a later call is told.
   closedBy?: ApplicationError;
   // Set by a caller that runs the call inside an outer transaction (hosted's
@@ -188,13 +189,17 @@ type Hub = {
   // address -> the session pushes go to: a push session's ID and its bound
   // aliases, a Slack bridge human's email/human, a hosted lease's name.
   registry: Map<string, ApplicationSession>;
-  // session ID -> the hosted session holding its name (hosted.ts reconcile).
-  hostedHolders: Map<string, ApplicationSession>;
   sessions: Set<ApplicationSession>;
-  probeMs: number;
   humanReach: HumanReach;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
+  // delegate's per-user bucket and the launcher cap (#252). A streak's
+  // rows go to delegateRows while a delegate call runs, to be written where
+  // its outcome keeps them; otherwise (a sweep) at once.
+  delegateLimit: RateLimit;
+  delegateLimiter: RateLimiter;
+  delegateRows: (() => void)[] | undefined;
+  delegateOpenCap: number;
   now: () => number;
   boardChanged: (board: string) => void;
 };
@@ -360,44 +365,36 @@ function createLazily(hub: Hub, authed: AuthedUser, { address, scope }: Exclude<
 }
 
 // Who holds an alias, for an alias_held refusal: its ID and where it runs.
-function describeHolder(hub: Hub, id: string): string {
-  const place = idRow(hub.db, id)?.place;
+// `place` describes the holder's machine, so only its own principal sees it
+// (#349): a team alias's asker can be another member.
+function describeHolder(hub: Hub, id: string, asker: string): string {
+  const row = idRow(hub.db, id);
+  const place = row?.principal === asker ? row.place : null;
   // A hosted root has no connection to disconnect: it is last seen when its client last called (#402).
   const hosted = hub.repo.hosted.get(id);
   if (hosted) return `the hosted session ${id}${place ? `, in ${place}` : ""}, last seen ${Math.floor((hub.now() - hosted.last_seen_at) / 1000)}s ago`;
   return `the session ${id}${place ? `, in ${place}` : ""}`;
 }
 
-// A bind's claim to continue an earlier session on the alias (#211), checked
-// against the alias's history in the bind's transaction. restored_from names
-// a public ID, which any client of the principal can present, so it proves
-// nothing (PR 4 S11, #259): kept as audit, carrying no status. previous_key
-// is the ended session's secret, so it proves descent after a reconnect
-// past the grace (PR 3 S4); a verified one carries the status over.
-function continuity(hub: Hub, authed: AuthedUser, id: string, address: string, m: Omit<BindRequest, "type" | "req_id">): Continuity | undefined {
-  const { db } = hub;
-  if (m.restored_from !== undefined) return { verified: false, detail: `restore claimed from ${m.restored_from}, not verified` };
-  if (m.previous_key === undefined) return undefined;
-  const prev = idAddress(m.previous_key);
-  const row = idRow(db, prev);
-  if (!row || row.principal !== authed.user_email || row.ended_at === null) {
-    return { verified: false, detail: `restore after end not verified: ${prev} isn't an ended session of yours` };
-  }
-  const c = continuityOf(db, address, prev);
-  if (!c.verified) return c;
-  inheritStatus(db, id, prev);
-  return { verified: true, detail: `restored after end of session ${prev}` };
+// A refusal's row, written now, or by the session's `afterRollback` when the call runs inside a transaction
+// the refusal's throw rolls back (#452, #467).
+function rowAfterRollback(session: ApplicationSession, write: () => void) {
+  if (session.afterRollback) session.afterRollback(write); else write();
 }
 
 export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
+  // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
+  // is the session's `afterRollback`, and a streak's audit row, written there where a commit keeps it, is handed
+  // to it as well, to be written again if the transaction rolls back. A refused take always rolls it back.
+  let streakAfterRollback: ((write: () => void) => void) | undefined;
+  const streakRow = (write: () => void) => { write(); streakAfterRollback?.(write); };
+  const delegateRow = (write: () => void) => { if (hub.delegateRows) hub.delegateRows.push(write); else write(); };
   const hub: Hub = {
     repo,
     db,
     registry: new Map(),
-    hostedHolders: new Map(),
     sessions: new Set(),
-    probeMs: opts.probeMs ?? 2000,
     humanReach: opts.humanReach ?? "team",
     slackRunning: opts.slackRunning ?? (() => false),
     now,
@@ -407,13 +404,23 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     helloLimiter: new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
       start: (email, ctx, retryAfterMs) => {
         console.error(`[grayboard] rate-limiting hellos from ${email}`);
-        writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs });
+        streakRow(() => writeAudit(repo, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
       },
       end: (email, refused) => {
         console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
-        writeAudit(repo, "hello.rate_limit_ended", email, null, { refused });
+        streakRow(() => writeAudit(repo, "bind.rate_limit_ended", email, null, { refused }));
       },
     }, opts.now),
+    delegateLimit: opts.delegateLimit ?? DELEGATE_LIMIT,
+    // Keyed by user email, so a user's sessions, aliases and children share
+    // one bucket and a fresh session can't reset it; capped like the
+    // hosted-request limiter's keys would be by users.
+    delegateLimiter: new RateLimiter(opts.delegateLimit ?? DELEGATE_LIMIT, {
+      start: (email, ctx, retryAfterMs) => delegateRow(() => writeAudit(repo, "delegation.throttled", email, email, { ...ctx, retry_after_ms: retryAfterMs })),
+      end: (email, refused) => delegateRow(() => writeAudit(repo, "delegation.throttle_ended", null, email, { refused })),
+    }, opts.now, 10_000),
+    delegateRows: undefined,
+    delegateOpenCap: opts.delegateOpenCap ?? DELEGATE_OPEN_CAP,
     boardChanged(board) {
       afterCommit(db, () => {
         for (const observer of [...observers]) {
@@ -472,7 +479,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
     const id = session.sessionId;
     detach(session);
-    if (hub.hostedHolders.get(id) === session) hub.hostedHolders.delete(id);
     if (session.writerId) touchId(db, session.writerId);
   }
   // The server closes the session: it leaves the hub, and its transport is
@@ -484,7 +490,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     session.sink.closed(error);
   }
   function valid(session: ApplicationSession, allowUnbound = false) {
-    if (session.ended) fail("id_ended", `session ${session.sessionId} has ended`);
     if (!session.active || !hub.sessions.has(session)) {
       // A superseded bridge connection is told so, a revoked tools-only
       // one why it may not write as its alias (S9); any other closed session
@@ -508,8 +513,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Ends sessions, each in its own transaction (bounces, claim releases,
   // holds released), then wakes what that changed and sweeps the freed
   // upload bytes. One end that throws is logged and audited id.end_failed
-  // and leaves the others ended; the next revalidate (a revoked alias) or
-  // start (a leftover) retries it.
+  // and leaves the others ended. Only a revoked alias's end is retried while
+  // the server runs (revalidate re-checks it); a startup leftover's is
+  // retried at the next start, and its holds stay until then (#475 item 2).
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
     const woken = new Set<string>();
@@ -593,7 +599,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
           }
         }
       };
-      if (hosted) repo.hosted.atomic(revoke); else repo.atomic(revoke);
+      if (hosted) repo.hosted.atomic(revoke);
+      else {
+        repo.atomic(revoke);
+        // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
+        // address set and registry entries follow the database, as a bind or unbind's do.
+        for (const s of hub.sessions) if (!s.human && s.sessionId === u.id) setHolds(hub, s, holdsOf(db, u.id));
+      }
     }
     endIds(ended, "revoked");
   }
@@ -624,25 +636,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
   // already holds answers ok and applies only `meta`; the others stay held,
   // and the primary changes only when the session held nothing.
-  // A hosted holder of the alias answers a probe before the bind decides
-  // (#402); bindNow is the rest, synchronous, which a hosted bind needs inside its
-  // transaction (hosted.ts clears a stale hosted contender itself first, so any hosted
-  // holder bindNow sees is live).
-  async function bind(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
-    valid(session, true);
-    const target = bindTarget(hub, session.authed, m.alias);
-    const holder = "error" in target ? null : holderOf(db, target.address);
-    const hosted = holder === null ? undefined : hub.hostedHolders.get(holder);
-    if (hosted && hosted.sessionId !== session.sessionId) {
-      const responding = await hosted.sink.probe(hub.probeMs).catch(() => false);
-      valid(session, true);
-      if (!responding && hub.hostedHolders.get(hosted.sessionId) === hosted) close(hosted);
-    }
-    return bindNow(session, m);
-  }
-  // `refused`: where a refusal's binding row goes when the caller's transaction will roll it back with the throw
-  // (a hosted bind runs inside one); it writes the row after the rollback.
-  function bindNow(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">, refused?: (address: string, detail: string) => void): BindResult {
+  // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
+  // transaction the refusal's throw rolls back, and the row is written after it.
+  function bindNow(session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): BindResult {
     valid(session, true);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
@@ -651,16 +647,18 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Lazy creation is here, after the bind limit: an unlimited create loop
     // would mint aliases without bound. Taken before the held check, so a
     // re-bind loop spends it too.
-    const t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias });
+    streakAfterRollback = session.afterRollback;
+    let t: Take;
+    try { t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAfterRollback = undefined; }
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
     const target = bindTarget(hub, authed, m.alias);
     if ("error" in target) {
-      if (target.address) (refused ?? ((a, d) => logBinding(db, id, a, "refused", d)))(target.address, target.error);
+      if (target.address) { const a = target.address; rowAfterRollback(session, () => logBinding(db, id, a, "refused", target.error)); }
       return fail(target.code, target.error);
     }
     const { address, scope } = target;
     const refuse = (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): never => {
-      (refused ?? ((a, d) => logBinding(db, id, a, "refused", d)))(address, detail);
+      rowAfterRollback(session, () => logBinding(db, id, address, "refused", detail));
       return fail(code, message, extra);
     };
     let meta: AliasMetaSet | undefined;
@@ -687,12 +685,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const message = unknownNameError(scope.name, known);
       return refuse("identity_unknown", message, message, { known });
     }
-    // Another session's hold is never taken over. A hosted
-    // holder was probed by bind (#402), or cleared by the hosted service: one idle
-    // past the hosted window ended and freed the alias; a live one refuses the bind.
+    // Another session's hold is never taken over. The hosted service clears a stale
+    // hosted holder first (#402): one idle past the hosted window ended and freed the
+    // alias; a live one refuses the bind.
     const holder = holderOf(db, address);
     if (holder !== null && holder !== id) {
-      const who = describeHolder(hub, holder);
+      const who = describeHolder(hub, holder, authed.user_email);
       return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who });
     }
     // Another user's tools-only session writing as it holds nothing, but the
@@ -707,21 +705,19 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       return refuse("bad_request", why, why);
     }
 
-    const restored = repo.atomic(() => {
+    repo.atomic(() => {
       createLazily(hub, authed, target, id);
-      const c = continuity(hub, authed, id, address, m);
       holdAlias(db, address, id, now());
-      logBinding(db, id, address, "bound", c?.detail ?? null);
+      logBinding(db, id, address, "bound", null);
       if (meta) setAliasMeta(db, address, meta, id, audit);
       touchAlias(db, address);
-      return c;
     });
 
     setHolds(hub, session, holdsOf(db, id));
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = owedBridgeNotice(repo, authed.user_email);
     const notices = noticesFor(hub, session.addresses, owed ? [owed] : []);
-    return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}), ...(restored ? { restored } : {}) };
+    return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
 
   // unbind (#284 PR 4 S2): release one hold. Its mail queues and its claims
@@ -749,13 +745,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
   const application = {
     repo,
-    // The live session holding `full`: the hub's view, which
-    // a transaction changes only after it commits (the hosted store's
-    // reconcile), as master's holder map did.
-    hostedHolder(full: string): ApplicationSession | undefined {
-      for (const s of hub.hostedHolders.values()) if (s.active && s.holds.includes(full)) return s;
-      return undefined;
-    },
     admitHosted,
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
     hostedCandidates(authed: AuthedUser, suggested: string | null) { return candidates(hub, authed, suggested); },
@@ -767,7 +756,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // place and suggested name (#443), null with no row. `root`: set for a child session (#523),
     // which acts under its root's addresses, never its own ID (not an address), and whose writes
     // carry its ID as `via`.
-    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, hold = false, push = false, root: string | null = null) {
+    hostedSession(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, push = false, root: string | null = null) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
@@ -786,14 +775,14 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const own = idRow(db, id)?.principal === authed.user_email;
       if (!session.readOnly && own) session.writerId = id;
       if (root !== null && own) session.via = id;
-      hub.sessions.add(session);
-      if (hold && holds.length) hub.hostedHolders.set(id, session);
-      if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
+      // Computed before the session is registered: a throw here leaves no holder or route behind (#385 item 9).
       const info: IdentityInfo = {
         identity_full: session.primary,
         ...helloOkFields(hub, authed),
         ...(session.readOnly && session.via === undefined ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
       };
+      hub.sessions.add(session);
+      if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
       return { session, info };
     },
     // The root a hosted child acts under (#523), recorded on the child's ids row, where it outlives the
@@ -884,7 +873,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
-    bind,
     bindNow,
     hostedRefused(id: string, address: string, detail: string) { logBinding(db, id, address, "refused", detail); },
     hostedCollided(authed: AuthedUser, id: string, why: string) { writeAudit(repo, "id.collision", authed.user_email, id, { why }); },
@@ -959,7 +947,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const board = normalizeBoard(boardInput);
       // Snapshot performs the same concealed access check as content reads.
       snapshot(db, reader(session, board), board, { limit: 1 });
-      if (observers.size >= 1024) fail("bad_request", "board observer capacity reached");
+      if (observers.size >= (opts.observerCap ?? DEFAULT_HOSTED_CAPS.watches.global)) fail("bad_request", "board observer capacity reached");
       const observer = { session, board, hooks };
       observers.add(observer);
       return () => removeObserver(observer);
@@ -1003,9 +991,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool));
-      const result = handleCall(hub, session, tool, args, publish);
-      afterCommit(db, () => expiry.arm());
-      return result;
+      // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
+      try { return handleCall(hub, session, tool, args, publish); }
+      finally { afterCommit(db, () => expiry.arm()); }
     },
     // Trusted committed domain operations, not client-supplied invalidations.
     boardsChanged,
@@ -1036,7 +1024,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       for (const id of users) application.disconnectUser(id);
       recheckAliases(null, null);
     },
-    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); },
+    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hub.delegateLimiter.sweep(); },
+    /** How many users have a bind or hosted-request bucket, for tests. */
+    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size, delegate: hub.delegateLimiter.size }),
     stopExpiry() {
       expiry.stop();
       for (const observer of [...observers]) removeObserver(observer);
@@ -1087,26 +1077,37 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput: string | null)
   ).slice(0, MAX_CANDIDATES);
 }
 
-// The user's live sessions with no alias, for peer_list: never another
-// user's (`where` describes their machine). A hold, a tools-only connection or
-// an idle legacy GET isn't listed: it receives nothing. A hosted session with no name is
-// listed as master listed it (#402).
+// The user's unbound hosted roots, for peer_list: never another user's
+// (`where` describes their machine). Read from the durable store (#475), so a
+// root with no request in flight is listed too. A root that holds an alias, a
+// tools-only root (it writes as its writes_as) and a child (it acts as its
+// root) aren't listed; nor is a root whose only live connections are idle
+// legacy GETs, which receive nothing (#431). A hosted session with no name is
+// listed as master listed it (#402). One row per session ID.
 function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
-  const mine = [
-    ...[...hub.sessions].filter((c) => c.transport === "hosted" && c.readOnly && c.listed),
-  ].filter((c) => c.authed.user_id === session.authed.user_id);
-  const statuses = idStatuses(hub.db, mine.map((c) => c.sessionId));
+  const user = session.authed.user_id;
+  // Per live session ID: whether any of its connections is listed (#489: a call adds its own beside others).
+  const live = new Map<string, boolean>();
+  for (const c of hub.sessions) {
+    if (c.transport !== "hosted" || c.authed.user_id !== user) continue;
+    live.set(c.sessionId, (live.get(c.sessionId) ?? false) || c.listed);
+  }
+  const roots = hub.repo.hosted.roots(user).filter((r) =>
+    r.writes_as === null && live.get(r.session_id) !== false && holdsOf(hub.db, r.session_id).length === 0);
+  const statuses = idStatuses(hub.db, roots.map((r) => r.session_id));
   const now = hub.now();
-  return mine.map((c) => {
-    const s = statuses.get(c.sessionId);
-    return unboundPeer(c.sessionId, c.place ?? null, c === session || c.sessionId === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
+  return roots.map((r) => {
+    const s = statuses.get(r.session_id);
+    return unboundPeer(r.session_id, r.place, r.session_id === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
   });
 }
 
 // A bare name means the one of that name in the acting address's own scope,
-// else the one alias anyone has with it (as @name does in a post). Shared
-// with delegate's `to` resolution (#184 review 7): both take bare and
-// mixed-case names through the same path.
+// and only that (as @name does in a post): another user's or team's alias is
+// named in full, so a bare name never wakes someone else's agent by accident
+// (security audit F-08; vision principle 9). The refusal names the full
+// handles that do exist. Shared with delegate's `to` resolution (#184 review
+// 7): both take bare and mixed-case names through the same path.
 type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
 function resolvePeer(repo: Repo, from: string, input: string): Peer {
   const p = addressParts(input);
@@ -1121,10 +1122,8 @@ function resolvePeer(repo: Repo, from: string, input: string): Peer {
     // full handle, as peer_list shows it.
     fail("not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
   }
-  const all = repo.aliases.findAllByName(p.name);
-  const only = all.length === 1 ? addressParts(all[0]!.address) : null;
-  if (only && only.kind !== "bare") return only;
-  const which = all.length ? `several identities are named "${p.name}": ${all.map(i => i.address).sort().join(", ")}` : `no identity is named "${p.name}"`;
+  const all = repo.aliases.findAllByName(p.name).map((i) => i.address).sort();
+  const which = all.length ? `"${p.name}" isn't in your scope; name it in full: ${all.join(", ")}` : `no identity is named "${p.name}"`;
   return fail("not_found", `${which}; peer_list shows exact handles`);
 }
 
@@ -1190,7 +1189,7 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, session.writerId ?? null, uploaderOf(session), session.via ?? null);
+    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1275,7 +1274,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   const { authed } = session;
   // The audit rows name the child that called, beside the routing `via` (#523).
   const byChild = session.via === undefined ? {} : { child: session.via };
-  const refused = (detail: Record<string, unknown>) => (session.afterRollback ?? ((w: () => void) => { w(); }))(() => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
+  const refused = (detail: Record<string, unknown>) => rowAfterRollback(session, () => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
@@ -1294,9 +1293,21 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   // Where a refused send was headed, for its audit row.
   let picked: string | undefined;
   let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
+  // A launcher's open requests: the same window dm_inbox lists by default (#252).
+  const since = hub.now() - inboxDays(undefined) * 86_400_000;
+  const open = (h: string) => repo.messages.openDelegations(h, since);
+  // The limiter's streak rows from this call: written inside the dedup
+  // transaction they'd roll back with it, so they're written after it.
+  const rows: (() => void)[] = [];
+  hub.delegateRows = rows;
   try {
     out = writeOnce(hub, session, "delegate", session.primary, args, m.resend === true, [], () => {
-      const d = resolveDelegation(db, session.primary, { ...m, to }, online, humanReachable);
+      // Checked and spent in here, so a dedup replay is neither charged nor
+      // refused; resend writes again, so it's charged (#252).
+      // The user's bucket, not the address's (#252): the row names the session that tripped it.
+      const t = hub.delegateLimiter.check(authed.user_email, { requester: session.primary, session_id: session.sessionId, ...byChild });
+      if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
+      const d = resolveDelegation(db, session.primary, authed.user_email, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h), open, hub.delegateOpenCap);
       picked = d.to;
       const w = writeSend(hub, session, prepareSend(hub, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
@@ -1306,19 +1317,27 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
         message_id: w.msg.id,
         ...byChild,
       });
+      hub.delegateLimiter.spend(authed.user_email);
       return { payload, ref: w.ref, msg: w.msg };
     });
   } catch (e) {
+    hub.delegateRows = undefined;
+    for (const row of rows) rowAfterRollback(session, row);
     // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
       refused({ reason: e.message, to: m.to });
       throw coreRefusal(e);
     }
+    // A throttled call is audited once per streak (delegation.throttled), not per call.
+    if (e instanceof ApplicationError && e.code === "rate_limited") throw e;
     // A refused send (canSend, a missing identity, a bad body) is a refusal,
     // not a request (#184 review 4).
     if (e instanceof ApplicationError) refused({ reason: e.message, to: picked });
     throw e;
   }
+  hub.delegateRows = undefined;
+  // Committed with the write: kept, and written again should hosted's outer transaction roll back.
+  for (const row of rows) { row(); session.afterRollback?.(row); }
   if ("replay" in out) return out.replay;
   afterCommit(db, () => {
     testPause("write:after-commit");
@@ -1342,12 +1361,7 @@ function handleRetract(hub: Hub, session: ApplicationSession, id: number): { not
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  const retracted = repo.atomic(() => {
-    if (!repo.messages.retract(m.sender, id)) return false;
-    writeAudit(repo, "message.retracted", session.authed.user_email, `message:${id}`, { message_id: id, sender: m.sender, recipient: m.recipient });
-    return true;
-  });
-  if (!retracted) return fail("bad_request", retractRefusal.replied(id));
+  if (!repo.messages.retract(m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
   afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs); });
   return {};
 }

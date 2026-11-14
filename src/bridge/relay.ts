@@ -25,7 +25,8 @@ export type RelayStore = Pick<Store, "thread" | "byTs" | "addThread" | "advance"
 
 export type ChannelParams = { content: string; meta: Record<string, string> };
 
-export type ToolResult = { ok: true; value: any } | { ok: false; error: string };
+// A refusal's `code` (`id_ended`, `not_found`, …) when the bus gave one: the relay words a few for the Slack reader (#428).
+export type ToolResult = { ok: true; value: any } | { ok: false; error: string; code?: string };
 
 /** A file the owner shared in Slack, checked and downloaded. */
 export type SlackFile = AttachmentFile & { slack_file: string };
@@ -548,7 +549,7 @@ export class Relay {
       ),
     );
     const where = row?.thread_ts ?? ts;
-    if (!r.ok) return this.say(where, `⚠️ not sent: ${r.error}`);
+    if (!r.ok) return this.say(where, row ? threadBounce(r) ?? `⚠️ not sent: ${r.error}` : `⚠️ not sent: ${r.error}`);
     const v = r.value as { message_id: number; delivered_now: boolean; recipient_last_seen?: string };
     if (row) this.store.advance(row.thread_ts, v.message_id);
     if (v.delivered_now) await this.react(ts);
@@ -676,4 +677,17 @@ export function fromSlack(s: string): string {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&");
+}
+
+// A reply in a mapped DM thread whose session can't receive it, worded for the
+// Slack reader rather than in session ids and alias bookkeeping (#428). The
+// detail's "it held …" clause (core/session_end.ts heldText) names the aliases
+// that outlive the session; mail to one of them reaches its next holder.
+export function threadBounce(r: { error: string; code?: string }): string | undefined {
+  if (r.code === "not_found") return "⚠️ Your reply wasn't sent: the agent session this thread was with no longer exists, so replies here reach nobody. Start a new message to a named agent instead.";
+  if (r.code !== "id_ended") return undefined;
+  const at = /ended at (\S+?);/.exec(r.error)?.[1];
+  const held = /it held (.+)$/.exec(r.error)?.[1];
+  const names = held && held !== "no alias" ? held : undefined;
+  return `⚠️ Your reply wasn't sent: the agent session this thread was with has ended${at ? ` (${at})` : ""}, so replies here reach nobody.${names ? ` Its names outlive it: message ${names} to reach whoever holds them now.` : " Start a new message to a named agent instead."}`;
 }

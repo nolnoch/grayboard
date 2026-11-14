@@ -14,13 +14,13 @@
 // The process's sign-in (#581): a signed-out call's offer in each role, a
 // subagent taking its root's mode, /grayboard login joining a pending flow,
 // an outcome kept across a session switch, and status's last sign-in line.
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
-import { createGrayboard, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { createGrayboard, factReader, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
@@ -43,6 +43,11 @@ const HELD = "another pi process holds delivery for this session";
 let srv: HostedServer, agentDir: string, stateDir: string, user: number, stopped: boolean;
 const instances: Instance[] = [];
 const PATH = process.env.PATH;
+// The extension reads BUS_IDENTITY at a root's start; a runner started under a bus name must not
+// bind its own name in every test (#816). The tests that set it restore this cleared value.
+const RUNNER_IDENTITY = process.env.BUS_IDENTITY;
+beforeAll(() => { delete process.env.BUS_IDENTITY; });
+afterAll(() => { if (RUNNER_IDENTITY !== undefined) process.env.BUS_IDENTITY = RUNNER_IDENTITY; });
 
 // The extension's per-harness globalThis slot (extension.ts `shared`): each
 // test starts with none, so no sign-in record, mode or voice leaks between tests.
@@ -203,7 +208,7 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
   expect(dm!.content).not.toContain(`human="true"`);
 
   // The Slack bridge's in-process human for this user.
-  const human = await srv.app.application.attachHuman({ user_id: user, user_email: EMAIL, session_id: 0 }, { deliver() {}, probe: async () => true, closed() {} });
+  const human = await srv.app.application.attachHuman({ user_id: user, user_email: EMAIL, session_id: 0 }, { deliver() {}, closed() {} });
   srv.app.application.send(human.session, `${EMAIL}/alpha`, "hello from slack");
   await until(() => alpha.deliveries.length > 1);
   // The first was receipted: the next read admitted only the new item.
@@ -1136,3 +1141,15 @@ test("a /grayboard login pending across a session switch leaves an outcome that 
   expect(b.notices.filter(n => n.message === SIGNED_IN.message)).toHaveLength(1);
   expect(await b.ext.status()).toMatch(LAST("command", "signed in"));
 }, 30_000);
+
+test("factReader reads each fact on its own: a throwing effort keeps the model, leaves effort out, and is said once per session (#547)", () => {
+  const warned: string[] = [];
+  const read = factReader(m => warned.push(m));
+  const readers = { model: () => "anthropic/claude-opus-5-5", effort: (): string | null => { throw new Error("thinking level gone"); } };
+  expect(read("s1", readers)).toEqual({ model: "anthropic/claude-opus-5-5" });
+  expect(read("s1", readers)).toEqual({ model: "anthropic/claude-opus-5-5" });
+  expect(warned).toEqual(["grayboard: couldn't read session s1's effort; the server keeps its last one: thinking level gone"]);
+  expect(read("s2", { model: () => { throw new Error("no model"); }, effort: () => null })).toEqual({ effort: null });
+  expect(warned).toHaveLength(2);
+  expect(read("s1", { model: () => null, effort: () => "high" })).toEqual({ model: null, effort: "high" });
+});

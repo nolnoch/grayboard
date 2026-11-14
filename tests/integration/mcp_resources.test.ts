@@ -11,14 +11,15 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
-import { hashToken, verifySessionToken } from "../../src/server/auth.ts";
-import { AppSession } from "../support/app_session.ts";
+import { hashToken } from "../../src/server/auth.ts";
+import { type AppSession, signedIn } from "../support/app_session.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string, dir: string, clock: number;
 const clients: Client[] = [];
+const appSessions: AppSession[] = [];
 const publicUrl = "https://grayboard.example.com:443/hosted";
 beforeEach(() => {
   clock = Date.now();
@@ -27,6 +28,7 @@ beforeEach(() => {
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
+  for (const s of appSessions.splice(0)) s.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
   await app.stop();
   expect(app.mcp.activeGetStreams).toBe(0);
@@ -38,7 +40,7 @@ afterEach(async () => {
 });
 const issue = (email = "alice@example.com", scopes = ["grayboard:tools", "grayboard:delivery"]) => issueOAuth(app.repo, app.oauth.resource, email, scopes, clock, OPENCODE_CLIENT);
 async function connect(token: string, version = "2026-07-28", role?: string, identity = "be") {
-  const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity });
+  const headers = new Headers({ Authorization: `Bearer ${token}` });
   if (role !== undefined) headers.set("X-Grayboard-Client", role);
   const client = new Client({ name: "resource-test", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
@@ -164,12 +166,12 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: role scopes and s
   await expect(connect(tools.token, version, "subscriber")).rejects.toThrow();
   await expect(connect(delivery.token, version)).rejects.toThrow();
   for (const role of ["native", "Subscriber", "subscriber, subscriber", ""]) {
-    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${tools.token}`, "X-Grayboard-Identity": "be", "X-Grayboard-Client": role } });
+    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${tools.token}`, "X-Grayboard-Client": role } });
     expect(res.status).toBe(400);
     await res.arrayBuffer();
   }
   for (const [role, token, required] of [["subscriber", tools.token, "grayboard:delivery"], [undefined, delivery.token, "grayboard:tools"]] as const) {
-    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", ...(role ? { "X-Grayboard-Client": role } : {}) } });
+    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${token}`, ...(role ? { "X-Grayboard-Client": role } : {}) } });
     expect(res.status).toBe(403);
     expect(res.headers.get("WWW-Authenticate")).toContain(`scope="${required}"`);
     await res.arrayBuffer();
@@ -311,10 +313,9 @@ test("explicit open conflicts with an existing live push owner; native and subsc
   const grant = issue();
   const login = await fetch(base + "/api/auth/dev-login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const { session_token } = await login.json() as { session_token: string };
-  const authed = verifySessionToken(session_token, app.repo, app.touches);
-  if (!authed) throw new Error("the dev-login token doesn't authenticate");
   // The session registers first; the name comes by bind.
-  const owner = new AppSession(app.application, authed, "be");
+  const owner = signedIn(app, session_token, "be");
+  appSessions.push(owner);
   await owner.connect();
   const native = await connect(grant.token);
   const sub = await connect(grant.token, "2026-07-28", "subscriber");

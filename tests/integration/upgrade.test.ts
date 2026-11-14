@@ -24,10 +24,10 @@ import { closeSessions, localSession, mcpSession, stopSession, type Session } fr
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
-import { direct } from "../support/events.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
 import { CLI } from "../support/paths.ts";
 import { newer } from "../../src/cli/update.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
@@ -219,17 +219,7 @@ async function releaseToken(server: ServerProcess, dbPath: string, email: string
   }
   // ServerProcess's public URL: the issuer, and the origin its redirects name.
   const issuer = "http://localhost";
-  const cookies = new Map([["gb_oauth_session", session]]);
-  const request = async (url: string, init: RequestInit = {}) => {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(url.replace(issuer, server.base), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [k, v] = cookie.split(";")[0]!.split("=");
-      cookies.set(k!, v!);
-    }
-    return res;
-  };
+  const browser = new Browser({ cookies: { gb_oauth_session: session }, rewrite: url => url.replace(issuer, server.base) }), request = browser.request.bind(browser);
   const verifier = secret();
   const redirectUri = "http://127.0.0.1:45678/callback";
   const binding = { client_id: HOSTED_CLIENT, redirect_uri: redirectUri, resource: `${issuer}/mcp` };
@@ -239,8 +229,7 @@ async function releaseToken(server: ServerProcess, dbPath: string, email: string
   // Anywhere else (Google's sign-in) means the release refused the hand-written session.
   expect(authorize.headers.get("Location"), "the release didn't accept the hand-written oauth_browsers session").toStartWith(`${issuer}/oauth/consent`);
   const page = await (await request(authorize.headers.get("Location")!)).text();
-  const form = { request: /name="request" value="([^"]+)"/.exec(page)?.[1] ?? "", csrf: /name="csrf" value="([^"]+)"/.exec(page)?.[1] ?? "" };
-  const decided = await request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: issuer }, body: new URLSearchParams({ ...form, decision: "approve" }) });
+  const decided = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page));
   expect(decided.status, page).toBe(303);
   const code = new URL(decided.headers.get("Location")!).searchParams.get("code")!;
   const token = await fetch(`${server.base}/oauth/token`, { method: "POST", body: new URLSearchParams({ ...binding, grant_type: "authorization_code", code, code_verifier: verifier }) });
@@ -326,9 +315,15 @@ function hostedReader(s: HostedSession): Reader {
       await s.next((e) => match(textOf(e)), 10_000);
     },
     quiet: (match) => s.none((e) => match(textOf(e))),
+    // The lease's inbox is every DM past the read point (application.pending), so the first read
+    // that shows `offline` also shows any DM a lost read point would bring back: no window to wait out.
     onlyDm: async (offline) => {
-      await s.next(direct((m) => m.body === offline), 10_000);
-      await s.none(direct());
+      const dms = await until(async () => {
+        const read = (await s.inbox()).filter((item) => item.event.kind === "direct");
+        return read.length ? read : undefined;
+      }, 10_000, `a DM in ${offline}'s recipient's inbox`);
+      expect(dms.map((item) => (item.event.kind === "direct" ? item.event.message.body : ""))).toEqual([offline]);
+      await s.receipt(dms.map((item) => item.id));
     },
     file: (id) => s.download(id),
   };
@@ -381,15 +376,6 @@ function mailbox(path: string, readPointSql: string, newestSql: string): Mailbox
     }
   };
   return { readPoint: (a) => one(readPointSql, a), newest: (a) => one(newestSql, a) };
-}
-
-function hasTable(path: string, name: string): boolean {
-  const db = new Database(path, { readonly: true });
-  try {
-    return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null;
-  } finally {
-    db.close();
-  }
 }
 
 // Waits until each agent's read point covers what it was delivered, takes
@@ -450,7 +436,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
     }
   }
   // A 2.x server keeps read points by address (#284); a 1.x server by identity.
-  const byAddress = hasTable(dbPath, "mailbox_cursors");
+  const byAddress = "mailbox_cursors" in schema(dbPath);
   const m = mailbox(
     dbPath,
     byAddress
@@ -482,24 +468,32 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 }, 60_000);
 
-// #282: this tree's server no longer serves `grayboard mcp --mode server` over WebSocket. A 2.x release's
-// process learns that at its first frame and exits with the refusal inside 2 s; a 1.x one is refused the
-// same way but may only time out (older than 1.10.0 never reads the answer), so for it the contract is that
-// no session is registered.
-test(`server: ${FROM}'s \`mcp --mode server\` is refused by this tree's server`, async () => {
+// #282, #475: this tree's server serves no WebSocket. `/ws`, or any path, answers an upgrade with the
+// ordinary 404 and registers nothing. A v2.3.0-or-later release's CLI refuses `mcp --mode server` itself
+// and exits non-zero inside 2 s. An older release dials the removed transport: with no refusal handler
+// it reads the 404 as a dropped connection and retries until killed (the maintainer's call, #475: no
+// shim for it), so for it the contract is that it never exits 0 and no session is registered.
+test(`server: ${FROM}'s \`mcp --mode server\` gets no session from this tree's server`, async () => {
   label = "refusal";
   srv = new TestServer({ dbPath: join(dir, "grayboard.db") });
   const token = await srv.login("alice@example.com");
+  const upgrade = { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version": "13" };
+  for (const path of ["/ws", "/"]) {
+    const res = await fetch(`${srv.base}${path}`, { headers: { ...upgrade, Authorization: `Bearer ${token}` } });
+    expect(res.status, path).toBe(404);
+    expect(res.headers.get("upgrade"), path).toBeNull();
+  }
   const run = (timeoutMs: number) =>
     runCli(["mcp", "--mode", "server"], { bin: rel.cli, cwd: dir, env: serverEnv(dir, srv!.base, token, "be"), holdStdin: true, timeoutMs });
-  if (FROM.startsWith("v1.")) {
-    await run(15_000).catch(() => undefined);
-  } else {
+  if (HOSTED_ONLY) {
     const started = Date.now();
     const r = await run(2_000);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(r.code).not.toBe(0);
     expect(r.err).toContain("no longer serves `grayboard mcp` over WebSocket");
+  } else {
+    const r = await run(5_000).catch((e: Error) => e);
+    if (!(r instanceof Error)) expect(r.code, r.err).not.toBe(0);
   }
   expect((srv.app.db.prepare(`SELECT COUNT(*) AS n FROM ids`).get() as { n: number }).n).toBe(0);
 }, 30_000);

@@ -1,12 +1,15 @@
 // Local mode's audit trail (the server's is src/server/audit.ts through the
 // Repo facade). The delegation slice writes the same actions both modes
-// write: delegation.requested, delegation.refused, handle.launcher_set;
+// write: delegation.requested, delegation.refused, delegation.throttled,
+// delegation.throttle_ended, handle.launcher_set;
 // message.retracted, which a repeated dm_retract is answered from (#254); and
 // id.collision, a session refused because its ID already has a row;
 // id.ended, a session ended (#284 decision 4), detailing what it held;
 // id.registered, a session's first rows, with how its liveness is kept;
 // id.detached and id.reattached, a keyed session's child exiting and a
 // restart under the same harness taking its place (#284 decision 3);
+// id.facts_changed, a session's model or effort replaced by a new owner's
+// (a keyed re-attach here, #365; a hosted ownership or request, #364);
 // id.reused, a session key re-presented after retention pruned its ended
 // session's row (#284 S10);
 // alias.created, a name's first bind or declaration (#284);
@@ -18,7 +21,7 @@
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "delegation.throttled" | "delegation.throttle_ended" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.facts_changed" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
 
 /**
  * Local mode's own actions beside the shared ones: Claude Code subagent
@@ -55,12 +58,14 @@ export function writeCoreAudit(
 }
 
 // The newest row for this action and target, or undefined.
+// The newest row for (action, target), searched by idx_audit_log_action_target (#295).
+export const AUDIT_LOG_LAST_SQL = `SELECT at, actor, detail FROM audit_log WHERE action = ? AND target = ? ORDER BY at DESC, rowid DESC LIMIT 1`;
 export function lastCoreAudit(
   db: Database,
   action: CoreAuditAction,
   target: string,
 ): { at: number; actor: string | null; detail: string | null } | undefined {
   return (db
-    .prepare(`SELECT at, actor, detail FROM audit_log WHERE action = ? AND target = ? ORDER BY at DESC, rowid DESC LIMIT 1`)
+    .prepare(AUDIT_LOG_LAST_SQL)
     .get(action, target) as { at: number; actor: string | null; detail: string | null } | null) ?? undefined;
 }

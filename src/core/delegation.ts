@@ -16,6 +16,7 @@
 import type { Database } from "bun:sqlite";
 
 import { CoreError } from "./errors.ts";
+import { addressParts } from "./addresses.ts";
 import { ALIAS_SESSION_SQL, humanHandles, lastSeen, primaryHoldSql, rosterHandles } from "./boards.ts";
 import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
 import { RESEND_PARAM, type ToolDef } from "./tools.ts";
@@ -27,25 +28,87 @@ import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 const LAUNCHER_SQL = `SELECT a.address FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
   WHERE i.launcher = 1 AND (a.human IS NULL OR a.human = 0)`;
 
+// Launcher sessions that hold no alias yet (#337): addressable by their ID
+// since #284, so delegable before they pick a name. The same rows
+// liveAddresses lists (not ended, push delivery, not a viewer or a child),
+// launchers only. A bound session is reached through its alias instead.
+const UNBOUND_LAUNCHER_SQL = `SELECT id AS address FROM ids i WHERE launcher = 1 AND ended_at IS NULL
+  AND delivery = 'push' AND viewer = 0 AND root_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM alias_holds ah WHERE ah.id = i.id)`;
+
 // The auto-pick's candidates: one per launcher session, its primary (#284
-// S13), so a session holding several aliases isn't picked several times.
+// S13), so a session holding several aliases isn't picked several times;
+// named launchers by name, then unbound ones by ID.
 export function launchers(db: Database): string[] {
   const primary = `(a.address = ${primaryHoldSql("i.id")} OR NOT EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address))`;
-  return (db.prepare(`${LAUNCHER_SQL} AND ${primary} ORDER BY a.address`).all() as { address: string }[]).map((r) => r.address);
+  const named = db.prepare(`${LAUNCHER_SQL} AND ${primary} ORDER BY a.address`).all() as { address: string }[];
+  const unbound = db.prepare(`${UNBOUND_LAUNCHER_SQL} ORDER BY id`).all() as { address: string }[];
+  return [...named, ...unbound].map((r) => r.address);
 }
 
-// An explicit delegate(to) may name any alias a launcher session holds.
+// An explicit delegate(to) may name any alias a launcher session holds, or
+// an unbound launcher's ID.
 export function isLauncher(db: Database, handle: string): boolean {
+  if (addressParts(handle)?.kind === "id") return !!db.prepare(`${UNBOUND_LAUNCHER_SQL} AND id = ?`).get(handle);
   return !!db.prepare(`${LAUNCHER_SQL} AND a.address = ?`).get(handle);
 }
 
-// Server handles are `email/name` (local handles are bare names, one user per
-// bus). A candidate is in the requester's own user when everything before its
-// last `/` matches the requester's — the same scope the human fallback uses.
-export function sameUser(requester: string, candidate: string): boolean {
-  const cut = requester.lastIndexOf("/");
-  if (cut === -1) return true;
-  return candidate.startsWith(requester.slice(0, cut + 1));
+// Whether `to` names an address that has had a session: a roster alias, or
+// a session ID with a row.
+function everConnected(db: Database, to: string): boolean {
+  if (addressParts(to)?.kind === "id") return !!db.prepare(`SELECT 1 FROM ids WHERE id = ?`).get(to);
+  return rosterHandles(db).includes(to);
+}
+
+// Whether `candidate` is in the requester's own user. The user is the
+// authenticated principal, never an address's spelling: a team alias
+// (`eng/sim`) is shared by every member, so a prefix test would let Alice's
+// `eng/sim` reach Bob's `eng/launcher` (security audit F-01). An ID's user
+// is its ids row's principal; an alias's is the principal of the session
+// that holds it (or, offline, last held it: ALIAS_SESSION_SQL, as the
+// launcher list reads it). Locally every principal is null: one user per
+// bus. No session behind the candidate: not another user's; the roster and
+// launcher checks refuse it as unknown.
+export function sameUser(principal: string | null, candidate: string, db: Database): boolean {
+  const row = addressParts(candidate)?.kind === "id"
+    ? db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(candidate)
+    : db.prepare(`SELECT i.principal FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL} WHERE a.address = ?`).get(candidate);
+  return !row || (row as { principal: string | null }).principal === principal;
+}
+
+// Limits (#252). A requester spends one token per fresh delegation (a dedup
+// replay spends none): a burst, then one every 10s. On a server the bucket is
+// the user's, shared by all their sessions and children; a local session
+// keeps its own. A launcher with DELEGATE_OPEN_CAP requests it hasn't taken
+// (the open count below) is skipped by the auto-pick and refused by name. A
+// server reads both from GRAYBOARD_DELEGATE_* (src/server/config.ts).
+export const DELEGATE_LIMIT = { burst: 60, perSec: 0.1 };
+export const DELEGATE_OPEN_CAP = 20;
+
+// The refusal when the requester's bucket is empty; `from` names whose
+// bucket it is ("your user", "this session").
+export function delegateThrottled(limit: { burst: number; perSec: number }, retryAfterMs: number, from: string): string {
+  const refill = limit.perSec >= 1 ? `${+limit.perSec.toFixed(2)} a second` : `one every ${+(1 / limit.perSec).toFixed(1)}s`;
+  return `too many delegation requests from ${from} (a burst of ${limit.burst}, then ${refill}, #252); retry in ${Math.max(1, Math.ceil(retryAfterMs / 1000))}s`;
+}
+
+// A launcher's open delegations: requests audited as sent to it in the last
+// `since` window whose message still exists (a retracted re-pick doesn't
+// count) and that its side hasn't taken. Taken is the launcher's reply in
+// the request's thread or its dm_ack (launcherInstruction: reply as soon as
+// it's taken); only the request's sender and recipient can thread from it,
+// so any reply not from the requester is the launcher's. Not the requester's
+// promise state: one requester that never settles would pin the launcher.
+// The audit row, not a body prefix, says which DMs are requests, so a plain
+// dm_send can't fill another's launcher. Both modes: auditTable is
+// audit_log locally, access_log on a server.
+export function countOpenDelegations(db: Database, auditTable: "audit_log" | "access_log", launcher: string, since: number): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM ${auditTable} a
+    JOIN messages m ON m.id = json_extract(a.detail, '$.message_id') AND m.recipient = a.target
+    WHERE a.action = 'delegation.requested' AND a.target = ? AND a.at > ?
+      AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = m.id AND r.sender != m.sender)
+      AND NOT EXISTS (SELECT 1 FROM dm_acks k WHERE k.message_id = m.id AND k.reader != m.sender)`).get(launcher, since) as { n: number };
+  return row.n;
 }
 
 const MAX_PERSONA_CHARS = 80;
@@ -70,21 +133,20 @@ function optField(raw: unknown, name: string, max: number): string | undefined {
   return raw === undefined || raw === null ? undefined : field(raw, name, max, true);
 }
 
-// The user's human handle, for the degrade path: local mode's declared human,
-// or (on a server, where handles are user@org/name) the caller's own, built
-// with the address formatter rather than string surgery. Reachability decides
-// the rest: on a server that's real Slack reachability passed in from the
-// mode (the hub knows; a last_seen row isn't reachability); locally, having
-// connected at least once (the bridge is woken by the socket). null when
-// there isn't one.
+// The user's human handle, for the degrade path: on a server, the caller's
+// own user's (built from its principal with the address formatter, never
+// from the requester's address: a team alias's scope is no one's human);
+// locally, the declared human. Reachability decides the rest: on a server
+// that's real Slack reachability passed in from the mode (the hub knows; a
+// last_seen row isn't reachability); locally, having connected at least
+// once (the bridge is woken by the socket). null when there isn't one.
 function humanFallbackHandle(
   db: Database,
   requester: string,
+  principal: string | null,
   reachable: (h: string) => boolean,
 ): string | null {
-  const candidates = requester.includes("/")
-    ? [formatDirectAddress(requester.split("/")[0]!, HUMAN_NAME)]
-    : humanHandles(db);
+  const candidates = principal !== null ? [formatDirectAddress(principal, HUMAN_NAME)] : humanHandles(db);
   for (const h of candidates) {
     if (h !== requester && reachable(h)) return h;
   }
@@ -102,9 +164,16 @@ export type Delegation = { to: string; body: string; humanFallback?: true };
 export function resolveDelegation(
   db: Database,
   requester: string,
+  // The requester's signed-in user (its email) on a server; null locally.
+  principal: string | null,
   args: { persona?: unknown; task?: unknown; context?: unknown; to?: unknown },
   online: (handle: string) => boolean,
   humanReachable?: (humanHandle: string) => boolean,
+  // The requester session's own addresses: never a delegation target (#253).
+  self: (handle: string) => boolean = (h) => h === requester,
+  // A launcher's open delegation requests, against the cap (#252).
+  open: (handle: string) => number = () => 0,
+  cap: number = DELEGATE_OPEN_CAP,
 ): Delegation {
   const persona = field(args.persona, "persona", MAX_PERSONA_CHARS);
   const task = field(args.task, "task", MAX_TASK_CHARS, true);
@@ -114,21 +183,31 @@ export function resolveDelegation(
   if (args.to !== undefined) {
     if (typeof args.to !== "string" || !args.to.trim()) throw new CoreError("to must be a string");
     const to = args.to.trim();
-    if (!sameUser(requester, to)) {
+    if (!sameUser(principal, to, db)) {
       throw new CoreError(`delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`);
     }
-    if (!rosterHandles(db).includes(to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
+    if (!everConnected(db, to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
+    if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
+    if (open(to) >= cap) throw new CoreError(full(to, cap));
     return { to, body: delegationBody(brief) };
   }
 
-  const live = launchers(db).filter((h) => sameUser(requester, h) && h !== requester && online(h));
-  if (live.length) return { to: live[0]!, body: delegationBody(brief) };
+  const live = launchers(db).filter((h) => sameUser(principal, h, db) && !self(h) && online(h));
+  const free = live.find((h) => open(h) < cap);
+  if (free !== undefined) return { to: free, body: delegationBody(brief) };
+  // Every live launcher is full: refused, not degraded to the human. The
+  // fallback would hand a loop's flood to a person (Slack) instead.
+  if (live.length) throw new CoreError(`every live launcher of yours has ${cap} open delegation requests it hasn't taken (the cap, #252); retry once one replies in a request's thread, or start another launcher`);
 
-  const human = humanFallbackHandle(db, requester, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
+  const human = humanFallbackHandle(db, requester, principal, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };
   throw new CoreError("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human to fall back to; start one or pass to");
+}
+
+function full(to: string, cap: number): string {
+  return `"${to}" has ${cap} open delegation requests it hasn't taken (the cap, #252); retry once it replies in one's thread, or pass another launcher`;
 }
 
 // What the launcher session receives. The harness owns the spawn surface: the

@@ -404,6 +404,22 @@ test.each(modes)("a root's bind stops delivery before the call and reopens under
   } finally { await r.controller.close(); }
 });
 
+test.each(modes)("five rebinds in a row each reopen delivery: a bind restarts the run, so lease recovery never accumulates across rebinds (#250) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    const opens = r.named("delivery_open").length;
+    for (let i = 1; i <= 5; i++) {
+      await r.controller.beforeCall({ sessionID: "R", tool: "bind" });
+      const row = r.rows.get("R")!;
+      r.rows.set("R", { ...row, generation: row.generation + 1 });
+      await r.controller.afterCall({ sessionID: "R", tool: "bind", result: { status: "completed", output: { name: "be", ownership: row.ownership, instructions: ["bound"] } } });
+      await until(() => r.root(r.controller)?.state === "active" && r.named("delivery_open").length === opens + i);
+    }
+  } finally { await r.controller.close(); }
+});
+
 test.each(modes)("an unbound result from any tool rebinds the remembered name (%s)", async mode => {
   const r = runtime(mode);
   try {

@@ -299,6 +299,7 @@ export async function main(env: Record<string, string | undefined> = process.env
     shim: shimCommand(join(dataDir, "relay"), join(import.meta.dir, "relay_shim.ts")),
     reader: () => startReader({ command: cfg.grayboard, parentSession: harnessSession, identity: bus.handle, version: VERSION, env: sessionFree(env) }),
     claims: store,
+    progress: (seq, note) => store.setProgress(seq, note),
     // Mirrored tree claims (#675): held on the bus under the factory's name.
     mirror: {
       async take(key, note) {

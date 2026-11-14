@@ -69,8 +69,13 @@ export function dedupWrite<W extends Written>(
     receipts.pruneSession(call.session, since);
     if (!call.resend) {
       const hit = receipts.find(call.session, call.sender, fp, since);
-      // A receipt whose row is gone (retracted, pruned) is a miss: the upsert below replaces it.
-      if (hit && receipts.refExists(hit.ref_kind, hit.ref_id)) {
+      // A receipt whose row is gone (retracted, pruned) is a miss: the upsert
+      // below replaces it, and the audit says why this repeat wrote fresh (#306).
+      if (hit && !receipts.refExists(hit.ref_kind, hit.ref_id)) {
+        writeAudit(repo, "request.receipt_stale", call.actor, call.sender, {
+          tool: call.tool, fp, ref_kind: hit.ref_kind, ref_id: hit.ref_id, first_at: new Date(hit.at).toISOString(), session: call.session,
+        });
+      } else if (hit) {
         const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
         const first_at = new Date(hit.at).toISOString();
         const stored = JSON.parse(hit.result_json) as W["payload"];

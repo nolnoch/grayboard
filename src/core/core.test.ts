@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import {
   cleanPlace,
+  oneLine,
   parseAliasMeta,
   acknowledge,
   activeAnnouncements,
@@ -94,6 +95,51 @@ test("prunePosts reports only boards with committed deleted posts", () => {
   db.run(`CREATE TRIGGER fail_prune BEFORE DELETE ON posts BEGIN SELECT RAISE(ABORT, 'rollback prune'); END`);
   expect(() => prunePosts(db, Date.now() + 1)).toThrow("rollback prune");
   expect(snapshot(db, "be", "kept").posts.map(p => p.body)).toEqual(["new"]);
+});
+
+// #340: prunePosts reads before it writes. Deferred, a commit by another
+// connection between that read and its first write fails the prune with
+// SQLITE_BUSY; immediate, the other writer waits instead.
+test("prunePosts holds the write lock from its first read, so a concurrent writer can't fail it", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gb-prune-")), "bus.db");
+  const a = new Database(path);
+  a.run("PRAGMA journal_mode = WAL");
+  initCoreSchema(a);
+  ensureAlias(a, "be", "test");
+  createBoard(a, "be", "e2e", "test");
+  post(a, "be", "e2e", "old");
+  a.run("UPDATE posts SET created_at = 0");
+  const b = new Database(path);
+  b.run("PRAGMA busy_timeout = 0");
+  let interleaved: string | undefined;
+  const prepare = a.prepare.bind(a);
+  const spy = spyOn(a, "prepare").mockImplementation(((sql: string) => {
+    const stmt = prepare(sql);
+    if (!sql.startsWith("SELECT DISTINCT board FROM posts")) return stmt;
+    const all = stmt.all.bind(stmt);
+    stmt.all = ((...args: unknown[]) => {
+      const rows = all(...(args as []));
+      // Another process writes between the prune's read and its first write.
+      try {
+        b.run("UPDATE boards SET purpose = 'moved on' WHERE name = 'e2e'");
+        interleaved = "wrote";
+      } catch (e) {
+        interleaved = String(e);
+      }
+      return rows;
+    }) as typeof stmt.all;
+    return stmt;
+  }) as typeof a.prepare);
+  try {
+    expect(prunePosts(a, 1)).toEqual(["e2e"]);
+  } finally {
+    spy.mockRestore();
+  }
+  // The other writer was held off, not let through to break the prune.
+  expect(interleaved).toMatch(/SQLITE_BUSY|database is locked/);
+  expect(b.prepare("SELECT COUNT(*) AS n FROM posts").get()).toEqual({ n: 0 });
+  a.close();
+  b.close();
 });
 
 test("snapshots page bounded history without touching cursor, notified_id, or outbox", () => {
@@ -501,6 +547,13 @@ test("claims are exclusive, renewable, and expire", () => {
   db.prepare(`UPDATE claims SET expires_at = 0`).run();
   expect(listClaims(db)).toEqual([]);
   expect(claim(db, "sim", "ticket:ENG-142")).toMatchObject({ ok: true, renewed: false });
+});
+
+// #81: an unknown board refuses with post's wording and writes nothing.
+test("claim_take on a board that doesn't exist is refused by name, not by a foreign key", () => {
+  expect(() => claim(db, "be", "ticket:ENG-142", { board: "e2ee" })).toThrow("no such board #e2ee; see board_list");
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claims`).get()).toEqual({ n: 0 });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_events`).get()).toEqual({ n: 0 });
 });
 
 test("claim_events keeps each claim's history after the row is gone", () => {
@@ -930,7 +983,7 @@ describe("with a scoped access policy", () => {
   });
 
   // #284 S13: an alias's labels reach only a principal that may act in its
-  // scope, and match runs after that cut. ID facts follow the row.
+  // scope, and match runs after that cut; so do its session's facts (F-12).
   test("a team alias's labels are hidden from a non-member's peer_list and its match", () => {
     db.prepare(
       `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task, source_board) VALUES ('eng/x', 'team', 'eng', 'x', 1, 1, 'ENG-142', 'eng')`,
@@ -943,10 +996,24 @@ describe("with a scoped access policy", () => {
     expect(row("be", "id:00000000000be", { task: "eng-142" })).toBeDefined();
     expect(row("be", "id:00000000000be", { scope: "eng" })).toBeDefined();
     const outsider = row("fe", "id:00000000000fe")!;
-    expect(outsider).toMatchObject({ handle: "eng/x", model: "opus" });
+    expect(outsider).toMatchObject({ handle: "eng/x" });
+    expect(outsider.model).toBeUndefined();
+    expect(row("fe", "id:00000000000fe", { model: "opus" })).toBeUndefined();
     expect(outsider.task).toBeUndefined();
     expect(outsider.source_board).toBeUndefined();
     expect(row("fe", "id:00000000000fe", { task: "ENG-142" })).toBeUndefined();
+  });
+
+  // #373 (S10): one scope check per alias scope in a roster, not one per row.
+  test("peer_list checks each alias scope once per call", () => {
+    for (const n of ["x", "y", "z"]) {
+      db.prepare(`INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task) VALUES (?, 'team', 'eng', ?, 1, 1, 'ENG-142')`).run(`eng/${n}`, n);
+    }
+    const checks: string[] = [];
+    setAccess(db, { ...policy, seesAliasMeta: (h, scope) => { checks.push(`${scope.scope_kind}:${scope.scope_ref}`); return policy.seesAliasMeta(h, scope); } });
+    const peers = who(db, "be", { include_offline: true }, () => true, { session: "id:00000000000be" }).peers.filter((p) => p.handle.startsWith("eng/"));
+    expect(peers.map((p) => [p.handle, p.task])).toEqual([["eng/x", "ENG-142"], ["eng/y", "ENG-142"], ["eng/z", "ENG-142"]]);
+    expect(checks.filter((c) => c === "team:eng")).toHaveLength(1);
   });
 
   test("claims hide a board the viewer can't see", () => {
@@ -1164,6 +1231,20 @@ test("a place and an unknown meta key are single bounded lines", () => {
   expect(() => parseAliasMeta({ [key]: "v" })).toThrow(`unknown meta key "k ${"x".repeat(38)}"; known:`);
 });
 
+// #372: bidi controls and zero-width characters go; ZWJ and ZWNJ stay.
+test("oneLine drops bidi controls and zero-width characters but keeps ZWJ and ZWNJ", () => {
+  for (const c of ["\u061c", "\u200e", "\u200f"]) expect(oneLine(`a${c}b`), "bidi mark").toBe("ab");
+  for (const c of ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e"]) expect(oneLine(`a${c}b`), "embedding/override").toBe("ab");
+  for (const c of ["\u2066", "\u2067", "\u2068", "\u2069"]) expect(oneLine(`a${c}b`), "isolate").toBe("ab");
+  for (const c of ["\u200b", "\u2060", "\ufeff"]) expect(oneLine(`a${c}b`), "zero-width").toBe("ab");
+  expect(oneLine("evil\u202eexe.txt")).toBe("evilexe.txt");
+  expect(oneLine(" \u200b a \u200b  b \u2066")).toBe("a b");
+  const family = "\u{1f468}\u200d\u{1f469}\u200d\u{1f467}";
+  expect(oneLine(`team ${family}`)).toBe(`team ${family}`);
+  expect(oneLine("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645")).toBe("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645");
+  expect(cleanPlace("\u202e\u200b")).toBeNull();
+});
+
 // #284 S5 (audit P2): a session's own post is not unread on any of its
 // addresses, whichever one it wrote as.
 test("a post written as one alias is not unread, digested or read back on the session's others", () => {
@@ -1184,4 +1265,15 @@ test("a post written as one alias is not unread, digested or read back on the se
   post(db, "sim", "e2e", "theirs");
   expect(listBoards(db, ["a"])[0]!.unread).toBe(1);
   expect(pendingFor(db, S, { all: true })).toMatchObject([{ kind: "digest", board: "e2e", unread: 1 }]);
+});
+
+// #76: a board purpose and a claim note are one line of status, not storage.
+test("board purpose and claim notes are capped", () => {
+  expect(() => createBoard(db, "be", "long", "p".repeat(501))).toThrow("purpose must be at most 500 chars");
+  createBoard(db, "be", "long", "p".repeat(500));
+  expect(() => claim(db, "be", "ticket:ENG-1", { note: "n".repeat(1001) })).toThrow("note must be at most 1000 chars");
+  expect(claim(db, "be", "ticket:ENG-1", { note: "n".repeat(1000) }).ok).toBe(true);
+  expect(() => release(db, "be", "ticket:ENG-1", "n".repeat(1001))).toThrow("note must be at most 1000 chars");
+  expect(listClaims(db).map((c) => c.key)).toContain("ticket:ENG-1");
+  release(db, "be", "ticket:ENG-1", "done");
 });

@@ -22,6 +22,8 @@ function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  // The mode above applies only to a new file; an existing one keeps its own (#88).
+  chmodSync(file, 0o600);
 }
 
 function output(data: unknown, json: boolean): void {
@@ -363,8 +365,13 @@ program
   .action(async () => {
     // Local credentials go regardless; what the server did decides the message.
     let outcome = "Logged out. The server closed this sign-in's open MCP connections.";
+    const creds = loadCredentials();
+    const server = process.env.GRAYBOARD_SERVER ?? creds?.server;
     try {
-      await makeClient().post("/api/auth/logout");
+      // A file that's corrupt, already signed out or names no server has no
+      // sign-in to revoke; it's still cleared below (#87).
+      if (!server || !creds?.session_token) outcome = "No valid sign-in was stored; the local credentials file is cleared.";
+      else await makeClient().post("/api/auth/logout");
     } catch (e) {
       outcome = e instanceof ApiError
         ? e.status === 401
@@ -576,7 +583,7 @@ slackCmd
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────
 
-// The refusal a `--mode server` gets, and what an old 2.x client's hello is answered with (src/server/ws_refusal.ts).
+// The refusal a `--mode server` gets: the WebSocket transport it dialed is gone (#282).
 function refuseServerMode(mode: string | undefined): void {
   if (mode === "server") {
     console.error(`[grayboard] ${UPGRADE_REFUSAL}`);
@@ -634,7 +641,10 @@ program
   .action((opts: OpenCodeSetupOptions) => {
     try {
       const result = setupOpenCode(opts, OC_PLUGIN.source);
-      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
+      const config = result.changed ? (result.dryRun ? "config changes required" : "config changes applied") : "config unchanged";
+      const adapters = result.adapters ? `; ${result.adapters} carried adapter${result.adapters === 1 ? "" : "s"} ${result.dryRun ? "to disable" : "disabled"}` : "";
+      const migration = result.migrated ? (result.dryRun ? "; recognized migration required" : "; recognized migration") : "";
+      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.${result.mcpName ?? "grayboard"} and plugin source (${config})${adapters}${migration}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
       for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
       console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");
@@ -760,11 +770,17 @@ program
     // `grayboard mcp` entry this step writes would run the local bus, so server mode skips it.
     const opencode = !!Bun.which("opencode");
     if (opts.register && opencode && server) {
-      console.log(`opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server.replace(/\/+$/, "")}/mcp --config <opencode config file> --revision <full git sha>`);
+      console.log(opencodeHostedHint(server));
     }
     const ocGuard = opts.register && opencode && !server ? opencodeShimGuard(OC_DIR) : { skip: false };
     if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
-    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
+    // The prompt can wait indefinitely: classify again after it, so a hosted migration finished meanwhile never gains a second delivery owner.
+    const ocRecheck = () => {
+      const guard = opencodeShimGuard(OC_DIR);
+      if (guard.skip && guard.warning) console.warn(`[grayboard] ${guard.warning}`);
+      return !guard.skip;
+    };
+    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
@@ -778,6 +794,7 @@ program
     const piCli = !!Bun.which("pi");
     if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) await installHarness(PI);
 
+    for (const w of undeliveredEntries()) console.warn(`[grayboard] ${w}`);
     if (failed) return;
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
     console.log(
@@ -791,6 +808,33 @@ program
       ` To bind a name at start, set BUS_IDENTITY in the launch command${server && opencode ? " (OpenCode: grayboard setup-opencode --name)" : ""}.`,
     );
   });
+
+/**
+ * omp, opencode and pi drop MCP notifications, so their grayboard entry must
+ * stay disabled with BUS_PUSH=off and an adapter must deliver (#95). An
+ * enabled push-mode entry with no adapter of either variant runs a delivery
+ * owner whose pushes go nowhere: messages are consumed unseen while senders
+ * see delivered_now. Returns one warning per such harness.
+ */
+function undeliveredEntries(): string[] {
+  const out: string[] = [];
+  const present = (p: string) => { try { lstatSync(p); return true; } catch { return false; } };
+  const harnesses: { name: string; config: HarnessConfig; env: string; adapters: string[] }[] = [
+    { name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] },
+    { name: "opencode", config: OC_CONFIG, env: "environment", adapters: [OC_PLUGIN.path] },
+    { name: "pi", config: PI.config, env: "env", adapters: [PI.local, PI.hosted] },
+  ];
+  for (const h of harnesses) {
+    let e: Entry | undefined;
+    try { e = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})?.[h.config.section]?.grayboard; } catch { continue; }
+    // A remote entry (hosted opencode) runs no `grayboard mcp`.
+    if (!e || typeof e !== "object" || e.enabled === false || e.type === "remote") continue;
+    if ((e[h.env] as Record<string, unknown> | undefined)?.BUS_PUSH === "off") continue;
+    if (h.adapters.some(present)) continue;
+    out.push(`${h.name}: the grayboard entry in ${h.config.path} is enabled with push on, but no grayboard adapter is installed, so ${h.name} drops its pushes and messages to its sessions are consumed unseen. Run \`grayboard setup\` to install the adapter, or remove the entry.`);
+  }
+  return out;
+}
 
 /** A failed adapter refresh step: printed with what to do, and the run fails. */
 function adapterFailed(e: unknown): void {
@@ -863,6 +907,22 @@ program
     if (refresh.exitCode !== 0) console.log("Some adapters weren't refreshed (above); after fixing that, run `grayboard setup`.");
   });
 
+// The server URL without credentials: printed text never repeats a sign-in URL's user:password.
+function withoutCredentials(server: string): string {
+  try {
+    const u = new URL(server);
+    u.username = u.password = "";
+    return u.href.replace(/\/+$/, "");
+  } catch {
+    return server.replace(/\/+$/, "");
+  }
+}
+
+// A team server is reached only through opencode's hosted MCP entry (#282).
+function opencodeHostedHint(server: string | undefined): string {
+  return `opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server ? `${withoutCredentials(server)}/mcp` : "<server url>/mcp"} --config <opencode config file> --revision <full git sha>`;
+}
+
 program
   .command("refresh-adapters", { hidden: true })
   .description("Rewrite installed omp/opencode/pi push adapters from this binary and update an enabled Claude Code plugin")
@@ -879,6 +939,14 @@ program
         try {
           if (putEntry(OC_CONFIG)) console.log(`Disabled the grayboard entry in ${OC_CONFIG.path} (the adapter serves the tools)`);
         } catch (e) { adapterFailed(e); }
+        // Before #282 this entry served the team server on a signed-in machine; now it runs the local bus (#474).
+        // The entry stays (a local opencode bus may be wanted); the user is told how to reach the server.
+        // Signed out (a truncated credentials file) names no server and says nothing.
+        const server = busMode() === "server" ? process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server : undefined;
+        if (server) {
+          console.log(`opencode: the grayboard plugin in ${OC_PLUGIN.path} runs this machine's local bus, not the team server you're signed in to (${withoutCredentials(server)}).`);
+          console.log(opencodeHostedHint(server));
+        }
       }
     }
     // omp and pi: where either variant is installed (and neither is a
@@ -897,6 +965,7 @@ program
         for (const note of r.notes) console.log(note);
       } catch (e) { adapterFailed(e); }
     }
+    for (const w of undeliveredEntries()) console.log(`[grayboard] ${w}`);
     refreshClaude();
   });
 

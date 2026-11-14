@@ -21,6 +21,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { accessAudits } from "../support/audit.ts";
 import { browse as browseConsent } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
 
@@ -35,7 +36,7 @@ let onRefresh: Hook | undefined;
 async function forward(req: IncomingMessage, body: Buffer): Promise<Response> {
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && !["host", "connection", "content-length"].includes(k)) headers.set(k, v);
-  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? body : undefined, redirect: "manual" });
+  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? new Uint8Array(body) : undefined, redirect: "manual" });
 }
 async function relay(upstream: Response, res: ServerResponse) {
   const headers: Record<string, string | string[]> = {};
@@ -108,7 +109,7 @@ async function seed(options: { scopes?: string[]; access?: string; expiresIn?: n
   await writeJsonAtomic(login({ clientId: store.clientId }).path, store);
   return { ...issued, store };
 }
-const audits = (action: string) => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM access_log WHERE action = ?").get(action)!.n;
+const audits = (action: string) => accessAudits(app.db, action).length;
 const grants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ?").get(CLIENT)!.n;
 const liveGrants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ? AND revoked_at IS NULL").get(CLIENT)!.n;
 // The client's fetch, with the requests `answer` picks answered here: a
@@ -240,6 +241,18 @@ test("the link file is gone once the browser answers, before the code exchange (
     return undefined;
   }, () => l.login());
   expect(linked).toBe(false);
+  expect(grants()).toBe(1);
+});
+
+test("present's answered signal aborts once the browser answers, before the code exchange (#506)", async () => {
+  let answered: AbortSignal | undefined;
+  const l = login({ present: async (url, signal) => { answered = signal; expect(signal?.aborted).toBe(false); await browse(url); } });
+  let atExchange: boolean | undefined;
+  await withFetch(async (_url, form) => {
+    if (form?.get("grant_type") === "authorization_code") atExchange = answered?.aborted;
+    return undefined;
+  }, () => l.login());
+  expect(atExchange).toBe(true);
   expect(grants()).toBe(1);
 });
 
@@ -507,7 +520,7 @@ test("while another process refreshes, a token that is still valid serves at onc
   const { store } = await seed({ expiresIn: 30_000 }); // inside the refresh margin, not expired
   const l = login();
   const held = tryAcquire(`${l.path}.refresh.lock`)!;
-  try { expect(await l.token()).toBe(store.access); } finally { held.release(); }
+  try { expect(await l.token()).toBe(store.access!); } finally { held.release(); }
   expect(refreshes).toBe(0);
   expect(await l.read()).toEqual(store);
 }, 10_000);

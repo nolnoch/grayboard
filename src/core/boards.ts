@@ -15,6 +15,7 @@ export type CoreDb = Database;
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_PURPOSE_CHARS = 500;
 
 // A post's or direct message's body, checked alike in both modes (#75).
 export function checkBody(body: unknown): string {
@@ -330,9 +331,16 @@ export function setPlace(db: Database, id: string, place: string | null): void {
 
 const MAX_STATUS = 200;
 
-/** Text as one line: whitespace runs to a space, other control characters dropped, trimmed. */
+// Bidi marks, embeddings, overrides and isolates (U+061C, U+200E-F,
+// U+202A-E, U+2066-9) and zero-width characters (U+200B, U+2060, U+FEFF):
+// they reorder or hide what a peer reads (#372). ZWJ (U+200D) builds emoji
+// sequences and ZWNJ (U+200C) is orthographic in Persian and Indic text, so
+// both stay; that's why this isn't all of \p{Cf}.
+const INVISIBLE = /[\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
+
+/** Text as one line: whitespace runs to a space, other control and bidi/zero-width characters dropped, trimmed. */
 export function oneLine(text: string): string {
-  return text.replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
+  return text.replace(INVISIBLE, "").replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
 }
 
 // One line saying what the session holding `handle` is doing; empty clears
@@ -385,6 +393,8 @@ export function createBoard(
 ): Board {
   const board = normalizeBoard(name);
   if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  // One line, shown in every board_list (#76).
+  if (purpose.length > MAX_PURPOSE_CHARS) throw new CoreError(`purpose must be at most ${MAX_PURPOSE_CHARS} chars`);
   const kind = opts.kind ?? "broadcast";
   if (kind !== "broadcast" && kind !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
   const denied = access(db).checkCreate(handle, scope);
@@ -515,10 +525,12 @@ export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts
 export type BoardUse = "read" | "subscribe" | "post";
 
 // Each of `handles`' view of the boards it can see (of `board` alone, when given).
+// A board summary's columns before mode and unread, shared by both list paths.
+const BOARD_COLUMNS = `b.*, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts`;
+
 function boardViews(db: Database, handles: string[], board: string | null): { handle: string; row: BoardSummary }[] {
   const q = db.prepare(
-    `SELECT b.*, s.mode AS mode,
-            (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
+    `SELECT ${BOARD_COLUMNS}, s.mode AS mode,
             CASE WHEN s.handle IS NULL THEN 0 ELSE
               (SELECT COUNT(*) FROM posts p
                 WHERE p.board = b.name AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}) END AS unread
@@ -552,7 +564,7 @@ export function boardAddress(db: Database, board: string, handles: string[], use
 export function listBoards(db: Database, handles: string[] | BoardPredicate): BoardSummary[] {
   if (typeof handles === "function") {
     const rows = db.prepare(
-      `SELECT b.*, NULL AS mode, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts, 0 AS unread
+      `SELECT ${BOARD_COLUMNS}, NULL AS mode, 0 AS unread
          FROM boards b WHERE b.archived_at IS NULL ORDER BY b.name`,
     ).all() as BoardSummary[];
     return rows.map(showBoard).filter(handles);
@@ -1066,7 +1078,7 @@ export function viewers(db: Database): (handle: string) => boolean {
 
 // A live session with no name yet (#182), addressed by its session ID
 // (#284), with the status it set as that ID.
-export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true } & SessionFacts;
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true; launcher?: true } & SessionFacts;
 
 // `you` is left out only for a viewer, which nothing can address.
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
@@ -1112,8 +1124,9 @@ export const ALIAS_SESSION_SQL = `COALESCE(
 // or a board's subscribers, each with its session's facts (ALIAS_SESSION_SQL).
 // A status is shown only while a session holds the alias: it's the
 // session's, and clears when the session ends (#284 decision 11). An alias's
-// labels are shown only to a caller that may act in its scope (#284 S13),
-// and `match` filters after that cut, so a hidden label can't be probed.
+// labels, and its session's facts, are shown only to a caller that may act
+// in its scope (#284 S13, F-12), and `match` filters after that cut, so a
+// hidden label or fact can't be probed.
 // `online` comes from the mode: a live session that will receive pushes
 // (local: its wakeup socket answers; server: an open connection).
 // `addresses`: the caller's address set, each row of which is its own and
@@ -1172,17 +1185,32 @@ export function who(
   }
   const now = Date.now();
   const all: Peer[] = [];
+  // One scope check per alias scope, not one per row (#373).
+  const viewer = ctx.session ?? handle;
+  const seen = new Map<string, boolean>();
+  const sees = (scope: Omit<AliasScope, "name">): boolean => {
+    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+    let v = seen.get(key);
+    if (v === undefined) seen.set(key, v = acc.seesAliasMeta(viewer, scope));
+    return v;
+  };
   for (const r of rows) {
     if (isViewer(r.handle)) continue;
-    const where = r.cwd ? describeLocation(r.cwd) : r.place;
-    const seesMeta = r.scope_kind !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
-    const session = sessionFacts(r);
+    const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    // The session's facts (where it runs, its status, harness, model, effort,
+    // launcher) follow the labels' cut: an alias's to a caller that may act
+    // in its scope, an ID's to one that may act in its principal's (security
+    // audit F-12). Another user's agent is a handle and its presence, nothing
+    // about their machine or work. Locally every row passes.
+    const seesSession = own.has(r.handle) || (r.scope_kind !== null ? seesMeta : sees({ scope_kind: "person", scope_ref: r.principal }));
+    const where = !seesSession ? null : r.cwd ? describeLocation(r.cwd) : r.place;
+    const session = seesSession ? sessionFacts(r) : {};
     const meta: AliasMeta = {};
     if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
     // An ID row's scope is its principal, which the row doesn't show: it
     // matches only for a caller that may act in that principal's scope (#371).
     if (opts.match) {
-      const idScope = opts.match.scope !== undefined && r.principal !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: "person", scope_ref: r.principal });
+      const idScope = opts.match.scope !== undefined && r.principal !== null && sees({ scope_kind: "person", scope_ref: r.principal });
       const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
       if (!matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
     }
@@ -1194,12 +1222,12 @@ export function who(
       ...(r.id ? { id: r.id } : {}),
       ...(r.mode ? { mode: r.mode } : {}),
       ...(where ? { where } : {}),
-      ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
+      ...(seesSession && r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
       ...session,
       ...meta,
       ...(r.human ? { human: true as const } : {}),
       ...(r.queue_off ? { queue_off: true as const } : {}),
-      ...(r.launcher ? { launcher: true as const } : {}),
+      ...(seesSession && r.launcher ? { launcher: true as const } : {}),
     });
   }
   // A board's roster lists its unbound subscribers by ID among its peers.
@@ -1217,14 +1245,21 @@ function sessionFacts(r: { harness: string | null; model: string | null; effort:
 }
 
 // The mode's unbound sessions with their ID facts, filtered by `match`.
+// `scope` matches an ID's principal with no seesAliasMeta check (unlike the
+// held rows above). That is safe only because every `unbound` list is the
+// caller's own user's sessions: the server's unboundPeers
+// (src/server/application.ts) filters on the caller's user_id, and local mode
+// has one user. A change that lists another user's sessions must add the
+// check here, or a scope match probes their principal (#371, #391).
 function unboundRows(db: Database, unbound: UnboundPeer[], match: PeerMatch | undefined): UnboundPeer[] {
-  const q = db.prepare(`SELECT principal, harness, model, effort FROM ids WHERE id = ?`);
+  const q = db.prepare(`SELECT principal, harness, model, effort, launcher FROM ids WHERE id = ?`);
   const out: UnboundPeer[] = [];
   for (const u of unbound) {
-    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null } | null;
+    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null } | null;
     const session = r ? sessionFacts(r) : {};
     if (match && !matches(match, { id: u.session_id, ...session, scope: r?.principal ?? undefined })) continue;
-    out.push({ ...u, ...session });
+    // An unbound launcher is delegable by its ID (#337), so it's marked as a bound one is (#764).
+    out.push({ ...u, ...session, ...(r?.launcher ? { launcher: true as const } : {}) });
   }
   return out;
 }
@@ -1523,6 +1558,9 @@ export function parseRetentionDays(raw: string | undefined, fallback: number): n
 // the transaction commits.
 export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<string, number>): string[] {
   const counts: Record<string, number> = {};
+  // Immediate: the first statement is a read, and a deferred transaction
+  // whose snapshot another writer advanced fails its first write with
+  // SQLITE_BUSY at once, busy_timeout or not (#340).
   const changed = db.transaction(() => {
     const boards = db.prepare(`SELECT DISTINCT board FROM posts WHERE created_at < ? ORDER BY board`).all(olderThanMs) as { board: string }[];
     const old = `SELECT id FROM posts WHERE created_at < ?`;
@@ -1540,7 +1578,7 @@ export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<s
     ).run(olderThanMs).changes;
     // Expired claims are left to sweepExpired, which announces them.
     return boards.map(b => b.board);
-  })();
+  }).immediate();
   if (deleted) for (const [table, n] of Object.entries(counts)) deleted[table] = (deleted[table] ?? 0) + n;
   return changed;
 }

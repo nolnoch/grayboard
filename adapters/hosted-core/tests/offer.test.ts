@@ -90,6 +90,24 @@ test("an automatic flow that finds the store signed in: no note, no Last, no end
   expect(state.last).toEqual({ origin: "startup", outcome: "signed in", at: 1, said: true });
 });
 
+test("an automatic flow that finds the store signed in runs `current` once, with the ended flow, and never `ended` (#596)", async () => {
+  const state: SignInState = {}, f = signer();
+  const ends: Outcome[] = [], currents: Flow[] = [];
+  const flow = start(state, f.s, { origin: "offer", browser: false, ifSignedOut: true, ended: (_, o) => { ends.push(o); }, current: f => { currents.push(f); } });
+  f.current();
+  await flow.done;
+  expect(currents).toEqual([flow]);
+  expect(currents[0]!.outcome).toBe("current");
+  expect(ends).toEqual([]);
+  expect(state.flow).toBeUndefined();
+  // A signed-in end runs `ended`, not `current`.
+  const g = signer(), later = start(state, g.s, { origin: "offer", browser: false, ifSignedOut: true, ended: (_, o) => { ends.push(o); }, current: f => { currents.push(f); } });
+  g.ok();
+  await later.done;
+  expect(currents).toEqual([flow]);
+  expect(ends).toEqual(["signed in"]);
+});
+
 test("the flow fails: its reason, with a reason quoting the flow's state replaced", async () => {
   let state: SignInState = {}, f = signer();
   let pending = call(state, f.s, 5_000);

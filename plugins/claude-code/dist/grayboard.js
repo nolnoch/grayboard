@@ -6923,7 +6923,7 @@ var require_dist2 = __commonJS(function(exports, module) {
 
 // plugins/claude-code/src/main.ts
 import { readdirSync as readdirSync3 } from "fs";
-import { join as join8 } from "path";
+import { join as join9 } from "path";
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js
 import process2 from "process";
@@ -14168,7 +14168,7 @@ var package_default = {
   scripts: {
     server: "bun src/server/main.ts",
     cli: "bun src/cli/main.ts",
-    typecheck: "tsc --noEmit",
+    typecheck: "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
     test: "bun test --timeout 30000 ./src ./tests",
     "test:opencode": "bash scripts/e2e.sh hosted-strict",
     "test:opencode:host": "bash scripts/e2e.sh hosted-host",
@@ -14180,11 +14180,11 @@ var package_default = {
   dependencies: {
     "@modelcontextprotocol/core": "2.4.0",
     "@modelcontextprotocol/server": "2.4.0",
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
     commander: "^12.0.0",
     jose: "^5.0.0",
     "jsonc-parser": "^3.3.1",
-    zod: "^4.0.0"
+    zod: "^4.2.0"
   },
   devDependencies: {
     "@earendil-works/pi-coding-agent": "1.4.0",
@@ -31562,6 +31562,7 @@ var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 var LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
 var MODEL_META = "io.github.nolnoch.grayboard/model";
 var EFFORT_META = "io.github.nolnoch.grayboard/effort";
+var SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 
 class SubscriberError extends Error {
   code;
@@ -31575,6 +31576,14 @@ class SubscriberError extends Error {
   }
 }
 var shownText = (value) => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f\u202A-\u202E\u2066-\u2069]/.test(value);
+var SERVER_TEXT_LIMIT = 512;
+var serverText = (text) => text.length <= SERVER_TEXT_LIMIT ? text : `${text.slice(0, SERVER_TEXT_LIMIT)}\u2026 (${text.length - SERVER_TEXT_LIMIT} more characters cut)`;
+function capServerText(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof Error && e.message.length > SERVER_TEXT_LIMIT)
+      e.message = serverText(e.message);
+  }
+}
 
 class LeaseUnavailable extends SubscriberError {
   constructor(code = "not_found") {
@@ -31602,7 +31611,7 @@ class ConnectRefused extends SubscriberError {
     super(typeof code === "string" && domainCodes.has(code) ? code : "invalid_response");
     this.status = status;
     this.body = body;
-    this.message = `Server refused the connection (HTTP ${status}): ${body}`;
+    this.message = `Server refused the connection (HTTP ${status}): ${serverText(body)}`;
   }
 }
 
@@ -31728,20 +31737,30 @@ class Connection {
     return { ...this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}, ...this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {} };
   }
   facts(sessionID) {
-    let f;
+    let f, suggested;
     try {
       f = this.wireOptions.facts?.(sessionID);
     } catch {
-      return {};
+      f = undefined;
+    }
+    try {
+      suggested = this.wireOptions.suggested?.(sessionID);
+    } catch {
+      suggested = undefined;
     }
     const wire = (v) => v === null ? "" : typeof v === "string" && v ? v : undefined;
     const model = wire(f?.model), effort = wire(f?.effort);
-    return { ...model === undefined ? {} : { [MODEL_META]: model }, ...effort === undefined ? {} : { [EFFORT_META]: effort } };
+    return {
+      ...model === undefined ? {} : { [MODEL_META]: model },
+      ...effort === undefined ? {} : { [EFFORT_META]: effort },
+      ...typeof suggested === "string" && suggested ? { [SUGGESTED_META]: suggested } : {}
+    };
   }
   async reachable(pending) {
     try {
       return await pending;
     } catch (error) {
+      capServerText(error);
       if (!(error instanceof ConnectRefused) && scopeRefusal(error))
         throw new InsufficientScope(error);
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
@@ -31842,6 +31861,10 @@ function isValidEmail(email) {
 function isValidIdentityName(name) {
   return NAME_RE.test(name.toLowerCase());
 }
+function shownName(raw) {
+  const clean = raw.replace(/\p{Cc}/gu, "");
+  return clean.length > 64 ? `${clean.slice(0, 64)}\u2026` : clean;
+}
 var HUMAN_NAME = "human";
 var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
 
@@ -31859,7 +31882,7 @@ function isOwnHuman(event, identity) {
 }
 
 // adapters/hosted-core/src/model.ts
-var ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
+var ADDRESS = /^[^\x00-\x20\x7f-\x9f\u202a-\u202e\u2066-\u2069]{1,160}$/;
 var MAX_HELD = 64;
 var validAddress = (value) => typeof value === "string" && ADDRESS.test(value);
 var validHeld = (value) => Array.isArray(value) && value.length <= MAX_HELD && value.every(validAddress) && new Set(value).size === value.length;
@@ -31989,10 +32012,13 @@ class FileRefused extends Error {
 async function readSmallJson(path, maxBytes) {
   let file;
   try {
-    file = await open2(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    file = await open2(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   } catch (error) {
-    if (error.code === "ENOENT")
+    const code = error.code;
+    if (code === "ENOENT")
       return;
+    if (code === "ELOOP")
+      throw new FileRefused("is a symbolic link");
     throw error;
   }
   try {
@@ -32548,6 +32574,7 @@ ${config.clientId}`)}.json`);
     const signal = AbortSignal.any([AbortSignal.timeout(SIGN_IN_FLOW_MS), ...outer ? [outer] : []]);
     const verifier = randomBytes2(32).toString("base64url"), state = randomBytes2(16).toString("base64url");
     const callback = await this.callback(state, signal);
+    const answered = new AbortController;
     let params;
     try {
       const url = new URL(meta.authorization_endpoint);
@@ -32562,10 +32589,11 @@ ${config.clientId}`)}.json`);
         code_challenge_method: "S256"
       }).toString();
       await this.share(url.href);
-      const presented = Promise.resolve().then(() => this.config.present(url.href));
+      const presented = Promise.resolve().then(() => this.config.present(url.href, answered.signal));
       presented.catch(() => {});
       params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally {
+      answered.abort();
       await this.unlink();
       callback.close();
     }
@@ -33027,24 +33055,32 @@ function warnOnce(key, text) {
 function procStarts(pids) {
   const out = new Map;
   if (process.platform !== "linux") {
-    const starts = ps("lstart", pids);
+    const lines = ps("stat=,lstart", pids);
     for (const pid of pids) {
-      const start = starts ? starts.get(pid) : null;
-      if (start !== undefined)
-        out.set(pid, start);
+      const m = lines?.get(pid)?.match(/^(\S+)\s+(.*)$/);
+      if (m && exited(m[1]))
+        continue;
+      if (m)
+        out.set(pid, m[2]);
       else if (pidExists(pid))
         out.set(pid, null);
     }
     return out;
   }
   for (const pid of pids) {
-    const start = statFields(pid)?.[19];
+    const fields = statFields(pid);
+    if (fields && exited(fields[0]))
+      continue;
+    const start = fields?.[19];
     if (start)
       out.set(pid, start);
     else if (pidExists(pid))
       out.set(pid, null);
   }
   return out;
+}
+function exited(state) {
+  return state.startsWith("Z") || state.startsWith("X");
 }
 function procStart(pid) {
   const starts = procStarts([pid]);
@@ -33080,7 +33116,7 @@ function parentCommandLine() {
 // plugins/claude-code/src/plugin.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdirSync as mkdirSync3, watch } from "fs";
-import { join as join7 } from "path";
+import { join as join8 } from "path";
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-compat.js
 function isZ4Schema(s) {
   const schema = s;
@@ -34871,6 +34907,11 @@ var ATTACHMENTS_PARAM = {
   items: { type: "string" },
   description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`
 };
+var ATTACHMENT_IDS_PARAM = {
+  type: "array",
+  items: { type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+};
 var ATTACHMENT_GET_TOOL = {
   name: "attachment_get",
   description: "attachment_get(id, dir?): save a file attached to a message or post you can read (ids are in its attachments) and return the saved path.",
@@ -34977,7 +35018,7 @@ class DeliveryStopped extends Error {
 var key = "diagnostics:v1";
 var fields = ["state", "message", "sessionID", "time", "held", "ownership", "operation", "code", "failure"];
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions"];
+var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link"];
 var operations = new Set(OPERATIONS);
 var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
@@ -35304,16 +35345,7 @@ var native_tools_default = [
           type: "number",
           description: "Optional. post_id to reply to."
         },
-        resend: {
-          type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes."
-        },
-        as: {
-          type: "string",
-          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
-        },
         attachment_ids: {
-          $schema: "https://json-schema.org/draft/2020-12/schema",
           type: "array",
           items: {
             type: "integer",
@@ -35321,6 +35353,14 @@ var native_tools_default = [
             maximum: 9007199254740991
           },
           description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+        },
+        resend: {
+          type: "boolean",
+          description: "true sends again even if an identical call landed in the last 10 minutes."
+        },
+        as: {
+          type: "string",
+          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
         }
       },
       required: [
@@ -35538,20 +35578,23 @@ var native_tools_default = [
   },
   {
     name: "dm_send",
-    description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
+    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
     inputSchema: {
       type: "object",
       properties: {
         to: {
-          type: "string"
+          type: "string",
+          description: "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
         },
         body: {
-          type: "string"
+          type: "string",
+          description: "Message body. Plain text or markdown."
         },
         parent_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Optional. message_id this is replying to; sets the thread parent."
         },
         pending: {
           type: "boolean",
@@ -35579,8 +35622,10 @@ var native_tools_default = [
         "to",
         "body"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
+    },
+    _meta: {
+      "anthropic/alwaysLoad": true
     }
   },
   {
@@ -35619,43 +35664,48 @@ var native_tools_default = [
   },
   {
     name: "dm_history",
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
+    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: {
       type: "object",
       properties: {
         peer: {
-          type: "string"
+          type: "string",
+          description: "Optional. Only return messages between you and this peer identity."
         },
         limit: {
-          type: "number"
+          type: "number",
+          description: "Max messages to return (default 20, max 200)."
         },
         before_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Return messages with id strictly less than this; use for pagination."
         }
       },
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     }
   },
   {
     name: "dm_thread",
-    description: "A whole direct-message thread you participate in.",
+    description: "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     inputSchema: {
       type: "object",
       properties: {
         thread: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Any message_id in the thread."
         }
       },
       required: [
         "thread"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
+    },
+    _meta: {
+      "anthropic/alwaysLoad": true
     }
   },
   {
@@ -35747,7 +35797,7 @@ class AttachmentRefused extends Error {
   status;
   code;
   constructor(status, code, message) {
-    super(message);
+    super(serverText(message));
     this.status = status;
     this.code = code;
   }
@@ -35908,7 +35958,7 @@ function hostTools(native) {
 }
 function withPaths(tool) {
   const properties = Object.fromEntries(Object.entries(tool.inputSchema.properties ?? {}).map(([key, value]) => key === "attachment_ids" ? ["attachments", ATTACHMENTS_PARAM] : [key, value]));
-  const description = tool.description?.replace("attachment_ids?", "attachments?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.");
+  const description = tool.description?.replace("attachment_ids?", "attachments?");
   return { ...tool, ...description === undefined ? {} : { description }, inputSchema: { ...tool.inputSchema, properties } };
 }
 var text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
@@ -36208,7 +36258,7 @@ class HostedClient {
     return this.options.login;
   }
   wireOptions(mode) {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.facts } : {} };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.facts } : {}, ...this.options.suggested ? { suggested: this.options.suggested } : {} };
   }
   factsFailed = new Set;
   facts = (sessionID) => {
@@ -36360,7 +36410,12 @@ function start(state, login, o) {
     finish(outcome);
     return o.ended(flow, outcome);
   };
-  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => result === "signed in" ? settle("signed in") : finish("current"), (error) => {
+  flow.done = login.login(abort.signal, o.ifSignedOut).then((result) => {
+    if (result === "signed in")
+      return settle("signed in");
+    finish("current");
+    return o.current?.(flow);
+  }, (error) => {
     if (abort.signal.aborted)
       return settle("cancelled");
     flow.failed = scrub(flow, message(error));
@@ -36648,7 +36703,7 @@ class Controller {
     check();
   }
   wireOptions(e) {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {} };
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {}, ...this.port.suggested ? { suggested: (id) => this.port.suggested(id) } : {} };
   }
   async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
     let current;
@@ -36707,6 +36762,7 @@ class Controller {
       await this.save(r, true);
       await this.watch(e);
       this.set(r, "approved", "Root approved; bind a name to receive deliveries");
+      let bound = false;
       try {
         if (names.length) {
           const epoch = r.epoch, signal = new AbortController().signal;
@@ -36716,12 +36772,13 @@ class Controller {
               await w.call("bind", { name, create, where: this.port.place() });
             await this.guard(r, epoch, signal);
           });
+          bound = true;
         }
         await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
         if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", failureCode(this.expired(error)));
       }
       await this.diagnostics.flush();
       return { ...r.status, roots: this.status().roots };
@@ -36763,11 +36820,22 @@ class Controller {
     return saved.approval;
   }
   async carried(sessionID) {
+    const back = await this.takeBack(sessionID);
+    return back === "unreadable" ? undefined : back;
+  }
+  async takeBack(sessionID) {
+    let approval;
     try {
-      const approval = await this.approvalFor(sessionID), live = this.roots.get(sessionID);
-      return await this.remembered(sessionID, approval) ?? (live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined);
+      approval = await this.approvalFor(sessionID);
     } catch {
       return;
+    }
+    const live = this.roots.get(sessionID);
+    const held = live && this.approvalKey(live.approval) === this.approvalKey(approval) && live.e.held?.length ? live.e.held : undefined;
+    try {
+      return await this.remembered(sessionID, approval) ?? held;
+    } catch {
+      return held ?? "unreadable";
     }
   }
   names(e) {
@@ -37494,6 +37562,7 @@ class RootDelivery {
       delivery: wire.delivery,
       ...wire.launcher ? { launcher: true } : {},
       ...wire.facts ? { facts: wire.facts } : {},
+      ...wire.suggested ? { suggested: wire.suggested } : {},
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
       ancestry: async (sessionID) => {
@@ -37525,10 +37594,11 @@ class RootDelivery {
     const id = this.o.sessionID, carried = this.carrying;
     try {
       this.begun = await this.epoch();
-      const remembered = carried ? undefined : await controller.carried(id);
+      const back = carried ? undefined : await controller.takeBack(id);
+      const remembered = back === "unreadable" ? undefined : back;
       if (carried || remembered)
         this.configuring = undefined;
-      const configured = this.configuring;
+      const configured = back === "unreadable" ? undefined : this.configuring;
       const expected = carried ?? remembered ?? (configured ? [configured] : undefined);
       const status = carried ? await controller.enroll(id, carried, false) : configured ? await controller.enroll(id, [configured], true) : await controller.resume(id);
       if (this.closed)
@@ -37537,13 +37607,18 @@ class RootDelivery {
       this.proxy?.forget(id);
       const root = status.roots.find((r) => r.sessionID === id);
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      const landed = (carried || configured) && root?.operation === "prepare" && root.code !== undefined ? expected : undefined;
       if (carried && bound?.length && this.carrying === carried)
         this.carrying = undefined;
-      const holds = (address) => !!bound?.some((b) => b === address || b.endsWith(`/${address}`));
+      const holds = (address) => !![...bound ?? [], ...landed ?? []].some((b) => b === address || b.endsWith(`/${address}`));
       if (configured && (holds(configured) || REFUSED.has(root?.code ?? "")))
         this.configuring = undefined;
       const missing = (expected ?? []).filter((address) => !holds(address));
-      if (missing.length && root?.state !== "paused") {
+      if (landed && root?.state !== "paused") {
+        const text = `this session is bound as ${landed.join(", ")}, but delivery couldn't start (${root?.message ?? status.message})`;
+        this.notices.set("start", text);
+        this.log(text, "warning");
+      } else if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
         const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}` : carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);
@@ -37751,14 +37826,16 @@ function putSignIn(base, claudePid, url, now = Date.now()) {
   mkdirSync2(dir, { recursive: true, mode: 448 });
   put(join5(dir, SIGN_IN), JSON.stringify({ url, at: now }));
 }
+var SIGN_IN_MAX = 16384;
 function dropSignIn(base, claudePid, url) {
   const path = join5(sessionDir(base, claudePid), SIGN_IN);
   if (url !== undefined) {
     let text;
     try {
-      text = readFileSync4(path, "utf8");
+      text = readSmall(path, SIGN_IN_MAX);
     } catch (error) {
-      if (error.code === "ENOENT")
+      const code = error.code;
+      if (code === "ENOENT" || code === "ELOOP" || code === undefined)
         return;
       throw error;
     }
@@ -37907,8 +37984,8 @@ async function testPauseAsync(point, env = process.env) {
 }
 
 // src/shared/identity.ts
-import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
-import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve4 } from "path";
+import { existsSync as existsSync3, readFileSync as readFileSync6, statSync as statSync4 } from "fs";
+import { basename as basename3, dirname as dirname5, join as join7, resolve as resolve5 } from "path";
 
 // src/core/session_id.ts
 var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -37939,10 +38016,12 @@ function normalizeAliasName(raw) {
   const p = addressParts(raw);
   if (p?.kind === "bare" || p?.kind === "alias")
     return { ok: true, name: p.address };
-  return { ok: false, error: `invalid identity name "${raw}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
+  return { ok: false, error: `invalid identity name "${shownName(raw)}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
 }
 
-// src/shared/identity.ts
+// src/shared/naming.ts
+import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve4 } from "path";
 var MAX_LEN = 32;
 function gitLocation(cwd) {
   for (let dir = cwd;; dir = dirname4(dir)) {
@@ -37960,35 +38039,6 @@ function gitLocation(cwd) {
     }
     if (dirname4(dir) === dir)
       return null;
-  }
-}
-function gitBranch(cwd) {
-  for (let dir = cwd;; dir = dirname4(dir)) {
-    const dotGit = join6(dir, ".git");
-    if (existsSync2(dotGit)) {
-      let gitdir = dotGit;
-      if (!statSync3(dotGit).isDirectory()) {
-        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
-        if (!m)
-          return null;
-        gitdir = resolve4(dir, m[1].trim());
-      }
-      const head = readFileSync5(join6(gitdir, "HEAD"), "utf8").trim();
-      return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
-    }
-    if (dirname4(dir) === dir)
-      return null;
-  }
-}
-function describeLocation(cwd) {
-  try {
-    const loc = gitLocation(cwd);
-    if (!loc)
-      return basename2(cwd);
-    const branch = gitBranch(cwd);
-    return `${basename2(loc.repo)}${loc.worktree ? ` worktree ${loc.worktree}` : ""}${branch ? ` on ${branch}` : ""}`;
-  } catch {
-    return null;
   }
 }
 function linkedWorktreeName(cwd) {
@@ -38043,6 +38093,37 @@ function sessionIdentity(env = process.env, cwd = process.cwd()) {
     return env.BUS_IDENTITY;
   return resolveIdentity(env.BUS_IDENTITY || pinnedIdentity(cwd, env)?.name || defaultIdentity(cwd), cwd);
 }
+
+// src/shared/identity.ts
+function gitBranch(cwd) {
+  for (let dir = cwd;; dir = dirname5(dir)) {
+    const dotGit = join7(dir, ".git");
+    if (existsSync3(dotGit)) {
+      let gitdir = dotGit;
+      if (!statSync4(dotGit).isDirectory()) {
+        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync6(dotGit, "utf8"));
+        if (!m)
+          return null;
+        gitdir = resolve5(dir, m[1].trim());
+      }
+      const head = readFileSync6(join7(gitdir, "HEAD"), "utf8").trim();
+      return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
+    }
+    if (dirname5(dir) === dir)
+      return null;
+  }
+}
+function describeLocation(cwd) {
+  try {
+    const loc = gitLocation(cwd);
+    if (!loc)
+      return basename3(cwd);
+    const branch = gitBranch(cwd);
+    return `${basename3(loc.repo)}${loc.worktree ? ` worktree ${loc.worktree}` : ""}${branch ? ` on ${branch}` : ""}`;
+  } catch {
+    return null;
+  }
+}
 function configuredIdentity(env = process.env, cwd = process.cwd()) {
   try {
     if (!isExplicitIdentity(env, cwd))
@@ -38088,6 +38169,13 @@ function createPlugin(o) {
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
   const place = describeLocation(o.cwd) ?? HARNESS;
   const configured = configuredIdentity(o.env, o.cwd);
+  const suggestion = (() => {
+    try {
+      return sessionIdentity(o.env, o.cwd);
+    } catch {
+      return;
+    }
+  })();
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...project ? attachRoots({}, project) : []])];
   const say = (message) => o.log(`[grayboard] ${message}`);
@@ -38107,7 +38195,7 @@ function createPlugin(o) {
     stateDir: config.dataDir,
     harness: HARNESS,
     loginAction,
-    present: async (url) => {
+    present: async (url, answered) => {
       const flow = signins.flow;
       await testPauseAsync("claude-sign-in-present", o.env);
       try {
@@ -38119,17 +38207,17 @@ function createPlugin(o) {
       say(`open ${url} to sign in to grayboard`);
       if (!server.getClientCapabilities()?.elicitation?.url)
         return;
+      if (!flow)
+        return;
       for (let sent = 0;; sent++) {
         const prompt = { id: randomUUID2(), withdraw: new AbortController };
-        if (flow) {
-          prompts.get(flow)?.withdraw.abort();
-          prompts.set(flow, prompt);
-        }
+        prompts.get(flow)?.withdraw.abort();
+        prompts.set(flow, prompt);
         say(`sign-in prompt sent (elicitation ${prompt.id})`);
         const start = Date.now();
         let result;
         try {
-          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
+          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_FLOW_MS, signal: AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) });
         } catch (error) {
           if (prompt.withdraw.signal.aborted)
             return;
@@ -38140,7 +38228,7 @@ function createPlugin(o) {
         say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action} after ${ms} ms`);
         if (result.action === "decline")
           throw new LoginFailed("sign-in declined");
-        if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow)
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS)
           return;
         if (sent >= RESENDS) {
           say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`);
@@ -38148,8 +38236,13 @@ function createPlugin(o) {
         }
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
+        await testPauseAsync("claude-sign-in-resend", o.env);
         if (signins.flow !== flow || flow.abort.signal.aborted) {
           say("sign-in ended before the prompt was sent again");
+          return;
+        }
+        if (answered?.aborted) {
+          say("the browser answered before the prompt was sent again");
           return;
         }
         if (prompts.get(flow) !== prompt)
@@ -38188,7 +38281,8 @@ function createPlugin(o) {
     env: o.env,
     launcher: o.env.BUS_LAUNCHER === "1",
     log: (message) => say(message),
-    facts: (sessionID) => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined
+    facts: (sessionID) => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined,
+    ...suggestion ? { suggested: (sessionID) => sessionID === config.id ? suggestion : undefined } : {}
   });
   const initializedOr = (signal) => {
     signal.throwIfAborted();
@@ -38221,31 +38315,36 @@ function createPlugin(o) {
       return signins.flow;
     if (!login || !root || !interactive || closed || !initialized)
       return;
-    const flow = start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
-      const prompt = prompts.get(flow);
-      try {
-        if (outcome === "signed in") {
-          if (prompt)
-            await server.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
-          say(`signed in (${origin})`);
-          await root.credentialChanged();
-        } else if (outcome !== "cancelled")
-          say(`sign-in failed (${[origin, ...prompt ? [`elicitation ${prompt.id}`] : []].join(", ")}): ${flow.failed}`);
-      } finally {
-        prompt?.withdraw.abort();
-        if (flow.url && !("error" in config)) {
-          try {
-            dropSignIn(config.dataDir, o.claude.pid, flow.url);
-          } catch (error) {
-            say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+    const flow = start(signins, login, {
+      origin,
+      browser: false,
+      ifSignedOut: true,
+      ended: async (flow, outcome) => {
+        const prompt = prompts.get(flow);
+        try {
+          if (outcome === "signed in") {
+            if (prompt)
+              await server.createElicitationCompletionNotifier(prompt.id)().catch(() => {});
+            say(`signed in (${origin})`);
+            await root.credentialChanged();
+          } else if (outcome !== "cancelled")
+            say(`sign-in failed (${[origin, ...prompt ? [`elicitation ${prompt.id}`] : []].join(", ")}): ${flow.failed}`);
+        } finally {
+          prompt?.withdraw.abort();
+          if (flow.url && !("error" in config)) {
+            try {
+              dropSignIn(config.dataDir, o.claude.pid, flow.url);
+            } catch (error) {
+              say(`couldn't remove the ended sign-in's link: ${message(error)}; the hook stops showing it ${SIGN_IN_FLOW_MS / 60000} minutes after it was written`);
+            }
           }
         }
-      }
-    } });
-    flow.done.then(() => {
-      if (flow.outcome === "current")
+      },
+      current: async () => {
         say(`sign-in not needed (${origin}): already signed in`);
-    }, () => {});
+        await root.credentialChanged();
+      }
+    });
     return flow;
   };
   const notes = {
@@ -38281,13 +38380,15 @@ function createPlugin(o) {
   const drainEnded = () => {
     if ("error" in config || closed)
       return;
-    for (const agent of takeEnded(config.dataDir, o.claude.pid))
-      root?.endChild(childOf(agent));
+    for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      if (validSourceId(childOf(agent)))
+        root?.endChild(childOf(agent));
+    }
   };
   const watchEnded = () => {
     if (endWatch || "error" in config || closed)
       return;
-    const dir = join7(sessionDir(config.dataDir, o.claude.pid), "ended");
+    const dir = join8(sessionDir(config.dataDir, o.claude.pid), "ended");
     try {
       mkdirSync3(dir, { recursive: true, mode: 448 });
       endWatch = watch(dir, () => drainEnded());
@@ -38314,9 +38415,14 @@ function createPlugin(o) {
     }
     if (taken.agent === null)
       return root.call(name, args, before);
+    const child = childOf(taken.agent), length = child.length;
+    if (!validSourceId(child)) {
+      say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
+      return failure2(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
+    }
     watchEnded();
     drainEnded();
-    return root.call(name, args, before, { child: childOf(taken.agent) });
+    return root.call(name, args, before, { child });
   };
   const tools = () => root?.tools() ?? hostTools(snapshotTools());
   const serve = (instructions) => {
@@ -38324,6 +38430,7 @@ function createPlugin(o) {
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() }));
     s.setRequestHandler(CallToolRequestSchema, async (req) => await call(req.params.name, req.params.arguments ?? {}, req.params._meta));
     s.oninitialized = () => {
+      s.ping().catch(() => {});
       initialized = true;
       markInitialized();
       if (login && interactive)
@@ -38398,7 +38505,7 @@ async function logout(args) {
   }
   let names;
   try {
-    names = readdirSync3(join8(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
+    names = readdirSync3(join9(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
   } catch (error) {
     if (error.code !== "ENOENT")
       throw error;
@@ -38409,7 +38516,7 @@ async function logout(args) {
   for (const name of names) {
     let store;
     try {
-      store = await readJson(join8(dataDir, "grants", name));
+      store = await readJson(join9(dataDir, "grants", name));
     } catch (error) {
       unreadable.push(`${name}: ${error.message}`);
       continue;

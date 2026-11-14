@@ -10,7 +10,8 @@
 // token from its environment. So every bus tool here is a read that is safe
 // for any local process to make; the tree claim tools write only the
 // factory's own store, inside the run's tree, which that uid could already
-// write. The token scopes a call to a live run: it is
+// write, and so does progress, which sets one line on the run's own row.
+// The token scopes a call to a live run: it is
 // minted per run and revoked when the run ends.
 import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
@@ -28,6 +29,17 @@ export type RelayTool = (typeof RELAY_TOOLS)[number];
 // reach only the run's own tree, keyed by the token's scope.
 export const TREE_TOOLS = ["tree_claim_take", "tree_claim_release", "tree_claims"] as const;
 export type TreeTool = (typeof TREE_TOOLS)[number];
+// Progress (#669): one line on where the run is, kept on its own row and
+// shown to whoever asks the request's status. Never posted otherwise.
+export const PROGRESS_TOOL = "progress";
+export const MAX_PROGRESS = 200;
+// A note as the factory keeps it: one line, no control characters, capped.
+export function progressLine(note: unknown): string {
+  if (typeof note !== "string") throw new Error("progress needs note: one line on where you are");
+  const line = note.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!line) throw new Error("progress needs note: one line on where you are");
+  return line.length > MAX_PROGRESS ? `${line.slice(0, MAX_PROGRESS - 1)}…` : line;
+}
 // A run's place in its tree: the root's seq and its own. `mirror` (#675):
 // the bus key prefix its tree claims are also held under, when mirrored.
 export type Scope = { tree: number; holder: number; mirror?: string };
@@ -51,9 +63,10 @@ export const MIRROR_KEY = /^[A-Za-z0-9._@+\-/]+$/;
 export type McpServer = { name: string; command: string; args: string[]; env: Record<string, string>; tools: readonly string[] };
 
 // What the factory asks of the relay: a server for one run, revoked when
-// the run ends. `scope`: the run's tree, for the tree claim tools.
+// the run ends. `scope`: the run's tree, for the tree claim tools. `seq`:
+// the run's own row, for the progress tool.
 export interface ChildTools {
-  grant(scope?: Scope): Promise<{ server: McpServer; revoke(): void }>;
+  grant(scope?: Scope, seq?: number): Promise<{ server: McpServer; revoke(): void }>;
   close(): Promise<void>;
 }
 
@@ -113,6 +126,7 @@ export type RelayOptions = {
   reader: () => Promise<Reader>;   // started on the first grant, again if it exits
   claims?: TreeClaims;             // tree claims; absent, a run gets only the reads
   mirror?: BusMirror;              // the bus side of mirrored tree claims (#675); absent, a mirrored scope's take fails
+  progress?: (seq: number, note: string) => boolean; // a run's progress note (#669); false when its row isn't running. Absent, no run gets the tool
   log(message: string): void;
 };
 
@@ -120,7 +134,7 @@ export type RelayOptions = {
 // started on the first grant, so a factory whose profiles never opt in
 // opens nothing.
 export class Relay implements ChildTools {
-  private readonly tokens = new Map<string, Scope | null>();
+  private readonly tokens = new Map<string, { scope: Scope | null; seq: number | null }>();
   private server: Server | null = null;
   private starting: Promise<void> | null = null;
   private reader: Promise<Reader> | null = null;
@@ -131,13 +145,14 @@ export class Relay implements ChildTools {
     this.path = join(o.dir, "relay.sock");
   }
 
-  async grant(scope?: Scope): Promise<{ server: McpServer; revoke(): void }> {
+  async grant(scope?: Scope, seq?: number): Promise<{ server: McpServer; revoke(): void }> {
     await (this.starting ??= this.listen().catch((e) => { this.starting = null; throw e; }));
     await this.read(); // a reader that can't start fails the grant, not each call
     const token = randomBytes(32).toString("hex");
     const tree = scope && this.o.claims ? scope : null;
-    this.tokens.set(token, tree);
-    const tools = tree ? [...RELAY_TOOLS, ...TREE_TOOLS] : [...RELAY_TOOLS];
+    const own = seq !== undefined && this.o.progress ? seq : null;
+    this.tokens.set(token, { scope: tree, seq: own });
+    const tools: string[] = [...RELAY_TOOLS, ...(tree ? TREE_TOOLS : []), ...(own !== null ? [PROGRESS_TOOL] : [])];
     const [command, ...args] = this.o.shim;
     return {
       server: { name: SERVER_NAME, command: command!, args, env: { FACTORY_RELAY_SOCK: this.path, FACTORY_RELAY_TOKEN: token, FACTORY_RELAY_TOOLS: tools.join(",") }, tools },
@@ -211,8 +226,16 @@ export class Relay implements ChildTools {
     let req: { token?: unknown; tool?: unknown; args?: unknown };
     try { req = JSON.parse(line); } catch { return { ok: false, error: "not a JSON request" }; }
     if (typeof req.token !== "string" || !this.tokens.has(req.token)) return { ok: false, error: "this run's bus tools have ended" };
-    const scope = this.tokens.get(req.token) ?? null;
+    const { scope, seq } = this.tokens.get(req.token)!;
     const tool = req.tool;
+    if (tool === PROGRESS_TOOL) {
+      if (seq === null || !this.o.progress) return { ok: false, error: `not a relayed tool: ${tool}` };
+      const raw = req.args !== null && typeof req.args === "object" && !Array.isArray(req.args) ? (req.args as Record<string, unknown>) : {};
+      try {
+        const line = progressLine(raw.note);
+        return this.o.progress(seq, line) ? { ok: true, text: "noted: whoever asks this request's status sees it" } : { ok: false, error: "this run's bus tools have ended" };
+      } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+    }
     if (typeof tool === "string" && (TREE_TOOLS as readonly string[]).includes(tool)) {
       if (!scope || !this.o.claims) return { ok: false, error: `not a relayed tool: ${tool}` };
       const raw = req.args !== null && typeof req.args === "object" && !Array.isArray(req.args) ? (req.args as Record<string, unknown>) : {};

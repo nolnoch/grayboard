@@ -9,14 +9,30 @@ export const LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
 // The harness's current model and effort for a session (#364): the server keeps the latest each request reports.
 export const MODEL_META = "io.github.nolnoch.grayboard/model";
 export const EFFORT_META = "io.github.nolnoch.grayboard/effort";
+// The name the harness would suggest for a session (#443, #522): the server keeps the first an ownership's requests carry.
+export const SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 // `facts` is read per request, for the session that request names, so a change mid-session (a model switch) reaches the server on the next one.
-export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true; facts?: (sessionID: string) => SessionFacts | undefined };
+// `suggested` too, on every wire: whichever request reaches the server first fixes the ownership's suggestion (#522).
+export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true; facts?: (sessionID: string) => SessionFacts | undefined; suggested?: (sessionID: string) => string | undefined };
 
 export class SubscriberError extends Error {
   constructor(readonly code: string, readonly known?: string[], readonly holder?: string) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}${holder ? `; held by ${holder}` : ""}`); }
 }
 // Server free text the host shows (an alias_held holder, an alias_lost reason): bounded, and no control or bidi characters.
 export const shownText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/.test(value);
+// Server-supplied error text an agent reads (an HTTP error body, a refusal's message): at most
+// SERVER_TEXT_LIMIT characters, with what was cut said, so a misbehaving server or a proxy's HTML
+// page can't flood the agent's context (#276).
+export const SERVER_TEXT_LIMIT = 512;
+export const serverText = (text: string): string =>
+  text.length <= SERVER_TEXT_LIMIT ? text : `${text.slice(0, SERVER_TEXT_LIMIT)}… (${text.length - SERVER_TEXT_LIMIT} more characters cut)`;
+// Caps the message of every error on a cause chain in place: the SDK puts a failed POST's
+// whole response body in its message, and a wrapper can repeat a cause's message.
+export function capServerText(error: unknown): void {
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    if (e instanceof Error && e.message.length > SERVER_TEXT_LIMIT) e.message = serverText(e.message);
+  }
+}
 export class LeaseUnavailable extends SubscriberError {
   constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
 }
@@ -38,7 +54,7 @@ export class ConnectRefused extends SubscriberError {
     let code: unknown;
     try { code = (JSON.parse(body) as { code?: unknown } | null)?.code; } catch {}
     super(typeof code === "string" && domainCodes.has(code) ? code : "invalid_response");
-    this.message = `Server refused the connection (HTTP ${status}): ${body}`;
+    this.message = `Server refused the connection (HTTP ${status}): ${serverText(body)}`;
   }
 }
 
@@ -149,18 +165,22 @@ abstract class Connection {
   }
   // The session's facts as `_meta`: a non-empty string as itself, `null` as an empty string (the server clears it, #558),
   // anything else as nothing; a provider that throws sends none (absence never clears on the server). HostedClient's
-  // provider says its own failures; this guard keeps any other host's from failing the request.
+  // provider says its own failures; this guard keeps any other host's from failing the request. Its suggested name
+  // rides with them, a non-empty string or nothing.
   protected facts(sessionID: string): Record<string, string> {
-    let f: SessionFacts | undefined;
-    try { f = this.wireOptions.facts?.(sessionID); } catch { return {}; }
+    let f: SessionFacts | undefined, suggested: unknown;
+    try { f = this.wireOptions.facts?.(sessionID); } catch { f = undefined; }
+    try { suggested = this.wireOptions.suggested?.(sessionID); } catch { suggested = undefined; }
     const wire = (v: unknown) => v === null ? "" : typeof v === "string" && v ? v : undefined;
     const model = wire(f?.model), effort = wire(f?.effort);
-    return { ...(model === undefined ? {} : { [MODEL_META]: model }), ...(effort === undefined ? {} : { [EFFORT_META]: effort }) };
+    return { ...(model === undefined ? {} : { [MODEL_META]: model }), ...(effort === undefined ? {} : { [EFFORT_META]: effort }),
+      ...(typeof suggested === "string" && suggested ? { [SUGGESTED_META]: suggested } : {}) };
   }
   // An abort of this wire's own signal is the controller stopping, never an outage.
   protected async reachable<T>(pending: Promise<T>): Promise<T> {
     try { return await pending; }
     catch (error) {
+      capServerText(error);
       if (!(error instanceof ConnectRefused) && scopeRefusal(error)) throw new InsufficientScope(error);
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
     }

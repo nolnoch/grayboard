@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -42,13 +43,46 @@ afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); da
 
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
-  let invalidations = 0;
-  const unlisten = hosted.listen(() => { invalidations++; });
+  const invalidations: (string | null)[] = [];
+  const unlisten = hosted.listen(changed => { invalidations.push(changed); });
   try {
-    database.repo.hosted.atomic(() => {});
-    expect(invalidations).toBe(1);
+    hosted.reconcile();
+    expect(invalidations).toEqual([null]);
     expect(application.holdsByOwner().size).toBe(4);
   } finally { unlisten(); }
+});
+
+test("a commit invalidates only the rows it changed; a touch or an empty commit tells nothing (#399)", async () => {
+  for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
+  const target = context("root-2");
+  if (!("id" in target)) throw new Error("fixture context");
+  const invalidations: (string | null)[] = [];
+  const unlisten = hosted.listen(changed => { invalidations.push(changed); });
+  try {
+    database.repo.hosted.atomic(() => {});
+    database.repo.hosted.atomic(() => database.repo.hosted.touch(target.id, now));
+    expect(invalidations).toEqual([]);
+    database.repo.hosted.atomic(() => database.repo.hosted.end(target.id, "closed", now));
+    expect(invalidations).toEqual([target.id]);
+    expect(application.holdsByOwner().size).toBe(3);
+  } finally { unlisten(); }
+});
+
+test("startup opens no holder session for a root its first sweep ends (#424 item 7)", async () => {
+  const root = context("lapsed-root");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  await delivery.open(principal, root);
+  hosted.close();
+  // The lease lapsed while the server was still up: no credit, and the startup sweep ends the root.
+  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, root.id]);
+  now += 5 * 60_000;
+  const opened = spyOn(application, "hostedSession");
+  try {
+    hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+    expect(database.repo.hosted.get(root.id)).toBeUndefined();
+    expect(opened).not.toHaveBeenCalled();
+  } finally { opened.mockRestore(); }
 });
 
 test("hosted source IDs attribute child writes and release only the root alias hold", async () => {
@@ -351,6 +385,8 @@ test("registration rejects invalid ownership graphs without moving an existing c
   await expect(hosted.register(principal, context("root"), "root")).rejects.toHaveProperty("code", "invalid_registration");
   await expect(hosted.register(principal, context("child"), "grandchild")).rejects.toHaveProperty("code", "root_is_child");
   await expect(hosted.register(principal, context("root"), "other")).rejects.toHaveProperty("code", "child_bound");
+  // The message names when it bound as a date, not a raw epoch, and leaves out an unknown place (#387 item 17).
+  await expect(hosted.register(principal, context("root"), "other")).rejects.toThrow(/holds "you@example.com\/be" as its own root \(bound \d{4}-\d\d-\d\dT[^,)]*\);/);
   await expect(hosted.register(principal, context("other"), "child")).rejects.toHaveProperty("code", "child_registered_elsewhere");
   await hosted.register(principal, context("unbound"), "grandchild");
   await expect(hosted.register(principal, context("root"), "unbound")).rejects.toHaveProperty("code", "has_children");
@@ -450,8 +486,8 @@ test("bind publishes its new hold before the after-commit pause and the first ho
   await sender.connect();
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     await sender.send("you@example.com/fe", "not for be");
-    expect(application.hostedHolder("you@example.com/fe")).toBeDefined();
-    expect(application.hostedHolder("you@example.com/be")).toBe(application.hostedHolder("you@example.com/fe"));
+    expect(application.aliasHolderId("you@example.com/fe")).not.toBeNull();
+    expect(application.aliasHolderId("you@example.com/be")).toBe(application.aliasHolderId("you@example.com/fe"));
   });
   const lease = await delivery.open(principal, context("root"));
   expect(await delivery.pending(principal, context("root"), lease.capability)).toHaveLength(1);
@@ -525,6 +561,34 @@ test("a refused writes_as declaration through the hosted gate keeps its refused 
   expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused' AND detail LIKE '%human%'").all()).toHaveLength(1);
 });
 
+test("a rate-limited hosted bind keeps its bind.rate_limited row after the transaction rolls back, and the streak's end is written once (#467)", async () => {
+  const limited = createApplication(database.repo, database.db, { helloLimit: { burst: 1, perSec: 0.01 }, now: () => now });
+  const service = createHostedSessions(limited, { now: () => now, isAuthorized: () => true });
+  const rows = (action: string) => (database.db.query("SELECT count(*) AS n FROM access_log WHERE action = ?").get(action) as { n: number }).n;
+  try {
+    await service.bind(principal, context("root"), { name: "fe", create: true });
+    await expect(service.bind(principal, context("root"), { name: "be", create: true })).rejects.toHaveProperty("code", "rate_limited");
+    expect(rows("bind.rate_limited")).toBe(1);
+    // The bucket refills; the bind that ends the streak commits, so its row is written there and not again.
+    now += 200_000;
+    await service.bind(principal, context("other"), { name: "ops", create: true });
+    expect(rows("bind.rate_limit_ended")).toBe(1);
+    expect(service.refusalRowsLost).toBe(0);
+  } finally { service.close(); limited.stopExpiry(); }
+});
+
+test("a refusal row whose write after the rollback fails is counted, and the refusal is still what the caller sees (#467)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-human", [GRAYBOARD_WRITES_AS_META]: "human" });
+  const write = spyOn(application, "hostedRefused").mockImplementation(() => { throw new Error("disk full"); });
+  const quiet = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await expect(hosted.whoami(generic, ctx)).rejects.toHaveProperty("code", "forbidden");
+    expect(hosted.refusalRowsLost).toBe(1);
+    expect(quiet.mock.calls.some(([line]) => String(line).includes('"operation":"hosted.refusal_row"'))).toBe(true);
+  } finally { write.mockRestore(); quiet.mockRestore(); }
+});
+
 test("ending a tools-only hosted root frees its alias for other users and restores writes_as when the same ID starts again (#451)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "fe" });
@@ -557,6 +621,53 @@ test("revoking one hosted hold releases only it, bumps the generation and closes
   expect(await hosted.whoami(principal, context("root"))).toMatchObject({ held: ["you@example.com/fe"], primary: "you@example.com/fe", ownership: before.ownership_id });
   expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'alias.revoked'").get()).toEqual({ n: 1 });
   await expect(delivery.receipt(principal, context("root"), lease.capability, [])).rejects.toHaveProperty("code", "not_found");
+});
+
+test("a revoked tools-only hosted root's ownership ends, audited once: a later recheck finds nothing to revoke again (#454)", async () => {
+  const team = database.repo.teams.create("ops", principal.authed.user_id);
+  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "ops/lead" });
+  const id = (meta as { id: string }).id;
+  await application.hostedWritesAs(generic.authed, "id:probe", "ops/lead", true);
+  expect(await hosted.whoami(generic, meta)).toMatchObject({ held: [], writes_as: "ops/lead" });
+  const before = database.repo.hosted.get(id)!;
+  const audits = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked'").all().map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
+  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  application.accessChanged(principal.authed.user_email, "admin@example.com");
+  const revoked = [{ actor: "admin@example.com", target: "ops/lead", detail: { session: id, principal: "you@example.com", writes_as: true, reason: expect.any(String) } }];
+  expect(audits()).toEqual(revoked);
+  expect(database.repo.hosted.get(id)).toBeUndefined();
+  expect(database.db.query("SELECT ended_at, end_reason FROM hosted_ownerships WHERE id = ?").get(before.ownership_id)).toMatchObject({ end_reason: "revoked" });
+  expect(database.db.query("SELECT writes_as FROM ids WHERE id = ?").get(id)).toEqual({ writes_as: null });
+  expect(aliasUser(database.db, "ops/lead")).toBeNull();
+  // Both rechecks, the principal's and the server's sweep, find the use gone.
+  application.accessChanged(principal.authed.user_email, "admin@example.com");
+  application.revalidate();
+  expect(audits()).toEqual(revoked);
+});
+
+test("a hosted root holding two names sends as either with as:, its ID too, and is refused any other address (#454)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.bind(principal, context("peer"), { name: "peer", create: true });
+  const id = (context("root") as { id: string }).id;
+  const send = (as: string | undefined, body: string) => hosted.run(principal, context("root"), "dm_send", s => application.send(s, "peer", body, as === undefined ? {} : { as }));
+  await send(undefined, "primary");
+  await send("be", "second");
+  await send("you@example.com/fe", "full");
+  await send(id, "by id");
+  const senders = database.db.query("SELECT body, sender FROM messages WHERE body IN ('primary', 'second', 'full', 'by id') ORDER BY id").all();
+  expect(senders).toEqual([
+    { body: "primary", sender: "you@example.com/fe" },
+    { body: "second", sender: "you@example.com/be" },
+    { body: "full", sender: "you@example.com/fe" },
+    { body: "by id", sender: id },
+  ]);
+  for (const other of ["peer", "you@example.com/qa"]) {
+    await expect(send(other, "refused")).rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("isn't one of this session's addresses") });
+  }
+  expect(database.db.query("SELECT count(*) AS n FROM messages WHERE body = 'refused'").get()).toEqual({ n: 0 });
 });
 
 test("a root whose last hold is revoked or unbound has no lease, so the sweep leaves it owning instead of expiring it (#451)", async () => {
@@ -678,14 +789,32 @@ test("a root's suggested name is its first request's, offered first among its un
   expect((await hosted.whoami(principal, ctx("root"))).candidates?.map(c => c.name)).not.toContain("grayboard-gb-aux");
   expect(() => ctx("root", 5)).toThrow(`_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
   for (const bad of ["", "a/b", "human", "x".repeat(33)]) expect(ctx("root", bad)).not.toHaveProperty("suggested");
+  // The ownership's start audit records its suggestion (#522), so the trail says why a session was offered a name.
+  const id = (ctx("root") as { id: string }).id;
+  const started = () => database.db.query<{ detail: string }, [string]>("SELECT detail FROM access_log WHERE action = 'hosted.ownership_started' AND target = ? ORDER BY rowid").all(id).map(r => JSON.parse(r.detail) as { suggested?: string });
+  expect(started().map(d => d.suggested)).toEqual(["grayboard-gb-aux"]);
+  // A new ownership of the same source ID takes its own suggestion, and one with none records none.
+  await hosted.end(principal, ctx("root"));
+  await hosted.whoami(principal, ctx("root", "second"));
+  expect(database.repo.hosted.get(id)).toMatchObject({ suggested: "second" });
+  await hosted.end(principal, ctx("root"));
+  await hosted.whoami(principal, ctx("root"));
+  expect(database.repo.hosted.get(id)).toMatchObject({ suggested: null });
+  expect(started().map(d => d.suggested)).toEqual(["grayboard-gb-aux", "second", undefined]);
+  // A child row's is null, whatever its requests suggest: a child never binds.
+  await hosted.register(principal, ctx("root"), "suggest-child");
+  const child = ctx("suggest-child", "kid");
+  await hosted.whoami(principal, child);
+  expect(database.repo.hosted.get((child as { id: string }).id)).toMatchObject({ suggested: null, root_session_id: id });
 });
 
-test("a request's launcher declaration is the ownership's: set by any root request and audited once, restated by a new ownership, cleared at its end, ignored for a child, refused unless a boolean (#473, #520)", async () => {
+test("a request's launcher declaration is the ownership's: set by any root request and audited once, restated by a new ownership, cleared and audited at its end, ignored on session_end and for a child, refused unless a boolean (#473, #520, #532)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const ctx = (extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-root", ...extra });
   const id = (ctx() as { id: string }).id;
   const flag = () => (database.db.prepare("SELECT launcher FROM ids WHERE id = ?").get(id) as { launcher: number }).launcher;
-  const audited = () => database.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'handle.launcher_set'").all();
+  const audited = () => database.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'handle.launcher_set' ORDER BY id").all();
+  const trail = () => audited().map(a => (JSON.parse(a.detail) as { on: boolean }).on);
   expect(() => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "x", [GRAYBOARD_LAUNCHER_META]: "yes" })).toThrow(`_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
   expect(ctx({ [GRAYBOARD_LAUNCHER_META]: false })).not.toHaveProperty("launcher");
   // A built-in client's declaration is read, whatever its source key; a third-party client's never is.
@@ -699,31 +828,42 @@ test("a request's launcher declaration is the ownership's: set by any root reque
   await hosted.bind(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }), { name: "lead", create: true });
   expect(flag()).toBe(1);
   expect(audited().map(a => ({ target: a.target, ...JSON.parse(a.detail) }))).toEqual([{ target: id, on: true, ownership: expect.any(Number), client_id: "grayboard-pi" }]);
-  // The ownership's end clears it; a new ownership that declares nothing isn't one, and one that declares restates it.
+  // The ownership's end clears it, audited `on: false` under the session with the user as actor (#532); a new
+  // ownership that declares nothing isn't one, and one that declares restates it.
   await hosted.end(generic, ctx());
   expect(flag()).toBe(0);
+  const cleared = database.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'handle.launcher_set' ORDER BY rowid DESC LIMIT 1").get()!;
+  expect({ actor: cleared.actor, target: cleared.target, ...JSON.parse(cleared.detail) }).toEqual({ actor: principal.authed.user_email, target: id, on: false, ownership: expect.any(Number), reason: "closed", client_id: "grayboard-pi" });
   await hosted.whoami(generic, ctx());
   expect(flag()).toBe(0);
+  // An ownership that was never a launcher ends with no row.
   await hosted.end(generic, ctx());
+  expect(trail()).toEqual([true, false]);
   await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
   expect(flag()).toBe(1);
-  expect(audited()).toHaveLength(2);
+  expect(trail()).toEqual([true, false, true]);
   // A later request of the ownership turns it on (#520: OpenCode's native client starts the ownership without the
   // plugin's `_meta`), audited once; a repeat, or a request that declares nothing, changes nothing.
   await hosted.end(generic, ctx());
   await hosted.whoami(generic, ctx());
   expect(flag()).toBe(0);
+  // session_end's declaration doesn't count (#532): it would set the flag only for the end to clear it, leaving a
+  // `true, false` pair for a launcher that never was one.
+  await hosted.end(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
+  expect(flag()).toBe(0);
+  expect(trail()).toEqual([true, false, true, false]);
+  await hosted.whoami(generic, ctx());
   await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
   await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
   await hosted.whoami(generic, ctx());
   expect(flag()).toBe(1);
-  expect(audited()).toHaveLength(3);
+  expect(trail()).toEqual([true, false, true, false, true]);
   // A child's declaration is ignored: the root launches, not its subagent.
   await hosted.register(generic, ctx(), "launcher-child");
   const child = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-child", [GRAYBOARD_LAUNCHER_META]: true });
   await hosted.whoami(generic, child);
   expect((database.db.prepare("SELECT launcher FROM ids WHERE id = ?").get((child as { id: string }).id) as { launcher: number }).launcher).toBe(0);
-  expect(audited()).toHaveLength(3);
+  expect(audited()).toHaveLength(5);
 });
 
 test("a declared launcher is a delegation target, and only its own session's initialize and bind text carry the launcher instruction (#473)", async () => {
@@ -741,13 +881,19 @@ test("a declared launcher is a delegation target, and only its own session's ini
   expect(hostedBoundInstruction(info, undefined, true)).toContain("You're a launcher session");
   expect(hostedBoundInstruction(info)).not.toContain("You're a launcher session");
   // The requester is a third session of the same user: the declared launcher takes the request, the other is not a target.
-  const requester = await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
+  await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
   const result = await hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it" }));
   expect(result).toMatchObject({ to: "you@example.com/lead" });
   await expect(hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it", to: "plain" }))).rejects.toThrow("isn't a launcher session");
   // The text follows the stored flag, not the later request: a restart without the declaration still gets the rule.
   const later = await hosted.bind(generic, ctx("lead-root"), { name: "lead2", create: true });
   expect(instructions(later)).toContain("You're a launcher session");
+  // Unbind's text follows the same flag (#521 item 7): the launcher keeps the sentence under its remaining name, the plain session never gets it.
+  expect(instructions(await hosted.unbind(generic, ctx("lead-root"), { name: "lead" }))).toContain("You're a launcher session");
+  await hosted.bind(generic, ctx("plain-root"), { name: "plain2", create: true });
+  const plainUnbound = await hosted.unbind(generic, ctx("plain-root"), { name: "plain" });
+  expect(instructions(plainUnbound)).toContain('"plain2"');
+  expect(instructions(plainUnbound)).not.toContain("You're a launcher session");
 });
 
 test("a bound session with no delivery declaration (OpenCode) gets initialize text that follows its lease, as bind's does; a declaration still decides (#531)", () => {
@@ -974,4 +1120,135 @@ test("a call whose root's ownership ended and restarted before it returns keeps 
   expect(after.ownership_id).toBeGreaterThan(before);
   expect(database.db.query("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(after.ownership_id)).toEqual({ ended_at: null });
   expect(hosted.inflightCount).toBe(0);
+});
+
+// #424 items 2-4: the restart credit and the liveness heartbeat's untested branches.
+const creditRows = () => database.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='hosted.lease_restart_credit'").all().map(row => JSON.parse(row.detail));
+const lastStart = () => JSON.parse(database.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='server.started' ORDER BY id DESC LIMIT 1").get()!.detail);
+
+test("the restart credit is what keeps an unbound idle root alive across a long outage", async () => {
+  const root = context("idle-root");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.whoami(principal, root);
+  const seen = database.repo.hosted.get(root.id)!.last_seen_at;
+  hosted.close();
+  // 20 minutes down: without the credit, the unbound root is past the 15-minute idle window at startup.
+  now += 20 * 60_000;
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  expect(database.repo.hosted.get(root.id)?.last_seen_at).toBe(now);
+  expect(creditRows()).toEqual([expect.objectContaining({ field: "last_seen_at", before: seen, after: now, downtime_ms: 20 * 60_000 })]);
+  expect(lastStart()).toMatchObject({ credited: 1 });
+});
+
+test("a disabled user's root earns no restart credit", async () => {
+  const root = context("disabled-root");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  await delivery.open(principal, root);
+  expect(database.repo.hosted.get(root.id)?.lease_deadline).not.toBeNull();
+  hosted.close();
+  database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+  now += 5 * 60_000;
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  expect(creditRows()).toEqual([]);
+  expect(lastStart()).toMatchObject({ downtime_ms: 5 * 60_000, credited: 0 });
+  expect(database.repo.hosted.get(root.id)).toBeUndefined();
+});
+
+test("the heartbeat follows a clock that steps backwards", async () => {
+  now += 5_000;
+  await until(() => database.repo.hosted.aliveAt() === now, 5_000);
+  // Less than a heartbeat interval behind the last beat: only the t < beat branch writes it.
+  now -= 500;
+  await until(() => database.repo.hosted.aliveAt() === now, 5_000);
+});
+
+test("a failed heartbeat write is reported and retried on the next tick", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  const write = spyOn(database.repo.hosted, "heartbeat").mockImplementation(() => { throw new Error("disk full"); });
+  try {
+    const before = database.repo.hosted.aliveAt();
+    now += 5_000;
+    await until(() => errors.mock.calls.some(call => String(call[0]).includes('"operation":"hosted.heartbeat"')), 5_000);
+    expect(database.repo.hosted.aliveAt()).toBe(before);
+    write.mockRestore();
+    // The fake clock stands still: a failure that had advanced the beat would never write again.
+    await until(() => database.repo.hosted.aliveAt() === now, 5_000);
+  } finally { write.mockRestore(); errors.mockRestore(); }
+});
+
+// #399: a request's hosted bookkeeping reads O(its own rows), not O(the fleet). The row lists the store hands back
+// during one call are counted with 3 and with 40 unrelated bound roots; the totals must match.
+async function rowsReadDuring(call: () => Promise<unknown>) {
+  const store = database.repo.hosted;
+  const listing = ["all", "expired", "idle", "disabled", "children"] as const;
+  let read = 0;
+  const spies = listing.map(name => spyOn(store, name).mockImplementation(((original: (...a: unknown[]) => unknown[]) => (...a: unknown[]) => {
+    const rows = original(...a); read += rows.length; return rows;
+  })((store[name] as (...a: unknown[]) => unknown[]).bind(store)) as never));
+  try { await call(); }
+  finally { for (const spy of spies) spy.mockRestore(); }
+  return read;
+}
+async function withOthers(others: number, tag: string, measure: () => Promise<number>) {
+  for (let i = 0; i < others; i++) await hosted.bind(principal, context(`${tag}-${others}-${i}`), { name: `${tag}-${others}-${i}`, create: true });
+  const read = await measure();
+  for (let i = 0; i < others; i++) await hosted.end(principal, context(`${tag}-${others}-${i}`));
+  return read;
+}
+test("one hosted call reads the same rows however many other sessions exist (#399)", async () => {
+  async function rowsRead(others: number) {
+    return withOthers(others, "other", async () => {
+      const caller = context(`caller-${others}`);
+      await hosted.bind(principal, caller, { name: `caller-${others}`, create: true });
+      const read = await rowsReadDuring(() => hosted.run(principal, caller, "dm_history", session => session.identityFull));
+      await hosted.end(principal, caller);
+      return read;
+    });
+  }
+  const few = await rowsRead(3), many = await rowsRead(40);
+  expect(many).toBe(few);
+});
+
+// #805: admitting a new session counts the user's and the server's rows rather than listing them.
+test("admitting a new session reads the same rows however many other sessions exist (#805)", async () => {
+  async function rowsRead(others: number) {
+    return withOthers(others, "admit", async () => {
+      const caller = context(`fresh-${others}`);
+      const read = await rowsReadDuring(() => hosted.whoami(principal, caller));
+      expect(database.repo.hosted.get(hostedId(`fresh-${others}`))).toBeDefined();
+      await hosted.end(principal, caller);
+      return read;
+    });
+  }
+  const few = await rowsRead(3), many = await rowsRead(40);
+  expect(many).toBe(few);
+});
+
+// #399: the timer, not the request, ends idle rows; a request refused at capacity sweeps first (at most once a
+// tick) and is admitted when the sweep freed a row.
+test("a user at capacity with idle rows is admitted after the refusal's re-sweep, at most once per tick (#399)", async () => {
+  for (let i = 0; i < hosted.limits.user; i++) await hosted.whoami(principal, context(`unbound-${i}`));
+  const idle = spyOn(database.repo.hosted, "idle");
+  try {
+    now += 1_000;
+    await expect(hosted.whoami(principal, context("refused-1"))).rejects.toHaveProperty("code", "bad_request");
+    const swept = idle.mock.calls.length;
+    expect(swept).toBeGreaterThan(0);
+    await expect(hosted.whoami(principal, context("refused-2"))).rejects.toHaveProperty("code", "bad_request");
+    expect(idle.mock.calls.length).toBe(swept);
+    now += 900_001;
+    await hosted.whoami(principal, context("admitted"));
+    expect(idle.mock.calls.length).toBeGreaterThan(swept);
+    expect(database.repo.hosted.get(hostedId("admitted"))).toBeDefined();
+  } finally { idle.mockRestore(); }
+});
+
+test("a configured per-user session cap admits past the default and refuses at its size (#805 F-06)", async () => {
+  hosted.close();
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 300 } });
+  expect(hosted.limits).toMatchObject({ user: 300, global: 4096 });
+  for (let i = 0; i < 300; i++) await hosted.whoami(principal, context(`unbound-${i}`));
+  expect(hostedRowCount(database.db)).toBe(300);
+  await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
 });
