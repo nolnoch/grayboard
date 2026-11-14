@@ -5,6 +5,7 @@
     "": {
       "name": "grayboard",
       "dependencies": {
+        "@modelcontextprotocol/client": "2.4.0",
         "@modelcontextprotocol/core": "2.4.0",
         "@modelcontextprotocol/sdk": "^1.32.1",
         "@modelcontextprotocol/server": "2.4.0",
@@ -15,7 +16,6 @@
       },
       "devDependencies": {
         "@earendil-works/pi-coding-agent": "1.4.0",
-        "@modelcontextprotocol/client": "2.4.0",
         "@oh-my-pi/pi-coding-agent": "18.14.0",
         "@opencode-ai/plugin": "1.19.4",
         "@types/bun": "latest",
