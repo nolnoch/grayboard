@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 
 export type Claim = {
@@ -139,6 +139,11 @@ export function claim(
          RETURNING *`,
       )
       .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
+    // A renewal that moves the claim onto an archived board would start new
+    // business there (#635), like a fresh [claim]; it rolls back instead.
+    if (renewed && row.board && row.board !== cur.board && getBoard(db, row.board)?.archived_at) {
+      throw new CoreError(`#${row.board} is archived; a claim can't move onto it`);
+    }
     logEvent(db, renewed ? "renew" : "take", as, row, now);
     const changed = !renewed
       ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts, false)

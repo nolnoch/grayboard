@@ -898,7 +898,9 @@ export function post(
     // least-recently-woken eligible subscriber and claims the post (TTL
     // takeover releases it to the next wake). Replies follow thread semantics
     // and release the claimer's claim.
-    const queue = !announcement && parentId === null && (b.kind ?? "broadcast") === "queue";
+    // An archived queue board takes no new work (#635): a claim's [release]
+    // or [expired] post landing there is a broadcast, never a delivery.
+    const queue = !announcement && parentId === null && !b.archived_at && (b.kind ?? "broadcast") === "queue";
     let unresolved: string[] = [];
     if (queue) {
       const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);

@@ -123,6 +123,26 @@ test("a new claim can't announce on an archived board; one already there still r
   ]);
 });
 
+test("a renewal can't move a claim onto an archived board", () => {
+  createBoard(db, "be", "task-2", "Another task");
+  claim(db, "be", "lane:a", { board: "task-1" });
+  tool("be", "board_archive", { board: "task-2" });
+  expect(() => claim(db, "be", "lane:a", { board: "task-2", note: "moved" })).toThrow(/#task-2 is archived/);
+  expect(() => claim(db, "be", "lane:a", { board: "task-2" })).toThrow(/#task-2 is archived/);
+  expect(listClaims(db).map((c) => [c.key, c.board])).toEqual([["lane:a", "task-1"]]);
+  expect(read(db, "be", "task-2", { before_id: 999 }).posts).toEqual([]);
+});
+
+test("a claim's release on an archived queue board is a broadcast, not new work", () => {
+  createBoard(db, "be", "q", "work", null, { kind: "queue" });
+  subscribe(db, "sim", "q", "push");
+  claim(db, "be", "lane:x", { board: "q" });
+  const before = listClaims(db).filter((c) => c.key !== "lane:x").length;
+  tool("be", "board_archive", { board: "q" });
+  release(db, "be", "lane:x");
+  expect(listClaims(db).length).toBe(before);
+});
+
 test("an archived queue board takes no new work; a live delivery still acks by reply", () => {
   createBoard(db, "be", "q", "work", null, { kind: "queue" });
   subscribe(db, "sim", "q", "push");
