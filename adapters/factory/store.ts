@@ -33,6 +33,9 @@ export type Row = Request & {
   // the round it belongs to. `notes`: a root's working memory, from its
   // lead's notes blocks, carried into each review's digest.
   round: number; notes: string | null;
+  // Progress (#669): the latest one-line note the row's open run gave with
+  // the progress tool, and when. A fresh run starts without one.
+  progress: string | null; progressAt: number | null;
 };
 export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string; round?: number };
 // A child process (#649): one per run of a request (a fanned-out request has
@@ -118,7 +121,7 @@ export class Store {
       const cols = new Set((this.db.query(`PRAGMA table_info(requests)`).all() as { name: string }[]).map((c) => c.name));
       const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"],
         ["question", "TEXT"], ["ask_human", "INTEGER NOT NULL DEFAULT 0"], ["asked_at", "INTEGER"], ["escalated_at", "INTEGER"], ["answer", "TEXT"], ["asks", "INTEGER NOT NULL DEFAULT 0"], ["resume", "INTEGER NOT NULL DEFAULT 0"],
-        ["round", "INTEGER NOT NULL DEFAULT 0"], ["notes", "TEXT"]];
+        ["round", "INTEGER NOT NULL DEFAULT 0"], ["notes", "TEXT"], ["progress", "TEXT"], ["progress_at", "INTEGER"]];
       for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
       // A run's granted budget (#655): its reservation while open, its charge when it ends without a cost.
       const runCols = new Set((this.db.query(`PRAGMA table_info(runs)`).all() as { name: string }[]).map((c) => c.name));
@@ -162,6 +165,16 @@ export class Store {
   // A root's working memory (#658), replaced whole: the caller caps it.
   setNotes(seq: number, notes: string): void {
     this.db.query(`UPDATE requests SET notes = ?, updated_at = ? WHERE seq = ?`).run(notes, this.now(), seq);
+  }
+
+  // A running row's progress note (#669), replaced whole: the caller cleans
+  // and caps it. False when the row isn't running.
+  setProgress(seq: number, note: string): boolean {
+    return this.db.query(`UPDATE requests SET progress = ?, progress_at = ? WHERE seq = ? AND state = 'running'`).run(note, this.now(), seq).changes > 0;
+  }
+
+  clearProgress(seq: number): void {
+    this.db.query(`UPDATE requests SET progress = NULL, progress_at = NULL WHERE seq = ?`).run(seq);
   }
 
   // A request's subtasks across every round, in posting order (so by round).
@@ -487,7 +500,7 @@ export class Store {
 export type ClaimHolder = { seq: number; title: string | null; note: string | null; takenAt: number };
 const LIVE = `(r.state IN ('running', 'asking') OR (r.state = 'queued' AND r.resume = 1))`;
 
-type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number; round: number; notes: string | null };
+type Fields = { seq: number; id: number; requester: string; persona: string; task: string; agent: string; state: State; reply: string | null; created_at: number; updated_at: number; phase: Phase; parent: number | null; title: string | null; profile: string | null; question: string | null; answer: string | null; asks: number; round: number; notes: string | null; progress: string | null };
 // The fleet a row belongs to, by its root's board: in `boards` (`within`) or not.
 function held(boards: string[], within: boolean): string {
   if (!boards.length) return "";
@@ -495,9 +508,9 @@ function held(boards: string[], within: boolean): string {
   return within ? ` AND ${inList}` : ` AND NOT (q.source = 'board' AND COALESCE(${inList}, 0))`;
 }
 
-type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number };
+type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number; progress_at: number | null };
 function toRow(r: Raw): Row {
-  const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, shared_until: _su, shared_by: _sb, ...rest } = r as Raw & { shared_until?: unknown; shared_by?: unknown };
-  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board, askHuman: ask_human === 1, askedAt: asked_at, escalatedAt: escalated_at, resume: resume === 1 };
+  const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, progress_at, shared_until: _su, shared_by: _sb, ...rest } = r as Raw & { shared_until?: unknown; shared_by?: unknown };
+  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board, askHuman: ask_human === 1, askedAt: asked_at, escalatedAt: escalated_at, resume: resume === 1, progress: rest.progress ?? null, progressAt: progress_at ?? null };
   return source === "board" ? { ...base, source: "board", board: board ?? "" } : { ...base, source: "dm" };
 }
