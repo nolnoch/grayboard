@@ -9,6 +9,7 @@ import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
 import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { createTouchQueue } from "./auth.ts";
+import { writeAudit } from "./audit.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 
@@ -34,6 +35,12 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
+  // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
+  // server started without dev auth revokes them, so a re-enable doesn't revive them.
+  if (!config.devAuth) {
+    const revoked = repo.sessions.revokeDev();
+    if (revoked > 0) writeAudit(repo, "auth.dev_sessions_revoked", null, null, { count: revoked });
+  }
   const application = createApplication(repo, db, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
 

@@ -45,7 +45,7 @@ describe("the server parses GRAYBOARD_* through the same rule", () => {
     const saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
     for (const k of KEYS) delete process.env[k];
     process.env.GRAYBOARD_DB_PATH = ":memory:";
-    process.env.GRAYBOARD_PUBLIC_URL = "https://grayboard.example.com";
+    process.env.GRAYBOARD_PUBLIC_URL = "http://localhost:8080";
     Object.assign(process.env, values);
     return () => {
       for (const k of KEYS) {

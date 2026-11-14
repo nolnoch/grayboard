@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { PrincipalTaken, type Repo, type Team } from "./db.ts";
+import { DEV_SESSION_LABEL, PrincipalTaken, type Repo, type Team } from "./db.ts";
 import { mayActIn } from "./access.ts";
 import type { Config } from "./config.ts";
 import {
@@ -9,6 +9,7 @@ import {
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
+import { isLoopbackIp } from "./client_addr.ts";
 import { canAdmin } from "./can_send.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
@@ -112,13 +113,20 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
 }
 
 async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Response> {
+  // The loopback public URL (config.ts) doesn't stop a remote client: the
+  // server listens on every interface, and a proxy forwards to it. Only a
+  // client on this host may sign in as anyone (security audit F-04).
+  if (!ip || !isLoopbackIp(ip)) {
+    writeAudit(repo, "auth.dev_login_refused", null, null, { ip: ip ?? undefined });
+    return jsonErr("forbidden", "dev sign-in answers only clients on the server's own host", 403);
+  }
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
   const user  = repo.users.upsertByEmail(email, null);
   const raw   = mintToken();
-  repo.sessions.create(user.id, hashToken(raw), "dev");
+  repo.sessions.create(user.id, hashToken(raw), DEV_SESSION_LABEL);
   writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
