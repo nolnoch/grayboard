@@ -1053,6 +1053,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       recheckAliases(null, null);
     },
     sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); },
+    /** How many users have a bind or hosted-request bucket, for tests. */
+    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size }),
     stopExpiry() {
       expiry.stop();
       for (const observer of [...observers]) removeObserver(observer);
