@@ -20,6 +20,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { reprDigest } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { withMeta } from "../helpers/hosted.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -64,23 +65,10 @@ afterEach(async () => {
 });
 
 const mapped = (url: string) => { const u = new URL(url); return base + u.pathname + u.search; };
-class Browser {
-  cookies = new Map<string, string>();
-  async request(url: string, init: RequestInit = {}) {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(mapped(url), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [key, value] = cookie.split(";")[0]!.split("=");
-      this.cookies.set(key!, value!);
-    }
-    return res;
-  }
-}
 // The full authorization code flow with PKCE S256 a native client runs; only the upstream
 // identity provider is stubbed (`exchangeGoogle`).
 async function grant(clientId: string): Promise<string> {
-  const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url"), browser = new Browser();
+  const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url"), browser = new Browser({ rewrite: mapped });
   const begin = await browser.request(`${issuer}/oauth/authorize?` + new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: redirectUrl, scope: SCOPES, resource, state,
     code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }));
   expect(begin.status).toBe(303);
@@ -88,8 +76,7 @@ async function grant(clientId: string): Promise<string> {
   const callback = await browser.request(`${issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" }));
   expect(callback.status).toBe(303);
   const page = await (await browser.request(callback.headers.get("Location")!)).text();
-  const request = /name="request" value="([^"]+)"/.exec(page)![1]!, csrf = /name="csrf" value="([^"]+)"/.exec(page)![1]!;
-  const approved = await browser.request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: "https://grayboard.example.com" }, body: new URLSearchParams({ request, csrf, decision: "approve" }) });
+  const approved = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page), "approve", "https://grayboard.example.com");
   expect(approved.status).toBe(303);
   const returned = new URL(approved.headers.get("Location")!);
   expect(returned.searchParams.get("state")).toBe(state);

@@ -28,6 +28,7 @@ import { direct } from "../support/events.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
 import { CLI } from "../support/paths.ts";
 import { newer } from "../../src/cli/update.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
@@ -219,17 +220,7 @@ async function releaseToken(server: ServerProcess, dbPath: string, email: string
   }
   // ServerProcess's public URL: the issuer, and the origin its redirects name.
   const issuer = "http://localhost";
-  const cookies = new Map([["gb_oauth_session", session]]);
-  const request = async (url: string, init: RequestInit = {}) => {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(url.replace(issuer, server.base), { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) {
-      const [k, v] = cookie.split(";")[0]!.split("=");
-      cookies.set(k!, v!);
-    }
-    return res;
-  };
+  const browser = new Browser({ cookies: { gb_oauth_session: session }, rewrite: url => url.replace(issuer, server.base) }), request = browser.request.bind(browser);
   const verifier = secret();
   const redirectUri = "http://127.0.0.1:45678/callback";
   const binding = { client_id: HOSTED_CLIENT, redirect_uri: redirectUri, resource: `${issuer}/mcp` };
@@ -239,8 +230,7 @@ async function releaseToken(server: ServerProcess, dbPath: string, email: string
   // Anywhere else (Google's sign-in) means the release refused the hand-written session.
   expect(authorize.headers.get("Location"), "the release didn't accept the hand-written oauth_browsers session").toStartWith(`${issuer}/oauth/consent`);
   const page = await (await request(authorize.headers.get("Location")!)).text();
-  const form = { request: /name="request" value="([^"]+)"/.exec(page)?.[1] ?? "", csrf: /name="csrf" value="([^"]+)"/.exec(page)?.[1] ?? "" };
-  const decided = await request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: issuer }, body: new URLSearchParams({ ...form, decision: "approve" }) });
+  const decided = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page));
   expect(decided.status, page).toBe(303);
   const code = new URL(decided.headers.get("Location")!).searchParams.get("code")!;
   const token = await fetch(`${server.base}/oauth/token`, { method: "POST", body: new URLSearchParams({ ...binding, grant_type: "authorization_code", code, code_verifier: verifier }) });

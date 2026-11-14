@@ -8,6 +8,7 @@ import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
 import type { Config } from "../../src/server/config.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { Browser, consentForm, submitConsent } from "./oauth_browser.ts";
 import { TestServer } from "./server.ts";
 
 const SCOPES = ["grayboard:delivery", "grayboard:tools"];
@@ -34,14 +35,7 @@ export function hostedServer(overrides: Partial<Config> = {}, email = "alice@exa
 // Walks authorize → (stubbed upstream) → consent → the client's loopback
 // callback, and returns the callback page's text.
 export async function browse(issuer: string, authorizeUrl: string, harness: string, decision: "approve" | "deny" = "approve"): Promise<string> {
-  const cookies = new Map<string, string>();
-  const request = async (url: string, init: RequestInit = {}) => {
-    const headers = new Headers(init.headers);
-    headers.set("Cookie", [...cookies].map(([k, v]) => `${k}=${v}`).join("; "));
-    const res = await fetch(url, { ...init, headers, redirect: "manual" });
-    for (const cookie of res.headers.getSetCookie()) { const [k, v] = cookie.split(";")[0]!.split("="); cookies.set(k!, v!); }
-    return res;
-  };
+  const browser = new Browser(), request = browser.request.bind(browser);
   const begin = await request(authorizeUrl);
   expect(begin.status).toBe(303);
   const google = new URL(begin.headers.get("Location")!);
@@ -50,8 +44,7 @@ export async function browse(issuer: string, authorizeUrl: string, harness: stri
   expect(callback.status).toBe(303);
   const page = await (await request(callback.headers.get("Location")!)).text();
   expect(page).toContain(`Authorize Grayboard for ${harness}`);
-  const id = /name="request" value="([^"]+)"/.exec(page)![1]!, csrf = /name="csrf" value="([^"]+)"/.exec(page)![1]!;
-  const decided = await request(`${issuer}/oauth/consent`, { method: "POST", headers: { Origin: issuer }, body: new URLSearchParams({ request: id, csrf, decision }) });
+  const decided = await submitConsent(browser, `${issuer}/oauth/consent`, consentForm(page), decision);
   expect(decided.status).toBe(303);
   const loopback = decided.headers.get("Location")!;
   expect(loopback).toStartWith("http://127.0.0.1:");
