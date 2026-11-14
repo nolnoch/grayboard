@@ -22,6 +22,8 @@ function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  // The mode above applies only to a new file; an existing one keeps its own (#88).
+  chmodSync(file, 0o600);
 }
 
 function output(data: unknown, json: boolean): void {
@@ -363,8 +365,13 @@ program
   .action(async () => {
     // Local credentials go regardless; what the server did decides the message.
     let outcome = "Logged out. The server closed this sign-in's open MCP connections.";
+    const creds = loadCredentials();
+    const server = process.env.GRAYBOARD_SERVER ?? creds?.server;
     try {
-      await makeClient().post("/api/auth/logout");
+      // A file that's corrupt, already signed out or names no server has no
+      // sign-in to revoke; it's still cleared below (#87).
+      if (!server || !creds?.session_token) outcome = "No valid sign-in was stored; the local credentials file is cleared.";
+      else await makeClient().post("/api/auth/logout");
     } catch (e) {
       outcome = e instanceof ApiError
         ? e.status === 401

@@ -6,7 +6,7 @@
 // they checked of the plugin itself (frames, reconnects, file paths and
 // presentation) has no live surface to compare, so it isn't here.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import type { SendResult } from "../../src/server/application.ts";
@@ -119,6 +119,33 @@ test("login and logout use GRAYBOARD_CREDENTIALS, not ~/.grayboard", async () =>
   await run("logout");
   expect(readFileSync(creds, "utf8")).toBe("");
   expect(existsSync(join(home, ".grayboard"))).toBe(false);
+});
+
+// #88: login leaves an existing 0644 file at 0600; a read of a loose file warns.
+test("login sets the credentials file to 0600 even when it already existed; a loose one is warned about", async () => {
+  const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");
+  const env = cleanEnv({ HOME: mkdtempSync(join(srv.dir, "gb-home-")), GRAYBOARD_CREDENTIALS: creds });
+  writeFileSync(creds, "", { mode: 0o644 });
+  chmodSync(creds, 0o644);
+  const loose = await runCli(["team", "list"], { env });
+  expect(loose.err).toContain(`${creds} is readable by other users (mode 0644); run: chmod 600 ${creds}`);
+  const r = await runCli(["login", "--dev", A, "--server", srv.base], { env });
+  expect(r.code, r.err).toBe(0);
+  expect(statSync(creds).mode & 0o777).toBe(0o600);
+  expect((await runCli(["team", "list"], { env })).err).not.toContain("readable by other users");
+});
+
+// #87: a corrupt file, or one naming no server, is cleared without a server call.
+test("logout clears a corrupt or serverless credentials file", async () => {
+  const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");
+  const env = cleanEnv({ HOME: mkdtempSync(join(srv.dir, "gb-home-")), GRAYBOARD_CREDENTIALS: creds });
+  for (const bad of ["{not json", JSON.stringify({ session_token: "t", user_email: A })]) {
+    writeFileSync(creds, bad, { mode: 0o600 });
+    const r = await runCli(["logout"], { env });
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain("No valid sign-in was stored; the local credentials file is cleared.");
+    expect(readFileSync(creds, "utf8")).toBe("");
+  }
 });
 
 test("grayboard claim acts as one of your identities; a watching session is woken", async () => {
