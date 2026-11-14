@@ -1169,7 +1169,8 @@ async function drainLoop(): Promise<void> {
 async function pushChannel(params: { content: string; meta: Record<string, string> }): Promise<boolean> {
   if (adapterPaused || claudePaused || shuttingDown) return false;
   // Claude Code renders the content as sent; an adapter's render() fences it again, to no effect.
-  params.content = fenceChannel(params.content);
+  // The human's session feeds the Slack bridge, a person, not a model: the body stays as sent.
+  if (!HUMAN) params.content = fenceChannel(params.content);
   if (CLAUDE_CURRENT && readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start)?.session !== HARNESS_SESSION) return false;
   if (!ADAPTER_OWNER) {
     await mcp.notification({ method: "notifications/claude/channel", params });

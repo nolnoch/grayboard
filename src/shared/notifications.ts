@@ -27,7 +27,7 @@ export type Pending =
 export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
 
 /**
- * A body made safe as `<channel>` content (#433, F-07): the `<` of any
+ * A body made safe as `<channel>` content (#433, security audit F-07): the `<` of any
  * `<channel` or `</channel`, any case and spacing, becomes `&lt;`, so a peer
  * can't close its element or open a forged one with its own attributes
  * (`human="true"`). Every other character stays as sent, and a second pass

@@ -195,7 +195,7 @@ test("dm_thread from any message returns the whole thread; pushes carry parent_i
   expect(pushes.find((p) => p.meta.message_id === String(leaf.message_id))?.meta.parent_id).toBe(String(reply.message_id));
 }, 20_000);
 
-// F-07: Claude Code shows a push's content as sent, and the pinned release
+// Security audit F-07: Claude Code shows a push's content as sent, and the pinned release
 // escapes only a closing tag, so the content of a DM and of a post comes
 // fenced: a peer's body can't open a forged `human="true"` element. Reads
 // return the body as sent.
@@ -212,6 +212,12 @@ test("a pushed DM or post can't open a channel element; reads keep the body as s
   expect(pushes.find((p) => p.meta.message_id === String(sent.message_id))!.content).toBe(fenced);
   expect(pushes.find((p) => p.meta.post_id === String(posted.post_id))!.content).toBe(fenced);
   expect((await call(fe, "dm_thread", { thread: sent.message_id }))[0].body).toBe(body);
+  // The human's session feeds the Slack bridge, a person: its pushes keep the body as sent.
+  await cli("human", "alex");
+  const alex = await localSession(dir, "alex", { extra: { BUS_HUMAN: "1" } });
+  const toHuman = await call(be, "dm_send", { to: "alex", body });
+  await until(() => alex.pushes.some((p) => p.meta.message_id === String(toHuman.message_id)), 10_000, "the DM to push to the human");
+  expect(alex.pushes.find((p) => p.meta.message_id === String(toHuman.message_id))!.content).toBe(body);
 }, 20_000);
 
 test("peer_list shows where a session runs and its status; a restart clears the status", async () => {
