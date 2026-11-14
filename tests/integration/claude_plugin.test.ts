@@ -481,6 +481,56 @@ test("a prompt Claude Code cancels unshown (its connection-setup handler) is sen
   await signedIn(s);
 }, 40_000);
 
+test("unshown cancels are re-sent at most RESENDS times: four instant cancels, four prompts, then the cap line (#506)", async () => {
+  const s = await plugin("sess-cap", { answer: async () => "cancel" });
+  await until(() => s.stderr().includes("sign-in prompt cancelled unshown 4 times; the link Claude Code shows under each grayboard call remains"), 15_000, "the cap line");
+  expect(s.elicits).toHaveLength(4);
+  expect(s.stderr().match(/sending it again \(\d\/3\)/g)).toEqual(["sending it again (1/3)", "sending it again (2/3)", "sending it again (3/3)"]);
+  // The flow and its link stay; the user can still open it.
+  const call = await texts(s, "whoami");
+  expect(call.texts[0]).toBe(STARTED);
+  expect(s.elicits).toHaveLength(4);
+  expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
+  await signedIn(s);
+}, 40_000);
+
+test("a flow that ends during the re-send wait sends no prompt (#506)", async () => {
+  // Held after the RESEND_MS wait while the browser signs in.
+  const release = join(dir, "resend.release");
+  const s = await plugin("sess-resend-ended", {
+    answer: async () => "cancel",
+    env: { BUS_TEST_PAUSE: "claude-sign-in-resend", BUS_TEST_PAUSE_FILE: release },
+  });
+  await until(() => s.stderr().includes("test pause hit: claude-sign-in-resend"), 10_000, "the re-send wait");
+  expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
+  await until(() => s.stderr().includes("signed in (startup)"), 10_000, "the flow's end");
+  writeFileSync(release, "");
+  await until(() => s.stderr().includes("sign-in ended before the prompt was sent again"), 10_000, "the re-send skipped");
+  expect(s.elicits).toHaveLength(1);
+  await signedIn(s);
+}, 40_000);
+
+test("a decline on a re-sent prompt ends the flow, and the next call starts another (#506)", async () => {
+  let n = 0;
+  const s = await plugin("sess-resend-decline", {
+    answer: async (e) => {
+      n++;
+      if (n === 1) return "cancel";
+      if (n === 2) return "decline";
+      void browse(srv.issuer, e.url, "Claude Code");
+      return "accept";
+    },
+  });
+  await until(() => /sign-in failed \((?:startup|offer), elicitation [^)]+\): sign-in declined/.test(s.stderr()), 10_000, "the decline");
+  expect(s.elicits).toHaveLength(2);
+  expect(s.stderr()).toContain("sending it again (1/3)");
+  await until(() => !linkFile(s), 5_000, "the declined flow's link removed");
+  expect((await texts(s, "whoami")).error).toBe(true);
+  await signedIn(s);
+  expect(s.elicits).toHaveLength(3);
+  expect(s.elicits[2]!.url).not.toBe(s.elicits[0]!.url);
+}, 40_000);
+
 test("a sign-in that can't reach the server says why in the next result", async () => {
   const s = await plugin("sess-unreachable", { env: { GRAYBOARD_SERVER_URL: "http://127.0.0.1:1/mcp" } });
   await until(() => s.stderr().includes("sign-in failed (startup): "), 15_000, "the failed startup sign-in");

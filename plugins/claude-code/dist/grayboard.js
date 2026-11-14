@@ -38122,17 +38122,17 @@ function createPlugin(o) {
       say(`open ${url} to sign in to grayboard`);
       if (!server.getClientCapabilities()?.elicitation?.url)
         return;
+      if (!flow)
+        return;
       for (let sent = 0;; sent++) {
         const prompt = { id: randomUUID2(), withdraw: new AbortController };
-        if (flow) {
-          prompts.get(flow)?.withdraw.abort();
-          prompts.set(flow, prompt);
-        }
+        prompts.get(flow)?.withdraw.abort();
+        prompts.set(flow, prompt);
         say(`sign-in prompt sent (elicitation ${prompt.id})`);
         const start = Date.now();
         let result;
         try {
-          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal });
+          result = await server.elicitInput({ mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` }, { timeout: SIGN_IN_FLOW_MS, signal: AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) });
         } catch (error) {
           if (prompt.withdraw.signal.aborted)
             return;
@@ -38143,7 +38143,7 @@ function createPlugin(o) {
         say(`sign-in prompt (elicitation ${prompt.id}) answered: ${result.action} after ${ms} ms`);
         if (result.action === "decline")
           throw new LoginFailed("sign-in declined");
-        if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow)
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS)
           return;
         if (sent >= RESENDS) {
           say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`);
@@ -38151,6 +38151,7 @@ function createPlugin(o) {
         }
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
+        await testPauseAsync("claude-sign-in-resend", o.env);
         if (signins.flow !== flow || flow.abort.signal.aborted) {
           say("sign-in ended before the prompt was sent again");
           return;

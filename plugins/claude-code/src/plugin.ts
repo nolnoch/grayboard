@@ -149,16 +149,20 @@ export function createPlugin(o: PluginOptions): Plugin {
       say(`open ${url} to sign in to grayboard`);
       // Claude Code switched URL elicitation off (tengu_mcp_url_elicitation): the link alone.
       if (!server!.getClientCapabilities()?.elicitation?.url) return;
+      // Login calls present only inside login(), which begin()'s signIns.start
+      // runs after setting the flow, so there always is one (#506).
+      if (!flow) return;
       for (let sent = 0; ; sent++) {
         const prompt: Prompt = { id: randomUUID(), withdraw: new AbortController() };
-        if (flow) { prompts.get(flow)?.withdraw.abort(); prompts.set(flow, prompt); }
+        prompts.get(flow)?.withdraw.abort();
+        prompts.set(flow, prompt);
         say(`sign-in prompt sent (elicitation ${prompt.id})`);
         const start = Date.now();
         let result;
         try {
           result = await server!.elicitInput(
             { mode: "url", elicitationId: prompt.id, url, message: `Sign in to grayboard at ${new URL(config.url).origin} for this Claude Code session.` },
-            { timeout: SIGN_IN_FLOW_MS, signal: flow ? AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) : prompt.withdraw.signal },
+            { timeout: SIGN_IN_FLOW_MS, signal: AbortSignal.any([flow.abort.signal, prompt.withdraw.signal]) },
           );
         } catch (error) {
           // Withdrawn: the browser answered first, and the flow went on without it.
@@ -171,10 +175,11 @@ export function createPlugin(o: PluginOptions): Plugin {
         // Only a decline ends the flow: Esc (cancel) may just free the keyboard
         // from a prompt Claude Code keeps up while the user finishes the link.
         if (result.action === "decline") throw new LoginFailed("sign-in declined");
-        if (result.action !== "cancel" || ms >= UNSHOWN_MS || !flow) return;
+        if (result.action !== "cancel" || ms >= UNSHOWN_MS) return;
         if (sent >= RESENDS) { say(`sign-in prompt cancelled unshown ${sent + 1} times; the link Claude Code shows under each grayboard call remains`); return; }
         say(`sign-in prompt cancelled unshown; sending it again (${sent + 1}/${RESENDS}) in ${RESEND_MS} ms`);
         await after(RESEND_MS);
+        await testPauseAsync("claude-sign-in-resend", o.env);
         // The flow ended (signed in, failed, aborted) while waiting: nothing to ask.
         if (signins.flow !== flow || flow.abort.signal.aborted) { say("sign-in ended before the prompt was sent again"); return; }
         // A later URL's prompt replaced this one.
