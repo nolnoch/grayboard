@@ -253,3 +253,15 @@ test("peer_list's match: harness, task, id and scope; an unknown key is refused"
   expect(await handles({ scope: "alice@example.com" })).toEqual(["alice@example.com/fe"]);
   await expect(member.call("peer_list", { match: { colour: "red" } })).rejects.toMatchObject({ message: expect.stringContaining(`match has no key "colour"`) });
 });
+
+// #356: the bind-target checks a team's scope shares with a person's, end to end.
+test("a bind of human in a team's scope is refused as reserved, and creates nothing", async () => {
+  await expect(srv.appSession(bob, "eng/human").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining(`"human" is reserved`) });
+  expect(rows(`SELECT address FROM aliases WHERE address = 'eng/human'`)).toEqual([]);
+});
+
+test("a bind in a service principal's scope is refused until #270, and creates nothing", async () => {
+  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining("service principals arrive with #270") });
+  expect(rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
+});
