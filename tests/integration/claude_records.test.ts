@@ -283,6 +283,8 @@ for (const fail of [false, true]) test(`native post-list activation ${fail ? "re
     expect(b.s.pushes.map(push => push.meta.kind ?? "mail")).toEqual(["guidance", "mail"]);
     expect(b.s.pushes[0]!.content).toContain(current.id);
     expect(b.s.pushes[0]!.content).toContain('identity "cc"');
+    // Not fenced (security audit F-07): it shows the genuine channel form.
+    expect(b.s.pushes[0]!.content).toContain('<channel source="grayboard"');
     expect(b.s.pushes[1]!.content).toBe("queued-until-native-activation");
     expect(cursor()).toBe(mail.message_id);
   }

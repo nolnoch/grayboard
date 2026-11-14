@@ -667,6 +667,28 @@ async function boardSnapshot(s: HostedSession, board: string): Promise<ReadResul
   return snapshot;
 }
 
+// #475 item 1: disabling a user ends their hosted children through the repo's own store, so the ends'
+// after-commit half runs: a live sender gets its bounce pushed now. The message stands in for mail that reached
+// the ID before it was a child (a send to a child's ID is refused).
+test("disable-user ends a hosted child and pushes its bounce to a live sender (#475 item 1)", async () => {
+  await restart({ admins: [C] });
+  const admin = await login(C);
+  await login(A);
+  const be = await srv.hosted(A, "be");
+  // An application session, not a hosted one: it gets the bounce only by the live push, where a hosted
+  // session's inbox poll would find it in the table anyway.
+  const fe = await srv.connected(await login(B), "fe");
+  const { child, id } = await childOf(be, A, "reviewer-run");
+  // Their clients drop first (no release), so the disable's 401s reach no client; the rows stay.
+  await Promise.all([be.drop(), child.drop()]);
+  expect(srv.app.repo.hosted.get(id)?.root_session_id).toBeTruthy();
+  srv.app.db.prepare(`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
+    VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, 0)`).run(`${B}/fe`, id, Date.now());
+  expect((await api(admin, "POST", "/api/admin/disable-user", { email: A })).status).toBe(200);
+  expect((await fe.next(direct())).message).toMatchObject({ sender: id, kind: "bounce" });
+  expect(srv.app.repo.hosted.get(id)).toBeUndefined();
+});
+
 test("#523: a child's DM and post carry its ID as via in pushes, reads and board snapshots, and still do after it ends; its root's carry none", async () => {
   const be = await srv.hosted(A, "be");
   const fe = await srv.hosted(A, "fe");

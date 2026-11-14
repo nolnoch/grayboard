@@ -1,9 +1,9 @@
 import pkg from "../../package.json" with { type: "json" };
-import { PrincipalTaken, type Repo, type Team, type User } from "./db.ts";
+import { LastOwner, PrincipalTaken, type Repo, type Team, type TeamRole, type User } from "./db.ts";
 import { mayActIn } from "./access.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
-  verifySessionToken, extractBearer, exchangeGoogleCode,
+  verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
 import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
@@ -90,17 +90,20 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {
     return badRequest("code, code_verifier, redirect_uri required");
   }
-  let email: string, displayName: string | null;
+  let identity: GoogleIdentity;
   try {
-    ({ email, displayName } = await exchangeGoogleCode(
+    identity = await exchangeGoogleCode(
       body.code, body.code_verifier, body.redirect_uri,
       config.googleClientId, config.googleClientSecret, config.orgDomain,
-    ));
+    );
   } catch (e) {
     return jsonErr("forbidden", String(e), 403);
   }
+  const email = identity.email;
   if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
-  const user = repo.users.upsertByEmail(email, displayName ?? null);
+  const signedIn = googleSignIn(repo, identity, { ip: ip ?? undefined });
+  if ("refused" in signedIn) return jsonErr("forbidden", signedIn.refused, 403);
+  const { user } = signedIn;
   const disabled = refuseDisabled(repo, user, { ip: ip ?? undefined });
   if (disabled) return disabled;
   const raw  = mintToken();
@@ -400,11 +403,11 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: Core
     if (e instanceof PrincipalTaken) return conflict(e.message);
     throw e;
   }
-  repo.teams.addMember(team.id, authed.user_id);
+  repo.teams.addMember(team.id, authed.user_id, "owner");
   ensureTeamBoard(db, team, authed.user_email);
   onTeamJoined(db, repo, team, authed.user_email);
   writeAudit(repo, "team.created", authed.user_email, name);
-  writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email });
+  writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
   return json({ name: team.name, created_at: team.created_at }, 201);
 }
 
@@ -419,8 +422,8 @@ function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | nu
   return team && repo.teams.isMember(team.id, authed.user_id) ? team : null;
 }
 
-// Members manage their team; admins can manage any team, e.g. one whose last
-// member left. as_admin marks the audit row when an admin isn't a member.
+// Members read their team's roster; admins can read any team's. as_admin
+// marks the audit row when an admin isn't a member.
 function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
   const team = memberTeam(teamName, authed, repo);
   if (team) return { team, audit: {} };
@@ -429,10 +432,32 @@ function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: C
   return any ? { team: any, audit: { as_admin: true } } : null;
 }
 
+// Owners change their team's membership; admins can change any team's, e.g.
+// one whose last member left or whose creator left before roles existed
+// (security audit F-02: a member could remove the creator, then bind the
+// team names the creator lost). as_admin marks an admin acting without
+// owning. A non-member still reads not found; a member who isn't an owner
+// is refused, naming who can.
+function ownedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
+  const managed = managedTeam(teamName, authed, repo, config);
+  if (!managed) return notFound();
+  const { team } = managed;
+  if (!managed.audit.as_admin && repo.teams.isOwner(team.id, authed.user_id)) return managed;
+  if (canAdmin(authed.user_email, config.admins).allow) return { team, audit: { as_admin: true } };
+  return forbidden(`only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`);
+}
+
+const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
+
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb, sessions: SessionHooks): Response {
   const team = memberTeam(teamName, authed, repo);
   if (!team) return notFound();
-  repo.teams.removeMember(team.id, authed.user_id);
+  try {
+    repo.teams.removeMember(team.id, authed.user_id);
+  } catch (e) {
+    if (e instanceof LastOwner) return lastOwner(e);
+    throw e;
+  }
   onTeamLeft(db, repo, team, authed.user_email);
   sessions.accessChanged(authed.user_email, authed.user_email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
@@ -440,32 +465,53 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb,
 }
 
 async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
-  const managed = managedTeam(teamName, authed, repo, config);
-  if (!managed) return notFound();
+  // Read the body before the ownership check (security audit F-02): an owner
+  // demoted while a slow body trickles in must not act on a stale check.
+  const body = await parseBody<{ email: string; role?: unknown }>(req);
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
   const { team } = managed;
-  const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
+  if (body.role !== undefined && body.role !== "owner" && body.role !== "member") return badRequest(`role must be "owner" or "member"`);
+  const role = body.role as TeamRole | undefined;
   const email = body.email.toLowerCase();
   const user  = repo.users.findByEmail(email);
   if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
-  repo.teams.addMember(team.id, user.id);
-  onTeamJoined(db, repo, team, email);
-  writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, ...managed.audit });
+  if (repo.teams.addMember(team.id, user.id, role ?? "member")) {
+    onTeamJoined(db, repo, team, email);
+    writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
+    return json({ ok: true });
+  }
+  // Already a member: a role changes only when one is asked for.
+  if (role === undefined) return json({ ok: true });
+  let from: TeamRole | null;
+  try {
+    from = repo.teams.setRole(team.id, user.id, role);
+  } catch (e) {
+    if (e instanceof LastOwner) return lastOwner(e);
+    throw e;
+  }
+  if (from !== null && from !== role) writeAudit(repo, "team.role_changed", authed.user_email, team.name, { member: email, role, from, ...managed.audit });
   return json({ ok: true });
 }
 
 async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config, sessions: SessionHooks): Promise<Response> {
-  const managed = managedTeam(teamName, authed, repo, config);
-  if (!managed) return notFound();
+  const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
   const { team } = managed;
-  const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   const user  = repo.users.findByEmail(email);
   if (!user || !repo.teams.isMember(team.id, user.id)) {
     return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
   }
-  repo.teams.removeMember(team.id, user.id);
+  try {
+    repo.teams.removeMember(team.id, user.id);
+  } catch (e) {
+    if (e instanceof LastOwner) return lastOwner(e);
+    throw e;
+  }
   onTeamLeft(db, repo, team, email);
   sessions.accessChanged(email, authed.user_email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
@@ -515,6 +561,19 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
   repo.users.setDisabled(target.id, false);
   writeAudit(repo, "auth.user_enabled", authed.user_email, body.email);
   await slack?.userChanged(target.id);
+  return json({ ok: true });
+}
+
+// Forgets a user's Google account (security audit F-13), so the next Google
+// sign-in with the email takes the account over: for a person whose Google
+// account was recreated, or an email an admin chooses to hand on.
+async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+  const body = await parseBody<{ email: string }>(req);
+  if (!body?.email) return badRequest("email required");
+  const target = repo.users.findByEmail(body.email.toLowerCase());
+  if (!target) return notFound();
+  repo.users.clearSubject(target.id);
+  writeAudit(repo, "auth.subject_cleared", authed.user_email, target.email, { had_subject: target.idp_subject !== null });
   return json({ ok: true });
 }
 
@@ -594,6 +653,7 @@ export async function handleHttp(
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
+  if (path === "/api/admin/unlink-idp"     && method === "POST") return adminUnlinkIdp(req, authed, repo);
 
   return notFound();
 }

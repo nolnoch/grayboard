@@ -38,15 +38,17 @@ grayboard identity create <name> [--mcp [path]] [--force]
 grayboard identity rm <name>
 
 grayboard team list
-grayboard team create <name>             # creator is auto-added
-grayboard team add <team> <email>        # any member or admin; they must have signed in once
-grayboard team remove <team> <email>     # any member or admin
+grayboard team create <name>             # you become its first owner
+grayboard team add <team> <email>        # an owner or admin; they must have signed in once
+grayboard team add <team> <email> --role owner|member   # an owner or admin changes a member's role
+grayboard team remove <team> <email>     # an owner or admin
 grayboard team leave <name>
 grayboard team members <name>            # members and admins
 
 grayboard admin revoke-session --email <e>   # every session the user has
 grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in
 grayboard admin enable-user --email <e>    # they sign in again; old sign-ins stay revoked
+grayboard admin unlink-idp --email <e>     # forget the user's Google account (see the server guide)
 ```
 
 > Admin commands work only for the emails in the server's `GRAYBOARD_ADMINS`. Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.

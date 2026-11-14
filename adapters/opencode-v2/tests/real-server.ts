@@ -66,7 +66,7 @@ export async function spawnRealServer(config: Config, dir: string): Promise<Real
 if (import.meta.main) {
   const config: Config = JSON.parse(process.argv[2]!);
   const app = startServer(config, { hostname: "127.0.0.1", background: false, oauth: {
-    exchangeGoogle: async () => ({ email: "you@example.com", displayName: "Fixture" }),
+    exchangeGoogle: async () => ({ email: "you@example.com", displayName: "Fixture", subject: "google-you@example.com" }),
     cimd: {
       resolve: async host => { if (host !== "opencode.ai") throw new Error("Unexpected CIMD host " + host); return [{ address: "93.184.216.34", family: 4 }]; },
       read: async url => { if (url.href !== OPENCODE_CLIENT) throw new Error("Unexpected CIMD URL"); return savedClientMetadata(url); },
