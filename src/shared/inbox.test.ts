@@ -24,3 +24,17 @@ test("rows show pending and kind only when they're set", () => {
   expect(showMessage({ id: 1, pending: 1 })).toEqual({ id: 1, pending: true });
   expect(showMessage({ id: 1, pending: 0, kind: "bounce" })).toEqual({ id: 1, kind: "bounce" });
 });
+
+// #533: delivered_at shows only once set, on reads and on both inbox lists.
+test("delivered_at shows only when set, in showMessage, unanswered and promised rows", () => {
+  expect(showMessage({ id: 1, pending: 0, delivered_at: null })).toEqual({ id: 1 });
+  expect(showMessage({ id: 1, pending: 0, delivered_at: 5 })).toEqual({ id: 1, delivered_at: 5 });
+  const sent = { ...msg(1, "be", "fe"), delivered_at: 7 };
+  const queued = { ...msg(2, "be", "sim"), delivered_at: null };
+  const threadOf = (id: number) => [id === 1 ? sent : queued];
+  expect(promised(["be"], [sent, queued], threadOf, 0)).toEqual([
+    { id: 1, to: "fe", age: "0m", delivered_at: 7, body: "m1" },
+    { id: 2, to: "sim", age: "0m", body: "m2" },
+  ]);
+  expect(unanswered(["fe"], [sent], threadOf, "fe", 0)).toEqual([{ id: 1, from: "be", age: "0m", delivered_at: 7, body: "m1" }]);
+});

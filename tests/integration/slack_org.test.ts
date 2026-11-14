@@ -375,6 +375,28 @@ test("disabling a user takes their human offline; enabling brings it back", asyn
   await until(() => posted("while disabled"));
 }, 30_000);
 
+// #533: a relink starts the new human past what queued for the old one, and
+// that skipped mail is never stamped delivered_at: it never reached Slack.
+test("a relink skips mail queued for the earlier link's human without stamping it delivered", async () => {
+  const [alice, , root] = await Promise.all(["alice", "bob", "root"].map((n) => login(`${n}@example.com`)));
+  await link(alice);
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" });
+  const fe = await hosted("bob@example.com", "fe");
+  expect((await api(root, "POST", "/api/admin/disable-user", { email: "alice@example.com" })).status).toBe(200);
+  const queued = await fe.call<SendResult>("dm_send", { to: "alice@example.com/human", body: "while disabled" });
+  expect(queued.delivered_now).toBe(false);
+  slack.say("unlink");
+  await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from")));
+  expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
+  await link(alice);
+  expect((await fe.call<SendResult>("dm_send", { to: "alice@example.com/human", body: "after relink" })).delivered_now).toBe(true);
+  await until(() => posted("after relink"));
+  expect(posted("while disabled")).toBe(false);
+  const row = srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(queued.message_id) as { delivered_at: number | null };
+  expect(row.delivered_at).toBeNull();
+}, 30_000);
+
 // The notice the owner used to get on their next WSS hello is gone with it
 // (#282): no hosted session carries it, so what stays is the durable record.
 test("a bridge that fails at boot records its death for its linked users, via the durable links", async () => {

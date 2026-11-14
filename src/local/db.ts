@@ -118,7 +118,7 @@ export function deliveredTo(reader: string, id: number, at = Date.now()): void {
        ON CONFLICT(reader) DO UPDATE SET last_seen_id = excluded.last_seen_id
        WHERE excluded.last_seen_id > cursors.last_seen_id`,
     ).run(reader, id);
-  })();
+  }).immediate();
 }
 
 export function getMessage(id: number): Message | undefined {
