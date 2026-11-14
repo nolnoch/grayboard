@@ -11,6 +11,7 @@ import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
+import { countOpenDelegations } from "../core/delegation.ts";
 import type { MailPort } from "../core/session_end.ts";
 import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
@@ -147,6 +148,8 @@ export interface Repo {
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(senders: string[], since: number): MessageRow[];
     ack(reader: string, id: number): void;
+    // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
+    openDelegations(launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
     markDelivered(id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
@@ -314,6 +317,7 @@ function initSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_hosted_grant ON hosted_sessions(grant_id);
     CREATE INDEX IF NOT EXISTS idx_hosted_ownership ON hosted_sessions(ownership_id);
     CREATE INDEX IF NOT EXISTS idx_hosted_deadline ON hosted_sessions(lease_deadline);
+    CREATE INDEX IF NOT EXISTS idx_hosted_user ON hosted_sessions(user_id);
     -- A hosted root's holds are alias_holds rows (#451); the unique index on its old single name goes (migrateHostedHolds).
     DROP INDEX IF EXISTS idx_hosted_name;
     -- A hosted root's holds the server took (#453, revokeAliases), one row per alias (a second loss restates it).
@@ -565,11 +569,18 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   const principalByName = (name: string): PrincipalRow | undefined =>
     db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
-  const observers = new Set<() => void>();
-  const changed = () => afterCommit(db, () => { for (const fn of observers) { try { fn(); } catch (error) { console.error("hosted invalidation failed", error); } } });
+  // Each changed row tells the observers after its transaction commits (#399); a rollback drops the notice with
+  // the change. `null`: any row may have changed (a grant or a user), so observers check every one.
+  const observers = new Set<(changed: string | null) => void>();
+  const changed = (id: string | null) => afterCommit(db, () => { for (const fn of observers) { try { fn(id); } catch (error) { console.error("hosted invalidation failed", error); } } });
   const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
     const value = fn(...args);
-    changed();
+    changed(null);
+    return value;
+  };
+  const marks = <A extends unknown[], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R => {
+    const value = fn(...args);
+    changed(id(...args));
     return value;
   };
   const oauth = makeOAuthStore(db);
@@ -581,7 +592,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     oauth: { ...oauth, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
-    hosted: { ...hosted, atomic: change(hosted.atomic), subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
+    hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
+      end: marks(hosted.end, session => session), childEnd: marks(hosted.childEnd, session => session),
+      park: marks(hosted.park, session => session), unpark: marks(hosted.unpark, session => session),
+      subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
     users: {
       upsertByEmail(email, displayName) {
         const now = clock();
@@ -607,13 +621,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           const now = clock();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);
           if (disabled) {
+            // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
+            db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             endHostedWhere(db, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
             db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
           }
         }).immediate();
-        changed();
+        changed(null);
       },
     },
 
@@ -648,7 +664,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         }).immediate();
-        changed();
+        changed(null);
       },
       touch(sessionId, now) {
         db.run("UPDATE sessions SET last_used_at = ? WHERE id = ?", [now, sessionId]);
@@ -840,6 +856,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`,
         ).all(JSON.stringify(senders), since));
+      },
+      openDelegations(launcher, since) {
+        return countOpenDelegations(db, "access_log", launcher, since);
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
@@ -1351,7 +1370,12 @@ function makeHostedStore(db: Database): HostedStore {
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
     ).get(id, id) !== null,
     all: () => db.query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all(),
+    counts: (user) => db.query<{ total: number; user: number }, [number]>(
+      "SELECT (SELECT count(*) FROM hosted_sessions WHERE parked_at IS NULL) AS total, (SELECT count(*) FROM hosted_sessions WHERE user_id = ?1 AND parked_at IS NULL) AS user").get(user)!,
+    ofOwnership: (ownership) => db.query<HostedSession, [number]>("SELECT * FROM hosted_sessions WHERE ownership_id = ? AND parked_at IS NULL").all(ownership),
     children: (root) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
+    roots: (user) => db.query<HostedSession, [number]>(
+      "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
     park(session, now) {
       db.run("UPDATE hosted_sessions SET parked_at = ? WHERE session_id = ? AND root_session_id IS NOT NULL AND parked_at IS NULL", [now, session]);
     },
@@ -1372,6 +1396,17 @@ function makeHostedStore(db: Database): HostedStore {
       db.run("UPDATE hosted_sessions SET grant_id = ?, bind_gen = ?, root_session_id = ?, ownership_id = ?, place = ?, lease_deadline = ?, last_seen_at = ? WHERE session_id = ?",
         [row.grant_id, row.bind_gen, row.root_session_id, row.ownership_id, row.place, row.lease_deadline, row.last_seen_at, row.session_id]);
     },
+    touch(session, now) {
+      db.run("UPDATE hosted_sessions SET last_seen_at = ? WHERE session_id = ?", [now, session]);
+    },
+    // The unary `+` keeps the planner off idx_hosted_root, which every root matches, so these two read
+    // idx_hosted_deadline and idx_hosted_user (#399).
+    expired: (now) => db.query<HostedSession, [number]>(
+      "SELECT * FROM hosted_sessions WHERE lease_deadline <= ? AND +root_session_id IS NULL").all(now),
+    idle: (cutoff) => db.query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
+      AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
+    disabled: () => db.query<HostedSession, []>(
+      "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
     childEnd(session, now, reason) {
       const row = get(session);
       if (!row?.root_session_id) return;

@@ -76,6 +76,41 @@ export function sameUser(principal: string | null, candidate: string, db: Databa
   return !row || (row as { principal: string | null }).principal === principal;
 }
 
+// Limits (#252). A requester spends one token per fresh delegation (a dedup
+// replay spends none): a burst, then one every 10s. On a server the bucket is
+// the user's, shared by all their sessions and children; a local session
+// keeps its own. A launcher with DELEGATE_OPEN_CAP requests it hasn't taken
+// (the open count below) is skipped by the auto-pick and refused by name. A
+// server reads both from GRAYBOARD_DELEGATE_* (src/server/config.ts).
+export const DELEGATE_LIMIT = { burst: 60, perSec: 0.1 };
+export const DELEGATE_OPEN_CAP = 20;
+
+// The refusal when the requester's bucket is empty; `from` names whose
+// bucket it is ("your user", "this session").
+export function delegateThrottled(limit: { burst: number; perSec: number }, retryAfterMs: number, from: string): string {
+  const refill = limit.perSec >= 1 ? `${+limit.perSec.toFixed(2)} a second` : `one every ${+(1 / limit.perSec).toFixed(1)}s`;
+  return `too many delegation requests from ${from} (a burst of ${limit.burst}, then ${refill}, #252); retry in ${Math.max(1, Math.ceil(retryAfterMs / 1000))}s`;
+}
+
+// A launcher's open delegations: requests audited as sent to it in the last
+// `since` window whose message still exists (a retracted re-pick doesn't
+// count) and that its side hasn't taken. Taken is the launcher's reply in
+// the request's thread or its dm_ack (launcherInstruction: reply as soon as
+// it's taken); only the request's sender and recipient can thread from it,
+// so any reply not from the requester is the launcher's. Not the requester's
+// promise state: one requester that never settles would pin the launcher.
+// The audit row, not a body prefix, says which DMs are requests, so a plain
+// dm_send can't fill another's launcher. Both modes: auditTable is
+// audit_log locally, access_log on a server.
+export function countOpenDelegations(db: Database, auditTable: "audit_log" | "access_log", launcher: string, since: number): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM ${auditTable} a
+    JOIN messages m ON m.id = json_extract(a.detail, '$.message_id') AND m.recipient = a.target
+    WHERE a.action = 'delegation.requested' AND a.target = ? AND a.at > ?
+      AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = m.id AND r.sender != m.sender)
+      AND NOT EXISTS (SELECT 1 FROM dm_acks k WHERE k.message_id = m.id AND k.reader != m.sender)`).get(launcher, since) as { n: number };
+  return row.n;
+}
+
 const MAX_PERSONA_CHARS = 80;
 const MAX_TASK_CHARS = 8000;
 const MAX_CONTEXT_CHARS = 4000;
@@ -136,6 +171,9 @@ export function resolveDelegation(
   humanReachable?: (humanHandle: string) => boolean,
   // The requester session's own addresses: never a delegation target (#253).
   self: (handle: string) => boolean = (h) => h === requester,
+  // A launcher's open delegation requests, against the cap (#252).
+  open: (handle: string) => number = () => 0,
+  cap: number = DELEGATE_OPEN_CAP,
 ): Delegation {
   const persona = field(args.persona, "persona", MAX_PERSONA_CHARS);
   const task = field(args.task, "task", MAX_TASK_CHARS, true);
@@ -152,15 +190,24 @@ export function resolveDelegation(
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
     if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
+    if (open(to) >= cap) throw new CoreError(full(to, cap));
     return { to, body: delegationBody(brief) };
   }
 
   const live = launchers(db).filter((h) => sameUser(principal, h, db) && !self(h) && online(h));
-  if (live.length) return { to: live[0]!, body: delegationBody(brief) };
+  const free = live.find((h) => open(h) < cap);
+  if (free !== undefined) return { to: free, body: delegationBody(brief) };
+  // Every live launcher is full: refused, not degraded to the human. The
+  // fallback would hand a loop's flood to a person (Slack) instead.
+  if (live.length) throw new CoreError(`every live launcher of yours has ${cap} open delegation requests it hasn't taken (the cap, #252); retry once one replies in a request's thread, or start another launcher`);
 
   const human = humanFallbackHandle(db, requester, principal, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };
   throw new CoreError("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human to fall back to; start one or pass to");
+}
+
+function full(to: string, cap: number): string {
+  return `"${to}" has ${cap} open delegation requests it hasn't taken (the cap, #252); retry once it replies in one's thread, or pass another launcher`;
 }
 
 // What the launcher session receives. The harness owns the spawn surface: the

@@ -20,14 +20,15 @@ export type AuditAction =
   | "auth.session_revoked"
   | "auth.user_disabled"
   | "auth.user_enabled"
+  | "auth.user_refused"
   | "bridge.notified"
   | "bridge.stopped"
   | "alias.created"
   | "alias.meta_set"
   | "alias.revoked"
   | "alias.deleted"
-  | "hello.rate_limit_ended"
-  | "hello.rate_limited"
+  | "bind.rate_limit_ended"
+  | "bind.rate_limited"
   | "hosted.alias_lost_notified"
   | "hosted.alias_lost_seen"
   | "hosted.capacity_refused"
@@ -96,6 +97,8 @@ export type AuditAction =
   | "team.member_removed"
   | "delegation.requested"
   | "delegation.refused"
+  | "delegation.throttled"
+  | "delegation.throttle_ended"
   | "handle.launcher_set";
 
 /** A request's user agent as audit rows and sessions carry it: at most 120 characters. */
