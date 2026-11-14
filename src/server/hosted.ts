@@ -215,7 +215,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   // a row written inside it, #452).
   // `wake`: a parked child's request makes it active again; an exchange's selection (`snapshot`) and session_end
   // don't, so ending one is never refused for capacity.
-  function rowFor(p: OAuthPrincipal, context: SessionContext, later: Array<() => void>, create = true, wake = true): HostedSession | undefined {
+  // `declare`: whether the request's launcher declaration counts; session_end's doesn't (#532), since its end clears
+  // the flag in the same request and would leave an `on: true` audit row for a launcher that never was one.
+  function rowFor(p: OAuthPrincipal, context: SessionContext, later: Array<() => void>, create = true, wake = true, declare = true): HostedSession | undefined {
     if (!("id" in context)) return undefined;
     let row = store.get(context.id);
     if (row && (row.user_id !== p.authed.user_id || row.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
@@ -224,7 +226,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       admit(p.authed.user_id);
       const t = now();
       const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later.push(() => application.hostedRefused(context.id, address, detail)));
-      row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t), user_id: p.authed.user_id,
+      row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
       application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later.push(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
@@ -242,7 +244,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     // Any request of a root's ownership may turn its launcher flag on (#520): OpenCode's native client starts the
     // ownership without the plugin's `_meta`, so the declaration arrives on a later subscriber request. A child's
     // and a tools-only root's are ignored; only the ownership's end clears it.
-    if (row && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(p.authed, row.session_id, { ownership: row.ownership_id, client_id: p.clientId });
+    if (row && declare && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(p.authed, row.session_id, { ownership: row.ownership_id, client_id: p.clientId });
     return row;
   }
   function rootOf(row: HostedSession): HostedSession {
@@ -373,7 +375,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       store.heartbeat(t);
     });
   }
-  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true): Promise<T> {
+  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true): Promise<T> {
     authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
@@ -384,7 +386,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         authorized(p);
         sweep();
         const later: Array<() => void> = [];
-        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later, true, wake)!; touch(r); return r; }); } catch (e) { for (const w of later) w(); throw e; } })();
+        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later, true, wake, declare)!; touch(r); return r; }); } catch (e) { for (const w of later) w(); throw e; } })();
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         const ids = [...new Set([row.session_id, id])];
         for (const s of ids) inflight.set(s, (inflight.get(s) ?? 0) + 1);
@@ -692,7 +694,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         });
         reconcile();
         return { ended: true };
-      }, false);
+      }, false, false);
     },
     release(id: string, reason: HostedEnd, deadline?: number) {
       store.atomic(() => store.end(id, reason, now(), deadline));

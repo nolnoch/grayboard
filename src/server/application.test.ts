@@ -345,3 +345,18 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
   await expect(connect(bob, "other", { key: "first-session" })).rejects.toMatchObject({ code: "id_collision" });
   expect(store.repo.aliases.find(`${bob.user_email}/other`)).toBeUndefined();
 });
+
+test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
+  const carol = tokenSession(store.repo, (u => ({ user_id: u.id, user_email: u.email }))(store.repo.users.upsertByEmail("carol@example.com", null)));
+  const a = await connect(alice, "be");
+  const b = await connect(bob, "fe");
+  await connect(carol, "sim");
+  const root = await a.send("bob@example.com/fe", "private");
+  const messages = () => (store.db.prepare("SELECT count(*) AS n FROM messages").get() as { n: number }).n;
+  const before = messages();
+  await expect(b.send("carol@example.com/sim", "x", { parent_id: root.message_id })).rejects.toMatchObject({
+    code: "bad_request",
+    message: `parent_id ${root.message_id} is a thread with alice@example.com/be, so a reply goes to alice@example.com/be; to write to someone else, send without parent_id`,
+  });
+  expect(messages()).toBe(before);
+});

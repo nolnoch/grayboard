@@ -678,14 +678,32 @@ test("a root's suggested name is its first request's, offered first among its un
   expect((await hosted.whoami(principal, ctx("root"))).candidates?.map(c => c.name)).not.toContain("grayboard-gb-aux");
   expect(() => ctx("root", 5)).toThrow(`_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
   for (const bad of ["", "a/b", "human", "x".repeat(33)]) expect(ctx("root", bad)).not.toHaveProperty("suggested");
+  // The ownership's start audit records its suggestion (#522), so the trail says why a session was offered a name.
+  const id = (ctx("root") as { id: string }).id;
+  const started = () => database.db.query<{ detail: string }, [string]>("SELECT detail FROM access_log WHERE action = 'hosted.ownership_started' AND target = ? ORDER BY rowid").all(id).map(r => JSON.parse(r.detail) as { suggested?: string });
+  expect(started().map(d => d.suggested)).toEqual(["grayboard-gb-aux"]);
+  // A new ownership of the same source ID takes its own suggestion, and one with none records none.
+  await hosted.end(principal, ctx("root"));
+  await hosted.whoami(principal, ctx("root", "second"));
+  expect(database.repo.hosted.get(id)).toMatchObject({ suggested: "second" });
+  await hosted.end(principal, ctx("root"));
+  await hosted.whoami(principal, ctx("root"));
+  expect(database.repo.hosted.get(id)).toMatchObject({ suggested: null });
+  expect(started().map(d => d.suggested)).toEqual(["grayboard-gb-aux", "second", undefined]);
+  // A child row's is null, whatever its requests suggest: a child never binds.
+  await hosted.register(principal, ctx("root"), "suggest-child");
+  const child = ctx("suggest-child", "kid");
+  await hosted.whoami(principal, child);
+  expect(database.repo.hosted.get((child as { id: string }).id)).toMatchObject({ suggested: null, root_session_id: id });
 });
 
-test("a request's launcher declaration is the ownership's: set by any root request and audited once, restated by a new ownership, cleared at its end, ignored for a child, refused unless a boolean (#473, #520)", async () => {
+test("a request's launcher declaration is the ownership's: set by any root request and audited once, restated by a new ownership, cleared and audited at its end, ignored on session_end and for a child, refused unless a boolean (#473, #520, #532)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const ctx = (extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-root", ...extra });
   const id = (ctx() as { id: string }).id;
   const flag = () => (database.db.prepare("SELECT launcher FROM ids WHERE id = ?").get(id) as { launcher: number }).launcher;
   const audited = () => database.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'handle.launcher_set'").all();
+  const trail = () => audited().map(a => (JSON.parse(a.detail) as { on: boolean }).on);
   expect(() => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "x", [GRAYBOARD_LAUNCHER_META]: "yes" })).toThrow(`_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
   expect(ctx({ [GRAYBOARD_LAUNCHER_META]: false })).not.toHaveProperty("launcher");
   // A built-in client's declaration is read, whatever its source key; a third-party client's never is.
@@ -699,31 +717,42 @@ test("a request's launcher declaration is the ownership's: set by any root reque
   await hosted.bind(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }), { name: "lead", create: true });
   expect(flag()).toBe(1);
   expect(audited().map(a => ({ target: a.target, ...JSON.parse(a.detail) }))).toEqual([{ target: id, on: true, ownership: expect.any(Number), client_id: "grayboard-pi" }]);
-  // The ownership's end clears it; a new ownership that declares nothing isn't one, and one that declares restates it.
+  // The ownership's end clears it, audited `on: false` under the session with the user as actor (#532); a new
+  // ownership that declares nothing isn't one, and one that declares restates it.
   await hosted.end(generic, ctx());
   expect(flag()).toBe(0);
+  const cleared = database.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'handle.launcher_set' ORDER BY rowid DESC LIMIT 1").get()!;
+  expect({ actor: cleared.actor, target: cleared.target, ...JSON.parse(cleared.detail) }).toEqual({ actor: principal.authed.user_email, target: id, on: false, ownership: expect.any(Number), reason: "closed", client_id: "grayboard-pi" });
   await hosted.whoami(generic, ctx());
   expect(flag()).toBe(0);
+  // An ownership that was never a launcher ends with no row.
   await hosted.end(generic, ctx());
+  expect(trail()).toEqual([true, false]);
   await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
   expect(flag()).toBe(1);
-  expect(audited()).toHaveLength(2);
+  expect(trail()).toEqual([true, false, true]);
   // A later request of the ownership turns it on (#520: OpenCode's native client starts the ownership without the
   // plugin's `_meta`), audited once; a repeat, or a request that declares nothing, changes nothing.
   await hosted.end(generic, ctx());
   await hosted.whoami(generic, ctx());
   expect(flag()).toBe(0);
+  // session_end's declaration doesn't count (#532): it would set the flag only for the end to clear it, leaving a
+  // `true, false` pair for a launcher that never was one.
+  await hosted.end(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
+  expect(flag()).toBe(0);
+  expect(trail()).toEqual([true, false, true, false]);
+  await hosted.whoami(generic, ctx());
   await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
   await hosted.whoami(generic, ctx({ [GRAYBOARD_LAUNCHER_META]: true }));
   await hosted.whoami(generic, ctx());
   expect(flag()).toBe(1);
-  expect(audited()).toHaveLength(3);
+  expect(trail()).toEqual([true, false, true, false, true]);
   // A child's declaration is ignored: the root launches, not its subagent.
   await hosted.register(generic, ctx(), "launcher-child");
   const child = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-child", [GRAYBOARD_LAUNCHER_META]: true });
   await hosted.whoami(generic, child);
   expect((database.db.prepare("SELECT launcher FROM ids WHERE id = ?").get((child as { id: string }).id) as { launcher: number }).launcher).toBe(0);
-  expect(audited()).toHaveLength(3);
+  expect(audited()).toHaveLength(5);
 });
 
 test("a declared launcher is a delegation target, and only its own session's initialize and bind text carry the launcher instruction (#473)", async () => {
