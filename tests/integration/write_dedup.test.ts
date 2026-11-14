@@ -401,6 +401,35 @@ describe("dedup and state answers (in process)", () => {
     expect(n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'")).toBe(1);
   });
 
+  // #302 (#254 AC3): delegate takes resend like the other append writes, in
+  // process and over hosted MCP: a second pending DM, a second
+  // delegation.requested, and a request.resent row.
+  test("delegate with resend: true delegates again, in process and over hosted MCP", async () => {
+    const lx = srv.appSession(you, "lx", { launcher: true });
+    await lx.connect();
+    const be = await session("be");
+    const req = { persona: "a researcher", task: "survey", to: "lx" };
+    const first = await be.delegate(req);
+    const forced = (await be.delegate({ ...req, resend: true })) as typeof first & Replayed;
+    expect(forced.replayed).toBeUndefined();
+    expect(forced.message_id).not.toBe(first.message_id);
+
+    const hosted = await srv.hosted("you@example.com", "qa");
+    const h1 = await hosted.call<typeof first & Replayed>("delegate", req);
+    expect((await hosted.call<typeof first & Replayed>("delegate", req)).replayed!.ref.id).toBe(h1.message_id);
+    const h2 = await hosted.call<typeof first & Replayed>("delegate", { ...req, resend: true });
+    expect(h2.replayed).toBeUndefined();
+    expect(h2.message_id).not.toBe(h1.message_id);
+
+    expect(n("SELECT COUNT(*) AS n FROM messages WHERE recipient = 'you@example.com/lx' AND pending = 1")).toBe(4);
+    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested'")).toBe(4);
+    const resent = (q("SELECT detail FROM access_log WHERE action = 'request.resent'") as { detail: string }[]).map((r) => JSON.parse(r.detail));
+    expect(resent).toEqual([
+      expect.objectContaining({ tool: "delegate", ref_kind: "message", ref_id: forced.message_id }),
+      expect.objectContaining({ tool: "delegate", ref_kind: "message", ref_id: h2.message_id }),
+    ]);
+  });
+
   test("claim_release and board_create repeats answer from state", async () => {
     const be = await session("be");
     await be.call("claim_take", { key: "ticket:ENG-142" });
