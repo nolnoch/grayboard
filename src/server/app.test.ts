@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startServer } from "./app.ts";
+import { startLimits, startServer } from "./app.ts";
 import { Database } from "bun:sqlite";
 import { until } from "../../tests/support/until.ts";
 
@@ -234,4 +234,10 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
       rmSync(dir, { recursive: true, force: true });
     }
   }
+});
+
+test("a start option overrides the config's limit, and an explicit undefined one doesn't wipe it (#385 item 14)", () => {
+  const config = { helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 } };
+  expect(startLimits(config, { helloLimit: undefined, hostedRequestLimit: undefined })).toMatchObject(config);
+  expect(startLimits(config, { helloLimit: { burst: 9, perSec: 9 } })).toMatchObject({ helloLimit: { burst: 9, perSec: 9 }, hostedRequestLimit: config.hostedRequestLimit });
 });

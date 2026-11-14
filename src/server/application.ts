@@ -802,14 +802,15 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const own = idRow(db, id)?.principal === authed.user_email;
       if (!session.readOnly && own) session.writerId = id;
       if (root !== null && own) session.via = id;
-      hub.sessions.add(session);
-      if (hold && holds.length) hub.hostedHolders.set(id, session);
-      if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
+      // Computed before the session is registered: a throw here leaves no holder or route behind (#385 item 9).
       const info: IdentityInfo = {
         identity_full: session.primary,
         ...helloOkFields(hub, authed),
         ...(session.readOnly && session.via === undefined ? { candidates: candidates(hub, authed, row?.suggested ?? null) } : {}),
       };
+      hub.sessions.add(session);
+      if (hold && holds.length) hub.hostedHolders.set(id, session);
+      if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
       return { session, info };
     },
     // The root a hosted child acts under (#523), recorded on the child's ids row, where it outlives the
@@ -1019,9 +1020,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool));
-      const result = handleCall(hub, session, tool, args, publish);
-      afterCommit(db, () => expiry.arm());
-      return result;
+      // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
+      try { return handleCall(hub, session, tool, args, publish); }
+      finally { afterCommit(db, () => expiry.arm()); }
     },
     // Trusted committed domain operations, not client-supplied invalidations.
     boardsChanged,

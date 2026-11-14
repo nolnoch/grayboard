@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -227,6 +227,14 @@ test("unbound hosted reads never use the human address and still list and read b
   expect(store.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE handle LIKE '%/human'").get()).toEqual({ n: 0 });
   application.close(owner);
   application.close(bobBe);
+});
+
+test("a hosted session whose hello facts throw is left unregistered (#385 item 9)", () => {
+  const teams = spyOn(store.repo.teams, "listForUser").mockImplementation(() => { throw new Error("db gone"); });
+  try {
+    expect(() => application.hostedSession(alice, "id:2222222222222", ["alice@example.com/be"], null, null, delivery(), true, true)).toThrow("db gone");
+  } finally { teams.mockRestore(); }
+  expect(application.hostedHolder("alice@example.com/be")).toBeUndefined();
 });
 
 test("unbound hosted sessions cannot use named operations or persist synthetic handles", async () => {
