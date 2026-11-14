@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
+import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
 import { testPause } from "../shared/testpause.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -12,7 +12,8 @@ import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
-import type { MailPort } from "../core/session_end.ts";
+import { endSession, type MailPort } from "../core/session_end.ts";
+import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
@@ -21,7 +22,17 @@ import { DiskBlobs } from "./blobs.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess } from "./oauth-types.ts";
 
 // Row types
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
+// idp_subject: the IdP's stable account ID (Google `sub`), set at the first
+// sign-in that carries one; null for a dev-auth user and one not signed in since
+// (security audit F-13).
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_subject: string | null };
+// What an IdP sign-in resolved to (security audit F-13). `linked`: the user had
+// no subject yet and now has this one. Refusals: `subject_mismatch`, the email's
+// user belongs to another IdP account (the email was reassigned);
+// `email_changed`, this IdP account's user has another email.
+export type IdpSignIn =
+  | { status: "ok"; user: User; linked: boolean }
+  | { status: "subject_mismatch" | "email_changed"; user: User };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 // An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
 // ref is the user's email; a team or service scope's is the principal's name.
@@ -76,6 +87,10 @@ export interface Repo {
   hosted: HostedStore;
   users: {
     upsertByEmail(email: string, displayName: string | null): User;
+    // An IdP sign-in: matches the subject first, then the email (F-13).
+    signIn(email: string, subject: string, displayName: string | null): IdpSignIn;
+    // Forgets a user's IdP subject, so the next sign-in with the email links its account.
+    clearSubject(userId: number): void;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
     setDisabled(userId: number, disabled: boolean): void;
@@ -140,7 +155,8 @@ export interface Repo {
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
-    bouncesFrom(id: string): MessageRow[];
+    // since: only an end's own bounces, made at or after its time (a reopened ID can end again, #475).
+    bouncesFrom(id: string, since?: number): MessageRow[];
     // A session's direct messages, sent or received by any of its addresses
     // (#284 S8): with peer, only those between the set and peer.
     history(addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
@@ -525,6 +541,10 @@ function initSchema(db: Database): void {
     ["oauth_tokens", "access_scopes", "TEXT"],
     ["oauth_codes", "grant_id", "TEXT REFERENCES oauth_grants(id) ON DELETE CASCADE"],
   ];
+  // users.idp_subject (security audit F-13): unique among the users that have one.
+  const userColumns = db.query<{ name: string }, []>(`PRAGMA table_info(users)`).all();
+  if (!userColumns.some(c => c.name === "idp_subject")) db.exec(`ALTER TABLE users ADD COLUMN idp_subject TEXT`);
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_idp_subject ON users(idp_subject) WHERE idp_subject IS NOT NULL");
   for (const [table, column, definition] of oauthColumns) {
     const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
     if (!columns.some(c => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -621,8 +641,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     changed(id(...args));
     return value;
   };
-  const oauth = makeOAuthStore(db);
   const hosted = makeHostedStore(db);
+  const oauth = makeOAuthStore(db, hosted);
   return {
     now: clock,
     atomic<T>(fn: () => Sync<T>): T {
@@ -648,6 +668,27 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return user;
         })();
       },
+      signIn(email, subject, displayName) {
+        return db.transaction((): IdpSignIn => {
+          const bySubject = db.query<User, [string]>("SELECT * FROM users WHERE idp_subject = ?").get(subject);
+          if (bySubject) {
+            if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
+            db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
+            return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+          }
+          const byEmail = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email);
+          if (byEmail?.idp_subject) return { status: "subject_mismatch", user: byEmail };
+          // A disabled account is refused by the caller: a refused sign-in
+          // must not bind it to whoever tried (security audit F-13).
+          if (byEmail && byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
+          const user = this.upsertByEmail(email, displayName);
+          db.run("UPDATE users SET idp_subject = ? WHERE id = ?", [subject, user.id]);
+          return { status: "ok", user: { ...user, idp_subject: subject }, linked: byEmail !== null && byEmail !== undefined };
+        }).immediate();
+      },
+      clearSubject(userId) {
+        db.run("UPDATE users SET idp_subject = NULL WHERE id = ?", [userId]);
+      },
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
       },
@@ -661,7 +702,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           if (disabled) {
             // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
             db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
-            endHostedWhere(db, "disabled", now, row => row.user_id === userId);
+            endHostedWhere(hosted, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
             db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
@@ -698,7 +739,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         db.transaction(() => {
           const now = clock();
           db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
-          endHostedWhere(db, "revoked", now, row => row.user_id === userId);
+          endHostedWhere(hosted, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         }).immediate();
@@ -834,8 +875,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       getById(id) {
         return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
       },
-      bouncesFrom(id) {
-        return db.query<MessageRow, [string]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' ORDER BY id`).all(id);
+      bouncesFrom(id, since = 0) {
+        return db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);
       },
       history(addresses, peer, limit = 20, beforeId) {
         const set = JSON.stringify(addresses);
@@ -956,27 +997,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
-    mail: {
-      unread(id) {
-        return db.query<{ id: number; sender: string }, [string]>(
-          `SELECT m.id, m.sender FROM messages m
-            WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
-              AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                    WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
-            ORDER BY m.id`,
-        ).all(id);
-      },
-      bounce(from, to, parentId, body, now) {
-        db.query(
-          `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
-           VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
-        ).run(from, to, body, parentId, now);
-      },
-      dropReader(id) {
-        db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
-        db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
-      },
-    },
+    mail: mailPort(db),
 
     cursors: {
       get(address, streamType, streamRef) {
@@ -1140,7 +1161,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   };
 }
 
-function makeOAuthStore(db: Database): OAuthStore {
+function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
     db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail })]);
@@ -1190,7 +1211,7 @@ function makeOAuthStore(db: Database): OAuthStore {
   const revokeGrant = (id: string, now: number) => {
     testPause("hosted:revoke:in-txn");
     db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, id]);
-    endHostedWhere(db, "revoked", now, row => row.grant_id === id);
+    endHostedWhere(hosted, "revoked", now, row => row.grant_id === id);
   };
   type Token = { hash: string; grant_id: string; kind: string; expires_at: number; spent_at: number | null; revoked_at: number | null; created_at: number };
   const token = (h: string) => db.query<Token, [string]>("SELECT * FROM oauth_tokens WHERE hash = ?").get(h);
@@ -1399,12 +1420,49 @@ function makeOAuthStore(db: Database): OAuthStore {
   };
 }
 
+// The server's mail as core's session end reads it (a MailPort): the repo's, and the hosted store's child ends (#475).
+function mailPort(db: Database): MailPort {
+  return {
+    unread(id) {
+      return db.query<{ id: number; sender: string }, [string]>(
+        `SELECT m.id, m.sender FROM messages m
+          WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
+            AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                  WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
+          ORDER BY m.id`,
+      ).all(id);
+    },
+    bounce(from, to, parentId, body, now) {
+      db.query(
+        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
+         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
+      ).run(from, to, body, parentId, now);
+    },
+    dropReader(id) {
+      db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
+      db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
+    },
+  };
+}
+
 function makeHostedStore(db: Database): HostedStore {
   const get = (id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
   const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
     const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
       WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
     db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
+  };
+  // A released child's ID ends in the release's transaction, with its reason (#475 item 1): left unended,
+  // nothing owns it, and the next start would end it as a WSS leftover. The ends' wakes wait in `ended`,
+  // queued at commit, for the application to run (`takeEnded`).
+  const mail = mailPort(db);
+  const coreAudit = (now: number): AuditSink => (action, actor, target, detail) =>
+    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, actor, action, target, detail ? JSON.stringify(detail) : null]);
+  let ended: EndedChild[] = [];
+  const endChild = (child: string, why: string, now: number) => {
+    const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
+    // Queued at commit, so a rolled-back release wakes nobody and bounces nothing.
+    if (end.ended) afterCommit(db, () => { ended.push({ id: child, at: now, wake: end.wake }); });
   };
   // The hosted_alias_lost column each reader's take marks (#453).
   const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
@@ -1469,6 +1527,12 @@ function makeHostedStore(db: Database): HostedStore {
       if (!row?.root_session_id) return;
       db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
       audit(row.root_session_id, "hosted.child_released", { child: session, reason }, now);
+      endChild(session, reason, now);
+    },
+    takeEnded() {
+      const taken = ended;
+      ended = [];
+      return taken;
     },
     end(session, reason, now, deadline) {
       const row = get(session);
@@ -1476,7 +1540,7 @@ function makeHostedStore(db: Database): HostedStore {
       testPause(reason === "expired" ? "hosted:lease-expire:in-txn" : "hosted:release:in-txn");
       const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id);
       db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
-      // A hosted ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
+      // A hosted root's ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
       // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it. The
       // launcher flag (#473) is the ownership's too: a resumed session that no longer declares one isn't one. Clearing
       // it is audited as its setting is (#532), so the trail shows when a hosted launcher stopped being one.
@@ -1488,7 +1552,10 @@ function makeHostedStore(db: Database): HostedStore {
         dropHold(db, address, session);
         logBinding(db, session, address, "released", reason, now);
       }
-      for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
+      for (const child of children) if (child.root_session_id) {
+        audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
+        endChild(child.session_id, reason, now);
+      }
       if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
       return true;
     },
@@ -1515,7 +1582,8 @@ function makeHostedStore(db: Database): HostedStore {
   return store;
 }
 
-function endHostedWhere(db: Database, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
-  const hosted = makeHostedStore(db);
+// The repo's own hosted store, never a fresh one: a child's end queues its wakes in that store's `ended`,
+// which the application drains (#475 item 1).
+function endHostedWhere(hosted: HostedStore, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
   for (const row of hosted.all()) if (!row.root_session_id && predicate(row)) hosted.end(row.session_id, reason, now);
 }
