@@ -379,3 +379,12 @@ test("a configured per-session watch cap bounds a listen's resource subscription
   const listen = await sub.listen({ resourceSubscriptions: ["grayboard://inbox"] });
   await listen.close();
 });
+
+test("a configured per-session watch cap bounds an older-protocol session's resource subscriptions (#805 F-06)", async () => {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, caps: { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 1 } } });
+  const client = await connect("2025-11-25", "native");
+  for (const name of ["one", "two"]) expect((await client.callTool({ name: "board_create", arguments: { name, purpose: "legacy watch cap" } })).isError).not.toBe(true);
+  expect(await client.subscribeResource({ uri: "grayboard://boards/one" })).toEqual({});
+  await expect(client.subscribeResource({ uri: "grayboard://boards/two" })).rejects.toThrow();
+});
