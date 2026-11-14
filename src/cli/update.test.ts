@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { get, newer, releasesOrigin, versionOrder } from "./update.ts";
+import { STALE_TEMP_MS, get, newer, releasesOrigin, sweepStaleTemps, versionOrder } from "./update.ts";
 
 test("newer compares release versions in semver order", () => {
   expect(newer("v1.0.1", "1.0.0")).toBe(true);
@@ -50,4 +53,28 @@ test("get refuses a body over its cap, stated or streamed, and returns one at th
   } finally {
     srv.stop(true);
   }
+});
+
+test("sweepStaleTemps removes only an interrupted update's old temp binaries (#317)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-update-"));
+  const now = Date.now();
+  const old = (now - STALE_TEMP_MS - 1000) / 1000;
+  const file = (name: string, aged = true) => {
+    const path = join(dir, name);
+    writeFileSync(path, "x");
+    if (aged) utimesSync(path, old, old);
+    return path;
+  };
+  const stale = file(".grayboard-v2.4.2-0123456789abcdef");
+  const rc = file(".grayboard-v1.3.0-rc1-fedcba9876543210");
+  const fresh = file(".grayboard-v2.4.2-aaaaaaaaaaaaaaaa", false); // an update running now
+  const binary = file("grayboard");
+  const other = file(".grayboard-backup");
+  const short = file(".grayboard-v2.4.2-0123");
+  const target = file("target");
+  symlinkSync(target, join(dir, ".grayboard-v2.4.2-bbbbbbbbbbbbbbbb"));
+  mkdirSync(join(dir, ".grayboard-v2.4.2-cccccccccccccccc"));
+  expect(sweepStaleTemps(dir, now).sort()).toEqual([rc, stale].sort());
+  for (const kept of [fresh, binary, other, short, target, join(dir, ".grayboard-v2.4.2-bbbbbbbbbbbbbbbb"), join(dir, ".grayboard-v2.4.2-cccccccccccccccc")]) expect(existsSync(kept)).toBe(true);
+  expect(sweepStaleTemps(join(dir, "missing"), now)).toEqual([]);
 });

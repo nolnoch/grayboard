@@ -99,7 +99,7 @@ describe("a lost answer, then the same call from the same session", () => {
     expect(srv.app.db.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
     expect(srv.app.db.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
     const events = await pushedBefore(lane, () => again.send("bob@example.com/lane", "sentinel 2"), "sentinel 2");
-    expect(events.filter(board((i) => i.post?.id === id)).length).toBe(1);
+    expect(events.filter(board((i) => i.kind === "push" && i.post.id === id)).length).toBe(1);
   });
 
   test("delegate: one pending DM, one delegation.requested, one launcher push", async () => {
@@ -225,7 +225,7 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
       expect(retry.note).toStartWith(`already posted to #work at ${retry.replayed!.first_at} as post ${id}; this repeat was not posted.`);
       expect(d.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
       expect(d.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
-      await lane.next(board((i) => i.post?.id === id), 5000);
+      await lane.next(board((i) => i.kind === "push" && i.post.id === id), 5000);
     } finally {
       d.close();
     }
@@ -293,7 +293,7 @@ describe("dedup and state answers (in process)", () => {
     const row = q("SELECT at, actor, target, detail FROM access_log WHERE action = 'message.retracted'") as { at: number; actor: string; target: string; detail: string }[];
     expect(row.length).toBe(1);
     expect(row[0]).toMatchObject({ actor: "you@example.com", target: `message:${first.message_id}` });
-    expect(JSON.parse(row[0]!.detail)).toEqual({ message_id: first.message_id, sender: "you@example.com/be", recipient: "you@example.com/fe" });
+    expect(JSON.parse(row[0]!.detail)).toEqual({ message_id: first.message_id, sender: "you@example.com/be", recipient: "you@example.com/fe", session: be.id });
     expect(await be.retract(first.message_id)).toMatchObject({ note: `already retracted by you at ${new Date(row[0]!.at).toISOString()}` });
     // Another sender's repeat is still refused.
     const sim = await session("sim");
@@ -301,6 +301,8 @@ describe("dedup and state answers (in process)", () => {
     const again = await dm(be, "oops");
     expect(again.replayed).toBeUndefined();
     expect(again.message_id).not.toBe(first.message_id);
+    const stale = q("SELECT detail FROM access_log WHERE action = 'request.receipt_stale'") as { detail: string }[];
+    expect(stale.map((r) => JSON.parse(r.detail))).toEqual([expect.objectContaining({ tool: "dm_send", ref_kind: "message", ref_id: first.message_id, session: be.id })]);
   });
 
   test("resolved spellings and re-uploaded files collide; other files and another session don't", async () => {

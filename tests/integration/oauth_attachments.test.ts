@@ -94,8 +94,8 @@ test("private board visibility is checked again after reading the blob", async (
   app.repo.teams.addMember(team.id, bob.authed.user_id);
   const { ensureTeamBoard, onTeamJoined, onTeamLeft } = await import("../../src/server/teams.ts");
   ensureTeamBoard(app.db, team, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, alice.authed.user_id, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, bob.authed.user_id, "bob@example.com");
+  onTeamJoined(app.db, app.repo, team, "alice@example.com");
+  onTeamJoined(app.db, app.repo, team, "bob@example.com");
   const id = (await (await attachment(alice.token)).json() as { id: number }).id;
   expect((await a.callTool({ name: "board_post", arguments: { board: "private", body: "team file", attachment_ids: [id] } })).isError).not.toBe(true);
   expect((await b.readResource({ uri: "grayboard://boards/private" })).contents.length).toBe(1);
@@ -106,7 +106,7 @@ test("private board visibility is checked again after reading the blob", async (
   const reading = attachment(bob.token, "GET", id);
   await Promise.race([entered, reading.then(response => { throw new Error(`blob read was bypassed: ${response.status}`); })]);
   app.repo.teams.removeMember(team.id, bob.authed.user_id);
-  onTeamLeft(app.db, app.repo, team, bob.authed.user_id, "bob@example.com");
+  onTeamLeft(app.db, app.repo, team, "bob@example.com");
   resume();
   const response = await reading;
   expect(response.status).toBe(404);

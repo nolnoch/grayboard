@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { spliceSh } from "../../scripts/release_keys.ts";
 import { keyId } from "../../src/shared/spki.ts";
 import { ROOT } from "./paths.ts";
+import { sha256Hex } from "../../src/shared/hash.ts";
 
 export type TestKey = { id: string; pem: string; priv: string };
 
@@ -49,7 +50,7 @@ export function sign(text: string, key = testKey()): string {
 /** A release's SHA256SUMS for `tag` over `files` (asset name → path), as release.yml writes it. */
 export function sumsFor(tag: string, files: Record<string, string>): string {
   const lines = Object.entries(files)
-    .map(([name, path]) => `${new Bun.CryptoHasher("sha256").update(readFileSync(path)).digest("hex")}  ${name}`)
+    .map(([name, path]) => `${sha256Hex(readFileSync(path))}  ${name}`)
     .sort((a, b) => (a.slice(66) < b.slice(66) ? -1 : 1));
   return [`# grayboard ${tag}`, ...lines].join("\n") + "\n";
 }

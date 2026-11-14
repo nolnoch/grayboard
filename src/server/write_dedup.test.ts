@@ -127,11 +127,21 @@ describe("dedupWrite", () => {
   test("a receipt whose row is gone is a miss, and is replaced", () => {
     const first = dedupWrite(repo, 1_000, call(), send());
     if (!("fresh" in first)) throw new Error("expected a fresh write");
-    expect(repo.messages.retract(SENDER, first.fresh.ref.id)).toBe(true);
+    expect(repo.messages.retract(SENDER, first.fresh.ref.id, { actor: "a@example.com", session: "s1" })).toBe(true);
+    // The Repo's retract writes its own audit row (#306), whoever calls it.
+    const [retracted] = audits("message.retracted");
+    expect(retracted).toMatchObject({ target: `message:${first.fresh.ref.id}`, actor: "a@example.com" });
+    expect(JSON.parse(retracted!.detail)).toEqual({ message_id: first.fresh.ref.id, sender: SENDER, recipient: expect.any(String), session: "s1" });
     const again = dedupWrite(repo, 2_000, call(), send());
     if (!("fresh" in again)) throw new Error("expected a fresh write");
     expect(again.fresh.ref.id).not.toBe(first.fresh.ref.id);
     expect(db.prepare("SELECT ref_id, at FROM write_receipts").all()).toEqual([{ ref_id: again.fresh.ref.id, at: 2_000 }]);
+    // The fresh write after a stale receipt says why it wasn't a replay (#306).
+    const stale = audits("request.receipt_stale");
+    expect(stale).toHaveLength(1);
+    expect(stale[0]).toMatchObject({ target: SENDER, actor: "a@example.com" });
+    expect(JSON.parse(stale[0]!.detail)).toEqual({ tool: "dm_send", fp: expect.any(String), ref_kind: "message", ref_id: first.fresh.ref.id, first_at: new Date(1_000).toISOString(), session: "s1" });
+    expect(audits("request.replayed")).toEqual([]);
   });
 
   test("past the window a repeat writes again; another session or sender never collides", () => {

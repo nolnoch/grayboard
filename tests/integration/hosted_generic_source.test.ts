@@ -119,7 +119,8 @@ function json(result: CallToolResult) {
 // Native tools answer `error: <message>`, native bind a JSON body, the subscriber role a structured code.
 function refused(result: CallToolResult): unknown {
   expect(result.isError).toBe(true);
-  if (result.structuredContent && "code" in result.structuredContent) return result.structuredContent.code;
+  const structured = result.structuredContent as Record<string, unknown> | undefined;
+  if (structured && "code" in structured) return structured.code;
   const text = textOf(result);
   return text.startsWith("error: ") ? /^error: (\w+)/.exec(text)?.[1] : JSON.parse(text).code;
 }

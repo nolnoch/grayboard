@@ -14168,7 +14168,7 @@ var package_default = {
   scripts: {
     server: "bun src/server/main.ts",
     cli: "bun src/cli/main.ts",
-    typecheck: "tsc --noEmit",
+    typecheck: "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
     test: "bun test --timeout 30000 ./src ./tests",
     "test:opencode": "bash scripts/e2e.sh hosted-strict",
     "test:opencode:host": "bash scripts/e2e.sh hosted-host",

@@ -187,6 +187,14 @@ export async function call(c: Client, name: string, args: Record<string, unknown
   }
 }
 
+// A tool call's error text; a call that succeeds throws, naming what it returned.
+export async function refusal(s: { c: Client }, name: string, args: Record<string, unknown> = {}): Promise<string> {
+  const r = await s.c.callTool({ name, arguments: args });
+  const text = (r.content as { text: string }[])[0]!.text;
+  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
+  return text;
+}
+
 // Ends one session mid-test. The SDK's close waits for the child to exit.
 export async function stopSession(c: Client): Promise<void> {
   open.delete(c);

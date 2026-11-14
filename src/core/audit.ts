@@ -7,6 +7,8 @@
 // id.registered, a session's first rows, with how its liveness is kept;
 // id.detached and id.reattached, a keyed session's child exiting and a
 // restart under the same harness taking its place (#284 decision 3);
+// id.facts_changed, a session's model or effort replaced by a new owner's
+// (a keyed re-attach here, #365; a hosted ownership or request, #364);
 // id.reused, a session key re-presented after retention pruned its ended
 // session's row (#284 S10);
 // alias.created, a name's first bind or declaration (#284);
@@ -18,7 +20,7 @@
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
 
-export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
+export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.requested" | "delegation.refused" | "handle.launcher_set" | "id.child_fallback" | "id.child_seen" | "id.collision" | "id.detached" | "id.end_failed" | "id.ended" | "id.facts_changed" | "id.promoted" | "id.reattached" | "id.registered" | "id.reused" | "id.signed_in_local" | "message.retracted";
 
 /**
  * Local mode's own actions beside the shared ones: Claude Code subagent

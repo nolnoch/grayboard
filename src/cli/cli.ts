@@ -634,7 +634,10 @@ program
   .action((opts: OpenCodeSetupOptions) => {
     try {
       const result = setupOpenCode(opts, OC_PLUGIN.source);
-      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
+      const config = result.changed ? (result.dryRun ? "config changes required" : "config changes applied") : "config unchanged";
+      const adapters = result.adapters ? `; ${result.adapters} carried adapter${result.adapters === 1 ? "" : "s"} ${result.dryRun ? "to disable" : "disabled"}` : "";
+      const migration = result.migrated ? (result.dryRun ? "; recognized migration required" : "; recognized migration") : "";
+      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.${result.mcpName ?? "grayboard"} and plugin source (${config})${adapters}${migration}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
       for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
       console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");
@@ -764,7 +767,13 @@ program
     }
     const ocGuard = opts.register && opencode && !server ? opencodeShimGuard(OC_DIR) : { skip: false };
     if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
-    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
+    // The prompt can wait indefinitely: classify again after it, so a hosted migration finished meanwhile never gains a second delivery owner.
+    const ocRecheck = () => {
+      const guard = opencodeShimGuard(OC_DIR);
+      if (guard.skip && guard.warning) console.warn(`[grayboard] ${guard.warning}`);
+      return !guard.skip;
+    };
+    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);

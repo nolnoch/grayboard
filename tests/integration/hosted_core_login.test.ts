@@ -35,7 +35,7 @@ let onRefresh: Hook | undefined;
 async function forward(req: IncomingMessage, body: Buffer): Promise<Response> {
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && !["host", "connection", "content-length"].includes(k)) headers.set(k, v);
-  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? body : undefined, redirect: "manual" });
+  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? new Uint8Array(body) : undefined, redirect: "manual" });
 }
 async function relay(upstream: Response, res: ServerResponse) {
   const headers: Record<string, string | string[]> = {};
@@ -519,7 +519,7 @@ test("while another process refreshes, a token that is still valid serves at onc
   const { store } = await seed({ expiresIn: 30_000 }); // inside the refresh margin, not expired
   const l = login();
   const held = tryAcquire(`${l.path}.refresh.lock`)!;
-  try { expect(await l.token()).toBe(store.access); } finally { held.release(); }
+  try { expect(await l.token()).toBe(store.access!); } finally { held.release(); }
   expect(refreshes).toBe(0);
   expect(await l.read()).toEqual(store);
 }, 10_000);

@@ -62,7 +62,7 @@ for (const text of ["", "[]", "null", '{"mcp":[]}', '{"mcp":{"servers":[]}}', '{
 
 for (const url of ["http://remote.example.com/mcp", "https://user:password@example.com/mcp", "https://example.com/mcp?token=secret", "https://example.com/mcp#fragment", "https://example.com/mcp?", "https://example.com/mcp#", "https://example.com//mcp", "https://example.com/a/../mcp", "https://example.com/%2e/mcp", "https://example.com/a\\mcp", "https://example.com/mcp/", "https://EXAMPLE.com/mcp", "https://example.com:443/mcp"]) test(`unsafe/ambiguous endpoint refuses: ${url}`, () => expect(() => hostedEndpoint(url)).toThrow());
 for (const url of ["https://grayboard.example.com/team/mcp", "http://127.0.0.1:8080/mcp", "http://localhost:8080/mcp", "http://[::1]:8080/mcp"]) test(`explicit endpoint accepts: ${url}`, () => expect(hostedEndpoint(url)).toBe(url));
-for (const name of ["human", "Human", "FE", "you@example.com/fe", "../fe", "", "a".repeat(33)]) test(`invalid name refuses: ${name}`, () => {
+for (const name of ["human", "Human", "you@example.com/fe", "../fe", "", "a".repeat(33)]) test(`invalid name refuses: ${name}`, () => {
   const f = fixture();
   expect(() => f.run({ name })).toThrow();
   expect(existsSync(f.config)).toBe(false);
@@ -195,7 +195,7 @@ test("migration dry-run validates all inputs without creating backups or moving 
   writeFileSync(f.config, before);
   f.seedAdapter();
   const result = f.run({ migrate: true, dryRun: true });
-  expect(result).toEqual({ changed: true, migrated: true, dryRun: true });
+  expect(result).toEqual({ changed: true, migrated: true, dryRun: true, adapters: 1 });
   expect(readFileSync(f.config, "utf8")).toBe(before);
   expect(readFileSync(f.adapter, "utf8")).toBe(source);
   expect(existsSync(f.config + ".grayboard-backup")).toBe(false);
@@ -733,3 +733,76 @@ test("refresh-adapters on a signed-in machine keeps the V1 entry and names the s
   expect(withCreds.stdout.toString()).toContain("grayboard setup-opencode --url https://bus.example.com/team/x/mcp ");
   expect(JSON.parse(readFileSync(config, "utf8")).mcp.grayboard).toEqual(entry);
 });
+
+test("--name follows the one naming rule: FE is lowercased and stored as fe (#382)", () => {
+  const f = fixture();
+  f.run({ name: "FE" });
+  expect(f.read().plugins[0].options).toEqual({ name: "fe", create: false });
+});
+
+test("argument errors carry no manual-resolution advice; config errors keep it (#382)", () => {
+  const f = fixture();
+  expect(() => f.run({ plugin: undefined, revision: "master" })).toThrow(/^Git plugin setup requires --revision[^.]*; alternatively supply an installed --plugin directory$/);
+  expect(() => hostedEndpoint("https://example.com/mcp?x")).toThrow(/ending in \/mcp, without credentials, query, or fragment$/);
+  writeFileSync(f.config, "[]");
+  expect(() => f.run()).toThrow("Resolve manually");
+});
+
+test("a plugin mcpName is the server setup writes and the guard classifies (#382)", () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ plugins: [{ package: f.plugin, options: { mcpName: "gb" } }] }));
+  const result = f.run();
+  expect(result).toMatchObject({ changed: true, mcpName: "gb" });
+  expect(f.read().mcp.servers).toEqual({ gb: { type: "remote", url: f.opts.url } });
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false, mcpName: "gb" });
+  // The local shim guard must see the hosted registration under its real name.
+  const guard = opencodeShimGuard(f.root);
+  expect(guard.skip).toBe(true);
+  // A second registration under the default name is a conflict, not something to add to.
+  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: f.opts.url } } }, plugins: [{ package: f.plugin, options: { mcpName: "gb" } }] }));
+  const before = readFileSync(f.config, "utf8");
+  expect(() => f.run({ migrate: true })).toThrow("Conflicting native Grayboard MCP entries");
+  expect(readFileSync(f.config, "utf8")).toBe(before);
+});
+
+test("CLI result message separates config changes, adapter moves and dry runs (#382)", () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: f.opts.url } } }, plugins: [{ package: f.plugin }] }));
+  f.seedAdapter();
+  const dry = invoke(f, [...cliArgs(f), "--migrate", "--dry-run"]);
+  expect(dry.exitCode).toBe(0);
+  expect(dry.stdout.toString()).toContain("(config unchanged); 1 carried adapter to disable; recognized migration required.");
+  expect(dry.stdout.toString()).not.toContain("with backups");
+  const applied = invoke(f, [...cliArgs(f), "--migrate"]);
+  expect(applied.stdout.toString()).toContain("(config unchanged); 1 carried adapter disabled; recognized migration.");
+  expect(applied.stdout.toString()).toContain(`Retained backup: ${f.adapter}.grayboard-backup`);
+});
+
+test("a config created after preflight, when none existed, is kept and the temp file removed (#381)", () => {
+  const f = fixture();
+  const concurrent = '{"created":"by the user meanwhile"}';
+  expect(() => setupOpenCode(f.opts, source, () => writeFileSync(f.config, concurrent))).toThrow("Config changed during setup");
+  expect(readFileSync(f.config, "utf8")).toBe(concurrent);
+  expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
+  // An empty file is still a concurrent file, kept like any other.
+  rmSync(f.config);
+  expect(() => setupOpenCode(f.opts, source, () => writeFileSync(f.config, ""))).toThrow();
+  expect(readFileSync(f.config, "utf8")).toBe("");
+});
+
+test("a sibling that gains Grayboard during setup refuses the commit and restores adapters (#381)", () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: f.old } }));
+  const before = readFileSync(f.config, "utf8");
+  f.seedAdapter();
+  const other = f.config.slice(0, -1);
+  const sibling = JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: "https://other.example.com/mcp" } } } });
+  let failure: unknown;
+  try { setupOpenCode({ ...f.opts, migrate: true }, source, () => writeFileSync(other, sibling)); } catch (e) { failure = e; }
+  expect(((failure as Error).cause as Error)?.message ?? (failure as Error).message).toContain("Sibling config changed during setup");
+  expect(readFileSync(f.config, "utf8")).toBe(before);
+  expect(readFileSync(other, "utf8")).toBe(sibling);
+  expect(readFileSync(f.adapter, "utf8")).toBe(source);
+  expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
+});
+
