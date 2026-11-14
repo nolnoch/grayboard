@@ -60,21 +60,20 @@ function everConnected(db: Database, to: string): boolean {
   return rosterHandles(db).includes(to);
 }
 
-// Server handles are `email/name` (local handles are bare names, one user per
-// bus). A candidate is in the requester's own user when everything before its
-// last `/` matches the requester's — the same scope the human fallback uses.
-// A session ID's spelling carries no scope: its user is its ids row's
-// principal (#337; null locally, where bare names are one user too).
-export function sameUser(requester: string, candidate: string, db: Database): boolean {
-  if (addressParts(candidate)?.kind === "id") {
-    const row = db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(candidate) as { principal: string | null } | null;
-    const cut = requester.lastIndexOf("/");
-    // No row: not another user's; the roster check below refuses it as unknown.
-    return !row || (cut === -1 ? row.principal === null : row.principal === requester.slice(0, cut));
-  }
-  const cut = requester.lastIndexOf("/");
-  if (cut === -1) return true;
-  return candidate.startsWith(requester.slice(0, cut + 1));
+// Whether `candidate` is in the requester's own user. The user is the
+// authenticated principal, never an address's spelling: a team alias
+// (`eng/sim`) is shared by every member, so a prefix test would let Alice's
+// `eng/sim` reach Bob's `eng/launcher` (security audit F-01). An ID's user
+// is its ids row's principal; an alias's is the principal of the session
+// that holds it (or, offline, last held it: ALIAS_SESSION_SQL, as the
+// launcher list reads it). Locally every principal is null: one user per
+// bus. No session behind the candidate: not another user's; the roster and
+// launcher checks refuse it as unknown.
+export function sameUser(principal: string | null, candidate: string, db: Database): boolean {
+  const row = addressParts(candidate)?.kind === "id"
+    ? db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(candidate)
+    : db.prepare(`SELECT i.principal FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL} WHERE a.address = ?`).get(candidate);
+  return !row || (row as { principal: string | null }).principal === principal;
 }
 
 // Limits (#252). A requester spends one token per fresh delegation (a dedup
@@ -134,21 +133,20 @@ function optField(raw: unknown, name: string, max: number): string | undefined {
   return raw === undefined || raw === null ? undefined : field(raw, name, max, true);
 }
 
-// The user's human handle, for the degrade path: local mode's declared human,
-// or (on a server, where handles are user@org/name) the caller's own, built
-// with the address formatter rather than string surgery. Reachability decides
-// the rest: on a server that's real Slack reachability passed in from the
-// mode (the hub knows; a last_seen row isn't reachability); locally, having
-// connected at least once (the bridge is woken by the socket). null when
-// there isn't one.
+// The user's human handle, for the degrade path: on a server, the caller's
+// own user's (built from its principal with the address formatter, never
+// from the requester's address: a team alias's scope is no one's human);
+// locally, the declared human. Reachability decides the rest: on a server
+// that's real Slack reachability passed in from the mode (the hub knows; a
+// last_seen row isn't reachability); locally, having connected at least
+// once (the bridge is woken by the socket). null when there isn't one.
 function humanFallbackHandle(
   db: Database,
   requester: string,
+  principal: string | null,
   reachable: (h: string) => boolean,
 ): string | null {
-  const candidates = requester.includes("/")
-    ? [formatDirectAddress(requester.split("/")[0]!, HUMAN_NAME)]
-    : humanHandles(db);
+  const candidates = principal !== null ? [formatDirectAddress(principal, HUMAN_NAME)] : humanHandles(db);
   for (const h of candidates) {
     if (h !== requester && reachable(h)) return h;
   }
@@ -166,6 +164,8 @@ export type Delegation = { to: string; body: string; humanFallback?: true };
 export function resolveDelegation(
   db: Database,
   requester: string,
+  // The requester's signed-in user (its email) on a server; null locally.
+  principal: string | null,
   args: { persona?: unknown; task?: unknown; context?: unknown; to?: unknown },
   online: (handle: string) => boolean,
   humanReachable?: (humanHandle: string) => boolean,
@@ -183,7 +183,7 @@ export function resolveDelegation(
   if (args.to !== undefined) {
     if (typeof args.to !== "string" || !args.to.trim()) throw new CoreError("to must be a string");
     const to = args.to.trim();
-    if (!sameUser(requester, to, db)) {
+    if (!sameUser(principal, to, db)) {
       throw new CoreError(`delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`);
     }
     if (!everConnected(db, to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
@@ -194,14 +194,14 @@ export function resolveDelegation(
     return { to, body: delegationBody(brief) };
   }
 
-  const live = launchers(db).filter((h) => sameUser(requester, h, db) && !self(h) && online(h));
+  const live = launchers(db).filter((h) => sameUser(principal, h, db) && !self(h) && online(h));
   const free = live.find((h) => open(h) < cap);
   if (free !== undefined) return { to: free, body: delegationBody(brief) };
   // Every live launcher is full: refused, not degraded to the human. The
   // fallback would hand a loop's flood to a person (Slack) instead.
   if (live.length) throw new CoreError(`every live launcher of yours has ${cap} open delegation requests it hasn't taken (the cap, #252); retry once one replies in a request's thread, or start another launcher`);
 
-  const human = humanFallbackHandle(db, requester, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
+  const human = humanFallbackHandle(db, requester, principal, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };
   throw new CoreError("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human to fall back to; start one or pass to");
 }
