@@ -35,6 +35,9 @@ export type Config = {
   // Hellos per user: the burst, and the refill per second (#210).
   helloLimit: RateLimit;
   hostedRequestLimit?: RateLimit;
+  // delegate's limits (#252); defaults in src/core/delegation.ts. Not read from the environment.
+  delegateLimit?: RateLimit;
+  delegateOpenCap?: number;
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
   authFailLimit: RateLimit;

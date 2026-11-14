@@ -11,6 +11,7 @@ import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
+import { countOpenDelegations } from "../core/delegation.ts";
 import type { MailPort } from "../core/session_end.ts";
 import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
@@ -147,6 +148,8 @@ export interface Repo {
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(senders: string[], since: number): MessageRow[];
     ack(reader: string, id: number): void;
+    // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
+    openDelegations(launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
     markDelivered(id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
@@ -851,6 +854,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`,
         ).all(JSON.stringify(senders), since));
+      },
+      openDelegations(launcher, since) {
+        return countOpenDelegations(db, "access_log", launcher, since);
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
