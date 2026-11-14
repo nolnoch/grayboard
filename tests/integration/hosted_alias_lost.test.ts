@@ -134,6 +134,24 @@ test("a root that lost its only hold is told on its next call, though the write 
   expect(pending()).toBe(0);
 });
 
+test("a root that lost a hold can't send or post as it; its other name still writes (#408)", async () => {
+  const a = await srv.hosted(A, "be");
+  const b = await srv.hosted(B, "eng/build");
+  await b.bind("fe");
+  await revoke();
+
+  for (const [tool, args] of [["dm_send", { to: `${A}/be`, body: "as lost" }], ["board_post", { board: "e2e", body: "as lost" }]] as const) {
+    const refused = await b.callRaw(tool, { ...args, as: "eng/build" });
+    expect(refused.isError).toBe(true);
+    expect(texts(refused)[0]).toContain(`"eng/build" isn't one of this session's addresses`);
+  }
+  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'as lost'").get()).toEqual({ n: 0 });
+  expect(srv.app.db.query("SELECT count(*) AS n FROM posts WHERE body = 'as lost'").get()).toEqual({ n: 0 });
+  await b.call("dm_send", { to: `${A}/be`, body: "as fe" });
+  expect(srv.app.db.query("SELECT sender FROM messages WHERE body = 'as fe'").all()).toEqual([{ sender: `${B}/fe` }]);
+  await a.close();
+});
+
 test("a child's whoami and tool results neither carry nor take its root's notice", async () => {
   const b = await srv.hosted(B, "fe");
   await b.bind("eng/build");
