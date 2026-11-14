@@ -11,7 +11,7 @@ import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, ch
 import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
 import { delegateOkFields, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -354,6 +354,10 @@ async function restoreNames(rec: { names: string[]; session_id: string }, siblin
     if (r.restored && !restored) { restored = true; restoredFrom = rec.session_id; }
   }
   for (const m of missed) startNotes.push(restoreNote(m.name, m.why, held.length > 0));
+  // Unverified: the name stays, the status doesn't; say so only when there was one to lose (#260).
+  if (held.length && !restored && (db.prepare(`SELECT status FROM ids WHERE id = ?`).get(rec.session_id) as { status: string | null } | null)?.status) {
+    startNotes.push(unverifiedRestoreNote(held));
+  }
 }
 if (WRITES_AS) {
   ensureAlias(db, WRITES_AS, WRITES_AS);
