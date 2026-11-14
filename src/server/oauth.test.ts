@@ -38,7 +38,7 @@ function makeService(cimd?: import("./oauth-cimd.ts").CimdOptions) {
       expect(input.verifier).toMatch(/^[\w-]{43}$/);
       expect(input.redirectUri).toBe(base + "/oauth/google/callback");
       if (input.code !== "fake-google-code") throw new Error("fake rejection");
-      return { email: "you@example.com", displayName: "You" };
+      return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
     } });
 }
 beforeEach(() => {
@@ -429,7 +429,7 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   expect((await fetch(authorization("https://client.example/client.json").url)).status).toBe(503);
   expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.cimd_failed'").get()).toEqual({ action: "oauth.cimd_failed" });
   service.close();
-  service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "other@elsewhere.example", displayName: null }) });
+  service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "other@elsewhere.example", displayName: null, subject: "google-other@elsewhere.example" }) });
   const browser = new Browser();
   const first = await browser.request(authorization().url);
   const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
@@ -445,6 +445,25 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
     expect(trail).toContain("oauth.request_failed");
     expect(trail).not.toContain("PRIVATE"); expect(trail).not.toContain("refresh-token.ts");
   } finally { storage.repo.oauth.createRequest = create; log.mockRestore(); }
+});
+
+// Security audit F-13: an email Google hands to a new account doesn't bring the old account's user with it.
+test("a Google account presenting a linked user's email is refused at the callback and audited", async () => {
+  const signIn = async (subject: string) => {
+    service.close();
+    service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "you@example.com", displayName: "You", subject }) });
+    const browser = new Browser();
+    const first = await browser.request(authorization().url);
+    const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
+    return (await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "code" }))).status;
+  };
+  expect(await signIn("google-first")).toBe(303);
+  expect(await signIn("google-second")).toBe(403);
+  expect(storage.db.query("SELECT action, actor, detail FROM access_log WHERE action LIKE 'auth.subject_%'").all()).toEqual([
+    { action: "auth.subject_refused", actor: "you@example.com", detail: JSON.stringify({ reason: "subject_mismatch", client_id: "native" }) },
+  ]);
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
+  expect(storage.repo.users.findByEmail("you@example.com")!.idp_subject).toBe("google-first");
 });
 
 test("direct config dev auth rejects either Google secret, including an override with an empty primary", () => {
@@ -468,7 +487,8 @@ test("default Google exchange consistently selects the Web override or primary f
         fixtureCalls++;
         expect(input.redirectUri).toBe(cfg.publicUrl + "/oauth/google/callback");
         expect(input.nonce).toBe(nonce);
-        return { email: "you@example.com", displayName: "You" };
+        // The real path's ID token below carries sub "fixture-user"; the modes share one database.
+        return { email: "you@example.com", displayName: "You", subject: "fixture-user" };
       } } : {});
       globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
         const req = new Request(input, init);
@@ -954,7 +974,7 @@ test("official SDK binds one canonical default-port resource while preserving ex
   const publicUrl = "https://grayboard.example.com:443/hosted";
   service.close();
   service = createOAuthServer(storage.repo, { ...config, publicUrl, devAuth: false }, { now: () => clock, exchangeGoogle: async input => {
-    expect(input.redirectUri).toBe(publicUrl + "/oauth/google/callback"); return { email: "you@example.com", displayName: "You" };
+    expect(input.redirectUri).toBe(publicUrl + "/oauth/google/callback"); return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
   } });
   expect(service.resource).toBe("https://grayboard.example.com/hosted/mcp"); expect(service.issuer).toBe(publicUrl);
   const mapURL = (url: string) => { const u = new URL(url); expect(u.origin).toBe("https://grayboard.example.com"); return base + u.pathname + u.search; };

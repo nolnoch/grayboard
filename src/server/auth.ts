@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
-import type { Repo } from "./db.ts";
+import type { Repo, User } from "./db.ts";
+import { writeAudit } from "./audit.ts";
 
 const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_ISSUERS  = ["accounts.google.com", "https://accounts.google.com"];
@@ -66,12 +67,16 @@ export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue)
   return { user_id: session.user_id, user_email: user!.email, session_id: session.id };
 }
 
+// A verified Google account. subject: its `sub`, the ID Google never reuses,
+// while an email can pass to another person (security audit F-13).
+export type GoogleIdentity = { email: string; displayName: string | null; subject: string };
+
 export async function verifyGoogleIdToken(
   idToken: string,
   clientId: string,
   allowedDomain: string,
   options: { expectedNonce?: string; keyResolver?: JWTVerifyGetKey } = {},
-): Promise<{ email: string; displayName: string | null }> {
+): Promise<GoogleIdentity> {
   const { payload } = await jwtVerify(idToken, options.keyResolver ?? googleJwks, {
     issuer: GOOGLE_ISSUERS,
     audience: clientId,
@@ -89,7 +94,7 @@ export async function verifyGoogleIdToken(
   }
   const email = (payload["email"] as string).toLowerCase();
   const displayName = typeof payload["name"] === "string" ? payload["name"] : null;
-  return { email, displayName };
+  return { email, displayName, subject: payload.sub };
 }
 
 export async function exchangeGoogleCode(
@@ -100,7 +105,7 @@ export async function exchangeGoogleCode(
   clientSecret: string,
   allowedDomain: string,
   expectedNonce?: string,
-): Promise<{ email: string; displayName: string | null }> {
+): Promise<GoogleIdentity> {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -120,6 +125,23 @@ export async function exchangeGoogleCode(
   }
   const { id_token } = (await res.json()) as { id_token: string };
   return verifyGoogleIdToken(id_token, clientId, allowedDomain, { expectedNonce });
+}
+
+// Resolves a Google sign-in to its user, subject first (security audit F-13),
+// and audits a first link or a refusal. A refusal's text tells the person
+// signing in what an admin can do; `detail` joins each audit row.
+export function googleSignIn(repo: Repo, identity: GoogleIdentity, detail: Record<string, unknown> = {}): { user: User } | { refused: string } {
+  const r = repo.users.signIn(identity.email, identity.subject, identity.displayName);
+  if (r.status === "subject_mismatch") {
+    writeAudit(repo, "auth.subject_refused", identity.email, null, { reason: r.status, ...detail });
+    return { refused: `${identity.email} is linked to a different Google account. If this account should have it, an admin runs grayboard admin unlink-idp --email ${identity.email}` };
+  }
+  if (r.status === "email_changed") {
+    writeAudit(repo, "auth.subject_refused", r.user.email, null, { reason: r.status, email: identity.email, ...detail });
+    return { refused: `this Google account belongs to grayboard user ${r.user.email} but now reports ${identity.email}. To sign in as ${identity.email} (a new account), an admin runs grayboard admin unlink-idp --email ${r.user.email}` };
+  }
+  if (r.status === "ok" && r.linked) writeAudit(repo, "auth.subject_linked", r.user.email, null, detail);
+  return { user: r.user };
 }
 
 export function extractBearer(req: Request): string | null {

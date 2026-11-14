@@ -47,6 +47,7 @@ grayboard team members <name>            # members and admins
 grayboard admin revoke-session --email <e>   # every session the user has
 grayboard admin disable-user --email <e>
 grayboard admin enable-user --email <e>
+grayboard admin unlink-idp --email <e>     # forget the user's Google account (see the server guide)
 ```
 
 > Admin commands work only for the emails in the server's `GRAYBOARD_ADMINS`. Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.

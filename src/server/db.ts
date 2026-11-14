@@ -21,7 +21,17 @@ import { DiskBlobs } from "./blobs.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess } from "./oauth-types.ts";
 
 // Row types
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
+// idp_subject: the IdP's stable account ID (Google `sub`), set at the first
+// sign-in that carries one; null for a dev-auth user and one not signed in since
+// (security audit F-13).
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_subject: string | null };
+// What an IdP sign-in resolved to (security audit F-13). `linked`: the user had
+// no subject yet and now has this one. Refusals: `subject_mismatch`, the email's
+// user belongs to another IdP account (the email was reassigned);
+// `email_changed`, this IdP account's user has another email.
+export type IdpSignIn =
+  | { status: "ok"; user: User; linked: boolean }
+  | { status: "subject_mismatch" | "email_changed"; user: User };
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 // An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
 // ref is the user's email; a team or service scope's is the principal's name.
@@ -76,6 +86,10 @@ export interface Repo {
   hosted: HostedStore;
   users: {
     upsertByEmail(email: string, displayName: string | null): User;
+    // An IdP sign-in: matches the subject first, then the email (F-13).
+    signIn(email: string, subject: string, displayName: string | null): IdpSignIn;
+    // Forgets a user's IdP subject, so the next sign-in with the email links its account.
+    clearSubject(userId: number): void;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
     setDisabled(userId: number, disabled: boolean): void;
@@ -517,6 +531,10 @@ function initSchema(db: Database): void {
     ["oauth_tokens", "access_scopes", "TEXT"],
     ["oauth_codes", "grant_id", "TEXT REFERENCES oauth_grants(id) ON DELETE CASCADE"],
   ];
+  // users.idp_subject (security audit F-13): unique among the users that have one.
+  const userColumns = db.query<{ name: string }, []>(`PRAGMA table_info(users)`).all();
+  if (!userColumns.some(c => c.name === "idp_subject")) db.exec(`ALTER TABLE users ADD COLUMN idp_subject TEXT`);
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_idp_subject ON users(idp_subject) WHERE idp_subject IS NOT NULL");
   for (const [table, column, definition] of oauthColumns) {
     const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
     if (!columns.some(c => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -609,6 +627,24 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run(`INSERT OR IGNORE INTO principals (kind, name, user_id, created_at) VALUES ('user', ?, ?, ?)`, [email, user.id, now]);
           return user;
         })();
+      },
+      signIn(email, subject, displayName) {
+        return db.transaction((): IdpSignIn => {
+          const bySubject = db.query<User, [string]>("SELECT * FROM users WHERE idp_subject = ?").get(subject);
+          if (bySubject) {
+            if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
+            db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
+            return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+          }
+          const byEmail = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email);
+          if (byEmail?.idp_subject) return { status: "subject_mismatch", user: byEmail };
+          const user = this.upsertByEmail(email, displayName);
+          db.run("UPDATE users SET idp_subject = ? WHERE id = ?", [subject, user.id]);
+          return { status: "ok", user: { ...user, idp_subject: subject }, linked: byEmail !== null && byEmail !== undefined };
+        }).immediate();
+      },
+      clearSubject(userId) {
+        db.run("UPDATE users SET idp_subject = NULL WHERE id = ?", [userId]);
       },
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;

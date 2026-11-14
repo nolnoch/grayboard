@@ -170,6 +170,8 @@ curl -s https://grayboard.example.com/api/auth/config   # now shows your client 
 
 **Sign in again** on each laptop: `grayboard login --server https://grayboard.example.com` opens the browser, completes Google's PKCE flow, and overwrites `~/.grayboard/credentials` (mode `0600`). Re-run the step 5 checks. Claude Code's plugin also needs the server's [hosted MCP](#hosted-mcp-over-http) Google client; once that's set up, [set up each developer](team.md#per-developer-setup-one-time).
 
+Each user's first Google sign-in ties their grayboard account to that Google account (its stable ID, not the email). A different Google account presenting the same email later, such as a new hire given a departed person's address, is refused rather than inheriting the old account's names, mail and teams; so is a known Google account that now reports a different email. If the email should go to the new account (the person's Google account was recreated, or you're deliberately handing the account on), run `grayboard admin unlink-idp --email <e>`; the next Google sign-in with that email takes the account. Every link, refusal and unlink writes an audit row.
+
 ## Hosted MCP over HTTP
 
 Use a server built from this source checkout for the hosted endpoint; the release installer above does not establish that a downloaded binary includes it. On the target platform, `bun install` then `bun run build` produces `dist/grayboard-server` and `dist/grayboard`; install those binaries in the service's configured locations, or use the source-mode service described in [step 2](#2-install-the-server).

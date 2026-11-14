@@ -28,7 +28,7 @@ export function hostedServer(overrides: Partial<Config> = {}, email = "alice@exa
   const port = freePort();
   const issuer = `http://127.0.0.1:${port}`;
   const srv = new TestServer({ httpPort: port, publicUrl: issuer, hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [], ...overrides },
-    { hostname: "127.0.0.1", oauth: { exchangeGoogle: async () => ({ email, displayName: email.split("@")[0]! }) } });
+    { hostname: "127.0.0.1", oauth: { exchangeGoogle: async () => ({ email, displayName: email.split("@")[0]!, subject: "google-" + email }) } });
   return Object.assign(srv, { issuer, resource: srv.app.oauth.resource });
 }
 

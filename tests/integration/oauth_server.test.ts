@@ -30,7 +30,7 @@ beforeEach(() => {
     expect(input.redirectUri).toBe(issuer + "/oauth/google/callback");
     expect(input.verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(input.nonce.length).toBeGreaterThan(30);
-    return { email: "alice@example.com", displayName: "Alice" };
+    return { email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" };
   } } });
   base = `http://127.0.0.1:${app.server.port}`;
 });

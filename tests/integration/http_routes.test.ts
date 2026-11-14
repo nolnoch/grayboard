@@ -82,11 +82,25 @@ test("admin routes: refused for non-admins and when no admins are configured", a
   await restart({ admins: ["alice@example.com"] });
   const admin = await login("alice@example.com");
   const bob = await login("bob@example.com");
-  for (const path of ["/api/admin/disable-user", "/api/admin/enable-user", "/api/admin/revoke-session"]) {
+  for (const path of ["/api/admin/disable-user", "/api/admin/enable-user", "/api/admin/revoke-session", "/api/admin/unlink-idp"]) {
     expect((await api(bob, "POST", path, { email: "alice@example.com" })).status).toBe(403);
   }
   expect((await api(admin, "POST", "/api/admin/disable-user", { email: "bob@example.com" })).status).toBe(200);
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
+});
+
+// Security audit F-13: an admin frees an email from its Google account, so the next account to present it signs in.
+test("admin unlink-idp clears a user's IdP subject and audits it", async () => {
+  await restart({ admins: ["root@example.com"] });
+  const root = await login("root@example.com");
+  expect(srv.app.repo.users.signIn("bob@example.com", "google-bob", null).status).toBe("ok");
+  expect(srv.app.repo.users.signIn("bob@example.com", "google-new", null).status).toBe("subject_mismatch");
+  expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "Bob@Example.com" })).status).toBe(200);
+  expect(srv.app.repo.users.findByEmail("bob@example.com")!.idp_subject).toBeNull();
+  expect(srv.app.repo.users.signIn("bob@example.com", "google-new", null)).toMatchObject({ status: "ok", linked: true });
+  expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "nobody@example.com" })).status).toBe(404);
+  expect(srv.app.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'auth.subject_cleared'").all())
+    .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: '{"had_subject":true}' }]);
 });
 
 test("admin revoke-session signs a user out of every session, ignoring an old CLI's all", async () => {
