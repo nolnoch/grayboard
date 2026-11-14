@@ -1090,16 +1090,19 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput: string | null)
 // The user's live sessions with no alias, for peer_list: never another
 // user's (`where` describes their machine). A hold, a tools-only connection or
 // an idle legacy GET isn't listed: it receives nothing. A hosted session with no name is
-// listed as master listed it (#402).
+// listed as master listed it (#402). One row per session ID: a hosted call adds
+// its own connection beside any other of the same ID that is live (#489).
 function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
-  const mine = [
-    ...[...hub.sessions].filter((c) => c.transport === "hosted" && c.readOnly && c.listed),
-  ].filter((c) => c.authed.user_id === session.authed.user_id);
-  const statuses = idStatuses(hub.db, mine.map((c) => c.sessionId));
+  const mine = new Map<string, ApplicationSession>();
+  for (const c of hub.sessions) {
+    if (c.transport !== "hosted" || !c.readOnly || !c.listed || c.authed.user_id !== session.authed.user_id) continue;
+    if (!mine.has(c.sessionId)) mine.set(c.sessionId, c);
+  }
+  const statuses = idStatuses(hub.db, [...mine.keys()]);
   const now = hub.now();
-  return mine.map((c) => {
+  return [...mine.values()].map((c) => {
     const s = statuses.get(c.sessionId);
-    return unboundPeer(c.sessionId, c.place ?? null, c === session || c.sessionId === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
+    return unboundPeer(c.sessionId, c.place ?? null, c.sessionId === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
   });
 }
 

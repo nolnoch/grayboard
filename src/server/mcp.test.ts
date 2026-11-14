@@ -1246,3 +1246,15 @@ for (const { label, initMeta } of UNBOUND_GETS) test(`peer_list doesn't show an 
     expect(hosted.activeGetStreams).toBe(1);
   } finally { await raw.close(); }
 });
+
+test("an unbound native hosted session lists itself once in peer_list's unbound_sessions (#489)", async () => {
+  const raw = await rawLegacyGet(token);
+  const fresh = { "ai.opencode/sessionID": "lone-root" };
+  try {
+    const listed = await raw.call("peer_list", {}, fresh);
+    const data = JSON.parse(listed.text.split("\n").find(line => line.startsWith("data: "))!.slice(6));
+    const unbound = JSON.parse(data.result.content[0].text).unbound_sessions as { session_id: string; self?: true }[];
+    expect(unbound).toHaveLength(1);
+    expect(unbound[0]).toMatchObject({ self: true });
+  } finally { await raw.close(); }
+});
