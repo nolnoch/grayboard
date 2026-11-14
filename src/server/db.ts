@@ -148,8 +148,10 @@ export interface Repo {
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
     markDelivered(id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
-    // and has no reply. False if any of that doesn't hold.
-    retract(sender: string, id: number): boolean;
+    // and has no reply. False if any of that doesn't hold. Audited as
+    // message.retracted in the delete's transaction (#306), as local's
+    // retractMessage is, so every caller writes the row a repeat is answered from.
+    retract(sender: string, id: number, by: { actor: string | null; session: string | null }): boolean;
     prune(olderThanMs: number): void;
   };
   // An ended session's mail, as core endSession reaches it (#284 decision 4).
@@ -229,7 +231,7 @@ export const QUEUED_TO_SQL = `SELECT m.recipient, COUNT(*) AS n FROM messages m
 
 // retract: the sender's message, still unread and unanswered. Exported for
 // the same EXPLAIN pin.
-export const RETRACTABLE_SQL = `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
+export const RETRACTABLE_SQL = `SELECT recipient FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
                AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
                                    WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0) AND delivered_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`;
@@ -830,15 +832,19 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       markDelivered(id, at) {
         db.run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
       },
-      retract(sender, id) {
+      retract(sender, id, by) {
         return db.transaction(() => {
-          const retractable = db.query<{ x: number }, [number, string]>(
+          const retractable = db.query<{ recipient: string }, [number, string]>(
             RETRACTABLE_SQL,
           ).get(id, sender);
           if (!retractable) return false;
           dropAttachments(db, "message", "?", id);
           db.run("DELETE FROM messages WHERE id = ?", [id]);
           db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
+          db.run(
+            "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, ?, 'message.retracted', ?, ?)",
+            [Date.now(), by.actor, `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: retractable.recipient, session: by.session })],
+          );
           return true;
         })();
       },
