@@ -1296,3 +1296,25 @@ test("an unbound native hosted session lists itself once in peer_list's unbound_
     expect(unbound[0]).toMatchObject({ self: true });
   } finally { await raw.close(); }
 });
+
+// #399: a hosted commit names the row it changed, and only the listens reading that row re-check their binding.
+test("an unbind stops only its own session's listen, through the per-row notice (#399)", async () => {
+  const first = await connect(), second = await otherClient();
+  expect((await first.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
+  expect((await first.callTool({ name: "board_create", arguments: { name: "mine", purpose: "first's watch" } })).isError).not.toBe(true);
+  expect((await second.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).not.toBe(true);
+  expect((await second.callTool({ name: "board_create", arguments: { name: "theirs", purpose: "second's watch" } })).isError).not.toBe(true);
+  const kept = await first.listen({ resourceSubscriptions: ["grayboard://boards/mine"] });
+  await second.listen({ resourceSubscriptions: ["grayboard://boards/theirs"] });
+  expect(hosted.activeListens).toBe(2);
+  // A binding change committed outside any request of either session, so only the notice can reach the listens.
+  const rebind = (email: string) => store.repo.hosted.atomic(() => {
+    const row = store.repo.hosted.all().find(r => store.repo.users.findById(r.user_id)?.email === email)!;
+    store.repo.hosted.update({ ...row, bind_gen: row.bind_gen + 1 });
+  });
+  rebind("bob@example.com");
+  await untilHosted(() => hosted.activeListens === 1);
+  rebind("alice@example.com");
+  await untilHosted(() => hosted.activeListens === 0);
+  await kept.close();
+});

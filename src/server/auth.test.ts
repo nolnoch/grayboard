@@ -88,12 +88,16 @@ describe("verifySessionToken", () => {
     expect(verifySessionToken(raw, repo, touches)).toBeNull();
   });
 
-  test("re-enabled user returns authed user", () => {
+  // Security audit F-14: disable revokes the token, so enable doesn't revive it.
+  test("re-enabled user's old token stays revoked; a new one works", () => {
     const u   = repo.users.upsertByEmail("wade@example.com", null);
     const raw = mintToken();
     repo.sessions.create(u.id, hashToken(raw), null);
     repo.users.setDisabled(u.id, true);
     repo.users.setDisabled(u.id, false);
-    expect(verifySessionToken(raw, repo, touches)).not.toBeNull();
+    expect(verifySessionToken(raw, repo, touches)).toBeNull();
+    const fresh = mintToken();
+    repo.sessions.create(u.id, hashToken(fresh), null);
+    expect(verifySessionToken(fresh, repo, touches)).not.toBeNull();
   });
 });

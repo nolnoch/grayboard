@@ -147,7 +147,7 @@ async function localCall(name: string, tool: ClaimTool, args: Record<string, unk
 
 async function serverCall(name: string, tool: ClaimTool, args: Record<string, unknown>): Promise<unknown> {
   try {
-    return await makeClient().post("/api/claims/call", { identity: name, tool, args });
+    return await makeClient().post("/api/claims/call", { as: name, tool, args });
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
     // An unknown identity is "unknown_identity"; a bare not_found means the route itself is missing.

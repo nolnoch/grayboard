@@ -10,6 +10,9 @@ import { startServer, type StartOptions } from "../../src/server/app.ts";
 import type { Config } from "../../src/server/config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
+import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
+import { attachmentDownload, attachmentRelease, attachmentUpload } from "../../src/server/http.ts";
+import { UploadGate } from "../../src/server/uploads.ts";
 import { cleanEnv } from "./env.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { type AppSession, type AppSessionOptions, signedIn } from "./app_session.ts";
@@ -70,14 +73,39 @@ export class TestServer {
     return { status: r.status, body: await r.json() };
   }
 
-  async upload(token: string, identity: string, filename: string, data: Uint8Array | string): Promise<{ status: number; body: Record<string, any> }> {
-    const q = `as=${encodeURIComponent(identity)}&filename=${encodeURIComponent(filename)}`;
-    const r = await fetch(`${this.base}/api/attachments?${q}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: data as string | Uint8Array<ArrayBuffer>,
-    });
+  // The shared attachment handlers (src/server/http.ts) run in-process as
+  // `identity`, as the hosted byte routes run them once they have resolved
+  // the session's bound name. For application sessions, which have no byte
+  // route of their own (#475); a hosted session uses HTTP (HostedSession.upload).
+  async uploadAs(token: string, identity: string, filename: string, data: Uint8Array | string): Promise<{ status: number; body: Record<string, any> }> {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const url = this.handlerUrl(identity, `&filename=${encodeURIComponent(filename)}`);
+    const req = new Request(url, { method: "POST", headers: { "Content-Length": String(bytes.length) }, body: bytes as Uint8Array<ArrayBuffer> });
+    const total = this.app.repo.attachmentLimits.total;
+    const r = await attachmentUpload(req, url, this.authed(token), this.app.repo, this.app.db, new UploadGate(4 * total, total));
     return { status: r.status, body: (await r.json()) as Record<string, any> };
+  }
+
+  async downloadAs(token: string, identity: string, id: number): Promise<{ status: number }> {
+    const r = await attachmentDownload(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo, this.app.db);
+    await r.body?.cancel();
+    return { status: r.status };
+  }
+
+  async releaseAs(token: string, identity: string, id: number): Promise<{ status: number }> {
+    const r = await attachmentRelease(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo, this.app.db);
+    await r.body?.cancel();
+    return { status: r.status };
+  }
+
+  private authed(token: string): AuthedUser {
+    const authed = verifySessionToken(token, this.app.repo, this.app.touches);
+    if (!authed) throw new Error("the token doesn't authenticate");
+    return authed;
+  }
+
+  private handlerUrl(identity: string, extra = ""): URL {
+    return new URL(`${this.base}/attachments?as=${encodeURIComponent(identity)}${extra}`);
   }
 
   // An application-level session (no socket, no hosted store): the

@@ -24,6 +24,7 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     await srv.app.slackReady;
     const token = await srv.login("you@example.com");
     const code = await srv.api(token, "POST", "/api/slack/link");
+    slack.emails.set("U1", "you@example.com");
     slack.say(`link ${code.body.code}`);
     await until(() => slack.posts().find(p => p.markdown_text?.startsWith("Linked to")));
     const agent = await srv.hosted("you@example.com", "fe");

@@ -314,7 +314,7 @@ describe("dedup and state answers (in process)", () => {
     expect(((await be.send("FE", "hello")) as Sent).replayed!.ref.id).toBe(first.message_id);
 
     const up = async (bytes: string) => {
-      const r = await srv.upload(you, "be", "notes.md", bytes);
+      const r = await srv.uploadAs(you, "be", "notes.md", bytes);
       expect(r.status).toBe(201);
       return r.body.id as number;
     };
@@ -346,7 +346,7 @@ describe("dedup and state answers (in process)", () => {
   test("board_post: a replay releases the retry's upload; a non-string body is a bad request", async () => {
     const be = await session("be");
     await be.call("board_create", { name: "e2e", purpose: "files" });
-    const up = async () => (await srv.upload(you, "be", "notes.md", "v1")).body.id as number;
+    const up = async () => (await srv.uploadAs(you, "be", "notes.md", "v1")).body.id as number;
     type Post = { post_id: number } & Replayed;
     const first = await be.call<Post>("board_post", { board: "e2e", body: "see file", attachment_ids: [await up()] });
     const retryUpload = await up();
