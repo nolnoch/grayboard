@@ -152,6 +152,7 @@ test("install.sh installs the latest release; setup --local registers it with ev
   writeOldEntries(realpathSync(join(bin, "grayboard")), { GRAYBOARD_X: "1" });
   const out = await expectOk(grayboard("setup", "-y", "--local"));
   expect(out).toContain("Using local mode.");
+  expect(out).toContain(`The repo's name (in ~/code/api, "api") is suggested first. To bind a name at start, set BUS_IDENTITY in the launch command.`);
   expect(out).toContain(`Registered in ${join(home, ".config", "opencode", "opencode.json")} (disabled: the plugin serves the tools)`);
   expect(out).toContain(`Registered in ${join(home, ".pi", "agent", "mcp.json")} (disabled: the extension serves the tools)`);
   expectRegistered();
@@ -169,6 +170,9 @@ test("setup --server keeps the sign-in at mode 600; logout truncates it; setup -
   const setup = await expectOk(grayboard("setup", "-y", "--server", srv.base));
   expect(setup).toContain(`Signed in to ${srv.base} as you@example.com.`);
   expect(setup).toContain(`grayboard setup-opencode --url ${srv.base}/mcp`);
+  // The closing tip (#544 item 5): no repo-name suggestion on a server, and OpenCode's start name is setup-opencode's.
+  expect(setup).toContain("To bind a name at start, set BUS_IDENTITY in the launch command (OpenCode: grayboard setup-opencode --name).");
+  expect(setup).not.toContain("is suggested first");
   expectRegistered(srv.base);
 
   await expectOk(grayboard("logout"));
