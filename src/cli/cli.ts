@@ -583,7 +583,7 @@ slackCmd
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────
 
-// The refusal a `--mode server` gets, and what an old 2.x client's hello is answered with (src/server/ws_refusal.ts).
+// The refusal a `--mode server` gets: the WebSocket transport it dialed is gone (#282).
 function refuseServerMode(mode: string | undefined): void {
   if (mode === "server") {
     console.error(`[grayboard] ${UPGRADE_REFUSAL}`);
@@ -1048,7 +1048,7 @@ teamCmd
 
 teamCmd
   .command("create <name>")
-  .description("Create a team (you are auto-added as a member; teams are invite-only)")
+  .description("Create a team (you are its first owner; teams are invite-only)")
   .action(async (name: string) => {
     try { output(await makeClient().post("/api/teams", { name }), globalJson()); }
     catch (e) { handleApiError(e); }
@@ -1056,15 +1056,16 @@ teamCmd
 
 teamCmd
   .command("add <team> <email>")
-  .description("Add someone to a team you're in, or any team if you're an admin (they must have signed in once)")
-  .action(async (team: string, email: string) => {
-    try { output(await makeClient().post(`/api/teams/${team}/add`, { email }), globalJson()); }
+  .description("Add someone to a team you own, or any team if you're an admin (they must have signed in once); --role changes an existing member's role")
+  .option("--role <role>", "owner or member (owners add and remove members)")
+  .action(async (team: string, email: string, opts: { role?: string }) => {
+    try { output(await makeClient().post(`/api/teams/${team}/add`, opts.role === undefined ? { email } : { email, role: opts.role }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 
 teamCmd
   .command("remove <team> <email>")
-  .description("Remove someone from a team you're in, or any team if you're an admin")
+  .description("Remove someone from a team you own, or any team if you're an admin")
   .action(async (team: string, email: string) => {
     try { output(await makeClient().post(`/api/teams/${team}/remove`, { email }), globalJson()); }
     catch (e) { handleApiError(e); }

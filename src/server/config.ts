@@ -6,6 +6,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LI
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
@@ -28,6 +29,8 @@ export type Config = {
   messageRetentionDays: number;
   auditRetentionDays: number;
   devAuth: boolean;
+  // Days a CLI session token may go unused before it's refused (security audit F-14); 0 never.
+  cliTokenIdleDays?: number;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -40,6 +43,10 @@ export type Config = {
   // Hellos per user: the burst, and the refill per second (#210).
   helloLimit: RateLimit;
   hostedRequestLimit?: RateLimit;
+  // delegate's limits (#252): GRAYBOARD_DELEGATE_BURST/_PER_SEC (per user) and
+  // GRAYBOARD_DELEGATE_OPEN_CAP; defaults in src/core/delegation.ts.
+  delegateLimit?: RateLimit;
+  delegateOpenCap?: number;
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
   authFailLimit: RateLimit;
@@ -84,6 +91,7 @@ export function loadConfig(): Config {
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
+    cliTokenIdleDays: idleDays(process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
@@ -93,6 +101,8 @@ export function loadConfig(): Config {
     authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
     oauthLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH", { burst: 60, perSec: 1 }, "requests"),
     oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),
+    delegateLimit: parseRateLimit(process.env, "GRAYBOARD_DELEGATE", DELEGATE_LIMIT, "requests"),
+    delegateOpenCap: positiveInt(process.env, "GRAYBOARD_DELEGATE_OPEN_CAP", DELEGATE_OPEN_CAP, MAX_BURST, "requests"),
     mcpLimits: parseMcpLimits(process.env),
     hostedCaps: parseHostedCaps(process.env),
     ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
@@ -241,6 +251,17 @@ export function parseMetricsAddr(raw: string | undefined): { hostname: string; p
   if (!m || port > 65535) throw new Error(`GRAYBOARD_METRICS_ADDR must be host:port or a port, not "${raw}"`);
   const host = m[1] ?? "127.0.0.1";
   return { hostname: host.startsWith("[") ? host.slice(1, -1) : host, port };
+}
+
+// CLI token idle days: unset or empty is the default, 0 is never, else a
+// whole number of days up to ten years. Plain digits, as elsewhere here.
+export const DEFAULT_CLI_TOKEN_IDLE_DAYS = 30;
+function idleDays(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_CLI_TOKEN_IDLE_DAYS;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3650) {
+    throw new Error(`GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days from 0 (never expire) to 3650, not "${raw}"`);
+  }
+  return Number(raw);
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so

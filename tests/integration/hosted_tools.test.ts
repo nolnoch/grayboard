@@ -60,14 +60,14 @@ test("team board: members see it and get pushes; non-members can't see or be men
   const b = await srv.hosted(B, "fe");
   const c = await srv.hosted(C, "sim");
 
-  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: "@sim @bob/fe secret plan" });
+  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: `@${C}/sim @bob/fe secret plan` });
   expect(posted.unresolved).toEqual(["bob/fe"]);
 
   const pushed = await c.next(board());
   expect(pushed.event.item).toMatchObject({
     kind: "push",
     reason: "mention",
-    post: { board: "eng", author: `${A}/be`, body: "@sim @bob/fe secret plan" },
+    post: { board: "eng", author: `${A}/be`, body: `@${C}/sim @bob/fe secret plan` },
   });
   await b.none(board());
 
@@ -110,6 +110,75 @@ test("who: live sessions are online; a closed one is offline with last_seen; tea
     [`${B}/fe`, true],
   ]);
   await expect(c.call("peer_list", { board: "eng" })).rejects.toMatchObject({ message: "no such board #eng; see board_list" });
+});
+
+// Security audit F-12: another user's agent shows its handle and presence,
+// never where it runs, its status, harness, model, effort or launcher flag,
+// and match can't probe them; a team alias shows them to the team's members.
+test("peer_list shows a session's facts only inside a scope the caller may act in (F-12)", async () => {
+  const alice = await login(A);
+  const bob = await login(B);
+  await login(C);
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: B });
+
+  const a = await srv.hosted(A, "be");
+  const b = await srv.hosted(B, "fe");
+  const c = await srv.hosted(C, "sim");
+  await srv.connected(bob, "eng/deploy");
+  const facts = (address: string, model: string) =>
+    srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = ?, effort = 'high', launcher = 1, status = 'on ENG-142', status_at = ?
+      WHERE id = (SELECT id FROM alias_holds WHERE address = ?)`).run(model, Date.now(), address);
+  facts(`${A}/be`, "model-a");
+  facts(`${B}/fe`, "model-b");
+  facts("eng/deploy", "model-d");
+  const FACTS = ["where", "status", "status_age", "harness", "model", "effort", "launcher"];
+  const row = (r: WhoResult, h: string) => r.peers.find((p) => p.handle === h)! as unknown as Record<string, unknown>;
+  const shown = (r: WhoResult, h: string) => FACTS.filter((k) => row(r, h)[k] !== undefined);
+
+  const byAlice = await a.call<WhoResult>("peer_list");
+  expect(shown(byAlice, `${A}/be`)).toEqual(FACTS);
+  expect(shown(byAlice, `${B}/fe`)).toEqual([]);
+  expect(row(byAlice, `${B}/fe`)).toMatchObject({ handle: `${B}/fe`, online: true });
+  // alice is in eng, so its alias's facts show to her though bob's session holds it.
+  expect(shown(byAlice, "eng/deploy")).toEqual(FACTS);
+  expect(await b.call<WhoResult>("peer_list").then((r) => shown(r, `${B}/fe`))).toEqual(FACTS);
+
+  // carol is in no team: only her own row shows facts.
+  const byCarol = await c.call<WhoResult>("peer_list");
+  expect([`${A}/be`, `${B}/fe`, "eng/deploy"].map((h) => shown(byCarol, h))).toEqual([[], [], []]);
+
+  // A hidden fact can't be probed with match.
+  expect((await c.call<WhoResult>("peer_list", { match: { model: "model-b" } })).peers).toEqual([]);
+  expect((await c.call<WhoResult>("peer_list", { match: { harness: "claude-code" } })).peers).toEqual([]);
+  expect((await b.call<WhoResult>("peer_list", { match: { model: "model-b" } })).peers.map((p) => p.handle)).toEqual([`${B}/fe`]);
+});
+
+// Security audit F-12: an ID row (a subscription taken unbound) is judged
+// by its principal's person scope: a teammate sees bob's ID on the roster,
+// never its facts.
+test("peer_list(board) shows another user's ID subscription without its facts (F-12)", async () => {
+  const alice = await login(A);
+  await login(B);
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: B });
+  const a = await srv.hosted(A, "be");
+  const b = await srv.hosted(B, null);
+  await b.call("peer_list");
+  // A hosted session can't subscribe unbound; a row as its ID is what a
+  // released alias's subscription leaves, so write it directly.
+  const { id: bobId } = srv.app.db.query(`SELECT id FROM ids WHERE principal = ?`).get(B) as { id: string };
+  srv.app.db.prepare(`INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('eng', ?, 'push', 0, 0)`).run(bobId);
+  srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = 'model-b', effort = 'high', status = 'on ENG-142', status_at = ? WHERE id = ?`)
+    .run(Date.now(), bobId);
+  const FACTS = ["where", "status", "harness", "model", "effort"];
+  const shown = (r: WhoResult) => {
+    const row = r.peers.find((p) => p.handle === bobId) as unknown as Record<string, unknown> | undefined;
+    expect(row).toBeDefined();
+    return FACTS.filter((k) => row![k] !== undefined);
+  };
+  expect(shown(await b.call<WhoResult>("peer_list", { board: "eng" }))).toEqual(FACTS);
+  expect(shown(await a.call<WhoResult>("peer_list", { board: "eng", include_offline: true }))).toEqual([]);
 });
 
 test("leaving a team drops its board and pending pushes", async () => {
@@ -191,22 +260,31 @@ test("a receipt that fails inside answers an internal error and keeps the sessio
   await fe.call("board_list");
 });
 
-test("a bare DM recipient is your own identity of that name, else the only one with it", async () => {
+test("a bare DM recipient is only ever your own identity of that name (F-08)", async () => {
   const a = await srv.hosted(A, "be");
   const a2 = await srv.hosted(A, "be-stream");
-  await srv.hosted(B, "be-stream");
+  const b = await srv.hosted(B, "be-stream");
   await srv.hosted(B, "fe");
   const c = await srv.hosted(C, "fe");
 
   // alice and bob both have be-stream: alice's bare name means her own.
   await a.call("dm_send", { to: "be-stream", body: "mine" });
   expect((await a2.next(direct())).event.message.body).toBe("mine");
-  // carol has no be: the only be is alice's.
-  await c.call("dm_send", { to: "be", body: "only one" });
-  expect((await a.next(direct())).event.message.body).toBe("only one");
-  // alice has no fe, and bob and carol each have one: ambiguous.
+  await b.none(direct());
+  // carol has no be: alice's, the only one, is named in full, never woken by the bare name.
+  // dm_history and delegate resolve a bare name the same way as dm_send.
+  const notMine = { message: `"be" isn't in your scope; name it in full: ${A}/be; peer_list shows exact handles` };
+  await expect(c.call("dm_history", { peer: "be" })).rejects.toMatchObject(notMine);
+  await expect(c.call("delegate", { persona: "reviewer", task: "look", to: "be" })).rejects.toMatchObject(notMine);
+  await expect(c.call("dm_send", { to: "be", body: "only one" })).rejects.toMatchObject({
+    message: `"be" isn't in your scope; name it in full: ${A}/be; peer_list shows exact handles`,
+  });
+  await a.none(direct());
+  await c.call("dm_send", { to: `${A}/be`, body: "in full" });
+  expect((await a.next(direct())).event.message.body).toBe("in full");
+  // alice has no fe, and bob and carol each have one.
   await expect(a.call("dm_send", { to: "fe", body: "?" })).rejects.toMatchObject({
-    message: `several identities are named "fe": ${B}/fe, ${C}/fe; peer_list shows exact handles`,
+    message: `"fe" isn't in your scope; name it in full: ${B}/fe, ${C}/fe; peer_list shows exact handles`,
   });
   await expect(a.call("dm_send", { to: "nobody", body: "?" })).rejects.toMatchObject({
     message: `no identity is named "nobody"; peer_list shows exact handles`,
@@ -216,15 +294,15 @@ test("a bare DM recipient is your own identity of that name, else the only one w
 test("dm_history: peer resolves like dm_send's recipient, oldest first, limit clamped; empty bodies refused", async () => {
   const a = await srv.hosted(A, "be");
   await srv.hosted(B, "fe");
-  for (const body of ["one", "two", "three"]) await a.call("dm_send", { to: "fe", body });
-  await expect(a.call("dm_send", { to: "fe", body: "  " })).rejects.toMatchObject({ message: "body is required" });
+  for (const body of ["one", "two", "three"]) await a.call("dm_send", { to: `${B}/fe`, body });
+  await expect(a.call("dm_send", { to: `${B}/fe`, body: "  " })).rejects.toMatchObject({ message: "body is required" });
 
   const bodies = async (peer: string, limit?: number) =>
     (await a.call<HistoryMessage[]>("dm_history", { peer, ...(limit !== undefined ? { limit } : {}) })).map((m) => m.body);
-  expect(await bodies("fe")).toEqual(["one", "two", "three"]);
+  expect(await bodies(`${B}/fe`)).toEqual(["one", "two", "three"]);
   expect(await bodies("Bob@Example.com/FE")).toEqual(["one", "two", "three"]);
-  expect(await bodies("fe", 2)).toEqual(["two", "three"]);
-  expect(await bodies("fe", 0)).toEqual(["three"]);
+  expect(await bodies(`${B}/fe`, 2)).toEqual(["two", "three"]);
+  expect(await bodies(`${B}/fe`, 0)).toEqual(["three"]);
   await expect(a.call("dm_history", { peer: "nobody" })).rejects.toMatchObject({
     message: `no identity is named "nobody"; peer_list shows exact handles`,
   });
@@ -468,7 +546,7 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   // A client can't name paths for the server to read: the hosted board_post
   // has no attachments field (attachment_ids only), and refuses one.
   await expect(a.call("board_post", { board: "eng", body: "x", attachments: ["/etc/hosts"] })).rejects.toMatchObject({ message: "Input validation error: Invalid arguments for tool board_post: data must NOT have additional properties" });
-  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: "@sim plan attached", attachment_ids: [up.body.id] });
+  const posted = await a.call<BoardPostResult>("board_post", { board: "eng", body: `@${C}/sim plan attached`, attachment_ids: [up.body.id] });
   const info = { id: up.body.id, filename: "plan.md", type: "text/markdown", size: 6, sha256: up.body.sha256 };
   expect(posted.attachments).toEqual([info]);
   expect(postOf((await c.next(board())).event.item).attachments).toEqual([info]);

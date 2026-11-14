@@ -10,11 +10,14 @@
 | `login` returns 403 after Google succeeds | The account isn't on `GRAYBOARD_ORG_DOMAIN` (`hd` mismatch), or its email isn't verified |
 | `login --dev` returns 404 | Dev auth is off (`GRAYBOARD_DEV_AUTH=1` not set) |
 | `grayboard admin …` returns 403 | Your email isn't in the server's `GRAYBOARD_ADMINS`, or it's unset; edit `/etc/grayboard/env` and restart |
-| `grayboard team join` returns 403 | Teams are invite-only (v1.1.7); a member runs `grayboard team add <team> <your email>` |
-| `team add` says the email has never signed in | That person runs `grayboard login` once, then a member adds them |
+| `grayboard team join` returns 403 | Teams are invite-only (v1.1.7); an owner runs `grayboard team add <team> <your email>` |
+| `team add` says the email has never signed in | That person runs `grayboard login` once, then an owner adds them |
+| `team add` or `team remove` says only an owner can | You're a member, not an owner; `grayboard team members <team>` lists the owners |
+| `team leave` says you're the last owner | Make another member an owner first: `grayboard team add <team> <email> --role owner` |
 | A session's instructions say its `BUS_IDENTITY` name is held, or `bind` says `"<handle>" is in use by the session id:…` | Another session holds that name (the message names it); see [One live session per identity](team.md#one-live-session-per-identity) |
 | `bind` says `you can't act as "<team>/<name>"` | You aren't a member of that team; bind a name in your own scope, or ask a member to add you |
 | A session fails with "this grayboard server no longer serves `grayboard mcp` over WebSocket" | The entry is an older `grayboard mcp --mode server`; run `grayboard update`, which moves Claude Code onto the plugin, or `grayboard setup --server <url>` |
+| A session's grayboard loops on "connection as session id:… lost; reconnecting" against a team server | The entry is a `grayboard mcp --mode server` from a CLI older than v2.3.0, which the server no longer answers; the same fix: `grayboard update`, or `grayboard setup --server <url>` |
 | `Error (unauthenticated): your sign-in isn't valid on …` | The server no longer knows your token, e.g. after the step 6 database reset; `grayboard login --server <url>`, then reconnect the session |
 | pi: tools work but messages never arrive | The extension isn't installed (`~/.pi/agent/extensions/grayboard.ts`, or `grayboard.js` with a team server; rerun `grayboard setup`), or pi was started with `--no-extensions` |
 | pi with a team server: grayboard tools fail, or `/grayboard status` says signed out | Open the sign-in link pi shows after a signed-out tool call, or run `/grayboard login` in pi; it keeps its own grant, separate from `grayboard login` |

@@ -32,7 +32,7 @@ const mentioned = (body: string) => board((i) => i.kind === "push" && i.reason =
 // person-scope name, so it can't hold the team alias eng/deploy (#451).
 
 // hosted twin: #451 (deploy, a team alias)
-test("@scope/name is exact; a bare name is the author's own scope's first, else the board's one match", async () => {
+test("@scope/name is exact; a bare name is only ever the author's own scope's (F-08)", async () => {
   const abe = await srv.hosted(A, "be");
   const aqa = await srv.hosted(A, "qa");
   const bqa = await srv.hosted(B, "qa");
@@ -57,14 +57,16 @@ test("@scope/name is exact; a bare name is the author's own scope's first, else 
   await aqa.next(mentioned(body));
   await bqa.none(mentioned(body));
 
-  // Bare with no own match: the one alias of that name on the roster.
+  // Bare with no own match: refused naming the one on the roster, which isn't woken.
   body = "@deploy roster";
-  expect((await abe.call<BoardPostResult>("board_post", { board: "e2e", body })).notified).toEqual(["eng/deploy"]);
-  await deploy.next(mentioned(body));
+  await expect(abe.call("board_post", { board: "e2e", body })).rejects.toMatchObject({
+    message: "@deploy isn't in your scope; name it in full: eng/deploy",
+  });
+  await deploy.none(mentioned(body));
 });
 
 // hosted twin: #451 (deploy, a team alias)
-test("an ambiguous bare name refuses the post with its candidates; an @id: reaches the session", async () => {
+test("a bare name only other scopes have refuses the post with its candidates; an @id: reaches the session", async () => {
   const aqa = await srv.hosted(A, "qa");
   const bqa = await srv.hosted(B, "qa");
   const deploy = await srv.connected(bob, "eng/deploy");
@@ -76,7 +78,7 @@ test("an ambiguous bare name refuses the post with its candidates; an @id: reach
   // eng has no qa of its own, and two people's are on the roster.
   await expect(deploy.call("board_post", { board: "e2e", body: "@qa which" })).rejects.toMatchObject({
     code: "bad_request",
-    message: `@qa matches ${A}/qa, ${B}/qa; name one`,
+    message: `@qa isn't in your scope; name it in full: ${A}/qa, ${B}/qa`,
   });
   expect((await deploy.call<ReadResult>("board_read", { board: "e2e" })).posts).toEqual([]);
   await aqa.none(board());
