@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
-import type { AppSession } from "../support/app_session.ts";
+import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
@@ -137,6 +137,16 @@ test("local: an explicit to that isn't a launcher is refused, naming the flag", 
   }
 }, 20_000);
 
+test("local: a launcher naming itself is refused as self-delegation, not as offline (#253)", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  try {
+    await call(be.c, "delegate", { persona: "p", task: "t", to: "be" });
+    throw new Error("expected a refusal");
+  } catch (e) {
+    expect((e as Error).message).toContain("can't delegate to itself");
+  }
+}, 20_000);
+
 test("local: no live launcher surfaces the request to the declared human", async () => {
   // The human's handle is declared, and its bridge session connected once
   // (the row's last_seen is the reachability the fallback checks).
@@ -193,6 +203,22 @@ test("server: the launcher flag on a session's ID records the capability; delega
     await sim.call("dm_ack", { message_id: [r.message_id, mixed.message_id, thread.at(-1)!.id] });
     const settled = await sim.call<Inbox>("dm_inbox");
     expect((settled.promised ?? []).some((p) => p.to === "you@example.com/be")).toBe(false);
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+test("server: a launcher naming itself is refused as self-delegation, and nothing is sent (#253)", async () => {
+  const srv = serve();
+  try {
+    const token = await srv.login("you@example.com");
+    const be = await launcher(srv, token, "be");
+    // Its primary, and a second alias it holds: before the fix the second
+    // was online to the server and the request went to the session itself.
+    expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be" }))).message).toContain("can't delegate to itself");
+    await be.bind("be2", { create: true });
+    expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be2" }))).message).toContain("can't delegate to itself");
+    expect((srv.app.db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n).toBe(0);
   } finally {
     await srv.stop();
   }

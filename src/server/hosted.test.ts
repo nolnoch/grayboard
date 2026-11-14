@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -1099,3 +1100,57 @@ test("a call whose root's ownership ended and restarted before it returns keeps 
   expect(hosted.inflightCount).toBe(0);
 });
 
+// #424 items 2-4: the restart credit and the liveness heartbeat's untested branches.
+const creditRows = () => database.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='hosted.lease_restart_credit'").all().map(row => JSON.parse(row.detail));
+const lastStart = () => JSON.parse(database.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='server.started' ORDER BY id DESC LIMIT 1").get()!.detail);
+
+test("the restart credit is what keeps an unbound idle root alive across a long outage", async () => {
+  const root = context("idle-root");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.whoami(principal, root);
+  const seen = database.repo.hosted.get(root.id)!.last_seen_at;
+  hosted.close();
+  // 20 minutes down: without the credit, the unbound root is past the 15-minute idle window at startup.
+  now += 20 * 60_000;
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  expect(database.repo.hosted.get(root.id)?.last_seen_at).toBe(now);
+  expect(creditRows()).toEqual([expect.objectContaining({ field: "last_seen_at", before: seen, after: now, downtime_ms: 20 * 60_000 })]);
+  expect(lastStart()).toMatchObject({ credited: 1 });
+});
+
+test("a disabled user's root earns no restart credit", async () => {
+  const root = context("disabled-root");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  await delivery.open(principal, root);
+  expect(database.repo.hosted.get(root.id)?.lease_deadline).not.toBeNull();
+  hosted.close();
+  database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+  now += 5 * 60_000;
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  expect(creditRows()).toEqual([]);
+  expect(lastStart()).toMatchObject({ downtime_ms: 5 * 60_000, credited: 0 });
+  expect(database.repo.hosted.get(root.id)).toBeUndefined();
+});
+
+test("the heartbeat follows a clock that steps backwards", async () => {
+  now += 5_000;
+  await until(() => database.repo.hosted.aliveAt() === now, 5_000);
+  // Less than a heartbeat interval behind the last beat: only the t < beat branch writes it.
+  now -= 500;
+  await until(() => database.repo.hosted.aliveAt() === now, 5_000);
+});
+
+test("a failed heartbeat write is reported and retried on the next tick", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  const write = spyOn(database.repo.hosted, "heartbeat").mockImplementation(() => { throw new Error("disk full"); });
+  try {
+    const before = database.repo.hosted.aliveAt();
+    now += 5_000;
+    await until(() => errors.mock.calls.some(call => String(call[0]).includes('"operation":"hosted.heartbeat"')), 5_000);
+    expect(database.repo.hosted.aliveAt()).toBe(before);
+    write.mockRestore();
+    // The fake clock stands still: a failure that had advanced the beat would never write again.
+    await until(() => database.repo.hosted.aliveAt() === now, 5_000);
+  } finally { write.mockRestore(); errors.mockRestore(); }
+});
