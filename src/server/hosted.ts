@@ -10,6 +10,7 @@ import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
+import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META, validSourceId } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit, type AuditAction } from "./audit.ts";
@@ -168,7 +169,7 @@ const DELIVERY_TTL_MS = 30_000;
 const TICK_MS = 250;
 const IDLE_EVERY = 20;
 const RECONCILE_EVERY = 120;
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   // GRAYBOARD_HOSTED_IDLE_SECONDS is parsed strictly in config.ts and arrives here as options.idleSeconds.
@@ -181,7 +182,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   const gates = new Map<string, { gate: BindGate; users: number }>();
   // `parked`: a root's parked children past it are evicted, oldest first (#584); with `children` a root has at most
   // twice MAX_CHILDREN child rows.
-  const limits = { user: 256, global: 4096, children: MAX_CHILDREN, parked: MAX_CHILDREN };
+  const caps = options.caps ?? DEFAULT_HOSTED_CAPS.sessions;
+  const limits = { user: caps.perUser, global: caps.global, children: MAX_CHILDREN, parked: MAX_CHILDREN };
   // Calls running per session ID (#584): a row with one is never idle-ended or parked. A child's call counts for
   // its root too, since ending a root deletes its children.
   const inflight = new Map<string, number>();

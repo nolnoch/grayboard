@@ -43,7 +43,6 @@ afterEach(() => srv.stop());
 
 const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
-const upload = (token: string, identity: string, filename: string, data: Uint8Array | string) => srv.upload(token, identity, filename, data);
 const postOf = (item: Pending) => {
   if (item.kind !== "push") throw new Error(`expected a push, got a ${item.kind}`);
   return item.post;
@@ -153,6 +152,33 @@ test("peer_list shows a session's facts only inside a scope the caller may act i
   expect((await c.call<WhoResult>("peer_list", { match: { model: "model-b" } })).peers).toEqual([]);
   expect((await c.call<WhoResult>("peer_list", { match: { harness: "claude-code" } })).peers).toEqual([]);
   expect((await b.call<WhoResult>("peer_list", { match: { model: "model-b" } })).peers.map((p) => p.handle)).toEqual([`${B}/fe`]);
+});
+
+// Security audit F-12: an ID row (a subscription taken unbound) is judged
+// by its principal's person scope: a teammate sees bob's ID on the roster,
+// never its facts.
+test("peer_list(board) shows another user's ID subscription without its facts (F-12)", async () => {
+  const alice = await login(A);
+  await login(B);
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: B });
+  const a = await srv.hosted(A, "be");
+  const b = await srv.hosted(B, null);
+  await b.call("peer_list");
+  // A hosted session can't subscribe unbound; a row as its ID is what a
+  // released alias's subscription leaves, so write it directly.
+  const { id: bobId } = srv.app.db.query(`SELECT id FROM ids WHERE principal = ?`).get(B) as { id: string };
+  srv.app.db.prepare(`INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('eng', ?, 'push', 0, 0)`).run(bobId);
+  srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = 'model-b', effort = 'high', status = 'on ENG-142', status_at = ? WHERE id = ?`)
+    .run(Date.now(), bobId);
+  const FACTS = ["where", "status", "harness", "model", "effort"];
+  const shown = (r: WhoResult) => {
+    const row = r.peers.find((p) => p.handle === bobId) as unknown as Record<string, unknown> | undefined;
+    expect(row).toBeDefined();
+    return FACTS.filter((k) => row![k] !== undefined);
+  };
+  expect(shown(await b.call<WhoResult>("peer_list", { board: "eng" }))).toEqual(FACTS);
+  expect(shown(await a.call<WhoResult>("peer_list", { board: "eng", include_offline: true }))).toEqual([]);
 });
 
 test("leaving a team drops its board and pending pushes", async () => {
@@ -391,8 +417,9 @@ test("only a message's sender and recipient can read its thread or reply to it",
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
 
-const download = (token: string, identity: string, id: number) =>
-  fetch(`${srv.base}/api/attachments/${id}?as=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
+// The hosted byte routes (src/server/mcp-attachments.ts), acting as the session's bound name.
+const upload = (s: HostedSession, filename: string, data: Uint8Array<ArrayBuffer> | string) => s.uploadRaw(filename, data);
+const download = (s: HostedSession, id: number) => s.attachmentRaw("GET", `/${id}`);
 
 const audits = (action: string) => accessAudits(srv.app.db, action);
 
@@ -419,24 +446,20 @@ test("#385: the DM tools take local's definitions, so a bad message ID or an unk
 });
 
 test("attachments on a DM: uploaded as your identity, bound by the send, pushed and read, fetched by its two parties", async () => {
-  const alice = await login(A);
-  const bob = await login(B);
-  const carol = await login(C);
   const a = await srv.hosted(A, "be");
   const b = await srv.hosted(B, "fe");
   const c = await srv.hosted(C, "sim");
 
-  // An unknown identity is refused as `grayboard claim` refuses one.
-  expect(await upload(alice, "nope", "x.png", PNG)).toMatchObject({ status: 404, body: { code: "unknown_identity" } });
-  expect((await upload(alice, "human", "x.png", PNG)).status).toBe(403);
-  expect((await upload(alice, "be", "x.bin", new Uint8Array([0, 1, 2]))).body.message).toMatch(/not an image/);
-  expect((await upload(alice, "be", "x.txt", new Uint8Array(0))).body.message).toBe("file x.txt: empty file");
+  expect((await upload(a, "x.bin", new Uint8Array([0, 1, 2]))).body.message).toMatch(/not an image/);
+  expect((await upload(a, "x.txt", new Uint8Array(0))).body.message).toBe("file x.txt: empty file");
   // The upload runs the checks an agent's path gets: names, key material, an extension matching the type.
-  expect((await upload(alice, "be", ".env", "A=1")).body.message).toMatch(/dotfiles/);
-  expect((await upload(alice, "be", "id_rsa", "x")).body.message).toMatch(/key or credentials/);
-  expect((await upload(alice, "be", "n.txt", "-----BEGIN RSA PRIVATE KEY-----")).body.message).toMatch(/key material/);
+  expect((await upload(a, ".env", "A=1")).body.message).toMatch(/dotfiles/);
+  expect((await upload(a, "id_rsa", "x")).body.message).toMatch(/key or credentials/);
+  expect((await upload(a, "n.txt", "-----BEGIN RSA PRIVATE KEY-----")).body.message).toMatch(/key material/);
 
-  const up = await upload(alice, "be", "../shot.png", PNG);
+  // A name with a path in it is refused before the body is read.
+  expect(await upload(a, "../shot.png", PNG)).toEqual({ status: 400, body: { code: "bad_request", message: "invalid filename" } });
+  const up = await upload(a, "shot.png", PNG);
   expect(up.status).toBe(201);
   expect(up.body).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: PNG.length, sha256: expect.any(String) });
   const info = { id: up.body.id, filename: "shot.png", type: "image/png", size: PNG.length, sha256: up.body.sha256 };
@@ -458,15 +481,15 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   expect((await b.call<HistoryMessage[]>("dm_history", { peer: `${A}/be` }))[0]!.attachments).toEqual([info]);
   expect((await b.call<InboxResult>("dm_inbox")).unanswered[0]!.attachments).toEqual([info]);
 
-  const got = await download(bob, "fe", up.body.id);
+  const got = await download(b, up.body.id);
   expect(got.status).toBe(200);
   expect(got.headers.get("content-type")).toBe("image/png");
   expect(got.headers.get("content-disposition")).toBe("attachment; filename*=UTF-8''shot.png");
   expect(got.headers.get("repr-digest")).toBe(`sha-256=:${createHash("sha256").update(PNG).digest("base64")}:`);
   expect(new Uint8Array(await got.arrayBuffer())).toEqual(PNG);
-  expect((await download(alice, "be", up.body.id)).status).toBe(200);
+  expect((await download(a, up.body.id)).status).toBe(200);
   // Not a party: reads as missing, and is logged.
-  const refused = await download(carol, "sim", up.body.id);
+  const refused = await download(c, up.body.id);
   expect(refused.status).toBe(404);
   expect(await refused.json()).toMatchObject({ message: `no attachment ${up.body.id} on a message or post you can read` });
   expect(audits("attachment.download_refused")).toMatchObject([{ actor: C, target: `attachment:${up.body.id}` }]);
@@ -475,16 +498,14 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
 
 test("attachments: a failed blob read or write is audited; a swept blob is a 404, a fault a bare 500", async () => {
   const { blobDir } = srv.config;
-  const alice = await login(A);
-  const bob = await login(B);
   const a = await srv.hosted(A, "be");
-  await srv.hosted(B, "fe");
+  const b = await srv.hosted(B, "fe");
 
-  const up = await upload(alice, "be", "shot.png", PNG);
+  const up = await upload(a, "shot.png", PNG);
   await a.call("dm_send", { to: `${B}/fe`, body: "see shot", attachment_ids: [up.body.id] });
   // Swept between the read check and the read.
   rmSync(join(blobDir, up.body.sha256.slice(0, 2), up.body.sha256));
-  const gone = await download(bob, "fe", up.body.id);
+  const gone = await download(b, up.body.id);
   expect(gone.status).toBe(404);
   expect(await gone.json()).toEqual({ code: "not_found", message: `attachment ${up.body.id}'s bytes are gone` });
   expect(audits("attachment.download_failed")).toMatchObject([{ actor: B, target: `attachment:${up.body.id}`, detail: { error: expect.stringContaining("are missing") } }]);
@@ -493,7 +514,7 @@ test("attachments: a failed blob read or write is audited; a swept blob is a 404
   // An unwritable blob directory: the client hears nothing of the path or errno.
   chmodSync(join(blobDir, "tmp"), 0o500);
   try {
-    const failed = await upload(alice, "be", "other.png", new Uint8Array([...PNG, 1]));
+    const failed = await upload(a, "other.png", new Uint8Array([...PNG, 1]));
     expect(failed).toEqual({ status: 500, body: { code: "internal", message: "internal error" } });
   } finally {
     chmodSync(join(blobDir, "tmp"), 0o700);
@@ -504,14 +525,14 @@ test("attachments: a failed blob read or write is audited; a swept blob is a 404
 test("attachments on a team board post follow the board; a retracted DM takes its files; uploads are capped", async () => {
   const alice = await login(A);
   const bob = await login(B);
-  const carol = await login(C);
+  await login(C);
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: C });
   await api(bob, "POST", "/api/identities", { name: "fe" });
   const a = await srv.hosted(A, "be");
   const c = await srv.hosted(C, "sim");
 
-  const up = await upload(alice, "be", "plan.md", "# plan");
+  const up = await upload(a, "plan.md", "# plan");
   expect(up.body.type).toBe("text/markdown");
   // A client can't name paths for the server to read: the hosted board_post
   // has no attachments field (attachment_ids only), and refuses one.
@@ -520,67 +541,62 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   const info = { id: up.body.id, filename: "plan.md", type: "text/markdown", size: 6, sha256: up.body.sha256 };
   expect(posted.attachments).toEqual([info]);
   expect(postOf((await c.next(board())).event.item).attachments).toEqual([info]);
-  expect((await download(carol, "sim", up.body.id)).status).toBe(200);
-  expect((await download(bob, "fe", up.body.id)).status).toBe(404);
+  expect((await download(c, up.body.id)).status).toBe(200);
 
   // bob/fe is offline, so the DM stays retractable.
-  const note = await upload(alice, "be", "note.txt", "retract me");
+  const note = await upload(a, "note.txt", "retract me");
   const queued = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "oops", attachment_ids: [note.body.id] });
   expect(queued.delivered_now).toBe(false);
   await a.call("dm_retract", { message_id: queued.message_id });
-  expect((await download(alice, "be", note.body.id)).status).toBe(404);
+  expect((await download(a, note.body.id)).status).toBe(404);
   // The retract sweeps the freed blob after its commit, not before its reply.
   await until(() => !srv.app.db.prepare(`SELECT 1 FROM attachment_blobs WHERE sha256 = ?`).get(note.body.sha256), 5000, "the retracted DM's blob swept");
+  // Not on the team: the board's file reads as missing.
+  expect((await download(await srv.hosted(B, "fe"), up.body.id)).status).toBe(404);
 
   const big = new Uint8Array(10 * 1024 * 1024).fill(0x61);
-  expect((await upload(alice, "be", "big.txt", new Uint8Array(big.length + 1).fill(0x61))).status).toBe(413);
+  expect((await upload(a, "big.txt", new Uint8Array(big.length + 1).fill(0x61))).status).toBe(413);
   // 50MB of unsent uploads per user, across their identities.
   for (let i = 0; i < 5; i++) {
     big[0] = 0x62 + i;
-    expect((await upload(alice, "be", `big${i}.txt`, big)).status).toBe(201);
+    expect((await upload(a, `big${i}.txt`, big)).status).toBe(201);
   }
-  const over = await upload(alice, "be", "one-more.txt", "x");
+  const over = await upload(a, "one-more.txt", "x");
   expect(over.status).toBe(413);
   expect(over.body.message).toMatch(/unsent uploads would exceed 50MB/);
-  expect((await upload(carol, "sim", "theirs.txt", "x")).status).toBe(201);
+  expect((await upload(c, "theirs.txt", "x")).status).toBe(201);
 });
 
 test("a server's own attachment limits: sent at initialize, enforced per file, per message and on unsent uploads", async () => {
   await restart({ attachmentLimits: { file: 100, total: 150 } });
-  const alice = await login(A);
   const a = await srv.hosted(A, "be");
   expect(a.native.client.getServerCapabilities()?.experimental?.[ATTACHMENT_LIMITS_CAPABILITY]).toEqual({ file: 100, total: 150 });
 
-  expect((await upload(alice, "be", "big.txt", "x".repeat(101))).body.message).toBe("file big.txt: 101B exceeds the 100B limit per file");
-  expect((await upload(alice, "be", "page.html", "<script>")).body.filename).toBe("page.html.txt");
-  const one = await upload(alice, "be", "a.txt", "a".repeat(80));
-  const two = await upload(alice, "be", "b.txt", "b".repeat(80));
+  expect((await upload(a, "big.txt", "x".repeat(101))).body.message).toBe("file big.txt: 101B exceeds the 100B limit per file");
+  expect((await upload(a, "page.html", "<script>")).body.filename).toBe("page.html.txt");
+  const one = await upload(a, "a.txt", "a".repeat(80));
+  const two = await upload(a, "b.txt", "b".repeat(80));
   await expect(a.call("dm_send", { to: "be", body: "both", attachment_ids: [one.body.id, two.body.id] })).rejects.toMatchObject({
     message: "attachments exceed 150B in all",
   });
   // Unsent uploads are capped at twice the per-message total.
-  await upload(alice, "be", "c.txt", "c".repeat(80));
-  expect((await upload(alice, "be", "d.txt", "d".repeat(80))).body.message).toMatch(/unsent uploads would exceed 300B/);
+  await upload(a, "c.txt", "c".repeat(80));
+  expect((await upload(a, "d.txt", "d".repeat(80))).body.message).toMatch(/unsent uploads would exceed 300B/);
 });
 
 test("a user's stored attachments are capped, sent or not; an upload needs a length; refusals are audited", async () => {
   await restart({ attachmentLimits: { file: 100, total: 150 }, attachmentUserQuota: 200 });
-  const alice = await login(A);
   const a = await srv.hosted(A, "be");
   for (const n of ["a", "b"]) {
-    const up = await upload(alice, "be", `${n}.txt`, n.repeat(90));
+    const up = await upload(a, `${n}.txt`, n.repeat(90));
     await a.call("dm_send", { to: "be", body: n, attachment_ids: [up.body.id] });
   }
-  const over = await upload(alice, "be", "c.txt", "c".repeat(30));
+  const over = await upload(a, "c.txt", "c".repeat(30));
   expect(over).toMatchObject({ status: 413, body: { message: "your stored attachments would exceed 200B; they're freed as their messages and posts age out" } });
-  expect((await upload(alice, "be", "d.txt", "d".repeat(20))).status).toBe(201);
+  expect((await upload(a, "d.txt", "d".repeat(20))).status).toBe(201);
 
   // A streamed body declares no length.
-  const streamed = await fetch(`${srv.base}/api/attachments?as=be&filename=e.txt`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${alice}` },
-    body: new ReadableStream({ start: (c) => (c.enqueue(new TextEncoder().encode("e")), c.close()) }),
-  });
+  const streamed = await a.attachmentRaw("POST", "?filename=e.txt", new ReadableStream({ start: (c) => (c.enqueue(new TextEncoder().encode("e")), c.close()) }));
   expect(streamed.status).toBe(411);
 
   expect(audits("attachment.upload_refused").map((r): Record<string, unknown> => ({ actor: r.actor, ...r.detail }))).toEqual([

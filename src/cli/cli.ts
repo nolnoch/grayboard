@@ -583,7 +583,7 @@ slackCmd
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────
 
-// The refusal a `--mode server` gets, and what an old 2.x client's hello is answered with (src/server/ws_refusal.ts).
+// The refusal a `--mode server` gets: the WebSocket transport it dialed is gone (#282).
 function refuseServerMode(mode: string | undefined): void {
   if (mode === "server") {
     console.error(`[grayboard] ${UPGRADE_REFUSAL}`);
