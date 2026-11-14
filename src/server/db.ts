@@ -19,6 +19,7 @@ import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
+import { requestOrigin } from "./request_context.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess } from "./oauth-types.ts";
 
 // Row types
@@ -549,6 +550,21 @@ function initSchema(db: Database): void {
   // before it, read through OWNER_SQL.
   const tmCols = db.prepare(`PRAGMA table_info(team_members)`).all() as { name: string }[];
   if (!tmCols.some((c) => c.name === "role")) db.exec(`ALTER TABLE team_members ADD COLUMN role TEXT`);
+  // ip, ua: the client address and user agent of the request that wrote the
+  // row (security audit F-19, request_context.ts); null for work no request
+  // caused and on rows from before it.
+  const logCols = db.prepare(`PRAGMA table_info(access_log)`).all() as { name: string }[];
+  if (!logCols.some((c) => c.name === "ip")) db.exec(`ALTER TABLE access_log ADD COLUMN ip TEXT`);
+  if (!logCols.some((c) => c.name === "ua")) db.exec(`ALTER TABLE access_log ADD COLUMN ua TEXT`);
+}
+
+/**
+ * Every access_log row goes in here: it stamps the client address and user
+ * agent of the request whose handling wrote it (security audit F-19).
+ */
+function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
+  const o = requestOrigin();
+  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua) VALUES (?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null]);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -934,10 +950,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           dropAttachments(db, "message", "?", id);
           db.run("DELETE FROM messages WHERE id = ?", [id]);
           db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
-          db.run(
-            "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, ?, 'message.retracted', ?, ?)",
-            [clock(), by.actor, `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: retractable.recipient, session: by.session })],
-          );
+          insertAudit(db, clock(), by.actor, "message.retracted", `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: retractable.recipient, session: by.session }));
           return true;
         })();
       },
@@ -985,10 +998,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     audit: {
       write(row) {
-        db.run(
-          "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)",
-          [row.at, row.actor, row.action, row.target, row.detail],
-        );
+        insertAudit(db, row.at, row.actor, row.action, row.target, row.detail);
       },
       last(action, target) {
         return (
@@ -1125,7 +1135,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
-    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail })]);
+    insertAudit(db, now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail }));
   };
   const invalid = { status: "invalid" } as const;
   const missing = { status: "not_found" } as const;
@@ -1411,14 +1421,14 @@ function makeHostedStore(db: Database): HostedStore {
   const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
     const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
       WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
-    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
+    insertAudit(db, now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null }));
   };
   // A released child's ID ends in the release's transaction, with its reason (#475 item 1): left unended,
   // nothing owns it, and the next start would end it as a WSS leftover. The ends' wakes wait in `ended`,
   // queued at commit, for the application to run (`takeEnded`).
   const mail = mailPort(db);
   const coreAudit = (now: number): AuditSink => (action, actor, target, detail) =>
-    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, actor, action, target, detail ? JSON.stringify(detail) : null]);
+    insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
   let ended: EndedChild[] = [];
   const endChild = (child: string, why: string, now: number) => {
     const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
