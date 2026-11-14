@@ -1056,22 +1056,28 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput: string | null)
   ).slice(0, MAX_CANDIDATES);
 }
 
-// The user's live sessions with no alias, for peer_list: never another
-// user's (`where` describes their machine). A hold, a tools-only connection or
-// an idle legacy GET isn't listed: it receives nothing. A hosted session with no name is
-// listed as master listed it (#402). One row per session ID: a hosted call adds
-// its own connection beside any other of the same ID that is live (#489).
+// The user's unbound hosted roots, for peer_list: never another user's
+// (`where` describes their machine). Read from the durable store (#475), so a
+// root with no request in flight is listed too. A root that holds an alias, a
+// tools-only root (it writes as its writes_as) and a child (it acts as its
+// root) aren't listed; nor is a root whose only live connections are idle
+// legacy GETs, which receive nothing (#431). A hosted session with no name is
+// listed as master listed it (#402). One row per session ID.
 function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
-  const mine = new Map<string, ApplicationSession>();
+  const user = session.authed.user_id;
+  // Per live session ID: whether any of its connections is listed (#489: a call adds its own beside others).
+  const live = new Map<string, boolean>();
   for (const c of hub.sessions) {
-    if (c.transport !== "hosted" || !c.readOnly || !c.listed || c.authed.user_id !== session.authed.user_id) continue;
-    if (!mine.has(c.sessionId)) mine.set(c.sessionId, c);
+    if (c.transport !== "hosted" || c.authed.user_id !== user) continue;
+    live.set(c.sessionId, (live.get(c.sessionId) ?? false) || c.listed);
   }
-  const statuses = idStatuses(hub.db, [...mine.keys()]);
+  const roots = hub.repo.hosted.roots(user).filter((r) =>
+    r.writes_as === null && live.get(r.session_id) !== false && holdsOf(hub.db, r.session_id).length === 0);
+  const statuses = idStatuses(hub.db, roots.map((r) => r.session_id));
   const now = hub.now();
-  return [...mine.values()].map((c) => {
-    const s = statuses.get(c.sessionId);
-    return unboundPeer(c.sessionId, c.place ?? null, c.sessionId === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
+  return roots.map((r) => {
+    const s = statuses.get(r.session_id);
+    return unboundPeer(r.session_id, r.place, r.session_id === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
   });
 }
 

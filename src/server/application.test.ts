@@ -244,6 +244,13 @@ test("a hosted session whose hello facts throw is left unregistered (#385 item 9
 });
 
 test("unbound hosted sessions cannot use named operations or persist synthetic handles", async () => {
+  // A hosted root's row: peer_list reads unbound roots from the store (#475).
+  const now = Date.now();
+  const ownership = store.repo.hosted.start("hosted-unbound", alice.user_id, "test", now);
+  store.repo.hosted.insert({
+    session_id: "hosted-unbound", ownership_id: ownership, user_id: alice.user_id, client_id: "test", grant_id: "grant", source_session_id: "hosted-unbound",
+    writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null,
+  });
   const { session, info } = application.hostedSession(alice, "hosted-unbound", [], null, null, delivery());
   expect(session.writerId).toBeUndefined();
   expect(info.candidates).toEqual([]);
