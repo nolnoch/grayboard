@@ -43,12 +43,28 @@ afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); da
 
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
-  let invalidations = 0;
-  const unlisten = hosted.listen(() => { invalidations++; });
+  const invalidations: (string | null)[] = [];
+  const unlisten = hosted.listen(changed => { invalidations.push(changed); });
+  try {
+    hosted.reconcile();
+    expect(invalidations).toEqual([null]);
+    expect(application.holdsByOwner().size).toBe(4);
+  } finally { unlisten(); }
+});
+
+test("a commit invalidates only the rows it changed; a touch or an empty commit tells nothing (#399)", async () => {
+  for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
+  const target = context("root-2");
+  if (!("id" in target)) throw new Error("fixture context");
+  const invalidations: (string | null)[] = [];
+  const unlisten = hosted.listen(changed => { invalidations.push(changed); });
   try {
     database.repo.hosted.atomic(() => {});
-    expect(invalidations).toBe(1);
-    expect(application.holdsByOwner().size).toBe(4);
+    database.repo.hosted.atomic(() => database.repo.hosted.touch(target.id, now));
+    expect(invalidations).toEqual([]);
+    database.repo.hosted.atomic(() => database.repo.hosted.end(target.id, "closed", now));
+    expect(invalidations).toEqual([target.id]);
+    expect(application.holdsByOwner().size).toBe(3);
   } finally { unlisten(); }
 });
 
@@ -1159,4 +1175,27 @@ test("a failed heartbeat write is reported and retried on the next tick", async 
     // The fake clock stands still: a failure that had advanced the beat would never write again.
     await until(() => database.repo.hosted.aliveAt() === now, 5_000);
   } finally { write.mockRestore(); errors.mockRestore(); }
+});
+
+// #399: a request's hosted bookkeeping reads O(its own rows), not O(the fleet). The row lists the store hands back
+// during one call are counted with 3 and with 40 unrelated bound roots; the totals must match.
+test("one hosted call reads the same rows however many other sessions exist (#399)", async () => {
+  const store = database.repo.hosted;
+  const listing = ["all", "expired", "idle", "disabled", "children"] as const;
+  async function rowsRead(others: number) {
+    for (let i = 0; i < others; i++) await hosted.bind(principal, context(`other-${others}-${i}`), { name: `other-${others}-${i}`, create: true });
+    const caller = context(`caller-${others}`);
+    await hosted.bind(principal, caller, { name: `caller-${others}`, create: true });
+    let read = 0;
+    const spies = listing.map(name => spyOn(store, name).mockImplementation(((original: (...a: unknown[]) => unknown[]) => (...a: unknown[]) => {
+      const rows = original(...a); read += rows.length; return rows;
+    })((store[name] as (...a: unknown[]) => unknown[]).bind(store)) as never));
+    try { await hosted.run(principal, caller, "dm_history", session => session.identityFull); }
+    finally { for (const spy of spies) spy.mockRestore(); }
+    for (let i = 0; i < others; i++) await hosted.end(principal, context(`other-${others}-${i}`));
+    await hosted.end(principal, caller);
+    return read;
+  }
+  const few = await rowsRead(3), many = await rowsRead(40);
+  expect(many).toBe(few);
 });

@@ -39,7 +39,7 @@ type Binding = { user: number; email: string; grant: string; role: HostedRole; i
 // authenticated request re-admits it. `dormant` holds the separate dormant bound.
 // `controls`: the tail of this protocol session's subscribe/unsubscribe chain; each runs after the previous settles (#431).
 type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
-type Live = { context: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
+type Live = { context: Context; rows: Set<string>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; idleSeconds?: number }) {
   const now = opts.now ?? Date.now;
@@ -137,7 +137,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if ("id" in context.sessionContext) {
       const row = hosted.row(context.sessionContext.id);
       const root = row && hosted.rootOf(row);
-      if (root && root.lease_deadline !== null && root.lease_deadline <= now()) hosted.sweep();
+      if (root && root.lease_deadline !== null && root.lease_deadline <= now()) hosted.settle(root.session_id);
     }
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
@@ -214,8 +214,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const root = hosted.rootOf(row);
     return hosted.named(root) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
   }
-  const unlistenHosted = hosted.listen(() => {
+  // The rows a live's binding reads: its own and its root's, fixed at creation (#399). A commit names the one
+  // row it changed, so only the lives reading it are checked; null checks them all.
+  function bindingRows(context: Context): Set<string> {
+    if (!("id" in context.sessionContext)) return new Set();
+    const row = hosted.row(context.sessionContext.id);
+    return new Set([context.sessionContext.id, ...(row?.root_session_id ? [row.root_session_id] : [])]);
+  }
+  const unlistenHosted = hosted.listen(changed => {
     for (const live of [...lives]) {
+      if (changed !== null && live.rows.size && !live.rows.has(changed)) continue;
       try { if (!idle(live) && !bindingLive(live.context)) live.stop(); }
       catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
     }
@@ -270,7 +278,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     previous.finish();
   }
   function makeLive(context: Context, uris: Map<string, string | null>, handler?: McpHttpHandler, legacy?: Legacy): Live {
-    const live: Live = { context, uris, watches: [], handler, legacy, stopped: false,
+    const live: Live = { context, rows: bindingRows(context), uris, watches: [], handler, legacy, stopped: false,
       hint(uri) {
         if (live.stopped || !live.uris.has(uri)) return;
         try {
