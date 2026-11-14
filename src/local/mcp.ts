@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
-import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
+import { boardNotification, dmNotification, fenceChannel, type Pending } from "../shared/notifications.ts";
 import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
@@ -1185,6 +1185,11 @@ async function drainLoop(): Promise<void> {
 
 async function pushChannel(params: { content: string; meta: Record<string, string> }): Promise<boolean> {
   if (adapterPaused || claudePaused || shuttingDown) return false;
+  // Claude Code renders the content as sent; an adapter's render() fences it again, to no effect.
+  // The human's session feeds the Slack bridge, a person, not a model: the body stays as sent.
+  // The guidance push is ours, not mail: it shows the genuine <channel ...>
+  // form, which fenced would teach the model that the escaped form is genuine.
+  if (!HUMAN && params.meta.kind !== "guidance") params.content = fenceChannel(params.content);
   if (CLAUDE_CURRENT && readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start)?.session !== HARNESS_SESSION) return false;
   if (!ADAPTER_OWNER) {
     await mcp.notification({ method: "notifications/claude/channel", params });

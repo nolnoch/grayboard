@@ -34943,6 +34943,9 @@ function attachmentsDir(env = process.env) {
 }
 
 // src/shared/notifications.ts
+function fenceChannel(content) {
+  return content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;");
+}
 function viaLabel(via) {
   return `subagent ${via}, harness-asserted`;
 }
@@ -34995,15 +34998,10 @@ function boardNotification(item) {
 // adapters/hosted-core/src/channel.ts
 function channelParams(item, identity) {
   const event = InboxEvent.parse(item.event);
-  if (event.kind === "direct") {
-    const params = dmNotification(event.message, identity.identity_full);
-    if (isOwnHuman(event, identity))
-      params.meta.human = "true";
-    return params;
-  }
-  const params = boardNotification(event.item);
+  const params = event.kind === "direct" ? dmNotification(event.message, identity.identity_full) : boardNotification(event.item);
   if (isOwnHuman(event, identity))
     params.meta.human = "true";
+  params.content = fenceChannel(params.content);
   return params;
 }
 
