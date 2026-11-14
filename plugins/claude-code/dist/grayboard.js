@@ -31852,6 +31852,10 @@ function isValidEmail(email) {
 function isValidIdentityName(name) {
   return NAME_RE.test(name.toLowerCase());
 }
+function shownName(raw) {
+  const clean = raw.replace(/\p{Cc}/gu, "");
+  return clean.length > 64 ? `${clean.slice(0, 64)}\u2026` : clean;
+}
 var HUMAN_NAME = "human";
 var HUMAN_RESERVED = `"${HUMAN_NAME}" is reserved for your Slack link (grayboard slack link); give this session another name`;
 
@@ -37941,7 +37945,7 @@ function normalizeAliasName(raw) {
   const p = addressParts(raw);
   if (p?.kind === "bare" || p?.kind === "alias")
     return { ok: true, name: p.address };
-  return { ok: false, error: `invalid identity name "${raw}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
+  return { ok: false, error: `invalid identity name "${shownName(raw)}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
 }
 
 // src/shared/naming.ts
