@@ -378,15 +378,6 @@ function mailbox(path: string, readPointSql: string, newestSql: string): Mailbox
   return { readPoint: (a) => one(readPointSql, a), newest: (a) => one(newestSql, a) };
 }
 
-function hasTable(path: string, name: string): boolean {
-  const db = new Database(path, { readonly: true });
-  try {
-    return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null;
-  } finally {
-    db.close();
-  }
-}
-
 // Waits until each agent's read point covers what it was delivered, takes
 // both offline, and has a third agent DM each of them.
 async function sendWhileOffline(m: Mailbox, be: Writer, fe: Writer, sim: () => Promise<Writer>, beHandle: string, feHandle: string): Promise<void> {
@@ -445,7 +436,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
     }
   }
   // A 2.x server keeps read points by address (#284); a 1.x server by identity.
-  const byAddress = hasTable(dbPath, "mailbox_cursors");
+  const byAddress = "mailbox_cursors" in schema(dbPath);
   const m = mailbox(
     dbPath,
     byAddress

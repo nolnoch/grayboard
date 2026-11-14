@@ -467,10 +467,12 @@ export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts
 export type BoardUse = "read" | "subscribe" | "post";
 
 // Each of `handles`' view of the boards it can see (of `board` alone, when given).
+// A board summary's columns before mode and unread, shared by both list paths.
+const BOARD_COLUMNS = `b.*, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts`;
+
 function boardViews(db: Database, handles: string[], board: string | null): { handle: string; row: BoardSummary }[] {
   const q = db.prepare(
-    `SELECT b.*, s.mode AS mode,
-            (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
+    `SELECT ${BOARD_COLUMNS}, s.mode AS mode,
             CASE WHEN s.handle IS NULL THEN 0 ELSE
               (SELECT COUNT(*) FROM posts p
                 WHERE p.board = b.name AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}) END AS unread
@@ -504,7 +506,7 @@ export function boardAddress(db: Database, board: string, handles: string[], use
 export function listBoards(db: Database, handles: string[] | BoardPredicate): BoardSummary[] {
   if (typeof handles === "function") {
     const rows = db.prepare(
-      `SELECT b.*, NULL AS mode, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts, 0 AS unread
+      `SELECT ${BOARD_COLUMNS}, NULL AS mode, 0 AS unread
          FROM boards b ORDER BY b.name`,
     ).all() as BoardSummary[];
     return rows.filter(handles);
