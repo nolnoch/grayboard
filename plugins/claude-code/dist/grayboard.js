@@ -32561,6 +32561,7 @@ ${config.clientId}`)}.json`);
     const signal = AbortSignal.any([AbortSignal.timeout(SIGN_IN_FLOW_MS), ...outer ? [outer] : []]);
     const verifier = randomBytes2(32).toString("base64url"), state = randomBytes2(16).toString("base64url");
     const callback = await this.callback(state, signal);
+    const answered = new AbortController;
     let params;
     try {
       const url = new URL(meta.authorization_endpoint);
@@ -32575,10 +32576,11 @@ ${config.clientId}`)}.json`);
         code_challenge_method: "S256"
       }).toString();
       await this.share(url.href);
-      const presented = Promise.resolve().then(() => this.config.present(url.href));
+      const presented = Promise.resolve().then(() => this.config.present(url.href, answered.signal));
       presented.catch(() => {});
       params = await Promise.race([presented.then(() => callback.result), callback.result]);
     } finally {
+      answered.abort();
       await this.unlink();
       callback.close();
     }
@@ -38118,7 +38120,7 @@ function createPlugin(o) {
     stateDir: config.dataDir,
     harness: HARNESS,
     loginAction,
-    present: async (url) => {
+    present: async (url, answered) => {
       const flow = signins.flow;
       await testPauseAsync("claude-sign-in-present", o.env);
       try {
@@ -38162,6 +38164,10 @@ function createPlugin(o) {
         await testPauseAsync("claude-sign-in-resend", o.env);
         if (signins.flow !== flow || flow.abort.signal.aborted) {
           say("sign-in ended before the prompt was sent again");
+          return;
+        }
+        if (answered?.aborted) {
+          say("the browser answered before the prompt was sent again");
           return;
         }
         if (prompts.get(flow) !== prompt)

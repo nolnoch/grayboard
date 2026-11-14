@@ -510,6 +510,42 @@ test("a flow that ends during the re-send wait sends no prompt (#506)", async ()
   await signedIn(s);
 }, 40_000);
 
+test("a re-send wait that ends after the browser answered, with the code exchange still running, sends no prompt (#506)", async () => {
+  // Held after the RESEND_MS wait; the server holds the code exchange.
+  const release = join(dir, "resend.release");
+  const s = await plugin("sess-resend-answered", {
+    answer: async () => "cancel",
+    env: { BUS_TEST_PAUSE: "claude-sign-in-resend", BUS_TEST_PAUSE_FILE: release },
+  });
+  await until(() => s.stderr().includes("test pause hit: claude-sign-in-resend"), 10_000, "the re-send wait");
+  const oauth = srv.app.oauth, fetch = oauth.fetch.bind(oauth);
+  const exchange = Promise.withResolvers<void>();
+  let held = false;
+  oauth.fetch = async (req, context) => {
+    if (req.method === "POST" && new URL(req.url).pathname === "/oauth/token" && new URLSearchParams(await req.clone().text()).get("grant_type") === "authorization_code") {
+      held = true;
+      await exchange.promise;
+    }
+    return fetch(req, context);
+  };
+  try {
+    const browsed = browse(srv.issuer, s.elicits[0]!.url, "Claude Code");
+    await until(() => held, 10_000, "the code exchange at the server");
+    writeFileSync(release, "");
+    await until(() => s.stderr().includes("the browser answered before the prompt was sent again"), 10_000, "the re-send skipped");
+    expect(s.elicits).toHaveLength(1);
+    expect(s.stderr()).not.toContain("sign-in ended before the prompt was sent again");
+    exchange.resolve();
+    expect(await browsed).toContain("Signed in to grayboard");
+  } finally {
+    exchange.resolve();
+    oauth.fetch = fetch;
+  }
+  await until(() => s.stderr().includes("signed in (startup)"), 10_000, "the flow's end");
+  expect(s.elicits).toHaveLength(1);
+  await signedIn(s);
+}, 40_000);
+
 test("a decline on a re-sent prompt ends the flow, and the next call starts another (#506)", async () => {
   let n = 0;
   const s = await plugin("sess-resend-decline", {
