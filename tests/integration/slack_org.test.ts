@@ -27,6 +27,7 @@ const serve = (apiUrl: string) =>
 
 beforeEach(async () => {
   slack = new FakeSlack({ channel: DM, owner: ALICE_SLACK, channelType: "im" });
+  slack.emails.set(ALICE_SLACK, "alice@example.com");
   srv = serve(slack.api);
   await srv.app.slackReady;
 });
@@ -359,16 +360,20 @@ test("thread replies while unlinked don't flood in at relink", async () => {
   expect(posted("while away")).toBe(false);
 }, 30_000);
 
-test("relinking from another Slack account starts new threads there", async () => {
+test("relinking from another Slack account with the same email starts new threads there, and tells the old one", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   const be = await hosted("alice@example.com", "be");
   const q = await be.call<SendResult>("dm_send", { to: "human", body: "first" });
   await until(() => posted("first"));
 
+  slack.emails.set("U0OTHER", "Alice@Example.com");
   const r = await api(alice, "POST", "/api/slack/link");
   slack.say(`link ${r.body.code}`, { user: "U0OTHER", channel: "D0OTHER" });
   await until(() => slack.posts().find((p) => p.channel === "D0OTHER" && p.markdown_text?.startsWith("Linked to")));
+  // #805 F-05: a link never moves silently.
+  expect(slack.posts().find((p) => p.channel === DM && p.markdown_text?.includes("now linked to another Slack account"))).toBeDefined();
+  expect(accessAudits(srv.app.db, "slack.relinked").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0OTHER", { from: ALICE_SLACK }]]);
   await be.call("dm_send", { to: "human", body: "second", parent_id: q.message_id });
   const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** second"));
   expect(post.channel).toBe("D0OTHER");
@@ -563,4 +568,48 @@ test("an attach that fails after a newer one for the same user went live leaves 
   const q = await be.call<SendResult>("dm_send", { to: "human", body: "still there?" });
   expect(q.delivered_now).toBe(true);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("still there?")));
+}, 30_000);
+
+// #805 F-05: a link code proves the CLI's token, not who sends it. Only the
+// Slack account whose email is the user's may redeem it; a stolen code sent
+// from another account is refused, used up, and leaves the link as it was.
+test("a link code redeemed from a Slack account with another email is refused and used up", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  slack.emails.set("U0MALLORY", "mallory@example.com");
+  const r = await api(alice, "POST", "/api/slack/link");
+  const seen = slack.posts().length;
+  slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
+  await until(() => slack.posts().slice(seen).find((p) => p.channel === "D0MALLORY" && p.markdown_text?.includes("email isn't `alice@example.com`")));
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0MALLORY", { reason: "email_mismatch" }]]);
+
+  // Used up: the right account can't redeem it after the refusal.
+  slack.emails.set("U0MALLORY", "alice@example.com");
+  const again = slack.posts().length;
+  slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
+  await until(() => slack.posts().slice(again).find((p) => p.markdown_text?.includes("isn't valid or has expired")));
+}, 30_000);
+
+test("without the email scope, a link is refused with what the admin must add", async () => {
+  const alice = await login("alice@example.com");
+  slack.emailScope = false;
+  const r = await api(alice, "POST", "/api/slack/link");
+  slack.say(`link ${r.body.code}`);
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("users:read.email")));
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
+}, 30_000);
+
+// An unreachable Slack isn't a missing scope: the user is told to retry, not
+// to ask the admin, and the refusal is audited.
+test("when Slack can't be reached to check the email, the link is refused with a retry", async () => {
+  const alice = await login("alice@example.com");
+  slack.usersInfoDown = true;
+  const r = await api(alice, "POST", "/api/slack/link");
+  slack.say(`link ${r.body.code}`);
+  const reply = await until(() => slack.posts().find((p) => p.markdown_text?.includes("couldn't reach Slack")));
+  expect(reply.markdown_text).not.toContain("users:read.email");
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);

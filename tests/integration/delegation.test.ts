@@ -358,6 +358,7 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     // Link, so the human is really reachable: the bridge is running and the
     // user is linked (review 10's reachability, not a last_seen row).
     const r = await srv.api(token, "POST", "/api/slack/link");
+    slack.emails.set("U0ALICE", "alice@example.com");
     slack.say(`link ${r.body.code}`);
     await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 
