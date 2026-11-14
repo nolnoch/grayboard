@@ -634,7 +634,10 @@ program
   .action((opts: OpenCodeSetupOptions) => {
     try {
       const result = setupOpenCode(opts, OC_PLUGIN.source);
-      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
+      const config = result.changed ? (result.dryRun ? "config changes required" : "config changes applied") : "config unchanged";
+      const adapters = result.adapters ? `; ${result.adapters} carried adapter${result.adapters === 1 ? "" : "s"} ${result.dryRun ? "to disable" : "disabled"}` : "";
+      const migration = result.migrated ? (result.dryRun ? "; recognized migration required" : "; recognized migration") : "";
+      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.${result.mcpName ?? "grayboard"} and plugin source (${config})${adapters}${migration}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
       for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
       console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");

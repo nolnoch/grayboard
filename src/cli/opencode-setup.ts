@@ -3,7 +3,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { applyEdits, modify, parseTree, getNodeValue, findNodeAtLocation, createScanner, SyntaxKind, type Node, type ParseError } from "jsonc-parser";
-import { isValidIdentityName } from "../shared/addressing.ts";
+import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
 
 type ObjectValue = Record<string, any>;
@@ -22,6 +22,11 @@ function backupPath(path: string): string {
   let candidate = path + backupSuffix;
   for (let n = 1; info(candidate); n++) candidate = path + backupSuffix + "." + n;
   return candidate;
+}
+
+/** A bad argument: nothing on disk needs resolving, so no recovery advice. */
+function refuse(message: string): never {
+  throw new Error(message);
 }
 
 function fail(message: string): never {
@@ -92,12 +97,22 @@ function removeOwnedProperty(text: string, path: (string | number)[]): string {
 
 export function hostedEndpoint(raw: string): string {
   const u = canonicalEndpoint(raw);
-  if (!u || !u.pathname.endsWith("/mcp") || u.pathname.includes("//") || u.href !== raw) fail("MCP endpoint must be canonical HTTPS (or HTTP loopback) ending in /mcp, without credentials, query, or fragment");
+  if (!u || !u.pathname.endsWith("/mcp") || u.pathname.includes("//") || u.href !== raw) refuse("MCP endpoint must be canonical HTTPS (or HTTP loopback) ending in /mcp, without credentials, query, or fragment");
   return u.href;
 }
 
-function identity(value: unknown): value is string {
-  return typeof value === "string" && isValidIdentityName(value) && value === value.toLowerCase() && value !== "human";
+/** The one naming rule every other path applies (lowercased, then checked); human stays reserved. */
+function identityName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = normalizeIdentityName(value);
+  return normalized.ok && normalized.name !== HUMAN_NAME ? normalized.name : undefined;
+}
+
+/** The native server name the hosted plugin watches: its `mcpName` option, as the plugin reads it. */
+function serverName(cfg: ObjectValue, base: string): string {
+  const entry = (cfg.plugins ?? []).find((e: unknown) => grayboardPackage(e, base));
+  const name = object(entry) && object(entry.options) ? entry.options.mcpName : undefined;
+  return typeof name === "string" ? name : "grayboard";
 }
 
 function substitution(value: string): boolean {
@@ -120,7 +135,7 @@ export function opencodeShimGuard(directory: string): { skip: boolean; warning?:
     for (const name of ["opencode.json", "opencode.jsonc"]) {
       const path = join(directory, name);
       const cfg = document(path, true).value;
-      for (const entry of [cfg.mcp?.grayboard, cfg.mcp?.servers?.grayboard]) {
+      for (const entry of [cfg.mcp?.grayboard, cfg.mcp?.servers?.grayboard, cfg.mcp?.servers?.[serverName(cfg, directory)]]) {
         if (entry === undefined || localEntry(entry, true)) continue;
         if (!isHostedGrayboard(entry)) return { skip: true, warning: "Remote or unrecognized grayboard MCP configuration found; leaving OpenCode unchanged" };
         hosted = true;
@@ -167,7 +182,7 @@ function localEntry(entry: unknown, registration = false): boolean {
   return env === undefined || (object(env) && Object.keys(env).every(k =>
     // Ordinary adapter refresh retains its established environment handling; migration stays strict.
     (registration && typeof env[k] === "string") ||
-    (k === "BUS_PUSH" && env[k] === "off") || (k === "BUS_IDENTITY" && identity(env[k]))));
+    (k === "BUS_PUSH" && env[k] === "off") || (k === "BUS_IDENTITY" && identityName(env[k]) !== undefined)));
 }
 
 function packageReference(entry: unknown): string | undefined {
@@ -197,17 +212,17 @@ export type OpenCodeSetupOptions = {
 type Move = { path: string; backup: string; source: string };
 
 /** Adapter source is supplied by the CLI's existing build macro, not loaded from a checkout. */
-export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean; launcher?: "declared" | "removed" | "unchanged"; backups?: string[] } {
+export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource: string, beforeReplace?: () => void): { changed: boolean; migrated: boolean; dryRun: boolean; launcher?: "declared" | "removed" | "unchanged"; backups?: string[]; mcpName?: string; adapters?: number } {
   const url = hostedEndpoint(opts.url);
-  if (!url.startsWith("https://")) fail("Hosted OpenCode setup requires HTTPS; use the existing local adapter for HTTP/local development");
-  if (opts.name !== undefined && !identity(opts.name)) fail("Name must be a lowercase simple agent name, not human or a full handle");
-  if (opts.create && !opts.name) fail("--create requires an explicit --name");
-  if (opts.plugin && opts.revision) fail("Choose --revision or installed-directory --plugin, not both");
-  if (!opts.plugin && !/^[0-9a-f]{40}$/.test(opts.revision ?? "")) fail("Git plugin setup requires --revision with a full lowercase 40-character commit hash; alternatively supply an installed --plugin directory");
+  if (!url.startsWith("https://")) refuse("Hosted OpenCode setup requires HTTPS; use the existing local adapter for HTTP/local development");
+  const name = opts.name === undefined ? undefined : identityName(opts.name) ?? refuse("Name must be a simple agent name (a-z 0-9 _ -, 1-32 chars after lowercasing), not human or a full handle");
+  if (opts.create && !name) refuse("--create requires an explicit --name");
+  if (opts.plugin && opts.revision) refuse("Choose --revision or installed-directory --plugin, not both");
+  if (!opts.plugin && !/^[0-9a-f]{40}$/.test(opts.revision ?? "")) refuse("Git plugin setup requires --revision with a full lowercase 40-character commit hash; alternatively supply an installed --plugin directory");
   const plugin = opts.plugin ? pluginDirectory(opts.plugin) : `github:nolnoch/grayboard#${opts.revision}::path:adapters/opencode-v2`;
   const path = resolve(opts.config);
-  if (![".json", ".jsonc"].includes(extname(path))) fail("Select an explicit JSON or JSONC config file");
-  if (!io(dirname(path), "Cannot inspect config parent", () => statSync(dirname(path))).isDirectory()) fail(`Config parent ${JSON.stringify(dirname(path))} must be a directory (ENOTDIR)`);
+  if (![".json", ".jsonc"].includes(extname(path))) refuse("Select an explicit JSON or JSONC config file");
+  if (!io(dirname(path), "Cannot inspect config parent", () => statSync(dirname(path))).isDirectory()) refuse(`Config parent ${JSON.stringify(dirname(path))} must be a directory (ENOTDIR)`);
   const current = document(path);
   const other = document(sibling(path)).value;
   if (other.mcp?.grayboard !== undefined || other.mcp?.servers?.grayboard !== undefined ||
@@ -215,7 +230,9 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   const desired = { type: "remote", url };
   const cfg = current.value;
   const old = cfg.mcp?.grayboard;
-  const native = cfg.mcp?.servers?.grayboard;
+  const mcpName = serverName(cfg, dirname(path));
+  const native = cfg.mcp?.servers?.[mcpName];
+  if (mcpName !== "grayboard" && cfg.mcp?.servers?.grayboard !== undefined) fail(`Conflicting native Grayboard MCP entries "grayboard" and ${JSON.stringify(mcpName)} require manual migration`);
   if (old !== undefined && !localEntry(old)) fail("Unrecognized V1 Grayboard MCP command");
   if (native !== undefined && !isDeepStrictEqual(native, desired) && !localEntry(native) && !isHostedGrayboard(native)) fail("Unrecognized native Grayboard MCP entry");
   const ownedPlugins = (cfg.plugins ?? []).map((entry: unknown, i: number) => grayboardPackage(entry, dirname(path)) ? i : -1).filter((i: number) => i >= 0) as number[];
@@ -224,7 +241,7 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   const priorPlugin = pluginIndex === undefined ? undefined : cfg.plugins[pluginIndex];
   if (object(priorPlugin) && Object.keys(priorPlugin).some(k => !["package", "options"].includes(k))) fail("Unknown Grayboard plugin fields");
   const pluginEntry: ObjectValue = object(priorPlugin) ? { ...priorPlugin, package: plugin } : { package: plugin };
-  if (opts.name !== undefined) pluginEntry.options = { ...pluginEntry.options, name: opts.name, create: !!opts.create };
+  if (name !== undefined) pluginEntry.options = { ...pluginEntry.options, name, create: !!opts.create };
   // Absence and false mean the same to the plugin; removal keeps one representation.
   const priorLauncher = object(pluginEntry.options) && Object.hasOwn(pluginEntry.options, "launcher");
   const action: "declared" | "removed" | "unchanged" = opts.launcher
@@ -259,7 +276,7 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     text = applyEdits(text, modify(text, keys, value, {}));
   };
   if (old !== undefined) text = removeOwnedProperty(text, ["mcp", "grayboard"]);
-  if (!isDeepStrictEqual(native, desired)) set(["mcp", "servers", "grayboard"], desired);
+  if (!isDeepStrictEqual(native, desired)) set(["mcp", "servers", mcpName], desired);
   if (pluginIndex === undefined) {
     if (cfg.plugins === undefined) set(["plugins"], [pluginEntry]);
     else set(["plugins", -1], pluginEntry);
@@ -267,8 +284,8 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     // Preserve unrelated option bytes and enrollment.
     if (object(priorPlugin)) {
       if (priorPlugin.package !== plugin) set(["plugins", pluginIndex, "package"], plugin);
-      if (opts.name !== undefined) {
-        set(["plugins", pluginIndex, "options", "name"], opts.name);
+      if (name !== undefined) {
+        set(["plugins", pluginIndex, "options", "name"], name);
         set(["plugins", pluginIndex, "options", "create"], !!opts.create);
       }
       if (opts.launcher === true && priorPlugin.options?.launcher !== true) set(["plugins", pluginIndex, "options", "launcher"], true);
@@ -277,7 +294,9 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   }
   const changed = text !== current.text;
   let configBackup = backupPath(path);
-  if (opts.dryRun || (!changed && !moves.length)) return { changed, migrated: migration, dryRun: !!opts.dryRun, ...launcher };
+  // Reported only when they say something: a non-default server name, adapters to move.
+  const extra = { ...(mcpName !== "grayboard" ? { mcpName } : {}), ...(moves.length ? { adapters: moves.length } : {}) };
+  if (opts.dryRun || (!changed && !moves.length)) return { changed, migrated: migration, dryRun: !!opts.dryRun, ...launcher, ...extra };
   // Preflight is complete. Keep the selected file atomic and roll back adapter moves on failure.
   const temp = path + `.grayboard-${process.pid}-${crypto.randomUUID()}.tmp`;
   const moved: Move[] = [];
@@ -331,5 +350,5 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     throw e;
   }
   const backups = [...(backedUp ? [configBackup] : []), ...moves.map(move => move.backup)];
-  return { changed, migrated: migration, dryRun: false, ...launcher, ...(backups.length ? { backups } : {}) };
+  return { changed, migrated: migration, dryRun: false, ...launcher, ...extra, ...(backups.length ? { backups } : {}) };
 }
