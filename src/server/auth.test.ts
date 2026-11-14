@@ -39,6 +39,17 @@ describe("token helpers", () => {
   });
 });
 
+test("a touch scheduled after cancelAll never runs: stop() closed the queue (#385)", async () => {
+  const touches = createTouchQueue();
+  const ran: string[] = [];
+  touches.schedule(() => ran.push("before"));
+  touches.cancelAll();
+  touches.schedule(() => ran.push("after"));
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  expect(ran).toEqual([]);
+});
+
 describe("verifySessionToken", () => {
   let repo: Repo;
   const touches = createTouchQueue();

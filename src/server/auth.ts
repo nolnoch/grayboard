@@ -27,6 +27,9 @@ export function mintToken(): string {
 // crash (the CI failure this fixes), so stop() cancels what is pending. The
 // queue is per-server: one startServer's stop() must not cancel a different
 // live server's touches in the same process (two TestServers in one test run).
+// cancelAll also closes the queue: a request still in flight when stop() runs
+// (one awaiting the OAuth handler, say) can verify a token after the cancel,
+// and its touch must not run against the closed database either (#385).
 export type TouchQueue = {
   schedule(run: () => void): void;
   cancelAll(): void;
@@ -34,8 +37,10 @@ export type TouchQueue = {
 
 export function createTouchQueue(): TouchQueue {
   const pending = new Set<NodeJS.Immediate>();
+  let closed = false;
   return {
     schedule(run: () => void): void {
+      if (closed) return;
       const t = setImmediate(() => {
         pending.delete(t);
         run();
@@ -43,6 +48,7 @@ export function createTouchQueue(): TouchQueue {
       pending.add(t);
     },
     cancelAll(): void {
+      closed = true;
       for (const t of pending) clearImmediate(t);
       pending.clear();
     },

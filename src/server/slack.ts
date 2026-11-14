@@ -350,7 +350,10 @@ export class SlackBridge implements SlackLinker {
       application.replay(session);
     } catch (e) {
       this.log(`${link.email}: couldn't bring the human online: ${(e as Error).message}`);
-      this.detach(link.user_id);
+      // Undo this attempt only (#385): a replay that threw after the set is
+      // this attempt's entry; anything else in `linked` is another live one.
+      if (this.linked.get(link.user_id)?.relay === relay) this.detach(link.user_id);
+      else relay.stop();
     }
   }
 

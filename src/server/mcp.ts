@@ -768,7 +768,11 @@ function registerNativeTools(server: McpServer, application: Application, hosted
       inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, properties, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
     }, (args, ctx) => run(ctx, tool.name, session => application.call(session, tool.name, args)));
   }
+  // Always loaded, as local's are (src/local/tools.ts): a host that defers tools behind a search otherwise hides
+  // the reply tool from agents (#385).
+  const ALWAYS_LOAD = { "anthropic/alwaysLoad": true };
   server.registerTool("dm_send", {
+    _meta: ALWAYS_LOAD,
     description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
     inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), resend: z.boolean().describe(RESEND_PARAM.description).optional(), as: z.string().describe(AS_PARAM.description).optional() }),
   }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
@@ -780,7 +784,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),
   }, (a, ctx) => run(ctx, "dm_history", session => application.history(session, a)));
-  server.registerTool("dm_thread", { description: "A whole direct-message thread you participate in.", inputSchema: z.strictObject({ thread: id }) },
+  server.registerTool("dm_thread", { _meta: ALWAYS_LOAD, description: "A whole direct-message thread you participate in.", inputSchema: z.strictObject({ thread: id }) },
     (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread)));
   server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() }) },
     (a, ctx) => run(ctx, "dm_inbox", session => application.inbox(session, a.days)));
