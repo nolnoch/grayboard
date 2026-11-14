@@ -722,19 +722,14 @@ test("refresh-adapters on a signed-in machine keeps the V1 entry and names the s
   const signedIn = invoke(f, ["refresh-adapters"]);
   expect(signedIn.exitCode, signedIn.stderr.toString()).toBe(0);
   const out = signedIn.stdout.toString();
-  expect(out).toContain("runs this machine's local bus, not the team server you're signed in to (https://bus.example.com/)");
+  expect(out).toContain("runs this machine's local bus, not the team server you're signed in to (https://bus.example.com)");
   expect(out).toContain("grayboard setup-opencode --url https://bus.example.com/mcp --config <opencode config file> --revision <full git sha>");
   expect(out).not.toContain('"t"');
+  // A sign-in URL's credentials are never printed; its path is kept, since the hosted entry is under it.
+  writeFileSync(join(f.root, "credentials"), JSON.stringify({ session_token: "t", server: "https://user:hunter2@bus.example.com/team/x", user_email: "you@example.com" }));
+  const withCreds = invoke(f, ["refresh-adapters"]);
+  expect(withCreds.exitCode, withCreds.stderr.toString()).toBe(0);
+  expect(withCreds.stdout.toString()).not.toContain("hunter2");
+  expect(withCreds.stdout.toString()).toContain("grayboard setup-opencode --url https://bus.example.com/team/x/mcp ");
   expect(JSON.parse(readFileSync(config, "utf8")).mcp.grayboard).toEqual(entry);
-});
-
-test("grayboard mcp on a signed-in machine says on stderr that it serves the local bus (#474)", async () => {
-  const f = fixture();
-  const run = (credentials: string) => {
-    writeFileSync(join(f.root, "credentials"), credentials);
-    const env = { ...process.env, HOME: f.root, XDG_CONFIG_HOME: join(f.root, "config"), GRAYBOARD_CREDENTIALS: join(f.root, "credentials"), BUS_DB_PATH: join(f.root, "bus.db"), BUS_SOCK_DIR: join(f.root, "sock"), BUS_IDENTITY: "t474", GRAYBOARD_TOKEN: undefined, GRAYBOARD_SERVER: undefined, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" };
-    return Bun.spawnSync([process.execPath, cli, "mcp"], { cwd: f.root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 15_000 }).stderr.toString();
-  };
-  expect(run("")).not.toContain("serving this machine's local bus");
-  expect(run(JSON.stringify({ session_token: "t", server: "https://bus.example.com", user_email: "you@example.com" }))).toContain("[grayboard] serving this machine's local bus; the team server https://bus.example.com is reached through the harness's hosted MCP entry, not this one");
 });

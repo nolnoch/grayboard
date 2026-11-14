@@ -597,9 +597,6 @@ program
   .action(async (opts: { mode?: string }) => {
     refuseServerMode(opts.mode);
     (await import("../local/launch.ts")).launch.modePinned = opts.mode === "local";
-    // A signed-in machine's entry that ran the team server before #282 now serves the local bus: say so where the harness logs stderr (#474).
-    const server = busMode() === "server" ? process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server : undefined;
-    if (server) console.error(`[grayboard] serving this machine's local bus; the team server ${server} is reached through the harness's hosted MCP entry, not this one`);
     // stdout is the MCP transport from here on; log to stderr only.
     try {
       await import("../local/mcp.ts");
@@ -866,9 +863,20 @@ program
     if (refresh.exitCode !== 0) console.log("Some adapters weren't refreshed (above); after fixing that, run `grayboard setup`.");
   });
 
+// The server URL without credentials: printed text never repeats a sign-in URL's user:password.
+function withoutCredentials(server: string): string {
+  try {
+    const u = new URL(server);
+    u.username = u.password = "";
+    return u.href.replace(/\/+$/, "");
+  } catch {
+    return server.replace(/\/+$/, "");
+  }
+}
+
 // A team server is reached only through opencode's hosted MCP entry (#282).
 function opencodeHostedHint(server: string | undefined): string {
-  return `opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server ? `${server.replace(/\/+$/, "")}/mcp` : "<server url>/mcp"} --config <opencode config file> --revision <full git sha>`;
+  return `opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server ? `${withoutCredentials(server)}/mcp` : "<server url>/mcp"} --config <opencode config file> --revision <full git sha>`;
 }
 
 program
@@ -892,7 +900,7 @@ program
         // Signed out (a truncated credentials file) names no server and says nothing.
         const server = busMode() === "server" ? process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server : undefined;
         if (server) {
-          console.log(`opencode: the grayboard plugin in ${OC_PLUGIN.path} runs this machine's local bus, not the team server you're signed in to (${server}).`);
+          console.log(`opencode: the grayboard plugin in ${OC_PLUGIN.path} runs this machine's local bus, not the team server you're signed in to (${withoutCredentials(server)}).`);
           console.log(opencodeHostedHint(server));
         }
       }
