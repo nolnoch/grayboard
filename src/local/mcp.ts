@@ -81,6 +81,7 @@ import {
   showMessage,
   unanswered,
   undeliveredInstruction,
+  withNotices,
 } from "../shared/inbox.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -735,7 +736,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   // Notices and fresh instructions are the root's: they never go to a child.
   if (signal.aborted || agent !== undefined || (ORDINARY && (callSession !== SESSION_ID || callEpoch !== adapterEpoch))) return r;
   const extra = notices();
-  let out = extra.length ? { ...r, content: [...r.content, ...extra.map((text) => ({ type: "text", text }))] } : r;
+  let out = withNotices(r, extra);
   if (instructionsStale && !out.structuredContent) {
     instructionsStale = false;
     out = { ...out, structuredContent: { name: primary(), instructions: localInstructions(true) } };
