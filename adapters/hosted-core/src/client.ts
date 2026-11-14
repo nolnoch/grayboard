@@ -35,6 +35,7 @@ export type HostedClientOptions = {
   env?: Record<string, string | undefined>;
   launcher?: boolean;       // the harness can spawn subagents (BUS_LAUNCHER=1): every request declares it (#473)
   facts?: (sessionID: string) => SessionFacts | undefined; // the session's current model and effort, sent on every request (#364)
+  suggested?: (sessionID: string) => string | undefined;    // the name the harness suggests for the session, sent on every request (#522)
   log(message: string, level: Level): void;
 };
 
@@ -73,7 +74,7 @@ export class HostedClient {
   get login(): Login { return this.options.login; }
 
   wireOptions(mode: "push" | "poll"): WireOptions {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...(this.options.launcher ? { launcher: true as const } : {}), ...(this.options.facts ? { facts: this.facts } : {}) };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...(this.options.launcher ? { launcher: true as const } : {}), ...(this.options.facts ? { facts: this.facts } : {}), ...(this.options.suggested ? { suggested: this.options.suggested } : {}) };
   }
   // The host's facts provider; a failure is said once per session and sends none.
   private readonly factsFailed = new Set<string>();

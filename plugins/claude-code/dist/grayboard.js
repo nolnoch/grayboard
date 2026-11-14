@@ -31562,6 +31562,7 @@ var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 var LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
 var MODEL_META = "io.github.nolnoch.grayboard/model";
 var EFFORT_META = "io.github.nolnoch.grayboard/effort";
+var SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 
 class SubscriberError extends Error {
   code;
@@ -31728,15 +31729,24 @@ class Connection {
     return { ...this.wireOptions.delivery ? { [DELIVERY_META]: this.wireOptions.delivery } : {}, ...this.wireOptions.launcher ? { [LAUNCHER_META]: true } : {} };
   }
   facts(sessionID) {
-    let f;
+    let f, suggested;
     try {
       f = this.wireOptions.facts?.(sessionID);
     } catch {
-      return {};
+      f = undefined;
+    }
+    try {
+      suggested = this.wireOptions.suggested?.(sessionID);
+    } catch {
+      suggested = undefined;
     }
     const wire = (v) => v === null ? "" : typeof v === "string" && v ? v : undefined;
     const model = wire(f?.model), effort = wire(f?.effort);
-    return { ...model === undefined ? {} : { [MODEL_META]: model }, ...effort === undefined ? {} : { [EFFORT_META]: effort } };
+    return {
+      ...model === undefined ? {} : { [MODEL_META]: model },
+      ...effort === undefined ? {} : { [EFFORT_META]: effort },
+      ...typeof suggested === "string" && suggested ? { [SUGGESTED_META]: suggested } : {}
+    };
   }
   async reachable(pending) {
     try {
@@ -36187,7 +36197,7 @@ class HostedClient {
     return this.options.login;
   }
   wireOptions(mode) {
-    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.facts } : {} };
+    return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...this.options.launcher ? { launcher: true } : {}, ...this.options.facts ? { facts: this.facts } : {}, ...this.options.suggested ? { suggested: this.options.suggested } : {} };
   }
   factsFailed = new Set;
   facts = (sessionID) => {
@@ -36627,7 +36637,7 @@ class Controller {
     check();
   }
   wireOptions(e) {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {} };
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {}, ...this.port.suggested ? { suggested: (id) => this.port.suggested(id) } : {} };
   }
   async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
     let current;
@@ -37473,6 +37483,7 @@ class RootDelivery {
       delivery: wire.delivery,
       ...wire.launcher ? { launcher: true } : {},
       ...wire.facts ? { facts: wire.facts } : {},
+      ...wire.suggested ? { suggested: wire.suggested } : {},
       storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
       place: this.o.place,
       ancestry: async (sessionID) => {
@@ -38067,6 +38078,13 @@ function createPlugin(o) {
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
   const place = describeLocation(o.cwd) ?? HARNESS;
   const configured = configuredIdentity(o.env, o.cwd);
+  const suggestion = (() => {
+    try {
+      return sessionIdentity(o.env, o.cwd);
+    } catch {
+      return;
+    }
+  })();
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...project ? attachRoots({}, project) : []])];
   const say = (message) => o.log(`[grayboard] ${message}`);
@@ -38167,7 +38185,8 @@ function createPlugin(o) {
     env: o.env,
     launcher: o.env.BUS_LAUNCHER === "1",
     log: (message) => say(message),
-    facts: (sessionID) => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined
+    facts: (sessionID) => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined,
+    ...suggestion ? { suggested: (sessionID) => sessionID === config.id ? suggestion : undefined } : {}
   });
   const initializedOr = (signal) => {
     signal.throwIfAborted();

@@ -3,8 +3,8 @@
 // revision, the server's own status and body for a refusal at initialize, and
 // a scope refusal classified for a new sign-in.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, MODEL_META, NativeWire, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
-import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
+import { ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, MODEL_META, NativeWire, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
+import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -32,6 +32,7 @@ test("the wire's delivery key is the one the server reads", () => {
   expect(LAUNCHER_META).toBe(GRAYBOARD_LAUNCHER_META);
   expect(MODEL_META).toBe(GRAYBOARD_MODEL_META);
   expect(EFFORT_META).toBe(GRAYBOARD_EFFORT_META);
+  expect(SUGGESTED_META).toBe(GRAYBOARD_SUGGESTED_META);
 });
 
 // Pins that the 2026-07-28 stream isn't held back like the legacy GET (#431).
@@ -128,4 +129,24 @@ test("each request carries its session's current model and effort, and a provide
   facts.set("raw-a", { model: null });
   await native.callTool("whoami", {}, "raw-a");
   expect(await row("a")).toEqual({ model: null, effort: "high" });
+});
+
+// The suggested name rides every request of the session it names (#522): the subscriber wire's first request fixes the
+// ownership's, so a native request that never names a suggestion still sees it offered; a provider that throws sends none.
+test("a wire's suggested name reaches the server and is offered first while unbound (#522)", async () => {
+  const token = issue();
+  const native = new NativeWire({ ...options(), suggested: id => { if (id === "raw-x") throw new Error("gone"); return id === "raw-s" ? "repo-name" : undefined; } }, { token: async () => token }, new AbortController().signal);
+  wires.push(native);
+  await native.connect();
+  const candidates = async (raw: string) => (JSON.parse(((await native.callTool("whoami", {}, raw)).content as Array<{ text: string }>)[0]!.text) as { candidates?: Array<{ name: string; suggested?: true }> }).candidates ?? [];
+  expect((await candidates("raw-s"))[0]).toMatchObject({ name: "repo-name", suggested: true });
+  expect((await candidates("raw-x")).some(c => c.suggested)).toBe(false);
+  const wire = new Wire({ ...options(), suggested: () => "from-subscriber" }, { token: async () => token }, new AbortController().signal, "raw-w");
+  wires.push(wire);
+  await wire.connect();
+  await wire.call("whoami");
+  const plain = new NativeWire(options(), { token: async () => token }, new AbortController().signal);
+  wires.push(plain);
+  await plain.connect();
+  expect((JSON.parse(((await plain.callTool("whoami", {}, "raw-w")).content as Array<{ text: string }>)[0]!.text) as { candidates: Array<{ name: string }> }).candidates[0]).toMatchObject({ name: "from-subscriber", suggested: true });
 });

@@ -7,8 +7,11 @@ export const LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
 // The harness's current model and effort for a session (#364): the server keeps the latest each request reports.
 export const MODEL_META = "io.github.nolnoch.grayboard/model";
 export const EFFORT_META = "io.github.nolnoch.grayboard/effort";
+// The name the harness would suggest for a session (#443, #522): the server keeps the first an ownership's requests carry.
+export const SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 // `facts` is read per request, for the session that request names, so a change mid-session (a model switch) reaches the server on the next one.
-export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true; facts?: (sessionID: string) => SessionFacts | undefined };
+// `suggested` too, on every wire: whichever request reaches the server first fixes the ownership's suggestion (#522).
+export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true; facts?: (sessionID: string) => SessionFacts | undefined; suggested?: (sessionID: string) => string | undefined };
 
 export class SubscriberError extends Error {
   constructor(readonly code: string, readonly known?: string[], readonly holder?: string) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}${holder ? `; held by ${holder}` : ""}`); }
@@ -147,13 +150,16 @@ abstract class Connection {
   }
   // The session's facts as `_meta`: a non-empty string as itself, `null` as an empty string (the server clears it, #558),
   // anything else as nothing; a provider that throws sends none (absence never clears on the server). HostedClient's
-  // provider says its own failures; this guard keeps any other host's from failing the request.
+  // provider says its own failures; this guard keeps any other host's from failing the request. Its suggested name
+  // rides with them, a non-empty string or nothing.
   protected facts(sessionID: string): Record<string, string> {
-    let f: SessionFacts | undefined;
-    try { f = this.wireOptions.facts?.(sessionID); } catch { return {}; }
+    let f: SessionFacts | undefined, suggested: unknown;
+    try { f = this.wireOptions.facts?.(sessionID); } catch { f = undefined; }
+    try { suggested = this.wireOptions.suggested?.(sessionID); } catch { suggested = undefined; }
     const wire = (v: unknown) => v === null ? "" : typeof v === "string" && v ? v : undefined;
     const model = wire(f?.model), effort = wire(f?.effort);
-    return { ...(model === undefined ? {} : { [MODEL_META]: model }), ...(effort === undefined ? {} : { [EFFORT_META]: effort }) };
+    return { ...(model === undefined ? {} : { [MODEL_META]: model }), ...(effort === undefined ? {} : { [EFFORT_META]: effort }),
+      ...(typeof suggested === "string" && suggested ? { [SUGGESTED_META]: suggested } : {}) };
   }
   // An abort of this wire's own signal is the controller stopping, never an outage.
   protected async reachable<T>(pending: Promise<T>): Promise<T> {
