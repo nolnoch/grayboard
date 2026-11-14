@@ -11,7 +11,7 @@
 // follows the hold: only the holder listens.
 import type { Database } from "bun:sqlite";
 
-import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, touchAlias, touchId, viewers, type AliasMetaSet } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, setIdFacts, touchAlias, touchId, viewers, type AliasMetaSet, type IdSessionFacts } from "../core/boards.ts";
 import { coreAuditSink, writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
 import { aliasHeldText, childCapacity, childSessionId, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, DEFAULT_IDLE_SECONDS, MAX_CANDIDATES, MAX_CHILDREN, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
@@ -330,8 +330,9 @@ const ATTACH_WAIT_MS = 5000;
  * outside the lock, then re-reads the row inside one. Refused, and audited as
  * id.collision, when the session has ended, another live child is attached,
  * or the row isn't this harness's. `held` is every name the session holds, oldest first.
+ * `facts`: this child's model and effort, which replace the stored ones.
  */
-export async function attachSession(db: Database, s: SessionRow, human: boolean, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
+export async function attachSession(db: Database, s: SessionRow, human: boolean, facts: IdSessionFacts = { model: null, effort: null }, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
   // Only a child of this harness is worth waiting for; any other refuses.
   const predecessor = () => {
     const b = db.prepare(`SELECT pid, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
@@ -371,6 +372,10 @@ export async function attachSession(db: Database, s: SessionRow, human: boolean,
     db.prepare(`UPDATE bindings SET attached_pid = ?, attached_start = ?, detached_at = NULL WHERE session_id = ?`)
       .run(s.attached_pid, s.attached_start, s.session_id);
     writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid });
+    // The new child reports its own model and effort (#365): what the last
+    // one reported is stale, as for a hosted session's new ownership.
+    const changed = setIdFacts(db, s.session_id, facts);
+    if (changed) writeCoreAudit(db, "id.facts_changed", s.session_id, s.session_id, { before: changed.before, after: changed.after, why: "reattach" });
     return { ok: true, held };
   }).immediate();
 }
