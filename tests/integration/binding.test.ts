@@ -9,12 +9,13 @@ import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
-import { call, closeSessions, localSession, stopSession as stop, type Session } from "../support/mcp.ts";
+import { call, closeSessions, localSession, stopSession as stop, type Session, refusal } from "../support/mcp.ts";
 import { latestV1Release, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 import { sigkill } from "../support/procs.ts";
 import { until } from "../support/until.ts";
 import { crockford13 } from "../../src/core/session_id.ts";
 import { poke } from "../../src/local/wakeup.ts";
+import { busRows, spawnCli as spawnBusCli, pauseEnv as busPauseEnv, releasePause } from "../support/local_bus.ts";
 
 let dir: string;
 
@@ -31,14 +32,7 @@ const session = (identity?: string, o: { cwd?: string; extra?: Record<string, st
   localSession(dir, identity, { cwd: o.cwd, extra: o.extra });
 
 // The bus file, read beside the sessions (WAL: readers don't block them).
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try {
-    return db.prepare(sql).all(...args) as T[];
-  } finally {
-    db.close();
-  }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
 const events = (name: string) => rows<{ session_id: string; event: string; detail: string | null }>(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id`, name);
 const contents = (s: Session) => s.pushes.map((p) => p.content);
@@ -50,12 +44,6 @@ const holderOf = (name: string) => rows<{ id: string }>(`SELECT id FROM alias_ho
 const statusOf = (name: string) => rows<{ status: string | null }>(`SELECT i.status FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`, name)[0]!.status;
 
 // A tool call's error text; a call that succeeds fails the test.
-async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
-  const r = await s.c.callTool({ name, arguments: args });
-  const text = (r.content as { text: string }[])[0]!.text;
-  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
-}
 
 // Every cell in the bus that equals `value`, as "table.column".
 function cellsEqual(value: string): string[] {
@@ -74,17 +62,10 @@ function cellsEqual(value: string): string[] {
 }
 
 // A CLI process whose stderr is read as it runs, for a test pause.
-function spawnCli(args: string[], extra: Record<string, string>) {
-  const p = Bun.spawn([process.execPath, CLI, ...args], { cwd: dir, env: localEnv(dir, undefined, extra), stdout: "pipe", stderr: "pipe" });
-  let err = "";
-  (async () => {
-    for await (const chunk of p.stderr) err += new TextDecoder().decode(chunk);
-  })();
-  return { p, stderr: () => err };
-}
+const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
-const pauseEnv = (point: string) => ({ BUS_TEST_PAUSE: point, BUS_TEST_PAUSE_FILE: join(dir, `go-${point}`) });
-const release = (point: string) => writeFileSync(join(dir, `go-${point}`), "");
+const pauseEnv = (point: string) => busPauseEnv(dir, point);
+const release = (point: string) => releasePause(dir, point);
 
 test("1, 3, 14, 18: an unbound session acts as its ID, offers its default with its mail, and binds", async () => {
   const repo = join(dir, "api");
