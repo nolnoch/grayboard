@@ -574,7 +574,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
           }
         }
       };
-      if (hosted) repo.hosted.atomic(revoke); else repo.atomic(revoke);
+      if (hosted) repo.hosted.atomic(revoke);
+      else {
+        repo.atomic(revoke);
+        // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
+        // address set and registry entries follow the database, as a bind or unbind's do.
+        for (const s of hub.sessions) if (!s.human && s.sessionId === u.id) setHolds(hub, s, holdsOf(db, u.id));
+      }
     }
     endIds(ended, "revoked");
   }

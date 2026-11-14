@@ -4,8 +4,9 @@
 // revalidate() is the backstop for a membership changed behind the server.
 // A team alias is held by application sessions: a hosted session holds one
 // person-scope name (#451). There is no WSS transport to tell a holder (#282):
-// a revocation is the database's (hold released, binding event, audit), and
-// the application session isn't told, so these assert that state.
+// a revocation is the database's (hold released, binding event, audit) and
+// the live session's address set (#475 7c), but the session isn't told, so
+// these assert that state.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { WhoResult } from "../../src/core/boards.ts";
 import type { AppSession } from "../support/app_session.ts";
@@ -79,6 +80,20 @@ test("a removed member's sessions lose the team's aliases: a holder keeps its ID
   ]));
   // A member can take the freed alias.
   expect((await srv.appSession(alice, "eng/build").connect()).bind?.alias).toBe("eng/build");
+});
+
+// #475 7c: the revoked hold leaves the live session too, not only the database: mail to
+// the alias is no longer pushed to it, and it no longer acts as it.
+test("a revoked hold leaves the live session: the alias's mail isn't pushed to it, and it can't write as it", async () => {
+  const build = srv.appSession(bob, "eng/build");
+  await build.connect();
+  expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
+  const sender = srv.appSession(alice, "be");
+  await sender.connect();
+  await sender.send("eng/build", "after the removal");
+  await build.none(direct((m) => m.body === "after the removal"));
+  await build.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await expect(build.call("board_post", { board: "e2e", body: "as the team", as: "eng/build" })).rejects.toThrow();
 });
 
 // hosted twin: #451 (team aliases on a session, alias_lost)
