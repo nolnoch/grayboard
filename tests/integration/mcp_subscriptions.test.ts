@@ -1,11 +1,6 @@
-import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/rate_limit.ts";
-import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { startServer } from "../../src/server/app.ts";
+import { TestServer } from "../support/server.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
@@ -15,17 +10,17 @@ import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { randomBytes } from "node:crypto";
 import { sessionContext } from "../../src/server/hosted.ts";
 
-let app: ReturnType<typeof startServer>, dir: string, base: string, clock: number;
+let srv: TestServer, app: TestServer["app"], base: string, clock: number;
 const clients: Client[] = [];
 beforeEach(() => {
   clock = Date.now();
-  dir = mkdtempSync(join(tmpdir(), "gb-mcp-streams-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock } });
+  srv = new TestServer({ publicUrl: "https://grayboard.example.com" }, { hostname: "127.0.0.1", oauth: { now: () => clock } });
+  app = srv.app;
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()));
-  await app.stop();
+  await srv.stop();
   expect(app.mcp.activeContexts).toBe(0);
   expect(app.mcp.activeResourceContexts).toBe(0);
   expect(app.mcp.activeStreams).toBe(0);
@@ -36,7 +31,6 @@ afterEach(async () => {
   expect(app.mcp.activePosts).toBe(0);
   expect(app.mcp.activeWatches).toBe(0);
   expect(app.mcp.activeBusListeners).toBe(0);
-  app.db.close(); rmSync(dir, { recursive: true, force: true });
 });
 const issue = (email = "alice@example.com") => issueOAuth(app.repo, app.oauth.resource, email, ["grayboard:tools", "grayboard:delivery"], clock, OPENCODE_CLIENT);
 async function until(predicate: () => boolean) {
