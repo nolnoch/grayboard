@@ -12,7 +12,7 @@ import { parseDelegation, requestOf, type Request } from "../../adapters/factory
 import { Database } from "bun:sqlite";
 import { ASK_DEFAULTS, commandOf, Factory, type AskPolicy, type Fleet, type Limits, type Route } from "../../adapters/factory/factory.ts";
 import { MAX_NOTES_CHARS, parsePlan, splitNotes, synthesisPrompt, triageInstruction } from "../../adapters/factory/fanout.ts";
-import { askOf, DEFAULTS, hasDailyCap, loadConfig, policyOf } from "../../adapters/factory/main.ts";
+import { askOf, DEFAULTS, hasDailyCap, loadConfig, policyOf, reloadRefusal } from "../../adapters/factory/main.ts";
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
 import { askInstruction, NO_ANSWER, NO_MORE, parseAsk } from "../../adapters/factory/ask.ts";
 import { humanInstruction } from "../../src/core/tools.ts";
@@ -2786,4 +2786,12 @@ test("limits (#657): a per-run budget and a day cap together: the grant is the l
   expect(r2.runs.map((r) => r.id)).toEqual([81, 82]);
   await b.bus.close();
   await b.done;
+});
+
+test("limits (#657): a reload that adds a day cap is refused while the running retention is under a day", () => {
+  const running = { ...DEFAULTS, limits: {}, fleets: [{ name: "sim", agent: "x" }] } as Parameters<typeof reloadRefusal>[0];
+  const capped = { ...running, limits: { dailyBudgetUsd: 5 } };
+  expect(reloadRefusal({ ...running, retentionMs: 60_000 }, capped)).toBe('"dailyBudgetUsd" needs a running "retentionMs" of at least 86400000 (a day); restart to change it');
+  expect(reloadRefusal({ ...running, retentionMs: 86_400_000 }, capped)).toBeNull();
+  expect(reloadRefusal({ ...running, retentionMs: 60_000 }, running)).toBeNull();
 });
