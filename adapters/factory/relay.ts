@@ -28,18 +28,22 @@ export type RelayTool = (typeof RELAY_TOOLS)[number];
 // reach only the run's own tree, keyed by the token's scope.
 export const TREE_TOOLS = ["tree_claim_take", "tree_claim_release", "tree_claims"] as const;
 export type TreeTool = (typeof TREE_TOOLS)[number];
-// A run's place in its tree: the root's seq and its own.
-export type Scope = { tree: number; holder: number };
+// A run's place in its tree: the root's seq and its own. `mirror` (#675):
+// the bus key prefix its tree claims are also held under, when mirrored.
+export type Scope = { tree: number; holder: number; mirror?: string };
 import type { ClaimHolder } from "./store.ts";
+import { busKey, mirrorNote, type BusMirror } from "./mirror.ts";
 export type { ClaimHolder };
 // The store's side of tree claims (store.ts).
 export interface TreeClaims {
-  claimTake(tree: number, holder: number, key: string, note: string | null): { ok: true; renewed: boolean } | { ok: false; holder: ClaimHolder };
+  claimTake(tree: number, holder: number, key: string, note: string | null, busKey?: string | null): { ok: true; renewed: boolean } | { ok: false; holder: ClaimHolder; mirrored?: true };
   claimRelease(tree: number, holder: number, key: string): boolean;
   claims(tree: number): (ClaimHolder & { key: string })[];
 }
 export const MAX_CLAIM_KEY = 200;
 export const MAX_CLAIM_NOTE = 500;
+// The keys a mirrored scope (#675) takes: path-shaped only.
+export const MIRROR_KEY = /^[A-Za-z0-9._@+\-/]+$/;
 
 // The MCP server a run attaches (#669): harness-neutral, so a runner maps it
 // to its own flags. `tools`: the tool names the server offers, for a runner
@@ -108,6 +112,7 @@ export type RelayOptions = {
   shim: string[];                  // the command that runs relay_shim.ts (shimCommand)
   reader: () => Promise<Reader>;   // started on the first grant, again if it exits
   claims?: TreeClaims;             // tree claims; absent, a run gets only the reads
+  mirror?: BusMirror;              // the bus side of mirrored tree claims (#675); absent, a mirrored scope's take fails
   log(message: string): void;
 };
 
@@ -211,7 +216,7 @@ export class Relay implements ChildTools {
     if (typeof tool === "string" && (TREE_TOOLS as readonly string[]).includes(tool)) {
       if (!scope || !this.o.claims) return { ok: false, error: `not a relayed tool: ${tool}` };
       const raw = req.args !== null && typeof req.args === "object" && !Array.isArray(req.args) ? (req.args as Record<string, unknown>) : {};
-      try { return { ok: true, text: treeCall(this.o.claims, scope, tool as TreeTool, raw) }; } catch (e) {
+      try { return { ok: true, text: await treeCall(this.o.claims, scope, tool as TreeTool, raw, this.o.mirror, this.o.log) }; } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
     }
@@ -229,8 +234,12 @@ export class Relay implements ChildTools {
 }
 
 // One tree claim call. Keys and notes are the children's own words, so
-// what comes back is rendered as data like a bus read.
-export function treeCall(c: TreeClaims, scope: Scope, tool: TreeTool, a: Record<string, unknown>): string {
+// what comes back is rendered as data like a bus read. A mirrored scope
+// (#675) also takes and releases the key on the bus: the store first (a
+// sibling's or another tree's hold refuses without touching the bus, whose
+// key would be the factory's either way), then the bus, undoing the store
+// take when the bus refuses or can't answer.
+export async function treeCall(c: TreeClaims, scope: Scope, tool: TreeTool, a: Record<string, unknown>, mirror?: BusMirror, log: (m: string) => void = () => {}): Promise<string> {
   const who = (h: { seq: number; title: string | null }) => `subtask ${h.seq}${h.title ? `: ${h.title}` : ""}`;
   if (tool === "tree_claims") {
     return render(c.claims(scope.tree).map((x) => ({ key: x.key, holder: x.seq === scope.holder ? "you" : who(x), ...(x.note ? { note: x.note } : {}), taken_at: new Date(x.takenAt).toISOString() })), "tree_claim_take on the key you need, which names its holder");
@@ -238,13 +247,39 @@ export function treeCall(c: TreeClaims, scope: Scope, tool: TreeTool, a: Record<
   if (typeof a.key !== "string" || !a.key.trim()) throw new Error(`${tool} needs key: what you're claiming, e.g. a path`);
   if (a.key.length > MAX_CLAIM_KEY) throw new Error(`a key is at most ${MAX_CLAIM_KEY} characters`);
   const key = a.key;
+  const bk = scope.mirror !== undefined ? busKey(scope.mirror, key) : null;
+  if (bk !== null && !mirror) throw new Error("this run's claims are mirrored to the bus, but the factory has no bus side for them");
+  // A mirrored key reaches every lane's startup instructions as a bus claim
+  // key, so it must be path-shaped: no whitespace, control or markup a child
+  // could use to address other agents. And it must fit the bus's own limit.
+  if (bk !== null && tool === "tree_claim_take") {
+    if (!MIRROR_KEY.test(key)) throw new Error(`not claimed: this run's claims are mirrored to the bus, which takes only path-shaped keys (letters, digits and . _ @ + - /): ${JSON.stringify(key.slice(0, 80))}`);
+    if (bk.length > MAX_CLAIM_KEY) throw new Error(`not claimed: on the bus this key is ${bk} (${bk.length} characters), past the bus's limit of ${MAX_CLAIM_KEY}; claim a shorter path`);
+  }
   if (tool === "tree_claim_release") {
-    return c.claimRelease(scope.tree, scope.holder, key) ? `released ${key}` : `you don't hold ${key}; nothing changed`;
+    if (!c.claimRelease(scope.tree, scope.holder, key)) return `you don't hold ${key}; nothing changed`;
+    // A failed release lapses with its TTL, and the factory's sweep retries it.
+    if (bk !== null) await mirror!.release(bk).catch((e) => log(`couldn't release ${bk} on the bus: ${e instanceof Error ? e.message : String(e)}`));
+    return `released ${key}`;
   }
   if (a.note !== undefined && typeof a.note !== "string") throw new Error("note must be text");
   const note = typeof a.note === "string" && a.note ? a.note.slice(0, MAX_CLAIM_NOTE) : null;
-  const r = c.claimTake(scope.tree, scope.holder, key, note);
-  if (r.ok) return r.renewed ? `you already held ${key}; the note is updated` : `claimed ${key}: yours until you release it or your run ends`;
+  const r = c.claimTake(scope.tree, scope.holder, key, note, bk);
+  if (r.ok && bk !== null) {
+    let held: Awaited<ReturnType<BusMirror["take"]>>;
+    try { held = await mirror!.take(bk, mirrorNote(scope.holder)); } catch (e) {
+      if (!r.renewed) c.claimRelease(scope.tree, scope.holder, key);
+      throw new Error(`not claimed: the bus couldn't be checked for ${bk}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (held) {
+      c.claimRelease(scope.tree, scope.holder, key);
+      // The holder's note is another lane's words: inside the fence.
+      return `not claimed: ${bk} is held on the bus outside this request. Work on something else, or check again later with tree_claims.\n\n${render({ holder: held.holder, ...(held.note ? { note: held.note } : {}), expires_at: new Date(held.expiresAt).toISOString() })}`;
+    }
+  }
+  if (r.ok) return r.renewed ? `you already held ${key}; the note is updated` : `claimed ${key}${bk !== null ? `, also held on the bus as ${bk}` : ""}: yours until you release it or your run ends`;
+  if (r.mirrored && r.holder.seq === scope.holder) return `not claimed: you already hold ${bk} under another spelling; release that one first, or keep using it`;
+  if (r.mirrored) return `not claimed: another run of this factory holds ${bk}. Work on something else, or check again later.\n\n${render({ holder: who(r.holder), ...(r.holder.note ? { note: r.holder.note } : {}), taken_at: new Date(r.holder.takenAt).toISOString() })}`;
   // The holder's title and note are another child's words: inside the fence.
   return `not claimed: another run of this tree holds ${key}. Work on something else, or check again later with tree_claims.\n\n${render({ holder: who(r.holder), ...(r.holder.note ? { note: r.holder.note } : {}), taken_at: new Date(r.holder.takenAt).toISOString() })}`;
 }

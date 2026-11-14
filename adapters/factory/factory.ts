@@ -10,6 +10,7 @@ import { oneLine, requestOf, type Key, type Request } from "./delegate.ts";
 import { answerPrompt, askInstruction, NO_ANSWER, NO_MORE, parseAsk, reseeded, type Ask } from "./ask.ts";
 import { notesInstruction, parsePlan, splitNotes, synthesisPrompt, triageInstruction, type Plan, type Result, type Round } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner } from "./runner.ts";
+import { MIRROR_TTL_MIN, mirrorNote, mirrorPrefix, RENEW_MS, repoId } from "./mirror.ts";
 import type { ChildTools } from "./relay.ts";
 import type { Admit, Hold, Row, RunOutcome, Store } from "./store.ts";
 import type { Place, Workdir, Workspaces } from "./workdir.ts";
@@ -64,6 +65,7 @@ export type FactoryOptions = {
   ask?: AskPolicy; // default ASK_DEFAULTS
   limits?: Limits; // the global limits (#655); default none
   askTickMs?: number; // how often parked questions' clocks are checked (default 30 s)
+  mirrorRenewMs?: number; // how often live mirrored claims (#675) are renewed on the bus (default RENEW_MS)
   childTools?: ChildTools; // the relay (#669) a run whose policy has busTools gets; absent, such a run fails unspawned
   log(message: string): void;
 };
@@ -89,6 +91,15 @@ export class Factory {
   private readonly cancelledBy = new Map<number, Stop>(); // seq → what stopped it while it ran: a cancel (#651), a deadline or a spent tree budget (#655)
   private load = ""; // the peer_status text last set
   private warnedHuman: string | undefined; // a config `human` already logged as undeclared
+  // Mirrored tree claims (#675): a sweep is owed (one failed);
+  // the rows running with mirrored claims, swept after; the bus keys the
+  // last sweep left held, and when it renewed them.
+  private mirrorDirty = false;
+  private readonly mirroredRuns = new Set<number>();
+  private mirrorHeld = new Set<string>();
+  private renewedAt = 0;
+  private sweeping: Promise<void> | null = null;
+  private sweepAgain = false;
 
   private cfg: Reconfig & { ask: AskPolicy; limits: Limits };
 
@@ -117,6 +128,9 @@ export class Factory {
     await this.syncFleets();
     await this.deadlines(); // trees that expired while the factory was down
     await this.housekeeping();
+    // What a crash left held on the bus; a factory that mirrors nothing
+    // leaves any to their TTL rather than list claims on every start.
+    if (this.cfg.policy.mirrorClaims || this.fleets().some((f) => f.policy?.mirrorClaims || f.routes?.some((r) => r.policy.mirrorClaims))) this.sweepMirror();
     this.timer = setInterval(() => void this.housekeeping().catch((e) => this.o.log(`housekeeping: ${msg(e)}`)), this.o.housekeepingMs ?? 3_600_000);
     // Parked questions' clocks (#652) run from their stored times, so a
     // restart resumes them where they were.
@@ -131,6 +145,53 @@ export class Factory {
     await consume.catch(() => {});
     await this.settle();
     return why;
+  }
+
+  // Mirrored tree claims (#675): the bus should hold, under this factory's
+  // name, exactly the live tree claims' keys. Releases the rest (a run that
+  // ended, a crash between the store and the bus) and renews the live ones
+  // inside their TTL. One sweep at a time; one asked for during it runs again
+  // after, since its snapshot may predate the ask.
+  private sweepMirror(): void {
+    if (this.stopping) return;
+    if (this.sweeping) { this.sweepAgain = true; return; }
+    this.sweeping = (async () => {
+      do {
+        this.sweepAgain = false;
+        await this.mirrorOnce().catch((e) => this.o.log(`mirrored claims: ${msg(e)}`));
+      } while (this.sweepAgain && !this.stopping);
+    })().finally(() => { this.sweeping = null; });
+  }
+
+  private async mirrorOnce(): Promise<void> {
+    // The bus first: a take in flight writes the store before the bus, so a
+    // key listed here is live in the store read after it, unless it ended.
+    const listed = await this.bus.call("claim_list", { prefix: "path:" });
+    const live = this.store.liveBusKeys();
+    const mine = (Array.isArray(listed) ? listed : []).filter((c): c is { key: string } => c !== null && typeof c === "object" && c.holder === this.bus.handle && typeof c.key === "string");
+    let failed = false;
+    for (const { key } of mine) {
+      // Re-read each time: a take may have landed while an earlier call awaited.
+      if (live.has(key) || this.store.liveBusKeys().has(key)) continue;
+      try {
+        await this.bus.call("claim_release", { key });
+        this.o.log(`released ${key} on the bus: no subtask holds it now`);
+      } catch (e) { failed = true; this.o.log(`couldn't release ${key} on the bus: ${msg(e)}`); }
+    }
+    const now = Date.now();
+    if (live.size > 0 && now - this.renewedAt >= (this.o.mirrorRenewMs ?? RENEW_MS)) {
+      this.renewedAt = now;
+      for (const [key, holder] of live) {
+        // A run that ended (and released) since the snapshot isn't taken back.
+        if (!this.store.liveBusKeys().has(key)) continue;
+        try {
+          const r = (await this.bus.call("claim_take", { key, ttl_minutes: MIRROR_TTL_MIN, note: mirrorNote(holder) })) as { ok?: unknown; held_by?: unknown };
+          if (r?.ok !== true) this.o.log(`${key} lapsed on the bus and ${typeof r?.held_by === "string" ? r.held_by : "someone else"} holds it now; the subtask still holds it in its tree`);
+        } catch (e) { this.o.log(`couldn't renew ${key} on the bus: ${msg(e)}`); }
+      }
+    }
+    this.mirrorHeld = new Set(live.keys());
+    this.mirrorDirty = failed;
   }
 
   // Waits for running execs to record their outcome (stop() aborted their
@@ -266,7 +327,7 @@ export class Factory {
       this.running++;
       const p: Promise<void> = this.exec(row)
         .catch((e) => this.o.log(`request ${row.id}: ${msg(e)}`))
-        .finally(() => { this.running--; this.inflight.delete(p); this.pump(); });
+        .finally(() => { this.running--; this.inflight.delete(p); if (this.mirroredRuns.delete(row.seq)) this.sweepMirror(); this.pump(); });
       this.inflight.add(p);
     }
     this.showLoad();
@@ -436,7 +497,15 @@ export class Factory {
     let tools: Awaited<ReturnType<ChildTools["grant"]>> | undefined;
     if (policy.busTools) {
       if (!this.o.childTools) return `[factory] failed: this run's profile has busTools on, but this factory has no relay for them; nothing was spawned.`;
-      try { tools = await this.o.childTools.grant(row.parent !== null ? { tree: root.seq, holder: row.seq } : undefined); } catch (e) {
+      // Mirrored claims (#675) name the repository the subtask works in.
+      let mirror: string | undefined;
+      if (row.parent !== null && policy.mirrorClaims) {
+        try { mirror = mirrorPrefix(await repoId(place.cwd)); } catch (e) {
+          return `[factory] failed: this run's profile mirrors its claims to the bus, but its working directory ${place.cwd} isn't in a git repository (${msg(e)}); nothing was spawned.`;
+        }
+        this.mirroredRuns.add(row.seq); // its claims may end with its row: the sweep after it releases them
+      }
+      try { tools = await this.o.childTools.grant(row.parent !== null ? { tree: root.seq, holder: row.seq, ...(mirror !== undefined ? { mirror } : {}) } : undefined); } catch (e) {
         return `[factory] failed: couldn't open the bus tools for this run: ${msg(e)}; nothing was spawned.`;
       }
       // The grant can take seconds (the reader's start), and until the lines
@@ -698,6 +767,11 @@ export class Factory {
         }
       }
       await this.deadlines();
+      // Mirrored claims (#675): a row that ended off the run path (a parked
+      // run cancelled or stopped) left its key live on the bus; and live keys
+      // are renewed inside their TTL.
+      const live = this.store.liveBusKeys();
+      if (this.mirrorDirty || [...this.mirrorHeld].some((k) => !live.has(k)) || (live.size > 0 && now - this.renewedAt >= (this.o.mirrorRenewMs ?? RENEW_MS))) this.sweepMirror();
       this.pump();
     } finally {
       this.ticking = false;

@@ -123,6 +123,8 @@ export class Store {
       // A run's granted budget (#655): its reservation while open, its charge when it ends without a cost.
       const runCols = new Set((this.db.query(`PRAGMA table_info(runs)`).all() as { name: string }[]).map((c) => c.name));
       if (!runCols.has("granted_usd")) this.db.exec(`ALTER TABLE runs ADD COLUMN granted_usd REAL`);
+      const claimCols = new Set((this.db.query(`PRAGMA table_info(claims)`).all() as { name: string }[]).map((c) => c.name));
+      if (!claimCols.has("bus_key")) this.db.exec(`ALTER TABLE claims ADD COLUMN bus_key TEXT`); // #675
     }).immediate();
   }
 
@@ -437,13 +439,27 @@ export class Store {
   // (finish, cancel, kill, a stopped tree, interrupted at restart, prune)
   // releases its claims without a step of its own, and a dead holder's key
   // is free to take.
-  claimTake(tree: number, holder: number, key: string, note: string | null): { ok: true; renewed: boolean } | { ok: false; holder: ClaimHolder } {
+  claimTake(tree: number, holder: number, key: string, note: string | null, busKey: string | null = null): { ok: true; renewed: boolean } | { ok: false; holder: ClaimHolder; mirrored?: true } {
     return this.db.transaction(() => {
       const cur = this.db.query(`SELECT c.holder, r.title, c.note, c.taken_at FROM claims c JOIN requests r ON r.seq = c.holder WHERE c.tree = ? AND c.key = ? AND ${LIVE}`).get(tree, key) as { holder: number; title: string | null; note: string | null; taken_at: number } | null;
       if (cur && cur.holder !== holder) return { ok: false as const, holder: { seq: cur.holder, title: cur.title, note: cur.note, takenAt: cur.taken_at } };
-      this.db.query(`INSERT INTO claims (tree, key, holder, note, taken_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (tree, key) DO UPDATE SET holder = excluded.holder, note = excluded.note, taken_at = CASE WHEN claims.holder = excluded.holder THEN claims.taken_at ELSE excluded.taken_at END`).run(tree, key, holder, note, this.now());
+      // A mirrored key (#675) is the factory's on the bus whichever run took
+      // it, so the bus can't tell two of its runs apart: the store does,
+      // across trees and across tree keys that name one bus key (`a`, `./a`).
+      if (busKey !== null) {
+        const other = this.db.query(`SELECT c.holder, r.title, c.note, c.taken_at FROM claims c JOIN requests r ON r.seq = c.holder WHERE c.bus_key = ? AND NOT (c.tree = ? AND c.key = ?) AND ${LIVE}`).get(busKey, tree, key) as { holder: number; title: string | null; note: string | null; taken_at: number } | null;
+        if (other) return { ok: false as const, holder: { seq: other.holder, title: other.title, note: other.note, takenAt: other.taken_at }, mirrored: true as const };
+      }
+      this.db.query(`INSERT INTO claims (tree, key, holder, note, taken_at, bus_key) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (tree, key) DO UPDATE SET holder = excluded.holder, note = excluded.note, bus_key = excluded.bus_key, taken_at = CASE WHEN claims.holder = excluded.holder THEN claims.taken_at ELSE excluded.taken_at END`).run(tree, key, holder, note, this.now(), busKey);
       return { ok: true as const, renewed: cur !== null };
     }).immediate();
+  }
+
+  // The bus keys of live mirrored claims (#675), each with its holder's
+  // seq: what the factory should hold on the bus now.
+  liveBusKeys(): Map<string, number> {
+    const rows = this.db.query(`SELECT c.bus_key, c.holder FROM claims c JOIN requests r ON r.seq = c.holder WHERE c.bus_key IS NOT NULL AND ${LIVE}`).all() as { bus_key: string; holder: number }[];
+    return new Map(rows.map((r) => [r.bus_key, r.holder]));
   }
 
   // False when `holder` doesn't hold `key`.

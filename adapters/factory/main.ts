@@ -11,6 +11,7 @@ import { join, resolve } from "node:path";
 import { LocalBus, sessionFree, startReader } from "./bus.ts";
 import { ClaudeRunner } from "./claude/runner.ts";
 import { ASK_DEFAULTS, Factory, type AskPolicy, type Fleet, type Limits, type Route } from "./factory.ts";
+import { MIRROR_TTL_MIN } from "./mirror.ts";
 import { Relay, shimCommand } from "./relay.ts";
 import type { Policy } from "./runner.ts";
 import { Store } from "./store.ts";
@@ -28,6 +29,7 @@ export type Config = {
   allowedTools: string[];  // tools a child runs without a prompt; default none. A shell needs Bash in both lists
   budgetUsd?: number;      // the most one run may spend, in USD (#649); absent, no cap
   busTools?: boolean;      // children get the read-only bus tools (#669); default off
+  mirrorClaims?: boolean;  // subtasks' tree claims are also held on the bus (#675); needs busTools and a worktree or shared workdir; default off
   profiles: Profile[];     // named agent + tool lists a fleet runs under (#643)
   fleets: Fleet[];         // queue boards `<name>-tasks` the factory is a lane on, each with the agent (and policy) it runs; projects (#645) included, with their routes
   maxConcurrent: number;
@@ -43,7 +45,7 @@ export type Config = {
 
 // A profile (#643): the agent, what its children may do and where they run
 // (#641). Its tool lists, mode and repo fall back to the global ones field by field.
-export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; budgetUsd?: number; busTools?: boolean; workdir?: WorkdirMode; repo?: string };
+export type Profile = { name: string; agent: string; tools?: string[]; allowedTools?: string[]; budgetUsd?: number; busTools?: boolean; mirrorClaims?: boolean; workdir?: WorkdirMode; repo?: string };
 
 // The fields a SIGHUP reload can't change: they shape the bus session, the
 // runner or the worker pool, which live as long as the process.
@@ -118,7 +120,8 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
     return v;
   };
   const busTools = raw.busTools !== undefined ? bool(raw.busTools, `"busTools"`) : false;
-  const global: Policy = { ...(tools ? { tools } : {}), allowedTools, ...(budgetUsd !== undefined ? { budgetUsd } : {}), ...(busTools ? { busTools } : {}) };
+  const mirrorClaims = raw.mirrorClaims !== undefined ? bool(raw.mirrorClaims, `"mirrorClaims"`) : false;
+  const global: Policy = { ...(tools ? { tools } : {}), allowedTools, ...(budgetUsd !== undefined ? { budgetUsd } : {}), ...(busTools ? { busTools } : {}), ...(mirrorClaims ? { mirrorClaims } : {}) };
   const mode = (v: unknown, what: string): WorkdirMode => {
     if (typeof v !== "string" || !(WORKDIR_MODES as readonly string[]).includes(v)) throw new Error(`${path}: ${what} must be one of ${WORKDIR_MODES.join(", ")}`);
     return v as WorkdirMode;
@@ -138,9 +141,17 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   };
   const globalRepo = raw.repo !== undefined ? repo(raw.repo, `"repo"`) : undefined;
   const workdir = workdirOf(raw.workdir !== undefined ? mode(raw.workdir, `"workdir"`) : "scratch", globalRepo, "the global config");
+  // Mirrored claims (#675) ride on the tree claim tools, and name a
+  // repository: a scratch directory has none another lane could share.
+  const mirrorable = (m: boolean, bt: boolean, w: WorkdirMode, who: string) => {
+    if (!m) return;
+    if (!bt) throw new Error(`${path}: ${who}: "mirrorClaims" needs "busTools": the tree claims it mirrors are bus tools`);
+    if (w === "scratch") throw new Error(`${path}: ${who}: "mirrorClaims" needs "workdir" "worktree" or "shared": a scratch directory is no repository other lanes edit`);
+  };
+  mirrorable(mirrorClaims, busTools, workdir.mode, "the global config");
 
   const rawProfiles = raw.profiles ?? [];
-  if (!Array.isArray(rawProfiles)) throw new Error(`${path}: "profiles" must be an array of {name, agent, tools?, allowedTools?, budgetUsd?, busTools?, workdir?, repo?}`);
+  if (!Array.isArray(rawProfiles)) throw new Error(`${path}: "profiles" must be an array of {name, agent, tools?, allowedTools?, budgetUsd?, busTools?, mirrorClaims?, workdir?, repo?}`);
   const profiles = new Map<string, Profile>();
   for (const p of rawProfiles as Record<string, unknown>[]) {
     if (typeof p !== "object" || p === null || typeof p.name !== "string" || !NAME.test(p.name)) throw new Error(`${path}: each profile's "name" must be 1-26 characters of a-z 0-9 _ -`);
@@ -152,11 +163,13 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
       ...(p.allowedTools !== undefined ? { allowedTools: list(p.allowedTools, `profile ${p.name}: "allowedTools"`) } : {}),
       ...(p.budgetUsd !== undefined ? { budgetUsd: usd(p.budgetUsd, `profile ${p.name}: "budgetUsd"`) } : {}),
       ...(p.busTools !== undefined ? { busTools: bool(p.busTools, `profile ${p.name}: "busTools"`) } : {}),
+      ...(p.mirrorClaims !== undefined ? { mirrorClaims: bool(p.mirrorClaims, `profile ${p.name}: "mirrorClaims"`) } : {}),
       ...(p.workdir !== undefined ? { workdir: mode(p.workdir, `profile ${p.name}: "workdir"`) } : {}),
       ...(p.repo !== undefined ? { repo: repo(p.repo, `profile ${p.name}: "repo"`) } : {}),
     });
     const q = profiles.get(p.name)!;
     workdirOf(q.workdir ?? workdir.mode, q.repo ?? workdir.repo, `profile ${p.name}`); // a profile no fleet uses yet must still be runnable
+    mirrorable(q.mirrorClaims ?? mirrorClaims, q.busTools ?? busTools, q.workdir ?? workdir.mode, `profile ${p.name}`);
   }
 
   // A profile as a route (#645): its agent, tool lists and working directory,
@@ -164,7 +177,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   // replaces the profile's.
   const routeOf = (p: Profile, repoOver?: string): Route => ({
     profile: p.name, agent: p.agent,
-    policy: { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools, ...((p.budgetUsd ?? budgetUsd) !== undefined ? { budgetUsd: p.budgetUsd ?? budgetUsd } : {}), ...((p.busTools ?? busTools) ? { busTools: true } : {}) },
+    policy: { ...(p.tools ? { tools: p.tools } : tools ? { tools } : {}), allowedTools: p.allowedTools ?? allowedTools, ...((p.budgetUsd ?? budgetUsd) !== undefined ? { budgetUsd: p.budgetUsd ?? budgetUsd } : {}), ...((p.busTools ?? busTools) ? { busTools: true } : {}), ...((p.mirrorClaims ?? mirrorClaims) ? { mirrorClaims: true } : {}) },
     workdir: workdirOf(p.workdir ?? workdir.mode, repoOver ?? p.repo ?? workdir.repo, `profile ${p.name}`),
   });
   const fromRoutes = (name: string, routes: Route[], fanout: { fanout?: boolean }): Fleet => {
@@ -258,7 +271,7 @@ export function askOf(c: Config): AskPolicy {
 
 // The global policy: delegations, and fleets without a profile.
 export function policyOf(c: Config): Policy {
-  return { ...(c.tools ? { tools: c.tools } : {}), allowedTools: c.allowedTools, ...(c.budgetUsd !== undefined ? { budgetUsd: c.budgetUsd } : {}), ...(c.busTools ? { busTools: true } : {}) };
+  return { ...(c.tools ? { tools: c.tools } : {}), allowedTools: c.allowedTools, ...(c.budgetUsd !== undefined ? { budgetUsd: c.budgetUsd } : {}), ...(c.busTools ? { busTools: true } : {}), ...(c.mirrorClaims ? { mirrorClaims: true } : {}) };
 }
 
 export async function main(env: Record<string, string | undefined> = process.env): Promise<number> {
@@ -286,6 +299,16 @@ export async function main(env: Record<string, string | undefined> = process.env
     shim: shimCommand(join(dataDir, "relay"), join(import.meta.dir, "relay_shim.ts")),
     reader: () => startReader({ command: cfg.grayboard, parentSession: harnessSession, identity: bus.handle, version: VERSION, env: sessionFree(env) }),
     claims: store,
+    // Mirrored tree claims (#675): held on the bus under the factory's name.
+    mirror: {
+      async take(key, note) {
+        const r = (await bus.call("claim_take", { key, ttl_minutes: MIRROR_TTL_MIN, ...(note ? { note } : {}) })) as { ok?: unknown; held_by?: unknown; note?: unknown; expires_at?: unknown };
+        if (r?.ok === true) return null;
+        if (typeof r?.held_by !== "string") throw new Error(`claim_take answered without ok or held_by`);
+        return { holder: r.held_by, note: typeof r.note === "string" ? r.note : null, expiresAt: typeof r.expires_at === "number" ? r.expires_at : 0 };
+      },
+      async release(key) { await bus.call("claim_release", { key }); },
+    },
     log,
   });
   const factory = new Factory(bus, store, runner, { childTools, fleets: cfg.fleets, policy: policyOf(cfg), workdir: cfg.workdir, ask: askOf(cfg), workspaces, runs: join(dataDir, "runs"), maxConcurrent: cfg.maxConcurrent, maxSubtasks: cfg.maxSubtasks, timeoutMs: cfg.timeoutMs, retentionMs: cfg.retentionMs, limits: cfg.limits, log });
