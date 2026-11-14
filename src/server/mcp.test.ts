@@ -12,8 +12,7 @@ import { createHostedMcp } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
-import { issueOAuth } from "../../tests/helpers/oauth.ts";
-import { randomBytes } from "node:crypto";
+import { issueOAuth, rotateOAuth } from "../../tests/helpers/oauth.ts";
 import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import { sessionContext } from "./hosted.ts";
@@ -575,10 +574,8 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
   await Bun.sleep(0);
   let refreshToken = grant.refreshToken;
   function rotate() {
-    const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();
-    expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
-      ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-    } }, now).status).toBe("ok");
+    const { access, refresh, status } = rotateOAuth(store.repo, grant, refreshToken);
+    expect(status).toBe("ok");
     refreshToken = refresh;
     return access;
   }
@@ -806,10 +803,8 @@ async function dormantFixture(limits?: McpLimits) {
     client, gets, hints, sids, uri, grant, headers, time, tick, sid: [...sids][0]!,
     // Rotates the refresh token on the same grant and sends the new access token from then on.
     refresh() {
-      const access = randomBytes(32).toString("base64url"), next = randomBytes(32).toString("base64url");
-      expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refresh), tokens: {
-        ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(next), accessExpiresAt: time.now + OAUTH_TTL.access, refreshExpiresAt: time.now + OAUTH_TTL.refresh,
-      } }, time.now).status).toBe("ok");
+      const { access, refresh: next, status } = rotateOAuth(store.repo, grant, refresh, time.now);
+      expect(status).toBe("ok");
       refresh = next;
       headers.set("Authorization", `Bearer ${access}`);
       return access;
@@ -824,6 +819,7 @@ const rawLegacy = (method: string, sid: string, access: string) => hosted.fetch(
 
 test("a legacy session idle past access expiry sleeps without admission and resumes on the same sid after refresh", async () => {
   const f = await dormantFixture();
+  const logged = spyOn(console, "error");
   const hostedId = sessionContext(oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${f.grant.token}` } })) as OAuthPrincipal, meta);
   f.time.now += OAUTH_TTL.access + 1;
   f.refresh();
@@ -848,6 +844,9 @@ test("a legacy session idle past access expiry sleeps without admission and resu
   expect(JSON.stringify(rows)).not.toContain(f.sid);
   const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
   expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired"]);
+  // The expected close is audited above, not logged as a stream failure (#494 item 10).
+  expect(logged.mock.calls.filter(args => String(args[0]).includes("mcp.stream"))).toEqual([]);
+  logged.mockRestore();
 });
 
 test("a dormant sid answers 404 to another binding and only its own user's new grant drops it", async () => {
@@ -858,15 +857,17 @@ test("a dormant sid answers 404 to another binding and only its own user's new g
   const stranger = issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
   expect((await rawLegacy("GET", f.sid, stranger)).status).toBe(404);
   expect(hosted.dormantLegacySessions).toBe(1);
-  const regranted = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
-  expect((await rawLegacy("GET", f.sid, regranted)).status).toBe(404);
+  const regranted = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT);
+  expect((await rawLegacy("GET", f.sid, regranted.token)).status).toBe(404);
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "grant_changed"]]);
+  // The drop row names both grants: the one the session had and the one that dropped it (#494 item 9).
+  expect(legacyRows()[1]).toMatchObject({ grant: f.grant.grantId, new_grant: regranted.grantId });
   // Dropped is never resurrected, even for the original grant.
   expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
 });
 
-for (const ending of ["idle", "grant_ended", "deleted"] as const) test(`a dormant legacy session is dropped: ${ending}`, async () => {
+for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) test(`a dormant legacy session is dropped: ${ending}`, async () => {
   const f = await dormantFixture();
   f.time.now += OAUTH_TTL.access + 1;
   f.tick();
@@ -878,6 +879,8 @@ for (const ending of ["idle", "grant_ended", "deleted"] as const) test(`a dorman
   } else if (ending === "grant_ended") {
     store.repo.oauth.revokeToken(hashToken(f.grant.refreshToken), OPENCODE_CLIENT, f.time.now);
     f.tick();
+  } else if (ending === "shutdown") {
+    await hosted.close();
   } else {
     // Teardown reserves no admission.
     expect((await rawLegacy("DELETE", f.sid, f.refresh())).status).toBe(200);
@@ -885,7 +888,28 @@ for (const ending of ["idle", "grant_ended", "deleted"] as const) test(`a dorman
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activeLegacySessions).toBe(0);
   expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", ending]]);
-  if (ending !== "grant_ended") expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
+  if (ending !== "grant_ended" && ending !== "shutdown") expect((await rawLegacy("GET", f.sid, f.refresh())).status).toBe(404);
+});
+
+test("a full legacy limit refuses rehydration with the session's ref, keeps it dormant, and still lets DELETE drop it (#494 items 1, 3, 7)", async () => {
+  const f = await dormantFixture({ ...DEFAULT_MCP_LIMITS, legacy: { global: 1, perUser: 1 } });
+  f.time.now += OAUTH_TTL.access + 1;
+  f.tick();
+  expect(hosted.dormantLegacySessions).toBe(1);
+  // Another legacy session takes the only admission.
+  token = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT).token;
+  await connect("2025-11-25");
+  expect(hosted.activeLegacySessions).toBe(1);
+  const access = f.refresh();
+  expect((await rawLegacy("GET", f.sid, access)).status).toBe(429);
+  expect(hosted.dormantLegacySessions).toBe(1);
+  const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all().map(row => JSON.parse(row.detail));
+  expect(refused).toEqual([expect.objectContaining({ kind: "legacy", ref: legacyRows()[0]!.ref })]);
+  // Teardown needs no admission, even with the limit full.
+  expect((await rawLegacy("DELETE", f.sid, access)).status).toBe(200);
+  expect(hosted.dormantLegacySessions).toBe(0);
+  expect(hosted.activeLegacySessions).toBe(1);
+  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "deleted"]]);
 });
 
 test("the dormant registry is bounded by the legacy limits", async () => {
@@ -1036,10 +1060,8 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
   // A watched resource keeps the GET attached, so the next subscribe checks it with its old token.
   expect((await client.callTool({ name: "board_create", arguments: { name: "watched", purpose: "keeps the GET attached" } })).isError).not.toBe(true);
   expect(await client.subscribeResource({ uri: "grayboard://boards/watched" })).toEqual({});
-  const access = randomBytes(32).toString("base64url"), refresh = randomBytes(32).toString("base64url"), now = Date.now();
-  expect(store.repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(grant.refreshToken), tokens: {
-    ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-  } }, now).status).toBe("ok");
+  const { access, status } = rotateOAuth(store.repo, grant, grant.refreshToken);
+  expect(status).toBe("ok");
   headers.set("Authorization", `Bearer ${access}`);
   const original = store.repo.oauth.findActiveAccess;
   const fault = kind === "internal" ? new ApplicationError("internal", "SELECT secret FROM private_storage") : new Error("SELECT secret FROM private_storage");
