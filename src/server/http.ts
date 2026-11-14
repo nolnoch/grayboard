@@ -47,16 +47,26 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 
 // ── route handlers ────────────────────────────────────────────────────────────
 
-async function healthz(repo: Repo): Promise<Response> {
-  try {
-    repo.users.findByEmail("__healthz__");
-    // The version lets a deploy check tell a restarted server from a stale one.
-    return json({ ok: true, version: pkg.version });
-  } catch (e) {
-    // A deploy check that sees this 503 needs the cause in the journal.
-    console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
-    return jsonErr("internal", "db not reachable", 503);
+// /healthz is unauthenticated, so its database probe is cached per repo for HEALTH_TTL_MS, success and failure
+// alike (#275): a flood costs one probe a second, and a down database logs one line a second. The probe is a
+// synchronous read, so no request can arrive while one is in flight and the cache alone is single-flight.
+export const HEALTH_TTL_MS = 1000;
+const health = new WeakMap<Repo, { at: number; ok: boolean }>();
+export function healthz(repo: Repo, now = performance.now()): Response {
+  let cached = health.get(repo);
+  if (!cached || now - cached.at >= HEALTH_TTL_MS) {
+    let ok = true;
+    try {
+      repo.users.findByEmail("__healthz__");
+    } catch (e) {
+      // A deploy check that sees this 503 needs the cause in the journal.
+      console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
+      ok = false;
+    }
+    health.set(repo, cached = { at: now, ok });
   }
+  // The version lets a deploy check tell a restarted server from a stale one.
+  return cached.ok ? json({ ok: true, version: pkg.version }) : jsonErr("internal", "db not reachable", 503);
 }
 
 function authConfig(config: Config): Response {
@@ -191,13 +201,13 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
 const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 
 async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
-  const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
-  if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
-  const handle = ownAddress(body.identity, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
+  const body = await parseBody<{ as?: string; tool?: string; args?: Record<string, unknown> }>(req);
+  if (!body?.as || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("as and a claim tool required");
+  const handle = ownAddress(body.as, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (handle instanceof Response) return handle;
-  if (body.args?.as !== undefined) return badRequest("name the address to act as in identity, not args.as");
+  if (body.args?.as !== undefined) return badRequest("name the address to act as in as, not args.as");
   try {
-    // As the session the identity is or is held by: its claims under any of
+    // As the session the address is or is held by: its claims under any of
     // its addresses are its own here (#360).
     const outcome = callBoardTool(db, handle, body.tool, body.args ?? {}, { addresses: addressSet(db, handle, authed.user_email) });
     if (outcome.boards?.length) {
@@ -248,14 +258,16 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
 
 // ── attachments ──────────────────────────────────────────────────────────────
 
-// The address named by ?as=. The Slack bridge's human stores its files
-// in-process, not here.
+// The address named by ?as=, which the hosted byte routes
+// (src/server/mcp-attachments.ts) set to the session's bound name; no HTTP
+// route takes it from a client (#475). The Slack bridge's human stores its
+// files in-process, not here.
 function queryAs(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): string | Response {
   return ownAddress(url.searchParams.get("as"), authed, repo, db, HUMAN_RESERVED);
 }
 
-// POST /api/attachments?as=&filename=, the file's bytes as the body.
-// The session's MCP process has already checked the path it came from; this
+// An upload (`?as=&filename=`), the file's bytes as the body, for the hosted
+// byte route's POST. The client has already checked the path it came from; this
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
@@ -304,7 +316,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
   }
 }
 
-// GET /api/attachments/<id>?as=: the file, for an identity that can
+// A download (`<id>?as=`), for the hosted byte route's GET: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
@@ -343,7 +355,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   }).immediate();
 }
 
-// DELETE /api/attachments/<id>?as=: drops an upload of that identity's
+// A release (`<id>?as=`), for the hosted byte route's DELETE: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
 export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
@@ -506,7 +518,7 @@ export type SessionHooks = {
 };
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
+  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
   sessions: SessionHooks,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
@@ -531,14 +543,6 @@ export async function handleHttp(
 
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
-
-  if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db, uploads);
-  if (path.startsWith("/api/attachments/") && method === "GET") {
-    return attachmentDownload(path.slice("/api/attachments/".length), url, authed, repo, db);
-  }
-  if (path.startsWith("/api/attachments/") && method === "DELETE") {
-    return attachmentRelease(path.slice("/api/attachments/".length), url, authed, repo, db);
-  }
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);

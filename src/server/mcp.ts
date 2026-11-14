@@ -21,7 +21,7 @@ import { hostedFailure } from "./hosted-diagnostics.ts";
 import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
 import { permitsOrigin } from "./origin.ts";
 import { RateLimiter } from "./rate_limit.ts";
-import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
+import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimits } from "./config.ts";
 import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -41,11 +41,11 @@ type Binding = { user: number; email: string; grant: string; role: HostedRole; i
 type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
 type Live = { context: Context; rows: Set<string>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; idleSeconds?: number }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   let closed = false, posts = 0, busListeners = 0;
-  const limits = opts.limits ?? DEFAULT_MCP_LIMITS;
+  const limits = opts.limits ?? DEFAULT_MCP_LIMITS, caps = opts.caps ?? DEFAULT_HOSTED_CAPS;
   // Dormant legacy sessions hold no admission; their own bound reuses the legacy limits (#476).
   type CapacityKind = keyof McpLimits | "dormant";
   const capacity: Record<CapacityKind, Map<number, number>> = { listen: new Map(), legacy: new Map(), post: new Map(), dormant: new Map() };
@@ -81,6 +81,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const contexts = new Set<Context>();
   const shutdown = new AbortController();
   const pendingRequests = new Set<Promise<void>>();
+  // In-flight handlers (a listen stream's ends when its response starts): kept above the POST cap it contains.
+  const exchangeCap = Math.max(512, 2 * limits.post.global);
   const bodyReads = new Set<Promise<unknown>>();
   async function readBody(request: Request) {
     const reading = readMcpBody(request, shutdown.signal);
@@ -99,12 +101,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const settled = promise.catch(() => {}).finally(() => closing.delete(settled));
     closing.add(settled);
   };
-  const resources = createResources(application, { isAuthorized: session => {
+  const resources = createResources(application, { caps: caps.watches, isAuthorized: session => {
     const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
     return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorized(principal);
   } });
-  const hosted = createHostedSessions(application, { now, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: principal => oauth.isAuthorized(principal) });
-  const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now });
+  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: principal => oauth.isAuthorized(principal) });
+  const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now, caps: caps.leases });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
@@ -359,7 +361,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         try {
           authorize(context, ctx.mcpReq.signal);
           if (subscribe) {
-            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= 32) throw new ApplicationError("bad_request", "resource watch capacity reached");
+            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
             const cap = watchable(context, uri);
             const previous = sessionContext(context.principal, legacy.meta);
             if (legacy.subscriptions.size && (!("id" in previous) || !("id" in context.sessionContext) || previous.id !== context.sessionContext.id)) {
@@ -583,7 +585,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (legacyPost) { legacyPost.posts--; legacyPost.lastUsed = now(); legacyPost = undefined; }
       };
       if (post) posts++;
-      if (pendingRequests.size >= 512) { releasePost(); return new Response("MCP exchange capacity reached", { status: 429 }); }
+      if (pendingRequests.size >= exchangeCap) { releasePost(); return new Response("MCP exchange capacity reached", { status: 429 }); }
       let finishRequest!: () => void;
       const pendingRequest = new Promise<void>(resolve => { finishRequest = resolve; });
       pendingRequests.add(pendingRequest);
@@ -611,7 +613,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); }
                 const context = exchange.context = await select(req);
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
-                if (uris.length > 32) throw new ApplicationError("bad_request", "resource watch capacity reached");
+                if (uris.length > caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
                 const authorized = new Map(uris.map(uri => [uri, watchable(context, uri)]));
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
                 live = makeLive(context, authorized, ownHandler);

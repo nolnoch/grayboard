@@ -176,10 +176,22 @@ export class HostedSession {
     await (await this.attachment("DELETE", `/${id}`)).body?.cancel();
   }
 
-  private async attachment(method: "POST" | "GET" | "DELETE", path: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
+  // An upload's answer as it came, refusals included: its status and JSON body.
+  async uploadRaw(filename: string, data: Uint8Array<ArrayBuffer> | string): Promise<{ status: number; body: Record<string, any> }> {
+    const r = await this.attachmentRaw("POST", `?filename=${encodeURIComponent(filename)}`, typeof data === "string" ? new TextEncoder().encode(data) : data);
+    return { status: r.status, body: (await r.json()) as Record<string, any> };
+  }
+
+  // One request to the hosted attachment routes, its response unchecked. `path`
+  // follows `<url>/attachments`: `?filename=…` or `/<id>`.
+  attachmentRaw(method: "POST" | "GET" | "DELETE", path: string, body?: Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>): Promise<Response> {
     const headers = new Headers({ Authorization: `Bearer ${this.token}`, "X-Grayboard-Session": encodeURIComponent(this.sessionId) });
     if (body) headers.set("Content-Type", "application/octet-stream");
-    const r = await fetch(`${this.wireOptions.url}/attachments${path}`, { method, headers, ...(body ? { body } : {}) });
+    return fetch(`${this.wireOptions.url}/attachments${path}`, { method, headers, ...(body ? { body } : {}) });
+  }
+
+  private async attachment(method: "POST" | "GET" | "DELETE", path: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
+    const r = await this.attachmentRaw(method, path, body);
     if (!r.ok) throw new Error(`${this.label}: ${method} attachments${path} answered ${r.status}: ${await r.text()}`);
     return r;
   }

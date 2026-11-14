@@ -92,18 +92,20 @@ test("1, 3, 14: an unbound session only reads, is listed for its user only, and 
   await expect(u.call("board_post", { board: "e2e", body: "from the id" })).rejects.toMatchObject({ code: "unbound" });
   await expect(u.send("be", "hi from the id")).rejects.toMatchObject({ code: "unbound" });
   expect(rows(`SELECT 1 FROM posts WHERE body = 'from the id'`)).toEqual([]);
-  // 14: the user's other sessions see it by session ID; another user's don't.
+  // 14: the user's other sessions see the unbound hosted root by session ID, from the
+  // durable store (#475); another user's don't. (u is an application session, no hosted
+  // root, so nothing lists it.)
+  const sId = (await s.call<{ unbound_sessions: { session_id: string; self?: true }[] }>("peer_list", {})).unbound_sessions.find((x) => x.self)!.session_id;
   const seen = (await be.call<{ unbound_sessions?: { session_id: string; self?: true }[] }>("peer_list", {})).unbound_sessions;
-  expect(seen).toEqual([expect.objectContaining({ session_id: u.id, unbound: true, online: true })]);
+  expect(seen).toEqual([expect.objectContaining({ session_id: sId, unbound: true, online: true })]);
   expect(seen![0]!.self).toBeUndefined();
   expect((await (await srv.hosted("bob@example.com", "ops")).call<{ unbound_sessions?: unknown }>("peer_list", {})).unbound_sessions).toBeUndefined();
-  // Bound, it's gone from the list.
-  await u.bind("api3", { create: true });
-  expect((await be.call<{ unbound_sessions?: unknown }>("peer_list", {})).unbound_sessions).toBeUndefined();
 
   // 3: a new name gets none of api's mail. The probe DM to api2 arrives
   // first: had the bind delivered api's backlog, it would have preceded it.
   await s.bind("api2");
+  // Bound, it's gone from the list.
+  expect((await be.call<{ unbound_sessions?: unknown }>("peer_list", {})).unbound_sessions).toBeUndefined();
   await be.call("dm_send", { to: "api2", body: "probe" });
   expect((await s.next(direct())).event.message.body).toBe("probe");
   // 1: binding the name delivers what waited, and a new DM wakes it.
@@ -114,6 +116,30 @@ test("1, 3, 14: an unbound session only reads, is listed for its user only, and 
   await be.call("dm_send", { to: "api", body: "four" });
   await s.next(direct((m) => m.body === "four"));
 }, 30_000);
+
+test("#475 3: peer_list reads the user's unbound hosted roots from the durable store, not only those with a request in flight", async () => {
+  const be = await srv.hosted(A, "be");
+  const unbound = async () => ((await be.call<{ unbound_sessions?: { session_id: string }[] }>("peer_list", {})).unbound_sessions ?? []).map((u) => u.session_id);
+  // An unbound root that made its call and has nothing in flight: its client closed, its row lives on.
+  const quiet = await srv.hosted(A, null);
+  const id = ((await quiet.call<{ unbound_sessions: { session_id: string; self?: true }[] }>("peer_list", {})).unbound_sessions).find((u) => u.self)!.session_id;
+  await quiet.close();
+  expect(srv.app.repo.hosted.get(id)).toMatchObject({ root_session_id: null });
+  expect(await unbound()).toEqual([id]);
+  // A tools-only root writes as its writes_as: it isn't an unbound session. (The bound root, be, isn't either.)
+  const row = srv.app.repo.hosted.get(id)!;
+  const tools = "id:toolsonly0001";
+  srv.app.repo.hosted.insert({ ...row, session_id: tools, source_session_id: tools, ownership_id: srv.app.repo.hosted.start(tools, row.user_id, row.client_id, Date.now()), writes_as: `${A}/ci` });
+  expect(await unbound()).toEqual([id]);
+  // Another user's unbound root is never listed.
+  const bob = await srv.hosted("bob@example.com", null);
+  await bob.call("board_list", {});
+  await bob.close();
+  expect(await unbound()).toEqual([id]);
+  // Ended, its row is gone and so is its entry.
+  expect(srv.app.repo.hosted.end(id, "closed", Date.now())).toBe(true);
+  expect(await unbound()).toEqual([]);
+}, 20_000);
 
 test("2, 13: a second session on a held explicit name starts unbound and names the holder; the holder keeps its mail", async () => {
   const first = await srv.hosted(A, "fe");
@@ -408,7 +434,7 @@ test("#284 #367: a team alias's unsent upload doesn't pass to the next member wh
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const mine = await connect("eng/api");
-  const up = await srv.upload(alice, "eng/api", "plan.md", "# plan");
+  const up = await srv.uploadAs(alice, "eng/api", "plan.md", "# plan");
   expect(up.status).toBe(201);
   endIt(mine);
 
@@ -416,9 +442,9 @@ test("#284 #367: a team alias's unsent upload doesn't pass to the next member wh
   const refused = `attachment ${up.body.id} isn't an unsent upload of yours`;
   await expect(theirs.send(`${A}/be`, "x", { attachment_ids: [up.body.id] })).rejects.toMatchObject({ code: "bad_request", message: refused });
   await expect(theirs.call("board_post", { board: "eng", body: "x", attachment_ids: [up.body.id] })).rejects.toMatchObject({ message: expect.stringContaining(refused) });
-  // Nor over HTTP, as the alias: the download and the release both refuse.
-  expect(await srv.api(bob, "GET", `/api/attachments/${up.body.id}?as=eng%2Fapi`)).toMatchObject({ status: 404 });
-  expect(await srv.api(bob, "DELETE", `/api/attachments/${up.body.id}?as=eng%2Fapi`)).toMatchObject({ status: 404 });
+  // Nor through the attachment handlers, as the alias: the download and the release both refuse.
+  expect(await srv.downloadAs(bob, "eng/api", up.body.id)).toEqual({ status: 404 });
+  expect(await srv.releaseAs(bob, "eng/api", up.body.id)).toEqual({ status: 404 });
   expect(rows(`SELECT message_id, post_id FROM attachments WHERE id = ?`, up.body.id)).toEqual([{ message_id: null, post_id: null }]);
 
   // #391: the uploader takes the alias back and still sends her own upload.
@@ -435,7 +461,7 @@ test("#367: after an unbind, the next member who binds a team alias can't send i
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const mine = await connect("eng/api");
-  const up = await srv.upload(alice, "eng/api", "plan.md", "# plan");
+  const up = await srv.uploadAs(alice, "eng/api", "plan.md", "# plan");
   expect(up.status).toBe(201);
   expect(await mine.unbind("eng/api")).toMatchObject({ alias: "eng/api", released: true });
 
@@ -721,7 +747,7 @@ test("an upload made as one alias attaches to a send as another, and to a reply 
   expect(await s.bind("b", { create: true })).toMatchObject({ alias: `${A}/b` });
   const peer = await connect("fe", { token: bob });
   const up = async () => {
-    const r = await srv.upload(alice, "a", "shot.png", PNG);
+    const r = await srv.uploadAs(alice, "a", "shot.png", PNG);
     expect(r.status).toBe(201);
     return r.body.id as number;
   };
