@@ -404,7 +404,8 @@ test("a relink skips mail queued for the earlier link's human without stamping i
   slack.say("unlink");
   await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from")));
   expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
-  await link(alice);
+  // Disabling revoked alice's CLI tokens (security audit F-14), so she signs in again.
+  await link(await login("alice@example.com"));
   expect((await fe.call<SendResult>("dm_send", { to: "alice@example.com/human", body: "after relink" })).delivered_now).toBe(true);
   await until(() => posted("after relink"));
   expect(posted("while disabled")).toBe(false);
