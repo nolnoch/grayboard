@@ -28,6 +28,8 @@ export interface HostedStore {
   // parked row, and `children` lists a root's children, parked or not.
   all(): HostedSession[];
   children(root: string): HostedSession[];
+  // A user's live roots, oldest first (#475): peer_list's unbound sessions are those holding nothing.
+  roots(user: number): HostedSession[];
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
   park(session: string, now: number): void;
   unpark(session: string, grant: string, now: number): void;
