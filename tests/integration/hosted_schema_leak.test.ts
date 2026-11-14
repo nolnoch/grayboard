@@ -12,11 +12,13 @@ const liveHeapMB = () => { Bun.gc(true); Bun.gc(true); return process.memoryUsag
 
 test("live heap stays flat across 1,000 native tool calls", async () => {
   const s = await srv.hosted("alice@example.com", "alpha");
-  // Warm every lazy path (SDK, zod, statement caches) before the baseline.
-  for (let i = 0; i < 200; i++) await s.call(i % 2 ? "whoami" : "board_list");
+  // Warm every lazy path (SDK, zod, statement caches) before the baseline: growth settles within
+  // about 1,000 calls (+1.1, +0.2, +0.03, +0.02 MB per 1,000 after it).
+  for (let i = 0; i < 1000; i++) await s.call(i % 2 ? "whoami" : "board_list");
   const before = liveHeapMB();
   for (let i = 0; i < 1000; i++) await s.call(i % 2 ? "whoami" : "board_list");
   const grew = liveHeapMB() - before;
-  // The leak retained 25+ MB per 1,000 calls; allow noise well below it.
-  expect(grew).toBeLessThan(8);
+  console.log(`live heap growth over 1,000 native calls: ${grew.toFixed(2)} MB`);
+  // The leak retained ~50 MB per 1,000 calls; this bound catches one of ~2 KB per call.
+  expect(grew).toBeLessThan(2);
 }, 120_000);
