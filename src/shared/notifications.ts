@@ -27,6 +27,18 @@ export type Pending =
 export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[] };
 
 /**
+ * A body made safe as `<channel>` content (#433, F-07): the `<` of any
+ * `<channel` or `</channel`, any case and spacing, becomes `&lt;`, so a peer
+ * can't close its element or open a forged one with its own attributes
+ * (`human="true"`). Every other character stays as sent, and a second pass
+ * changes nothing. The pinned Claude Code escapes only a closing tag, so every
+ * path that hands Claude Code channel content applies this itself.
+ */
+export function fenceChannel(content: string): string {
+  return content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;");
+}
+
+/**
  * How text for a person names a child writer (#523): the harness asserted
  * which subagent wrote it, and nothing on the bus checks that, so the label
  * says so. Channel meta carries the bare ID as `via`.

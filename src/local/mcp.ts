@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
-import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
+import { boardNotification, dmNotification, fenceChannel, type Pending } from "../shared/notifications.ts";
 import { delegateOkFields, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote } from "../core/bindings.ts";
@@ -1168,6 +1168,8 @@ async function drainLoop(): Promise<void> {
 
 async function pushChannel(params: { content: string; meta: Record<string, string> }): Promise<boolean> {
   if (adapterPaused || claudePaused || shuttingDown) return false;
+  // Claude Code renders the content as sent; an adapter's render() fences it again, to no effect.
+  params.content = fenceChannel(params.content);
   if (CLAUDE_CURRENT && readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start)?.session !== HARNESS_SESSION) return false;
   if (!ADAPTER_OWNER) {
     await mcp.notification({ method: "notifications/claude/channel", params });
