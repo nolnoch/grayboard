@@ -351,6 +351,19 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
   }
 }, 40_000);
 
+// #272: a local `to` resolves as the server resolves it: case doesn't matter,
+// for delegate and dm_send alike.
+test("local: a mixed-case to reaches the launcher, by delegate and by dm_send", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim");
+  const r = await call(sim.c, "delegate", { persona: "p", task: "mixed t", to: "Be" });
+  expect(r).toMatchObject({ to: "be", delivered_now: true });
+  await until(() => be.pushes.some((p) => String(p.content).includes('"task": "mixed t"')), 10_000, "the delegate push");
+  const d = await call(sim.c, "dm_send", { to: "BE", body: "mixed dm" });
+  expect(d).toMatchObject({ delivered_now: true });
+  await until(() => be.pushes.some((p) => String(p.content).includes("mixed dm")), 10_000, "the dm push");
+}, 40_000);
+
 // #284 PR 4: the launcher flag is the session's, so it stands behind every
 // alias the session holds; a delegate to its second alias lands on it.
 test("local and server: a delegate to a launcher session's second alias is accepted", async () => {
