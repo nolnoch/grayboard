@@ -1068,8 +1068,9 @@ export const ALIAS_SESSION_SQL = `COALESCE(
 // or a board's subscribers, each with its session's facts (ALIAS_SESSION_SQL).
 // A status is shown only while a session holds the alias: it's the
 // session's, and clears when the session ends (#284 decision 11). An alias's
-// labels are shown only to a caller that may act in its scope (#284 S13),
-// and `match` filters after that cut, so a hidden label can't be probed.
+// labels, and its session's facts, are shown only to a caller that may act
+// in its scope (#284 S13, F-12), and `match` filters after that cut, so a
+// hidden label or fact can't be probed.
 // `online` comes from the mode: a live session that will receive pushes
 // (local: its wakeup socket answers; server: an open connection).
 // `addresses`: the caller's address set, each row of which is its own and
@@ -1139,9 +1140,15 @@ export function who(
   };
   for (const r of rows) {
     if (isViewer(r.handle)) continue;
-    const where = r.cwd ? describeLocation(r.cwd) : r.place;
     const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
-    const session = sessionFacts(r);
+    // The session's facts (where it runs, its status, harness, model, effort,
+    // launcher) follow the labels' cut: an alias's to a caller that may act
+    // in its scope, an ID's to one that may act in its principal's (security
+    // audit F-12). Another user's agent is a handle and its presence, nothing
+    // about their machine or work. Locally every row passes.
+    const seesSession = own.has(r.handle) || (r.scope_kind !== null ? seesMeta : sees({ scope_kind: "person", scope_ref: r.principal }));
+    const where = !seesSession ? null : r.cwd ? describeLocation(r.cwd) : r.place;
+    const session = seesSession ? sessionFacts(r) : {};
     const meta: AliasMeta = {};
     if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
     // An ID row's scope is its principal, which the row doesn't show: it
@@ -1159,12 +1166,12 @@ export function who(
       ...(r.id ? { id: r.id } : {}),
       ...(r.mode ? { mode: r.mode } : {}),
       ...(where ? { where } : {}),
-      ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
+      ...(seesSession && r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
       ...session,
       ...meta,
       ...(r.human ? { human: true as const } : {}),
       ...(r.queue_off ? { queue_off: true as const } : {}),
-      ...(r.launcher ? { launcher: true as const } : {}),
+      ...(seesSession && r.launcher ? { launcher: true as const } : {}),
     });
   }
   // A board's roster lists its unbound subscribers by ID among its peers.
