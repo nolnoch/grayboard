@@ -33,6 +33,8 @@ export interface HostedStore {
   // An ownership's unparked rows (idx_hosted_ownership): what a grant re-attach moves.
   ofOwnership(ownership: number): HostedSession[];
   children(root: string): HostedSession[];
+  // A user's live roots, oldest first (#475): peer_list's unbound sessions are those holding nothing.
+  roots(user: number): HostedSession[];
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
   park(session: string, now: number): void;
   unpark(session: string, grant: string, now: number): void;

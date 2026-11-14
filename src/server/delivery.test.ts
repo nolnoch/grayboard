@@ -372,3 +372,18 @@ test("reattachment on successful open invalidates old grant capabilities", async
   expect(delivery.activeLeaseCount).toBe(1);
   await expect(delivery.pending(bob, context(bob), lease.capability)).rejects.toHaveProperty("code", "not_found");
 });
+
+test("a configured per-user lease cap admits past the default and refuses at its size (#805 F-06)", async () => {
+  delivery.close();
+  delivery = createDelivery(hosted, { isAuthorized: () => authorized, caps: { global: 256, perUser: 40 } });
+  await delivery.open(bob, context(bob));
+  for (let i = 1; i < 40; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    await delivery.open(bob, c);
+  }
+  expect(delivery.activeLeaseCount).toBe(40);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+});

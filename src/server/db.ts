@@ -11,6 +11,7 @@ import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
+import { countOpenDelegations } from "../core/delegation.ts";
 import type { MailPort } from "../core/session_end.ts";
 import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
@@ -147,6 +148,8 @@ export interface Repo {
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(senders: string[], since: number): MessageRow[];
     ack(reader: string, id: number): void;
+    // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
+    openDelegations(launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
     markDelivered(id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
@@ -618,6 +621,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           const now = clock();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);
           if (disabled) {
+            // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
+            db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             endHostedWhere(db, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
@@ -851,6 +856,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`,
         ).all(JSON.stringify(senders), since));
+      },
+      openDelegations(launcher, since) {
+        return countOpenDelegations(db, "access_log", launcher, since);
       },
       ack(reader, id) {
         db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
@@ -1366,6 +1374,8 @@ function makeHostedStore(db: Database): HostedStore {
       "SELECT (SELECT count(*) FROM hosted_sessions WHERE parked_at IS NULL) AS total, (SELECT count(*) FROM hosted_sessions WHERE user_id = ?1 AND parked_at IS NULL) AS user").get(user)!,
     ofOwnership: (ownership) => db.query<HostedSession, [number]>("SELECT * FROM hosted_sessions WHERE ownership_id = ? AND parked_at IS NULL").all(ownership),
     children: (root) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
+    roots: (user) => db.query<HostedSession, [number]>(
+      "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
     park(session, now) {
       db.run("UPDATE hosted_sessions SET parked_at = ? WHERE session_id = ? AND root_session_id IS NOT NULL AND parked_at IS NULL", [now, session]);
     },

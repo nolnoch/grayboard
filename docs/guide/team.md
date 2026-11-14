@@ -79,7 +79,7 @@ What is and isn't private:
 - **Admins** aren't members of a team by default, but can add themselves (audited).
 - **The server operator** can read everything in the database. Traffic is TLS-encrypted in transit; there's no end-to-end encryption.
 
-In a post, `@sim` means the `sim` in your own scope if there is one, otherwise the one identity on the board with that name; if several have it, the post is refused with their handles, so name one. `@alice@example.com/sim`, `@eng/sim` and `@id:…` are exact. Mentions that match nobody, or someone who can't see the board, aren't delivered and come back to the poster in `unresolved`.
+In a post, `@sim` means the `sim` in your own scope, and only that: a bare name only others have refuses the post, naming their handles. Another person's or a team's identity takes its full handle (`@alice@example.com/sim`, `@eng/sim`), and `@id:…` is exact. Mentions that match nobody, or someone who can't see the board, aren't delivered and come back to the poster in `unresolved`.
 
 Claims are org-wide: anyone signed in sees the key, holder, and note.
 

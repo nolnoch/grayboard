@@ -9,7 +9,8 @@ import {
 
 import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
-import { delegateOkFields, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
+import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
+import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
 import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
@@ -143,6 +144,14 @@ const HUMAN = process.env.BUS_HUMAN === "1";
 const LAUNCHER = process.env.BUS_LAUNCHER === "1";
 // BUS_MODEL, BUS_EFFORT: what this session's harness runs on, shown on its
 // peer_list rows (#284 S12). Self-reported, read once, ended with the session.
+// delegate's per-requester bucket (#252): in this process, so per session
+// (a session's children call through it too). A server's is per user; local
+// mode is one user, and a bucket shared across processes would need a table. A streak is audited once, at
+// its first refusal and when the bucket is full again.
+const delegateLimiter = new RateLimiter(DELEGATE_LIMIT, {
+  start: (requester, ctx, retryAfterMs) => writeCoreAudit(db, "delegation.throttled", requester, null, { ...ctx, retry_after_ms: retryAfterMs }),
+  end: (requester, refused) => writeCoreAudit(db, "delegation.throttle_ended", requester, null, { refused }),
+});
 const MODEL = process.env.BUS_MODEL || undefined;
 const EFFORT = process.env.BUS_EFFORT || undefined;
 // BUS_HARNESS_SESSION: the harness's own id for the session this process
@@ -844,9 +853,16 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const byChild = child === undefined ? {} : { child };
     // `to` resolved as dm_send resolves a recipient, as the server does (#272).
     const args = typeof a.to === "string" ? { ...a, to: localRecipient(a.to.trim()) } : a;
+    // The requester's bucket (#252): checked before resolving, spent once the
+    // request is written (a re-pick spends nothing more).
+    const t = delegateLimiter.check(IDENTITY, byChild);
+    if (!t.ok) return { ...text(`error: ${delegateThrottled(DELEGATE_LIMIT, t.retryAfterMs, "this session")}`), isError: true };
+    // A launcher's open requests, over dm_inbox's default window (#252).
+    const since = Date.now() - inboxDays(undefined) * 86_400_000;
+    const open = (h: string) => countOpenDelegations(db, "audit_log", h, since);
     let d;
     try {
-      d = resolveDelegation(db, IDENTITY, args, online, undefined, (h) => ADDRS.includes(h));
+      d = resolveDelegation(db, IDENTITY, args, online, undefined, (h) => ADDRS.includes(h), open);
     } catch (e) {
       if (e instanceof CoreError) {
         writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
@@ -863,6 +879,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // both (review 16).
     let msgId = (await insertMessage(IDENTITY, WRITER, d.to, d.body, null, true, [], undefined, via, rootLive)).id;
     writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId, ...byChild });
+    delegateLimiter.spend(IDENTITY);
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
     if (!delivered && !d.humanFallback) {
@@ -873,7 +890,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       // proceeds when the retraction wins; otherwise the request stays
       // queued for the first pick, which the catch below treats as fine.
       try {
-        const d2 = resolveDelegation(db, IDENTITY, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h));
+        const d2 = resolveDelegation(db, IDENTITY, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h), open);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
           const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via, rootLive)).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
