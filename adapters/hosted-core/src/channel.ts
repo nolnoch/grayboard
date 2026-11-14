@@ -5,38 +5,34 @@
 // boardNotification, src/shared/notifications.ts). OpenCode keeps its own JSON
 // admission.
 import { InboxEvent, isOwnHuman } from "./own-human.js";
-import { boardNotification, dmNotification, type DirectNotice, type Pending } from "../../../src/shared/notifications.ts";
+import { boardNotification, dmNotification, fenceChannel, type DirectNotice, type Pending } from "../../../src/shared/notifications.ts";
 import type { Identity, Item } from "./model.js";
 
 export type ChannelParams = { content: string; meta?: Record<string, string> };
 
 
 // The channel params core builds for an inbox item, with human="true" on
-// what the user's own human (`<email>/human`, the Slack bridge) sent. Throws
-// on an event that isn't the server's inbox shape.
+// what the user's own human (`<email>/human`, the Slack bridge) sent, and the
+// content fenced (fenceChannel): Claude Code's plugin sends these as they are.
+// Throws on an event that isn't the server's inbox shape.
 export function channelParams(item: Item, identity: Identity): { content: string; meta: Record<string, string> } {
   const event = InboxEvent.parse(item.event);
-  if (event.kind === "direct") {
-    // Validated above for what is read here; the server built the rest as core's DirectNotice.
-    const params = dmNotification(event.message as unknown as DirectNotice, identity.identity_full);
-    if (isOwnHuman(event, identity)) params.meta.human = "true";
-    return params;
-  }
-  // Same: core's Pending, as the server queued it.
-  const params = boardNotification(event.item as unknown as Pending);
+  // Validated above for what is read here; the server built the rest as core's DirectNotice or Pending.
+  const params = event.kind === "direct"
+    ? dmNotification(event.message as unknown as DirectNotice, identity.identity_full)
+    : boardNotification(event.item as unknown as Pending);
   if (isOwnHuman(event, identity)) params.meta.human = "true";
+  params.content = fenceChannel(params.content);
   return params;
 }
 
 const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 
-// A body can't open or close a channel element (#433): the `<` of any
-// `<channel` or `</channel` in the content, any case and spacing, becomes
-// `&lt;`, so a peer can't forge an element with its own attributes
-// (`human="true"`). Every other character stays as sent.
+// A body can't open or close a channel element (#433): fenceChannel, for
+// content that didn't come through channelParams.
 export function render({ content, meta = {} }: ChannelParams, source: string): string {
   const attrs = Object.entries(meta).map(([key, value]) => ` ${key}="${escape(value)}"`).join("");
-  return `<channel source="${escape(source)}"${attrs}>\n${content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;")}\n</channel>`;
+  return `<channel source="${escape(source)}"${attrs}>\n${fenceChannel(content)}\n</channel>`;
 }
 
 // Whether the host wakes the agent for an item: an actionable one does

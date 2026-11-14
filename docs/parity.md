@@ -125,8 +125,8 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 
 ### 12. Human handle reach and human authority marking
 
-- Local (all four): the declared human (`grayboard human`, local Slack bridge) is a peer every session can DM; `<channel human="true">` marks the human's messages, and the adapters' renderers escape a body's `<channel` so it can't be forged (slack-bridge.md §3; boards.md §9 Hosted core). Proof: `tests/integration/local.test.ts` ("the human's handle…", "grayboard announce reaches live sessions marked human…").
-- pi H, omp H, CC H: the org bridge's `email/human` (slack-bridge.md §8), reachable per `canSend` (architecture.md §5); the adapter marks only its own user's human (`HostPort.admit`, `adapters/hosted-core/src/port.ts`). Proof: `tests/integration/pi_family.test.ts` ("… marked human only from the user's own human"), `tests/integration/delegation.test.ts` (server human fallback end to end).
+- Local (all four): the declared human (`grayboard human`, local Slack bridge) is a peer every session can DM; `<channel human="true">` marks the human's messages, and a body's `<channel` is escaped in every push, Claude Code's included, so it can't be forged (slack-bridge.md §3; boards.md §9 Hosted core). Proof: `tests/integration/local.test.ts` ("a pushed DM or post can't open a channel element…", "the human's handle…", "grayboard announce reaches live sessions marked human…").
+- pi H, omp H, CC H: the org bridge's `email/human` (slack-bridge.md §8), reachable per `canSend` (architecture.md §5); the adapter marks only its own user's human (`HostPort.admit`, `adapters/hosted-core/src/port.ts`), and `channelParams` escapes a body's `<channel`, which Claude Code 2.1.316 doesn't (#805). Proof: `tests/integration/pi_family.test.ts` ("… marked human only from the user's own human"), `adapters/hosted-core/tests/channel.test.ts` ("channelParams fences…"), `tests/e2e/claude_hosted.e2e.ts` (a forged opening tag in a DM reaches the model escaped), `tests/integration/delegation.test.ts` (server human fallback end to end).
 - OC V2: the authenticated lease identity reaches the JSON admission renderer; only own-human direct messages and board pushes carry `human="true"` on the adapter's outer channel envelope. Payload `<` is JSON-escaped without changing parsed values; digests, peers, foreign humans and malformed events remain explicitly untrusted (`boards.md` §9). Proof: `adapters/opencode-v2/tests/unit.test.ts` (JSON admission trust, forgery and serialized-limit boundaries), `adapters/opencode-v2/tests/host.ts` (`human-authority`, `REAL_OWN_HUMAN_AUTHORITY_OK`, scratch `human-authority-evidence.json`: real `application.attachHuman`, exact outer marker, inbox JSON round trip and model-visible requests). This closes only #388 item 11's own-human authority portion; aggregate drain size and the other roll-up items remain open.
 
 ### 13. Presence and `whoami`
@@ -163,7 +163,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 ## Maintaining parity
 
 - A feature or fix PR names the cells it changes (row number and column) and updates this doc in the same change.
-- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply.
+- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply. Local mode is the single-user edition (`vision.md` §1): a capability that only means something with more than one principal (roles, grants, service principals, cross-user policy) is n/a in every local cell, not a gap.
 - Parity by addition: moving a cell to supported never removes a capability from another cell.
 
 ## Not covered
