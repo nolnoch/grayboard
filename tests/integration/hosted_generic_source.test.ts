@@ -42,7 +42,7 @@ function start(oauthClients: OAuthClient[]) {
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients,
   }, { hostname: "127.0.0.1", background: false, oauth: {
-    exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice" }),
+    exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }),
     cimd: {
       resolve: async () => [{ address: "93.184.216.34", family: 4 }],
       read: async url => JSON.stringify({ client_id: url.href, client_name: url.href === OPENCODE_CLIENT ? "OpenCode" : "Metadata client", redirect_uris: [redirectUrl], token_endpoint_auth_method: "none" }),

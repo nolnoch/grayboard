@@ -1119,4 +1119,13 @@ adminCmd
     catch (e) { handleApiError(e); }
   });
 
+adminCmd
+  .command("unlink-idp")
+  .description("Forget a user's Google account, so the next Google sign-in with the email takes the account over")
+  .requiredOption("--email <email>", "Target user email")
+  .action(async (opts: { email: string }) => {
+    try { output(await makeClient().post("/api/admin/unlink-idp", { email: opts.email }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
 program.parseAsync(process.argv);
