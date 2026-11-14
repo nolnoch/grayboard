@@ -67,6 +67,8 @@ const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 
 export interface Repo {
+  // The server's clock, for rows written outside the Repo too (writeAudit).
+  now(): number;
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
   oauth: OAuthStore;
@@ -216,7 +218,8 @@ export interface Repo {
   attachmentUserQuota: number;
 }
 
-export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number };
+// `now` is the hub's clock (application.ts): rows, audit and write receipts read one clock, so a test clock moves them together (#297).
+export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number };
 
 // undeliveredFrom: messages a sender has sent that the recipient's read point
 // hasn't reached. The read point is the last delivered-and-handled message id
@@ -255,7 +258,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     recordChildRoots(d);
     seedSchema(d, first);
   });
-  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
+  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, opts.now);
   setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
   return { db, repo };
 }
@@ -554,7 +557,7 @@ export class PrincipalTaken extends Error {
   }
 }
 
-function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
+function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
   const principalByName = (name: string): PrincipalRow | undefined =>
     db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
@@ -568,6 +571,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const oauth = makeOAuthStore(db);
   const hosted = makeHostedStore(db);
   return {
+    now: clock,
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
@@ -576,7 +580,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     hosted: { ...hosted, atomic: change(hosted.atomic), subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
     users: {
       upsertByEmail(email, displayName) {
-        const now = Date.now();
+        const now = clock();
         return db.transaction(() => {
           db.run(
             `INSERT INTO users (email, display_name, created_at) VALUES (?, ?, ?)
@@ -596,7 +600,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       setDisabled(userId, disabled) {
         db.transaction(() => {
-          const now = Date.now();
+          const now = clock();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);
           if (disabled) {
             endHostedWhere(db, "disabled", now, row => row.user_id === userId);
@@ -611,7 +615,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     sessions: {
       create(userId, tokenHash, label) {
-        const now = Date.now();
+        const now = clock();
         const r = db.run(
           `INSERT INTO sessions (user_id, token_hash, created_at, last_used_at, label) VALUES (?, ?, ?, ?, ?)`,
           [userId, tokenHash, now, now, label],
@@ -630,11 +634,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(sessionId) ?? undefined;
       },
       revoke(sessionId) {
-        db.run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [Date.now(), sessionId]);
+        db.run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [clock(), sessionId]);
       },
       revokeAllForUser(userId) {
         db.transaction(() => {
-          const now = Date.now();
+          const now = clock();
           db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           endHostedWhere(db, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
@@ -671,7 +675,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return db.query<Alias, [string, string, string, string, string, number]>(
           `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
            VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
-        ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, Date.now())!;
+        ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;
       },
       find(address) {
         return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
@@ -695,7 +699,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     teams: {
       create(name, createdBy) {
         return db.transaction(() => {
-          const now = Date.now();
+          const now = clock();
           if (db.query<{ x: number }, [string]>("SELECT 1 AS x FROM principals WHERE name = ?").get(name)) throw new PrincipalTaken(name);
           const team = db.query<Team, [string, number, number]>(
             "INSERT INTO teams (name, created_by, created_at) VALUES (?, ?, ?) RETURNING *",
@@ -715,7 +719,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       addMember(teamId, userId) {
         db.run(
           "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at) VALUES (?, ?, ?)",
-          [teamId, userId, Date.now()],
+          [teamId, userId, clock()],
         );
       },
       removeMember(teamId, userId) {
@@ -745,7 +749,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null]>(
             `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
-          ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0, via)!;
+          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via)!;
           const attachments = files ? bindAttachments(db, files.ids, files.uploader, { message_id: row.id }, attachmentLimits) : [];
           return attachments.length ? { ...row, attachments } : row;
         })();
@@ -834,7 +838,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).all(JSON.stringify(senders), since));
       },
       ack(reader, id) {
-        db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
+        db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
       },
       markDelivered(id, at) {
         db.run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
@@ -850,7 +854,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
           db.run(
             "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, ?, 'message.retracted', ?, ?)",
-            [Date.now(), by.actor, `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: retractable.recipient, session: by.session })],
+            [clock(), by.actor, `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: retractable.recipient, session: by.session })],
           );
           return true;
         })();
@@ -967,7 +971,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run(
             `INSERT INTO slack_links (user_id, slack_user, dm_channel, linked_at) VALUES (?, ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET slack_user = excluded.slack_user, dm_channel = excluded.dm_channel, linked_at = excluded.linked_at`,
-            [userId, slackUser, dmChannel, Date.now()],
+            [userId, slackUser, dmChannel, clock()],
           );
         })();
       },

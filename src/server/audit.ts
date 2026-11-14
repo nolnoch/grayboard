@@ -111,7 +111,7 @@ export function writeAudit(
   detail?: Record<string, unknown>,
 ): void {
   repo.audit.write({
-    at: Date.now(),
+    at: repo.now(),
     actor,
     action,
     target,
