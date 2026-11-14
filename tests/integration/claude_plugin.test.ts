@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitationCompleteNotificationSchema, ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
+import { CancelledNotificationSchema, ElicitationCompleteNotificationSchema, ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Diagnostics } from "../../adapters/hosted-core/src/diagnostics.ts";
 import { tryAcquire } from "../../adapters/hosted-core/src/lock.ts";
@@ -74,7 +74,9 @@ const leaseClosed = (id: string) => srv.app.db.query<{ n: number }, [string]>(
   "SELECT count(*) AS n FROM access_log WHERE action = 'hosted.lease_closed' AND target = ?").get(hostedSessionId(user(), CLIENT_ID, id))!.n;
 
 type Elicit = { url: string; message: string };
-type Plugin = Session & { elicits: Elicit[]; completed: string[] };
+// completed: elicitation ids the plugin completed; withdrawn: ids whose request it
+// cancelled (notifications/cancelled).
+type Plugin = Session & { elicits: Elicit[]; completed: string[]; withdrawn: string[] };
 
 // One Claude Code session's plugin server. `flags` are Claude Code's own;
 // `answer` answers each URL elicitation (default: accept and complete the
@@ -82,7 +84,8 @@ type Plugin = Session & { elicits: Elicit[]; completed: string[] };
 async function plugin(id: string, o: {
   flags?: string[]; answer?: (e: Elicit) => Promise<ElicitResult["action"]>; elicit?: boolean; before?: ClientShape["before"]; env?: Record<string, string>;
 } = {}): Promise<Plugin> {
-  const elicits: Elicit[] = [], completed: string[] = [];
+  const elicits: Elicit[] = [], completed: string[] = [], withdrawn: string[] = [];
+  const ids = new Map<string | number, string>(); // JSON-RPC request id → elicitation id
   const answer = o.answer ?? (async (e) => { void browse(srv.issuer, e.url, "Claude Code"); return "accept"; });
   const s = await mcpSession({
     env: {
@@ -98,18 +101,26 @@ async function plugin(id: string, o: {
       before: o.before,
       setup: (c: Client) => {
         if (o.elicit === false) return;
-        c.setRequestHandler(ElicitRequestSchema, async (req) => {
-          const p = req.params as { mode?: string; url: string; message: string };
+        c.setRequestHandler(ElicitRequestSchema, async (req, extra) => {
+          const p = req.params as { mode?: string; url: string; message: string; elicitationId: string };
           expect(p.mode).toBe("url");
+          ids.set(extra.requestId, p.elicitationId);
           const e = { url: p.url, message: p.message };
           elicits.push(e);
           return { action: await answer(e) };
+        });
+        // Recorded by request id, not through the handler's abort signal: the
+        // SDK's own cancel handler (Claude Code 2.1.316 bundles the same) skips
+        // request id 0, which is the plugin's first prompt (#713).
+        c.setNotificationHandler(CancelledNotificationSchema, async (n) => {
+          const id = n.params.requestId === undefined ? undefined : ids.get(n.params.requestId);
+          if (id) withdrawn.push(id);
         });
         c.setNotificationHandler(ElicitationCompleteNotificationSchema, async (n) => { completed.push(n.params.elicitationId); });
       },
     },
   });
-  return Object.assign(s, { elicits, completed });
+  return Object.assign(s, { elicits, completed, withdrawn });
 }
 
 // A tool result's text blocks, error or not.
@@ -451,11 +462,26 @@ test("a prompt left unanswered (#497, #500): every signed-out call shows the use
   expect(linkFile(s)).toBe(false);
   expect(shown(s)).toBeUndefined();
   await until(() => s.completed.length === 1, 10_000, "the elicitation's completion notice");
+  // Completed, then its request withdrawn: Claude Code keeps no pending prompt (#501).
+  await until(() => s.withdrawn.length === 1, 10_000, "the prompt's withdrawal");
+  expect(s.withdrawn).toEqual(s.completed);
   expect(s.elicits).toHaveLength(1);
   const said = s.stderr();
   expect(said).toContain("sign-in prompt sent (elicitation ");
-  expect(said).not.toContain("sign-in prompt ended without an answer");
+  expect(said).not.toMatch(/sign-in prompt \(elicitation [^)]+\) ended without an answer/);
   expect(said).not.toContain("sign-in failed");
+}, 40_000);
+
+test("a sign-in denied in the browser: the flow fails, its unanswered prompt is withdrawn and never completed (#501)", async () => {
+  const s = await plugin("sess-denied", { answer: () => new Promise(() => {}) });
+  await until(() => s.elicits.length === 1, 10_000, "the startup sign-in prompt");
+  await browse(srv.issuer, s.elicits[0]!.url, "Claude Code", "deny");
+  await until(() => s.stderr().includes("sign-in failed (startup"), 15_000, "the failed flow");
+  await until(() => s.withdrawn.length === 1, 10_000, "the prompt's withdrawal");
+  expect(s.completed).toEqual([]);
+  expect(linkFile(s)).toBe(false);
+  // The withdrawal isn't an unanswered prompt: the flow's failure is the one line.
+  expect(s.stderr()).not.toMatch(/sign-in prompt \(elicitation [^)]+\) ended without an answer/);
 }, 40_000);
 
 test("a prompt Claude Code cancels unshown (its connection-setup handler) is sent again; a cancel after it was shown is not", async () => {
@@ -607,6 +633,10 @@ test("a refused link file of another session's sign-in is said in the log only, 
   try {
     s = await plugin("sess-refused", { answer: () => new Promise<ElicitResult["action"]>(() => {}) });
     await until(() => s.stderr().includes("sign-in link isn't shown here: not on this server's origin"), 15_000, "the refusal in the log");
+    // With no link to show, a call waits LINK_MS (20 s), then names the other session's sign-in (#501).
+    const waiting = await texts(s, "whoami");
+    expect(waiting.error).toBe(true);
+    expect(waiting.texts[0]).toBe("grayboard: sign-in in progress in another Claude Code session; finish it there, then call a grayboard tool again");
   } finally { held.release(); }
   // The waited-on sign-in ended without a grant; the next call starts this session's own.
   await until(() => s.stderr().includes("sign-in failed (startup): "), 15_000, "the startup flow's end");
