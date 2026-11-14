@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -126,6 +126,31 @@ test("a keyed attach is refused when the held handle and BUS_HUMAN disagree", as
   holdAlias(db, "fe", id);
   db.prepare(`DELETE FROM alias_holds WHERE address = 'boss'`).run();
   expect(await attachSession(db, self, true)).toMatchObject({ ok: false, error: expect.stringContaining(`holds "fe", which isn't the declared human handle`) });
+});
+
+// #365: a keyed restart under another model or effort replaces the stored
+// facts, audited with the before and after; the same facts write nothing.
+test("a keyed attach records the new child's model and effort", async () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const id = "id:0123456789abf";
+  const self = thisSession(id, { pid: process.pid, proc_start: procStart(process.pid) ?? null, rule: "env" });
+  registerSession(db, self, { model: "opus", effort: "high" });
+  const facts = () => db.prepare(`SELECT model, effort FROM ids WHERE id = ?`).get(id);
+  const audits = () => (db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.facts_changed' AND target = ?`).all(id) as { detail: string }[]).map((r) => JSON.parse(r.detail));
+  const restart = () => db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
+
+  restart();
+  expect(await attachSession(db, self, false, { model: "sonnet", effort: "low" })).toEqual({ ok: true, held: [] });
+  expect(facts()).toEqual({ model: "sonnet", effort: "low" });
+  expect(audits()).toEqual([{ before: { model: "opus", effort: "high" }, after: { model: "sonnet", effort: "low" }, why: "reattach" }]);
+  restart();
+  expect(await attachSession(db, self, false, { model: "sonnet", effort: "low" })).toMatchObject({ ok: true });
+  expect(audits()).toHaveLength(1);
+  // A child that reports none clears them: the old ones were the last child's.
+  restart();
+  expect(await attachSession(db, self, false)).toMatchObject({ ok: true });
+  expect(facts()).toEqual({ model: null, effort: null });
+  expect(audits()).toHaveLength(2);
 });
 
 // #210: a retry loop refused for the same reason is one row with a count.
@@ -385,4 +410,27 @@ test("local resume is explicit opt-in without changing harness-session discovery
     endLocalSession(db, root);
     expect(conversationSnapshot(db, "conversation")).toEqual({ session_id: ordinary, names: ["ordinary"] });
   } finally { db.close(); }
+});
+
+// #338: an open's probes of ids read only live rows, through the partial
+// index, not a scan of every ended session retention hasn't pruned yet.
+test("liveSessions probes ids through the live-row index", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const seen: string[] = [];
+  const prepare = db.prepare.bind(db);
+  const spy = spyOn(db, "prepare").mockImplementation(((sql: string) => {
+    seen.push(sql);
+    return prepare(sql);
+  }) as typeof db.prepare);
+  try {
+    liveSessions(db);
+  } finally {
+    spy.mockRestore();
+  }
+  const probes = seen.filter((sql) => /FROM ids WHERE/.test(sql) && sql.includes("ended_at IS NULL"));
+  expect(probes).toHaveLength(2);
+  for (const sql of probes) {
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((r) => r.detail);
+    expect(plan[0], sql).toBe("SCAN ids USING INDEX idx_ids_live");
+  }
 });

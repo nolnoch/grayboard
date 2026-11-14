@@ -767,7 +767,13 @@ program
     }
     const ocGuard = opts.register && opencode && !server ? opencodeShimGuard(OC_DIR) : { skip: false };
     if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
-    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
+    // The prompt can wait indefinitely: classify again after it, so a hosted migration finished meanwhile never gains a second delivery owner.
+    const ocRecheck = () => {
+      const guard = opencodeShimGuard(OC_DIR);
+      if (guard.skip && guard.warning) console.warn(`[grayboard] ${guard.warning}`);
+      return !guard.skip;
+    };
+    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);

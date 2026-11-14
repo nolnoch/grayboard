@@ -126,6 +126,22 @@ test("a lazily created team alias follows only its team's board", async () => {
   expect(rows(`SELECT created_by FROM boards WHERE name = 'eng'`)).toEqual([{ created_by: "alice@example.com" }]);
 });
 
+// #349: an alias_held refusal names the holder's place (its machine and
+// directory) only to the holder's own principal.
+test("an alias_held refusal shows the holder's place to its own principal, not to another member", async () => {
+  const build = srv.appSession(bob, "eng/build");
+  expect((await build.connect()).bind?.alias).toBe("eng/build");
+  srv.app.db.query(`UPDATE ids SET place = 'bob-box:~/src/secret-project' WHERE id = ?`).run(build.id);
+
+  const other = srv.appSession(alice, "eng/build");
+  const refusal = await other.connect().then(() => { throw new Error("alice's bind was not refused"); }, (e: { code: string; message: string }) => e);
+  expect(refusal.code).toBe("alias_held");
+  expect(refusal.message).toContain(build.id);
+  expect(refusal.message).not.toContain("secret-project");
+
+  await expect(srv.appSession(bob, "eng/build").connect()).rejects.toMatchObject({ code: "alias_held", message: expect.stringContaining(`${build.id}, in bob-box:~/src/secret-project`) });
+});
+
 // #284 S8 (decided): an alias in use is exclusive across principals. While
 // bob's session holds eng/build, alice can't write as it (tools-only
 // writes_as, ?as=) or bind it; while alice's tools-only session writes as
@@ -252,4 +268,16 @@ test("peer_list's match: harness, task, id and scope; an unknown key is refused"
   expect(await handles({ scope: "eng" })).toEqual(["eng/build"]);
   expect(await handles({ scope: "alice@example.com" })).toEqual(["alice@example.com/fe"]);
   await expect(member.call("peer_list", { match: { colour: "red" } })).rejects.toMatchObject({ message: expect.stringContaining(`match has no key "colour"`) });
+});
+
+// #356: the bind-target checks a team's scope shares with a person's, end to end.
+test("a bind of human in a team's scope is refused as reserved, and creates nothing", async () => {
+  await expect(srv.appSession(bob, "eng/human").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining(`"human" is reserved`) });
+  expect(rows(`SELECT address FROM aliases WHERE address = 'eng/human'`)).toEqual([]);
+});
+
+test("a bind in a service principal's scope is refused until #270, and creates nothing", async () => {
+  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining("service principals arrive with #270") });
+  expect(rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
 });

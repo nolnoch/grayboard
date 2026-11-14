@@ -99,7 +99,7 @@ describe("a lost answer, then the same call from the same session", () => {
     expect(srv.app.db.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
     expect(srv.app.db.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
     const events = await pushedBefore(lane, () => again.send("bob@example.com/lane", "sentinel 2"), "sentinel 2");
-    expect(events.filter(board((i) => i.post?.id === id)).length).toBe(1);
+    expect(events.filter(board((i) => i.kind === "push" && i.post.id === id)).length).toBe(1);
   });
 
   test("delegate: one pending DM, one delegation.requested, one launcher push", async () => {
@@ -225,7 +225,7 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
       expect(retry.note).toStartWith(`already posted to #work at ${retry.replayed!.first_at} as post ${id}; this repeat was not posted.`);
       expect(d.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
       expect(d.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
-      await lane.next(board((i) => i.post?.id === id), 5000);
+      await lane.next(board((i) => i.kind === "push" && i.post.id === id), 5000);
     } finally {
       d.close();
     }

@@ -340,7 +340,7 @@ async function asChild<T = unknown>(s: Session, raw: unknown, name: string, args
     return text as T;
   }
 }
-type Who = { id: string; root?: string; child?: true };
+type Who = { id: string; primary?: string; aliases?: string[]; principal?: string | null; root?: string; child?: true };
 type Sent = { message_id: number; delivered_now: boolean };
 async function childRefusal(s: Session, raw: unknown, name: string, args: Record<string, unknown> = {}): Promise<string> {
   const r = await childCall(s, raw, name, args);
@@ -789,7 +789,7 @@ test("a runner child's unbind is refused child_session; a bind refused for a hel
 
 test("BUS_PARENT_SESSION with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY refuses to start", async () => {
   const why = "[grayboard] BUS_PARENT_SESSION makes this process a subagent of the session that recorded it, in place of a session that owns its delivery; it can't be combined with BUS_PUSH=off, BUS_HUMAN=1 or BUS_SESSION_KEY";
-  for (const extra of [{ BUS_PUSH: "off" }, { BUS_HUMAN: "1" }, { BUS_SESSION_KEY: mintSessionKey() }]) {
+  for (const extra of [{ BUS_PUSH: "off" }, { BUS_HUMAN: "1" }, { BUS_SESSION_KEY: mintSessionKey() }] as Record<string, string>[]) {
     const r = await runCli(["mcp", "--mode", "local"], { cwd: dir, env: localEnv(dir, undefined, { BUS_PARENT_SESSION: "pi-1", ...extra }) });
     expect({ extra, code: r.code, said: r.err.includes(why) }).toEqual({ extra, code: 1, said: true });
   }

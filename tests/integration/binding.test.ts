@@ -580,7 +580,7 @@ test("13, 15: an unbound exit leaves nothing; a SIGKILLed holder's row is reaped
 }, 30_000);
 
 test("#211: a name record whose session the name's history doesn't show restores the name unverified, with a fresh status", async () => {
-  let s = await session(null);
+  let s = await session();
   await s.call("bind", { name: "api", create: true });
   await s.call("peer_status", { text: "mid-task" });
   const path = join(dir, `bind.${s.harnessPid}`);
@@ -594,7 +594,7 @@ test("#211: a name record whose session the name's history doesn't show restores
 }, 30_000);
 
 test("audit S7: a name record past MAX_HOLDS restores the first names and reports the rest untried", async () => {
-  let s = await session(null);
+  let s = await session();
   await s.call("bind", { name: "api", create: true });
   const path = join(dir, `bind.${s.harnessPid}`);
   const extra = Array.from({ length: 9 }, (_, i) => `n${i}`);
@@ -629,7 +629,7 @@ test("#259: a stray refused while the holder lived binds the name after its deat
 // #284: a 1.x name record and binding history carry a 16-hex session ID, the
 // same 64 bits; a restart across the upgrade still matches its history.
 test("#284: a restart from a 1.x name record is verified against 1.x binding history", async () => {
-  let s = await session(null);
+  let s = await session();
   await s.call("bind", { name: "api", create: true });
   await s.call("peer_status", { text: "mid-task" });
   const legacy = "0123456789abcdef";
@@ -644,7 +644,7 @@ test("#284: a restart from a 1.x name record is verified against 1.x binding his
 }, 30_000);
 
 test("#211: a restore is verified in the transaction that binds: a bind that lands while it waits makes it unverified", async () => {
-  const s = await session(null, { extra: pauseEnv("bind:before-txn") });
+  const s = await session(undefined, { extra: pauseEnv("bind:before-txn") });
   const bind = s.call("bind", { name: "api", create: true });
   await until(() => s.stderr().includes("test pause hit: bind:before-txn"));
   release("bind:before-txn");
@@ -872,7 +872,7 @@ test("#284 S4: a reply goes as the held alias its parent reached or was sent as;
     const a = s.pushes.find((p) => p.meta.message_id === String(toA.message_id));
     return a && b ? { a, b } : undefined;
   }, 10_000, "both DMs pushed");
-  expect([pushed.b.meta.to, pushed.a.meta.to]).toEqual(["b", undefined]);
+  expect([pushed.b.meta.to, pushed.a.meta.to] as (string | undefined)[]).toEqual(["b", undefined]);
   const inbox = (await s.call("dm_inbox", {})).unanswered as { id: number; to?: string }[];
   expect(inbox.find((m) => m.id === toB.message_id)?.to).toBe("b");
   expect(inbox.find((m) => m.id === toA.message_id)?.to).toBeUndefined();

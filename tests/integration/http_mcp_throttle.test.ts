@@ -154,7 +154,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
       expect([finds, lists]).toEqual(before);
     }
     for (const method of ["GET", "DELETE", "OPTIONS", "HEAD"]) {
-      const blocked = await fetch(`${srv.base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "MCP-Protocol-Version": version, ...(legacySession ? { "Mcp-Session-Id": legacySession } : {}) } });
+      const blocked = await fetch(`${srv.base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "MCP-Protocol-Version": version, ...(legacySession ? { "Mcp-Session-Id": legacySession as string } : {}) } });
       expect(blocked.status).toBe(429);
       expect(blocked.headers.get("Retry-After")).toBe("1");
       await blocked.text();

@@ -108,7 +108,7 @@ test("a credential drift's pause is the sign-out's to say: one line, no pause no
     await storeLogin().logout();
     await until(() => record(a)?.state === "paused", 10_000, "paused by the drift");
     await until(() => a.logs.length > 0, 10_000, "the sign-out said");
-    const result = await a.root.call("whoami");
+    const result = await a.root.call("whoami", {});
     expect(result.isError).toBe(true);
     expect(texts(result).join("\n")).not.toContain("delivery paused");
     expect(a.logs).toEqual([{ level: "warning", message: SIGNED_OUT }]);
@@ -136,7 +136,7 @@ test("a root whose delivery another holder has runs tools-only, refuses bind, an
   await until(() => record(b)?.state === "active", 15_000, "the waiter's takeover");
   await active(b, "holder");
   expect(b.root.status().held).toBeUndefined();
-  const result = await b.root.call("whoami");
+  const result = await b.root.call("whoami", {});
   expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([]);
   expect(row("wait-1")).toMatchObject({ name: "holder" });
 }, 30_000);
@@ -153,7 +153,7 @@ test("a root in lock error whose resume finds delivery held elsewhere is held, n
   await live("relock-1", "holder");
   await a.root.resume();
   expect(a.root.status()).toEqual({ held: HELD });
-  const result = await a.root.call("whoami");
+  const result = await a.root.call("whoami", {});
   expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([`grayboard: ${HELD}`]);
 }, 30_000);
 
@@ -192,7 +192,7 @@ test("a carried name a start takes is said nowhere; one the server refuses is sa
   await taker.root.start();
   await active(taker, "carrier");
   expect(taker.logs).toEqual([]);
-  expect(texts(await taker.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(texts(await taker.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
   expect(row("carry-2")).toMatchObject({ name: "carrier" });
 
   await live("taken-1", "taken");
@@ -200,9 +200,9 @@ test("a carried name a start takes is said nowhere; one the server refuses is sa
   await refused.root.start();
   const said = /^this session couldn't take the name alice@example\.com\/taken it carried over \(.*alias_held.*\); it is unbound$/;
   expect(refused.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
-  const next = texts(await refused.root.call("whoami"));
+  const next = texts(await refused.root.call("whoami", {}));
   expect(next[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
-  expect(texts(await refused.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(texts(await refused.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
 });
 
 // An explicit BUS_IDENTITY (#443): a session with nothing to take back binds it at its first start, creating it.
@@ -211,7 +211,7 @@ test("a configured name binds at a fresh root's first start, created and said no
   await fresh.root.start();
   await active(fresh, "conf-new");
   expect(fresh.logs).toEqual([]);
-  expect(texts(await fresh.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(texts(await fresh.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
   expect(row("conf-1")).toMatchObject({ name: "conf-new" });
 
   // A resumed session takes back what it held, not the configured name.
@@ -264,7 +264,7 @@ test("a configured name another session holds is said once and in the next tool 
   await r.root.start();
   const said = /^BUS_IDENTITY asked for "conf-held", but this session couldn't bind it \(.*alias_held.*\); it is unbound$/;
   expect(r.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
-  expect(texts(await r.root.call("whoami"))[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
+  expect(texts(await r.root.call("whoami", {}))[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
   await r.root.resume();
   expect(r.logs).toHaveLength(1);
   expect(row("conf-held-2")).toMatchObject({ name: null });
@@ -282,7 +282,7 @@ test("a tools-only root (push off) binds its configured name through its own con
   const said = /^BUS_IDENTITY asked for "conf-tools-held", but this session couldn't bind it \(.*\); it started unbound$/;
   await until(() => held.logs.length > 0, 10_000, "tools-only refusal said");
   expect(held.logs).toEqual([{ level: "warning", message: expect.stringMatching(said) }]);
-  expect(texts(await held.root.call("whoami"))[0]).toMatch(/^grayboard: BUS_IDENTITY asked for "conf-tools-held"/);
+  expect(texts(await held.root.call("whoami", {}))[0]).toMatch(/^grayboard: BUS_IDENTITY asked for "conf-tools-held"/);
 });
 
 test("a tools-only configured bind the server couldn't be reached for is said once and tried again before the agent's next call, ahead of its own bind (#543 audit 4)", async () => {
@@ -362,7 +362,7 @@ test("notices are keyed slots shown with the next tool result: held, then the ho
   b.root.noticeOnce("last", "last");
   const result = await b.root.call("whoami", {}, async () => "before the call");
   expect(texts(result).slice(0, 4)).toEqual([`grayboard: ${HELD}`, "grayboard: first", "grayboard: last", "grayboard: before the call"]);
-  expect(texts(await b.root.call("whoami")).filter(t => t.startsWith("grayboard: "))).toEqual([]);
+  expect(texts(await b.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
 });
 
 test("a child's calls go through HostedClient.call: a refused register and a JSON-RPC error come back as error results with the retry hint and their message", async () => {
@@ -431,7 +431,7 @@ test("a shutdown while a start's push connection is still connecting releases th
     if (mode === "push") made.push(p);
     return p;
   });
-  let down: Promise<string | undefined> | undefined;
+  let down: Promise<string[] | undefined> | undefined;
   try {
     const b = rig("first-1");
     const started = b.root.start();

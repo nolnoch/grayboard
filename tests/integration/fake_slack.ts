@@ -36,7 +36,7 @@ export class FakeSlack {
   private envelope = 0;
   readonly server = Bun.serve({
     port: 0,
-    fetch: async (req, srv) => {
+    fetch: async (req, srv): Promise<Response | undefined> => {
       const url = new URL(req.url);
       if (url.pathname === "/ws") return srv.upgrade(req) ? undefined : new Response("no", { status: 400 });
       if (url.pathname.startsWith("/upload/")) {
@@ -48,7 +48,7 @@ export class FakeSlack {
         // Slack answers 403 to a token without files:read, or (as it once did) its sign-in page.
         if (f?.forbidden) return new Response("", { status: 403 });
         if (!f || !req.headers.get("authorization")?.startsWith("Bearer xoxb-")) return new Response("<html>sign in</html>", { headers: { "Content-Type": "text/html" } });
-        return new Response(f.data);
+        return new Response(f.data as Uint8Array<ArrayBuffer>);
       }
       const method = url.pathname.replace(/^\/api\//, "");
       const body = await parseBody(req);

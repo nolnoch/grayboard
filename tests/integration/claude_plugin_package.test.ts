@@ -60,9 +60,9 @@ test("the manifest carries package.json's version and runs the bundle with bun, 
   expect(skill).toContain('!`bun "${CLAUDE_PLUGIN_ROOT}/dist/grayboard.js" logout --data "${CLAUDE_PLUGIN_DATA}"`');
 });
 
-const expectPinned = (doc: { name: string; plugins: { name: string; source: unknown }[] }) => {
+const expectPinned = (doc: { name: string; plugins: unknown[] }) => {
   expect(doc.name).toBe("grayboard");
-  for (const entry of doc.plugins) {
+  for (const entry of doc.plugins as { name: string; source: unknown }[]) {
     expect(entry.name).toBe("grayboard");
     expect(entry.source).toEqual({ source: "git-subdir", url: "https://github.com/nolnoch/grayboard.git", path: "plugins/claude-code", ref: expect.stringMatching(TAG_RE), sha: expect.stringMatching(SHA_RE) });
   }

@@ -1,0 +1,7 @@
+{
+  // Typechecks tests/ (#341). Run by `bun run typecheck` after the root config.
+  "extends": "./tsconfig.json",
+  "include": ["tests/**/*.ts"],
+  // Imports adapters/opencode-v2, whose own frozen install and strict typecheck (`bun run test:opencode`) cover it; its deps aren't in the root install.
+  "exclude": ["tests/e2e/opencode-config.ts"]
+}
