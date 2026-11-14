@@ -29,6 +29,16 @@ export function isValidIdentityName(name: string): boolean {
 export type NormalizedName = { ok: true; name: string } | { ok: false; error: string };
 
 /**
+ * A refused name as an error message quotes it (#544 item 3): control
+ * characters dropped, so a raw BUS_IDENTITY can't move the cursor or end the
+ * line in a terminal or a log, and cut at 64 characters.
+ */
+export function shownName(raw: string): string {
+  const clean = raw.replace(/\p{Cc}/gu, "");
+  return clean.length > 64 ? `${clean.slice(0, 64)}…` : clean;
+}
+
+/**
  * An explicit identity (a BUS_IDENTITY or a pin) made to the server's one
  * naming rule (#181): lowercased, then [a-z0-9_-], 1-32 chars. The server
  * lowercased at hello, so local did too at the point the name is claimed —
@@ -39,7 +49,7 @@ export type NormalizedName = { ok: true; name: string } | { ok: false; error: st
 export function normalizeIdentityName(raw: string): NormalizedName {
   const name = raw.toLowerCase();
   if (!NAME_RE.test(name)) {
-    return { ok: false, error: `invalid identity name "${raw}": after lowercasing, must be 1-32 chars of a-z 0-9 _ -` };
+    return { ok: false, error: `invalid identity name "${shownName(raw)}": after lowercasing, must be 1-32 chars of a-z 0-9 _ -` };
   }
   return { ok: true, name };
 }

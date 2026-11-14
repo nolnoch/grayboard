@@ -7,7 +7,7 @@
 //   bare     = name                  ; local mode's aliases, in its one implicit person scope
 //
 // The name rule itself (`[a-z0-9_-]{1,32}`) lives in src/shared/addressing.ts.
-import { isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
+import { isValidEmail, isValidIdentityName, shownName } from "../shared/addressing.ts";
 import { SESSION_ID } from "./session_id.ts";
 import { CoreError } from "./errors.ts";
 
@@ -47,7 +47,7 @@ export function addressParts(input: string): ParsedAddress | null {
 export function normalizeAliasName(raw: string): { ok: true; name: string } | { ok: false; error: string } {
   const p = addressParts(raw);
   if (p?.kind === "bare" || p?.kind === "alias") return { ok: true, name: p.address };
-  return { ok: false, error: `invalid identity name "${raw}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
+  return { ok: false, error: `invalid identity name "${shownName(raw)}": a name (after lowercasing, 1-32 chars of a-z 0-9 _ -), or scope/name` };
 }
 
 /** Who owns an alias's scope: a person, a team or a service principal. */
