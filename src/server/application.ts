@@ -5,6 +5,7 @@
 // transport and its hello are gone (#282): a hosted session's lifetime is the
 // hosted store's lease, not a connection's grace.
 import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
+import { DEFAULT_HOSTED_CAPS } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
@@ -81,6 +82,8 @@ export type ApplicationOptions = {
   // delegate's limits (#252): per user, and the open requests one launcher may hold.
   delegateLimit?: RateLimit;
   delegateOpenCap?: number;
+  // Board observers server-wide: hosted resource watches are observers, so it is their global cap (#805).
+  observerCap?: number;
   // The hub's clock: the rate limiters' and the write-dedup window's
   // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
@@ -401,11 +404,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     helloLimiter: new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
       start: (email, ctx, retryAfterMs) => {
         console.error(`[grayboard] rate-limiting hellos from ${email}`);
-        streakRow(() => writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
+        streakRow(() => writeAudit(repo, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
       },
       end: (email, refused) => {
         console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
-        streakRow(() => writeAudit(repo, "hello.rate_limit_ended", email, null, { refused }));
+        streakRow(() => writeAudit(repo, "bind.rate_limit_ended", email, null, { refused }));
       },
     }, opts.now),
     delegateLimit: opts.delegateLimit ?? DELEGATE_LIMIT,
@@ -510,8 +513,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Ends sessions, each in its own transaction (bounces, claim releases,
   // holds released), then wakes what that changed and sweeps the freed
   // upload bytes. One end that throws is logged and audited id.end_failed
-  // and leaves the others ended; the next revalidate (a revoked alias) or
-  // start (a leftover) retries it.
+  // and leaves the others ended. Only a revoked alias's end is retried while
+  // the server runs (revalidate re-checks it); a startup leftover's is
+  // retried at the next start, and its holds stay until then (#475 item 2).
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
     const woken = new Set<string>();
@@ -595,7 +599,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
           }
         }
       };
-      if (hosted) repo.hosted.atomic(revoke); else repo.atomic(revoke);
+      if (hosted) repo.hosted.atomic(revoke);
+      else {
+        repo.atomic(revoke);
+        // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
+        // address set and registry entries follow the database, as a bind or unbind's do.
+        for (const s of hub.sessions) if (!s.human && s.sessionId === u.id) setHolds(hub, s, holdsOf(db, u.id));
+      }
     }
     endIds(ended, "revoked");
   }
@@ -937,7 +947,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const board = normalizeBoard(boardInput);
       // Snapshot performs the same concealed access check as content reads.
       snapshot(db, reader(session, board), board, { limit: 1 });
-      if (observers.size >= 1024) fail("bad_request", "board observer capacity reached");
+      if (observers.size >= (opts.observerCap ?? DEFAULT_HOSTED_CAPS.watches.global)) fail("bad_request", "board observer capacity reached");
       const observer = { session, board, hooks };
       observers.add(observer);
       return () => removeObserver(observer);
@@ -1067,22 +1077,28 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput: string | null)
   ).slice(0, MAX_CANDIDATES);
 }
 
-// The user's live sessions with no alias, for peer_list: never another
-// user's (`where` describes their machine). A hold, a tools-only connection or
-// an idle legacy GET isn't listed: it receives nothing. A hosted session with no name is
-// listed as master listed it (#402). One row per session ID: a hosted call adds
-// its own connection beside any other of the same ID that is live (#489).
+// The user's unbound hosted roots, for peer_list: never another user's
+// (`where` describes their machine). Read from the durable store (#475), so a
+// root with no request in flight is listed too. A root that holds an alias, a
+// tools-only root (it writes as its writes_as) and a child (it acts as its
+// root) aren't listed; nor is a root whose only live connections are idle
+// legacy GETs, which receive nothing (#431). A hosted session with no name is
+// listed as master listed it (#402). One row per session ID.
 function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
-  const mine = new Map<string, ApplicationSession>();
+  const user = session.authed.user_id;
+  // Per live session ID: whether any of its connections is listed (#489: a call adds its own beside others).
+  const live = new Map<string, boolean>();
   for (const c of hub.sessions) {
-    if (c.transport !== "hosted" || !c.readOnly || !c.listed || c.authed.user_id !== session.authed.user_id) continue;
-    if (!mine.has(c.sessionId)) mine.set(c.sessionId, c);
+    if (c.transport !== "hosted" || c.authed.user_id !== user) continue;
+    live.set(c.sessionId, (live.get(c.sessionId) ?? false) || c.listed);
   }
-  const statuses = idStatuses(hub.db, [...mine.keys()]);
+  const roots = hub.repo.hosted.roots(user).filter((r) =>
+    r.writes_as === null && live.get(r.session_id) !== false && holdsOf(hub.db, r.session_id).length === 0);
+  const statuses = idStatuses(hub.db, roots.map((r) => r.session_id));
   const now = hub.now();
-  return [...mine.values()].map((c) => {
-    const s = statuses.get(c.sessionId);
-    return unboundPeer(c.sessionId, c.place ?? null, c.sessionId === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
+  return roots.map((r) => {
+    const s = statuses.get(r.session_id);
+    return unboundPeer(r.session_id, r.place, r.session_id === session.sessionId, s ? { text: s.status, age: age(now - (s.status_at ?? now)) } : undefined);
   });
 }
 

@@ -23,10 +23,11 @@ export type StartOptions = ApplicationOptions & {
 };
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
-export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "delegateLimit" | "delegateOpenCap">, opts: StartOptions) {
+export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps">, opts: StartOptions) {
   return {
     ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit,
     delegateLimit: opts.delegateLimit ?? config.delegateLimit, delegateOpenCap: opts.delegateOpenCap ?? config.delegateOpenCap,
+    observerCap: opts.observerCap ?? config.hostedCaps?.watches.global,
   };
 }
 
@@ -48,7 +49,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
   const oauth = createOAuthServer(repo, config, opts.oauth);
-  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
@@ -107,7 +108,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
         authGate.charge(caller, req, path, "sign-in");
       }
-      return handleHttp(req, repo, db, config, touches, uploads, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      return handleHttp(req, repo, db, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
     },
 
     websocket: refusal.handlers,

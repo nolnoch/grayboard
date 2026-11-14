@@ -10,6 +10,11 @@ import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
+// Hosted session rows, delivery leases and resource watches (#805, F-06); docs/guide/server.md §Sizing the caps.
+export type HostedCaps = { sessions: { global: number; perUser: number }; leases: { global: number; perUser: number }; watches: { global: number; perSession: number } };
+export const DEFAULT_HOSTED_CAPS: HostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
+// Every cap may be raised to this: a guard against a typo, not a tested size.
+const CAP_CEILING = 1_000_000;
 
 export type Config = {
   dbPath: string;
@@ -46,6 +51,7 @@ export type Config = {
   oauthLimit?: RateLimit;
   oauthGlobalLimit?: RateLimit;
   mcpLimits?: McpLimits;
+  hostedCaps?: HostedCaps;
   // How long an unbound, or bound but never-delivering, hosted session may idle (src/server/hosted.ts); default 900.
   hostedIdleSeconds?: number;
   trustedProxies: readonly string[];
@@ -93,6 +99,7 @@ export function loadConfig(): Config {
     delegateLimit: parseRateLimit(process.env, "GRAYBOARD_DELEGATE", DELEGATE_LIMIT, "requests"),
     delegateOpenCap: positiveInt(process.env, "GRAYBOARD_DELEGATE_OPEN_CAP", DELEGATE_OPEN_CAP, MAX_BURST, "requests"),
     mcpLimits: parseMcpLimits(process.env),
+    hostedCaps: parseHostedCaps(process.env),
     ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),
@@ -104,11 +111,26 @@ function parseMcpLimits(env: Record<string, string | undefined>): McpLimits {
   for (const kind of ["listen", "legacy", "post"] as const) {
     const prefix = `GRAYBOARD_MCP_${kind.toUpperCase()}`;
     const defaults = DEFAULT_MCP_LIMITS[kind];
-    const global = positiveInt(env, `${prefix}_GLOBAL`, defaults.global, defaults.global, "requests");
-    const perUser = positiveInt(env, `${prefix}_PER_USER`, Math.min(defaults.perUser, global), global, "requests");
-    limits[kind] = { global, perUser };
+    const { global, scoped } = globalAndScoped(env, prefix, "PER_USER", defaults.global, defaults.perUser, "requests");
+    limits[kind] = { global, perUser: scoped };
   }
   return limits;
+}
+
+function parseHostedCaps(env: Record<string, string | undefined>): HostedCaps {
+  const d = DEFAULT_HOSTED_CAPS;
+  const sessions = globalAndScoped(env, "GRAYBOARD_HOSTED_SESSIONS", "PER_USER", d.sessions.global, d.sessions.perUser, "sessions");
+  const leases = globalAndScoped(env, "GRAYBOARD_DELIVERY_LEASES", "PER_USER", d.leases.global, d.leases.perUser, "leases");
+  const watches = globalAndScoped(env, "GRAYBOARD_RESOURCE_WATCHES", "PER_SESSION", d.watches.global, d.watches.perSession, "watches");
+  return { sessions: { global: sessions.global, perUser: sessions.scoped }, leases: { global: leases.global, perUser: leases.scoped }, watches: { global: watches.global, perSession: watches.scoped } };
+}
+
+// A server-wide cap and a narrower one (per user or per session), which can't exceed it. An unset narrower cap
+// keeps its default, lowered to the server-wide one when that is set below it.
+function globalAndScoped(env: Record<string, string | undefined>, prefix: string, scope: string, global0: number, scoped0: number, unit: string) {
+  const global = positiveInt(env, `${prefix}_GLOBAL`, global0, CAP_CEILING, unit);
+  const scoped = positiveInt(env, `${prefix}_${scope}`, Math.min(scoped0, global), global, unit);
+  return { global, scoped };
 }
 
 function mcpGoogleConfig(): Pick<Config, "mcpGoogle"> {
