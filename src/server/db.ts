@@ -621,6 +621,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           const now = clock();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);
           if (disabled) {
+            // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
+            db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             endHostedWhere(db, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
