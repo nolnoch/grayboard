@@ -45,28 +45,39 @@ function warnOnce(key: string, text: string): void {
 
 /**
  * Each pid's start time, as an opaque string: absent when the pid doesn't
- * exist, null when it does but its start time can't be read (an unknown, never
- * evidence that it's gone). Linux: field 22 (starttime, clock ticks since
- * boot). macOS: `ps -o lstart=`, one fork for the whole list.
+ * exist or is a zombie (exited, not yet reaped by its parent: #331), null
+ * when it does but its start time can't be read (an unknown, never evidence
+ * that it's gone). Linux: field 22 (starttime, clock ticks since boot), after
+ * the state in field 3. macOS: `ps -o stat=,lstart=`, one fork for the whole list.
  */
 export function procStarts(pids: number[]): Map<number, string | null> {
   const out = new Map<number, string | null>();
   if (process.platform !== "linux") {
-    const starts = ps("lstart", pids);
+    const lines = ps("stat=,lstart", pids);
     for (const pid of pids) {
-      const start = starts ? starts.get(pid) : null;
-      if (start !== undefined) out.set(pid, start);
+      const m = lines?.get(pid)?.match(/^(\S+)\s+(.*)$/);
+      if (m && exited(m[1]!)) continue;
+      if (m) out.set(pid, m[2]!);
       else if (pidExists(pid)) out.set(pid, null);
     }
     return out;
   }
   for (const pid of pids) {
-    // Fields after the command start at field 3, so field 22 is index 19.
-    const start = statFields(pid)?.[19];
+    // Fields after the command start at field 3: the state is index 0 and
+    // field 22 is index 19.
+    const fields = statFields(pid);
+    if (fields && exited(fields[0]!)) continue;
+    const start = fields?.[19];
     if (start) out.set(pid, start);
     else if (pidExists(pid)) out.set(pid, null);
   }
   return out;
+}
+
+// A process state that means it has exited: a zombie (Z) or, on Linux, one
+// being torn down (X). kill(pid, 0) still succeeds on both.
+function exited(state: string): boolean {
+  return state.startsWith("Z") || state.startsWith("X");
 }
 
 /** `pid`'s start time; undefined when it doesn't exist, null when it does but can't be read. */
