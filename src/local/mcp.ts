@@ -780,6 +780,13 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   // the call, which its writes also name as `via` (#523), else this one.
   const WRITER = child ?? SESSION_ID;
   const via = child ?? null;
+  // A runner child's root is checked live at call start, but a call that
+  // awaits (a liveness probe, an attachment read) can outlast it: its write
+  // checks again in the write's own transaction (#557). The next call then
+  // finds the root gone and runs as its own session.
+  const rootLive = liveParent === null || child === undefined ? undefined : ((root: string, c: string) => () => {
+    if (!runnerRootLive(db, c, root)) throw new CoreError(`child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`);
+  })(liveParent, child);
 
   // With no name, the session acts as its ID (#284 S13).
   const IDENTITY = primary();
@@ -820,7 +827,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     checkBody(d.body);
     // The message id tracks the pick that owns the work: a re-pick replaces
     // both (review 16).
-    let msgId = (await insertMessage(IDENTITY, WRITER, d.to, d.body, null, true, [], undefined, via)).id;
+    let msgId = (await insertMessage(IDENTITY, WRITER, d.to, d.body, null, true, [], undefined, via, rootLive)).id;
     writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId, ...byChild });
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
@@ -834,7 +841,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       try {
         const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
-          const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via)).id;
+          const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via, rootLive)).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
           d = d2;
           msgId = id2;
@@ -891,7 +898,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       return { ...text(`error: ${replyPeerError(parent.id, peer!)}`), isError: true };
     }
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
-    const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, WRITER, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }, via));
+    const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, WRITER, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }, via, rootLive));
     // The result names the sender whenever it isn't the primary.
     const p = { ...(sender !== IDENTITY ? { sent_as: sender } : {}), ...(pending ? { pending: true } : {}), ...(attachments.length ? { attachments } : {}), ...bindHint(child) };
     // A socket that answers for a released name is a bind's swap window: the
@@ -995,9 +1002,13 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const { attachments: paths, as: _as, ...args } = a;
     const files = paths === undefined ? [] : await readAttachmentFiles(paths, ROOTS);
     // Bound in the post's transaction; a refused post releases the uploads.
-    const { result, wake } = await withUploads(actor, files, (ids) =>
-      db.transaction(() => callBoardTool(db, actor, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx)).immediate(),
-    );
+    const { result, wake } = await withUploads(actor, files, (ids) => {
+      testPause("board:before-txn");
+      return db.transaction(() => {
+        rootLive?.();
+        return callBoardTool(db, actor, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx);
+      }).immediate();
+    });
     await wakeAll(wake);
     // board_post and a taken claim are writes; a claim held by someone else is a refusal.
     const wrote = typeof result === "object" && result !== null && (name === "board_post" || (name === "claim_take" && "ok" in result && result.ok === true));
