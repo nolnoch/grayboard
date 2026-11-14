@@ -96,6 +96,51 @@ test("prunePosts reports only boards with committed deleted posts", () => {
   expect(snapshot(db, "be", "kept").posts.map(p => p.body)).toEqual(["new"]);
 });
 
+// #340: prunePosts reads before it writes. Deferred, a commit by another
+// connection between that read and its first write fails the prune with
+// SQLITE_BUSY; immediate, the other writer waits instead.
+test("prunePosts holds the write lock from its first read, so a concurrent writer can't fail it", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gb-prune-")), "bus.db");
+  const a = new Database(path);
+  a.run("PRAGMA journal_mode = WAL");
+  initCoreSchema(a);
+  ensureAlias(a, "be", "test");
+  createBoard(a, "be", "e2e", "test");
+  post(a, "be", "e2e", "old");
+  a.run("UPDATE posts SET created_at = 0");
+  const b = new Database(path);
+  b.run("PRAGMA busy_timeout = 0");
+  let interleaved: string | undefined;
+  const prepare = a.prepare.bind(a);
+  const spy = spyOn(a, "prepare").mockImplementation(((sql: string) => {
+    const stmt = prepare(sql);
+    if (!sql.startsWith("SELECT DISTINCT board FROM posts")) return stmt;
+    const all = stmt.all.bind(stmt);
+    stmt.all = ((...args: unknown[]) => {
+      const rows = all(...(args as []));
+      // Another process writes between the prune's read and its first write.
+      try {
+        b.run("UPDATE boards SET purpose = 'moved on' WHERE name = 'e2e'");
+        interleaved = "wrote";
+      } catch (e) {
+        interleaved = String(e);
+      }
+      return rows;
+    }) as typeof stmt.all;
+    return stmt;
+  }) as typeof a.prepare);
+  try {
+    expect(prunePosts(a, 1)).toEqual(["e2e"]);
+  } finally {
+    spy.mockRestore();
+  }
+  // The other writer was held off, not let through to break the prune.
+  expect(interleaved).toMatch(/SQLITE_BUSY|database is locked/);
+  expect(b.prepare("SELECT COUNT(*) AS n FROM posts").get()).toEqual({ n: 0 });
+  a.close();
+  b.close();
+});
+
 test("snapshots page bounded history without touching cursor, notified_id, or outbox", () => {
   subscribe(db, "fe", "e2e", "push");
   subscribe(db, "sim", "e2e", "digest");

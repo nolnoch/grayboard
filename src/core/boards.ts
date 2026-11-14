@@ -1473,6 +1473,9 @@ export function parseRetentionDays(raw: string | undefined, fallback: number): n
 // the transaction commits.
 export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<string, number>): string[] {
   const counts: Record<string, number> = {};
+  // Immediate: the first statement is a read, and a deferred transaction
+  // whose snapshot another writer advanced fails its first write with
+  // SQLITE_BUSY at once, busy_timeout or not (#340).
   const changed = db.transaction(() => {
     const boards = db.prepare(`SELECT DISTINCT board FROM posts WHERE created_at < ? ORDER BY board`).all(olderThanMs) as { board: string }[];
     const old = `SELECT id FROM posts WHERE created_at < ?`;
@@ -1490,7 +1493,7 @@ export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<s
     ).run(olderThanMs).changes;
     // Expired claims are left to sweepExpired, which announces them.
     return boards.map(b => b.board);
-  })();
+  }).immediate();
   if (deleted) for (const [table, n] of Object.entries(counts)) deleted[table] = (deleted[table] ?? 0) + n;
   return changed;
 }
