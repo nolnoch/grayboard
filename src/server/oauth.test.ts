@@ -856,6 +856,31 @@ test("a drained browser-route bucket doesn't block token refresh from the same a
   expect(await tokenPost("/oauth/token", { grant_type: "refresh_token", client_id: "native", refresh_token: tokens.refresh_token, resource: service.resource })).toBe(200);
 });
 
+// A page on another site can make every visitor's browser GET the browser
+// routes as subresources (#404); only a top-level navigation, or a client that
+// sends no Sec-Fetch-Mode, spends the address bucket.
+test("browser-route GETs that aren't navigations cost nothing and reach no client lookup; navigations still spend and 429", async () => {
+  service.close(); config = { ...config, oauthClients: [] }; config.oauthLimit = { burst: 2, perSec: 1 };
+  const clientId = "https://opencode.ai/oauth/opencode/client.json";
+  let reads = 0;
+  service = makeService({ resolve: async () => [{ address: "93.184.216.34", family: 4 }], read: async () => { reads++; return JSON.stringify({ client_id: clientId, client_name: "OpenCode", redirect_uris: ["http://127.0.0.1/callback"], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"] }); } });
+  const url = authorization(clientId).url;
+  const get = (target: string, mode?: string) => service.fetch(new Request(target, mode ? { headers: { "Sec-Fetch-Mode": mode } } : {}), { key: "office" }).then(r => r!.status);
+  const rows = () => storage.db.query("SELECT 1 FROM access_log").all().length;
+  const before = rows();
+  for (let i = 0; i < 50; i++) for (const mode of ["no-cors", "cors", "same-origin", "websocket"]) {
+    expect(await get(url, mode)).toBe(403);
+    expect(await get(base + "/oauth/unknown", mode)).toBe(403);
+  }
+  expect(reads).toBe(0);
+  expect(rows()).toBe(before);
+  // The bucket is untouched: two navigations pass, the third is refused.
+  expect(await get(url, "navigate")).toBe(303);
+  expect(reads).toBe(1);
+  expect(await get(url)).toBe(303);
+  expect(await get(url, "navigate")).toBe(429);
+});
+
 test("expired upstream/consent/code never mints; browser pending capacity and trusted address rate limits bounded", async () => {
   const browser = new Browser(); const a = authorization();
   const r = await browser.request(a.url), google = new URL(r.headers.get("location")!);
