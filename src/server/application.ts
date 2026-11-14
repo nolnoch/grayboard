@@ -35,6 +35,7 @@ import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type B
 import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
 import { mayActIn, principalCanSee } from "./access.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
@@ -459,7 +460,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     for (const board of new Set(boards)) hub.boardChanged(board);
   }
   // Announces claims that lapse on their boards.
-  const expiry = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged);
+  // Armed from requests, it fires for every holder: detached, so its rows
+  // don't carry the arming request's address (security audit F-19).
+  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged);
+  const expiry = { arm: () => detached(() => expiryTimer.arm()), stop: () => expiryTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
     for (const a of session.addresses) if (hub.registry.get(a) === session) hub.registry.delete(a);

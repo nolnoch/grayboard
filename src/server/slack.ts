@@ -23,6 +23,7 @@ import { onAliasCreated } from "./teams.ts";
 import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
 import { failureDiagnostic } from "./diagnostics.ts";
+import { detached } from "./request_context.ts";
 
 /** users.info errors that mean Slack won't give this account's email, as opposed to Slack being unreachable. */
 const NO_EMAIL = new Set(["missing_scope", "user_not_found", "user_not_visible"]);
@@ -274,11 +275,14 @@ export class SlackBridge implements SlackLinker {
     const sink: DeliverySink = {
       closed: () => this.detach(link.user_id),
       deliver(m) {
-        if (m.kind === "direct") relay.notify(dmNotification(m.message));
+        // The relay's one drain loop carries every queued item, whoever's
+        // request started it: detached, so its rows carry no request's
+        // address (security audit F-19).
+        if (m.kind === "direct") detached(() => relay.notify(dmNotification(m.message)));
         else if (m.item.kind === "digest") {
           try { application.receiptBoards(session, [refOf(m.item)]); } catch {}
         }
-        else relay.notify(boardNotification(m.item));
+        else detached(() => relay.notify(boardNotification(m.item)));
       },
     };
 

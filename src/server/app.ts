@@ -2,7 +2,9 @@ import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
-import { AuthGate } from "./auth_gate.ts";
+import { AuthGate, type Caller } from "./auth_gate.ts";
+import { userAgent } from "./audit.ts";
+import { inRequest } from "./request_context.ts";
 import { createHostedMcp } from "./mcp.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
 import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
@@ -75,6 +77,31 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
   const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
 
+  async function route(req: Request, caller: Caller): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    const limited = authGate.refuse(caller, path);
+    if (limited) return limited;
+
+    const response = await oauth.fetch(req, { key: caller.key });
+    if (response) return response;
+    // The OAuth byte routes charge a refused bearer as /mcp does (#401).
+    // The AS routes above authenticate clients by secret, not bearer, and
+    // stay under the OAuth limiters alone.
+    const attachmentResponse = attachments.fetch(req);
+    if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
+    if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
+
+    // A sign-in costs a token up front: the exchange awaits Google. Only a
+    // JSON body is accepted, uncharged otherwise: a cross-origin page can
+    // post a form without a preflight, but not application/json.
+    if (signInRoute(req.method, path, config)?.charged) {
+      if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
+      authGate.charge(caller, req, path, "sign-in");
+    }
+    return handleHttp(req, repo, db, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+  }
+
   // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
   const gauges = (): Gauges => {
     const used = mcp.capacityUsed;
@@ -100,28 +127,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     async fetch(req, server) {
       // First, before anything reads the database (#240).
       const caller = authGate.caller(req, server.requestIP(req)?.address);
-      const url = new URL(req.url);
-      const path = url.pathname;
-      const limited = authGate.refuse(caller, path);
-      if (limited) return limited;
-
-      const response = await oauth.fetch(req, { key: caller.key });
-      if (response) return response;
-      // The OAuth byte routes charge a refused bearer as /mcp does (#401).
-      // The AS routes above authenticate clients by secret, not bearer, and
-      // stay under the OAuth limiters alone.
-      const attachmentResponse = attachments.fetch(req);
-      if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
-      if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
-
-      // A sign-in costs a token up front: the exchange awaits Google. Only a
-      // JSON body is accepted, uncharged otherwise: a cross-origin page can
-      // post a form without a preflight, but not application/json.
-      if (signInRoute(req.method, path, config)?.charged) {
-        if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
-        authGate.charge(caller, req, path, "sign-in");
-      }
-      return handleHttp(req, repo, db, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+      // Every audit row this request writes carries where it came from (security audit F-19).
+      return inRequest({ ip: caller.ip, ua: userAgent(req) }, () => route(req, caller));
     },
 
     // A route that throws something other than a refusal it maps itself. Bun's

@@ -10,7 +10,7 @@ import { createHash } from "node:crypto";
 
 import { FakeSlack } from "./fake_slack.ts";
 import { direct } from "../support/events.ts";
-import { accessAudits } from "../support/audit.ts";
+import { accessAudits, auditOrigins } from "../support/audit.ts";
 import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
@@ -143,6 +143,9 @@ test("attachments cross the org bridge both ways for a hosted session, and the a
   const audit = (action: string) => accessAudits(srv.app.db, action);
   const sent = await until(() => audit("attachment.sent_to_slack")[0]);
   expect(sent.actor).toBe("alice@example.com");
+  // The relay's drain started inside be's /mcp request, but carries every
+  // queued item: its rows carry no request's address (security audit F-19).
+  expect(auditOrigins(srv.app.db, "attachment.sent_to_slack")).toEqual([{ ip: null, ua: null }]);
   const sha256 = createHash("sha256").update(png).digest("hex");
   expect(sent.detail).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
   // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
