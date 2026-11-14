@@ -217,6 +217,8 @@ test("a CLI token idle past cliTokenIdleDays is refused; a fresh sign-in works",
   await restart({ cliTokenIdleDays: 1 });
   const bob = await login("bob@example.com");
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(200);
+  // The request's last-used touch runs on a later setImmediate (TouchQueue); let it land first, or it overwrites the backdate.
+  await new Promise((resolve) => setImmediate(resolve));
   srv.app.db.run(`UPDATE sessions SET last_used_at = ?`, [Date.now() - 2 * 86_400_000]);
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
   expect((await api(await login("bob@example.com"), "GET", "/api/whoami")).status).toBe(200);

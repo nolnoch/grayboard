@@ -433,7 +433,15 @@ test("only a message's sender and recipient can read its thread or reply to it",
     message: `parent_id ${root.message_id} is not a message you sent or received`,
   });
   // #524: a reply goes to the parent's other party; to anyone else it would thread where that party can't read it.
-  // A native tool's refusal is text only, so its `bad_request` code is asserted in src/server/application.test.ts (#530).
+  // A native tool's refusal carries its code in structuredContent (#806), as the subscriber role's do; the text is unchanged.
+  const code = async (s: HostedSession, tool: string, args: Record<string, unknown>) => {
+    const result = await s.callRaw(tool, args);
+    return [result.isError, result.structuredContent, result.content?.[0]?.type === "text" ? result.content[0].text.startsWith("error: ") : false];
+  };
+  expect(await code(b, "dm_send", { to: `${C}/sim`, body: "x", parent_id: root.message_id })).toEqual([true, { code: "bad_request" }, true]);
+  expect(await code(c, "dm_thread", { thread: reply.message_id })).toEqual([true, { code: "not_found" }, true]);
+  expect(await code(c, "dm_ack", { message_id: 99999 })).toEqual([true, { code: "not_found" }, true]);
+  expect((await c.callRaw("bind", { name: "never-made" })).structuredContent).toMatchObject({ code: "identity_unknown" });
   await expect(b.call("dm_send", { to: `${C}/sim`, body: "x", parent_id: root.message_id })).rejects.toMatchObject({
     message: `parent_id ${root.message_id} is a thread with ${A}/be, so a reply goes to ${A}/be; to write to someone else, send without parent_id`,
   });

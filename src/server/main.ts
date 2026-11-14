@@ -10,7 +10,7 @@ if (process.argv.includes("--version")) {
 }
 
 const config = loadConfig();
-const { server, stop } = startServer(config);
+const { server, stop, metrics } = startServer(config);
 
 // Handlers go in before the listening line: a supervisor (or test) that
 // signals on seeing it must reach shutdown, not the default kill (#422).
@@ -30,6 +30,8 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
+// An unauthenticated listener: say where it bound, every start.
+console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${metrics.port}` : "off"}`);
 // Write-capable hosted clients are a trust decision (#414, #429); say which at every start.
 const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
 console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);

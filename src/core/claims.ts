@@ -60,14 +60,15 @@ export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Par
 
 // The calling session (#284): `addresses` is its address set, the primary
 // first; `session` its ID, recorded on the posts it makes (S8); `via` the
-// child session acting under those addresses (#523), recorded beside it.
-export type ClaimCtx = { addresses?: string[]; session?: string; via?: string };
+// child session acting under those addresses (#523), recorded beside it;
+// `user` the signed-in user on a server, recorded as the post's author_user.
+export type ClaimCtx = { addresses?: string[]; session?: string; via?: string; user?: string };
 
 // A new claim can't announce on an archived board (#635); its update, release
 // or expiry, ending what's already there, can (`ending`).
 function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true): ClaimChanges {
   if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via, allowArchived: ending });
+  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending });
   return { wake: result.wake, boards: [result.post.board] };
 }
 

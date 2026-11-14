@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { refusalCount } from "./metrics.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
@@ -7,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { openDatabase } from "./db.ts";
-import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, sessionContext, withoutFacts } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, OTHER_USER_NOTE, sessionContext, withoutFacts } from "./hosted.ts";
 import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
@@ -125,7 +126,9 @@ test("child quota refusal leaves grant, lease and graph unchanged; ending a chil
   for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
   const lease = await delivery.open(principal, context("root"));
   const otherGrant = { ...principal, grantId: "G2" };
+  const counted = refusalCount("hosted_child");
   await expect(hosted.register(otherGrant, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
+  expect(refusalCount("hosted_child")).toBe(counted + 1);
   expect(database.repo.hosted.all().every(row => row.grant_id === "G1")).toBe(true);
   expect(delivery.describe(principal, context("root"), lease.capability).capability).toBe(lease.capability);
   await hosted.end(principal, context("child-0"));
@@ -244,7 +247,9 @@ test("only a generic-key client's delivery declaration is read, and strictly", (
 
 test("a bind result follows the declared delivery: push has no lease note, poll has no channel lines and says to check, absent points at delivery_open", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
-  const expected = (name: string, source: string | null, notes: string[]) => [`Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`, ...notes, ...boundInstructions(name, source, true, () => [], [])].join(" ");
+  // A pushed session is told what other_user means (security audit F-10); a poll session gets no pushes to mark.
+  const general = (source: string | null) => () => source === null ? [] : [OTHER_USER_NOTE];
+  const expected = (name: string, source: string | null, notes: string[]) => [`Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`, ...notes, ...boundInstructions(name, source, true, general(source), [])].join(" ");
   const cases = [
     ["push-run", { mode: "push", source: "grayboard-pi" }, "grayboard-pi", []],
     ["poll-run", { mode: "poll", source: "grayboard-pi" }, null, ["No pushes reach this session; check dm_inbox and board_read yourself."]],
@@ -255,13 +260,23 @@ test("a bind result follows the declared delivery: push has no lease note, poll 
     const result = await hosted.bind(generic, sessionContext(generic, { [GRAYBOARD_SESSION_META]: name }), { name, create: true }, declared);
     texts[name] = result.content[0]!.text;
     expect(texts[name]).toBe(expected(name, source, [...notes]));
-    expect(result.structuredContent.instructions).toEqual(boundInstructions(name, source, true, () => [], []));
+    expect(result.structuredContent.instructions).toEqual(boundInstructions(name, source, true, general(source), []));
   }
   expect(texts["push-run"]).toContain(`<channel source="grayboard-pi" message_id="..."`);
   expect(texts["absent-run"]).toContain(`<channel source="grayboard" message_id="..."`);
   // A poll session's bind result reads as its `initialize` text does: no channel lines.
-  for (const line of ["<channel", "Pushes don't survive /clear", "delivery_open"]) expect(texts["poll-run"]).not.toContain(line);
+  for (const line of ["<channel", "Pushes don't survive /clear", "delivery_open", "other_user"]) expect(texts["poll-run"]).not.toContain(line);
+  for (const name of ["push-run", "absent-run"]) expect(texts[name]).toContain(OTHER_USER_NOTE);
   for (const line of COORDINATION_INSTRUCTIONS) expect(texts["poll-run"]).toContain(line);
+  // Unbind's result under a remaining name carries the same general lines: a pushed session keeps the other_user line, a poll one never gets it.
+  for (const [name, declared, source] of cases) {
+    const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: name });
+    await hosted.bind(generic, ctx, { name: `${name}-2`, create: true }, declared);
+    const released = await hosted.unbind(generic, ctx, { name }, declared);
+    const text = (released.structuredContent as { instructions: string[] }).instructions.join(" ");
+    if (source === null) expect(text).not.toContain("other_user");
+    else expect(text).toContain(OTHER_USER_NOTE);
+  }
 });
 
 test("unbound context cannot write or implicitly create names", async () => {
@@ -903,12 +918,14 @@ test("a bound session with no delivery declaration (OpenCode) gets initialize te
   // Lease open: pushed, with the default source, and no poll or lease note.
   const leased = hostedBoundInstruction(info, undefined, false, true);
   expect(leased).toContain(channel);
+  expect(leased).toContain(OTHER_USER_NOTE);
   for (const line of ["Poll dm_inbox", "delivery_open", "You're a launcher session"]) expect(leased).not.toContain(line);
   // No lease: it polls, and says why nothing is pushed yet.
   const unleased = hostedBoundInstruction(info);
   expect(unleased).toContain("Poll dm_inbox");
   expect(unleased).toContain(note);
   expect(unleased).not.toContain("<channel");
+  expect(unleased).not.toContain("other_user");
   // The launcher lines ride either, only with the flag.
   for (const leaseOpen of [false, true]) expect(hostedBoundInstruction(info, undefined, true, leaseOpen)).toContain("You're a launcher session");
   // A declaration outranks the lease.
@@ -1273,7 +1290,9 @@ test("a user at capacity with idle rows is admitted after the refusal's re-sweep
   const idle = spyOn(database.repo.hosted, "idle");
   try {
     now += 1_000;
+    const counted = refusalCount("hosted_session");
     await expect(hosted.whoami(principal, context("refused-1"))).rejects.toHaveProperty("code", "bad_request");
+    expect(refusalCount("hosted_session")).toBe(counted + 1);
     const swept = idle.mock.calls.length;
     expect(swept).toBeGreaterThan(0);
     await expect(hosted.whoami(principal, context("refused-2"))).rejects.toHaveProperty("code", "bad_request");

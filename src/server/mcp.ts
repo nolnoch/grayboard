@@ -14,7 +14,7 @@ import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
-import { HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
+import { domainData, HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -24,6 +24,7 @@ import { RateLimiter } from "./rate_limit.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimits } from "./config.ts";
 import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
+import { countRefusal, timeTool } from "./metrics.ts";
 
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
@@ -56,6 +57,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const count = counts.get(user) ?? 0;
     const scope = used[kind] >= limit.global ? "global" : count >= limit.perUser ? "user" : undefined;
     if (scope) {
+      countRefusal(`mcp_${kind}`);
       writeAudit(application.repo, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId, ...detail });
       return undefined;
     }
@@ -361,7 +363,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         try {
           authorize(context, ctx.mcpReq.signal);
           if (subscribe) {
-            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
+            if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
             const cap = watchable(context, uri);
             const previous = sessionContext(context.principal, legacy.meta);
             if (legacy.subscriptions.size && (!("id" in previous) || !("id" in context.sessionContext) || previous.id !== context.sessionContext.id)) {
@@ -551,6 +553,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     sessions: hosted,
     delivery,
     get activeContexts() { return contexts.size; },
+    // O(1) reads for the metrics scrape (#805): admissions held per capacity kind, exchanges in flight.
+    get capacityUsed(): Readonly<Record<CapacityKind, number>> { return { ...used }; },
+    get pendingExchanges() { return pendingRequests.size; },
     get activeLeases() { return delivery.activeLeaseCount; },
     get activeResourceContexts() { return principals.size; },
     get activeStreams() { return forwarding.size; },
@@ -578,14 +583,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         boundary.principal = principal.authed.user_id;
         postReservation = post ? reserve("post", principal) : undefined;
       } catch (error) { report(error, "hosted-fetch", boundary); return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
-      if (post && !postReservation) return new Response("MCP request capacity reached", { status: 429 });
+      if (post && !postReservation) return new Response("MCP request capacity reached", { status: 429 }); // counted in reserve()
       let released = false, legacyPost: Legacy | undefined;
       const releasePost = () => {
         if (post && !released) { released = true; posts--; postReservation!(); }
         if (legacyPost) { legacyPost.posts--; legacyPost.lastUsed = now(); legacyPost = undefined; }
       };
       if (post) posts++;
-      if (pendingRequests.size >= exchangeCap) { releasePost(); return new Response("MCP exchange capacity reached", { status: 429 }); }
+      if (pendingRequests.size >= exchangeCap) { releasePost(); countRefusal("mcp_exchange"); return new Response("MCP exchange capacity reached", { status: 429 }); }
       let finishRequest!: () => void;
       const pendingRequest = new Promise<void>(resolve => { finishRequest = resolve; });
       pendingRequests.add(pendingRequest);
@@ -610,10 +615,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               const listen = SubscriptionsListenRequestSchema.safeParse(body.parsedBody);
               if (listen.success) {
                 releaseListen = reserve("listen", principal);
-                if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); }
+                if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); } // counted in reserve()
                 const context = exchange.context = await select(req);
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
-                if (uris.length > caps.watches.perSession) throw new ApplicationError("bad_request", "resource watch capacity reached");
+                if (uris.length > caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
                 const authorized = new Map(uris.map(uri => [uri, watchable(context, uri)]));
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
                 live = makeLive(context, authorized, ownHandler);
@@ -642,7 +647,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 // Teardown needs no admission.
                 if (req.method === "DELETE") { drop(legacy, "deleted"); context.finish(); releasePost(); return new Response(null, { status: 200 }); }
                 const release = reserve("legacy", principal, { ref: legacy.ref });
-                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
+                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); } // counted in reserve()
                 const since = legacy.dormant.since;
                 legacy.dormant.release();
                 legacy.dormant = undefined;
@@ -656,7 +661,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               if (!legacy) {
                 if (req.method !== "POST") { context.finish(); releasePost(); return new Response("missing MCP session", { status: 400 }); }
                 const release = reserve("legacy", principal);
-                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); }
+                if (!release) { context.finish(); releasePost(); return new Response("MCP session capacity reached", { status: 429 }); } // counted in reserve()
                 legacy = { ref: crypto.randomUUID(), meta: exchange.meta, binding: binding(context), principal, release, subscriptions: new Map(), posts: 0, lastUsed: now(), stopped: false, controls: Promise.resolve() } as Legacy;
                 const created = legacy;
                 newLegacy = legacy;
@@ -752,36 +757,41 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   // marks it, so a host caching this session's instructions fetches them again.
   const said = (result: CallToolResult, notice: string | undefined): CallToolResult => notice
     ? { ...withNotices(result, [notice]), _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
+  // Every tool error carries its code in structuredContent (#806), as the subscriber role's do; the text, which
+  // the agent reads, stays `error: <message>`.
+  const refusal = (e: unknown): CallToolResult => {
+    const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
+    return { ...text(`error: ${message}`), structuredContent: domainData(e), isError: true };
+  };
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
-      const context = current(ctx);
-      return said(text(await hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }) ?? "ok"), notice);
+      return said(text(await timeTool(tool, () => { const context = current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }); }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
-      const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
-      return said({ ...text(`error: ${message}`), isError: true }, notice);
+      return said(refusal(e), notice);
     }
   };
   server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
-    const context = current(ctx);
     let notice: string | undefined;
-    return said(text(await hosted.whoami(context.principal, context.sessionContext, n => { notice = n; })), notice);
+    try {
+      return said(text(await timeTool("whoami", () => { const context = current(ctx); return hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }); })), notice);
+    } catch (e) { report(e, "whoami"); return said(refusal(e), notice); }
   });
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
     if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden"].includes(e.code)) refuse(e.code);
-    return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), isError: true };
+    return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), structuredContent: domainData(e), isError: true };
   };
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
     inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
-    try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.declared); }
+    try { return await timeTool("bind", () => { const context = current(ctx); return hosted.bind(context.principal, context.sessionContext, args, context.declared); }); }
     catch (e) { return bindRefusal(e, "bind"); }
   });
   server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: HOSTED_UNBIND_INPUT }, async (args, ctx) => {
-    try { const context = current(ctx); return await hosted.unbind(context.principal, context.sessionContext, args, context.declared); }
+    try { return await timeTool("unbind", () => { const context = current(ctx); return hosted.unbind(context.principal, context.sessionContext, args, context.declared); }); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
@@ -813,7 +823,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
       }
       return ackResult(acked, missing).text;
     });
-    return { ...result, ...(missing.length && !acked.length ? { isError: true } : {}) };
+    return { ...result, ...(missing.length && !acked.length && !result.isError ? { structuredContent: { code: "not_found" }, isError: true } : {}) };
   });
   server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: DM_RETRACT_INPUT },
     (a, ctx) => run(ctx, "dm_retract", session => application.retract(session, a.message_id)));
