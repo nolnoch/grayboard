@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
-import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
+import { boardNotification, dmNotification, fenceChannel, type Pending } from "../shared/notifications.ts";
 import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
@@ -862,7 +862,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const open = (h: string) => countOpenDelegations(db, "audit_log", h, since);
     let d;
     try {
-      d = resolveDelegation(db, IDENTITY, args, online, undefined, (h) => ADDRS.includes(h), open);
+      d = resolveDelegation(db, IDENTITY, null, args, online, undefined, (h) => ADDRS.includes(h), open);
     } catch (e) {
       if (e instanceof CoreError) {
         writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
@@ -890,7 +890,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       // proceeds when the retraction wins; otherwise the request stays
       // queued for the first pick, which the catch below treats as fine.
       try {
-        const d2 = resolveDelegation(db, IDENTITY, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h), open);
+        const d2 = resolveDelegation(db, IDENTITY, null, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h), open);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
           const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via, rootLive)).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
@@ -1185,6 +1185,11 @@ async function drainLoop(): Promise<void> {
 
 async function pushChannel(params: { content: string; meta: Record<string, string> }): Promise<boolean> {
   if (adapterPaused || claudePaused || shuttingDown) return false;
+  // Claude Code renders the content as sent; an adapter's render() fences it again, to no effect.
+  // The human's session feeds the Slack bridge, a person, not a model: the body stays as sent.
+  // The guidance push is ours, not mail: it shows the genuine <channel ...>
+  // form, which fenced would teach the model that the escaped form is genuine.
+  if (!HUMAN && params.meta.kind !== "guidance") params.content = fenceChannel(params.content);
   if (CLAUDE_CURRENT && readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start)?.session !== HARNESS_SESSION) return false;
   if (!ADAPTER_OWNER) {
     await mcp.notification({ method: "notifications/claude/channel", params });

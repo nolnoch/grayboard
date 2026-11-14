@@ -29,6 +29,8 @@ export type Config = {
   messageRetentionDays: number;
   auditRetentionDays: number;
   devAuth: boolean;
+  // Days a CLI session token may go unused before it's refused (security audit F-14); 0 never.
+  cliTokenIdleDays?: number;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -87,6 +89,7 @@ export function loadConfig(): Config {
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
+    cliTokenIdleDays: idleDays(process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
@@ -235,6 +238,17 @@ function retentionDays(name: string, raw: string | undefined, fallback: number):
   const days = parseRetentionDays(raw, fallback);
   if (days === null) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
   return days;
+}
+
+// CLI token idle days: unset or empty is the default, 0 is never, else a
+// whole number of days up to ten years. Plain digits, as elsewhere here.
+export const DEFAULT_CLI_TOKEN_IDLE_DAYS = 30;
+function idleDays(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_CLI_TOKEN_IDLE_DAYS;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3650) {
+    throw new Error(`GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days from 0 (never expire) to 3650, not "${raw}"`);
+  }
+  return Number(raw);
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so

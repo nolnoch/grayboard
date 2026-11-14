@@ -75,7 +75,7 @@ export function dmTools(opts: { attachments: AttachmentForm }): ToolDef[] {
           to: {
             type: "string",
             description: opts.attachments === "ids"
-              ? "The peer's exact handle, as peer_list shows it, or a bare identity name."
+              ? "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
               : "The peer's exact handle, as peer_list shows it.",
           },
           body: { type: "string", description: "Message body. Plain text or markdown." },
