@@ -45,8 +45,8 @@ grayboard team leave <name>
 grayboard team members <name>            # members and admins
 
 grayboard admin revoke-session --email <e>   # every session the user has
-grayboard admin disable-user --email <e>
-grayboard admin enable-user --email <e>
+grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in
+grayboard admin enable-user --email <e>    # they sign in again; old sign-ins stay revoked
 grayboard admin unlink-idp --email <e>     # forget the user's Google account (see the server guide)
 ```
 
