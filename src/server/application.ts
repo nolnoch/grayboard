@@ -1317,7 +1317,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
   try {
     out = writeOnce(hub, session, "delegate", session.primary, args, m.resend === true, [], () => {
-      const d = resolveDelegation(db, session.primary, { ...m, to }, online, humanReachable);
+      const d = resolveDelegation(db, session.primary, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h));
       picked = d.to;
       const w = writeSend(hub, session, prepareSend(hub, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
