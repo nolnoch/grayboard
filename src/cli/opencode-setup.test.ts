@@ -705,3 +705,36 @@ test("ordinary local/V1 setup and refresh still install carried shim; refresh re
   expect(lstatSync(adapter).isSymbolicLink()).toBe(true);
   expect(readFileSync(target, "utf8")).toBe("intentional checkout");
 });
+
+// Before #282 a signed-in machine's V1 entry served the team server; now it runs the local bus (#474). refresh-adapters
+// keeps the entry and says how to reach the server; a signed-out machine (truncated credentials) hears nothing.
+test("refresh-adapters on a signed-in machine keeps the V1 entry and names the setup-opencode command (#474)", () => {
+  const f = fixture();
+  fakeOpenCode(f);
+  expect(invoke(f, ["setup", "--local", "-y"]).exitCode).toBe(0);
+  const config = join(f.root, "config", "opencode", "opencode.json");
+  const entry = JSON.parse(readFileSync(config, "utf8")).mcp.grayboard;
+  writeFileSync(join(f.root, "credentials"), "");
+  const signedOut = invoke(f, ["refresh-adapters"]);
+  expect(signedOut.exitCode, signedOut.stderr.toString()).toBe(0);
+  expect(signedOut.stdout.toString()).not.toContain("setup-opencode");
+  writeFileSync(join(f.root, "credentials"), JSON.stringify({ session_token: "t", server: "https://bus.example.com/", user_email: "you@example.com" }));
+  const signedIn = invoke(f, ["refresh-adapters"]);
+  expect(signedIn.exitCode, signedIn.stderr.toString()).toBe(0);
+  const out = signedIn.stdout.toString();
+  expect(out).toContain("runs this machine's local bus, not the team server you're signed in to (https://bus.example.com/)");
+  expect(out).toContain("grayboard setup-opencode --url https://bus.example.com/mcp --config <opencode config file> --revision <full git sha>");
+  expect(out).not.toContain('"t"');
+  expect(JSON.parse(readFileSync(config, "utf8")).mcp.grayboard).toEqual(entry);
+});
+
+test("grayboard mcp on a signed-in machine says on stderr that it serves the local bus (#474)", async () => {
+  const f = fixture();
+  const run = (credentials: string) => {
+    writeFileSync(join(f.root, "credentials"), credentials);
+    const env = { ...process.env, HOME: f.root, XDG_CONFIG_HOME: join(f.root, "config"), GRAYBOARD_CREDENTIALS: join(f.root, "credentials"), BUS_DB_PATH: join(f.root, "bus.db"), BUS_SOCK_DIR: join(f.root, "sock"), BUS_IDENTITY: "t474", GRAYBOARD_TOKEN: undefined, GRAYBOARD_SERVER: undefined, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" };
+    return Bun.spawnSync([process.execPath, cli, "mcp"], { cwd: f.root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 15_000 }).stderr.toString();
+  };
+  expect(run("")).not.toContain("serving this machine's local bus");
+  expect(run(JSON.stringify({ session_token: "t", server: "https://bus.example.com", user_email: "you@example.com" }))).toContain("[grayboard] serving this machine's local bus; the team server https://bus.example.com is reached through the harness's hosted MCP entry, not this one");
+});

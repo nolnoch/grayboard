@@ -156,7 +156,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 - #559 items 2–6: omp L robustness edges (no abort or timeout while a call waits for the process, wrapper scripts not recognised, ACP with on-disk MCP config, advisor calls, Windows).
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
-- #474: on a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus.
+- On a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus, and prints the `setup-opencode` command that reaches the server; `grayboard mcp` says on stderr that it serves the local bus (#474). Proof: `src/cli/opencode-setup.test.ts` ("(#474)").
 - #427: pi's `pi update --extensions` doesn't refresh the loose-file adapter; only `grayboard update` does.
 
 ## Maintaining parity

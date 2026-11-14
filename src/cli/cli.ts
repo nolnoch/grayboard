@@ -597,6 +597,9 @@ program
   .action(async (opts: { mode?: string }) => {
     refuseServerMode(opts.mode);
     (await import("../local/launch.ts")).launch.modePinned = opts.mode === "local";
+    // A signed-in machine's entry that ran the team server before #282 now serves the local bus: say so where the harness logs stderr (#474).
+    const server = busMode() === "server" ? process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server : undefined;
+    if (server) console.error(`[grayboard] serving this machine's local bus; the team server ${server} is reached through the harness's hosted MCP entry, not this one`);
     // stdout is the MCP transport from here on; log to stderr only.
     try {
       await import("../local/mcp.ts");
@@ -760,7 +763,7 @@ program
     // `grayboard mcp` entry this step writes would run the local bus, so server mode skips it.
     const opencode = !!Bun.which("opencode");
     if (opts.register && opencode && server) {
-      console.log(`opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server.replace(/\/+$/, "")}/mcp --config <opencode config file> --revision <full git sha>`);
+      console.log(opencodeHostedHint(server));
     }
     const ocGuard = opts.register && opencode && !server ? opencodeShimGuard(OC_DIR) : { skip: false };
     if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
@@ -863,6 +866,11 @@ program
     if (refresh.exitCode !== 0) console.log("Some adapters weren't refreshed (above); after fixing that, run `grayboard setup`.");
   });
 
+// A team server is reached only through opencode's hosted MCP entry (#282).
+function opencodeHostedHint(server: string | undefined): string {
+  return `opencode: a team server is reached through opencode's hosted MCP entry, which setup doesn't write. Run:\n  grayboard setup-opencode --url ${server ? `${server.replace(/\/+$/, "")}/mcp` : "<server url>/mcp"} --config <opencode config file> --revision <full git sha>`;
+}
+
 program
   .command("refresh-adapters", { hidden: true })
   .description("Rewrite installed omp/opencode/pi push adapters from this binary and update an enabled Claude Code plugin")
@@ -879,6 +887,14 @@ program
         try {
           if (putEntry(OC_CONFIG)) console.log(`Disabled the grayboard entry in ${OC_CONFIG.path} (the adapter serves the tools)`);
         } catch (e) { adapterFailed(e); }
+        // Before #282 this entry served the team server on a signed-in machine; now it runs the local bus (#474).
+        // The entry stays (a local opencode bus may be wanted); the user is told how to reach the server.
+        // Signed out (a truncated credentials file) names no server and says nothing.
+        const server = busMode() === "server" ? process.env.GRAYBOARD_SERVER ?? loadCredentials()?.server : undefined;
+        if (server) {
+          console.log(`opencode: the grayboard plugin in ${OC_PLUGIN.path} runs this machine's local bus, not the team server you're signed in to (${server}).`);
+          console.log(opencodeHostedHint(server));
+        }
       }
     }
     // omp and pi: where either variant is installed (and neither is a
