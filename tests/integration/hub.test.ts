@@ -272,11 +272,11 @@ test("a bound session replies to a thread it received as its ID; once ended, not
   const ops = await srv.hosted(B, "ops");
   expect((await ops.attachmentRaw("GET", `/${up}`)).status).toBe(404);
   const take = { tool: "claim_take", args: { key: "ticket:ENG-142" } };
-  expect((await api(alice, "POST", "/api/claims/call", { identity: a.id, ...take })).status).toBe(200);
+  expect((await api(alice, "POST", "/api/claims/call", { as: a.id, ...take })).status).toBe(200);
 
   // The restart ends the session the WSS transport can no longer reattach.
   await restart({ dbPath: dbPath });
   alice = await login(A);
-  const gone = await api(alice, "POST", "/api/claims/call", { identity: a.id, ...take });
+  const gone = await api(alice, "POST", "/api/claims/call", { as: a.id, ...take });
   expect(gone).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });
 });

@@ -39,7 +39,7 @@ const revoked = () => rows(`SELECT actor, target, detail FROM access_log WHERE a
 const REASON = `${B} isn't a member of team eng`;
 // One HTTP call made as `identity`: a claim taken under it, a fresh key each time.
 let claimKey = 0;
-const actAs = (token: string, identity: string) => srv.api(token, "POST", "/api/claims/call", { identity, tool: "claim_take", args: { key: `ticket:ENG-${++claimKey}` } });
+const actAs = (token: string, identity: string) => srv.api(token, "POST", "/api/claims/call", { as: identity, tool: "claim_take", args: { key: `ticket:ENG-${++claimKey}` } });
 
 // hosted twin: #451 (team aliases on a session, alias_lost, a tools-only writer)
 test("a removed member's sessions lose the team's aliases: a holder keeps its ID, a tools-only writer ends, a closed session's hold is dropped", async () => {
