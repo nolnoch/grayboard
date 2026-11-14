@@ -1161,6 +1161,12 @@ function sessionFacts(r: { harness: string | null; model: string | null; effort:
 }
 
 // The mode's unbound sessions with their ID facts, filtered by `match`.
+// `scope` matches an ID's principal with no seesAliasMeta check (unlike the
+// held rows above). That is safe only because every `unbound` list is the
+// caller's own user's sessions: the server's unboundPeers
+// (src/server/application.ts) filters on the caller's user_id, and local mode
+// has one user. A change that lists another user's sessions must add the
+// check here, or a scope match probes their principal (#371, #391).
 function unboundRows(db: Database, unbound: UnboundPeer[], match: PeerMatch | undefined): UnboundPeer[] {
   const q = db.prepare(`SELECT principal, harness, model, effort FROM ids WHERE id = ?`);
   const out: UnboundPeer[] = [];

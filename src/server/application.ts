@@ -1190,7 +1190,7 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, p.ids, session.writerId ?? null, uploaderOf(session), session.via ?? null);
+    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
