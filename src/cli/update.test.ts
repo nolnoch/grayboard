@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, symlinkSync, utimesSync, writeFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { STALE_TEMP_MS, newer, releasesOrigin, sweepStaleTemps, versionOrder } from "./update.ts";
+import { STALE_TEMP_MS, get, newer, releasesOrigin, sweepStaleTemps, versionOrder } from "./update.ts";
 
 test("newer compares release versions in semver order", () => {
   expect(newer("v1.0.1", "1.0.0")).toBe(true);
@@ -30,6 +30,28 @@ test("releasesOrigin: unset or empty is GitHub, trailing slashes go, http only t
   expect(() => releasesOrigin("mirror.example.com")).toThrow("isn't a URL");
   for (const raw of ["http://localhost:@evil.example.com", "https://user:pw@mirror.example.com"]) {
     expect(() => releasesOrigin(raw), raw).toThrow(`must not carry user info: ${raw}`);
+  }
+});
+
+// #316: a body with no Content-Length is counted as it streams, and reading stops past the cap.
+test("get refuses a body over its cap, stated or streamed, and returns one at the cap", async () => {
+  const srv = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (path === "/stated") return new Response(new Uint8Array(2048));
+      if (path === "/exact") return new Response(new Uint8Array(1024));
+      // Endless, with no Content-Length: only a reader that stops can finish.
+      return new Response(new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(512)); } }));
+    },
+  });
+  try {
+    const url = (p: string) => `http://localhost:${srv.port}${p}`;
+    await expect(get(url("/stated"), "the stated file", 5000, 1024)).rejects.toThrow(`the stated file from ${url("/stated")} is larger than 1024 bytes; not updating`);
+    await expect(get(url("/streamed"), "the streamed file", 5000, 1024)).rejects.toThrow(`the streamed file from ${url("/streamed")} is larger than 1024 bytes; not updating`);
+    expect((await get(url("/exact"), "the exact file", 5000, 1024)).byteLength).toBe(1024);
+  } finally {
+    srv.stop(true);
   }
 });
 

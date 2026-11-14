@@ -121,16 +121,13 @@ binary_sum() {
   esac
 }
 
-# The digest the release's API response lists for asset $2 ($1 = the release's
-# API URL). GitHub's JSON is line-oriented, so split objects onto lines and
+# The digest the release's API response lists for asset $2 ($1 = the saved
+# response). GitHub's JSON is line-oriented, so split objects onto lines and
 # take the digest that follows the asset's name. api.github.com pretty-prints
 # ("name": "x"), mirrors may serve compact ("name":"x"): the patterns allow
 # either. Validated against the live API before use (#173).
 asset_digest() {
-  # awk reads to EOF: an early exit would SIGPIPE curl or tr on a large
-  # response, and pipefail would turn that into a missing digest.
-  curl "${CURL_LIMITS[@]}" -fsSL -H "Accept: application/vnd.github+json" "$1" \
-    | tr ',{}' '\n' \
+  tr ',{}' '\n' < "$1" \
     | awk -v name="$2" '
         /"name":/ { seen = ($0 ~ "\"name\": ?\"" name "\"") }
         seen && !found && /"digest":/ { sub(/.*"digest": ?"/, ""); sub(/".*/, ""); print; found = 1 }
@@ -194,15 +191,26 @@ trap cleanup EXIT
 
 refuse() { echo "grayboard: $*; not installing." >&2; exit 1; }
 
-# fetch <asset> <file in tmp>
+# What an origin may send, so a broken or hostile one is refused by name
+# rather than filling memory or INSTALL_DIR's disk (#316). The same bounds as
+# src/cli/update.ts.
+MAX_SUMS=65536
+MAX_API=4194304
+MAX_ASSET=536870912
+
+# fetch <asset> <file in tmp> <max bytes>
 fetch() {
   echo "grayboard: downloading ${base_url}/$1"
-  curl "${CURL_LIMITS[@]}" -fsSL -o "${tmp}/$2" "${base_url}/$1" || refuse "couldn't download ${base_url}/$1"
+  local rc=0
+  curl "${CURL_LIMITS[@]}" --max-filesize "$3" -fsSL -o "${tmp}/$2" "${base_url}/$1" || rc=$?
+  # 63: curl's "maximum file size exceeded", stated or as it streamed.
+  [ "$rc" -ne 63 ] || refuse "$1 from ${base_url} is larger than $3 bytes"
+  [ "$rc" -eq 0 ] || refuse "couldn't download ${base_url}/$1"
 }
 
 # SHA256SUMS.sig is one line: the signing key's id and the base64 DER signature.
-fetch SHA256SUMS SHA256SUMS
-fetch SHA256SUMS.sig SHA256SUMS.sig
+fetch SHA256SUMS SHA256SUMS "$MAX_SUMS"
+fetch SHA256SUMS.sig SHA256SUMS.sig "$MAX_SUMS"
 # Parsed as strictly as src/shared/release_verify.ts: exactly that line, at
 # most one trailing newline.
 sigline="$(cat "${tmp}/SHA256SUMS.sig")"
@@ -230,18 +238,26 @@ sums_bad="$(awk '
 tagline="$(head -n 1 "${tmp}/SHA256SUMS")"
 [ "$tagline" = "# grayboard ${VERSION}" ] || refuse "SHA256SUMS is signed for ${tagline#\# grayboard }, not ${VERSION}"
 
+# The release API response, read once for every asset's digest. A failed
+# fetch leaves it empty, so each asset is then refused for want of a digest.
+api_rc=0
+curl "${CURL_LIMITS[@]}" --max-filesize "$MAX_API" -fsSL -H "Accept: application/vnd.github+json" "$release_api" \
+  > "${tmp}/release.json" || api_rc=$?
+[ "$api_rc" -ne 63 ] || refuse "the release API response from ${release_api} is larger than ${MAX_API} bytes"
+[ "$api_rc" -eq 0 ] || : > "${tmp}/release.json"
+
 # verified <asset> <file in tmp>: download $1 only once SHA256SUMS and the
 # release API both list a sha256 for it, then require the file to match both.
 verified() {
   local asset="$1" want_sum want_api got
   want_sum="$(awk -v n="$asset" 'NR > 1 && $2 == n { print $1 }' "${tmp}/SHA256SUMS")"
   [[ "$want_sum" =~ ^[0-9a-f]{64}$ ]] || refuse "${asset}: SHA256SUMS lists no sha256"
-  want_api="$(asset_digest "$release_api" "$asset")" || want_api=""
+  want_api="$(asset_digest "${tmp}/release.json" "$asset")" || want_api=""
   case "$want_api" in
     sha256:????????????????????????????????????????????????????????????????) ;;
     *) refuse "${asset}: the release API lists no sha256 digest" ;;
   esac
-  fetch "$asset" "$2"
+  fetch "$asset" "$2" "$MAX_ASSET"
   got="$(binary_sum "${tmp}/$2")"
   [ "$got" = "$want_sum" ] || refuse "${asset}: sha256 ${got}, but SHA256SUMS lists ${want_sum}"
   [ "$got" = "${want_api#sha256:}" ] || refuse "${asset}: sha256 ${got}, but the release API lists ${want_api}"
