@@ -32,7 +32,20 @@ async function openTogether(kind: Kind, path: string, trial: number): Promise<vo
   const procs = Array.from({ length: CHILDREN }, () =>
     Bun.spawn([process.execPath, CHILD, kind, path, go], { env: cleanEnv(), stdout: "ignore", stderr: "pipe" }),
   );
-  await until(() => procs.every((p) => existsSync(`${go}.ready-${p.pid}`)) || undefined);
+  const ready = (p: (typeof procs)[number]) => existsSync(`${go}.ready-${p.pid}`);
+  // Longer than the child's own 10 s go-file deadline; a child that dies first, or a timeout,
+  // fails with every child's stderr rather than only the condition (#178).
+  try {
+    await until(() => {
+      const dead = procs.find((p) => p.exitCode !== null && !ready(p));
+      if (dead) throw new Error(`child ${dead.pid} exited ${dead.exitCode} before writing its ready file`);
+      return procs.every(ready) || undefined;
+    }, 15_000, `${kind} trial ${trial}: every child's ready file`);
+  } catch (e) {
+    for (const p of procs) p.kill();
+    const errs = await Promise.all(procs.map(async (p) => `child ${p.pid} stderr:\n${await new Response(p.stderr).text()}`));
+    throw new Error(`${(e as Error).message}\n${errs.join("\n")}`);
+  }
   writeFileSync(go, "");
   const results = await Promise.all(procs.map(async (p) => ({ code: await p.exited, err: await new Response(p.stderr).text() })));
   const failed = results.filter((r) => r.code !== 0);
