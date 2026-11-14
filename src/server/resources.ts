@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { BOARD_NAME_RE, type SnapshotOptions } from "../core/boards.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -20,6 +21,7 @@ export type ResourceHooks = {
 export type ResourceOptions = {
   // Trusted boundary rechecks the session's grant/scopes; never derive a principal here.
   isAuthorized(session: ApplicationSession): boolean;
+  caps?: HostedCaps["watches"];
 };
 type Watch = {
   id: string;
@@ -33,6 +35,7 @@ function notify(operation: "resources.changed" | "resources.closed", callback?: 
 }
 
 export function createResources(application: Application, options: ResourceOptions) {
+  const caps = options.caps ?? DEFAULT_HOSTED_CAPS.watches;
   const watches = new Map<string, Watch>();
   // Each session's watches, so a session's close and its capacity check don't scan every watch (#805).
   const bySession = new Map<ApplicationSession, Set<Watch>>();
@@ -90,7 +93,7 @@ export function createResources(application: Application, options: ResourceOptio
     watch(session: ApplicationSession, uri: string, hooks: ResourceHooks): string {
       requireSession(session);
       const board = parseBoardResourceUri(uri);
-      if (watches.size >= 1024 || (bySession.get(session)?.size ?? 0) >= 32) {
+      if (watches.size >= caps.global || (bySession.get(session)?.size ?? 0) >= caps.perSession) {
         throw new ApplicationError("bad_request", "resource watch capacity reached");
       }
       const watch: Watch = { id: randomBytes(32).toString("base64url"), session, board, hooks };

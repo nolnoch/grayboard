@@ -506,3 +506,17 @@ test("per-session watch capacity counts only that session's watches and frees on
   resources.unwatch(b, theirs);
   expect(resources.activeWatchCount).toBe(0);
 });
+
+// #805 F-06: raised watch caps reach both the resource registry and the application's board observers, whose own
+// cap was a hard-coded 1024 that would bind first.
+test("configured watch caps admit past the defaults and refuse at the configured size", async () => {
+  resources.close();
+  application.stopExpiry();
+  application = createApplication(store.repo, store.db, { observerCap: 1100 });
+  resources = createResources(application, { isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
+  const a = await select(alice);
+  application.call(a, "board_create", { name: "wide", purpose: "capacity" });
+  for (let i = 0; i < 1100; i++) resources.watch(a, "grayboard://boards/wide", hooks());
+  expect(resources.activeWatchCount).toBe(1100);
+  expect(() => resources.watch(a, "grayboard://boards/wide", hooks())).toThrow("resource watch capacity reached");
+});
