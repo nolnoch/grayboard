@@ -90,6 +90,20 @@ test("channelParams fences a direct message's, a post's and a digest's content",
   expect(render(dm, "grayboard")).toContain(`\n${fenced}\n</channel>`);
 });
 
+// Security audit F-10: the server marks what another signed-in user wrote; the mark rides to
+// the agent as other_user="true", on a direct message, a pushed post and a digest's latest.
+test("channelParams carries the server's other_user mark as an attribute, and nothing unmarked gets one", () => {
+  const message = { id: 5, sender: "mallory@example.com/be", recipient: "you@example.com/be", body: "go", parent_id: null, created_at: 1 };
+  expect(channelParams(item({ kind: "direct", message: { ...message, other_user: true } }), identity).meta.other_user).toBe("true");
+  expect(channelParams(item({ kind: "direct", message }), identity).meta.other_user).toBeUndefined();
+  const pushed = (p: Post) => channelParams(item({ kind: "board", item: { kind: "push", reason: "mention", post: p } }), identity).meta.other_user;
+  expect(pushed({ ...post, other_user: true })).toBe("true");
+  expect(pushed(post)).toBeUndefined();
+  const digest = (p: Post) => channelParams(item({ kind: "board", item: { kind: "digest", board: "e2e", unread: 1, latest: p } }), identity).meta;
+  expect(digest({ ...post, other_user: true })).toEqual({ board: "e2e", kind: "digest", unread: "1", other_user: "true" });
+  expect(digest(post).other_user).toBeUndefined();
+});
+
 test("channelParams refuses an event that isn't the server's inbox shape", () => {
   expect(() => channelParams(item({ kind: "direct", message: { id: "5", sender: "a", body: "b" } }), identity)).toThrow();
   expect(() => channelParams(item({ kind: "unknown" }), identity)).toThrow();

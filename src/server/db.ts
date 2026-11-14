@@ -123,11 +123,15 @@ export interface Repo {
     // the ids and their uploader travel together, so the type requires one
     // with the other (#391). senderId: the sending session's ID (#284); null
     // for a writer with no session. via: the child session that wrote it
-    // (#523), else null.
+    // (#523), else null. senderUser: the writer's signed-in user (security
+    // audit F-10), kept out of reads like sender_id.
     insert(
       sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
-      files?: MessageFiles, senderId?: string | null, via?: string | null,
+      files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null,
     ): MessageRow;
+    // The writer's signed-in user of each message and post that has one
+    // recorded (rows from before F-10, bounces and system posts have none).
+    writerUsers(messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
@@ -531,6 +535,9 @@ function initSchema(db: Database): void {
   // via: the child session (a harness subagent, #523) that wrote it under its
   // root's addresses; null for a root's own write.
   if (!msgCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE messages ADD COLUMN via TEXT`);
+  // sender_user: the writer's signed-in user (security audit F-10), so a
+  // recipient of another user can be told so; null before it and for bounces.
+  if (!msgCols.some((c) => c.name === "sender_user")) db.exec(`ALTER TABLE messages ADD COLUMN sender_user TEXT`);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -748,18 +755,24 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null) {
+      insert(sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
         return db.transaction(() => {
-          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null]>(
-            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
-          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via)!;
+          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null]>(
+            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
+          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via, senderUser)!;
           const attachments = files ? bindAttachments(db, files.ids, files.uploader, { message_id: row.id }, attachmentLimits) : [];
           return attachments.length ? { ...row, attachments } : row;
         })();
       },
       getById(id) {
         return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
+      },
+      writerUsers(messageIds, postIds) {
+        const pairs = (table: "messages" | "posts", column: "sender_user" | "author_user", ids: number[]) => new Map(ids.length === 0 ? [] :
+          db.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
+            .all(JSON.stringify(ids)).map((r) => [r.id, r.user] as const));
+        return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds) };
       },
       bouncesFrom(id) {
         return db.query<MessageRow, [string]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' ORDER BY id`).all(id);

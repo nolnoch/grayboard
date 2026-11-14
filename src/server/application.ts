@@ -50,7 +50,8 @@ export class ApplicationError extends Error {
 export type DirectMessage = ReturnType<typeof showMessage<MessageRow>>;
 export type HistoryMessage = DirectMessage & { delivered?: boolean };
 export type DeliveryEvent =
-  | { kind: "direct"; message: DirectMessage }
+  // other_user: set only by pending(), a hosted lease's pull (security audit F-10).
+  | { kind: "direct"; message: DirectMessage & { other_user?: true } }
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
@@ -891,17 +892,26 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(a, "direct", a) }));
-      const direct: DeliveryEvent[] = repo.messages.unreadSince(streams)
-        .slice(0, limit).map(message => ({ kind: "direct", message: showMessage(message) }));
+      const messages = repo.messages.unreadSince(streams).slice(0, limit);
       const seen = new Set<string>();
-      const boards: Pending[] = [];
+      const all: Pending[] = [];
       for (const a of session.addresses) {
         for (const item of pendingFor(db, a, { all: true })) {
           const key = pendingKey(refOf(item));
-          if (!seen.has(key)) { seen.add(key); boards.push(item); }
+          if (!seen.has(key)) { seen.add(key); all.push(item); }
         }
       }
-      return [...direct, ...boards.slice(0, limit - direct.length).map(item => ({ kind: "board" as const, item }))];
+      const boards = all.slice(0, limit - messages.length);
+      // Security audit F-10: what another signed-in user wrote is marked
+      // other_user, by the user recorded at write time, never the address's
+      // spelling (a team alias or an ID names no user). The user isn't shown.
+      const writers = repo.messages.writerUsers(messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
+      const other = (user: string | undefined) => user !== undefined && user !== session.authed.user_email;
+      const markPost = <P extends { id: number }>(post: P): P => other(writers.posts.get(post.id)) ? { ...post, other_user: true } : post;
+      return [
+        ...messages.map((m): DeliveryEvent => ({ kind: "direct", message: other(writers.messages.get(m.id)) ? { ...showMessage(m), other_user: true } : showMessage(m) })),
+        ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push" ? { ...item, post: markPost(item.post) } : { ...item, latest: markPost(item.latest) } })),
+      ];
     },
     boardCatalog(session: ApplicationSession, after?: string) {
       valid(session, true);
@@ -1152,7 +1162,7 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null);
+    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1319,6 +1329,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     human: session.human,
     ...(session.writerId ? { session: session.writerId } : {}),
     ...(session.via ? { via: session.via } : {}),
+    user: session.authed.user_email,
     addresses: session.addresses,
     ...(session.readOnly ? { reader: seer(hub.repo, session) } : {}),
     ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),

@@ -296,6 +296,10 @@ export function initCoreSchema(db: Database): void {
   // null for a root's own writes. Stored at write time: a hosted child's
   // source row is gone once it ends, so childhood can't be derived at read.
   if (!postCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE posts ADD COLUMN via TEXT`);
+  // The writer's signed-in user on a server (security audit F-10), so a reader
+  // of another user can be told so; null locally, for posts from before it,
+  // and for system posts. Never shown on reads (POST_COLS).
+  if (!postCols.some((c) => c.name === "author_user")) db.exec(`ALTER TABLE posts ADD COLUMN author_user TEXT`);
 
   // The principal an upload counts against (#284 decision 13): a server
   // user's email, null in local mode. Backfilled from the uploader's "email/"

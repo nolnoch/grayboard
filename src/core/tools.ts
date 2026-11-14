@@ -432,6 +432,8 @@ export type ToolContext = {
   human?: boolean;
   session?: string;
   via?: string;
+  // The caller's signed-in user, on a server: recorded on its posts (author_user).
+  user?: string;
   addresses?: string[];
   // A reader with no address (an unbound hosted session): board_list,
   // board_read, claim_list and peer_list judge board visibility by it
@@ -484,7 +486,7 @@ export function callBoardTool(
         str(a, "board"),
         str(a, "body"),
         optNum(a, "parent_id") ?? null,
-        { online: ctx.online, author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
+        { online: ctx.online, author_id: ctx.session, author_user: ctx.user, via: ctx.via, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
       );
       const isViewer = viewers(db);
       const result: BoardPostResult = {
@@ -560,6 +562,7 @@ export function callBoardTool(
         addresses: ctx.addresses,
         session: ctx.session,
         via: ctx.via,
+        user: ctx.user,
       });
       const { wake, boards, ...rest } = r;
       return { result: rest, wake, boards };
@@ -567,7 +570,7 @@ export function callBoardTool(
 
     case "claim_release": {
       const key = str(a, "key");
-      const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session, via: ctx.via });
+      const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user });
       return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake, boards };
     }
 
