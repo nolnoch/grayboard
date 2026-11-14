@@ -372,6 +372,10 @@ export function createPlugin(o: PluginOptions): Plugin {
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() as ListedTool[] }));
     s.setRequestHandler(CallToolRequestSchema, async req => await call(req.params.name, req.params.arguments ?? {}, req.params._meta) as ServerResult);
     s.oninitialized = () => {
+      // Spends JSON-RPC request id 0 (the SDK numbers requests synchronously):
+      // the SDK's cancel handler, which Claude Code 2.1.316 bundles, ignores a
+      // cancel of id 0, so a sign-in prompt given it could never be withdrawn (#713).
+      void s.ping().catch(() => {});
       initialized = true;
       markInitialized();
       // A session without a grant offers the sign-in at once.

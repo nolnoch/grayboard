@@ -75,8 +75,9 @@ const leaseClosed = (id: string) => srv.app.db.query<{ n: number }, [string]>(
 
 type Elicit = { url: string; message: string };
 // completed: elicitation ids the plugin completed; withdrawn: ids whose request it
-// cancelled (notifications/cancelled).
-type Plugin = Session & { elicits: Elicit[]; completed: string[]; withdrawn: string[] };
+// cancelled (notifications/cancelled), recorded by request id (#713).
+// aborted: ids whose handler the SDK's own cancel handler aborted, as Claude Code's does.
+type Plugin = Session & { elicits: Elicit[]; completed: string[]; withdrawn: string[]; aborted: string[] };
 
 // One Claude Code session's plugin server. `flags` are Claude Code's own;
 // `answer` answers each URL elicitation (default: accept and complete the
@@ -84,7 +85,7 @@ type Plugin = Session & { elicits: Elicit[]; completed: string[]; withdrawn: str
 async function plugin(id: string, o: {
   flags?: string[]; answer?: (e: Elicit) => Promise<ElicitResult["action"]>; elicit?: boolean; before?: ClientShape["before"]; env?: Record<string, string>;
 } = {}): Promise<Plugin> {
-  const elicits: Elicit[] = [], completed: string[] = [], withdrawn: string[] = [];
+  const elicits: Elicit[] = [], completed: string[] = [], withdrawn: string[] = [], aborted: string[] = [];
   const ids = new Map<string | number, string>(); // JSON-RPC request id → elicitation id
   const answer = o.answer ?? (async (e) => { void browse(srv.issuer, e.url, "Claude Code"); return "accept"; });
   const s = await mcpSession({
@@ -105,6 +106,7 @@ async function plugin(id: string, o: {
           const p = req.params as { mode?: string; url: string; message: string; elicitationId: string };
           expect(p.mode).toBe("url");
           ids.set(extra.requestId, p.elicitationId);
+          extra.signal.addEventListener("abort", () => aborted.push(p.elicitationId), { once: true });
           const e = { url: p.url, message: p.message };
           elicits.push(e);
           return { action: await answer(e) };
@@ -112,15 +114,17 @@ async function plugin(id: string, o: {
         // Recorded by request id, not through the handler's abort signal: the
         // SDK's own cancel handler (Claude Code 2.1.316 bundles the same) skips
         // request id 0, which is the plugin's first prompt (#713).
+        const builtin = (c as unknown as { _notificationHandlers: Map<string, (n: unknown) => Promise<void>> })._notificationHandlers.get("notifications/cancelled")!;
         c.setNotificationHandler(CancelledNotificationSchema, async (n) => {
           const id = n.params.requestId === undefined ? undefined : ids.get(n.params.requestId);
           if (id) withdrawn.push(id);
+          await builtin(n);
         });
         c.setNotificationHandler(ElicitationCompleteNotificationSchema, async (n) => { completed.push(n.params.elicitationId); });
       },
     },
   });
-  return Object.assign(s, { elicits, completed, withdrawn });
+  return Object.assign(s, { elicits, completed, withdrawn, aborted });
 }
 
 // A tool result's text blocks, error or not.
@@ -478,6 +482,8 @@ test("a sign-in denied in the browser: the flow fails, its unanswered prompt is 
   await browse(srv.issuer, s.elicits[0]!.url, "Claude Code", "deny");
   await until(() => s.stderr().includes("sign-in failed (startup"), 15_000, "the failed flow");
   await until(() => s.withdrawn.length === 1, 10_000, "the prompt's withdrawal");
+  // The SDK's handler, which skips request id 0, aborted it too: the plugin spent id 0 on a ping (#713).
+  await until(() => s.aborted.length === 1, 5_000, "the SDK's cancel handler to abort the prompt");
   expect(s.completed).toEqual([]);
   expect(linkFile(s)).toBe(false);
   // The withdrawal isn't an unanswered prompt: the flow's failure is the one line.
