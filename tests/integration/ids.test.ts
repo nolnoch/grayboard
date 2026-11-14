@@ -262,7 +262,7 @@ test("race: a send that commits before the end's transaction is bounced to its s
   await until(() => be.pushes.some((p) => p.meta.kind === "bounce"));
   const bounce = be.pushes.find((p) => p.meta.kind === "bounce")!;
   expect(bounce.meta.parent_id).toBe(String(sent.message_id));
-  expect(bounce.content).toContain(`${id} ended at`);
+  expect(bounce.content).toContain(`\`${id}\` ended at`);
   expect((await be.call("dm_inbox", {})).unanswered).toContainEqual(expect.objectContaining({ id: Number(bounce.meta.message_id), from: id, kind: "bounce" }));
 }, 30_000);
 

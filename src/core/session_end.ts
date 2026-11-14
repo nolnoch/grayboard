@@ -65,18 +65,27 @@ export function endSession(
   testPause("end:in-txn");
 
   const wake = new Set<string>();
-  const body = bounceBody(id, now, held);
+  // One bounce per sender (#334), threaded under its latest unread message
+  // and naming the others. `bounced` and `unbounced` count messages.
+  const bySender = new Map<string, number[]>();
+  for (const m of mail.unread(id)) {
+    const ids = bySender.get(m.sender);
+    if (ids) ids.push(m.id);
+    else bySender.set(m.sender, [m.id]);
+  }
   let bounced = 0;
   let unbounced = 0;
-  for (const m of mail.unread(id)) {
-    // A bounce to an ID that has itself ended would only bounce back.
-    if (isEndedId(db, m.sender)) {
-      unbounced++;
+  for (const [sender, ids] of bySender) {
+    // A bounce to an ID that has ended would only bounce back, and one whose
+    // row is gone (pruned) can never be read.
+    if (!liveIdOrAlias(db, sender)) {
+      unbounced += ids.length;
       continue;
     }
-    mail.bounce(id, m.sender, m.id, body, now);
-    bounced++;
-    wake.add(m.sender);
+    const latest = Math.max(...ids);
+    mail.bounce(id, sender, latest, bounceBody(id, now, held, ids.filter((x) => x !== latest).sort((a, b) => a - b)), now);
+    bounced += ids.length;
+    wake.add(sender);
   }
 
   // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.
@@ -128,18 +137,21 @@ export function endSession(
   return { ended: true, held, wake: [...wake] };
 }
 
-function isEndedId(db: Database, address: string): boolean {
-  if (addressParts(address)?.kind !== "id") return false;
+/** False for an ID sender that has ended or whose row is gone; an alias is durable, so always true. */
+function liveIdOrAlias(db: Database, address: string): boolean {
+  if (addressParts(address)?.kind !== "id") return true;
   const r = db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(address) as { ended_at: number | null } | null;
-  return r?.ended_at != null;
+  return r != null && r.ended_at == null;
 }
 
 function heldText(held: string[]): string {
   return held.length ? `it held ${held.map((a) => `\`${a}\``).join(", ")}` : "it held no alias";
 }
 
-export function bounceBody(id: string, endedAt: number, held: string[]): string {
-  return `${id} ended at ${new Date(endedAt).toISOString()} before reading this; ${heldText(held)}.`;
+/** A bounce's text. `earlier`: the sender's other unread message ids, ascending; the bounce threads under the latest. */
+export function bounceBody(id: string, endedAt: number, held: string[], earlier: number[] = []): string {
+  const also = earlier.length ? ` or your earlier ${earlier.length === 1 ? "message" : "messages"} ${earlier.join(", ")}` : "";
+  return `\`${id}\` ended at ${new Date(endedAt).toISOString()} before reading this${also}; ${heldText(held)}.`;
 }
 
 /**
