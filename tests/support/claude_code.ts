@@ -16,7 +16,7 @@
 // - the dev-channels warning is the one dialog; the driver confirms it.
 // The prompt is typed once the plugin's MCP server is up: a prompt given on
 // the command line goes to the model before MCP tools exist.
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanEnv } from "./env.ts";
 import { CACHE } from "./releases.ts";
@@ -42,12 +42,29 @@ export function claudeCodeBin(): string {
   return bin;
 }
 
-export type ClaudeHome = { dir: string; config: string; home: string; work: string; env: Record<string, string> };
+export type ClaudeHome = { dir: string; config: string; home: string; work: string; env: Record<string, string>; bunStderr: string };
 
-/** A scratch Claude Code: config dir, HOME and a trusted work dir under `dir`, talking to `modelUrl`. */
+// Claude Code's debug log keeps only the first stderr line of a plugin's MCP
+// server (#506), so the plugin's own log (sign-in lines among them) would be
+// lost. Every `bun` Claude Code starts (the plugin's server and its hooks)
+// resolves through PATH to this shim first, which runs this test's bun with
+// stderr copied to `log` and still passed on to Claude Code. `exec` keeps the
+// pid, so Claude Code's signals reach bun itself.
+function bunShim(dir: string, log: string): string {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  const q = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`;
+  writeFileSync(join(bin, "bun"), `#!/usr/bin/env bash\nexec ${q(process.execPath)} "$@" 2> >(tee -a ${q(log)} >&2)\n`);
+  chmodSync(join(bin, "bun"), 0o755);
+  return bin;
+}
+
+/** A scratch Claude Code: config dir, HOME and a trusted work dir under `dir`, talking to `modelUrl`; the stderr of every `bun` it runs is copied to `bunStderr`. */
 export function claudeHome(dir: string, modelUrl: string, allow: string[] = []): ClaudeHome {
   const config = join(dir, "config"), home = join(dir, "home"), work = join(dir, "work");
   for (const d of [config, home, work]) mkdirSync(d, { recursive: true });
+  const bunStderr = join(dir, "bun-stderr.log");
+  const shim = bunShim(dir, bunStderr);
   writeFileSync(join(config, ".claude.json"), JSON.stringify({
     hasCompletedOnboarding: true,
     customApiKeyResponses: { approved: [FAKE_KEY.slice(-20)], rejected: [] },
@@ -65,7 +82,8 @@ export function claudeHome(dir: string, modelUrl: string, allow: string[] = []):
     CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF: "1",
     ENABLE_TOOL_SEARCH: "false",
   });
-  return { dir, config, home, work, env };
+  env.PATH = `${shim}:${env.PATH ?? ""}`;
+  return { dir, config, home, work, env, bunStderr };
 }
 
 /** A non-interactive `claude <args>` in `h`; throws with its output unless it exits 0. */
