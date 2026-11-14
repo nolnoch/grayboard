@@ -15,7 +15,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi
 import { version } from "../../package.json" with { type: "json" };
 import type { Level } from "../hosted-core/src/client.ts";
 import { loadMode } from "../hosted-core/src/proxy.ts";
-import { COMMAND, createGrayboard, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
+import { COMMAND, createGrayboard, factReader, toolArgs, toolResult, type Grayboard, type Marker, type ShutdownReason, type StartReason } from "./extension.ts";
 import { registry, rootOf } from "./omp-ancestry.ts";
 import { instructionHooks, modelName } from "./omp-instructions.ts";
 
@@ -64,6 +64,7 @@ export default function grayboard(pi: ExtensionAPI) {
     else pi.logger.info(message);
     show(message, level);
   };
+  const readFacts = factReader(message => notify(message, "warning"));
 
   // Read at each register, so a subagent revived after its main session
   // moved on (/new) registers under the root that is live now.
@@ -114,11 +115,10 @@ export default function grayboard(pi: ExtensionAPI) {
     // Like `record`: between omp's switch and session_switch, ctx already
     // shows the next session's model, so only the session it names answers.
     // omp's `inherit` names no level of its own: it's none, and clears the server's (#558).
-    facts: sessionID => {
-      if (ctx?.sessionManager.getSessionId() !== sessionID) return undefined;
-      const effort = pi.getThinkingLevel();
-      return { model: ctx.model ? modelName(ctx.model) : null, effort: effort && effort !== "inherit" ? effort : null };
-    },
+    facts: sessionID => ctx?.sessionManager.getSessionId() === sessionID ? readFacts(sessionID, {
+      model: () => ctx?.model ? modelName(ctx.model) : null,
+      effort: () => { const effort = pi.getThinkingLevel(); return effort && effort !== "inherit" ? effort : null; },
+    }) : undefined,
   });
 
   const begin = async (context: ExtensionContext, reason: StartReason) => {

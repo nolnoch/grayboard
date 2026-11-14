@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
-import { createGrayboard, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { createGrayboard, factReader, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
@@ -1136,3 +1136,15 @@ test("a /grayboard login pending across a session switch leaves an outcome that 
   expect(b.notices.filter(n => n.message === SIGNED_IN.message)).toHaveLength(1);
   expect(await b.ext.status()).toMatch(LAST("command", "signed in"));
 }, 30_000);
+
+test("factReader reads each fact on its own: a throwing effort keeps the model, leaves effort out, and is said once per session (#547)", () => {
+  const warned: string[] = [];
+  const read = factReader(m => warned.push(m));
+  const readers = { model: () => "anthropic/claude-opus-5-5", effort: (): string | null => { throw new Error("thinking level gone"); } };
+  expect(read("s1", readers)).toEqual({ model: "anthropic/claude-opus-5-5" });
+  expect(read("s1", readers)).toEqual({ model: "anthropic/claude-opus-5-5" });
+  expect(warned).toEqual(["grayboard: couldn't read session s1's effort; the server keeps its last one: thinking level gone"]);
+  expect(read("s2", { model: () => { throw new Error("no model"); }, effort: () => null })).toEqual({ effort: null });
+  expect(warned).toHaveLength(2);
+  expect(read("s1", { model: () => null, effort: () => "high" })).toEqual({ model: null, effort: "high" });
+});
