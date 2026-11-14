@@ -109,17 +109,25 @@ export function putSignIn(base: string, claudePid: number, url: string, now = Da
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   put(join(dir, SIGN_IN), JSON.stringify({ url, at: now }));
 }
+// The sign-in file holds one JSON object with a URL of at most 2048 characters.
+const SIGN_IN_MAX = 16_384;
 /**
  * Removes the session's sign-in link: with `url`, only that flow's, so a flow
- * that ended never removes a newer one's. Throws on a read or removal that
- * fails other than for a missing file.
+ * that ended never removes a newer one's. A link, FIFO, other non-regular or
+ * oversized file there is no flow's and stays (the next putSignIn renames over
+ * it, #588). Throws on a read or removal that fails other than for a missing file.
  */
 export function dropSignIn(base: string, claudePid: number, url?: string): void {
   const path = join(sessionDir(base, claudePid), SIGN_IN);
   if (url !== undefined) {
     let text: string;
-    try { text = readFileSync(path, "utf8"); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    try { text = readSmall(path, SIGN_IN_MAX); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // readSmall's own refusals (not a regular file, too large) carry no code.
+      if (code === "ENOENT" || code === "ELOOP" || code === undefined) return;
+      throw error;
+    }
     let held: unknown;
     try { held = (JSON.parse(text) as { url?: unknown }).url; } catch { return; }
     if (held !== url) return;
@@ -129,7 +137,8 @@ export function dropSignIn(base: string, claudePid: number, url?: string): void 
 /** The live sign-in link in `dir`, or undefined: none, malformed, too long, not an authorization URL's shape (HTTPS, or HTTP on loopback), or older than a flow. */
 export function readSignIn(dir: string, now = Date.now()): string | undefined {
   try {
-    const value = JSON.parse(readFileSync(join(dir, SIGN_IN), "utf8")) as { url?: unknown; at?: unknown };
+    // Never following a link or waiting on a FIFO a same-user process planted (#588).
+    const value = JSON.parse(readSmall(join(dir, SIGN_IN), SIGN_IN_MAX)) as { url?: unknown; at?: unknown };
     if (typeof value.url !== "string" || typeof value.at !== "number") return undefined;
     const age = now - value.at;
     if (!(age >= 0 && age <= SIGN_IN_FLOW_MS)) return undefined;
@@ -211,7 +220,10 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       pruneEnded(ended);
     } else if (event === "session-end") {
       // Keep attribution and facts across clear, not the outgoing permission to resume.
-      if (input.reason === "clear") {
+      // Hosted: /resume also ends a session in a process that lives on, with its
+      // MCP server and any sign-in flow, so its dir stays too (#588; the next
+      // session-start resets the facts).
+      if (input.reason === "clear" || (o.hosted && input.reason === "resume")) {
         if (!o.hosted) rmSync(join(dir, "current"), { force: true });
         return;
       }

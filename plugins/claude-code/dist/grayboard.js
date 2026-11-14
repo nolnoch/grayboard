@@ -37741,14 +37741,16 @@ function putSignIn(base, claudePid, url, now = Date.now()) {
   mkdirSync2(dir, { recursive: true, mode: 448 });
   put(join5(dir, SIGN_IN), JSON.stringify({ url, at: now }));
 }
+var SIGN_IN_MAX = 16384;
 function dropSignIn(base, claudePid, url) {
   const path = join5(sessionDir(base, claudePid), SIGN_IN);
   if (url !== undefined) {
     let text;
     try {
-      text = readFileSync4(path, "utf8");
+      text = readSmall(path, SIGN_IN_MAX);
     } catch (error) {
-      if (error.code === "ENOENT")
+      const code = error.code;
+      if (code === "ENOENT" || code === "ELOOP" || code === undefined)
         return;
       throw error;
     }
