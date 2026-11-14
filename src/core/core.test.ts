@@ -549,6 +549,13 @@ test("claims are exclusive, renewable, and expire", () => {
   expect(claim(db, "sim", "ticket:ENG-142")).toMatchObject({ ok: true, renewed: false });
 });
 
+// #81: an unknown board refuses with post's wording and writes nothing.
+test("claim_take on a board that doesn't exist is refused by name, not by a foreign key", () => {
+  expect(() => claim(db, "be", "ticket:ENG-142", { board: "e2ee" })).toThrow("no such board #e2ee; see board_list");
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claims`).get()).toEqual({ n: 0 });
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_events`).get()).toEqual({ n: 0 });
+});
+
 test("claim_events keeps each claim's history after the row is gone", () => {
   claim(db, "be", "ticket:ENG-142", { note: "signature work", board: "e2e" });
   claim(db, "sim", "ticket:ENG-142", { note: "me too" });
