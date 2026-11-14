@@ -62,6 +62,22 @@ const RESTART_DELAYS_MS = [0, 1_000, 5_000];
 const STABLE_MS = 60_000;
 // How long a killed child gets to exit before SIGKILL, as in the omp adapter.
 const EXIT_WAIT_MS = 1_500;
+// How long a child gets to end its session after its stdin closes at
+// session_shutdown, before it is killed. pi awaits the handler unbounded.
+const END_WAIT_MS = 3_000;
+
+// Ends a child that is still running: SIGTERM, then SIGKILL after EXIT_WAIT_MS
+// (logged, so a forced kill doesn't read as a slow end), then its exit.
+async function terminate(proc: ChildProcess, log: (text: string) => void): Promise<void> {
+  const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+  if (proc.exitCode !== null || proc.signalCode !== null || !proc.pid) return;
+  proc.kill();
+  const force = setTimeout(() => {
+    log(`grayboard: process ${proc.pid} still running ${EXIT_WAIT_MS} ms after SIGTERM; sent SIGKILL`);
+    proc.kill("SIGKILL");
+  }, EXIT_WAIT_MS);
+  try { await exited; } finally { clearTimeout(force); }
+}
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -210,8 +226,6 @@ export default function grayboard(pi: ExtensionAPI) {
     // since /new, /resume and fork change the id.
     const env = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: PARENT_SESSION, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
     const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "inherit"] });
-    const exited = Promise.withResolvers<void>();
-    proc.once("exit", () => exited.resolve());
     const pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
     let next = 1;
     let gone: Error | undefined;
@@ -246,11 +260,7 @@ export default function grayboard(pi: ExtensionAPI) {
       // EPIPE can happen while the child is still alive. Kill it and wait for
       // its exit (SIGKILL after EXIT_WAIT_MS) before a replacement, so it
       // can't linger as a second delivery owner or keep its names (#599).
-      const ending = proc.exitCode !== null || proc.signalCode !== null || !proc.pid ? Promise.resolve() : (async () => {
-        proc.kill();
-        const force = setTimeout(() => proc.kill("SIGKILL"), EXIT_WAIT_MS);
-        try { await exited.promise; } finally { clearTimeout(force); }
-      })();
+      const ending = terminate(proc, (text) => report(ctx, text, "warning"));
       stopping = ending;
       if (Date.now() - startedAt >= STABLE_MS) restarts = 0;
       const attempt = restarts;
@@ -408,7 +418,7 @@ export default function grayboard(pi: ExtensionAPI) {
 
   // Also fires before /new, /resume, and fork, which start the session again:
   // wait for the child to exit so the next one can take the name.
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     // /new, /resume, fork and quit must not leave a backoff that can spawn
     // a child for the outgoing session after the next session starts.
     restart?.cancel();
@@ -422,7 +432,7 @@ export default function grayboard(pi: ExtensionAPI) {
     const { proc } = c;
     const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
     proc.stdin!.end();
-    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 3000))]);
-    if (proc.exitCode === null) proc.kill();
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, END_WAIT_MS))]);
+    await terminate(proc, (text) => report(ctx, text, "warning"));
   });
 }

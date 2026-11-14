@@ -49,6 +49,8 @@ const PREFIX = `mcp__${SERVER.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace
 const AGENT_META = "io.github.nolnoch.grayboard/agent";
 // omp gives session_shutdown handlers 2 s; the grayboard process gets most of it to end its session.
 const EXIT_WAIT_MS = 1_500;
+// At quit, what is left of those 2 s for a SIGTERM to work before SIGKILL.
+const QUIT_KILL_MS = 400;
 // An unexpected exit restarts the grayboard process after each delay in turn,
 // as omp's MCP manager restarted its stdio servers; one more exit gives up.
 // A process that ran STABLE_MS before exiting starts the count over.
@@ -89,11 +91,26 @@ type Shared = {
   // Consecutive restarts, and the one waiting to start.
   restarts?: number;
   restart?: Promise<void>;
+  // The exit of the last child fail() killed; quit waits for it.
+  stopping?: Promise<void>;
   exitReason?: string;
   instructions?: string;
 };
 const KEY = Symbol.for("io.github.nolnoch.grayboard/omp-local");
 const shared = ((globalThis as Record<symbol, unknown>)[KEY] ??= {}) as Shared;
+
+// Ends a child that is still running: SIGTERM, then SIGKILL after waitMs
+// (logged, so a forced kill doesn't read as a slow end), then its exit.
+async function terminate(proc: ChildProcess, waitMs: number, log: (text: string) => void): Promise<void> {
+  const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+  if (proc.exitCode !== null || proc.signalCode !== null || !proc.pid) return;
+  proc.kill();
+  const force = setTimeout(() => {
+    log(`grayboard: process ${proc.pid} still running ${waitMs} ms after SIGTERM; sent SIGKILL`);
+    proc.kill("SIGKILL");
+  }, waitMs);
+  try { await exited; } finally { clearTimeout(force); }
+}
 
 // Whether a subagent belongs to the top-level session that runs grayboard:
 // its chain of parentIds reaches the owner's agent, and no other live
@@ -360,8 +377,6 @@ export default function grayboard(pi: ExtensionAPI) {
     const selection = shared.selected!;
     const env = { ...own.env, BUS_HARNESS_SESSION: selection.id, BUS_ADAPTER_OWNER: own.protocol ? owner : undefined };
     const proc = spawn(own.cmd, own.args, { cwd: own.cwd ?? selection.ctx.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
-    const exited = Promise.withResolvers<void>();
-    proc.once("exit", () => exited.resolve());
     const pending = new Map<number, PromiseWithResolvers<unknown>>();
     let next = 1;
     let gone: Error | undefined;
@@ -396,11 +411,8 @@ export default function grayboard(pi: ExtensionAPI) {
       // EPIPE can happen while the child is still alive. Kill it and wait for
       // its exit (SIGKILL after EXIT_WAIT_MS) before a replacement, so it
       // can't linger as a second delivery owner or keep its names (#580).
-      const ending = proc.exitCode !== null || proc.signalCode !== null || !proc.pid ? Promise.resolve() : (async () => {
-        proc.kill();
-        const force = setTimeout(() => proc.kill("SIGKILL"), EXIT_WAIT_MS);
-        try { await exited.promise; } finally { clearTimeout(force); }
-      })();
+      const ending = terminate(proc, EXIT_WAIT_MS, (text) => pi.logger.warn(text));
+      shared.stopping = ending;
       if (Date.now() - startedAt >= STABLE_MS) shared.restarts = 0;
       const attempt = shared.restarts ?? 0;
       if (shared.owner !== pi || attempt >= RESTART_DELAYS_MS.length) {
@@ -617,11 +629,14 @@ export default function grayboard(pi: ExtensionAPI) {
     shared.child = undefined;
     shared.restart = undefined;
     shared.exitReason = "grayboard: the main omp session ended";
+    // A child fail() killed must be gone before omp exits, or its SIGKILL
+    // timer dies with omp and a child ignoring SIGTERM outlives it (#604).
+    await shared.stopping;
     if (!c) return;
     const exited = Promise.withResolvers<void>();
     c.proc.once("exit", () => exited.resolve());
     c.proc.stdin!.end();
     await Promise.race([exited.promise, Bun.sleep(EXIT_WAIT_MS)]);
-    if (c.proc.exitCode === null && c.proc.signalCode === null) c.proc.kill();
+    await terminate(c.proc, QUIT_KILL_MS, (text) => pi.logger.warn(text));
   });
 }

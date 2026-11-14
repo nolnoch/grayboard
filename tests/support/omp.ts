@@ -751,7 +751,7 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
 // (tests/support/stops_reading.ts): the adapter's next write fails with EPIPE,
 // and it kills that process before the replacement starts, so the replacement
 // takes the name back and no stale delivery owner remains (#580).
-export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
+export function ompLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?: boolean } = {}): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
@@ -774,7 +774,7 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
     try {
       installLocal(dir, model.port, [process.execPath, join(ROOT, "tests/support/stops_reading.ts")]);
       peer = await localSession(dir, "peer");
-      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING });
+      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_STOP_READING: join(dir, "stopped"), BUS_TEST_STOP_READING_ON: STOP_READING, ...(opts.ignoreSigterm ? { BUS_TEST_IGNORE_SIGTERM: "1" } : {}) });
       await omp.command({ type: "get_state" }, 30_000);
       const holder = () => localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-580'")[0]?.id;
       await omp.command({ type: "prompt", message: "bind" });
@@ -796,6 +796,13 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       await until(() => { const h = holder(); return h !== undefined && h !== first ? h : undefined; }, 15_000, "omp-580 held by the replacement");
       const replacement = grayboards(omp.pid);
       expect(replacement).toHaveLength(2);
+      if (opts.ignoreSigterm) {
+        // Only the SIGKILL ended the relay, and the replacement waited for it.
+        const sigterm = Number(readFileSync(join(dir, "stopped.sigterm"), "utf8"));
+        const started = Number(readFileSync(join(dir, "stopped.started"), "utf8"));
+        expect(started - sigterm).toBeGreaterThanOrEqual(1_400);
+        await until(() => ompLog(dir).includes("sent SIGKILL"), 5_000, "the SIGKILL reported");
+      }
       expect(localRows<{ ended_at: number | null }>(dir, "SELECT ended_at FROM ids WHERE id = ?", first)[0]?.ended_at).not.toBeNull();
 
       await omp.command({ type: "prompt", message: "who" });
@@ -806,7 +813,7 @@ export function ompLocalStopsReadingScenario(dir: string): Promise<void> {
       await omp.quit();
       await until(() => !replacement.some(alive), 5_000, "the replacement ended with omp");
     } finally {
-      for (const p of seen) { try { process.kill(p, "SIGKILL"); } catch {} }
+      for (const p of seen) { if (alive(p)) try { process.kill(p, "SIGKILL"); } catch {} }
       await stopAll(procs);
       if (peer) await stopSession(peer.c);
       model.stop();
