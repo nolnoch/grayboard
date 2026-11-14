@@ -82,6 +82,7 @@ export type AuditAction =
   | "id.promoted"
   | "id.reattached"
   | "id.registered"
+  | "id.reopened"
   | "id.reused"
   | "id.signed_in_local"
   | "message.retracted"

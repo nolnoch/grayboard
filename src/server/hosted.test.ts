@@ -1160,3 +1160,44 @@ test("a failed heartbeat write is reported and retried on the next tick", async 
     await until(() => database.repo.hosted.aliveAt() === now, 5_000);
   } finally { write.mockRestore(); errors.mockRestore(); }
 });
+
+// #475 items 1 and 7a: a released child's ID ends with the release's own reason, and an ID that comes back
+// as a root reopens its row, so every session holding an alias has an unended row (revocation,
+// deletion and retention all filter on ended_at IS NULL).
+const idEnd = (id: string) => database.db.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(id)?.ended_at ?? null;
+const endedWhy = (id: string) => childAudits("id.ended").filter(a => a.target === id).map(a => a.why);
+test("a released child's ID ends with the release's reason, not at the next start (#475 item 1)", async () => {
+  hosted.limits.parked = 1;
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  for (const raw of ["closed", "evicted", "kept"]) { await hosted.register(principal, context("root"), raw); now += 1000; }
+  await hosted.end(principal, context("closed"));
+  expect(idEnd(hostedId("closed"))).toBe(now);
+  expect(endedWhy(hostedId("closed"))).toEqual(["closed"]);
+  now += 900_001; hosted.sweep();
+  expect(database.repo.hosted.get(hostedId("evicted"))).toBeUndefined();
+  expect(endedWhy(hostedId("evicted"))).toEqual(["evicted"]);
+  // A root's end takes its children with it, each ended with the root's reason.
+  await hosted.end(principal, context("root"));
+  expect(endedWhy(hostedId("kept"))).toEqual(["closed"]);
+  expect(idEnd(hostedId("root"))).toBeNull();
+  // Nothing is left for the startup sweep to label a WSS leftover.
+  hosted.close(); application.stopExpiry();
+  application = createApplication(database.repo, database.db);
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  expect(childAudits("id.ended").filter(a => a.why === "wss_removed")).toEqual([]);
+});
+
+test("an ended ID that comes back as a root reopens its row, audited, and its alias is revocable (#475 item 7a)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  await hosted.end(principal, context("child"));
+  // A row an earlier release ended at a restart (`wss_removed`) reopens the same way.
+  const endedAt = now - 60_000;
+  database.db.run("UPDATE ids SET ended_at = ? WHERE id = ?", [endedAt, hostedId("child")]);
+  now += 1000;
+  await hosted.bind(principal, context("child"), { name: "fe", create: true });
+  expect(idEnd(hostedId("child"))).toBeNull();
+  expect(database.db.query("SELECT held_aliases_json, root_id FROM ids WHERE id = ?").get(hostedId("child"))).toEqual({ held_aliases_json: null, root_id: null });
+  expect(childAudits("id.reopened")).toEqual([expect.objectContaining({ target: hostedId("child"), ended_at: endedAt })]);
+  expect(aliasUser(database.db, "you@example.com/fe")).toBe(hostedId("child"));
+});

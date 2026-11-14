@@ -158,6 +158,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
 - On a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus, and prints the `setup-opencode` command that reaches the server, with the URL's credentials stripped (#474); the entry's `grayboard mcp` already says on stderr that it serves the local bus (#491). Proof: `src/cli/opencode-setup.test.ts` ("(#474)").
+- #475: an ID whose session ended comes back differently per mode, on purpose: hosted reopens its row (the ID is the harness's own and can't change), local refuses it `id_collision` (`registerId`).
 - #427: pi's `pi update --extensions` doesn't refresh the loose-file adapter; only `grayboard update` does.
 
 ## Maintaining parity
