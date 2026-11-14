@@ -12,6 +12,7 @@ import { startRetentionJobs } from "./retention.ts";
 import { createTouchQueue } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
+import { serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
 
 export type StartOptions = ApplicationOptions & {
   hostname?: string;
@@ -129,6 +130,21 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     }, 30_000));
     stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
+  // The lag sampler runs with or without a listener: /healthz will read it (#805).
+  const stopLag = opts.background !== false ? startLagSampler() : undefined;
+  // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
+  const gauges = (): Gauges => {
+    const used = mcp.capacityUsed;
+    return {
+      mcp_admissions: { help: "Hosted MCP admissions held, by capacity kind.", values: (["listen", "legacy", "post", "dormant"] as const).map(kind => ({ value: used[kind], labels: { kind } })) },
+      mcp_exchanges_in_flight: { help: "Hosted MCP exchanges being handled.", values: [{ value: mcp.pendingExchanges }] },
+      hosted_sessions_holding: { help: "Bound hosted sessions this process holds a name for.", values: [{ value: mcp.sessions.holderCount }] },
+      delivery_leases: { help: "Open delivery leases.", values: [{ value: mcp.activeLeases }] },
+      resource_watches: { help: "Open board resource watches.", values: [{ value: mcp.activeWatches }] },
+      hosted_refusal_rows_lost: { help: "Refusal audit rows that failed to write.", values: [{ value: mcp.sessions.refusalRowsLost }] },
+    };
+  };
+  const metrics = config.metricsAddr ? serveMetrics(config.metricsAddr, gauges) : undefined;
 
   return {
     server,
@@ -147,11 +163,15 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
     touches,
+    // The metrics listener, when GRAYBOARD_METRICS_ADDR configured one.
+    metrics,
     stop() {
       if (stopPromise) return stopPromise;
       slack?.stop();
       for (const t of timers) clearInterval(t);
       stopRetention?.();
+      stopLag?.();
+      metrics?.stop(true);
       stopExpiry();
       touches.cancelAll();
       server.stop(true);

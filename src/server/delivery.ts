@@ -7,6 +7,7 @@ import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { countRefusal } from "./metrics.ts";
 
 export type DeliveryPrincipal = OAuthPrincipal;
 export type DeliveryLease = { capability: string; identity: IdentityInfo; expiresAt: number; ownership: number; bind_gen: number };
@@ -96,7 +97,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         // A lease this open replaces (another grant's) frees its slot here, not after the check; a
         // session is one user's, so that slot is this user's.
         const replaced = previous ? 1 : 0;
-        if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) throw new ApplicationError("bad_request", "delivery lease capacity reached");
+        if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
         const expiresAt = now() + ttl;
         store.update({ ...row, lease_deadline: expiresAt, last_seen_at: now() });
         hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null });

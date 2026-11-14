@@ -24,6 +24,7 @@ import { RateLimiter } from "./rate_limit.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimits } from "./config.ts";
 import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
+import { countRefusal, timeTool } from "./metrics.ts";
 
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
@@ -56,6 +57,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const count = counts.get(user) ?? 0;
     const scope = used[kind] >= limit.global ? "global" : count >= limit.perUser ? "user" : undefined;
     if (scope) {
+      countRefusal(`mcp_${kind}`);
       writeAudit(application.repo, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId, ...detail });
       return undefined;
     }
@@ -551,6 +553,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     sessions: hosted,
     delivery,
     get activeContexts() { return contexts.size; },
+    // O(1) reads for the metrics scrape (#805): admissions held per capacity kind, exchanges in flight.
+    get capacityUsed(): Readonly<Record<CapacityKind, number>> { return { ...used }; },
+    get pendingExchanges() { return pendingRequests.size; },
     get activeLeases() { return delivery.activeLeaseCount; },
     get activeResourceContexts() { return principals.size; },
     get activeStreams() { return forwarding.size; },
@@ -585,7 +590,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (legacyPost) { legacyPost.posts--; legacyPost.lastUsed = now(); legacyPost = undefined; }
       };
       if (post) posts++;
-      if (pendingRequests.size >= exchangeCap) { releasePost(); return new Response("MCP exchange capacity reached", { status: 429 }); }
+      if (pendingRequests.size >= exchangeCap) { releasePost(); countRefusal("mcp_exchange"); return new Response("MCP exchange capacity reached", { status: 429 }); }
       let finishRequest!: () => void;
       const pendingRequest = new Promise<void>(resolve => { finishRequest = resolve; });
       pendingRequests.add(pendingRequest);
@@ -756,7 +761,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     let notice: string | undefined;
     try {
       const context = current(ctx);
-      return said(text(await hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }) ?? "ok"), notice);
+      return said(text(await timeTool(tool, () => hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; })) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
@@ -767,7 +772,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
     const context = current(ctx);
     let notice: string | undefined;
-    return said(text(await hosted.whoami(context.principal, context.sessionContext, n => { notice = n; })), notice);
+    return said(text(await timeTool("whoami", () => hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }))), notice);
   });
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
@@ -777,11 +782,11 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
     inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
-    try { const context = current(ctx); return await hosted.bind(context.principal, context.sessionContext, args, context.declared); }
+    try { const context = current(ctx); return await timeTool("bind", () => hosted.bind(context.principal, context.sessionContext, args, context.declared)); }
     catch (e) { return bindRefusal(e, "bind"); }
   });
   server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: HOSTED_UNBIND_INPUT }, async (args, ctx) => {
-    try { const context = current(ctx); return await hosted.unbind(context.principal, context.sessionContext, args, context.declared); }
+    try { const context = current(ctx); return await timeTool("unbind", () => hosted.unbind(context.principal, context.sessionContext, args, context.declared)); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).

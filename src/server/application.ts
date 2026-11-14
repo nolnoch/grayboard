@@ -28,6 +28,7 @@ import {
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
+import { countRefusal } from "./metrics.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
 import { assertDeliverableId, endSession, Undeliverable } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
@@ -926,7 +927,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const board = normalizeBoard(boardInput);
       // Snapshot performs the same concealed access check as content reads.
       snapshot(db, reader(session, board), board, { limit: 1 });
-      if (observers.size >= (opts.observerCap ?? DEFAULT_HOSTED_CAPS.watches.global)) fail("bad_request", "board observer capacity reached");
+      if (observers.size >= (opts.observerCap ?? DEFAULT_HOSTED_CAPS.watches.global)) { countRefusal("board_observer"); fail("bad_request", "board observer capacity reached"); }
       const observer = { session, board, hooks };
       observers.add(observer);
       return () => removeObserver(observer);
