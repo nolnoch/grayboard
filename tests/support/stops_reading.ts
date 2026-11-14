@@ -9,7 +9,10 @@
 // adapter closing stdin ends grayboard through its stdin, as a closed adapter
 // pipe would; after it stopped reading, SIGTERM does so a second later (under
 // the adapter's 1.5 s SIGKILL), as a slow session end would, so a replacement
-// started before the old process exits finds the name still held.
+// started before the old process exits finds the name still held. With
+// $BUS_TEST_IGNORE_SIGTERM=1 it ignores that SIGTERM instead, so only the
+// adapter's SIGKILL ends it (#604); it writes the SIGTERM's time to
+// <marker>.sigterm, and a replacement writes its start time to <marker>.started.
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, writeFileSync } from "node:fs";
 
@@ -23,8 +26,13 @@ const trigger = process.env.BUS_TEST_STOP_READING_ON!;
 const child = spawn(cmd!, args, { stdio: ["pipe", "inherit", "inherit"] });
 child.on("exit", (code) => process.exit(code ?? 1));
 let stopped = false;
-process.on("SIGTERM", () => setTimeout(() => child.stdin!.end(), stopped ? 1_000 : 0));
+const ignoreTerm = process.env.BUS_TEST_IGNORE_SIGTERM === "1";
+process.on("SIGTERM", () => {
+  if (stopped && ignoreTerm) return writeFileSync(`${marker}.sigterm`, String(Date.now()));
+  setTimeout(() => child.stdin!.end(), stopped ? 1_000 : 0);
+});
 let stopping = existsSync(marker);
+if (stopping) writeFileSync(`${marker}.started`, String(Date.now()));
 let buf = "";
 process.stdin.on("end", () => child.stdin!.end());
 process.stdin.setEncoding("utf8").on("data", (chunk: string) => {

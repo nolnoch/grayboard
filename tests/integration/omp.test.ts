@@ -44,6 +44,7 @@ test("omp local: a push-started bind refreshes instructions; a killed child rest
 test("omp local: /new, /fork and /resume rotate actual conversation roots without restarting the child; selected ordered holds and empty snapshots beat outgoing carry; crash restart uses the selected ID (#195)", () => ompLocalResumeScenario(dir), 120_000);
 
 test("omp local: a grayboard that stops reading while it holds the name is killed on EPIPE before the replacement starts, which takes the name back; no stale process remains (#580)", () => ompLocalStopsReadingScenario(dir), 120_000);
+test("omp local: one that also ignores SIGTERM is SIGKILLed, logged, and gone before the replacement starts (#604)", () => ompLocalStopsReadingScenario(dir, { ignoreSigterm: true }), 120_000);
 for (const kind of ["keyed", "human", "runner"] as const) {
   test(`omp excluded local ${kind}: tools and /new retain excluded provenance (#195 audit 2)`, () =>
     localAdapterExcludedScenario(dir, kind, "mcp__grayboard_", (port, procs, identity, env) => {

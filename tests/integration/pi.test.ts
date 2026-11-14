@@ -41,6 +41,7 @@ test("pi: an enabled grayboard MCP entry makes the extension register nothing an
 test("pi: no grayboard at the entry's command fails the extension load with the reason", () => piMissingBinaryScenario(dir), 60_000);
 test("pi: a grayboard that stops reading makes the next write fail with EPIPE, which pi survives and reports", () => piStdinClosedScenario(dir), 60_000);
 test("pi local: a grayboard that stops reading while it holds the name is killed on EPIPE and gone before the replacement starts, which takes the name back; no stale process remains (#599)", () => piLocalStopsReadingScenario(dir), 120_000);
+test("pi local: one that also ignores SIGTERM is SIGKILLed, reported, and gone before the replacement starts (#604)", () => piLocalStopsReadingScenario(dir, { ignoreSigterm: true }), 120_000);
 test("pi hosted load smoke: the embedded bundle loads under Node signed in; session_start sees pi's session id, the MCP client connects, the node:sqlite delivery lock is taken; no grayboard process runs and quit leaves nothing leased", () => piHostedLoadSmoke(dir), 60_000);
 test("pi hosted: signed out it says how to sign in; /grayboard login walks the consent page; bind takes the lease; a DM is one turn whose receipt moves the cursor; files go out with dm_send and come in with attachment_get; no grayboard process runs", () => piHostedScenario(dir), 120_000);
 test("pi hosted: /fork is a new root with its own lease that carries the name, /new carries it, /resume of the first session rebinds its remembered name", () => piHostedCarryScenario(dir), 120_000);
