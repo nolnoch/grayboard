@@ -418,7 +418,8 @@ function noRowHolder(db: Database, name: string, deadRow: boolean): string {
  */
 export type Ended = { ended: string[]; wake: string[] };
 
-export const NOTHING_ENDED: Ended = { ended: [], wake: [] };
+// A fresh empty result each call: callers push into what they get back.
+export const nothingEnded = (): Ended => ({ ended: [], wake: [] });
 
 function merge(into: Ended, id: string, r: EndedSession): void {
   into.ended.push(id);
@@ -474,7 +475,7 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
   const silent = new Set((db.prepare(`SELECT id FROM ids WHERE (delivery = 'none' OR viewer = 1) AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
   const alive = live.filter((r) => !silent.has(r.session_id));
   const orphans = db.prepare(`SELECT id FROM ids WHERE ${ORPHAN_WHERE}`).all() as { id: string }[];
-  if (!dead.length && !orphans.length) return { alive, ...NOTHING_ENDED };
+  if (!dead.length && !orphans.length) return { alive, ...nothingEnded() };
   testPause("end:before-txn");
   // Each candidate ends in its own transaction (#284 S3): one end that fails
   // is logged and audited, and leaves the others ended and this opener
@@ -572,7 +573,7 @@ export async function acquireName(
   testPause("bind:before-txn");
   return db.transaction((): AcquireResult => {
     const now = Date.now();
-    let ended = NOTHING_ENDED;
+    let ended = nothingEnded();
     const refuse = (error: string, extra: { holder?: string; known?: string[] } = {}): AcquireResult => {
       logBinding(db, opts.promote?.child ?? sessionId, name, "refused", extra.holder ?? error, now);
       return { ok: false, error, ...extra, ended };
