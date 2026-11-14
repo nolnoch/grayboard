@@ -3052,3 +3052,52 @@ test("shared (#679): a reload that first makes a fleet share is refused without 
   // The other refusal: a daily cap needs the running retention of a day.
   expect(reloadRefusal({ ...running, retentionMs: 60_000 }, { ...running, limits: { dailyBudgetUsd: 5 } }, true)).toStartWith('"dailyBudgetUsd" needs a running "retentionMs" of at least');
 });
+
+// ── limits: the remaining paths (#657) ───────────────────────────────────────
+
+test("limits (#657): a deadline that fires on a running subtask stops its waiting root and the siblings with it", async () => {
+  const runner = new FakeRunner(["researcher"], true);
+  const { bus, store, done } = loop({ runner, maxConcurrent: 3, fleets: [{ name: "sim", agent: "researcher", limits: { deadlineMs: 800 } }] });
+  bus.deliver(task(7));
+  await until(() => runner.gates.has(7), 5000, "triage runs");
+  runner.gates.get(7)!.resolve({ ok: true, text: PLAN() });
+  await until(() => runner.runs.length === 3, 5000, "both subtasks run");
+  expect(store.get({ source: "board", id: 7 })!.state).toBe("waiting");
+  await until(() => bus.replies(7).some((b) => b.startsWith("[factory] stopped:")), 5000, "the root stopped by its subtask's timer");
+  // No tick ran it (the question clock's is 30 s): the subtasks' clamped timers did.
+  expect(bus.replies(7)[2]).toBe("[factory] stopped: the task passed its deadline of 1s after it fanned out on #sim-work (posts 1001, 1002); its subtasks stop and nothing is combined.");
+  for (const id of [1001, 1002]) {
+    expect(bus.replies(id)).toEqual(["[factory] stopped: the task passed its deadline of 1s while fake agent `researcher` ran."]);
+    expect(store.runs(store.get({ source: "board", id })!.seq).map((r) => r.outcome)).toEqual(["deadline"]);
+  }
+  expect(runner.runs).toHaveLength(3); // no synthesis
+  await bus.close();
+  await done;
+});
+
+test("limits (#657): a per-run budget and a day cap together: the grant is the lesser, and only the day cap holds", async () => {
+  // The per-run cap is first in grant()'s list; a hold looks only past it.
+  const runner = new FakeRunner();
+  runner.meta = () => ({ code: 0, costUsd: 2.5 });
+  const { bus, done } = loop({ runner, maxConcurrent: 1, policy: { allowedTools: [], budgetUsd: 0.005 }, limits: { dailyBudgetUsd: 3 } });
+  bus.deliver(ask(80));
+  await until(() => bus.replies(80).length === 2, 5000, "80 runs under a per-run cap below the least grant: it isn't held");
+  expect(runner.policies[0]!.budgetUsd).toBe(0.005);
+  await bus.close();
+  await done;
+  const r2 = new FakeRunner();
+  r2.meta = () => ({ code: 0, costUsd: 2.5 });
+  const b = loop({ runner: r2, maxConcurrent: 1, policy: { allowedTools: [], budgetUsd: 5 }, limits: { dailyBudgetUsd: 3 } });
+  b.bus.deliver(ask(81));
+  await until(() => b.bus.replies(81).length === 2, 5000, "81 done");
+  expect(r2.policies[0]!.budgetUsd).toBe(3); // the day's $3, not the run's $5
+  b.bus.deliver(ask(82));
+  await until(() => b.bus.replies(82).length === 2, 5000, "82 done");
+  expect(r2.policies[1]!.budgetUsd).toBeCloseTo(0.5, 9); // what the day has left
+  b.bus.deliver(ask(83));
+  await until(() => b.bus.replies(83).length === 1, 5000, "83 taken");
+  expect(b.bus.replies(83)[0]).toContain("queued, held: the factory's daily budget of $3 is spent"); // the day, though the run's $5 is untouched
+  expect(r2.runs.map((r) => r.id)).toEqual([81, 82]);
+  await b.bus.close();
+  await b.done;
+});
