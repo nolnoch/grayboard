@@ -12,9 +12,14 @@ DB_PATH="${GRAYBOARD_DB_PATH:-/var/lib/grayboard/bus.db}"
 BLOB_DIR="${GRAYBOARD_BLOB_DIR:-$(dirname "$DB_PATH")/blobs}"
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET must be set}"
 DATE="$(date -u +%Y-%m-%d)"
-TMP="/tmp/grayboard-backup-${DATE}.sqlite"
+# The snapshot is the whole database: write it only where this user can read it, under a name
+# no other user can predict or pre-create (#92).
+umask 077
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/grayboard-backup.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+TMP="$WORK/${DATE}.sqlite"
 
-sqlite3 "$DB_PATH" ".backup $TMP"
+sqlite3 "$DB_PATH" ".backup '$TMP'"
 aws s3 cp "$TMP" "s3://${S3_BUCKET}/grayboard/${DATE}.sqlite" --storage-class STANDARD_IA
 rm -f "$TMP"
 
