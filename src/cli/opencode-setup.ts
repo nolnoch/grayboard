@@ -1,4 +1,4 @@
-import { lstatSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, symlinkSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, statSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, symlinkSync, readlinkSync, realpathSync, openSync, writeSync, fsyncSync, closeSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -22,6 +22,14 @@ function backupPath(path: string): string {
   let candidate = path + backupSuffix;
   for (let n = 1; info(candidate); n++) candidate = path + backupSuffix + "." + n;
   return candidate;
+}
+
+/** Best effort: makes a completed rename durable where the platform allows a directory fsync. */
+function syncDirectory(path: string): void {
+  try {
+    const fd = openSync(path, "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  } catch {}
 }
 
 function fail(message: string): never {
@@ -208,8 +216,10 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
   const path = resolve(opts.config);
   if (![".json", ".jsonc"].includes(extname(path))) fail("Select an explicit JSON or JSONC config file");
   if (!io(dirname(path), "Cannot inspect config parent", () => statSync(dirname(path))).isDirectory()) fail(`Config parent ${JSON.stringify(dirname(path))} must be a directory (ENOTDIR)`);
+  const existed = info(path) !== undefined;
   const current = document(path);
-  const other = document(sibling(path)).value;
+  const otherDocument = document(sibling(path));
+  const other = otherDocument.value;
   if (other.mcp?.grayboard !== undefined || other.mcp?.servers?.grayboard !== undefined ||
       [other.plugins, other.plugin].some(list => list?.some((entry: unknown) => grayboardPackage(entry, dirname(path))))) fail("Sibling config defines Grayboard; resolve the selected scope's conflicting files manually");
   const desired = { type: "remote", url };
@@ -295,18 +305,36 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
       }
       backedUp = true;
     }
+    if (changed) {
+      // Durable before any adapter moves, so a crash never leaves adapters moved behind a lost write.
+      const fd = openSync(temp, "wx", current.mode);
+      tempCreated = true;
+      try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+    }
     for (const move of moves) {
-      if (info(move.backup) || readFileSync(move.path, "utf8") !== move.source) fail("Adapter changed during setup");
-      renameSync(move.path, move.backup);
+      if (readFileSync(move.path, "utf8") !== move.source) fail("Adapter changed during setup");
+      // link(2) never replaces: a backup created since preflight refuses instead of being overwritten.
+      try { linkSync(move.path, move.backup); }
+      catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") fail("Adapter changed during setup"); throw e; }
+      try { unlinkSync(move.path); }
+      catch (e) { try { unlinkSync(move.backup); } catch {} throw e; }
       moved.push(move);
     }
     if (changed) {
-      writeFileSync(temp, text, { flag: "wx", mode: current.mode });
-      tempCreated = true;
       beforeReplace?.();
       if (document(path).text !== current.text) fail("Config changed during setup");
-      renameSync(temp, path);
+      if (document(sibling(path)).text !== otherDocument.text) fail("Sibling config changed during setup");
+      if (existed) renameSync(temp, path);
+      else {
+        // No config at preflight: a file created since must be kept, never replaced.
+        try { linkSync(temp, path); }
+        catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") fail("Config changed during setup"); throw e; }
+        // The config is in place; a leftover temp name must not roll the committed setup back.
+        tempCreated = false;
+        try { unlinkSync(temp); } catch {}
+      }
       tempCreated = false;
+      syncDirectory(dirname(path));
     }
   } catch (e) {
     let incomplete = false;
