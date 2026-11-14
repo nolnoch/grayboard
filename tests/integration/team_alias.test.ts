@@ -282,13 +282,14 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   await expect(outsider.bind("eng/build", { meta: { task: "mine" } })).rejects.toMatchObject({ code: "forbidden" });
   expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
 
-  // The labels reach a member; a non-member's row has only the session's facts, and match can't probe them.
+  // The labels and the session's facts reach a member; a non-member's row has neither (F-12), and match can't probe them.
   const member = srv.appSession(alice, "fe");
   await member.connect();
   expect(await peerRow(member)).toMatchObject({ task: "ENG-142", source_board: "e2e", harness: "opus" });
   expect(await peerRow(member, { task: "eng-142" })).toBeDefined();
   const seen = (await peerRow(outsider))!;
-  expect(seen).toMatchObject({ handle: "eng/build", harness: "opus" });
+  expect(seen).toMatchObject({ handle: "eng/build" });
+  expect(seen.harness).toBeUndefined();
   expect(seen.task).toBeUndefined();
   expect(seen.source_board).toBeUndefined();
   expect(await peerRow(outsider, { task: "ENG-142" })).toBeUndefined();
