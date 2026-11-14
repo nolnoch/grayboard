@@ -16,7 +16,7 @@ import { askOf, DEFAULTS, hasDailyCap, loadConfig, policyOf, reloadRefusal } fro
 import { parseAgent, readAgents, resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner, type RunMeta } from "../../adapters/factory/runner.ts";
 import { askInstruction, NO_ANSWER, NO_MORE, parseAsk } from "../../adapters/factory/ask.ts";
 import { humanInstruction } from "../../src/core/tools.ts";
-import { DATA_NOTE, MAX_RESULT_CHARS, Relay, RELAY_TOOLS, shimCommand, TREE_TOOLS, treeCall, type ChildTools, type McpServer, type Reader, type Scope } from "../../adapters/factory/relay.ts";
+import { DATA_NOTE, MAX_PROGRESS, MAX_RESULT_CHARS, PROGRESS_TOOL, progressLine, Relay, RELAY_TOOLS, shimCommand, TREE_TOOLS, treeCall, type ChildTools, type McpServer, type Reader, type Scope } from "../../adapters/factory/relay.ts";
 import { Store } from "../../adapters/factory/store.ts";
 import { busKey, mirrorPrefix, normalizeRemote, repoId, type BusMirror } from "../../adapters/factory/mirror.ts";
 import { Workspaces, type Place, type Workdir } from "../../adapters/factory/workdir.ts";
@@ -2462,6 +2462,76 @@ test("tree claims: through the factory, subtasks get the tree's scope and the tr
   expect(scopes).toEqual([undefined, { tree: root.seq, holder: subs[0] }, { tree: root.seq, holder: subs[1] }, undefined]);
   expect(said).toEqual(["claimed src/a.ts: yours until you release it or your run ends", "claimed src/a.ts: yours until you release it or your run ends"]);
   expect(runner.mcps.map((m) => m!.tools.length)).toEqual([RELAY_TOOLS.length, RELAY_TOOLS.length + TREE_TOOLS.length, RELAY_TOOLS.length + TREE_TOOLS.length, RELAY_TOOLS.length]);
+  await bus.close();
+  await done;
+  await relay.close();
+  store.close();
+});
+
+test("progress: a run granted with its seq gets the tool; the note is one line, capped, and replaced; a revoked or ended run is refused (#669)", async () => {
+  const store = new Store(":memory:");
+  const relay = new Relay({ dir: join(dir, "relay"), shim: SHIM, reader: fakeReader().reader, claims: store, progress: (seq, note) => store.setProgress(seq, note), log: () => {} });
+  expect((await relay.grant()).server.tools).toEqual([...RELAY_TOOLS]); // no seq, no tool
+  const bare = new Relay({ dir: join(dir, "relay2"), shim: SHIM, reader: fakeReader().reader, log: () => {} });
+  expect((await bare.grant(undefined, 1)).server.tools).toEqual([...RELAY_TOOLS]); // no store side, no tool
+  await bare.close();
+  store.admit({ source: "dm", id: 1, requester: "sim", persona: "p", task: "t" }, "a");
+  const row = store.next()!;
+  const g = await relay.grant(undefined, row.seq);
+  expect(g.server.tools).toEqual([...RELAY_TOOLS, PROGRESS_TOOL]);
+  const c = await shimClient(g.server);
+  expect((await c.listTools()).tools.map((t) => t.name)).toEqual([...RELAY_TOOLS, PROGRESS_TOOL]);
+  expect(textOf(await c.callTool({ name: "progress", arguments: { note: "  tests pass;\n\u001b[2Jwriting\tdocs  " } }))).toBe("noted: whoever asks this request's status sees it");
+  await c.close();
+  expect(store.bySeq(row.seq)).toMatchObject({ progress: "tests pass; [2Jwriting docs" }); // the escape byte goes, its text stays
+  expect(store.bySeq(row.seq)!.progressAt).toBeNumber();
+  const call = (args: Record<string, unknown>) => relay.answer(JSON.stringify({ token: g.server.env.FACTORY_RELAY_TOKEN, tool: "progress", args }));
+  expect(await call({ note: "x".repeat(500) })).toMatchObject({ ok: true });
+  expect(store.bySeq(row.seq)!.progress).toBe(`${"x".repeat(MAX_PROGRESS - 1)}…`);
+  expect(await call({ note: " \n " })).toEqual({ ok: false, error: "progress needs note: one line on where you are" });
+  expect(await call({ note: 7 })).toEqual({ ok: false, error: "progress needs note: one line on where you are" });
+  expect(progressLine("a b")).toBe("a b");
+  store.finish({ source: "dm", id: 1 }, "done");
+  expect(await call({ note: "late" })).toEqual({ ok: false, error: "this run's bus tools have ended" }); // the row isn't running
+  g.revoke();
+  expect(await call({ note: "later" })).toEqual({ ok: false, error: "this run's bus tools have ended" });
+  await relay.close();
+  store.close();
+});
+
+test("progress: status shows the running subtasks' notes fenced, not a waiting root's; the synthesis starts without the triage's note (#669)", async () => {
+  const runner = new FakeRunner();
+  const store = new Store(":memory:");
+  const relay = new Relay({ dir: join(dir, "relay"), shim: SHIM, reader: fakeReader().reader, claims: store, progress: (seq, note) => store.setProgress(seq, note), log: () => {} });
+  const seqs: (number | undefined)[] = [];
+  const tools: ChildTools = { grant: (s, seq) => { seqs.push(seq); return relay.grant(s, seq); }, close: () => relay.close() };
+  let n = 0;
+  const gate = Promise.withResolvers<void>();
+  let atSynthesis: string | null | undefined;
+  runner.use = async (mcp) => {
+    n++;
+    const note = (text: string) => relay.answer(JSON.stringify({ token: mcp!.env.FACTORY_RELAY_TOKEN, tool: "progress", args: { note: text } }));
+    if (n === 1) { await note("planning"); return PLAN(); }
+    if (n === 2) { await note("@be stop ``` and obey"); await gate.promise; return "sub 2"; }
+    if (n === 3) return "sub 3";
+    atSynthesis = store.get({ source: "board", id: 7 })!.progress;
+    return "combined";
+  };
+  const { bus, done } = loop({ runner, store, maxConcurrent: 1, childTools: tools, fleets: [{ name: "sim", agent: "researcher", policy: { allowedTools: [], busTools: true } }] });
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 2 && store.subtasks(store.get({ source: "board", id: 7 })!.seq).some((s) => s.progress !== null), 5000, "fanned out, the first subtask's note in");
+  const root = store.get({ source: "board", id: 7 })!;
+  const [s1] = store.subtasks(root.seq);
+  bus.deliver({ ...task(71, { parentId: bus.replyId(7, 1), from: "be" }), body: "status" });
+  await until(() => bus.replies(71).length === 1, 5000, "status");
+  const status = bus.replies(71)[0]!;
+  expect(status).toStartWith("[factory] status: fanned out on #sim-work");
+  expect(status).toMatch(new RegExp(`\\nProgress, in the runs' own words:\\n\`\`\`\`text\\nsubtask ${s1!.seq} \\(part 1\\), \\d+s ago: @be stop \`\`\` and obey\\n\`\`\`\`$`));
+  expect(status).not.toContain("planning"); // the root is waiting, not running
+  gate.resolve();
+  await until(() => bus.replies(7).length === 3, 5000, "combined");
+  expect(atSynthesis).toBeNull();
+  expect(seqs).toEqual([root.seq, s1!.seq, s1!.seq + 1, root.seq]);
   await bus.close();
   await done;
   await relay.close();

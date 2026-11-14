@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { Delivery, FactoryBus } from "./bus.ts";
 import { oneLine, requestOf, type Key, type Request } from "./delegate.ts";
 import { answerPrompt, askInstruction, NO_ANSWER, NO_MORE, parseAsk, reseeded, type Ask } from "./ask.ts";
-import { notesInstruction, parsePlan, splitNotes, synthesisPrompt, triageInstruction, type Plan, type Result, type Round } from "./fanout.ts";
+import { fenced, notesInstruction, parsePlan, splitNotes, synthesisPrompt, triageInstruction, type Plan, type Result, type Round } from "./fanout.ts";
 import { resolvePersona, type Agent, type Outcome, type Policy, type Resume, type Runner } from "./runner.ts";
 import { MIRROR_TTL_MIN, mirrorNote, mirrorPrefix, RENEW_MS, repoId } from "./mirror.ts";
 import type { ChildTools } from "./relay.ts";
@@ -490,10 +490,12 @@ export class Factory {
       return `[factory] ${g}${row.seq === root.seq && root.fanoutBoard ? `; nothing is combined, and each subtask's outcome is on #${root.fanoutBoard}${this.postsOf(root)}` : ""}`;
     }
     const policy: Policy = g === undefined ? set.policy : { ...set.policy, budgetUsd: g };
-    // A fresh run holds no tree claims (#669); a resume keeps its own.
-    if (!row.resume) this.store.clearClaims(row.seq);
+    // A fresh run holds no tree claims (#669) and has said nothing of its
+    // progress; a resume keeps both.
+    if (!row.resume) { this.store.clearClaims(row.seq); this.store.clearProgress(row.seq); }
     // Bus tools (#669): a token for this run only, revoked when it ends. A
-    // subtask's also scopes it to its tree, for the tree claim tools.
+    // subtask's also scopes it to its tree, for the tree claim tools; every
+    // run's names its own row, for the progress tool.
     let tools: Awaited<ReturnType<ChildTools["grant"]>> | undefined;
     if (policy.busTools) {
       if (!this.o.childTools) return `[factory] failed: this run's profile has busTools on, but this factory has no relay for them; nothing was spawned.`;
@@ -505,7 +507,7 @@ export class Factory {
         }
         this.mirroredRuns.add(row.seq); // its claims may end with its row: the sweep after it releases them
       }
-      try { tools = await this.o.childTools.grant(row.parent !== null ? { tree: root.seq, holder: row.seq, ...(mirror !== undefined ? { mirror } : {}) } : undefined); } catch (e) {
+      try { tools = await this.o.childTools.grant(row.parent !== null ? { tree: root.seq, holder: row.seq, ...(mirror !== undefined ? { mirror } : {}) } : undefined, row.seq); } catch (e) {
         return `[factory] failed: couldn't open the bus tools for this run: ${msg(e)}; nothing was spawned.`;
       }
       // The grant can take seconds (the reader's start), and until the lines
@@ -1050,7 +1052,16 @@ export class Factory {
     else state = `finished: ${oneLine((row.reply ?? "").split("\n")[0] ?? "")}`;
     const done = runs.filter((r) => r.ended_at !== null);
     const turns = done.reduce((n, r) => n + (r.turns ?? 0), 0), cost = done.reduce((n, r) => n + (r.cost_usd ?? 0), 0);
-    return `[factory] status: ${state}. ${done.length} run${done.length === 1 ? "" : "s"} finished so far${done.length ? `: ${turns} turn${turns === 1 ? "" : "s"}, $${cost.toFixed(4)}` : ""}.`;
+    return `[factory] status: ${state}. ${done.length} run${done.length === 1 ? "" : "s"} finished so far${done.length ? `: ${turns} turn${turns === 1 ? "" : "s"}, $${cost.toFixed(4)}` : ""}.${this.progressOf(row, subs)}`;
+  }
+
+  // The running rows' latest progress notes (#669). They're the runs' own
+  // words, and the status reply goes to the bus: fenced, so a handle in one
+  // wakes nobody.
+  private progressOf(row: Row, subs: Row[]): string {
+    const lines = [row, ...subs].filter((r) => r.state === "running" && r.progress !== null)
+      .map((r) => `${r.seq === row.seq ? "this request" : `subtask ${r.seq}${r.title ? ` (${oneLine(r.title)})` : ""}`}, ${ago(r.progressAt ?? Date.now())} ago: ${r.progress}`);
+    return lines.length ? `\nProgress, in the runs' own words:\n${fenced(lines.join("\n"))}` : "";
   }
 
   private async housekeeping(): Promise<void> {
