@@ -721,6 +721,22 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
 }
 
+// Built once per process, not per request (#811): `fromJsonSchema` compiles through the SDK's process-wide
+// ajv validator, which caches by schema object identity and never evicts, so a fresh object per
+// registration retained a compiled validator on every hosted request. The wrapper is stateless.
+const sharedTool = (tool: ToolDef) => ({
+  description: tool.description,
+  ...(tool._meta ? { _meta: tool._meta } : {}),
+  inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
+});
+const NATIVE_BOARD_TOOLS = boardTools({ teams: true, attachments: "ids" }).map(tool => ({ name: tool.name, config: sharedTool(tool) }));
+const NATIVE_DM_TOOLS = Object.fromEntries(dmTools({ attachments: "ids" }).map(t => [t.name, sharedTool(t)])) as Record<"dm_send" | "dm_history" | "dm_thread", ReturnType<typeof sharedTool>>;
+const NATIVE_DELEGATE_INPUT = fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]);
+const DM_INBOX_INPUT = z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() });
+const DM_ACK_INPUT = z.strictObject({ message_id: z.union([id, ids.min(1)]) });
+const DM_RETRACT_INPUT = z.strictObject({ message_id: id });
+const WHOAMI_INPUT = z.strictObject({});
+
 function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
   // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do; `_meta`
   // marks it, so a host caching this session's instructions fetches them again.
@@ -738,7 +754,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
       return said({ ...text(`error: ${message}`), isError: true }, notice);
     }
   };
-  server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: z.strictObject({}) }, async (_, ctx) => {
+  server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
     const context = current(ctx);
     let notice: string | undefined;
     return said(text(await hosted.whoami(context.principal, context.sessionContext, n => { notice = n; })), notice);
@@ -759,28 +775,23 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     catch (e) { return bindRefusal(e, "unbind"); }
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
-  const shared = (tool: ToolDef) => ({
-    description: tool.description,
-    ...(tool._meta ? { _meta: tool._meta } : {}),
-    inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
-  });
-  for (const tool of boardTools({ teams: true, attachments: "ids" })) {
-    server.registerTool(tool.name, shared(tool), (args, ctx) => run(ctx, tool.name, session => application.call(session, tool.name, args)));
+  for (const { name, config } of NATIVE_BOARD_TOOLS) {
+    server.registerTool(name, config, (args, ctx) => run(ctx, name, session => application.call(session, name, args)));
   }
-  const dm = Object.fromEntries(dmTools({ attachments: "ids" }).map(t => [t.name, t])) as Record<"dm_send" | "dm_history" | "dm_thread", ToolDef>;
-  server.registerTool("dm_send", shared(dm.dm_send),
+  const dm = NATIVE_DM_TOOLS;
+  server.registerTool("dm_send", dm.dm_send,
     (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to as string, a.body as string, a as Parameters<typeof application.send>[3])));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,
-    inputSchema: fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
+    inputSchema: NATIVE_DELEGATE_INPUT,
   }, (a, ctx) => run(ctx, "delegate", session => application.delegate(session, a)));
-  server.registerTool("dm_history", shared(dm.dm_history),
+  server.registerTool("dm_history", dm.dm_history,
     (a, ctx) => run(ctx, "dm_history", session => application.history(session, a as Parameters<typeof application.history>[1])));
-  server.registerTool("dm_thread", shared(dm.dm_thread), (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread as number)));
-  server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() }) },
+  server.registerTool("dm_thread", dm.dm_thread, (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread as number)));
+  server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: DM_INBOX_INPUT },
     (a, ctx) => run(ctx, "dm_inbox", session => application.inbox(session, a.days)));
   server.registerTool(DM_ACK_TOOL.name, {
-    description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta, inputSchema: z.strictObject({ message_id: z.union([id, ids.min(1)]) }),
+    description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta, inputSchema: DM_ACK_INPUT,
   }, async (a, ctx) => {
     const acked: number[] = [], missing: number[] = [];
     const result = await run(ctx, "dm_ack", session => {
@@ -794,6 +805,6 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     });
     return { ...result, ...(missing.length && !acked.length ? { isError: true } : {}) };
   });
-  server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: z.strictObject({ message_id: id }) },
+  server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: DM_RETRACT_INPUT },
     (a, ctx) => run(ctx, "dm_retract", session => application.retract(session, a.message_id)));
 }
