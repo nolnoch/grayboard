@@ -97,6 +97,7 @@ export type AuditAction =
   | "team.created"
   | "team.member_added"
   | "team.member_removed"
+  | "team.role_changed"
   | "delegation.requested"
   | "delegation.refused"
   | "delegation.throttled"
