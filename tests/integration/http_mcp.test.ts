@@ -6,6 +6,7 @@ import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../s
 import { type AppSession, type AppSessionOptions, signedIn } from "../support/app_session.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_LAUNCHER_META } from "../../src/shared/session_meta.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 
 let srv: TestServer;
@@ -360,4 +361,29 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
   } finally { app.repo.oauth.findActiveAccess = original; }
   expect(app.repo.aliases.find("alice@example.com/unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
+});
+
+// #521 item 6: the launcher declaration rides a real HTTP request's `_meta`, and the next initialize of the same
+// session reads the stored flag into its instructions; a session that never declared gets no launcher sentence.
+test("HTTP: a launcher declared in _meta reaches the session's initialize instructions; an undeclared session's carry none", async () => {
+  const token = await login();
+  const open = async (raw: string, launcher: boolean) => {
+    const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+    clients.push(client);
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+      requestInit: { headers: { Authorization: `Bearer ${token}` } },
+      fetch: async (input, init) => {
+        const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, raw);
+        return fetch(launcher ? await withMeta(req, GRAYBOARD_LAUNCHER_META, true) : req);
+      },
+    }));
+    return client;
+  };
+  const sentence = "You're a launcher session";
+  const lead = await open("lead-root", true), plain = await open("plain-root", false);
+  await bindFixture(lead, "lead");
+  await bindFixture(plain, "plain");
+  // A second initialize of each session, with no declaration on the wire: the text follows the stored flag.
+  expect((await open("lead-root", false)).getInstructions()).toContain(sentence);
+  expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
 });

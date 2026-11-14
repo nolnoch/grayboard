@@ -865,13 +865,19 @@ test("a declared launcher is a delegation target, and only its own session's ini
   expect(hostedBoundInstruction(info, undefined, true)).toContain("You're a launcher session");
   expect(hostedBoundInstruction(info)).not.toContain("You're a launcher session");
   // The requester is a third session of the same user: the declared launcher takes the request, the other is not a target.
-  const requester = await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
+  await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
   const result = await hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it" }));
   expect(result).toMatchObject({ to: "you@example.com/lead" });
   await expect(hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it", to: "plain" }))).rejects.toThrow("isn't a launcher session");
   // The text follows the stored flag, not the later request: a restart without the declaration still gets the rule.
   const later = await hosted.bind(generic, ctx("lead-root"), { name: "lead2", create: true });
   expect(instructions(later)).toContain("You're a launcher session");
+  // Unbind's text follows the same flag (#521 item 7): the launcher keeps the sentence under its remaining name, the plain session never gets it.
+  expect(instructions(await hosted.unbind(generic, ctx("lead-root"), { name: "lead" }))).toContain("You're a launcher session");
+  await hosted.bind(generic, ctx("plain-root"), { name: "plain2", create: true });
+  const plainUnbound = await hosted.unbind(generic, ctx("plain-root"), { name: "plain" });
+  expect(instructions(plainUnbound)).toContain('"plain2"');
+  expect(instructions(plainUnbound)).not.toContain("You're a launcher session");
 });
 
 test("a bound session with no delivery declaration (OpenCode) gets initialize text that follows its lease, as bind's does; a declaration still decides (#531)", () => {
