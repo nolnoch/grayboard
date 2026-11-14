@@ -38342,6 +38342,7 @@ function createPlugin(o) {
     s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() }));
     s.setRequestHandler(CallToolRequestSchema, async (req) => await call(req.params.name, req.params.arguments ?? {}, req.params._meta));
     s.oninitialized = () => {
+      s.ping().catch(() => {});
       initialized = true;
       markInitialized();
       if (login && interactive)
