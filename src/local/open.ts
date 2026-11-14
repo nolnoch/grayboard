@@ -11,6 +11,7 @@ import { holdsOf } from "../core/bindings.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { openSqlite } from "../core/sqlite.ts";
 import { conversationSnapshot, liveSessions, type Ended, type SessionRow } from "./binding.ts";
+import { ATTACHMENT_BYTES_SQL } from "./blobs.ts";
 import { privateDbFiles, privateDir } from "./perms.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
@@ -76,6 +77,7 @@ export const RETENTION_SETTING_SQL = `
 
 function initLocalSchema(db: Database): void {
   db.exec(RETENTION_SETTING_SQL);
+  db.exec(ATTACHMENT_BYTES_SQL);
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
