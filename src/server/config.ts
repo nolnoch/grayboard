@@ -41,6 +41,8 @@ export type Config = {
   oauthLimit?: RateLimit;
   oauthGlobalLimit?: RateLimit;
   mcpLimits?: McpLimits;
+  // How long an unbound, or bound but never-delivering, hosted session may idle (src/server/hosted.ts); default 900.
+  hostedIdleSeconds?: number;
   trustedProxies: readonly string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
@@ -84,6 +86,7 @@ export function loadConfig(): Config {
     oauthLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH", { burst: 60, perSec: 1 }, "requests"),
     oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),
     mcpLimits: parseMcpLimits(process.env),
+    ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     ...slackConfig(),
   };

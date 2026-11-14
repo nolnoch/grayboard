@@ -9,6 +9,7 @@ import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-c
 import { writeAudit } from "./audit.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { isTrustedOrigin } from "./origin.ts";
 
 // `sourceKey` is the `_meta` key that maps this client's hosted session source, or null
 // (unmapped: reads only). A pure function of the client ID and the startup config.
@@ -181,11 +182,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const sameOrigin = (req: Request, mandatory = false) => {
     const origin = req.headers.get("origin");
     if (origin === null && !mandatory) return;
-    if (!origin || !/^https?:\/\/[^\s/@?#,\\]+$/.test(origin)) fail("invalid_request", 403);
-    let parsed: URL;
-    try { parsed = new URL(origin); } catch { fail("invalid_request", 403); }
-    const serialized = origin.replace(parsed.protocol === "https:" ? /:443$/ : /:80$/, "");
-    if (serialized !== parsed.origin || parsed.origin !== base.origin) fail("invalid_request", 403);
+    if (origin === null || !isTrustedOrigin(origin, base.origin)) fail("invalid_request", 403);
   };
   const getFlow = (req: Request, id: string) => {
     if (!secret(id)) fail();

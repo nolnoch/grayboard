@@ -5,6 +5,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setAccess } from "../core/boards.ts";
+import { dropHold, logBinding } from "../core/bindings.ts";
+import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
@@ -1036,7 +1038,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 }
 
 function makeOAuthStore(db: Database): OAuthStore {
-  const audit = (action: string, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
+  const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
     db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail })]);
   };
@@ -1296,7 +1298,7 @@ function makeOAuthStore(db: Database): OAuthStore {
 
 function makeHostedStore(db: Database): HostedStore {
   const get = (id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
-  const audit = (session: string, action: string, detail: Record<string, unknown>, now: number) => {
+  const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
     const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
       WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
     db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
@@ -1363,8 +1365,9 @@ function makeHostedStore(db: Database): HostedStore {
       db.run("UPDATE ids SET writes_as = NULL, launcher = 0 WHERE id = ?", [session]);
       if (launcher) audit(session, "handle.launcher_set", { on: false, ownership: row.ownership_id, reason }, now);
       // Every hold the ownership has, not one name's (#451): ending it releases them all.
-      for (const { address } of db.query<{ address: string }, [string]>("DELETE FROM alias_holds WHERE id = ? RETURNING address").all(session)) {
-        db.run("INSERT INTO binding_events(session_id, name, event, at, detail) VALUES (?, ?, 'released', ?, ?)", [session, address, now, reason]);
+      for (const { address } of db.query<{ address: string }, [string]>("SELECT address FROM alias_holds WHERE id = ?").all(session)) {
+        dropHold(db, address, session);
+        logBinding(db, session, address, "released", reason, now);
       }
       for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
       if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);

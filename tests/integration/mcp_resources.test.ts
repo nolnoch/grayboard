@@ -38,7 +38,7 @@ afterEach(async () => {
 });
 const issue = (email = "alice@example.com", scopes = ["grayboard:tools", "grayboard:delivery"]) => issueOAuth(app.repo, app.oauth.resource, email, scopes, clock, OPENCODE_CLIENT);
 async function connect(token: string, version = "2026-07-28", role?: string, identity = "be") {
-  const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity });
+  const headers = new Headers({ Authorization: `Bearer ${token}` });
   if (role !== undefined) headers.set("X-Grayboard-Client", role);
   const client = new Client({ name: "resource-test", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
@@ -164,12 +164,12 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: role scopes and s
   await expect(connect(tools.token, version, "subscriber")).rejects.toThrow();
   await expect(connect(delivery.token, version)).rejects.toThrow();
   for (const role of ["native", "Subscriber", "subscriber, subscriber", ""]) {
-    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${tools.token}`, "X-Grayboard-Identity": "be", "X-Grayboard-Client": role } });
+    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${tools.token}`, "X-Grayboard-Client": role } });
     expect(res.status).toBe(400);
     await res.arrayBuffer();
   }
   for (const [role, token, required] of [["subscriber", tools.token, "grayboard:delivery"], [undefined, delivery.token, "grayboard:tools"]] as const) {
-    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", ...(role ? { "X-Grayboard-Client": role } : {}) } });
+    const res = await fetch(base + "/mcp", { headers: { Authorization: `Bearer ${token}`, ...(role ? { "X-Grayboard-Client": role } : {}) } });
     expect(res.status).toBe(403);
     expect(res.headers.get("WWW-Authenticate")).toContain(`scope="${required}"`);
     await res.arrayBuffer();

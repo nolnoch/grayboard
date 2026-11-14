@@ -89,7 +89,7 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "X-Grayboard-Where": "tools" } },
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
     fetch: async (input, init) => {
       let request = new Request(input, init);
       if (request.method === "POST" && request.body) {
@@ -185,7 +185,7 @@ test("Origin policy precedes authentication and context creation on every HTTP m
     for (const origin of forbidden) {
       for (const authorization of [undefined, `Bearer ${token}`]) {
         const response = await hosted.fetch(new Request("http://localhost/mcp", {
-          method, headers: { Origin: origin, "X-Grayboard-Identity": "refused", ...(authorization ? { Authorization: authorization } : {}) },
+          method, headers: { Origin: origin, ...(authorization ? { Authorization: authorization } : {}) },
         }));
         expect(response.status).toBe(403);
       }
@@ -513,7 +513,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
   const abort = new AbortController();
   const params = { name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" }, _meta: { ...meta }, ...(version === "2026-07-28" ? { _meta: { ...meta, "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientInfo": { name: "barrier", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } : {}) };
   try {
-    const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params }) }));
+    const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params }) }));
     await selection;
     store.repo.sessions.revokeAllForUser(user.user_id);
     if (stop === "abort") abort.abort(); else await hosted.close();
@@ -966,7 +966,7 @@ test("shutdown awaits pending original request source cancellation", async () =>
   let release!: () => void, cancelStarted = false, closed = false;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const body = new ReadableStream<Uint8Array>({ cancel: async () => { cancelStarted = true; await gate; } });
-  const request = new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "be", "Content-Type": "application/json" }, body });
+  const request = new Request("http://localhost/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body });
   const pending = hosted.fetch(request);
   await Bun.sleep(0);
   const closing = hosted.close().then(() => { closed = true; });
@@ -1113,7 +1113,7 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
   const original = store.repo.oauth.findActiveAccess;
   store.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); };
   try {
-    const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } }));
+    const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
     expect(store.repo.aliases.find(`${user.user_email}/unselected`)).toBeUndefined();

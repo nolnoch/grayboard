@@ -76,6 +76,27 @@ for (const revokeFirst of [false, true]) test(`forced attachment/revoke transact
   }
 }, 15_000);
 
+test("forced bind/bind overlap on one name gives it one holder (#387 item 23)", async () => {
+  const { principal } = issue();
+  const results = await overlap({ operation: "bind", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:bind:in-txn");
+  expect(results[0]).toMatchObject({ ok: true });
+  expect(results[1]).toMatchObject({ ok: false });
+  const holders = database.repo.hosted.all().filter(row => application.hostedHolds(row.session_id).map(short).includes("fe"));
+  expect(holders).toHaveLength(1);
+  expect(holders[0]?.source_session_id).toBe("root");
+}, 15_000);
+
+test("forced release/bind overlap hands the name to the contender only after the release commits (#387 item 23)", async () => {
+  const { principal } = issue();
+  await hosted.bind(principal, context(principal), { name: "fe", create: true });
+  const results = await overlap({ operation: "end", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:release:in-txn");
+  expect(results.every(result => result.ok)).toBe(true);
+  const rows = database.repo.hosted.all();
+  expect(rows.map(row => row.source_session_id)).toEqual(["other"]);
+  expect(application.hostedHolds(rows[0]!.session_id).map(short)).toEqual(["fe"]);
+  expect(releases()).toHaveLength(1);
+}, 15_000);
+
 test("forced root registration/end overlap cannot leave an orphan child", async () => {
   const { principal } = issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
@@ -272,6 +293,15 @@ test("G2 ordinary writes do not attach, G1 revoke releases atomically including 
   expect(await hosted.whoami(second.principal, context(second.principal, "child"))).toHaveProperty("unbound", true);
 });
 
+test("a reattach with no open lease audits no lease_closed (#387 item 15)", async () => {
+  const first = issue(), second = issue();
+  await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
+  await hosted.register(first.principal, context(first.principal), "child");
+  await hosted.register(second.principal, context(second.principal), "child");
+  expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.grant_attached'").get()?.count).toBe(1);
+  expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.lease_closed'").get()?.count).toBe(0);
+});
+
 test("successful G2 root registration reattaches once; G1 revoke cannot end it, disable does", async () => {
   const first = issue(), second = issue();
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
@@ -282,6 +312,7 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   await expect(delivery.renew(first.principal, context(first.principal), lease.capability)).rejects.toHaveProperty("code", "not_found");
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.child_registered'").get()?.count).toBe(1);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.grant_attached'").get()?.count).toBe(1);
+  expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.lease_closed'").get()?.count).toBe(1);
   database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
   expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("primary", "you@example.com/fe");
   expect(releases()).toEqual([]);

@@ -49,7 +49,7 @@ async function connect(version: string, role = "subscriber", signal?: AbortSigna
   const client = new Client({ name: "resource-unit", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
-    requestInit: { headers: { Authorization: `Bearer ${grant.token}`, "X-Grayboard-Identity": "be", ...(role === "native" ? {} : { "X-Grayboard-Client": role }) } },
+    requestInit: { headers: { Authorization: `Bearer ${grant.token}`, ...(role === "native" ? {} : { "X-Grayboard-Client": role }) } },
     fetch: async (input, init) => {
       let request = new Request(input, { ...init, ...(signal ? { signal } : {}) });
       if (request.method === "POST" && request.body) {

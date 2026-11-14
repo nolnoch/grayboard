@@ -12,7 +12,7 @@ import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META, validSourceId } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
-import { writeAudit } from "./audit.ts";
+import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
@@ -166,8 +166,9 @@ const DELIVERY_TTL_MS = 30_000;
 export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; isAuthorized(principal: OAuthPrincipal): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
-  const rawIdle = options.idleSeconds ?? Number(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ?? String(DEFAULT_IDLE_SECONDS));
-  if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive integer");
+  // GRAYBOARD_HOSTED_IDLE_SECONDS is parsed strictly in config.ts and arrives here as options.idleSeconds.
+  const rawIdle = options.idleSeconds ?? DEFAULT_IDLE_SECONDS;
+  if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("hosted idle seconds must be a positive integer");
   const idle = rawIdle * 1000;
   // A delivery lease's TTL (createDelivery reads it from the service); the
   // restart credit caps a deadline at one TTL past startup (#423).
@@ -203,7 +204,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     };
     return { call: <T>(fn: () => Promise<T>) => enter(false, fn), bind: <T>(fn: () => Promise<T>) => enter(true, fn) };
   };
-  const audit = (id: string, action: `hosted.${string}`, detail: Record<string, unknown>, principal?: OAuthPrincipal) => {
+  const audit = (id: string, action: AuditAction, detail: Record<string, unknown>, principal?: OAuthPrincipal) => {
     const row = store.get(id);
     const actor = principal?.authed.user_email ?? (row && repo.users.findById(row.user_id)?.email) ?? null;
     writeAudit(repo, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
@@ -410,7 +411,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     authorized(p);
     for (const child of store.all().filter(r => r.ownership_id === fresh.ownership_id)) store.update({ ...child, grant_id: p.grantId });
     audit(row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
-    audit(row.session_id, "hosted.lease_closed", { reason: "reattached" });
+    // The lease is tied to the grant (delivery.ts), so a reattach closes one only if it was open.
+    if (fresh.lease_deadline !== null) audit(row.session_id, "hosted.lease_closed", { reason: "reattached" });
     return { ...fresh, grant_id: p.grantId };
   }
   function snapshot(p: OAuthPrincipal, row?: HostedSession) {
@@ -652,7 +654,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           const existing = store.get(childId);
           if (existing && (existing.user_id !== p.authed.user_id || existing.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
           const childHolds = existing ? application.hostedHolds(childId) : [];
-          if (existing && (childHolds.length || existing.writes_as)) throw new ApplicationError("child_bound", `session ${childId} holds ${childHolds.length ? childHolds.map(h => `"${h}"`).join(", ") : `nothing, writing as "${existing.writes_as}",`} as its own root (bound ${existing.created_at}, in ${existing.place}); end it with session_end from that session, or leave it as its own root.`);
+          if (existing && (childHolds.length || existing.writes_as)) throw new ApplicationError("child_bound", `session ${childId} holds ${childHolds.length ? childHolds.map(h => `"${h}"`).join(", ") : `nothing, writing as "${existing.writes_as}",`} as its own root (bound ${new Date(existing.created_at).toISOString()}${existing.place ? `, in ${existing.place}` : ""}); end it with session_end from that session, or leave it as its own root.`);
           if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
           const descendants = store.children(childId);
           if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);

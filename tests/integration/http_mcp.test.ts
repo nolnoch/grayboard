@@ -63,7 +63,7 @@ async function connect(token: string, identity = "be", version = "2026-07-28", o
   });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity, ...(origin === undefined ? {} : { Origin: origin }) } },
+    requestInit: { headers: { Authorization: `Bearer ${token}`, ...(origin === undefined ? {} : { Origin: origin }) } },
     fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, identity)),
   }));
   if (bind) await bindFixture(client, identity);
@@ -123,7 +123,6 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
     fetch: (input, init) => {
       const req = new Request(input, init);
       req.headers.set("Origin", origin);
-      req.headers.set("X-Grayboard-Identity", identity);
       return fetch(req);
     },
   }));
@@ -137,7 +136,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
     await expect(client.callTool({ name: "board_create", arguments: { name: "forbidden", purpose: "must not dispatch" } })).rejects.toThrow();
     for (const method of ["POST", "GET", "DELETE", "OPTIONS", "PUT", "PATCH", "HEAD"]) {
       const res = await fetch(`${base}/mcp`, {
-        method, headers: { Origin: forbidden, Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity, "MCP-Protocol-Version": version },
+        method, headers: { Origin: forbidden, Authorization: `Bearer ${token}`, "MCP-Protocol-Version": version },
       });
       expect(res.status).toBe(403);
     }
@@ -251,7 +250,7 @@ test("OAuth challenges and actual scope precede identity validation on every met
   const expired = issueOAuth(app.repo, app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now() - 3_600_001).token;
   for (const method of ["POST", "GET", "DELETE", "OPTIONS", "PUT", "PATCH", "HEAD"]) {
     for (const [token, status, error] of [[legacy, 401, "invalid_token"], [expired, 401, "invalid_token"], [delivery, 403, "insufficient_scope"], ["wrong", 401, "invalid_token"]] as const) {
-      const response = await fetch(`${base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } });
+      const response = await fetch(`${base}/mcp`, { method, headers: { Authorization: `Bearer ${token}` } });
       expect(response.status).toBe(status);
       expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="${status === 401 ? "grayboard:delivery grayboard:tools" : "grayboard:tools"}", error="${error}"`);
     }
@@ -288,7 +287,7 @@ test("old session remains accepted on retained API but not new MCP", async () =>
   const headers = { Authorization: `Bearer ${token}` };
   expect((await fetch(`${base}/api/auth/config`, { headers })).status).toBe(200);
   expect((await fetch(`${base}/api/identities`, { headers })).status).toBe(200);
-  expect((await fetch(`${base}/mcp`, { headers: { ...headers, "X-Grayboard-Identity": "be" } })).status).toBe(401);
+  expect((await fetch(`${base}/mcp`, { headers: headers })).status).toBe(401);
 });
 
 test("connected clients cannot dispatch after their actual access deadline", async () => {
@@ -336,7 +335,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
   const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; c.enqueue(encoder.encode("{")); } });
   const json = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" }, ...(version === "2026-07-28" ? { _meta: { "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientInfo": { name: "barrier", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } : {}) } });
   try {
-    const pending = fetch(base + "/mcp", { method: "POST", headers: { Authorization: `Bearer ${issued.token}`, "X-Grayboard-Identity": "unselected", "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body });
+    const pending = fetch(base + "/mcp", { method: "POST", headers: { Authorization: `Bearer ${issued.token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body });
     await authenticated;
     if (failure === "expiry") clock = Date.now() + 3_600_001;
     if (failure === "revoke") app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now());
@@ -364,7 +363,7 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
   const original = app.repo.oauth.findActiveAccess;
   app.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); };
   try {
-    const response = await fetch(`${base}/mcp`, { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Identity": "unselected" } });
+    const response = await fetch(`${base}/mcp`, { headers: { Authorization: `Bearer ${token}` } });
     expect(response.status).toBe(500);
     expect(response.headers.has("WWW-Authenticate")).toBe(false);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });

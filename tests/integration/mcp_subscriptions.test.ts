@@ -45,7 +45,7 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 async function connect(token: string, version: string, role?: string, identity = "be") {
-  const headers = new Headers({ Authorization: `Bearer ${token}`, "X-Grayboard-Identity": identity });
+  const headers = new Headers({ Authorization: `Bearer ${token}` });
   const principal = app.oauth.authenticate(new Request(base + "/mcp", { headers }));
   if (principal instanceof Response) throw new Error("fixture authentication failed");
   const routing = sessionContext(principal, { "ai.opencode/sessionID": identity });
