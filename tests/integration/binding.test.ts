@@ -431,6 +431,58 @@ test("9: a DM sent mid-unbind is queued for the name's next holder, never consum
   await until(() => contents(third).includes("mid-unbind"));
 }, 30_000);
 
+// #374 (the #284 PR 4 audit's A4 fix): an unbind whose release transaction
+// fails leaves the hold, so the session answers on the name's socket again;
+// a DM sent after is delivered now, and a retried unbind releases it.
+test("an unbind whose release fails listens on the name again; a retry releases it", async () => {
+  const s = await session("fe", { extra: pauseEnv("unbind:before-txn") });
+  await s.call("bind", { name: "fe2", create: true });
+  const be = await session("be");
+  const unbinding = s.c.callTool({ name: "unbind", arguments: { name: "fe2" } });
+  await until(() => s.stderr().includes("test pause hit: unbind:before-txn"));
+  expect(existsSync(join(dir, "sock.fe2"))).toBe(false);
+  // The writer lock, held past the session's busy timeout, fails releaseName's BEGIN IMMEDIATE.
+  const lock = new Database(join(dir, "bus.db"));
+  lock.exec("BEGIN IMMEDIATE");
+  try {
+    release("unbind:before-txn");
+    const failed = await unbinding.then((r) => r, (e: unknown) => ({ isError: true, thrown: String(e) }));
+    expect(failed.isError).toBe(true);
+  } finally {
+    lock.exec("ROLLBACK");
+    lock.close();
+  }
+  expect(holderOf("fe2")).toBeDefined();
+  expect(existsSync(join(dir, "sock.fe2"))).toBe(true);
+  expect(await be.call("dm_send", { to: "fe2", body: "after the failure" })).toMatchObject({ delivered_now: true });
+  await until(() => contents(s).includes("after the failure"));
+  // The pause file stays, so the retry passes the point at once.
+  expect((await s.c.callTool({ name: "unbind", arguments: { name: "fe2" } })).isError).toBeFalsy();
+  expect(holderOf("fe2")).toBeUndefined();
+  expect(existsSync(join(dir, "sock.fe2"))).toBe(false);
+}, 30_000);
+
+// #374 (W4): a cancel that crosses an unbind's result on the wire (the process
+// is paused past its last cancel check) still gets the unbind into the next
+// result once, as a cancelled bind's does (audit 7).
+test("a cancelled unbind that completes is reported in the next result", async () => {
+  const s = await session("fe", { extra: pauseEnv("unbind:before-txn") });
+  const abort = new AbortController();
+  const unbinding = s.c.callTool({ name: "unbind", arguments: { name: "fe" } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: unbind:before-txn"));
+  abort.abort();
+  await expect(unbinding).rejects.toThrow();
+  release("unbind:before-txn");
+  await until(() => holderOf("fe") === undefined);
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text);
+  expect(texts.slice(1).join(" ")).toContain(`unbind("fe") completed after it was cancelled.`);
+  expect(texts.slice(1).join(" ").length).toBeGreaterThan(`unbind("fe") completed after it was cancelled.`.length);
+  // Told once.
+  const again = await s.c.callTool({ name: "peer_list", arguments: {} });
+  expect((again.content as { text: string }[]).map((c) => c.text).join(" ")).not.toContain("completed after it was cancelled");
+}, 30_000);
+
 test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
   const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
   const abort = new AbortController();
