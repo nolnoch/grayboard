@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { PrincipalTaken, type Repo, type Team } from "./db.ts";
+import { PrincipalTaken, type Repo, type Team, type User } from "./db.ts";
 import { mayActIn } from "./access.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
@@ -101,6 +101,8 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   }
   if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
   const user = repo.users.upsertByEmail(email, displayName ?? null);
+  const disabled = refuseDisabled(repo, user, { ip: ip ?? undefined });
+  if (disabled) return disabled;
   const raw  = mintToken();
   const ua   = userAgent(req);
   repo.sessions.create(user.id, hashToken(raw), ua);
@@ -111,12 +113,22 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
 
+// A disabled user gets no CLI token (security audit F-14); OAuth refuses the
+// same way at consent (oauth.user_refused).
+function refuseDisabled(repo: Repo, user: User, detail: Record<string, unknown>): Response | null {
+  if (user.disabled_at === null) return null;
+  writeAudit(repo, "auth.user_refused", user.email, null, detail);
+  return jsonErr("forbidden", "this account is disabled; ask a grayboard admin to run admin enable-user", 403);
+}
+
 async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
   const user  = repo.users.upsertByEmail(email, null);
+  const disabled = refuseDisabled(repo, user, { dev: true, ip: ip ?? undefined });
+  if (disabled) return disabled;
   const raw   = mintToken();
   repo.sessions.create(user.id, hashToken(raw), "dev");
   writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
