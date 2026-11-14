@@ -191,13 +191,13 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
 const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 
 async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
-  const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
-  if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
-  const handle = ownAddress(body.identity, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
+  const body = await parseBody<{ as?: string; tool?: string; args?: Record<string, unknown> }>(req);
+  if (!body?.as || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("as and a claim tool required");
+  const handle = ownAddress(body.as, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (handle instanceof Response) return handle;
-  if (body.args?.as !== undefined) return badRequest("name the address to act as in identity, not args.as");
+  if (body.args?.as !== undefined) return badRequest("name the address to act as in as, not args.as");
   try {
-    // As the session the identity is or is held by: its claims under any of
+    // As the session the address is or is held by: its claims under any of
     // its addresses are its own here (#360).
     const outcome = callBoardTool(db, handle, body.tool, body.args ?? {}, { addresses: addressSet(db, handle, authed.user_email) });
     if (outcome.boards?.length) {

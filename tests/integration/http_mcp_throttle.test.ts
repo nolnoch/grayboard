@@ -49,7 +49,7 @@ test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion i
     await srv.appSession(token, "qa").connect();
     const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${otherHostedToken}` } });
     expect(response.status).toBe(405);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(0);
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'bind.rate_limited'").all()).toHaveLength(0);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
   } finally { await client.close(); await srv.stop(); }
 }, 60_000);

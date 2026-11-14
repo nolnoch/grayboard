@@ -390,11 +390,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     helloLimiter: new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
       start: (email, ctx, retryAfterMs) => {
         console.error(`[grayboard] rate-limiting hellos from ${email}`);
-        streakRow(() => writeAudit(repo, "hello.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
+        streakRow(() => writeAudit(repo, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
       },
       end: (email, refused) => {
         console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
-        streakRow(() => writeAudit(repo, "hello.rate_limit_ended", email, null, { refused }));
+        streakRow(() => writeAudit(repo, "bind.rate_limit_ended", email, null, { refused }));
       },
     }, opts.now),
     boardChanged(board) {

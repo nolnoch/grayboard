@@ -141,7 +141,7 @@ test("bind budget is per user and spent before an alias is created or a hold tak
   await expect(a.bind("refused")).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
   expect(store.repo.aliases.listForScope("person", alice.user_email).map(x => x.name)).toEqual(["be"]);
   expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([{ event: "bound" }]);
-  expect(store.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(1);
+  expect(store.db.query("SELECT * FROM access_log WHERE action = 'bind.rate_limited'").all()).toHaveLength(1);
   expect((await application.attachHuman(alice, delivery())).session.human).toBe(true);
   // Per user: bob's bind spends his own budget.
   expect((await connect(bob, "fe")).session.holds).toEqual(["bob@example.com/fe"]);
