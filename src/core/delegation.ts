@@ -16,6 +16,7 @@
 import type { Database } from "bun:sqlite";
 
 import { CoreError } from "./errors.ts";
+import { addressParts } from "./addresses.ts";
 import { ALIAS_SESSION_SQL, humanHandles, lastSeen, primaryHoldSql, rosterHandles } from "./boards.ts";
 import { formatDirectAddress, HUMAN_NAME } from "../shared/addressing.ts";
 import { RESEND_PARAM, type ToolDef } from "./tools.ts";
@@ -27,22 +28,50 @@ import { RESEND_PARAM, type ToolDef } from "./tools.ts";
 const LAUNCHER_SQL = `SELECT a.address FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
   WHERE i.launcher = 1 AND (a.human IS NULL OR a.human = 0)`;
 
+// Launcher sessions that hold no alias yet (#337): addressable by their ID
+// since #284, so delegable before they pick a name. The same rows
+// liveAddresses lists (not ended, push delivery, not a viewer or a child),
+// launchers only. A bound session is reached through its alias instead.
+const UNBOUND_LAUNCHER_SQL = `SELECT id AS address FROM ids i WHERE launcher = 1 AND ended_at IS NULL
+  AND delivery = 'push' AND viewer = 0 AND root_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM alias_holds ah WHERE ah.id = i.id)`;
+
 // The auto-pick's candidates: one per launcher session, its primary (#284
-// S13), so a session holding several aliases isn't picked several times.
+// S13), so a session holding several aliases isn't picked several times;
+// named launchers by name, then unbound ones by ID.
 export function launchers(db: Database): string[] {
   const primary = `(a.address = ${primaryHoldSql("i.id")} OR NOT EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address))`;
-  return (db.prepare(`${LAUNCHER_SQL} AND ${primary} ORDER BY a.address`).all() as { address: string }[]).map((r) => r.address);
+  const named = db.prepare(`${LAUNCHER_SQL} AND ${primary} ORDER BY a.address`).all() as { address: string }[];
+  const unbound = db.prepare(`${UNBOUND_LAUNCHER_SQL} ORDER BY id`).all() as { address: string }[];
+  return [...named, ...unbound].map((r) => r.address);
 }
 
-// An explicit delegate(to) may name any alias a launcher session holds.
+// An explicit delegate(to) may name any alias a launcher session holds, or
+// an unbound launcher's ID.
 export function isLauncher(db: Database, handle: string): boolean {
+  if (addressParts(handle)?.kind === "id") return !!db.prepare(`${UNBOUND_LAUNCHER_SQL} AND id = ?`).get(handle);
   return !!db.prepare(`${LAUNCHER_SQL} AND a.address = ?`).get(handle);
+}
+
+// Whether `to` names an address that has had a session: a roster alias, or
+// a session ID with a row.
+function everConnected(db: Database, to: string): boolean {
+  if (addressParts(to)?.kind === "id") return !!db.prepare(`SELECT 1 FROM ids WHERE id = ?`).get(to);
+  return rosterHandles(db).includes(to);
 }
 
 // Server handles are `email/name` (local handles are bare names, one user per
 // bus). A candidate is in the requester's own user when everything before its
 // last `/` matches the requester's — the same scope the human fallback uses.
-export function sameUser(requester: string, candidate: string): boolean {
+// A session ID's spelling carries no scope: its user is its ids row's
+// principal (#337; null locally, where bare names are one user too).
+export function sameUser(requester: string, candidate: string, db: Database): boolean {
+  if (addressParts(candidate)?.kind === "id") {
+    const row = db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(candidate) as { principal: string | null } | null;
+    const cut = requester.lastIndexOf("/");
+    // No row: not another user's; the roster check below refuses it as unknown.
+    return !row || (cut === -1 ? row.principal === null : row.principal === requester.slice(0, cut));
+  }
   const cut = requester.lastIndexOf("/");
   if (cut === -1) return true;
   return candidate.startsWith(requester.slice(0, cut + 1));
@@ -114,16 +143,16 @@ export function resolveDelegation(
   if (args.to !== undefined) {
     if (typeof args.to !== "string" || !args.to.trim()) throw new CoreError("to must be a string");
     const to = args.to.trim();
-    if (!sameUser(requester, to)) {
+    if (!sameUser(requester, to, db)) {
       throw new CoreError(`delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`);
     }
-    if (!rosterHandles(db).includes(to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
+    if (!everConnected(db, to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
     return { to, body: delegationBody(brief) };
   }
 
-  const live = launchers(db).filter((h) => sameUser(requester, h) && h !== requester && online(h));
+  const live = launchers(db).filter((h) => sameUser(requester, h, db) && h !== requester && online(h));
   if (live.length) return { to: live[0]!, body: delegationBody(brief) };
 
   const human = humanFallbackHandle(db, requester, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));

@@ -109,6 +109,23 @@ test("local: a delegate request lands on the live launcher, harness-neutral, tra
   }
 }, 30_000);
 
+// #337: a fresh launcher can take work before it picks a name: delegation
+// reaches it by its session ID, by auto-pick and by an explicit to.
+test("local: an unbound launcher is delegable by its ID", async () => {
+  const fresh = await localSession(dir, undefined, { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim");
+  const id = (await call(fresh.c, "whoami")).id as string;
+  expect(id).toMatch(/^id:/);
+
+  const auto = await call(sim.c, "delegate", { persona: "a researcher", task: "t1" });
+  expect(auto.to).toBe(id);
+  expect(auto.delivered_now).toBe(true);
+  const named = await call(sim.c, "delegate", { persona: "a researcher", task: "t2", to: id });
+  expect(named.to).toBe(id);
+  await until(() => fresh.pushes.length >= 2, 10_000, "both requests pushed to the unbound launcher");
+  expect(String(fresh.pushes[0]!.content)).toContain("[delegation request from sim]");
+}, 30_000);
+
 test("local: an explicit to that isn't a launcher is refused, naming the flag", async () => {
   const sim = await localSession(dir, "sim");
   await localSession(dir, "ad"); // live, not a launcher
