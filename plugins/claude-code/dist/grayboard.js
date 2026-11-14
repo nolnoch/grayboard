@@ -35579,6 +35579,9 @@ var native_tools_default = [
       ],
       $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
+    },
+    _meta: {
+      "anthropic/alwaysLoad": true
     }
   },
   {
@@ -35654,6 +35657,9 @@ var native_tools_default = [
       ],
       $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
+    },
+    _meta: {
+      "anthropic/alwaysLoad": true
     }
   },
   {
