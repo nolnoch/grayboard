@@ -39,6 +39,7 @@ import { SIGN_IN_FLOW_MS } from "../../../src/shared/signin.ts";
 import { testPauseAsync } from "../../../src/shared/testpause.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
 import { configuredIdentity, describeLocation, sessionIdentity } from "../../../src/shared/identity.ts";
+import { validSourceId } from "../../../src/shared/session_meta.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
 
 export const HARNESS = "Claude Code";
@@ -331,7 +332,10 @@ export function createPlugin(o: PluginOptions): Plugin {
   let endWatch: FSWatcher | undefined;
   const drainEnded = () => {
     if ("error" in config || closed) return;
-    for (const agent of takeEnded(config.dataDir, o.claude.pid)) void root?.endChild(childOf(agent));
+    for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      // A child id over the server's limit was refused at its call, so it has no session to end.
+      if (validSourceId(childOf(agent))) void root?.endChild(childOf(agent));
+    }
   };
   const watchEnded = () => {
     if (endWatch || "error" in config || closed) return;
@@ -356,9 +360,16 @@ export function createPlugin(o: PluginOptions): Plugin {
       return failure(`grayboard couldn't tell which Claude Code agent made this call (${cause}), so it didn't run. Restart Claude Code so the grayboard plugin's hooks run; hooks turned off (disableAllHooks, or managed settings that allow only managed hooks) stop every grayboard call.`);
     }
     if (taken.agent === null) return root!.call(name, args, before);
+    // The server takes a session id of at most 1024 characters (#555 item 15);
+    // a long session id plus a long agent id can pass that, so say why here.
+    const child = childOf(taken.agent), length = child.length;
+    if (!validSourceId(child)) {
+      say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
+      return failure(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
+    }
     watchEnded();
     drainEnded();
-    return root!.call(name, args, before, { child: childOf(taken.agent) });
+    return root!.call(name, args, before, { child });
   };
 
   const tools = (): NativeTool[] => root?.tools() ?? hostTools(snapshotTools());
