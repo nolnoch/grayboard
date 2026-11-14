@@ -32,6 +32,14 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   const application = hosted.application, store = application.repo.hosted;
   const ttl = hosted.leaseTtl, now = options.now ?? hosted.now;
   const leases = new Map<string, Lease>();
+  // A session holds at most one lease (a reopen finishes the previous first): looked up and counted without a
+  // scan (#805).
+  const bySession = new Map<string, Lease>(), perUser = new Map<number, number>();
+  function track(lease: Lease) {
+    leases.set(lease.capability, lease); bySession.set(lease.sessionId, lease);
+    const user = lease.principal.authed.user_id;
+    perUser.set(user, (perUser.get(user) ?? 0) + 1);
+  }
   const attempts = new WeakMap<DeliveryLease, { lease: Lease; version: number; created: boolean; hooks: DeliveryHooks }>();
   function opened(lease: Lease, created: boolean, hooks: DeliveryHooks) {
     const result = describe(lease);
@@ -43,6 +51,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   let stopped = false;
   function finish(lease: Lease) {
     if (!leases.delete(lease.capability)) return;
+    if (bySession.get(lease.sessionId) === lease) bySession.delete(lease.sessionId);
+    const user = lease.principal.authed.user_id, n = (perUser.get(user) ?? 1) - 1;
+    if (n) perUser.set(user, n); else perUser.delete(user);
     application.close(lease.session);
     lease.issued.clear(); lease.acknowledged.clear(); notify("delivery.closed", lease.hooks.closed);
   }
@@ -50,8 +61,10 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     return !!row && row.session_id === lease.sessionId && row.ownership_id === lease.ownership && row.bind_gen === lease.generation &&
       row.grant_id === lease.principal.grantId && row.lease_deadline !== null && row.lease_deadline > now();
   }
-  const unlisten = hosted.listen(() => {
-    for (const lease of [...leases.values()]) if (!matches(lease, store.get(lease.sessionId))) finish(lease);
+  // `changed`: the one row a commit changed (#399), so only its leases are checked; null checks them all.
+  const unlisten = hosted.listen(changed => {
+    const check = changed === null ? [...leases.values()] : [bySession.get(changed)].filter(l => l !== undefined);
+    for (const lease of check) if (!matches(lease, store.get(lease.sessionId))) finish(lease);
   });
   function stale(p: DeliveryPrincipal, context: SessionContext, capability: string): never {
     throw new StaleCapability();
@@ -77,9 +90,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       return hosted.owning(p, context, row => {
         if (!application.hostedHolds(row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
         hosted.seeLost(p, row);
-        previous = [...leases.values()].find(l => l.sessionId === row.session_id);
+        previous = bySession.get(row.session_id);
         if (previous && matches(previous, row)) return previous;
-        if (leases.size >= 256 || [...leases.values()].filter(l => l.principal.authed.user_id === p.authed.user_id).length >= 32) throw new ApplicationError("bad_request", "delivery lease capacity reached");
+        // A lease this open replaces (another grant's) frees its slot here, not after the check; a
+        // session is one user's, so that slot is this user's.
+        const replaced = previous ? 1 : 0;
+        if (leases.size - replaced >= 256 || (perUser.get(p.authed.user_id) ?? 0) - replaced >= 32) throw new ApplicationError("bad_request", "delivery lease capacity reached");
         const expiresAt = now() + ttl;
         store.update({ ...row, lease_deadline: expiresAt, last_seen_at: now() });
         hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null });
@@ -95,7 +111,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         }, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
           ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
-        leases.set(lease.capability, lease);
+        track(lease);
         return opened(lease, true, hooks);
       });
     },
@@ -174,7 +190,6 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           get(p, context, capability, store.get(row.session_id));
           store.end(row.session_id, "closed", now());
         });
-        hosted.reconcile();
       }).catch(error => refused(p, context, error));
     },
     async cancel(result: DeliveryLease) {
@@ -190,7 +205,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         store.atomic(() => {
           if (matches(lease, store.get(lease.sessionId))) store.end(lease.sessionId, "closed", now());
         });
-        hosted.sweep();
+        hosted.settle(lease.sessionId);
         finish(lease);
       });
     },

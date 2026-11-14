@@ -17,20 +17,34 @@ export type HostedLost = { alias: string; reason: string; primary: boolean };
 export type LostReader = "agent" | "controller";
 export interface HostedStore {
   atomic<T>(fn: () => T): T;
-  subscribe(fn: () => void): () => void;
+  // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
+  // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
+  subscribe(fn: (changed: string | null) => void): () => void;
   get(id: string): HostedSession | undefined;
   // Whether the session ID is a hosted session's: a root's ownership row
   // stays after it ends; a child's row only while it is registered.
   owned(id: string): boolean;
-  // Every row but parked children (#566): what the limits count and the sweeps scan. `get` still returns a
+  // Every row but parked children (#566): the row set the limits count (`counts`) and the sweeps scan. `get` still returns a
   // parked row, and `children` lists a root's children, parked or not.
   all(): HostedSession[];
+  // What admission counts, without loading rows (#805): unparked rows on the server and the user's. The user's is
+  // O(own rows) on idx_hosted_user; the server's walks idx_hosted_parked, bounded by the global row cap.
+  counts(user: number): { total: number; user: number };
+  // An ownership's unparked rows (idx_hosted_ownership): what a grant re-attach moves.
+  ofOwnership(ownership: number): HostedSession[];
   children(root: string): HostedSession[];
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
   park(session: string, now: number): void;
   unpark(session: string, grant: string, now: number): void;
   insert(row: HostedSession): void;
   update(row: HostedSession): void;
+  // Activity only: `last_seen_at`, observed by no one (#399).
+  touch(session: string, now: number): void;
+  // The sweep's candidates by query, not by scanning every row (#399): roots whose lease lapsed by `now`; idle
+  // unparked rows (children, and roots with no lease and no hold) last seen before `cutoff`; disabled users' roots.
+  expired(now: number): HostedSession[];
+  idle(cutoff: number): HostedSession[];
+  disabled(): HostedSession[];
   // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
   start(session: string, user: number, client: string, now: number, suggested?: string | null): number;
   end(session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
