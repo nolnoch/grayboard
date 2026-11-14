@@ -241,7 +241,8 @@ test("#284 S2: a DM pushed for an alias and unacked at its unbind reaches its ne
   expect(await s.unbind("fe2")).toMatchObject({ released: false });
   // Re-bound on the same session, the board item goes out again.
   expect(await s.bind("fe2")).toMatchObject({ alias: `${A}/fe2` });
-  await s.next(board((i) => i.kind === "push" && i.post?.id === post.item.post?.id));
+  const posted = post.item.kind === "push" ? post.item.post.id : undefined;
+  await s.next(board((i) => i.kind === "push" && i.post.id === posted));
   await s.next(direct((m) => m.id === dm.message.id));
   expect(await s.unbind("fe2")).toMatchObject({ released: true });
   // Another session's bind of fe2 gets the DM still unacked.
