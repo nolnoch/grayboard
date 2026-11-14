@@ -12,7 +12,7 @@ import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import type { MailPort } from "../core/session_end.ts";
-import { afterCommit, openSqlite } from "../core/sqlite.ts";
+import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./can_send.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
@@ -1050,15 +1050,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     storage: {
       reclaimFreePages(maxPages) {
-        // incremental_vacuum(0) would mean every free page: never unbounded.
-        const pages = Math.floor(maxPages);
-        if (!(pages > 0)) throw new RangeError(`reclaimFreePages needs a positive page count, not ${maxPages}`);
-        const free = () => db.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count;
-        const incremental = db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()!.auto_vacuum === 2;
-        const before = free();
-        if (incremental && before > 0) db.run(`PRAGMA incremental_vacuum(${pages})`);
-        const remaining = free();
-        return { reclaimed: before - remaining, remaining, incremental };
+        return reclaimFreePages(db, maxPages);
       },
     },
 

@@ -9,7 +9,7 @@ import { dirname } from "node:path";
 
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays, pruneEndedIds, prunePosts } from "../core/boards.ts";
 import { dropAttachments, pruneUnbound, sweepBlobs, type BlobStore } from "../core/attachments.ts";
-import { openSqlite } from "../core/sqlite.ts";
+import { logReclaimed, openSqlite, reclaimFreePages, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { refuseForbiddenBus, RETENTION_SETTING_SQL } from "./open.ts";
 import { privateDbFiles, privateDir } from "./perms.ts";
@@ -50,7 +50,8 @@ export function writeRetentionSetting(path: string, days: number | null | undefi
   refuseForbiddenBus(path);
   privateDir(dirname(path));
   privateDbFiles(path);
-  const db = openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;", (d) => d.exec(RETENTION_SETTING_SQL));
+  // It can create the bus, so it sets auto_vacuum as openLocalDb does (#148).
+  const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;", (d) => d.exec(RETENTION_SETTING_SQL));
   try {
     return db.transaction(() => {
       const before = storedSetting(db);
@@ -88,7 +89,7 @@ function claimRun(db: Database, now: number, fallbackDays: number): number | nul
 }
 
 // Messages, posts and ended sessions older than the window, uploads left unbound,
-// then the bytes nothing names any more. The window is the bus's stored setting,
+// then the bytes nothing names any more, then the free pages that left (#148). The window is the bus's stored setting,
 // re-read on every run so a long session sees a change, else `fallbackDays`; with
 // retention off only the unbound uploads and unnamed bytes go. Returns false
 // without pruning if the bus was pruned within the last day.
@@ -116,6 +117,11 @@ export async function runLocalRetention(db: Database, blobs: BlobStore, fallback
   // Also finishes any sweep a crash or a failed delete left.
   const swept = await sweepBlobs(db, blobs);
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
+  try {
+    logReclaimed(reclaimFreePages(db, RECLAIM_PAGES_PER_RUN), "docs/guide/local.md §Reclaiming disk space");
+  } catch (e) {
+    console.error("[grayboard] retention: reclaiming free pages failed:", e);
+  }
   return true;
 }
 

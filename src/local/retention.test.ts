@@ -1,4 +1,4 @@
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -185,6 +185,61 @@ describe("the stored setting", () => {
       await runLocalRetention(db, blobs, 90, NOW + DAY);
       expect(err.mock.calls.flat().join(" ")).not.toContain("retention: deleted");
     } finally { err.mockRestore(); }
+  });
+});
+
+// #148 item 32: the server's free-page reclaim (#137), on the local bus.
+describe("reclaiming free pages", () => {
+  const freed = (d: Database, rows: number) => {
+    d.run("CREATE TABLE IF NOT EXISTS filler (x BLOB)");
+    d.transaction(() => { for (let i = 0; i < rows; i++) d.run("INSERT INTO filler VALUES (randomblob(4000))"); })();
+    d.run("DELETE FROM filler");
+  };
+  const free = (d: Database) => d.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count;
+  const autoVacuum = (d: Database) => d.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()!.auto_vacuum;
+
+  test("a new bus is incremental, and a retention run returns its free pages and says how many", async () => {
+    expect(autoVacuum(db)).toBe(2);
+    freed(db, 300);
+    const before = free(db);
+    expect(before).toBeGreaterThanOrEqual(300);
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await runLocalRetention(db, blobs, 90, NOW)).toBe(true);
+      expect(err.mock.calls.map((c) => String(c[0]))).toContain(`[grayboard] retention: reclaimed ${before} free database pages (0 left)`);
+    } finally { err.mockRestore(); }
+    expect(free(db)).toBe(0);
+  });
+
+  test("a bus created by `grayboard retention` before any session is incremental too", () => {
+    const path = join(dir, "set-first.db");
+    writeRetentionSetting(path, 30, NOW);
+    const d = openLocalDb(path).db;
+    try { expect(autoVacuum(d)).toBe(2); } finally { d.close(); }
+  });
+
+  test("a bus from before #148 (auto_vacuum=NONE) reclaims nothing and says how to convert it", async () => {
+    const path = join(dir, "old.db");
+    const old = new Database(path);
+    old.exec("PRAGMA journal_mode = WAL;");
+    freed(old, 500);
+    old.close();
+    // Opening adds the schema, which reuses some of those pages.
+    const d = openLocalDb(path).db;
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(autoVacuum(d)).toBe(0);
+      expect(free(d)).toBeGreaterThan(100);
+      await runLocalRetention(d, new SqliteBlobs(d), 90, NOW);
+      // The run's own writes may reuse a page or two; it returns none.
+      const left = free(d);
+      expect(left).toBeGreaterThan(100);
+      const lines = err.mock.calls.map((c) => String(c[0]));
+      expect(lines.filter((l) => l.includes("reclaimed"))).toEqual([]);
+      expect(lines).toContain(
+        `[grayboard] retention: the database has ${left} free pages it can't reclaim (auto_vacuum is not INCREMENTAL); a one-time VACUUM converts it (docs/guide/local.md §Reclaiming disk space)`,
+      );
+    } finally { err.mockRestore(); d.close(); }
   });
 });
 
