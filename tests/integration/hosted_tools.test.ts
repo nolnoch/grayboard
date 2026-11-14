@@ -364,6 +364,9 @@ test("#385: the DM tools take local's definitions, so a bad message ID or an unk
     ["dm_history", { before_id: -1 }],
     ["dm_send", { to: `${A}/be`, body: "x", parent_id: root.message_id + 0.5 }],
     ["dm_send", { to: `${A}/be`, body: "x", attachments: ["/etc/passwd"] }],
+    // application.send takes `resend` only as a boolean; the schema is what refuses any other (#475).
+    ["dm_send", { to: `${A}/be`, body: "x", resend: "yes" }],
+    ["delegate", { persona: "researcher", task: "x", resend: 1 }],
   ] as const) {
     const result = await b.callRaw(tool, args);
     const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
