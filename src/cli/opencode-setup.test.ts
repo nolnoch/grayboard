@@ -733,3 +733,32 @@ test("refresh-adapters on a signed-in machine keeps the V1 entry and names the s
   expect(withCreds.stdout.toString()).toContain("grayboard setup-opencode --url https://bus.example.com/team/x/mcp ");
   expect(JSON.parse(readFileSync(config, "utf8")).mcp.grayboard).toEqual(entry);
 });
+
+test("a config created after preflight, when none existed, is kept and the temp file removed (#381)", () => {
+  const f = fixture();
+  const concurrent = '{"created":"by the user meanwhile"}';
+  expect(() => setupOpenCode(f.opts, source, () => writeFileSync(f.config, concurrent))).toThrow("Config changed during setup");
+  expect(readFileSync(f.config, "utf8")).toBe(concurrent);
+  expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
+  // An empty file is still a concurrent file, kept like any other.
+  rmSync(f.config);
+  expect(() => setupOpenCode(f.opts, source, () => writeFileSync(f.config, ""))).toThrow();
+  expect(readFileSync(f.config, "utf8")).toBe("");
+});
+
+test("a sibling that gains Grayboard during setup refuses the commit and restores adapters (#381)", () => {
+  const f = fixture();
+  writeFileSync(f.config, JSON.stringify({ mcp: { grayboard: f.old } }));
+  const before = readFileSync(f.config, "utf8");
+  f.seedAdapter();
+  const other = f.config.slice(0, -1);
+  const sibling = JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: "https://other.example.com/mcp" } } } });
+  let failure: unknown;
+  try { setupOpenCode({ ...f.opts, migrate: true }, source, () => writeFileSync(other, sibling)); } catch (e) { failure = e; }
+  expect(((failure as Error).cause as Error)?.message ?? (failure as Error).message).toContain("Sibling config changed during setup");
+  expect(readFileSync(f.config, "utf8")).toBe(before);
+  expect(readFileSync(other, "utf8")).toBe(sibling);
+  expect(readFileSync(f.adapter, "utf8")).toBe(source);
+  expect(readdirSync(f.root).some(x => x.endsWith(".tmp"))).toBe(false);
+});
+
