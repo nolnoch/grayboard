@@ -38,7 +38,7 @@ import { dropSignIn, MISSING_TEXT, putSignIn, readFacts, sessionDir, takeEnded, 
 import { SIGN_IN_FLOW_MS } from "../../../src/shared/signin.ts";
 import { testPauseAsync } from "../../../src/shared/testpause.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
-import { configuredIdentity, describeLocation } from "../../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation, sessionIdentity } from "../../../src/shared/identity.ts";
 import { channelsOffNotice } from "../../../src/shared/toolguard.ts";
 
 export const HARNESS = "Claude Code";
@@ -104,6 +104,9 @@ export function createPlugin(o: PluginOptions): Plugin {
   const place = describeLocation(o.cwd) ?? HARNESS;
   // An explicit BUS_IDENTITY: this session binds it at its first start (#443).
   const configured = configuredIdentity(o.env, o.cwd);
+  // The name local mode would suggest here (#522): the pin or the repo's, with the worktree suffix. None when the
+  // directory gives no name (defaultIdentity throws).
+  const suggestion = (() => { try { return sessionIdentity(o.env, o.cwd); } catch { return undefined; } })();
   // Attachments come from and go to the session's directory and the project's.
   const project = o.env.CLAUDE_PROJECT_DIR;
   const roots = [...new Set([...attachRoots(o.env, o.cwd), ...(project ? attachRoots({}, project) : [])])];
@@ -204,6 +207,8 @@ export function createPlugin(o: PluginOptions): Plugin {
     // The root's model and effort as the hooks last wrote them (#545), read per
     // request; a child session reports none (no hook names a subagent's model).
     facts: sessionID => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined,
+    // The root's suggested name, local mode's (#522); a child's is the server's to ignore, so it sends none.
+    ...(suggestion ? { suggested: (sessionID: string) => sessionID === config.id ? suggestion : undefined } : {}),
   });
 
   // Resolves at `initialized`; rejects once `signal` (the run loop's) aborts.

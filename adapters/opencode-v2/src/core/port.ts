@@ -26,6 +26,8 @@ export interface HostPort<E extends Enrollment = Enrollment> {
   readonly launcher?: true;      // the harness can spawn subagents: every wire declares it, and the server turns the ownership's flag on (#473, #520)
   // Optional: the session's current model and effort, read per request (#364). Omitted where the harness exposes none (Claude Code).
   facts?(sessionID: string): SessionFacts | undefined;
+  // Optional: the name the harness suggests for the session (#443, #522), the repo's as local mode's is. Every wire sends it.
+  suggested?(sessionID: string): string | undefined;
   readonly storage: KeyValueStorage;
   place(): string;               // bind `where`; captured at construction, guard refuses once it differs
   ancestry(sessionID: string): Promise<SessionPath>; // {sessionID, root, via}; throws AncestryError

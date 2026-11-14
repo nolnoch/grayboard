@@ -30,7 +30,7 @@ import { failure, hostTools, snapshotTools, type CallHooks, type NativeTool, typ
 import { outputOf } from "../hosted-core/src/results.ts";
 import { RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
-import { configuredIdentity, describeLocation } from "../../src/shared/identity.ts";
+import { configuredIdentity, describeLocation, sessionIdentity } from "../../src/shared/identity.ts";
 
 export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
@@ -165,6 +165,8 @@ export function createGrayboard(h: Harness): Grayboard {
   // An explicit BUS_IDENTITY: each new root binds it at its first start (#443),
   // which also says one the naming rule refuses (the host has no UI at load).
   const configured = configuredIdentity(process.env, process.cwd());
+  // The name local mode would suggest here (#522); none when the directory gives no name.
+  const suggestion = (() => { try { return sessionIdentity(process.env, process.cwd()); } catch { return undefined; } })();
 
   const login = "url" in config ? new Login({
     resource: config.url, clientId: h.clientId, stateDir, harness: h.name, loginAction: LOGIN_ACTION,
@@ -199,6 +201,7 @@ export function createGrayboard(h: Harness): Grayboard {
     loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, get launcher() { return role.kind === "root" && process.env.BUS_LAUNCHER === "1"; }, log,
     // Only this process's own session: the harness's model is that session's.
     ...(h.facts ? { facts: (id: string) => session?.id === id ? h.facts!(id) : undefined } : {}),
+    ...(suggestion ? { suggested: (id: string) => session?.id === id ? suggestion : undefined } : {}),
   }) : undefined;
 
   // ---- sign-in ----

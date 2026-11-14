@@ -221,7 +221,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     check();
   }
   private wireOptions(e: E): WireOptions {
-    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...(this.port.delivery ? { delivery: this.port.delivery } : {}), ...(this.port.launcher ? { launcher: true as const } : {}), ...(this.port.facts ? { facts: (id: string) => this.port.facts!(id) } : {}) };
+    return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...(this.port.delivery ? { delivery: this.port.delivery } : {}), ...(this.port.launcher ? { launcher: true as const } : {}), ...(this.port.facts ? { facts: (id: string) => this.port.facts!(id) } : {}), ...(this.port.suggested ? { suggested: (id: string) => this.port.suggested!(id) } : {}) };
   }
   private async wire(e: E, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000), beforeRetry?: () => Promise<void>) {
     let current: string | undefined;
