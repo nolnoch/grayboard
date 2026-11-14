@@ -11,7 +11,7 @@ import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { idAddress } from "../../src/core/bindings.ts";
 import { endSession } from "../../src/core/session_end.ts";
-import { ApplicationError } from "../../src/server/application.ts";
+import { refusal } from "../support/app_session.ts";
 import type { AppSession, AppSessionOptions } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
@@ -55,23 +55,13 @@ const app = (identity: string | null, o: AppSessionOptions & { token?: string } 
   const { token, ...opts } = o;
   return srv.appSession(token ?? alice, identity, opts);
 };
-async function connect(identity: string | null, opts: AppSessionOptions & { token?: string } = {}): Promise<AppSession> {
-  const s = app(identity, opts);
-  await s.connect();
-  return s;
-}
+const connect = (identity: string | null, { token, ...opts }: AppSessionOptions & { token?: string } = {}): Promise<AppSession> => srv.connected(token ?? alice, identity, opts);
 // The session ends as a hosted ID's expiry ends it (core endSession): holds and
 // claims released, unread mail bounced. A close alone no longer ends one
 // (#282: no grace, no clean-exit frame), so tests that need an ended session end it.
 function endIt(s: AppSession): void {
   s.close();
   srv.app.repo.atomic(() => endSession(srv.app.db, srv.app.repo.mail, s.id, { why: "exit", now: Date.now() }));
-}
-// The ApplicationError a connect or a call is refused with.
-async function refuses<T>(f: () => Promise<T>): Promise<ApplicationError> {
-  const e = await f().then(() => undefined, (e: unknown) => e);
-  if (!(e instanceof ApplicationError)) throw new Error(`expected an ApplicationError, got ${e}`);
-  return e;
 }
 // The server restarts on the same database, a new in-process TestServer.
 async function restarted(): Promise<void> {
@@ -130,7 +120,7 @@ test("2, 13: a second session on a held explicit name starts unbound and names t
   const firstId = events("fe")[0]!.session_id;
   // The second session's bind is refused with the holder named.
   const second = await srv.hosted(A, null);
-  await expect(second.bind("fe")).rejects.toMatchObject({ message: expect.stringContaining(firstId) });
+  await expect(second.bind("fe")).rejects.toMatchObject({ code: "alias_held", message: expect.stringContaining(firstId) });
   expect((await second.call<{ peers: { handle: string; online: boolean }[] }>("peer_list", {})).peers).toEqual(
     expect.arrayContaining([expect.objectContaining({ handle: `${A}/fe`, online: true })]),
   );
@@ -194,7 +184,7 @@ test("#284 S1, S2, S6: bind adds a hold; unbind releases one, its claims and mai
   expect(u.left).toEqual(["ticket:ENG-142"]);
   expect(events("fe").at(-1)).toEqual({ session_id: sid, event: "released", detail: "unbind" });
   expect(rows(`SELECT address FROM alias_holds WHERE id = ?`, sid)).toEqual([{ address: `${A}/fe2` }]);
-  expect((await s.call<{ claim: { key: string } }[]>("claim_list", {})).map((c) => c.holder)).toEqual([`${A}/fe`]);
+  expect((await s.call<{ holder: string }[]>("claim_list", {})).map((c) => c.holder)).toEqual([`${A}/fe`]);
   expect(rows(`SELECT 1 FROM claim_events WHERE key = 'ticket:ENG-142' AND event = 'moved'`)).toEqual([]);
   await expect(s.call("claim_release", { key: "ticket:ENG-142" })).rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining(`${A}/fe`) });
   expect(await be.send(`${A}/fe`, "after unbind")).toMatchObject({ delivered_now: false });
@@ -268,7 +258,7 @@ test("audit 2 (server): a hold-only session holds its names: never online, and a
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
   for (const opts of [{ push: false, hold: true } as AppSessionOptions, {}]) {
     const t = await connect(null, opts);
-    expect((await refuses(() => t.bind("fe"))).code).toBe("alias_held");
+    expect((await refusal(t.bind("fe"))).code).toBe("alias_held");
   }
   // It holds the name without taking pushes: not online, and DMs wait.
   const fe = async () => (await be.call<{ peers: { handle: string; online: boolean }[] }>("peer_list", { include_offline: true })).peers.find((p) => p.handle === `${A}/fe`);
@@ -307,12 +297,13 @@ test("audit 11 (server): a call after a bind runs as the name it bound", async (
 }, 20_000);
 
 // hosted twin: #451 (holder probe)
-test("audit 15: a holder that can't answer keeps its name: another session's bind is refused, never a takeover", async () => {
-  const s = await connect("fe", { probe: "silent" });
+// An application session is never a hosted holder, so no bind probes it: this
+// is the live holder's refusal, not a silent probe's.
+test("audit 15: a live holder keeps its name: another session's bind is refused, never a takeover", async () => {
+  const s = await connect("fe");
   const holder = events("fe")[0]!.session_id;
-  // The holder stops answering the probe; its name is still never taken over.
   const t = await connect(null);
-  const e = await refuses(() => t.bind("fe"));
+  const e = await refusal(t.bind("fe"));
   expect(e.code).toBe("alias_held");
   expect(e.message).toContain(`"${A}/fe" is in use by the session ${holder}`);
   expect(s.session.holds).toEqual([`${A}/fe`]);
@@ -378,7 +369,7 @@ test("16, 18: raw binds: create: false, lazy create; an unbound connection reads
   await be.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // 16: create: false refuses an unknown name with the closest known ones.
-  const refused = await refuses(() => app("bee", { bind: { create: false } }).connect());
+  const refused = await refusal(app("bee", { bind: { create: false } }).connect());
   expect(refused).toMatchObject({ code: "identity_unknown", message: expect.stringContaining("closest") });
   expect(refused.extra.known).toEqual(["be"]);
   expect(rows(`SELECT 1 FROM aliases WHERE name = 'bee'`)).toEqual([]);
@@ -439,7 +430,7 @@ test("11 (server): a restore refused by the bind limit binds after the wait", as
   const restored = await connect(null);
   await connect("x1");
   await connect("x2");
-  const limited = await refuses(() => restored.bind("api", { restored_from: before }));
+  const limited = await refusal(restored.bind("api", { restored_from: before }));
   expect(limited.code).toBe("rate_limited");
   expect(limited.extra.retry_after_ms).toBeGreaterThan(0);
   expect(rows(`SELECT 1 FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([]);
@@ -564,7 +555,7 @@ test("#284: a key whose ID is another principal's session is refused with id_col
   const mine = await connect("api", { key });
   expect(rows(`SELECT id, principal FROM ids`)).toEqual([{ id: idAddress(key), principal: A }]);
   expect(rows(`SELECT address, id FROM alias_holds`)).toEqual([{ address: `${A}/api`, id: idAddress(key) }]);
-  expect(await refuses(() => app("api", { key, token: bob }).connect())).toMatchObject({ code: "id_collision", message: expect.stringContaining(idAddress(key)) });
+  expect(await refusal(app("api", { key, token: bob }).connect())).toMatchObject({ code: "id_collision", message: expect.stringContaining(idAddress(key)) });
   expect(rows(`SELECT address FROM alias_holds`)).toEqual([{ address: `${A}/api` }]);
   expect(rows(`SELECT action, target FROM access_log WHERE action IN ('id.registered', 'id.collision') ORDER BY id`)).toEqual([
     { action: "id.registered", target: idAddress(key) }, { action: "id.collision", target: idAddress(key) },
@@ -594,10 +585,10 @@ test("13 (server): a hosted bind's result carries its name and instructions", as
 
 test("audit 19: a bind or writes_as refused for an invalid or reserved name is refused, and a reserved one logged", async () => {
   const long = `x${"y".repeat(40)}!`;
-  expect(await refuses(() => app(long).connect())).toMatchObject({ code: "bad_request" });
-  expect(await refuses(() => app("human").connect())).toMatchObject({ code: "forbidden" });
+  expect(await refusal(app(long).connect())).toMatchObject({ code: "bad_request" });
+  expect(await refusal(app("human").connect())).toMatchObject({ code: "forbidden" });
   // A tools-only connection can't write as it either.
-  expect(await refuses(() => app("human", { push: false }).connect())).toMatchObject({ code: "forbidden" });
+  expect(await refusal(app("human", { push: false }).connect())).toMatchObject({ code: "forbidden" });
   // Each refusal is logged under its session's ID: the bind's and the writes_as's.
   const refused = { session_id: expect.stringMatching(/^id:[0-9a-z]{13}$/), event: "refused", detail: expect.stringContaining("human") };
   expect(events("human")).toEqual([refused, refused]);
@@ -760,7 +751,7 @@ test("#284 S10 (server): a restore takes back its names but one held by another"
   // The restore re-binds its record: "api" is refused, naming its holder; "be" restores.
   const r = await connect("be", { bind: { restored_from: sid } });
   expect(r.session.holds).toEqual([`${A}/be`]);
-  const e = await refuses(() => r.bind("api", { restored_from: sid }));
+  const e = await refusal(r.bind("api", { restored_from: sid }));
   expect(e.code).toBe("alias_held");
   expect(e.message).toContain(t.id);
   expect(rows(`SELECT id FROM alias_holds WHERE address = ?`, `${A}/api`)).toEqual([{ id: t.id }]);
@@ -859,7 +850,7 @@ test("#259: a stray refused a while its holder lives takes it after the end, unv
   await p.call("peer_status", { text: "p's task" });
   expect(await p.call("claim_take", { key: "ticket:ENG-7" })).toMatchObject({ claim: { holder: `${A}/a` } });
   const x = await connect("b");
-  expect((await refuses(() => x.bind("a", { restored_from: p.id }))).code).toBe("alias_held");
+  expect((await refusal(x.bind("a", { restored_from: p.id }))).code).toBe("alias_held");
   await x.send(`${A}/a`, "from b");
   await p.next(direct((m) => m.body === "from b" && m.sender === `${A}/b`));
 

@@ -7,7 +7,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
-import type { AppSession } from "../support/app_session.ts";
 import { board } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -29,20 +28,15 @@ afterEach(() => srv.stop());
 
 const mentioned = (body: string) => board((i) => i.kind === "push" && i.reason === "mention" && i.post.body === body);
 
-// An application session: a hosted session holds one person-scope name, so
-// it can't hold the team alias eng/deploy (#451).
-async function connect(token: string, identity: string): Promise<AppSession> {
-  const s = srv.appSession(token, identity);
-  await s.connect();
-  return s;
-}
+// Application sessions (srv.connected): a hosted session holds one
+// person-scope name, so it can't hold the team alias eng/deploy (#451).
 
 // hosted twin: #451 (deploy, a team alias)
 test("@scope/name is exact; a bare name is the author's own scope's first, else the board's one match", async () => {
   const abe = await srv.hosted(A, "be");
   const aqa = await srv.hosted(A, "qa");
   const bqa = await srv.hosted(B, "qa");
-  const deploy = await connect(bob, "eng/deploy");
+  const deploy = await srv.connected(bob, "eng/deploy");
   await abe.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // Exact: another person's alias, and a team's.
@@ -73,10 +67,10 @@ test("@scope/name is exact; a bare name is the author's own scope's first, else 
 test("an ambiguous bare name refuses the post with its candidates; an @id: reaches the session", async () => {
   const aqa = await srv.hosted(A, "qa");
   const bqa = await srv.hosted(B, "qa");
-  const deploy = await connect(bob, "eng/deploy");
+  const deploy = await srv.connected(bob, "eng/deploy");
   // A session with no name holds no lease and receives nothing (#229), so the
   // session an @id: names is one bound to a name of its own.
-  const bound = await connect(alice, "sim");
+  const bound = await srv.connected(alice, "sim");
   await deploy.call("board_create", { name: "e2e", purpose: "fixtures" });
 
   // eng has no qa of its own, and two people's are on the roster.

@@ -7,13 +7,12 @@ import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
-import { verifySessionToken } from "../../src/server/auth.ts";
 import type { Config } from "../../src/server/config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { cleanEnv } from "./env.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { AppSession, type AppSessionOptions } from "./app_session.ts";
+import { type AppSession, type AppSessionOptions, signedIn } from "./app_session.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession, type HostedOptions } from "./hosted_session.ts";
 
 function serverConfig(dir: string, overrides: Partial<Config>): Config {
@@ -86,10 +85,15 @@ export class TestServer {
   // an API request resolves it. Identity null stays unbound; connect() it.
   // Closed by stop().
   appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-    const authed = verifySessionToken(token, this.app.repo, this.app.touches);
-    if (!authed) throw new Error("appSession: the token doesn't authenticate");
-    const s = new AppSession(this.app.application, authed, identity, opts);
+    const s = signedIn(this.app, token, identity, opts);
     this.appSessions.push(s);
+    return s;
+  }
+
+  // appSession, connected (bound unless identity is null or it's tools-only).
+  async connected(token: string, identity: string | null, opts: AppSessionOptions = {}): Promise<AppSession> {
+    const s = this.appSession(token, identity, opts);
+    await s.connect();
     return s;
   }
 
@@ -98,7 +102,7 @@ export class TestServer {
   // stop(). Inbox polling spends hosted requests: give this server a large
   // hostedRequestLimit.
   async hosted(email: string, identity: string | null, opts: HostedOptions = {}): Promise<HostedSession> {
-    const { token } = issueOAuth(this.app.repo, this.app.oauth.resource, email, opts.scopes ?? HOSTED_SCOPES, Date.now(), opts.client ?? HOSTED_CLIENT);
+    const { token } = issueOAuth(this.app.repo, this.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
     const s = new HostedSession(`${this.base}/mcp`, token, identity, opts);
     this.hostedSessions.push(s);
     await s.connect();

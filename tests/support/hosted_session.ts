@@ -10,23 +10,22 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 import { LeaseUnavailable, NativeWire, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import type { PendingDelivery } from "../../src/server/delivery.ts";
-import { BUILTIN_CLIENT_IDS } from "../../src/server/oauth-config.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { until } from "./until.ts";
 
 export const HOSTED_CLIENT = "grayboard-pi";
 export const HOSTED_SCOPES = ["grayboard:tools", "grayboard:delivery"];
 
-// client: the built-in OAuth client the token is issued to, and the delivery
-// declaration's source. scopes: the token's. sessionId: the raw session ID
-// both wires send (random by default). create: bind's create (default true).
-// receipt: "auto" receipts every item next()/none() read, as a harness does
-// once it has delivered them; "manual" leaves that to receipt(). delivery:
-// whether a lease opens whenever the session binds (default true; an unbound
-// session can't hold one).
+// The token is HOSTED_CLIENT's (a built-in client: the server reads the
+// generic session key and the delivery declaration only for one, src/server/
+// oauth-config.ts sourceKeyFor), with HOSTED_SCOPES, and HOSTED_CLIENT is the
+// delivery declaration's source. sessionId: the raw session ID both wires send
+// (random by default). create: bind's create (default true). receipt: "auto"
+// receipts every item next()/none() read, as a harness does once it has
+// delivered them; "manual" leaves that to receipt(). delivery: whether a lease
+// opens whenever the session binds (default true; an unbound session can't
+// hold one).
 export type HostedOptions = {
-  client?: string;
-  scopes?: string[];
   sessionId?: string;
   create?: boolean;
   receipt?: "auto" | "manual";
@@ -82,8 +81,11 @@ export class HostedSession {
   private readonly wireOptions: WireOptions;
   private readonly abort = new AbortController();
   private lease?: { capability: string; expiresAt: number; ttl: number };
-  // Items read and not yet taken by next(), oldest first; every ID read, so
-  // an item still in the inbox is buffered once.
+  // Items read and not yet taken by next(), oldest first; every ID read under
+  // the current lease, so an item still in the inbox is buffered once. A bind
+  // keeps only the buffered IDs: an item the new lease shows again is read
+  // again (an item ID is not lease-stamped), as a harness rebuilds its view on
+  // a new lease.
   private buffer: InboxItem[] = [];
   private seen = new Set<string>();
   private closing?: Promise<void>;
@@ -95,9 +97,7 @@ export class HostedSession {
     private readonly identity: string | null,
     private readonly opts: HostedOptions = {},
   ) {
-    const client = opts.client ?? HOSTED_CLIENT;
-    // The generic session key and the delivery declaration are read only for a built-in client (src/server/oauth-config.ts sourceKeyFor).
-    if (!BUILTIN_CLIENT_IDS.includes(client)) throw new Error(`HostedSession: ${client} isn't a built-in hosted client (${BUILTIN_CLIENT_IDS.join(", ")})`);
+    const client = HOSTED_CLIENT;
     this.sessionId = opts.sessionId ?? `test-${randomBytes(8).toString("hex")}`;
     const options: WireOptions = { url, sessionKey: GRAYBOARD_SESSION_META, client: { name: client, version: "1.0.0" }, delivery: { mode: "push", source: client } };
     const auth = { token: async () => token };
@@ -189,6 +189,7 @@ export class HostedSession {
   async bind(name: string, { create = this.opts.create ?? true }: { create?: boolean } = {}): Promise<unknown> {
     this.lease = undefined;
     this.subscriber.capability = undefined;
+    this.seen = new Set(this.buffer.map((item) => item.id));
     const result = await this.call("bind", { name, create });
     if (this.opts.delivery ?? true) {
       const lease = leaseOf(await this.subscriber.call("delivery_open"));

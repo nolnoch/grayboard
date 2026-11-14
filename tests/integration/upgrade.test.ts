@@ -24,7 +24,6 @@ import { closeSessions, localSession, mcpSession, stopSession, type Session } fr
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
-import { direct } from "../support/events.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
 import { CLI } from "../support/paths.ts";
 import { newer } from "../../src/cli/update.ts";
@@ -316,9 +315,15 @@ function hostedReader(s: HostedSession): Reader {
       await s.next((e) => match(textOf(e)), 10_000);
     },
     quiet: (match) => s.none((e) => match(textOf(e))),
+    // The lease's inbox is every DM past the read point (application.pending), so the first read
+    // that shows `offline` also shows any DM a lost read point would bring back: no window to wait out.
     onlyDm: async (offline) => {
-      await s.next(direct((m) => m.body === offline), 10_000);
-      await s.none(direct());
+      const dms = await until(async () => {
+        const read = (await s.inbox()).filter((item) => item.event.kind === "direct");
+        return read.length ? read : undefined;
+      }, 10_000, `a DM in ${offline}'s recipient's inbox`);
+      expect(dms.map((item) => (item.event.kind === "direct" ? item.event.message.body : ""))).toEqual([offline]);
+      await s.receipt(dms.map((item) => item.id));
     },
     file: (id) => s.download(id),
   };

@@ -6,10 +6,9 @@ import { join } from "node:path";
 import { startServer } from "../../src/server/app.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
-import { verifySessionToken } from "../../src/server/auth.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { AppSession, type AppSessionOptions } from "../support/app_session.ts";
+import { type AppSession, type AppSessionOptions, signedIn } from "../support/app_session.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
@@ -50,9 +49,7 @@ async function legacyLogin(email = "alice@example.com") {
 // An application session (#282) signed in with a session token: the launcher
 // the hosted MCP has no form of yet (#451).
 function appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-  const authed = verifySessionToken(token, app.repo, app.touches);
-  if (!authed) throw new Error("appSession: the token doesn't authenticate");
-  const s = new AppSession(app.application, authed, identity, opts);
+  const s = signedIn(app, token, identity, opts);
   appSessions.push(s);
   return s;
 }

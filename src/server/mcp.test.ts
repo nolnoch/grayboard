@@ -167,7 +167,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   expect(peers.peers).toContainEqual(expect.objectContaining({ handle: "alice@example.com/fe", online: true, status: "working", where: "owner" }));
   expect(store.repo.cursors.directFor(owner.session.identityFull)).toBe(0);
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  await expect(new AppSession(application, user, "fe", { probe: "silent" }).connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
+  await expect(new AppSession(application, user, "fe").connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
 });
 
 test("Origin policy precedes authentication and context creation on every HTTP method", async () => {

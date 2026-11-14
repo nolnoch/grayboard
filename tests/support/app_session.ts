@@ -11,6 +11,7 @@ import { expect } from "bun:test";
 import { idAddress, mintSessionKey } from "../../src/core/bindings.ts";
 import type { PendingRef } from "../../src/core/boards.ts";
 import {
+  ApplicationError,
   type Application,
   type ApplicationSession,
   type BindResult,
@@ -23,9 +24,12 @@ import {
   type SendResult,
   type UnbindResult,
 } from "../../src/server/application.ts";
-import type { AuthedUser } from "../../src/server/auth.ts";
+import type { startServer } from "../../src/server/app.ts";
+import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
 import type { DelegateRequest, DelegateResult, ErrorCode } from "../../src/shared/protocol.ts";
 import { until } from "./until.ts";
+
+type StartedServer = ReturnType<typeof startServer>;
 
 export type AppEvent =
   | DeliveryEvent
@@ -35,11 +39,10 @@ export type AppEvent =
 // push/hold/key: a session with push: false and no hold is tools-only, whose
 // identity is the alias it writes as; key: the session key its ID derives
 // from, minted when absent. harness: what hostedRegister records. bind:
-// further fields for the identity's bind. probe: how the session answers a
-// bind's probe of its alias (a contender asking whether the holder is alive):
-// "answer" (the default), "silent" (no answer: false after the probe's ms), or
-// a function of the ms. launcher: the declaration a hosted request's
-// `_meta` carries (#473), declared as `rowFor` does.
+// further fields for the identity's bind. launcher: the declaration a hosted
+// request's `_meta` carries (#473), declared as `rowFor` does. The session
+// answers a bind's probe of its alias while it's open; it is never a hosted
+// holder (hostedSession registers it with no holds), so no bind probes it.
 export type AppSessionOptions = {
   push?: boolean;
   launcher?: boolean;
@@ -47,12 +50,26 @@ export type AppSessionOptions = {
   key?: string;
   harness?: string;
   bind?: Record<string, unknown>;
-  probe?: "answer" | "silent" | ((ms: number) => Promise<boolean>);
 };
 
 // What connect() answers: the session's ID and what its user's instructions
 // would carry, and the bind's result when the identity was bound.
 export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
+
+// An AppSession of the server `app`, signed in with the session token
+// `token` as an API request resolves it; connect() it. The caller closes it.
+export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
+  const authed = verifySessionToken(token, app.repo, app.touches);
+  if (!authed) throw new Error("appSession: the token doesn't authenticate");
+  return new AppSession(app.application, authed, identity, opts);
+}
+
+// The ApplicationError `p` (a connect, a bind, a call) is refused with.
+export async function refusal(p: Promise<unknown>): Promise<ApplicationError> {
+  const e = await p.then(() => undefined, (e: unknown) => e);
+  if (!(e instanceof ApplicationError)) throw new Error(`expected an ApplicationError, got ${e}`);
+  return e;
+}
 
 type Waiter = { pred: (e: AppEvent) => boolean; resolve: (e: AppEvent) => void; reject: (e: Error) => void };
 
@@ -88,14 +105,7 @@ export class AppSession {
         this.arrive({ kind: "closed", code: error.code, message: error.message });
         this.drop(`closed by the server (${error.code}: ${error.message})`);
       },
-      probe: (ms) => {
-        const probe = this.opts.probe ?? "answer";
-        if (probe === "answer") return Promise.resolve(!this.closed);
-        if (typeof probe === "function") return probe(ms);
-        const { promise, resolve } = Promise.withResolvers<boolean>();
-        setTimeout(() => resolve(false), ms);
-        return promise;
-      },
+      probe: () => Promise.resolve(!this.closed),
     };
   }
 
