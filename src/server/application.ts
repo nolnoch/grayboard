@@ -1103,9 +1103,11 @@ function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
 }
 
 // A bare name means the one of that name in the acting address's own scope,
-// else the one alias anyone has with it (as @name does in a post). Shared
-// with delegate's `to` resolution (#184 review 7): both take bare and
-// mixed-case names through the same path.
+// and only that (as @name does in a post): another user's or team's alias is
+// named in full, so a bare name never wakes someone else's agent by accident
+// (security audit F-08; vision principle 9). The refusal names the full
+// handles that do exist. Shared with delegate's `to` resolution (#184 review
+// 7): both take bare and mixed-case names through the same path.
 type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
 function resolvePeer(repo: Repo, from: string, input: string): Peer {
   const p = addressParts(input);
@@ -1120,10 +1122,8 @@ function resolvePeer(repo: Repo, from: string, input: string): Peer {
     // full handle, as peer_list shows it.
     fail("not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
   }
-  const all = repo.aliases.findAllByName(p.name);
-  const only = all.length === 1 ? addressParts(all[0]!.address) : null;
-  if (only && only.kind !== "bare") return only;
-  const which = all.length ? `several identities are named "${p.name}": ${all.map(i => i.address).sort().join(", ")}` : `no identity is named "${p.name}"`;
+  const all = repo.aliases.findAllByName(p.name).map((i) => i.address).sort();
+  const which = all.length ? `"${p.name}" isn't in your scope; name it in full: ${all.join(", ")}` : `no identity is named "${p.name}"`;
   return fail("not_found", `${which}; peer_list shows exact handles`);
 }
 
@@ -1307,7 +1307,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       // The user's bucket, not the address's (#252): the row names the session that tripped it.
       const t = hub.delegateLimiter.check(authed.user_email, { requester: session.primary, session_id: session.sessionId, ...byChild });
       if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
-      const d = resolveDelegation(db, session.primary, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h), open, hub.delegateOpenCap);
+      const d = resolveDelegation(db, session.primary, authed.user_email, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h), open, hub.delegateOpenCap);
       picked = d.to;
       const w = writeSend(hub, session, prepareSend(hub, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
