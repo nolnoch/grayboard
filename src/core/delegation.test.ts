@@ -173,6 +173,57 @@ describe("resolveDelegation", () => {
   });
 });
 
+// #337: a launcher session that hasn't bound a name is delegable by its ID
+// (addressable since #284), after every named launcher.
+describe("unbound launchers (#337)", () => {
+  function unbound(launcher: boolean, principal: string | null = null): string {
+    const id = `id:${String(++sessions).padStart(13, "0")}`;
+    registerId(db, { id, principal, launcher });
+    return id;
+  }
+
+  test("launchers lists an unbound launcher's ID after the named ones; not a non-launcher, an ended, a tools-only or a child ID", () => {
+    const u = unbound(true);
+    unbound(false);
+    db.prepare(`UPDATE ids SET ended_at = 1 WHERE id = ?`).run(unbound(true));
+    db.prepare(`UPDATE ids SET delivery = 'none' WHERE id = ?`).run(unbound(true));
+    db.prepare(`UPDATE ids SET root_id = ? WHERE id = ?`).run(u, unbound(true));
+    session("zed", true);
+    expect(launchers(db)).toEqual(["zed", u]);
+    expect(isLauncher(db, u)).toBe(true);
+  });
+
+  test("a bound launcher is listed by its alias, never also by its ID", () => {
+    session("a", true);
+    expect(launchers(db)).toEqual(["a"]);
+    expect(isLauncher(db, `id:${String(sessions).padStart(13, "0")}`)).toBe(false);
+  });
+
+  test("auto-pick reaches an unbound launcher when no named one is live; explicit to may name its ID", () => {
+    const u = unbound(true);
+    expect(resolveDelegation(db, "me", args, live).to).toBe(u);
+    expect(resolveDelegation(db, "me", { ...args, to: u }, live).to).toBe(u);
+    session("a", true);
+    expect(resolveDelegation(db, "me", args, live).to).toBe("a");
+  });
+
+  test("explicit to: an ID with no row is unknown; a non-launcher ID names the flag", () => {
+    expect(() => resolveDelegation(db, "me", { ...args, to: "id:0000000000999" }, live)).toThrow(/ever connected/);
+    const n = unbound(false);
+    expect(() => resolveDelegation(db, "me", { ...args, to: n }, live)).toThrow(/isn't a launcher session/);
+  });
+
+  test("an ID's user is its principal: another user's unbound launcher is neither picked nor nameable", () => {
+    const alices = unbound(true, "alice@example.com");
+    const bobs = unbound(true, "bob@b.com");
+    expect(resolveDelegation(db, "bob@b.com/me", args, live).to).toBe(bobs);
+    expect(() => resolveDelegation(db, "bob@b.com/me", { ...args, to: alices }, live)).toThrow(/own user|authority ruling/);
+    // A local requester (bare handle, no principal) doesn't reach a server user's ID.
+    db.prepare(`UPDATE ids SET launcher = 0 WHERE id = ?`).run(bobs);
+    expect(() => resolveDelegation(db, "me", { ...args, to: alices }, live)).toThrow(/own user|authority ruling/);
+  });
+});
+
 describe("payload", () => {
   test("carries the persona and task fenced as data, never a model name; the floor is parent relay", () => {
     const body = delegationBody({ requester: "me", persona: "a researcher", task: "do the thing" });
