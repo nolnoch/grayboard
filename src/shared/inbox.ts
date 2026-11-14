@@ -6,9 +6,10 @@ type Msg = { id: number; sender: string; recipient: string; body: string; parent
 
 // via (#523): the child session that wrote the message under its root's address.
 export type InboxItem = { id: number; from: string; via?: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
-export type PromiseItem = { id: number; to: string; via?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
+// No kind: a bounce is stored pending = 0, so it is never a promise.
+export type PromiseItem = { id: number; to: string; via?: string; parent_id?: number; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
 
-export const INBOX_DAYS = 3;
+const INBOX_DAYS = 3;
 export const MAX_INBOX_DAYS = 30;
 // Promises don't age out with the days argument; they stay until kept or acked.
 export const PROMISE_DAYS = MAX_INBOX_DAYS;
@@ -155,7 +156,7 @@ export function undeliveredInstruction(
 
 // A queued message to a handle idle this long is likely a misaddress (a live
 // peer under another handle), so the send result says so and names the undo.
-export const STALE_RECIPIENT_MS = 3_600_000;
+const STALE_RECIPIENT_MS = 3_600_000;
 
 export function queuedNote(recipient: string, seen: number | null, now = Date.now()): string {
   if (seen !== null && now - seen < STALE_RECIPIENT_MS) return "Recipient offline; will be delivered on their next session.";

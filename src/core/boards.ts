@@ -316,9 +316,16 @@ export function setPlace(db: Database, id: string, place: string | null): void {
 
 const MAX_STATUS = 200;
 
-/** Text as one line: whitespace runs to a space, other control characters dropped, trimmed. */
+// Bidi marks, embeddings, overrides and isolates (U+061C, U+200E-F,
+// U+202A-E, U+2066-9) and zero-width characters (U+200B, U+2060, U+FEFF):
+// they reorder or hide what a peer reads (#372). ZWJ (U+200D) builds emoji
+// sequences and ZWNJ (U+200C) is orthographic in Persian and Indic text, so
+// both stay; that's why this isn't all of \p{Cf}.
+const INVISIBLE = /[\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
+
+/** Text as one line: whitespace runs to a space, other control and bidi/zero-width characters dropped, trimmed. */
 export function oneLine(text: string): string {
-  return text.replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
+  return text.replace(INVISIBLE, "").replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
 }
 
 // One line saying what the session holding `handle` is doing; empty clears
@@ -467,10 +474,12 @@ export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts
 export type BoardUse = "read" | "subscribe" | "post";
 
 // Each of `handles`' view of the boards it can see (of `board` alone, when given).
+// A board summary's columns before mode and unread, shared by both list paths.
+const BOARD_COLUMNS = `b.*, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts`;
+
 function boardViews(db: Database, handles: string[], board: string | null): { handle: string; row: BoardSummary }[] {
   const q = db.prepare(
-    `SELECT b.*, s.mode AS mode,
-            (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
+    `SELECT ${BOARD_COLUMNS}, s.mode AS mode,
             CASE WHEN s.handle IS NULL THEN 0 ELSE
               (SELECT COUNT(*) FROM posts p
                 WHERE p.board = b.name AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}) END AS unread
@@ -504,7 +513,7 @@ export function boardAddress(db: Database, board: string, handles: string[], use
 export function listBoards(db: Database, handles: string[] | BoardPredicate): BoardSummary[] {
   if (typeof handles === "function") {
     const rows = db.prepare(
-      `SELECT b.*, NULL AS mode, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts, 0 AS unread
+      `SELECT ${BOARD_COLUMNS}, NULL AS mode, 0 AS unread
          FROM boards b ORDER BY b.name`,
     ).all() as BoardSummary[];
     return rows.filter(handles);
@@ -1116,17 +1125,26 @@ export function who(
   }
   const now = Date.now();
   const all: Peer[] = [];
+  // One scope check per alias scope, not one per row (#373).
+  const viewer = ctx.session ?? handle;
+  const seen = new Map<string, boolean>();
+  const sees = (scope: Omit<AliasScope, "name">): boolean => {
+    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+    let v = seen.get(key);
+    if (v === undefined) seen.set(key, v = acc.seesAliasMeta(viewer, scope));
+    return v;
+  };
   for (const r of rows) {
     if (isViewer(r.handle)) continue;
     const where = r.cwd ? describeLocation(r.cwd) : r.place;
-    const seesMeta = r.scope_kind !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
     const session = sessionFacts(r);
     const meta: AliasMeta = {};
     if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
     // An ID row's scope is its principal, which the row doesn't show: it
     // matches only for a caller that may act in that principal's scope (#371).
     if (opts.match) {
-      const idScope = opts.match.scope !== undefined && r.principal !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: "person", scope_ref: r.principal });
+      const idScope = opts.match.scope !== undefined && r.principal !== null && sees({ scope_kind: "person", scope_ref: r.principal });
       const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
       if (!matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
     }
@@ -1473,6 +1491,9 @@ export function parseRetentionDays(raw: string | undefined, fallback: number): n
 // the transaction commits.
 export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<string, number>): string[] {
   const counts: Record<string, number> = {};
+  // Immediate: the first statement is a read, and a deferred transaction
+  // whose snapshot another writer advanced fails its first write with
+  // SQLITE_BUSY at once, busy_timeout or not (#340).
   const changed = db.transaction(() => {
     const boards = db.prepare(`SELECT DISTINCT board FROM posts WHERE created_at < ? ORDER BY board`).all(olderThanMs) as { board: string }[];
     const old = `SELECT id FROM posts WHERE created_at < ?`;
@@ -1490,7 +1511,7 @@ export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<s
     ).run(olderThanMs).changes;
     // Expired claims are left to sweepExpired, which announces them.
     return boards.map(b => b.board);
-  })();
+  }).immediate();
   if (deleted) for (const [table, n] of Object.entries(counts)) deleted[table] = (deleted[table] ?? 0) + n;
   return changed;
 }

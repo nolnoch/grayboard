@@ -50,14 +50,15 @@ const SH = ["sh", "-c", `"$@"; exit $?`, "sh", process.execPath];
 test("a SIGKILLed child restarted under its live harness re-attaches: same ID, name, status and queued mail, no bounce", async () => {
   const key = mintSessionKey();
   const id = idAddress(key);
-  let s = await localSession(dir, undefined, { extra: { BUS_SESSION_KEY: key, ...pauseEnv("attach:before-txn") } });
+  let s = await localSession(dir, undefined, { extra: { BUS_SESSION_KEY: key, BUS_MODEL: "claude-opus-5-5", BUS_EFFORT: "high", ...pauseEnv("attach:before-txn") } });
   const peer = await localSession(dir, "fe");
   await s.call("bind", { name: "api", create: true });
   await s.call("peer_status", { text: "mid-task" });
   // Liveness is the harness's, with this child attached.
   const first = binding(id)!;
   expect(first).toMatchObject({ pid: s.harnessPid, harness_rule: "ancestor", detached_at: null });
-  expect(audit("id.registered", id)).toEqual([expect.objectContaining({ keyed: true, harness_rule: "ancestor", harness_pid: s.harnessPid })]);
+  // The session's facts ride on its registration, as on the server (#373).
+  expect(audit("id.registered", id)).toEqual([expect.objectContaining({ keyed: true, harness_rule: "ancestor", harness_pid: s.harnessPid, model: "claude-opus-5-5", effort: "high" })]);
 
   // Down between the crash and the attach: mail to its name waits.
   const restarted = s.restart("crash");
@@ -73,7 +74,7 @@ test("a SIGKILLed child restarted under its live harness re-attaches: same ID, n
   const now = binding(id)!;
   expect(now.pid).toBe(first.pid);
   expect(now.attached_pid).not.toBe(first.attached_pid);
-  expect(audit("id.reattached", id)).toEqual([{ old_pid: first.attached_pid, new_pid: now.attached_pid, harness_pid: s.harnessPid }]);
+  expect(audit("id.reattached", id)).toEqual([{ old_pid: first.attached_pid, new_pid: now.attached_pid, harness_pid: s.harnessPid, held: ["api"] }]);
   expect(audit("id.ended", id)).toEqual([]);
   expect(peer.pushes.filter((p) => p.meta.kind === "bounce")).toEqual([]);
 }, 30_000);

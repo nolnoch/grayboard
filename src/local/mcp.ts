@@ -49,7 +49,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
@@ -336,7 +336,7 @@ async function restoreNames(rec: { names: string[]; session_id: string }, siblin
     if (sibling && n.ok) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
     const r = n.ok
       ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id })
-      : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
+      : { ok: false as const, error: n.error, ended: nothingEnded() };
     await deliverEnded(db, r.ended);
     if (!r.ok) { missed.push({ name, why: r.error }); continue; }
     held.push(r.name);
@@ -1397,7 +1397,7 @@ const shutdown = async () => {
   for (const h of [...listeners.keys()]) stopListening(h);
   stopIdListening();
   await Promise.race([Promise.allSettled([...calls, inflight]), Bun.sleep(SHUTDOWN_WAKE_MS)]);
-  let ended: Ended = NOTHING_ENDED;
+  let ended: Ended = nothingEnded();
   try {
     // A keyed session outlives this process while its harness runs.
     if (HARNESS && isAlive(HARNESS.pid, HARNESS.proc_start)) detachSession(db, SESSION_ID);

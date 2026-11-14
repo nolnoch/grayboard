@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import {
   cleanPlace,
+  oneLine,
   parseAliasMeta,
   acknowledge,
   activeAnnouncements,
@@ -94,6 +95,51 @@ test("prunePosts reports only boards with committed deleted posts", () => {
   db.run(`CREATE TRIGGER fail_prune BEFORE DELETE ON posts BEGIN SELECT RAISE(ABORT, 'rollback prune'); END`);
   expect(() => prunePosts(db, Date.now() + 1)).toThrow("rollback prune");
   expect(snapshot(db, "be", "kept").posts.map(p => p.body)).toEqual(["new"]);
+});
+
+// #340: prunePosts reads before it writes. Deferred, a commit by another
+// connection between that read and its first write fails the prune with
+// SQLITE_BUSY; immediate, the other writer waits instead.
+test("prunePosts holds the write lock from its first read, so a concurrent writer can't fail it", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gb-prune-")), "bus.db");
+  const a = new Database(path);
+  a.run("PRAGMA journal_mode = WAL");
+  initCoreSchema(a);
+  ensureAlias(a, "be", "test");
+  createBoard(a, "be", "e2e", "test");
+  post(a, "be", "e2e", "old");
+  a.run("UPDATE posts SET created_at = 0");
+  const b = new Database(path);
+  b.run("PRAGMA busy_timeout = 0");
+  let interleaved: string | undefined;
+  const prepare = a.prepare.bind(a);
+  const spy = spyOn(a, "prepare").mockImplementation(((sql: string) => {
+    const stmt = prepare(sql);
+    if (!sql.startsWith("SELECT DISTINCT board FROM posts")) return stmt;
+    const all = stmt.all.bind(stmt);
+    stmt.all = ((...args: unknown[]) => {
+      const rows = all(...(args as []));
+      // Another process writes between the prune's read and its first write.
+      try {
+        b.run("UPDATE boards SET purpose = 'moved on' WHERE name = 'e2e'");
+        interleaved = "wrote";
+      } catch (e) {
+        interleaved = String(e);
+      }
+      return rows;
+    }) as typeof stmt.all;
+    return stmt;
+  }) as typeof a.prepare);
+  try {
+    expect(prunePosts(a, 1)).toEqual(["e2e"]);
+  } finally {
+    spy.mockRestore();
+  }
+  // The other writer was held off, not let through to break the prune.
+  expect(interleaved).toMatch(/SQLITE_BUSY|database is locked/);
+  expect(b.prepare("SELECT COUNT(*) AS n FROM posts").get()).toEqual({ n: 0 });
+  a.close();
+  b.close();
 });
 
 test("snapshots page bounded history without touching cursor, notified_id, or outbox", () => {
@@ -949,6 +995,18 @@ describe("with a scoped access policy", () => {
     expect(row("fe", "id:00000000000fe", { task: "ENG-142" })).toBeUndefined();
   });
 
+  // #373 (S10): one scope check per alias scope in a roster, not one per row.
+  test("peer_list checks each alias scope once per call", () => {
+    for (const n of ["x", "y", "z"]) {
+      db.prepare(`INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen, task) VALUES (?, 'team', 'eng', ?, 1, 1, 'ENG-142')`).run(`eng/${n}`, n);
+    }
+    const checks: string[] = [];
+    setAccess(db, { ...policy, seesAliasMeta: (h, scope) => { checks.push(`${scope.scope_kind}:${scope.scope_ref}`); return policy.seesAliasMeta(h, scope); } });
+    const peers = who(db, "be", { include_offline: true }, () => true, { session: "id:00000000000be" }).peers.filter((p) => p.handle.startsWith("eng/"));
+    expect(peers.map((p) => [p.handle, p.task])).toEqual([["eng/x", "ENG-142"], ["eng/y", "ENG-142"], ["eng/z", "ENG-142"]]);
+    expect(checks.filter((c) => c === "team:eng")).toHaveLength(1);
+  });
+
   test("claims hide a board the viewer can't see", () => {
     claim(db, "be", "ticket:ENG-1", { board: "eng" });
     expect(listClaims(db, "ticket:", "fe")[0]!.board).toBeNull();
@@ -1162,6 +1220,20 @@ test("a place and an unknown meta key are single bounded lines", () => {
   expect(cleanPlace(" \u0000 ")).toBeNull();
   const key = `k\n${"x".repeat(500)}`;
   expect(() => parseAliasMeta({ [key]: "v" })).toThrow(`unknown meta key "k ${"x".repeat(38)}"; known:`);
+});
+
+// #372: bidi controls and zero-width characters go; ZWJ and ZWNJ stay.
+test("oneLine drops bidi controls and zero-width characters but keeps ZWJ and ZWNJ", () => {
+  for (const c of ["\u061c", "\u200e", "\u200f"]) expect(oneLine(`a${c}b`), "bidi mark").toBe("ab");
+  for (const c of ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e"]) expect(oneLine(`a${c}b`), "embedding/override").toBe("ab");
+  for (const c of ["\u2066", "\u2067", "\u2068", "\u2069"]) expect(oneLine(`a${c}b`), "isolate").toBe("ab");
+  for (const c of ["\u200b", "\u2060", "\ufeff"]) expect(oneLine(`a${c}b`), "zero-width").toBe("ab");
+  expect(oneLine("evil\u202eexe.txt")).toBe("evilexe.txt");
+  expect(oneLine(" \u200b a \u200b  b \u2066")).toBe("a b");
+  const family = "\u{1f468}\u200d\u{1f469}\u200d\u{1f467}";
+  expect(oneLine(`team ${family}`)).toBe(`team ${family}`);
+  expect(oneLine("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645")).toBe("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645");
+  expect(cleanPlace("\u202e\u200b")).toBeNull();
 });
 
 // #284 S5 (audit P2): a session's own post is not unread on any of its
