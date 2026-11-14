@@ -468,6 +468,14 @@ export const ATTACHMENTS_PARAM = {
   description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`,
 };
 
+// The hosted form (a server's hosted MCP): files uploaded first through the
+// authenticated attachment HTTP API, named by the IDs it returned.
+export const ATTACHMENT_IDS_PARAM = {
+  type: "array",
+  items: { type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths.",
+};
+
 // Not alwaysLoad: a channel notification with files names this tool
 // (files_tool, src/core/tools.ts), and tool results list the ids.
 export const ATTACHMENT_GET_TOOL = {

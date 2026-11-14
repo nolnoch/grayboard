@@ -354,6 +354,25 @@ const download = (token: string, identity: string, id: number) =>
 
 const audits = (action: string) => accessAudits(srv.app.db, action);
 
+test("#385: the DM tools take local's definitions, so a bad message ID or an unknown argument is refused before any handler", async () => {
+  const a = await srv.hosted(A, "be");
+  const b = await srv.hosted(B, "fe");
+  const root = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "hi" });
+  for (const [tool, args] of [
+    ["dm_thread", { thread: 1.5 }],
+    ["dm_thread", { thread: 0 }],
+    ["dm_history", { before_id: -1 }],
+    ["dm_send", { to: `${A}/be`, body: "x", parent_id: root.message_id + 0.5 }],
+    ["dm_send", { to: `${A}/be`, body: "x", attachments: ["/etc/passwd"] }],
+  ] as const) {
+    const result = await b.callRaw(tool, args);
+    const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
+    expect([tool, args, result.isError, text.startsWith(`Input validation error: Invalid arguments for tool ${tool}:`)]).toEqual([tool, args, true, true]);
+  }
+  // Nothing was sent by the refused calls.
+  expect((await b.call<HistoryMessage[]>("dm_history", {})).map((m) => m.body)).toEqual(["hi"]);
+});
+
 test("attachments on a DM: uploaded as your identity, bound by the send, pushed and read, fetched by its two parties", async () => {
   const alice = await login(A);
   const bob = await login(B);

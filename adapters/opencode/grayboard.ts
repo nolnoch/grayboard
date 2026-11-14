@@ -32,6 +32,7 @@ type JsonSchema = {
   type?: string;
   description?: string;
   enum?: unknown[];
+  exclusiveMinimum?: number;
   items?: JsonSchema;
   anyOf?: JsonSchema[];
   properties?: Record<string, JsonSchema>;
@@ -95,8 +96,10 @@ function toZod(s: JsonSchema, at: string): any {
     if (s.type !== "string" || !s.enum.every((v) => typeof v === "string")) throw new Error(`grayboard: ${at}: only string enums are supported`);
     out = z.enum(s.enum as [string, ...string[]]);
   } else if (s.type === "string") out = z.string();
-  else if (s.type === "number") out = z.number();
-  else if (s.type === "integer") out = z.number().int();
+  else if (s.type === "number" || s.type === "integer") {
+    out = s.type === "integer" ? z.number().int() : z.number();
+    if (typeof s.exclusiveMinimum === "number") out = out.gt(s.exclusiveMinimum);
+  }
   else if (s.type === "boolean") out = z.boolean();
   else if (s.type === "array") {
     if (!s.items) throw new Error(`grayboard: ${at}: array without items`);

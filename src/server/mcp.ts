@@ -1,11 +1,11 @@
 import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
-import { AS_PARAM, boardTools, DEFAULT_CHANNEL_SOURCE, RESEND_PARAM } from "../core/tools.ts";
+import { boardTools, DEFAULT_CHANNEL_SOURCE, dmTools, type ToolDef } from "../core/tools.ts";
 import { BIND_TOOL, UNBIND_TOOL } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { DELEGATE_TOOL } from "../core/delegation.ts";
-import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, PENDING_PARAM, ackResult, withNotices } from "../shared/inbox.ts";
+import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, ackResult, withNotices } from "../shared/inbox.ts";
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
 import { GRAYBOARD_ALIAS_LOST_META } from "../shared/session_meta.ts";
@@ -29,7 +29,6 @@ export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
 const ids = z.array(id);
-const attachmentIds = ids.describe("IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths.");
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
@@ -759,33 +758,25 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     try { const context = current(ctx); return await hosted.unbind(context.principal, context.sessionContext, args, context.declared); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
-  for (const tool of boardTools({ teams: true })) {
-    const properties = { ...tool.inputSchema.properties };
-    if (tool.name === "board_post") { delete properties.attachments; properties.attachment_ids = z.toJSONSchema(attachmentIds); }
-    server.registerTool(tool.name, {
-      description: tool.name === "board_post" ? tool.description.replace("attachments?", "attachment_ids?") : tool.description,
-      ...(tool._meta ? { _meta: tool._meta } : {}),
-      inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, properties, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
-    }, (args, ctx) => run(ctx, tool.name, session => application.call(session, tool.name, args)));
+  // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
+  const shared = (tool: ToolDef) => ({
+    description: tool.description,
+    ...(tool._meta ? { _meta: tool._meta } : {}),
+    inputSchema: fromJsonSchema<Record<string, unknown>>({ ...tool.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
+  });
+  for (const tool of boardTools({ teams: true, attachments: "ids" })) {
+    server.registerTool(tool.name, shared(tool), (args, ctx) => run(ctx, tool.name, session => application.call(session, tool.name, args)));
   }
-  // Always loaded, as local's are (src/local/tools.ts): a host that defers tools behind a search otherwise hides
-  // the reply tool from agents (#385).
-  const ALWAYS_LOAD = { "anthropic/alwaysLoad": true };
-  server.registerTool("dm_send", {
-    _meta: ALWAYS_LOAD,
-    description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
-    inputSchema: z.strictObject({ to: z.string(), body: z.string(), parent_id: id.optional(), pending: z.boolean().describe(PENDING_PARAM.description).optional(), attachment_ids: attachmentIds.optional(), resend: z.boolean().describe(RESEND_PARAM.description).optional(), as: z.string().describe(AS_PARAM.description).optional() }),
-  }, (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to, a.body, a)));
+  const dm = Object.fromEntries(dmTools({ attachments: "ids" }).map(t => [t.name, t])) as Record<"dm_send" | "dm_history" | "dm_thread", ToolDef>;
+  server.registerTool("dm_send", shared(dm.dm_send),
+    (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to as string, a.body as string, a as Parameters<typeof application.send>[3])));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,
     inputSchema: fromJsonSchema<{ persona: string; task: string; context?: string; to?: string }>({ ...DELEGATE_TOOL.inputSchema, additionalProperties: false } as Parameters<typeof fromJsonSchema>[0]),
   }, (a, ctx) => run(ctx, "delegate", session => application.delegate(session, a)));
-  server.registerTool("dm_history", {
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
-    inputSchema: z.strictObject({ peer: z.string().optional(), limit: z.number().optional(), before_id: id.optional() }),
-  }, (a, ctx) => run(ctx, "dm_history", session => application.history(session, a)));
-  server.registerTool("dm_thread", { _meta: ALWAYS_LOAD, description: "A whole direct-message thread you participate in.", inputSchema: z.strictObject({ thread: id }) },
-    (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread)));
+  server.registerTool("dm_history", shared(dm.dm_history),
+    (a, ctx) => run(ctx, "dm_history", session => application.history(session, a as Parameters<typeof application.history>[1])));
+  server.registerTool("dm_thread", shared(dm.dm_thread), (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread as number)));
   server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: z.strictObject({ days: z.number().positive().max(MAX_INBOX_DAYS).optional() }) },
     (a, ctx) => run(ctx, "dm_inbox", session => application.inbox(session, a.days)));
   server.registerTool(DM_ACK_TOOL.name, {
