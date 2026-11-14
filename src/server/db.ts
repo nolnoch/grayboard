@@ -31,6 +31,8 @@ export type Team     = { id: number; name: string; created_by: number; policy: s
 // delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
 // via: the child session (a harness subagent, #523) that wrote it under its root's addresses; null for a root's own write.
 export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at: number | null; pending: number; kind: "bounce" | null; via: string | null; attachments?: AttachmentInfo[] };
+// A message's files: upload ids and the uploader they must belong to (#391).
+export type MessageFiles = { ids: number[]; uploader: Uploader };
 // Only a direct message's sender and recipient can see it, its thread, or
 // the files it carries. One you're not in reads as missing, so its existence
 // doesn't leak. `me`: every address the caller reads as (#284 S8).
@@ -111,14 +113,16 @@ export interface Repo {
     isMember(teamId: number, userId: number): boolean;
   };
   messages: {
-    // attachmentIds: unbound uploads of `uploader` (the sending session's
+    // files: unbound uploads (ids) of their uploader (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
-    // transaction (a refused id throws CoreError and nothing is written).
-    // senderId: the sending session's ID (#284); null for a writer with no
-    // session. via: the child session that wrote it (#523), else null.
+    // transaction (a refused id throws CoreError and nothing is written);
+    // the ids and their uploader travel together, so the type requires one
+    // with the other (#391). senderId: the sending session's ID (#284); null
+    // for a writer with no session. via: the child session that wrote it
+    // (#523), else null.
     insert(
-      sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean, attachmentIds?: number[],
-      senderId?: string | null, uploader?: Uploader, via?: string | null,
+      sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
+      files?: MessageFiles, senderId?: string | null, via?: string | null,
     ): MessageRow;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
@@ -725,14 +729,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, attachmentIds = [], senderId = null, uploader, via = null) {
-        if (attachmentIds.length && !uploader) throw new Error("messages.insert: attachments need their uploader");
+      insert(sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null) {
         return db.transaction(() => {
           const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null]>(
             `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
           ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0, via)!;
-          const attachments = bindAttachments(db, attachmentIds, uploader!, { message_id: row.id }, attachmentLimits);
+          const attachments = files ? bindAttachments(db, files.ids, files.uploader, { message_id: row.id }, attachmentLimits) : [];
           return attachments.length ? { ...row, attachments } : row;
         })();
       },

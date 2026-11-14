@@ -36716,6 +36716,7 @@ class Controller {
       await this.save(r, true);
       await this.watch(e);
       this.set(r, "approved", "Root approved; bind a name to receive deliveries");
+      let bound = false;
       try {
         if (names.length) {
           const epoch = r.epoch, signal = new AbortController().signal;
@@ -36725,12 +36726,13 @@ class Controller {
               await w.call("bind", { name, create, where: this.port.place() });
             await this.guard(r, epoch, signal);
           });
+          bound = true;
         }
         await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
         if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, "enroll", failureCode(this.expired(error)));
+          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", failureCode(this.expired(error)));
       }
       await this.diagnostics.flush();
       return { ...r.status, roots: this.status().roots };
@@ -37559,13 +37561,18 @@ class RootDelivery {
       this.proxy?.forget(id);
       const root = status.roots.find((r) => r.sessionID === id);
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      const landed = (carried || configured) && root?.operation === "prepare" && root.code !== undefined ? expected : undefined;
       if (carried && bound?.length && this.carrying === carried)
         this.carrying = undefined;
-      const holds = (address) => !!bound?.some((b) => b === address || b.endsWith(`/${address}`));
+      const holds = (address) => !![...bound ?? [], ...landed ?? []].some((b) => b === address || b.endsWith(`/${address}`));
       if (configured && (holds(configured) || REFUSED.has(root?.code ?? "")))
         this.configuring = undefined;
       const missing = (expected ?? []).filter((address) => !holds(address));
-      if (missing.length && root?.state !== "paused") {
+      if (landed && root?.state !== "paused") {
+        const text = `this session is bound as ${landed.join(", ")}, but delivery couldn't start (${root?.message ?? status.message})`;
+        this.notices.set("start", text);
+        this.log(text, "warning");
+      } else if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
         const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}` : carried ? `this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}` : `this session couldn't take back its ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} (${root?.message ?? status.message}); ${now}`;
         this.notices.set("start", text);

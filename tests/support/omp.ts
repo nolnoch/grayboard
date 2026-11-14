@@ -19,6 +19,7 @@ import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
+import { accessAudits } from "./hosted_rows.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
@@ -98,9 +99,7 @@ const serverId = (srv: HostedServer, raw: string): string | undefined => srv.app
 const idle = (omp: Pi, ms = 30_000) => until(async () => (await omp.command({ type: "get_state" })).isSettled === true, ms, "omp settled");
 
 // The hosted audit rows of `action`, oldest first.
-type Audit = { target: string; detail: Record<string, unknown> };
-const audits = (srv: HostedServer, action: string): Audit[] => srv.app.db.query<{ target: string; detail: string }, [string]>(
-  "SELECT target, detail FROM access_log WHERE action = ? ORDER BY id").all(action).map((r) => ({ target: r.target, detail: JSON.parse(r.detail) }));
+const audits = (srv: HostedServer, action: string) => accessAudits(srv.app.db, action);
 // The server sessions registered as children of `root` right now.
 const liveChildren = (srv: HostedServer, root: string): string[] => srv.app.db.query<{ session_id: string }, [string]>(
   "SELECT session_id FROM hosted_sessions WHERE root_session_id = ?").all(root).map((r) => r.session_id);

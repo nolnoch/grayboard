@@ -301,14 +301,22 @@ export class RootDelivery {
       // enroll's and resume's failures record operation "enroll"; a resume
       // names its root before the rebind, so the name alone proves nothing.
       const bound = root && root.operation !== "enroll" && root.state !== "unbound" ? root.held : undefined;
+      // An enroll whose binds landed but whose prepare failed records "prepare" with the
+      // failure's code (#544 item 2; prepare's own progress records carry none): the
+      // server holds what it asked for, though delivery didn't start.
+      const landed = (carried || configured) && root?.operation === "prepare" && root.code !== undefined ? expected : undefined;
       if (carried && bound?.length && this.carrying === carried) this.carrying = undefined;
       // Bound, or refused by the server (held, the user's handle): tried for
       // good. Unreachable or signed out: the next start tries again.
       // The configured name is bare; holds are qualified (`<email>/<name>`).
-      const holds = (address: string) => !!bound?.some(b => b === address || b.endsWith(`/${address}`));
+      const holds = (address: string) => !![...bound ?? [], ...landed ?? []].some(b => b === address || b.endsWith(`/${address}`));
       if (configured && (holds(configured) || REFUSED.has(root?.code ?? ""))) this.configuring = undefined;
       const missing = (expected ?? []).filter(address => !holds(address));
-      if (missing.length && root?.state !== "paused") {
+      if (landed && root?.state !== "paused") {
+        const text = `this session is bound as ${landed.join(", ")}, but delivery couldn't start (${root?.message ?? status.message})`;
+        this.notices.set("start", text);
+        this.log(text, "warning");
+      } else if (missing.length && root?.state !== "paused") {
         const now = bound?.length ? `it is bound as ${bound.join(", ")}` : "it is unbound";
         const text = configured ? `BUS_IDENTITY asked for "${configured}", but this session couldn't bind it (${root?.message ?? status.message}); ${now}`
           : carried ?`this session couldn't take the ${missing.length > 1 ? "names" : "name"} ${missing.join(", ")} it carried over (${root?.message ?? status.message}); ${now}`
