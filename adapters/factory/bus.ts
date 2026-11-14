@@ -34,6 +34,7 @@ export type LocalBusOptions = {
   command: string[];             // the grayboard CLI: [binary] or [bun, src/cli/main.ts]
   identity: string;              // BUS_IDENTITY: the name the factory binds
   env?: Record<string, string>;  // the child's base env (default: this process's)
+  launcher?: boolean;            // BUS_LAUNCHER (default true); the poster (#636) is no launcher, so no delegation lands where nothing reads DMs
   cwd?: string;
   version: string;               // reported as the MCP client's version
   // BUS_HARNESS_SESSION: the id a reader child (#669) names as its
@@ -89,7 +90,7 @@ export class LocalBus implements FactoryBus {
     if (!command) throw new Error("no grayboard command");
     // Push on (the module is the delivery owner, boards.md §9) and launcher:
     // delegation auto-pick finds it like any launcher session (§13).
-    const env = { ...sessionFree(o.env ?? process.env), BUS_IDENTITY: o.identity, BUS_LAUNCHER: "1", ...(o.harnessSession ? { BUS_HARNESS_SESSION: o.harnessSession } : {}) };
+    const env = { ...sessionFree(o.env ?? process.env), BUS_IDENTITY: o.identity, ...(o.launcher === false ? {} : { BUS_LAUNCHER: "1" }), ...(o.harnessSession ? { BUS_HARNESS_SESSION: o.harnessSession } : {}) };
     const transport = new StdioClientTransport({ command, args: [...prefix, "mcp", "--mode", "local"], env, ...(o.cwd ? { cwd: o.cwd } : {}), stderr: "inherit" });
     const client = new Client({ name: "grayboard-factory", version: o.version }, { capabilities: {} });
     const early: Delivery[] = [];

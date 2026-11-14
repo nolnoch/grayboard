@@ -15,8 +15,11 @@ import type { RunMeta } from "./runner.ts";
 // (rows whose `parent` is its seq) are out. finished: the outcome is in
 // `reply`, sent when replied = 1. asking (#652): its run ended on a
 // question (`question`), and it holds no slot until an answer queues it again
-// to resume (`resume` = 1, the answer in `answer`).
-export type State = "queued" | "running" | "waiting" | "asking" | "finished";
+// to resume (`resume` = 1, the answer in `answer`). shared (#636): a
+// subtask posted on its fleet's share board, waiting until `shared_until`
+// for a listed lane to take it; it runs here (queued) when none does, or
+// finishes with that lane's outcome (`shared_by`).
+export type State = "queued" | "running" | "waiting" | "asking" | "shared" | "finished";
 // run: the request itself (a fan-out-capable one when `fanout`). synthesize:
 // a fanned-out request whose subtasks all finished, combining their results;
 // with rounds left (#658) it's the lead's review, which may plan again.
@@ -33,6 +36,8 @@ export type Row = Request & {
   // the round it belongs to. `notes`: a root's working memory, from its
   // lead's notes blocks, carried into each review's digest.
   round: number; notes: string | null;
+  // Shared subtasks (#636): until when it waits for a taker, and the lane whose outcome finished it.
+  sharedUntil: number | null; sharedBy: string | null;
 };
 export type Admit = { fanout?: boolean; parent?: number; title?: string; profile?: string; round?: number };
 // A child process (#649): one per run of a request (a fanned-out request has
@@ -85,6 +90,8 @@ export class Store {
       resume INTEGER NOT NULL DEFAULT 0,
       round INTEGER NOT NULL DEFAULT 0,
       notes TEXT,
+      shared_until INTEGER,
+      shared_by TEXT,
       UNIQUE (source, id)
     )`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS runs (
@@ -118,7 +125,7 @@ export class Store {
       const cols = new Set((this.db.query(`PRAGMA table_info(requests)`).all() as { name: string }[]).map((c) => c.name));
       const add: [string, string][] = [["phase", "TEXT NOT NULL DEFAULT 'run'"], ["fanout", "INTEGER NOT NULL DEFAULT 0"], ["parent", "INTEGER"], ["title", "TEXT"], ["fanout_board", "TEXT"], ["profile", "TEXT"],
         ["question", "TEXT"], ["ask_human", "INTEGER NOT NULL DEFAULT 0"], ["asked_at", "INTEGER"], ["escalated_at", "INTEGER"], ["answer", "TEXT"], ["asks", "INTEGER NOT NULL DEFAULT 0"], ["resume", "INTEGER NOT NULL DEFAULT 0"],
-        ["round", "INTEGER NOT NULL DEFAULT 0"], ["notes", "TEXT"]];
+        ["round", "INTEGER NOT NULL DEFAULT 0"], ["notes", "TEXT"], ["shared_until", "INTEGER"], ["shared_by", "TEXT"]];
       for (const [name, type] of add) if (!cols.has(name)) this.db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`);
       // A run's granted budget (#655): its reservation while open, its charge when it ends without a cost.
       const runCols = new Set((this.db.query(`PRAGMA table_info(runs)`).all() as { name: string }[]).map((c) => c.name));
@@ -138,11 +145,11 @@ export class Store {
     return this.insert(r, "", "finished", reply);
   }
 
-  private insert(r: Request, agent: string, state: State, reply: string | null, o: Admit = {}): boolean {
+  private insert(r: Request, agent: string, state: State, reply: string | null, o: Admit & { sharedUntil?: number } = {}): boolean {
     const t = this.now();
     const board = r.source === "board" ? r.board : null;
-    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at, fanout, parent, title, profile, round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t, o.fanout ? 1 : 0, o.parent ?? null, o.title ?? null, o.profile ?? null, o.round ?? 0);
+    const res = this.db.query(`INSERT OR IGNORE INTO requests (source, id, board, requester, persona, task, context, agent, state, reply, created_at, updated_at, fanout, parent, title, profile, round, shared_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(r.source, r.id, board, r.requester, r.persona, r.task, r.context ?? null, agent, state, reply, t, t, o.fanout ? 1 : 0, o.parent ?? null, o.title ?? null, o.profile ?? null, o.round ?? 0, o.sharedUntil ?? null);
     return res.changes === 1;
   }
 
@@ -151,12 +158,36 @@ export class Store {
   // a round (#658): the request's count goes up by one and its subtasks
   // carry the new count.
   // A subtask runs as `agent` (its profile's, #645) when given, else as its parent's.
-  fanOut(parent: Row, board: string, subtasks: { r: Request; title: string; profile?: string; agent?: string }[]): void {
+  // With `sharedUntil` (#636) the subtasks were posted on a share board:
+  // they wait as shared until then, not queued.
+  fanOut(parent: Row, board: string, subtasks: { r: Request; title: string; profile?: string; agent?: string }[], sharedUntil?: number): void {
     this.db.transaction(() => {
       const round = (this.bySeq(parent.seq)?.round ?? parent.round) + 1;
       this.db.query(`UPDATE requests SET state = 'waiting', fanout_board = ?, round = ?, updated_at = ? WHERE seq = ?`).run(board, round, this.now(), parent.seq);
-      for (const s of subtasks) this.insert(s.r, s.agent ?? parent.agent, "queued", null, { parent: parent.seq, title: s.title, round, ...(s.profile ? { profile: s.profile } : {}) });
+      for (const s of subtasks) this.insert(s.r, s.agent ?? parent.agent, sharedUntil === undefined ? "queued" : "shared", null, { parent: parent.seq, title: s.title, round, ...(s.profile ? { profile: s.profile } : {}), ...(sharedUntil === undefined ? {} : { sharedUntil }) });
     })();
+  }
+
+  // ── shared subtasks (#636) ──
+  // A shared subtask runs here after all: our own lane took it, or no
+  // listed lane did in time. False when it was no longer shared.
+  shareTake(seq: number): boolean {
+    return this.db.query(`UPDATE requests SET state = 'queued', updated_at = ? WHERE seq = ? AND state = 'shared'`).run(this.now(), seq).changes === 1;
+  }
+
+  // A listed lane's outcome finishes a shared subtask. It was already said
+  // in the thread, so nothing is left to send. False when it was no longer shared.
+  shareFinish(seq: number, reply: string, by: string): boolean {
+    return this.db.query(`UPDATE requests SET state = 'finished', reply = ?, replied = 1, shared_by = ?, updated_at = ? WHERE seq = ? AND state = 'shared'`).run(reply, by, this.now(), seq).changes === 1;
+  }
+
+  // Shared subtasks whose wait ended by `now`.
+  sharedDue(now: number): Row[] {
+    return (this.db.query(`SELECT * FROM requests WHERE state = 'shared' AND shared_until <= ? ORDER BY seq`).all(now) as Raw[]).map(toRow);
+  }
+
+  sharedRows(): Row[] {
+    return (this.db.query(`SELECT * FROM requests WHERE state = 'shared' ORDER BY seq`).all() as Raw[]).map(toRow);
   }
 
   // A root's working memory (#658), replaced whole: the caller caps it.
@@ -278,7 +309,7 @@ export class Store {
 
   // A cancel (#651), in one transaction. A queued or asking request finishes
   // with `reply`. A waiting one finishes too (so it never synthesizes), with
-  // its queued and asking subtasks; its running subtasks are returned for the caller to
+  // its queued, asking and shared (#636) subtasks; its running subtasks are returned for the caller to
   // stop. A running request is the caller's to stop. Returns the rows
   // finished here and the running ones, or null when it had already finished.
   cancel(seq: number, reply: (r: Row) => string): { finished: Row[]; running: Row[] } | null {
@@ -287,7 +318,7 @@ export class Store {
       if (!r || r.state === "finished") return null;
       if (r.state === "running") return { finished: [], running: [r] };
       const subs = r.state === "waiting" ? this.subtasks(seq) : [];
-      const finished = [r, ...subs.filter((s) => s.state === "queued" || s.state === "asking")];
+      const finished = [r, ...subs.filter((s) => s.state === "queued" || s.state === "asking" || s.state === "shared")];
       for (const f of finished) this.finish(f, reply(f));
       return { finished: finished.map((f) => this.bySeq(f.seq)!), running: subs.filter((s) => s.state === "running") };
     }).immediate();
@@ -319,10 +350,10 @@ export class Store {
   }
 
   // A subtask's siblings that will still run: queued, asking (a resume
-  // runs), or taken by next() but not yet granted (no open run, so no
+  // runs), shared (#636: it may come back to run here), or taken by next() but not yet granted (no open run, so no
   // reservation): pump() takes several rows before any reaches its grant.
   siblingsLeft(parent: number, self: number): number {
-    return (this.db.query(`SELECT COUNT(*) AS n FROM requests q WHERE q.parent = ? AND q.seq != ? AND (q.state IN ('queued', 'asking') OR (q.state = 'running' AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.seq = q.seq AND r.ended_at IS NULL)))`).get(parent, self) as { n: number }).n;
+    return (this.db.query(`SELECT COUNT(*) AS n FROM requests q WHERE q.parent = ? AND q.seq != ? AND (q.state IN ('queued', 'asking', 'shared') OR (q.state = 'running' AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.seq = q.seq AND r.ended_at IS NULL)))`).get(parent, self) as { n: number }).n;
   }
 
   // Queued requests admitted before this one.
@@ -495,9 +526,9 @@ function held(boards: string[], within: boolean): string {
   return within ? ` AND ${inList}` : ` AND NOT (q.source = 'board' AND COALESCE(${inList}, 0))`;
 }
 
-type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number };
+type Raw = Fields & { source: string; board: string | null; replied: number; context: string | null; fanout: number; fanout_board: string | null; ask_human: number; asked_at: number | null; escalated_at: number | null; resume: number; shared_until: number | null; shared_by: string | null };
 function toRow(r: Raw): Row {
-  const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, ...rest } = r;
-  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board, askHuman: ask_human === 1, askedAt: asked_at, escalatedAt: escalated_at, resume: resume === 1 };
+  const { context, replied, source, board, fanout, fanout_board, ask_human, asked_at, escalated_at, resume, shared_until, shared_by, ...rest } = r;
+  const base = { ...rest, ...(context !== null ? { context } : {}), replied: replied === 1, fanout: fanout === 1, fanoutBoard: fanout_board, askHuman: ask_human === 1, askedAt: asked_at, escalatedAt: escalated_at, resume: resume === 1, sharedUntil: shared_until, sharedBy: shared_by };
   return source === "board" ? { ...base, source: "board", board: board ?? "" } : { ...base, source: "dm" };
 }
