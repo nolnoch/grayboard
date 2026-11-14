@@ -731,8 +731,10 @@ export function createHostedSessions(application: Application, options: { now?: 
     },
     instructions: hostedUnboundInstruction,
   };
-  const unsubscribe = store.subscribe(reconcile);
+  // Subscribed after the credit: its transaction would otherwise reconcile once before the sweep, opening
+  // holder sessions for roots the sweep then ends (#424 item 7). The sweep reconciles what's left.
   creditDowntime();
+  const unsubscribe = store.subscribe(reconcile);
   sweep();
   let beat = now();
   const timer = setInterval(() => {

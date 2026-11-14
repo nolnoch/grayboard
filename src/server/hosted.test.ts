@@ -51,6 +51,23 @@ test("one reconciliation invalidates listeners once, not once per root", async (
   } finally { unlisten(); }
 });
 
+test("startup opens no holder session for a root its first sweep ends (#424 item 7)", async () => {
+  const root = context("lapsed-root");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  await delivery.open(principal, root);
+  hosted.close();
+  // The lease lapsed while the server was still up: no credit, and the startup sweep ends the root.
+  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, root.id]);
+  now += 5 * 60_000;
+  const opened = spyOn(application, "hostedSession");
+  try {
+    hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+    expect(database.repo.hosted.get(root.id)).toBeUndefined();
+    expect(opened).not.toHaveBeenCalled();
+  } finally { opened.mockRestore(); }
+});
+
 test("hosted source IDs attribute child writes and release only the root alias hold", async () => {
   const root = context("root"), child = context("child");
   if (!("id" in root) || !("id" in child)) throw new Error("fixture context");
@@ -1081,3 +1098,4 @@ test("a call whose root's ownership ended and restarted before it returns keeps 
   expect(database.db.query("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(after.ownership_id)).toEqual({ ended_at: null });
   expect(hosted.inflightCount).toBe(0);
 });
+
