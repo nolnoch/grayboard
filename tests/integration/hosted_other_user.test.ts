@@ -81,3 +81,23 @@ test("a digest is marked by its latest post's writer", async () => {
   await aqa.call("board_post", { board: "e2e", body: "alice's news" });
   expect(marked((await abe.next(digest("alice's news"))).event)).toBeUndefined();
 });
+
+// A claim's announcement is a post too: marked by its writer, whether a hosted
+// session took it or `grayboard claim` (POST /api/claims/call) did.
+test("a claim announcement is marked by the user who took it, over MCP or the CLI route", async () => {
+  const abe = await srv.hosted(A, "be");
+  await abe.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await abe.call("board_subscribe", { board: "e2e", mode: "push" });
+  const bfe = await srv.hosted(B, "fe");
+  const announced = (key: string) => board((i) => i.kind === "push" && i.post.body.includes(key));
+  await bfe.call("claim_take", { key: "ticket:ENG-1", board: "e2e" });
+  expect(marked((await abe.next(announced("ticket:ENG-1"))).event)).toBe(true);
+  const cli = await srv.api(bob, "POST", "/api/claims/call", { identity: "fe", tool: "claim_take", args: { key: "ticket:ENG-2", board: "e2e" } });
+  expect(cli.status).toBe(200);
+  expect(marked((await abe.next(announced("ticket:ENG-2"))).event)).toBe(true);
+  await abe.call("claim_take", { key: "ticket:ENG-3", board: "e2e" });
+  const aqa = await srv.hosted(A, "qa");
+  await aqa.call("board_subscribe", { board: "e2e", mode: "push" });
+  await abe.call("claim_release", { key: "ticket:ENG-3" });
+  expect(marked((await aqa.next(announced("ticket:ENG-3"))).event)).toBeUndefined();
+});

@@ -199,7 +199,7 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreD
   try {
     // As the session the identity is or is held by: its claims under any of
     // its addresses are its own here (#360).
-    const outcome = callBoardTool(db, handle, body.tool, body.args ?? {}, { addresses: addressSet(db, handle, authed.user_email) });
+    const outcome = callBoardTool(db, handle, body.tool, body.args ?? {}, { addresses: addressSet(db, handle, authed.user_email), user: authed.user_email });
     if (outcome.boards?.length) {
       try { void Promise.resolve(onBoardsChanged?.(outcome.boards)).catch(() => {}); } catch {}
     }
