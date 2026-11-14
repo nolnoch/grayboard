@@ -46,8 +46,8 @@ grayboard team leave <name>
 grayboard team members <name>            # members and admins
 
 grayboard admin revoke-session --email <e>   # every session the user has
-grayboard admin disable-user --email <e>
-grayboard admin enable-user --email <e>
+grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in
+grayboard admin enable-user --email <e>    # they sign in again; old sign-ins stay revoked
 ```
 
 > Admin commands work only for the emails in the server's `GRAYBOARD_ADMINS`. Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.

@@ -207,9 +207,10 @@ test("invalid schemas and local paths fail without mutation; application errors 
 test("attachment IDs bind only the caller's uploads and downloads stay access checked", async () => {
   const [alice, bob, carol] = await Promise.all([login(), login("bob@example.com"), login("carol@example.com")]);
   const [a, b, c] = await Promise.all([connect(alice), connect(bob), connect(carol)]);
-  const uploaded = await fetch(`${base}/api/attachments?as=be&filename=note.txt`, {
-    method: "POST", headers: { Authorization: `Bearer ${await legacyLogin()}` }, body: "public fixture text",
-  });
+  // The hosted byte routes act as the session the header names: each user's connection is keyed "be".
+  const bytes = (token: string, path: string, init: RequestInit = {}) =>
+    fetch(`${base}/mcp/attachments${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": "be" } });
+  const uploaded = await bytes(alice, "?filename=note.txt", { method: "POST", body: "public fixture text" });
   expect(uploaded.status).toBe(201);
   const attachment = await uploaded.json() as { id: number };
   expect((await c.callTool({ name: "dm_send", arguments: { to: "bob@example.com/be", body: "stolen", attachment_ids: [attachment.id] } })).isError).toBe(true);
@@ -217,12 +218,23 @@ test("attachment IDs bind only the caller's uploads and downloads stay access ch
   expect(sent.attachments).toMatchObject([{ id: attachment.id }]);
   const thread = value(await b.callTool({ name: "dm_thread", arguments: { thread: sent.message_id } }));
   expect(thread[0].attachments).toMatchObject([{ id: attachment.id }]);
-  for (const [token, status] of [[await legacyLogin("bob@example.com"), 200], [await legacyLogin("carol@example.com"), 404]] as const) {
-    const download = await fetch(`${base}/api/attachments/${attachment.id}?as=be`, { headers: { Authorization: `Bearer ${token}` } });
+  for (const [token, status] of [[bob, 200], [carol, 404]] as const) {
+    const download = await bytes(token, `/${attachment.id}`);
     expect(download.status).toBe(status);
     if (status === 200) expect(await download.text()).toBe("public fixture text");
+    else await download.body?.cancel();
   }
   expect((await a.callTool({ name: "dm_send", arguments: { to: "bob@example.com/be", body: "reuse", attachment_ids: [attachment.id] } })).isError).toBe(true);
+});
+
+// #475: the session-token attachment routes (`/api/attachments?as=`) are gone; files travel only through the hosted byte routes.
+test("the old /api/attachments routes answer 404", async () => {
+  const token = await legacyLogin();
+  for (const [method, path] of [["POST", "/api/attachments?as=be&filename=note.txt"], ["GET", "/api/attachments/1?as=be"], ["DELETE", "/api/attachments/1?as=be"]] as const) {
+    const response = await fetch(`${base}${path}`, { method, headers: { Authorization: `Bearer ${token}` }, ...(method === "POST" ? { body: "x" } : {}) });
+    expect([method, response.status]).toEqual([method, 404]);
+    await response.body?.cancel();
+  }
 });
 
 test("revocation is checked on subsequent calls, including legacy", async () => {

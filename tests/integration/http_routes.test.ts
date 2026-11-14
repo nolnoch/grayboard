@@ -198,6 +198,32 @@ test("admin routes: refused for non-admins and when no admins are configured", a
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
 });
 
+// Security audit F-14: disable revokes the user's CLI tokens, so enable
+// doesn't revive them, and a disabled user can't sign in for a new one.
+test("disable-user revokes CLI tokens for good; a disabled user gets no new token", async () => {
+  await restart({ admins: ["root@example.com"] });
+  const root = await login("root@example.com");
+  const bob = await login("bob@example.com");
+  expect((await api(root, "POST", "/api/admin/disable-user", { email: "bob@example.com" })).status).toBe(200);
+  const live = () => srv.app.db.query(
+    `SELECT COUNT(*) AS n FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = 'bob@example.com' AND s.revoked_at IS NULL`).get();
+  expect(live()).toEqual({ n: 0 });
+
+  const refused = await fetch(`${srv.base}/api/auth/dev-login`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "bob@example.com" }),
+  });
+  expect(refused.status).toBe(403);
+  expect(await refused.json()).toMatchObject({ code: "forbidden", message: expect.stringContaining("disabled") });
+  expect(live()).toEqual({ n: 0 });
+  expect(srv.app.db.query(`SELECT actor, json_extract(detail, '$.dev') AS dev FROM access_log WHERE action = 'auth.user_refused'`).all())
+    .toEqual([{ actor: "bob@example.com", dev: 1 }]);
+
+  expect((await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" })).status).toBe(200);
+  expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
+  const again = await login("bob@example.com");
+  expect((await api(again, "GET", "/api/whoami")).status).toBe(200);
+});
+
 test("admin revoke-session signs a user out of every session, ignoring an old CLI's all", async () => {
   await restart({ admins: ["root@example.com"] });
   const root = await login("root@example.com");

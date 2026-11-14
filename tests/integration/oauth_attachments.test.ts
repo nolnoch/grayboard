@@ -115,15 +115,11 @@ test("private board visibility is checked again after reading the blob", async (
 
 test("old API remains session-only and OAuth cannot become admin or WS credentials", async () => {
   const alice = issue();
-  app.repo.aliases.create({ scope_kind: "person", scope_ref: alice.authed.user_email, name: "be" }, alice.authed.user_email);
   const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const legacy = (await login.json() as { session_token: string }).session_token;
-  const oldUpload = await fetch(`${base}/api/attachments?as=be&filename=report.txt`, { method: "POST", headers: { Authorization: `Bearer ${legacy}`, "Content-Length": String(bytes.length) }, body: bytes });
-  expect(oldUpload.status).toBe(201);
-  const id = (await oldUpload.json() as { id: number }).id;
-  expect((await fetch(`${base}/api/attachments/${id}?as=be`, { headers: { Authorization: `Bearer ${legacy}` } })).status).toBe(200);
-  expect((await attachment(legacy, "GET", id)).status).toBe(401);
-  for (const path of ["/api/attachments/1?as=be", "/api/identities", "/api/admin/users", "/api/teams"]) {
+  expect((await attachment(legacy)).status).toBe(401);
+  expect((await attachment(legacy, "GET", 1)).status).toBe(401);
+  for (const path of ["/api/identities", "/api/admin/users", "/api/teams"]) {
     const response = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${alice.token}` } });
     expect(response.status).toBe(401);
     await response.arrayBuffer();

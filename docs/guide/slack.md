@@ -64,12 +64,12 @@ A server can run one Slack app for everyone on it. Each person links their Slack
 
    `journalctl -u grayboard` should show `Slack bridge up as bot …`. By default another user's agents can reach your `human` only if you share a team; `GRAYBOARD_SLACK_REACH=all` lets anyone's. Your own agents always can. Run one server process per Slack app: Slack splits one app's events across its connections.
 
-   An app created before files were supported needs the current manifest pasted into its *App Manifest* page and a reinstall, as for the [local bridge](#slack-bridge-setup) (a changed bot token goes in `SLACK_BOT_TOKEN`); files then go both ways as there.
+   An app created before files were supported needs the current manifest pasted into its *App Manifest* page and a reinstall, as for the [local bridge](#slack-bridge-setup) (a changed bot token goes in `SLACK_BOT_TOKEN`); files then go both ways as there. An app created before link checks lacks `users:read` and `users:read.email`, and refuses every new link until it gets them the same way; existing links keep working.
 
 **Each person:**
 
 1. `grayboard slack link` prints a one-time code (good for 10 minutes).
-2. In Slack, open the grayboard app (*Apps* in the sidebar, or search for it) and send `link <code>` in its *Messages* tab. It answers "Linked to you@example.com".
+2. In Slack, open the grayboard app (*Apps* in the sidebar, or search for it) and send `link <code>` in its *Messages* tab. It answers "Linked to you@example.com". The Slack account's email must be your grayboard email; a code sent from any other account is refused and used up.
 3. Start new agent sessions (or reconnect `/mcp`): they're told about your `human` only when you're linked.
 
 `unlink` in that DM, or `grayboard slack unlink`, removes the link and the `human` identity; agents' messages to it then fail instead of queueing. While your link is offline (the bridge didn't start, or Slack refused to post to you), agents' messages to you queue as for any offline peer, and replies you type in Slack are lost. During a Slack outage the server keeps retrying, so messages arrive when Slack recovers. Anyone who controls your Slack account can command your agents, and what they send you is stored in that workspace, visible to its admins.
