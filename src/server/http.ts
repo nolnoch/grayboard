@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { PrincipalTaken, type Repo, type Team, type User } from "./db.ts";
 import { mayActIn } from "./access.ts";
-import type { Config } from "./config.ts";
+import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, exchangeGoogleCode,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
@@ -35,10 +35,10 @@ function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
 function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
-function requireAuth(req: Request, repo: Repo, touches: TouchQueue): AuthedUser | null {
+function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number): AuthedUser | null {
   const raw = extractBearer(req);
   if (!raw) return null;
-  return verifySessionToken(raw, repo, touches);
+  return verifySessionToken(raw, repo, touches, idleDays);
 }
 
 async function parseBody<T>(req: Request): Promise<T | null> {
@@ -547,7 +547,7 @@ export async function handleHttp(
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);
 
-  const authed = requireAuth(req, repo, touches);
+  const authed = requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);

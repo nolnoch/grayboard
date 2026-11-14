@@ -99,7 +99,7 @@ export class TestServer {
   }
 
   private authed(token: string): AuthedUser {
-    const authed = verifySessionToken(token, this.app.repo, this.app.touches);
+    const authed = verifySessionToken(token, this.app.repo, this.app.touches, 0);
     if (!authed) throw new Error("the token doesn't authenticate");
     return authed;
   }

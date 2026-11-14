@@ -57,7 +57,7 @@ export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
 // An AppSession of the server `app`, signed in with the session token
 // `token` as an API request resolves it; connect() it. The caller closes it.
 export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-  const authed = verifySessionToken(token, app.repo, app.touches);
+  const authed = verifySessionToken(token, app.repo, app.touches, 0);
   if (!authed) throw new Error("appSession: the token doesn't authenticate");
   return new AppSession(app.application, authed, identity, opts);
 }

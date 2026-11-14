@@ -10,7 +10,7 @@ const KEYS = [
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
-  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS",
+  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -190,6 +190,19 @@ describe("loadConfig", () => {
     for (const bad of [" 900 ", "1e3", "0", "1.5", "-3"]) {
       process.env.GRAYBOARD_HOSTED_IDLE_SECONDS = bad;
       expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive whole number of seconds/);
+    }
+  });
+
+  test("CLI token idle days default to 30; 0 means never; else plain digits up to 3650 (security audit F-14)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().cliTokenIdleDays).toBe(30);
+    for (const [raw, days] of [["", 30], ["0", 0], ["7", 7], ["3650", 3650]] as const) {
+      process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS = raw;
+      expect(loadConfig().cliTokenIdleDays).toBe(days);
+    }
+    for (const bad of [" 7", "07", "1e2", "1.5", "-1", "3651", "never"]) {
+      process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days/);
     }
   });
 
