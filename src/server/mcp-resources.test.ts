@@ -339,3 +339,17 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["renew", "inb
   expect(renewed.isError).toBeUndefined();
   expect(JSON.parse((renewed.content[0] as { text: string }).text).capability).toBe(lease.capability);
 });
+
+test("the subscriber role's whoami carries the session's id and principal beside its holds, as the native one does (#489)", async () => {
+  const p = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (p instanceof Response) throw new Error("fixture unauthorized");
+  const context = sessionContext(p, meta);
+  if (!("id" in context)) throw new Error("fixture context");
+  const client = await connect("2026-07-28");
+  const result = await client.callTool({ name: "whoami", arguments: {} });
+  expect(result.isError).not.toBe(true);
+  const body = JSON.parse((result.content as { text: string }[])[0]!.text);
+  expect(body).toMatchObject({ id: context.id, principal: "alice@example.com", held: ["alice@example.com/be"], primary: "alice@example.com/be" });
+  // The subscriber names its holds `held`, as the native role does; local whoami calls them `aliases`.
+  expect(body).not.toHaveProperty("aliases");
+});
