@@ -1,9 +1,10 @@
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, renameSync, statSync, unlinkSync } from "node:fs";
 
 import { sweepBlobs } from "../core/attachments.ts";
 import { sockDir } from "../shared/sockdir.ts";
 import { SqliteBlobs } from "./blobs.ts";
+import { privateDir } from "./perms.ts";
 
 const SOCK_DIR = sockDir();
 
@@ -26,7 +27,7 @@ export type WakeupHandler = () => void;
  * removes the real path only while it's still this listener's.
  */
 export function listenForWakeup(identity: string, onWake: WakeupHandler): () => void {
-  if (!existsSync(SOCK_DIR)) mkdirSync(SOCK_DIR, { recursive: true });
+  privateDir(SOCK_DIR);
   const path = sockPath(identity);
   // Short: a unix socket path has a ~104-byte limit, and test dirs are deep.
   const own = `${SOCK_DIR}/.w${process.pid}.${Math.random().toString(36).slice(2, 8)}`;

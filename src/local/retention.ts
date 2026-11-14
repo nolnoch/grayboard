@@ -4,7 +4,7 @@
 // A setting stored in the bus (`grayboard retention`) outranks each session's
 // env, so no session can disagree with it: off means no history is deleted.
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays, pruneEndedIds, prunePosts } from "../core/boards.ts";
@@ -12,6 +12,7 @@ import { dropAttachments, pruneUnbound, sweepBlobs, type BlobStore } from "../co
 import { openSqlite } from "../core/sqlite.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { refuseForbiddenBus, RETENTION_SETTING_SQL } from "./open.ts";
+import { privateDbFiles, privateDir } from "./perms.ts";
 
 const DAY_MS = 86_400_000;
 // How often a long session checks whether a day has passed since the last run.
@@ -47,7 +48,8 @@ export function readRetentionSetting(path: string): RetentionSetting | null {
 // schema upgrade, and no ending of dead sessions, unlike openLocalDb.
 export function writeRetentionSetting(path: string, days: number | null | undefined, now = Date.now()): RetentionSetting | null {
   refuseForbiddenBus(path);
-  mkdirSync(dirname(path), { recursive: true });
+  privateDir(dirname(path));
+  privateDbFiles(path);
   const db = openSqlite(path, "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;", (d) => d.exec(RETENTION_SETTING_SQL));
   try {
     return db.transaction(() => {
