@@ -150,9 +150,10 @@ function put(path, text) {
   writeFileSync(tmp, text, { mode: 384 });
   renameSync(tmp, path);
 }
+var SIGN_IN_MAX = 16384;
 function readSignIn(dir, now = Date.now()) {
   try {
-    const value = JSON.parse(readFileSync2(join(dir, SIGN_IN), "utf8"));
+    const value = JSON.parse(readSmall(join(dir, SIGN_IN), SIGN_IN_MAX));
     if (typeof value.url !== "string" || typeof value.at !== "number")
       return;
     const age = now - value.at;
@@ -232,7 +233,7 @@ function runHook(event, stdin, o) {
       put(join(ended, `${now}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`), agent);
       pruneEnded(ended);
     } else if (event === "session-end") {
-      if (input.reason === "clear") {
+      if (input.reason === "clear" || o.hosted && input.reason === "resume") {
         if (!o.hosted)
           rmSync(join(dir, "current"), { force: true });
         return;
