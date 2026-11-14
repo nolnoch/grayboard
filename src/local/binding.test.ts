@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -385,4 +385,27 @@ test("local resume is explicit opt-in without changing harness-session discovery
     endLocalSession(db, root);
     expect(conversationSnapshot(db, "conversation")).toEqual({ session_id: ordinary, names: ["ordinary"] });
   } finally { db.close(); }
+});
+
+// #338: an open's probes of ids read only live rows, through the partial
+// index, not a scan of every ended session retention hasn't pruned yet.
+test("liveSessions probes ids through the live-row index", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const seen: string[] = [];
+  const prepare = db.prepare.bind(db);
+  const spy = spyOn(db, "prepare").mockImplementation(((sql: string) => {
+    seen.push(sql);
+    return prepare(sql);
+  }) as typeof db.prepare);
+  try {
+    liveSessions(db);
+  } finally {
+    spy.mockRestore();
+  }
+  const probes = seen.filter((sql) => /FROM ids WHERE/.test(sql) && sql.includes("ended_at IS NULL"));
+  expect(probes).toHaveLength(2);
+  for (const sql of probes) {
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((r) => r.detail);
+    expect(plan[0], sql).toBe("SCAN ids USING INDEX idx_ids_live");
+  }
 });
