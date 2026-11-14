@@ -79,8 +79,11 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
       const response = await oauth.fetch(req, { key: caller.key });
       if (response) return response;
+      // The OAuth byte routes charge a refused bearer as /mcp does (#401).
+      // The AS routes above authenticate clients by secret, not bearer, and
+      // stay under the OAuth limiters alone.
       const attachmentResponse = attachments.fetch(req);
-      if (attachmentResponse) return attachmentResponse;
+      if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
       if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
       // A pre-removal `grayboard mcp --mode server` (#282): no auth, no session; the handler answers its hello with a refusal.
       if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
