@@ -779,7 +779,7 @@ test("a request's launcher declaration is the ownership's: set by any root reque
   const ctx = (extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "launcher-root", ...extra });
   const id = (ctx() as { id: string }).id;
   const flag = () => (database.db.prepare("SELECT launcher FROM ids WHERE id = ?").get(id) as { launcher: number }).launcher;
-  const audited = () => database.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'handle.launcher_set'").all();
+  const audited = () => database.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'handle.launcher_set' ORDER BY id").all();
   const trail = () => audited().map(a => (JSON.parse(a.detail) as { on: boolean }).on);
   expect(() => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "x", [GRAYBOARD_LAUNCHER_META]: "yes" })).toThrow(`_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
   expect(ctx({ [GRAYBOARD_LAUNCHER_META]: false })).not.toHaveProperty("launcher");

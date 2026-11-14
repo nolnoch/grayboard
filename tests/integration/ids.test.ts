@@ -329,7 +329,7 @@ async function childRefusal(s: Session, raw: unknown, name: string, args: Record
   if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
   return text;
 }
-const childSeen = () => rows<{ actor: string; target: string; detail: string }>(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen'`)
+const childSeen = () => rows<{ actor: string; target: string; detail: string }>(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen' ORDER BY rowid`)
   .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
 
 test("a subagent's call is its root's child: its DM and post are stored with its ID and shown as via in pushes and reads; the root's carry none", async () => {
