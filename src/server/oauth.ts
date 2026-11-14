@@ -262,6 +262,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!path.startsWith("/oauth/")) return undefined;
     if (closed) return json({ error: "temporarily_unavailable" }, 503);
     const tokenRoute = req.method === "POST" && (path === "/oauth/token" || path === "/oauth/revoke");
+    // A browser GET that isn't a top-level navigation (an <img>, a no-cors
+    // fetch from another site's page) is refused uncharged and unaudited,
+    // before any client lookup (#404): every visitor behind one address could
+    // otherwise drain its bucket and block that address's sign-ins. A client
+    // that sends no Sec-Fetch-Mode (not a browser) is charged as before.
+    const mode = req.headers.get("sec-fetch-mode");
+    if (req.method === "GET" && mode !== null && mode !== "navigate") return json({ error: "invalid_request" }, 403);
     const checks = buckets(context, tokenRoute);
     const limited = rate(checks, path);
     if (limited) return limited;
