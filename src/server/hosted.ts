@@ -333,7 +333,11 @@ export function createHostedSessions(application: Application, options: { now?: 
   // A root that holds a name has a holder session, rebuilt when its ownership or generation changes. `changed`:
   // the one row a commit changed (#399); null (startup, the backstop timer, a grant or user change) checks every
   // root.
+  // The listeners run even when a holder rebuild throws: the stream timer's stamps go stale only through them (#899).
   function reconcile(changed: string | null = null) {
+    try { rebuild(changed); } finally { for (const listener of listeners) listener(changed); }
+  }
+  function rebuild(changed: string | null) {
     if (changed !== null) {
       const row = store.get(changed), holder = holders.get(changed);
       const held = row && !row.root_session_id && row.parked_at === null ? application.hostedHolds(changed) : [];
@@ -343,7 +347,6 @@ export function createHostedSessions(application: Application, options: { now?: 
       }
       const user = row && held.length && !holders.has(changed) ? repo.users.findById(row.user_id) : undefined;
       if (row && user) holders.set(changed, { row, session: application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, changed, held, null, row, quietSink).session });
-      for (const listener of listeners) listener(changed);
       return;
     }
     const held = application.holdsByOwner();
@@ -362,7 +365,6 @@ export function createHostedSessions(application: Application, options: { now?: 
       const { session } = application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row, quietSink);
       holders.set(row.session_id, { row, session });
     }
-    for (const listener of listeners) listener(null);
   }
   // The sweep finds its rows by query (#399); a request settles only its own (`settle`). `full`: the idle and
   // disabled passes too, which the timer runs every IDLE_EVERY ticks (the idle window is minutes, and
