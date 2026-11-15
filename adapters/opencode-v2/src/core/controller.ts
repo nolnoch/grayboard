@@ -21,6 +21,9 @@ export type ControllerOptions = {
   // The host's own session-ID shape: restored diagnostics for such IDs skip the
   // active-root lookup (OpenCode passes `ses_…`).
   knownRoot?: RegExp;
+  // A host that starts a turn for every item it admits (Claude Code): the lease withholds non-waking items
+  // until a waking one carries them (#854), where the server knows the option.
+  context?: false;
 };
 // A forwarded native tool call's outcome, as a host reports it to afterCall:
 // the tool's parsed result object, or a failure.
@@ -88,6 +91,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   private readonly place: string;
   private readonly wait: Wait;
   private readonly configured?: { name: string; create: boolean };
+  private readonly context?: false;
   // Saved roots restore skipped because their session had ended: the next
   // save drops their records (`prune`). An edited record stays, and every
   // restore reports it, since it may be another location's (#660).
@@ -96,6 +100,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep;
     this.configured = options.configured;
+    if (options.context === false) this.context = false;
     this.place = port.place();
     const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
     this.state = { state: "unenrolled", message: idle, roots: [] };
@@ -445,7 +450,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           await this.guard(r, epoch, signal);
         } else if (!sameHeld(current.held, e.held)) throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
         let lease: Lease;
-        try { lease = leaseOf(await wire.call("delivery_open"), e); }
+        try { lease = leaseOf(await wire.call("delivery_open", this.context === false && await wire.takes("delivery_open", "context") ? { context: false } : {}), e); }
         catch (error) {
           // The primary revoked between this whoami and delivery_open (#453) gives a lease naming another
           // identity: the next iteration's whoami reports the loss. Once; a second refusal pauses.

@@ -24,12 +24,14 @@ export const HOSTED_SCOPES = ["grayboard:tools", "grayboard:delivery"];
 // receipts every item next()/none() read, as a harness does once it has
 // delivered them; "manual" leaves that to receipt(). delivery: whether a lease
 // opens whenever the session binds (default true; an unbound session can't
-// hold one).
+// hold one). context: false opens the lease as Claude Code's plugin does
+// (a host without context-only admission: non-waking items wait, #854).
 export type HostedOptions = {
   sessionId?: string;
   create?: boolean;
   receipt?: "auto" | "manual";
   delivery?: boolean;
+  context?: false;
 };
 
 // One item of the lease's inbox: { id, actionable, event } and the lease
@@ -204,7 +206,7 @@ export class HostedSession {
     this.seen = new Set(this.buffer.map((item) => item.id));
     const result = await this.call("bind", { name, create });
     if (this.opts.delivery ?? true) {
-      const lease = leaseOf(await this.subscriber.call("delivery_open"));
+      const lease = leaseOf(await this.subscriber.call("delivery_open", this.opts.context === false ? { context: false } : {}));
       this.subscriber.capability = lease.capability;
       this.lease = { ...lease, ttl: lease.expiresAt - Date.now() };
     }

@@ -13,6 +13,8 @@ export type DeliveryPrincipal = OAuthPrincipal;
 export type DeliveryLease = { capability: string; identity: IdentityInfo; expiresAt: number; ownership: number; bind_gen: number };
 // `address`: the alias a direct item was sent to, which the client checks against its hold set (#451); a DM to the session's own ID and a board item have none (canReceiveBoard checks boards).
 export type PendingDelivery = { id: string; actionable: boolean; event: DeliveryEvent; ownership: number; bind_gen: number; address?: string };
+// `context: false`: the host can't show an item without starting a turn (Claude Code), so non-waking items wait (#854).
+export type DeliveryOpenOptions = { context?: boolean };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
 export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; now?: () => number; caps?: HostedCaps["leases"] };
 type Issued = { item: PendingDelivery; ref?: PendingRef };
@@ -24,6 +26,9 @@ const boardOf = (item: PendingDelivery) => item.event.kind === "board" ? (item.e
 type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number;
   session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Acked>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
+  // `drained`: this lease's first pull is done, so a host without context (`context: false`) gets non-waking
+  // items only alongside a waking one (#854). A reconnect keeps its lease; a new lease drains once, as a start.
+  context: boolean; drained: boolean;
 };
 const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); } };
 class StaleCapability extends ApplicationError {
@@ -93,13 +98,13 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   const service = {
     get activeLeaseCount() { return leases.size; },
     describe(p: DeliveryPrincipal, context: SessionContext, capability: string) { try { return describe(get(p, context, capability)); } catch (error) { return refused(p, context, error); } },
-    async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}): Promise<DeliveryLease> {
+    async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, row => {
         if (!application.hostedHolds(row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
         hosted.seeLost(p, row);
         previous = bySession.get(row.session_id);
-        if (previous && matches(previous, row)) return previous;
+        if (previous && matches(previous, row)) { previous.context = openOptions.context ?? true; return previous; }
         // A lease this open replaces (another grant's) frees its slot here, not after the check; a
         // session is one user's, so that slot is this user's.
         const replaced = previous ? 1 : 0;
@@ -118,7 +123,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           closed() { if (lease) finish(lease); },
         }, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
-          ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false };
+          ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false,
+          context: openOptions.context ?? true, drained: false };
         track(lease);
         return opened(lease, true, hooks);
       });
@@ -153,10 +159,17 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const lease = get(p, context, capability, row);
         await testPauseAsync("hosted:pending:in-gate");
         get(p, context, capability);
-        const items = application.pending(lease.session, limit).map(event => itemOf(event, lease));
+        let items = application.pending(lease.session, limit).map(event => itemOf(event, lease));
+        // Security audit F-03 (#854): a host without context starts a turn for every item it's given, so
+        // after the lease's first pull (local mode's first drain) a lone non-waking item (ungranted,
+        // deferred, a digest) stays unreceipted until a waking one arrives to carry it. A full page with
+        // none waking goes out anyway: a direct item is receipted only in order, so holding it back would
+        // starve every item behind it (it costs a sender `limit` unwoken items per turn).
+        if (!lease.context && lease.drained && items.length < limit && !items.some(item => item.actionable)) items = [];
         const unseen = items.filter(item => !lease.issued.has(item.id));
         if (lease.issued.size + unseen.length > 1000) { countRefusal("delivery_receipts"); throw new ApplicationError("receipt_capacity", "delivery lease receipt capacity reached; release and reopen"); }
         for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
+        lease.drained = true;
         return items;
       }).catch(error => refused(p, context, error));
     },

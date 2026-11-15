@@ -43,7 +43,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 15 | Delegation launcher declaration | yes | yes | yes | yes | yes | yes | yes | yes |
 | 16 | Update | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 17 | Repo-name suggestion while unbound | yes | yes | yes | yes | yes | yes | yes | yes |
-| 18 | Another user's item wakes only under a grant (`msg.wake`) | n/a | yes | n/a | yes | n/a | yes | n/a | gap ([#854](https://github.com/nolnoch/grayboard/issues/854)) |
+| 18 | Another user's item wakes only under a grant (`msg.wake`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 
 ## Evidence by row
 
@@ -56,7 +56,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 
 - pi L, omp L, OC V1: DMs, mentions and thread replies start a turn; digests and deferred pushes are context only (boards.md §9). Proof: `tests/integration/pi.test.ts` piScenario, `tests/integration/omp.test.ts` omp local task run (a peer's DM reaches main once), `tests/integration/opencode.test.ts` ("an unbound session acts as its ID…": the DM arrives as a prompt).
 - CC L: channel notifications, only while Claude Code's channel gate registers the server; gate off → tools-only, reason in instructions and first result (`claudeChannels`, boards.md §9). Proof: `tests/integration/local.test.ts` (pushes at the MCP level; "a Claude Code session whose channels are off runs tools-only and is warned why").
-- pi H, omp H, CC H: hosted-core lease and `RootDelivery` (boards.md §9 Hosted core). Proof: `tests/integration/pi.test.ts` "pi hosted: …", `tests/integration/omp.test.ts` "omp hosted: …", `tests/integration/claude_plugin.test.ts` ("a flagged interactive session: … a DM arrives as one channel push"), e2e `claude-hosted` (`tests/e2e/claude_hosted.e2e.ts`).
+- pi H, omp H, CC H: hosted-core lease and `RootDelivery` (boards.md §9 Hosted core). CC H's lease is `context: false`, so a digest or deferred push waits for a waking item instead of starting a turn (#854). Proof: `tests/integration/pi.test.ts` "pi hosted: …", `tests/integration/omp.test.ts` "omp hosted: …", `tests/integration/claude_plugin.test.ts` ("a flagged interactive session: … a DM arrives as one channel push"), e2e `claude-hosted` (`tests/e2e/claude_hosted.e2e.ts`).
 - OC V2: delivery opens only on a human-enrolled, bound root (#226; `docs/guide/harnesses.md` §OpenCode V2). Proof: `adapters/opencode-v2` `test:host` (`adapters/opencode-v2/tests/host.ts`).
 
 ### 3. Current instructions on push-started turns
@@ -184,4 +184,4 @@ Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only
 - Server side, every hosted cell: `application.pending()` marks another user's DM or push that no grant covers `ungranted` and not actionable, per pull (architecture.md §5 `msg.wake`, #806). Proof: `tests/integration/hosted_wake_grant.test.ts`.
 - pi H, omp H: hosted-core's `wakes()` refuses an `ungranted` item whatever the actionable flag (boards.md §9 Hosted core). Proof: `adapters/hosted-core/tests/channel.test.ts` ("an ungranted item never wakes…").
 - OC V2: admits the item with `resume: item.actionable` (`adapters/opencode-v2/src/lifecycle.ts`), so it lands as context. Proof: the server half above; no host test sends a cross-user item.
-- CC H: gap ([#854](https://github.com/nolnoch/grayboard/issues/854)). Claude Code wakes on any channel notification and the plugin notifies every item, so an ungranted item still starts a turn, as a digest or deferred push does.
+- CC H: Claude Code wakes on any channel notification, so the plugin opens its lease with `context: false` and the server withholds a lone non-waking item, ungranted among them, until a waking one carries it (#854; boards.md §9 Hosted Claude Code). Not a wake bound: a full page of 100 non-waking items goes out, so a sender spends 100 unwoken items per turn it starts. Proof: `tests/integration/hosted_context_off.test.ts`, `adapters/hosted-core/tests/controller.test.ts` ("context: false opens the lease…"); no Claude Code test sends a cross-user item.

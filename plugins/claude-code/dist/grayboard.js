@@ -31811,6 +31811,17 @@ class Wire extends Connection {
       throw new Error("Invalid delivery response");
     return JSON.parse(content[0].text);
   }
+  async takes(tool, arg) {
+    let cursor;
+    do {
+      const page = await this.reachable(this.client.listTools(cursor === undefined ? {} : { cursor }, this.options()));
+      const found = page.tools.find((t) => t.name === tool);
+      if (found)
+        return Object.hasOwn(found.inputSchema.properties ?? {}, arg);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return false;
+  }
   async listen() {
     const subscription = await this.reachable(this.client.listen({ resourceSubscriptions: ["grayboard://inbox"] }, this.options()));
     if (!subscription.honoredFilter.resourceSubscriptions?.includes("grayboard://inbox")) {
@@ -36562,12 +36573,15 @@ class Controller {
   place;
   wait;
   configured;
+  context;
   skipped = new Set;
   constructor(port, options = {}) {
     this.port = port;
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep5;
     this.configured = options.configured;
+    if (options.context === false)
+      this.context = false;
     this.place = port.place();
     const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
     this.state = { state: "unenrolled", message: idle, roots: [] };
@@ -36960,7 +36974,7 @@ class Controller {
           throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
         let lease;
         try {
-          lease = leaseOf(await wire.call("delivery_open"), e);
+          lease = leaseOf(await wire.call("delivery_open", this.context === false && await wire.takes("delivery_open", "context") ? { context: false } : {}), e);
         } catch (error) {
           if (!(error instanceof Refusal) || reidentified)
             throw error;
@@ -37540,7 +37554,7 @@ class RootDelivery {
       this.begun = await this.epoch();
       if (this.closed)
         return;
-      const controller = this.controller = new Controller(this.port(), { sink: this.sink });
+      const controller = this.controller = new Controller(this.port(), { sink: this.sink, ...this.o.context === false ? { context: false } : {} });
       await controller.restore();
       if (this.closed)
         return;
@@ -38302,6 +38316,7 @@ function createPlugin(o) {
     stateDir: config.dataDir,
     place: () => place,
     push,
+    context: false,
     ...configured && "name" in configured ? { configured: configured.name } : {},
     admit: async (item, _stableID, identity, signal) => {
       if (!initialized)

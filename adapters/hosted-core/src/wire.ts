@@ -217,6 +217,17 @@ export class Wire extends Connection {
     if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== "text") throw new Error("Invalid delivery response");
     return JSON.parse(content[0].text as string);
   }
+  // Whether this server's `tool` takes `arg`: an older server's strict schema refuses an argument it lacks.
+  async takes(tool: string, arg: string): Promise<boolean> {
+    let cursor: string | undefined;
+    do {
+      const page = await this.reachable(this.client.listTools(cursor === undefined ? {} : { cursor }, this.options()));
+      const found = page.tools.find(t => t.name === tool);
+      if (found) return Object.hasOwn(found.inputSchema.properties ?? {}, arg);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return false;
+  }
   async listen() {
     const subscription = await this.reachable(this.client.listen({ resourceSubscriptions: ["grayboard://inbox"] }, this.options()));
     if (!subscription.honoredFilter.resourceSubscriptions?.includes("grayboard://inbox")) {
