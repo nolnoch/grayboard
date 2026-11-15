@@ -60,6 +60,11 @@ function everConnected(db: Database, to: string): boolean {
   return rosterHandles(db).includes(to);
 }
 
+// The refusal for a target in another user (security audit F-01).
+export function crossUserRefusal(to: string): string {
+  return `delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`;
+}
+
 // Whether `candidate` is in the requester's own user. The user is the
 // authenticated principal, never an address's spelling: a team alias
 // (`eng/sim`) is shared by every member, so a prefix test would let Alice's
@@ -183,9 +188,7 @@ export function resolveDelegation(
   if (args.to !== undefined) {
     if (typeof args.to !== "string" || !args.to.trim()) throw new CoreError("to must be a string");
     const to = args.to.trim();
-    if (!sameUser(principal, to, db)) {
-      throw new CoreError(`delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`);
-    }
+    if (!sameUser(principal, to, db)) throw new CoreError(crossUserRefusal(to));
     if (!everConnected(db, to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
     if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
