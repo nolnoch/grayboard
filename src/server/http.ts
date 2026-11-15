@@ -19,6 +19,7 @@ import { listClaims } from "../core/claims.ts";
 import { addressSet, aliasHeldText, aliasUser, idRow } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
+import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
 
@@ -258,7 +259,7 @@ function identityList(authed: AuthedUser, repo: Repo): Response {
   return json(repo.aliases.listForScope("person", authed.user_email).map(i => ({ name: i.name, created_at: i.created_at })));
 }
 
-async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
   const body = await parseBody<{ name: string }>(req);
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
@@ -266,6 +267,8 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
   const existing = repo.aliases.find(`${authed.user_email}/${name}`);
   if (existing) return conflict(`identity "${name}" already exists`);
+  const capped = aliasCapRefusal(repo, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
+  if (capped) return badRequest(capped);
   const identity = repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
   writeAudit(repo, "alias.created", authed.user_email, identity.address);
   onAliasCreated(db, repo, authed.user_id, identity.address);
@@ -556,6 +559,28 @@ async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, re
   return json({ ok: true, team: managed.team.name, policy, previous: from });
 }
 
+// A team's name, deleted by a team owner or an admin (#347), as a user
+// deletes their own (identityDelete): refused while a session holds or
+// writes as it, so no session outlives the name it acts as. Its queued
+// mail and claims stay with the address, as on unbind, for a member who
+// binds the name again.
+async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+  const body = await parseBody<{ name?: unknown }>(req); // before the ownership check, as in teamAdd
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
+  if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
+  const name = body.name.toLowerCase();
+  if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
+  const existing = repo.aliases.find(`${managed.team.name}/${name}`);
+  if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
+  const user = aliasUser(db, existing.address);
+  if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
+  repo.aliases.remove(existing.address);
+  forgetHandle(db, existing.address);
+  writeAudit(repo, "alias.deleted", authed.user_email, existing.address, { team: managed.team.name, ...managed.audit });
+  return json({ ok: true, deleted: existing.address });
+}
+
 function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Response {
   const managed = managedTeam(teamName, authed, repo, config);
   if (!managed) return notFound();
@@ -654,7 +679,7 @@ export async function handleHttp(
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
-  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);
+  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db, config);
   if (path.startsWith("/api/identities/") && method === "DELETE") {
     return identityDelete(path.slice("/api/identities/".length), authed, repo, db);
   }
@@ -683,6 +708,7 @@ export async function handleHttp(
     if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db, config, sessions);
     if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo, config);
     if (action === "policy"  && method === "POST") return teamPolicy(teamName, req, authed, repo, config);
+    if (action === "delete-alias" && method === "POST") return teamDeleteAlias(teamName, req, authed, repo, db, config);
   }
 
   if (path.startsWith("/api/admin/")) {

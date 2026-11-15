@@ -11,7 +11,7 @@ const KEYS = [
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS",
-  "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP",
+  "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
   "GRAYBOARD_RESOURCE_WATCHES_GLOBAL", "GRAYBOARD_RESOURCE_WATCHES_PER_SESSION",
@@ -241,6 +241,17 @@ describe("loadConfig", () => {
     }
     process.env.GRAYBOARD_HELLO_PER_SEC = "0.1";
     expect(loadConfig().helloLimit).toEqual({ burst: 60, perSec: 0.1 });
+  });
+
+  test("the per-scope name cap defaults to 500; set, it parses as a positive whole number (#347)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().aliasScopeCap).toBe(500);
+    process.env.GRAYBOARD_ALIAS_SCOPE_CAP = "40";
+    expect(loadConfig().aliasScopeCap).toBe(40);
+    for (const bad of ["0", "2.5", "many"]) {
+      process.env.GRAYBOARD_ALIAS_SCOPE_CAP = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_ALIAS_SCOPE_CAP must be a positive whole number of names/);
+    }
   });
 
   test("delegate's per-user limit defaults to 60 and 0.1/s and its open cap to 20; set, they parse like the hello limit (#252)", () => {
