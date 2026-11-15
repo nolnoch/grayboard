@@ -92,6 +92,10 @@ export interface Repo {
   now(): number;
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
+  // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this
+  // connection or another; undefined inside a transaction, whose writes may yet roll back. A cache of
+  // what those tables say is valid while this is unchanged (#853).
+  authGeneration(): string | undefined;
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
@@ -102,6 +106,8 @@ export interface Repo {
     clearSubject(userId: number): void;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
+    // findById(id)?.disabled_at != null, cached on authGeneration (#853).
+    isDisabled(userId: number): boolean;
     setDisabled(userId: number, disabled: boolean): void;
   };
   sessions: {
@@ -317,9 +323,22 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     recordChildRoots(d);
     seedSchema(d, first);
   });
+  authGenerationTriggers(db);
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, opts.now);
   setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
   return { db, repo };
+}
+
+// #853: a connection-local counter every write to the authorization tables bumps, by trigger, so no
+// write site can forget to. TEMP objects live and die with this connection, outside the schema, and
+// roll back with their transaction: Repo.authGeneration reads the counter only outside one.
+function authGenerationTriggers(db: Database): void {
+  db.exec(`CREATE TEMP TABLE IF NOT EXISTS auth_generation(n INTEGER NOT NULL);
+    INSERT INTO auth_generation(n) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM auth_generation)`);
+  for (const table of ["oauth_tokens", "oauth_grants", "users"]) for (const op of ["INSERT", "UPDATE", "DELETE"]) {
+    db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS auth_generation_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
+      BEGIN UPDATE auth_generation SET n = n + 1; END`);
+  }
 }
 
 // #451: a hosted root holds aliases like any session, in alias_holds, whose address
@@ -694,11 +713,18 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   };
   const hosted = makeHostedStore(db);
   const oauth = makeOAuthStore(db, hosted);
+  // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
+  const generation = db.query<{ n: number; v: number }, []>("SELECT n, (SELECT data_version FROM pragma_data_version) AS v FROM temp.auth_generation");
+  const authGeneration = () => { if (db.inTransaction) return undefined; const g = generation.get()!; return `${g.n}:${g.v}`; };
+  const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+  let disabledGeneration: string | undefined;
+  const disabled = new Map<number, boolean>();
   return {
     now: clock,
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
+    authGeneration,
 
     oauth: { ...oauth, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
     hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
@@ -743,8 +769,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
       },
-      findById(userId) {
-        return db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+      findById: userById,
+      isDisabled(userId) {
+        const g = authGeneration();
+        if (g === undefined) return userById(userId)?.disabled_at != null;
+        if (g !== disabledGeneration) { disabled.clear(); disabledGeneration = g; }
+        let d = disabled.get(userId);
+        if (d === undefined) disabled.set(userId, d = userById(userId)?.disabled_at != null);
+        return d;
       },
       setDisabled(userId, disabled) {
         db.transaction(() => {
@@ -1441,8 +1473,8 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
     findActiveAccess(h, resource, requiredScopes, now) {
       if (!time(now) || !hash(h) || !Array.isArray(requiredScopes)) return undefined;
       // One read snapshot binds token, grant and user liveness.
-      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null }, [string, number, number]>(`
-        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes FROM oauth_tokens t
+      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null; grant_expiry: number }, [string, number, number]>(`
+        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes, g.expires_at AS grant_expiry FROM oauth_tokens t
         JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
         WHERE t.hash = ? AND t.kind = 'access' AND t.revoked_at IS NULL AND t.expires_at > ?
           AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now, now);
@@ -1453,7 +1485,7 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
       if (!scopes(accessScopes) || !accessScopes.every(s => g.scopes.includes(s)) ||
           g.resource !== resource || !requiredScopes.every(s => accessScopes.includes(s))) return undefined;
       const a: OAuthAccess = { tokenHash: h, grantId: g.id, userId: g.userId, clientId: g.clientId,
-        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry };
+        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry, grantExpiresAt: row.grant_expiry };
       return a;
     },
     isGrantActive(id, now) {

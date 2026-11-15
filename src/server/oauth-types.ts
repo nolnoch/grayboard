@@ -17,6 +17,8 @@ export type OAuthGrant = OAuthBinding & {
 };
 export type OAuthAccess = OAuthBinding & {
   tokenHash: string; grantId: string; userId: number; createdAt: number; expiresAt: number;
+  // The grant's expiry: the access is live only while both are in the future (#853 caches on it).
+  grantExpiresAt: number;
 };
 // scopes describes the access token only; refresh permission always remains the original grant scope.
 export type OAuthTokenPair = OAuthBinding & {

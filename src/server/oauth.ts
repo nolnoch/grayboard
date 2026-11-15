@@ -3,7 +3,7 @@ import { exchangeGoogleCode, googleSignIn, hashToken, type AuthedUser, type Goog
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
-import { OAUTH_TTL, type OAuthRequest } from "./oauth-types.ts";
+import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
 import { writeAudit } from "./audit.ts";
@@ -454,6 +454,28 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const bearerError = (status: 401 | 403, error: string | undefined, requiredScopes: string[]) => json({ error: error ?? "unauthorized" }, status, {
     "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}", scope="${(status === 401 ? OAUTH_SCOPES : requiredScopes).join(" ")}"${error ? `, error="${error}"` : ""}`,
   });
+  // A live access token and its user's email, by hash (#853). Every hosted request and the stream timer's
+  // every live ask this, so a hit skips the token-grant-user join: positives only, held while
+  // repo.authGeneration is unchanged (any write to tokens, grants or users clears the lot) and both the
+  // token and its grant are unexpired, which are the join's own time conditions. Never cached inside a
+  // transaction, whose writes may roll back.
+  let accessGeneration: string | undefined;
+  const accessCache = new Map<string, { access: OAuthAccess; email: string }>();
+  function activeAccess(accessHash: string): { access: OAuthAccess; email: string } | undefined {
+    const t = now(), generation = repo.authGeneration();
+    if (generation !== undefined) {
+      if (generation !== accessGeneration) { accessCache.clear(); accessGeneration = generation; }
+      const hit = accessCache.get(accessHash);
+      if (hit && t < hit.access.expiresAt && t < hit.access.grantExpiresAt) return hit;
+    }
+    const access = repo.oauth.findActiveAccess(accessHash, resource, [], t);
+    if (!access) return undefined;
+    const user = repo.users.findById(access.userId);
+    if (!user || user.disabled_at !== null) return undefined;
+    const found = { access, email: user.email };
+    if (generation !== undefined) accessCache.set(accessHash, found);
+    return found;
+  }
   return {
     issuer, resource, resourceMetadata,
     async fetch(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
@@ -472,19 +494,18 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
       if (u.searchParams.has("access_token") || !auth || !/^Bearer [A-Za-z0-9_-]{43}$/i.test(auth)) return bearerError(401, auth ? "invalid_token" : undefined, requiredScopes);
       const accessHash = hashToken(auth.slice(7));
-      const access = repo.oauth.findActiveAccess(accessHash, resource, [], now());
-      if (!access) return bearerError(401, "invalid_token", requiredScopes);
+      const found = activeAccess(accessHash);
+      if (!found) return bearerError(401, "invalid_token", requiredScopes);
+      const { access, email } = found;
       if (!requiredScopes.every(s => access.scopes.includes(s))) return bearerError(403, "insufficient_scope", requiredScopes);
-      const user = repo.users.findById(access.userId);
-      if (!user || user.disabled_at !== null) return bearerError(401, "invalid_token", requiredScopes);
-      return { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
-        sourceKey: sourceKeyFor(access.clientId, clients), scopes: access.scopes, accessHash, accessExpiry: access.expiresAt };
+      return { authed: { user_id: access.userId, user_email: email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
+        sourceKey: sourceKeyFor(access.clientId, clients), scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
     },
     isGrantActive(grantId: string): boolean { return !closed && repo.oauth.isGrantActive(grantId, now()); },
     isAuthorized(principal: OAuthPrincipal): boolean {
       if (closed || principal.accessExpiry <= now()) return false;
-      const a = repo.oauth.findActiveAccess(principal.accessHash, resource, principal.scopes, now());
-      return !!a && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
+      const a = activeAccess(principal.accessHash)?.access;
+      return !!a && principal.scopes.every(s => a.scopes.includes(s)) && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
     },
     close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); },
   };

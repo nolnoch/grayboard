@@ -400,7 +400,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const root = row.root_session_id ? store.get(row.root_session_id) : row;
       if (root && !root.root_session_id) {
         const t = now();
-        if (repo.users.findById(root.user_id)?.disabled_at != null) store.end(root.session_id, "disabled", t);
+        if (repo.users.isDisabled(root.user_id)) store.end(root.session_id, "disabled", t);
         else if (root.lease_deadline !== null && root.lease_deadline <= t) store.end(root.session_id, "expired", t, root.lease_deadline);
         else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(root.session_id).length) store.end(root.session_id, "idle", t);
       }
