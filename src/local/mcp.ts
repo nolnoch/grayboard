@@ -303,6 +303,9 @@ const holds = (): string[] => (liveParent === null ? held : holdsOf(db, livePare
 // mail, claims and uploads as (#284 S1): its holds and its ID. A tools-only
 // process receives nothing, so its ID isn't one of its addresses.
 const primary = (): string => WRITES_AS ?? primaryOf(holds(), rootId());
+// The name structuredContent reports: the primary hold, or null when unbound,
+// as on a server (#375 F10), though an unbound local session sends as its ID.
+const heldName = (): string | null => WRITES_AS ?? holds()[0] ?? null;
 const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...holds(), rootId()]);
 // The first successful write of a session acting as its ID says how to get a
 // readable name, once per session (#470). A root's notice: never a child's (#523).
@@ -769,7 +772,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   let out = withNotices(r, extra);
   if (instructionsStale && !out.structuredContent) {
     instructionsStale = false;
-    out = { ...out, structuredContent: { name: primary(), instructions: localInstructions(true) } };
+    out = { ...out, structuredContent: { name: heldName(), instructions: localInstructions(true) } };
   }
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
@@ -1338,7 +1341,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     const ok = bindOk(n.name, held, (general) => localInstructions(general));
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
-      requeued.push(bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      requeued.push(bindMissed(n.name, "it was cancelled", ok.content[0]!.text));
       instructionsStale = true;
     }
     return ok;
@@ -1380,9 +1383,9 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
     console.error(`[grayboard] session ${SESSION_ID} released "${n.name}"; ${held.length ? `holds "${held.join('", "')}"` : "unbound"}`);
     if (!held.length) unboundCandidates = await candidateNames(db, SUGGESTED);
     const left = listClaims(db).filter((c) => c.holder === n.name).map((c) => c.key);
-    const ok = unbindOk(n.name, before, primary(), left, (general) => localInstructions(general));
+    const ok = unbindOk(n.name, before, heldName(), left, (general) => localInstructions(general));
     if (signal.aborted) {
-      requeued.push(unbindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      requeued.push(unbindMissed(n.name, "it was cancelled", ok.content[0]!.text));
       instructionsStale = true;
     }
     return ok;

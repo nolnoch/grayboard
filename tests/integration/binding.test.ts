@@ -290,8 +290,9 @@ test("#284 S1, S2: bind adds a hold; unbind releases one, its claims and mail st
 
   // Unbinding the last hold leaves the session acting as its ID.
   const last = await s.c.callTool({ name: "unbind", arguments: { name: "fe2" } });
-  expect((last.content as { text: string }[])[0]!.text).toContain(`You now send as "${id}".`);
-  expect((last.structuredContent as { name: string; instructions: string[] })).toEqual({ name: id, instructions: expect.arrayContaining([expect.stringContaining("This session has no bus name yet, so it acts as its ID")]) });
+  // F10: unbound, the result says so and names nothing, as hosted's does.
+  expect((last.content as { text: string }[])[0]!.text).toContain("This session is now unbound.");
+  expect((last.structuredContent as { name: string | null; instructions: string[] })).toEqual({ name: null, instructions: expect.arrayContaining([expect.stringContaining("This session has no bus name yet, so it acts as its ID")]) });
   expect((await s.call("peer_list", {})).you).toBe(id);
   expect(rows(`SELECT name FROM bindings WHERE session_id = ?`, id)).toEqual([{ name: null }]);
   expect(JSON.parse(readFileSync(join(dir, `bind.${s.harnessPid}`), "utf8")).names).toEqual([]);
