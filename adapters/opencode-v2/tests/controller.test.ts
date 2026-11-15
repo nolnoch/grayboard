@@ -611,6 +611,36 @@ test("a native refresh that never lands within the rotation grace pauses, asks O
     expect(o.r.calls.some(c => ["delivery_release", "session_end"].includes(c.name))).toBe(false);
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
+test("a native call refused before dispatch never holds the reconnect (#661)", async () => {
+  const o = await outage();
+  try {
+    o.r.holdRegistration(async () => { throw new Error("child_bound: end the child first"); });
+    await expect(o.controller.before({ sessionID: "G", tool: "grayboard_dm_send", id: "refused" })).rejects.toThrow("child_bound");
+    o.r.f.expire();
+    o.stop();
+    await until(() => o.r.f.reloads === 1);
+    expect(o.waits.slice(0, 22)).toEqual([...Array(21).fill(500), 1000]);
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
+test("a refresh that lands while the server is down resumes on restore's outage backoff, never pausing again (#661)", async () => {
+  let down = false, refused = 0, during: unknown;
+  const o: Awaited<ReturnType<typeof outage>> = await outage((_elapsed, ms) => {
+    // The first recovery wait: the token is refreshed, and the server is down for the prepare's connect.
+    if (ms === 1000) { o.r.f.rotate("fake-access-two"); down = true; }
+    else if (refused) during = o.controller.status().roots.find(root => root.sessionID === "R");
+  });
+  try {
+    o.r.observe(async operation => { if (operation === "connect" && down) { down = false; refused++; throw new ServerUnreachable(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })); } });
+    o.r.f.expire();
+    o.stop();
+    await until(() => refused === 1 && o.controller.status().roots.find(root => root.sessionID === "R")?.state === "active");
+    // The grace, one recovery wait, then restore's outage backoff: never the recovery's again.
+    expect(o.waits).toEqual([...Array(21).fill(500), 1000, 500]);
+    expect(during).toMatchObject({ state: "retrying", operation: "recover", code: "server_unreachable" });
+    expect(o.controller.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "active", ownership: 1 });
+    expect(o.r.calls.some(c => c.name === "bind")).toBe(false);
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
 // #661: OpenCode 2.1.4 refreshes only when a request draws a 401. Past the grace the plugin makes OpenCode
 // reconnect the entry, never while a native call is in flight (a reconnect kills it), and the refresh that
 // reconnect causes resumes delivery under the same ownership.

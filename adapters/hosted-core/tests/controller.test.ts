@@ -783,6 +783,23 @@ test.each(modes)("a recovery check while a native unbind is in flight waits for 
     expect(o.r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
   } finally { await o.c.close(); await o.r.controller.close(); }
 });
+// A native bind that fails during the wait sets no holds: the wait goes on, and a later refresh rebinds the remembered name.
+test.each(modes)("a native bind that fails during the wait leaves it waiting; a later refresh resumes the remembered holds (%s)", async mode => {
+  const o = await expiredPause(mode, async (n, r, c) => {
+    if (n === 1) {
+      await c.beforeCall({ sessionID: "R", tool: "bind" });
+      await c.afterCall({ sessionID: "R", tool: "bind", result: { status: "error" } });
+    }
+    if (n === 2) { r.rows.delete("R"); r.expireAccess(); }
+  });
+  try {
+    await until(() => o.recovering() >= 2 && o.r.root(o.c)?.state === "active");
+    expect(o.waits).toEqual([...GRACE, 1000, 2000]);
+    expect(o.states).toContainEqual({ id: "R", state: "paused", operation: "after", code: "native_access_expired" });
+    expect(o.after().filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/work" }]);
+    expect(o.r.root(o.c)).toMatchObject({ state: "active", held: ["you@example.com/be"] });
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
 // A drift clears the wait; a later enroll of another root clears the controller's drift, which must not revive it.
 test.each(modes)("a drift during the wait ends it even after another root enrolls: a refresh then resumes nothing (%s)", async mode => {
   const o = await expiredPause(mode, async (n, r, c) => { if (n === 1) { r.drift(); r.expireAccess(); await c.enroll("B", ["fe"], true); } });
