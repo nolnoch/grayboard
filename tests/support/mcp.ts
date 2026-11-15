@@ -195,6 +195,14 @@ export async function refusal(s: { c: Client }, name: string, args: Record<strin
   return text;
 }
 
+// The same, with the refusal's structuredContent code (#959).
+export async function refusalCoded(s: { c: Client }, name: string, args: Record<string, unknown> = {}): Promise<{ text: string; code: unknown }> {
+  const r = await s.c.callTool({ name, arguments: args });
+  const text = (r.content as { text: string }[])[0]!.text;
+  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
+  return { text, code: (r.structuredContent as { code?: unknown } | undefined)?.code };
+}
+
 // Ends one session mid-test. The SDK's close waits for the child to exit.
 export async function stopSession(c: Client): Promise<void> {
   open.delete(c);
