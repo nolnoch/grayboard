@@ -1334,3 +1334,42 @@ test("a configured per-user session cap admits past the default and refuses at i
   expect(hostedRowCount(database.db)).toBe(300);
   await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
 });
+
+test("#881: a request reads its row once and skips its own user's disabled read; the sweep's settle still ends a disabled user's root", async () => {
+  const { Database } = await import("bun:sqlite");
+  const root = context("one-read");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  const query = spyOn(Database.prototype, "query");
+  try {
+    const count = (sql: string) => query.mock.calls.filter(([s]) => String(s) === sql).length;
+    const rowReads = () => count("SELECT * FROM hosted_sessions WHERE session_id = ?"), userReads = () => count("SELECT * FROM users WHERE id = ?");
+    query.mockClear();
+    await hosted.whoami(principal, root);
+    // settle's read (rowFor reuses it), touchAfter's and whoami's own; before #881, four and one user read.
+    expect(rowReads()).toBe(3);
+    expect(userReads()).toBe(0);
+    // Positive case: settle with no authorized user (the sweep's and mcp authorize's) still reads, and ends.
+    database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+    query.mockClear();
+    hosted.settle(root.id);
+    expect(userReads()).toBe(1);
+    expect(database.repo.hosted.get(root.id)).toBeUndefined();
+  } finally { query.mockRestore(); }
+});
+
+test("#881: a settle that ends a lapsed root stands when the same request is then refused", async () => {
+  const lapsed = context("lapsed"), other = context("other");
+  if (!("id" in lapsed)) throw new Error("fixture context");
+  await hosted.bind(principal, lapsed, { name: "be", create: true });
+  await delivery.open(principal, lapsed);
+  await hosted.whoami(principal, other);
+  delivery.close(); hosted.close();
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 1 } });
+  delivery = createDelivery(hosted, { isAuthorized: () => authorized });
+  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, lapsed.id]);
+  // settle ends the lapsed root; rowFor then starts a new row there, which the one-row cap refuses.
+  await expect(hosted.whoami(principal, lapsed)).rejects.toHaveProperty("code", "bad_request");
+  expect(database.repo.hosted.get(lapsed.id)).toBeUndefined();
+  expect(hostedRowCount(database.db)).toBe(1);
+});
