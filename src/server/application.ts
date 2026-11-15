@@ -1424,12 +1424,15 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       // docs/vision.md principle 11). Online state, the open cap and the
       // limiter are routing and stay the first call's.
       picked = stored.to;
-      if (!sameUser(authed.user_email, stored.to, db)) throw new CoreError(crossUserRefusal(stored.to));
+      // An auto-pick repeat never named this target: say the first
+      // delegation went, and how to delegate afresh (a fresh pick).
+      const hint = m.to === undefined ? ` This repeat was not sent: your first call auto-picked "${stored.to}"; to delegate again with a fresh pick, call with resend: true.` : "";
+      if (!sameUser(authed.user_email, stored.to, db)) throw new CoreError(crossUserRefusal(stored.to) + hint);
       const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
       const decision = authorize(repo, { humanReach: hub.humanReach }, req);
       if (!decision.allow) {
         rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, session.primary), req, decision));
-        fail(decision.code, decision.reason);
+        fail(decision.code, decision.reason + hint);
       }
     });
   } catch (e) {
@@ -1437,7 +1440,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     for (const row of rows) rowAfterRollback(session, row);
     // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
-      refused({ reason: e.message, to: m.to });
+      refused({ reason: e.message, to: m.to ?? picked });
       throw coreRefusal(e);
     }
     // A throttled call is audited once per streak (delegation.throttled), not per call.

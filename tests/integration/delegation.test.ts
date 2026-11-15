@@ -319,6 +319,34 @@ test("server: a delegate repeat after its launcher's name moved to another user 
   }
 }, 30_000);
 
+// The auto-pick half: the caller never named the launcher, so the refusal
+// says what the first call picked and how to pick afresh, and the audit row
+// names the pick.
+test("server: an auto-pick delegate repeat after its pick moved to another user names the pick and resend", async () => {
+  const srv = serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const aliceSim = await srv.connected(alice, "eng/sim");
+    const req = { persona: "a researcher", task: "t" };
+    expect((await aliceSim.delegate(req)).to).toBe("eng/builder");
+
+    await aliceLauncher.unbind("eng/builder");
+    await srv.connected(bob, "eng/builder");
+    const refusedRows = () => srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused'`).all() as { detail: string }[];
+    const before = refusedRows().length;
+    await expect(aliceSim.delegate(req)).rejects.toThrow(/auto-picked "eng\/builder".*resend: true/);
+    const rows = refusedRows();
+    expect(rows.length).toBe(before + 1);
+    expect(JSON.parse(rows[rows.length - 1].detail)).toMatchObject({ to: "eng/builder" });
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
 test("local: a tools-only sidecar leaves the owner's launcher flag alone (review 5)", async () => {
   const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
   const sim = await localSession(dir, "sim");

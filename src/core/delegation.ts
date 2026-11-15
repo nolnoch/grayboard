@@ -60,6 +60,11 @@ function everConnected(db: Database, to: string): boolean {
   return rosterHandles(db).includes(to);
 }
 
+// The refusal for a target in another user (security audit F-01).
+export function crossUserRefusal(to: string): string {
+  return `delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`;
+}
+
 // Whether `candidate` is in the requester's own user. The user is the
 // authenticated principal, never an address's spelling: a team alias
 // (`eng/sim`) is shared by every member, so a prefix test would let Alice's
@@ -69,10 +74,6 @@ function everConnected(db: Database, to: string): boolean {
 // launcher list reads it). Locally every principal is null: one user per
 // bus. No session behind the candidate: not another user's; the roster and
 // launcher checks refuse it as unknown.
-export function crossUserRefusal(to: string): string {
-  return `delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`;
-}
-
 export function sameUser(principal: string | null, candidate: string, db: Database): boolean {
   const row = addressParts(candidate)?.kind === "id"
     ? db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(candidate)
