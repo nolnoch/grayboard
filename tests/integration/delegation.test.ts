@@ -242,7 +242,7 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     expect(r.human_fallback).toBeUndefined();
 
     // An explicit cross-user `to` is refused, naming the scope...
-    await expect(bobSim.call("delegate", { persona: "p", task: "t", to: "alice@example.com/be" })).rejects.toThrow(/own user|authority ruling/);
+    await expect(bobSim.call("delegate", { persona: "p", task: "t", to: "alice@example.com/be" })).rejects.toThrow(/belongs to another user/);
     // ...and nothing landed on alice's launcher.
     await aliceBe.none(direct());
 

@@ -241,10 +241,10 @@ describe("unbound launchers (#337)", () => {
     const alices = unbound(true, "alice@example.com");
     const bobs = unbound(true, "bob@b.com");
     expect(resolveDelegation(db, "bob@b.com/me", "bob@b.com", args, live).to).toBe(bobs);
-    expect(() => resolveDelegation(db, "bob@b.com/me", "bob@b.com", { ...args, to: alices }, live)).toThrow(/own user|authority ruling/);
+    expect(() => resolveDelegation(db, "bob@b.com/me", "bob@b.com", { ...args, to: alices }, live)).toThrow(/belongs to another user, and you share no team whose policy is delegating/);
     // A local requester (bare handle, no principal) doesn't reach a server user's ID.
     db.prepare(`UPDATE ids SET launcher = 0 WHERE id = ?`).run(bobs);
-    expect(() => resolveDelegation(db, "me", null, { ...args, to: alices }, live)).toThrow(/own user|authority ruling/);
+    expect(() => resolveDelegation(db, "me", null, { ...args, to: alices }, live)).toThrow(/belongs to another user, and you share no team whose policy is delegating/);
   });
 });
 
@@ -316,7 +316,7 @@ describe("own-user scope (#246 review 1-2)", () => {
 
   test("an explicit cross-user to is refused, naming the ruling", () => {
     session("alice@example.com/be", true);
-    expect(() => resolveDelegation(db, "bob@b.com/me", "bob@b.com", { ...args, to: "alice@example.com/be" }, live)).toThrow(/own user|authority ruling/);
+    expect(() => resolveDelegation(db, "bob@b.com/me", "bob@b.com", { ...args, to: "alice@example.com/be" }, live)).toThrow(/belongs to another user, and you share no team whose policy is delegating/);
   });
 
   // Security audit F-01: a team alias is every member's address, so its
