@@ -104,6 +104,14 @@ test("channelParams carries the server's other_user mark as an attribute, and no
   expect(digest(post).other_user).toBeUndefined();
 });
 
+// #256: a launcher acts on another user's delegation request only when the
+// server marked it delegated (a delegate.to grant it checked).
+test("channelParams carries the server's delegated mark on a DM, and nothing unmarked gets one", () => {
+  const message = { id: 7, sender: "bob@example.com/sim", recipient: "you@example.com/launcher", body: "go", parent_id: null, created_at: 1 };
+  expect(channelParams(item({ kind: "direct", message: { ...message, other_user: true, delegated: true } }), identity).meta).toMatchObject({ other_user: "true", delegated: "true" });
+  expect(channelParams(item({ kind: "direct", message: { ...message, other_user: true } }), identity).meta.delegated).toBeUndefined();
+});
+
 test("channelParams refuses an event that isn't the server's inbox shape", () => {
   expect(() => channelParams(item({ kind: "direct", message: { id: "5", sender: "a", body: "b" } }), identity)).toThrow();
   expect(() => channelParams(item({ kind: "unknown" }), identity)).toThrow();

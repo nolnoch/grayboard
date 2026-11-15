@@ -56,7 +56,7 @@ export type HistoryMessage = DirectMessage & { delivered?: boolean };
 export type DeliveryEvent =
   // other_user, ungranted: set only by pending(), a hosted lease's pull
   // (security audit F-10, F-03).
-  | { kind: "direct"; message: DirectMessage & { other_user?: true; ungranted?: true } }
+  | { kind: "direct"; message: DirectMessage & { other_user?: true; ungranted?: true; delegated?: true } }
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
@@ -1607,17 +1607,30 @@ function handleBoardPost(hub: Hub, session: ApplicationSession, me: string, args
 // pull-free reads (dm_inbox, dm_thread, dm_history, board_read), so /clear or
 // a poll session loses no mark. Decided per call, so a revoked grant governs
 // the next one (principle 11); one decision per writer per call. Rows from
-// before the column carry no writer and no mark.
-type WriterMark = { other_user?: true; ungranted?: true };
+// before the column carry no writer and no mark. Another user's message the
+// server wrote through `delegate` (its delegation.requested row) is also
+// marked delegated while a delegate.to grant covers its writer and this
+// session's user (#256): the mark a launcher acts on, which a plain dm_send
+// carrying a delegation header can't earn.
+type WriterMark = { other_user?: true; ungranted?: true; delegated?: true };
 function writerMarks(repo: Repo, session: ApplicationSession, messageIds: number[], postIds: number[]) {
   const writers = repo.messages.writerUsers(messageIds, postIds);
   const me = session.authed.user_email;
-  const granted = new Map<string, boolean>();
-  const wakes = (user: string) => granted.get(user) ?? (granted.set(user, authorize(repo, {}, { verb: "msg.wake", from_user: user, to_user: me }).allow), granted.get(user)!);
+  const decided = new Map<string, boolean>();
+  const may = (verb: "msg.wake" | "delegate.to", user: string) => {
+    const key = `${verb} ${user}`;
+    if (!decided.has(key)) decided.set(key, authorize(repo, {}, { verb, from_user: user, to_user: me }).allow);
+    return decided.get(key)!;
+  };
+  const foreign = messageIds.filter((id) => { const u = writers.messages.get(id); return u !== undefined && u !== me; });
+  const delegations = foreign.length ? repo.messages.delegationIds(foreign) : new Set<number>();
   const mark = (user: string | undefined, judged: boolean): WriterMark =>
-    user === undefined || user === me ? {} : { other_user: true, ...(judged && !wakes(user) ? { ungranted: true as const } : {}) };
+    user === undefined || user === me ? {} : { other_user: true, ...(judged && !may("msg.wake", user) ? { ungranted: true as const } : {}) };
   return {
-    message: (id: number): WriterMark => mark(writers.messages.get(id), true),
+    message: (id: number): WriterMark => {
+      const m = mark(writers.messages.get(id), true);
+      return m.other_user && delegations.has(id) && may("delegate.to", writers.messages.get(id)!) ? { ...m, delegated: true } : m;
+    },
     post: (id: number, judged = true): WriterMark => mark(writers.posts.get(id), judged),
   };
 }

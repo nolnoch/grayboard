@@ -34980,6 +34980,8 @@ function dmNotification(msg, primary) {
     meta.other_user = "true";
   if (msg.ungranted)
     meta.ungranted = "true";
+  if (msg.delegated)
+    meta.delegated = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }

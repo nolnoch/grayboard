@@ -30,7 +30,7 @@ export type Pending =
   | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true }
   | { kind: "digest"; board: string; unread: number; latest: Post };
 
-export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[]; other_user?: true; ungranted?: true };
+export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[]; other_user?: true; ungranted?: true; delegated?: true };
 
 /**
  * A body made safe as `<channel>` content (#433, security audit F-07): the `<` of any
@@ -73,6 +73,7 @@ export function dmNotification(msg: DirectNotice, primary?: string): { content: 
   if (msg.kind) meta.kind = msg.kind;
   if (msg.other_user) meta.other_user = "true";
   if (msg.ungranted) meta.ungranted = "true";
+  if (msg.delegated) meta.delegated = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }

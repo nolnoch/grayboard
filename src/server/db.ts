@@ -179,6 +179,8 @@ export interface Repo {
     // The writer's signed-in user of each message and post that has one
     // recorded (rows from before F-10, bounces and system posts have none).
     writerUsers(messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
+    // Which of these messages `delegate` wrote: each has a delegation.requested row targeting its recipient (#256).
+    delegationIds(messageIds: number[]): Set<number>;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
@@ -966,6 +968,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
             .all(JSON.stringify(ids)).map((r) => [r.id, r.user] as const));
         return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds) };
+      },
+      delegationIds(messageIds) {
+        return new Set(db.query<{ id: number }, [string]>(
+          `SELECT m.id FROM messages m
+           JOIN access_log a ON a.action = 'delegation.requested' AND a.target = m.recipient AND json_extract(a.detail, '$.message_id') = m.id
+           WHERE m.id IN (SELECT value FROM json_each(?))`,
+        ).all(JSON.stringify(messageIds)).map((r) => r.id));
       },
       bouncesFrom(id, since = 0) {
         return db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);
