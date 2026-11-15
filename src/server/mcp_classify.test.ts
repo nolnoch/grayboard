@@ -22,12 +22,23 @@ const bodies: Array<[string, unknown]> = [
   ["_meta not an object", { jsonrpc: "2.0", id: 11, method: "tools/list", params: { _meta: "x" } }],
 ];
 
+// claimsModern reads only the body, so the SDK must say modern for a fired body whatever headers ride with it: a
+// legacy client's protocol-version or session header, or an Mcp-Method that disagrees with the body's method (#952).
+const headerVariants: Array<[string, Record<string, string>]> = [
+  ["no headers", {}],
+  ["legacy protocol header", { "Mcp-Protocol-Version": "2025-06-18" }],
+  ["legacy session header", { "Mcp-Session-Id": "x" }],
+  ["mismatched Mcp-Method", { "Mcp-Method": "initialize" }],
+];
+
 test("claimsModern never says modern where the SDK's isLegacyRequest says legacy, and does fire on modern traffic", async () => {
   const fired: string[] = [];
   for (const [name, body] of bodies) {
     if (!claimsModern(body)) continue;
     fired.push(name);
-    expect({ name, legacy: await isLegacyRequest(post(), body) }).toEqual({ name, legacy: false });
+    for (const [variant, headers] of headerVariants) {
+      expect({ name, variant, legacy: await isLegacyRequest(post(headers), body) }).toEqual({ name, variant, legacy: false });
+    }
   }
   expect(fired).toEqual(["modern tools/call", "modern listen", "claim with an invalid envelope", "claim naming an unserved revision", "modern notification", "claim on a malformed message"]);
   // The bodies it leaves to the SDK include ones the SDK does route legacy, so the corpus exercises both answers.

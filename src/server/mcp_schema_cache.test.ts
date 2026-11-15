@@ -24,8 +24,32 @@ describe("HostedMcpServer.toolInputSchemaJson", () => {
     expect(first).toBeDefined();
     expect(second).toBe(first!);
     expect(first).toEqual(make(McpServer).toolInputSchemaJson("read")!);
-    // The SDK alone converts again for each server.
+    // The SDK alone converts again for each server. If this starts failing, the SDK caches by schema itself and
+    // HostedMcpServer's override can be deleted.
     expect(make(McpServer).toolInputSchemaJson("read")).not.toBe(make(McpServer).toolInputSchemaJson("read"));
+  });
+
+  test("the cache is keyed by schema object, not tool name: an updated paramsSchema gets its own conversion", () => {
+    const server = make(HostedMcpServer);
+    const before = server.toolInputSchemaJson("read");
+    const NEXT = z.strictObject({ post: z.number() });
+    const tool = server.registerTool("read2", { description: "r", inputSchema: INPUT }, () => ({ content: [] }));
+    expect(server.toolInputSchemaJson("read2")).toBe(before!);
+    tool.update({ paramsSchema: NEXT });
+    const after = server.toolInputSchemaJson("read2");
+    expect(after).not.toBe(before!);
+    const plain = new McpServer({ name: "t", version: "1" });
+    plain.registerTool("read2", { description: "r", inputSchema: NEXT }, () => ({ content: [] }));
+    expect(after).toEqual(plain.toolInputSchemaJson("read2")!);
+    expect(after).not.toEqual(before!);
+  });
+
+  test("a tool with no inputSchema defers to the SDK", () => {
+    const server = make(HostedMcpServer);
+    server.registerTool("bare", { description: "b" }, () => ({ content: [] }));
+    const plain = make(McpServer);
+    plain.registerTool("bare", { description: "b" }, () => ({ content: [] }));
+    expect(server.toolInputSchemaJson("bare")).toEqual(plain.toolInputSchemaJson("bare"));
   });
 
   test("unknown and disabled tools defer to the SDK", () => {
