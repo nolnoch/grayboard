@@ -586,22 +586,32 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     // the generation's tables. The rest wait for phase B's full check, whose settle may commit.
     const checked = new Set<Context>(), full: Live[] = [], fullStreams: [OwnedStream, Context][] = [];
     const t = now();
-    const gen = application.repo.authRead(() => {
-      const gen = application.repo.authGeneration();
-      for (const live of [...lives]) {
-        if (live.stopped) continue;
-        checked.add(live.context);
-        const s = fresh(live.context, gen, t);
-        if (!s) { full.push(live); continue; }
-        try { validStamped(live, s); } catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); }
-      }
-      for (const [stream, context] of streamContexts) {
-        if (checked.has(context)) continue;
-        if (!fresh(context, gen, t)) { fullStreams.push([stream, context]); continue; }
-        try { authCheck(context); } catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); }
-      }
-      return gen;
-    });
+    let gen: string | undefined;
+    try {
+      gen = application.repo.authRead(() => {
+        const gen = application.repo.authGeneration();
+        for (const live of [...lives]) {
+          if (live.stopped) continue;
+          checked.add(live.context);
+          const s = fresh(live.context, gen, t);
+          if (!s) { full.push(live); continue; }
+          try { validStamped(live, s); } catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); }
+        }
+        for (const [stream, context] of streamContexts) {
+          if (checked.has(context)) continue;
+          if (!fresh(context, gen, t)) { fullStreams.push([stream, context]); continue; }
+          try { authCheck(context); } catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); }
+        }
+        return gen;
+      });
+    } catch {
+      // The generation read failed: every context is stale, and phase B's own checks close the ones that fail.
+      gen = undefined;
+      full.length = 0; fullStreams.length = 0;
+      for (const live of lives) if (!live.stopped) full.push(live);
+      const owned = new Set(full.map(l => l.context));
+      for (const [stream, context] of streamContexts) if (!owned.has(context)) fullStreams.push([stream, context]);
+    }
     // Phase B: a full check, stamped with the generation and notice number read before it.
     for (const live of full) {
       if (live.stopped) continue;

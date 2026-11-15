@@ -759,7 +759,8 @@ test("global POST admission remains bounded across distinct authenticated users"
   await (await connect()).listResources();
 });
 
-// Rebuilds OAuth and hosted MCP on a fake clock and captures the 1 s timer for explicit ticks.
+// Rebuilds OAuth and hosted MCP on a fake clock and captures the 1 s timers for explicit ticks: `tick` runs every one,
+// `tickStream` only the stream timer, which createHostedMcp starts last.
 async function clocked(limits?: McpLimits, streamRecheckMs?: number) {
   await hosted.close(); oauth.close();
   const time = { now: Date.now() };
@@ -772,7 +773,7 @@ async function clocked(limits?: McpLimits, streamRecheckMs?: number) {
   }) as typeof setInterval);
   try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => time.now, ...(limits ? { limits } : {}), ...(streamRecheckMs ? { streamRecheckMs } : {}) }); }
   finally { spy.mockRestore(); }
-  return { time, tick: () => { for (const tick of intervals) tick(); } };
+  return { time, tick: () => { for (const tick of intervals) tick(); }, tickStream: () => intervals.at(-1)!() };
 }
 
 for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases modern and legacy admission before replacements`, async () => {
@@ -1342,7 +1343,7 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
 // #899: the stream timer re-reads a live's hosted rows only when they could have changed. A listen checked once
 // (stamped), then each way it can end, within a tick of the write or deadline that ends it.
 async function stampedListen(recheckMs = 3_600_000) {
-  const { time, tick } = await clocked(undefined, recheckMs);
+  const { time, tick, tickStream } = await clocked(undefined, recheckMs);
   const grant = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
   token = grant.token;
   const client = await connect();
@@ -1351,7 +1352,7 @@ async function stampedListen(recheckMs = 3_600_000) {
   expect(hosted.activeListens).toBe(1);
   tick(); tick(); // the first stamps it; the second is a quiet one
   expect(hosted.activeListens).toBe(1);
-  return { time, tick, grant, listen };
+  return { time, tick, tickStream, grant, listen };
 }
 const aliceRoot = () => store.repo.hosted.all().find(r => !r.root_session_id && r.user_id === user.user_id)!;
 const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => void][] = [
@@ -1362,11 +1363,23 @@ const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => void][] =
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
   ["binding change", () => store.repo.hosted.atomic(() => { const r = aliceRoot(); store.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); })],
 ];
-for (const [what, end] of ends) test(`#899: a stamped listen ends within a tick of ${what}`, async () => {
-  const f = await stampedListen();
+// Only the stream timer ticks (the hosted sweep would end an expired session's row itself), and the backstop sits
+// past the access TTL, so the expiry case reaches phase A's auth check with a fresh stamp.
+for (const [what, end] of ends) test(`#899: a stamped listen ends within a stream tick of ${what}`, async () => {
+  const f = await stampedListen(OAUTH_TTL.access * 10);
   end(f);
-  f.tick();
-  await untilHosted(() => hosted.activeListens === 0);
+  f.tickStream();
+  expect(hosted.activeListens).toBe(0);
+  await f.listen.close();
+});
+
+test("#899: a failed generation read leaves every stream to phase B's full check, which closes a revoked one", async () => {
+  const f = await stampedListen();
+  store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, f.time.now);
+  const authGeneration = store.repo.authGeneration;
+  store.repo.authGeneration = () => { throw new Error("generation read failed"); };
+  try { f.tickStream(); } finally { store.repo.authGeneration = authGeneration; }
+  expect(hosted.activeListens).toBe(0);
   await f.listen.close();
 });
 
