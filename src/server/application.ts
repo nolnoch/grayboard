@@ -355,10 +355,10 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
     if (e instanceof CoreError) return { code: "not_found", error: e.message, address };
     throw e;
   }
-  if (scope.name === HUMAN_NAME) return { code: "forbidden", error: HUMAN_RESERVED, address };
   const t = { ...scope, scope_ref: scope.scope_ref! };
-  const req: AuthzRequest = { verb: "alias.bind", principal: userPrincipal(authed), scope: t };
+  const req: AuthzRequest = { verb: "alias.bind", principal: userPrincipal(authed), scope: t, name: scope.name };
   const d = authorize(repo, {}, req);
+  if (!d.allow && d.rule === "alias.human_reserved") return { code: "forbidden", error: HUMAN_RESERVED, address, authz: { req, d } };
   if (!d.allow) return { code: "forbidden", error: `you can't act as "${address}": ${d.reason}; bind a name in your own scope, or in a team's you belong to`, address, authz: { req, d } };
   return { address, scope: t };
 }

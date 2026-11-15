@@ -8,6 +8,7 @@ import { HOSTED_CLIENT, HOSTED_SCOPES, HostedToolError } from "../support/hosted
 import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { DENY_ROW_LIMIT } from "../../src/server/policy.ts";
+import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { withMeta } from "../helpers/hosted.ts";
@@ -167,5 +168,77 @@ describe("session acts", () => {
     await expect(call("whoami")).rejects.toThrow();
     const got = accessAudits(srv.app.db, "authz.decision");
     expect(got.map((x) => [x.actor, x.detail.verb, x.detail.allow, x.detail.address])).toEqual([[B, "alias.bind", false, "eng/build"]]);
+  });
+});
+
+// #851: the refusals that decided inline before the seam now go through it,
+// each with its response unchanged and one row.
+describe("pre-seam refusals", () => {
+  const claimAs = (token: string, as: string) => srv.api(token, "POST", "/api/claims/call", { as, tool: "claim_take", args: { key: "k" } });
+  const idOf = (email: string) => srv.app.db.query<{ id: string }, [string]>("SELECT id FROM ids WHERE principal = ? ORDER BY rowid DESC").get(email)!.id;
+
+  test("an HTTP `as` naming another user's, an unknown, a viewer's or an ended session ID is refused alike and leaves one row each", async () => {
+    const [a, b] = await Promise.all([srv.login(A), srv.login(B)]);
+    await srv.connected(a, "fe");
+    const theirs = idOf(A);
+    await srv.connected(b, "be");
+    const mine = idOf(B);
+    srv.app.db.run("UPDATE ids SET ended_at = 1000 WHERE id = ?", [mine]);
+    await srv.connected(b, "viewer");
+    const viewer = idOf(B);
+    srv.app.db.run("UPDATE ids SET viewer = 1 WHERE id = ?", [viewer]);
+    const unknown = "id:0000000000000";
+    const texts: string[] = [];
+    for (const id of [theirs, unknown, viewer, mine]) {
+      const r = await claimAs(b, id);
+      expect(r.status).toBe(403);
+      texts.push(r.body.message);
+    }
+    expect(texts).toEqual([`${theirs} isn't a session of yours`, `${unknown} isn't a session of yours`, `${viewer} isn't a session of yours`, `${mine} ended at ${new Date(1000).toISOString()}`]);
+    const got = accessAudits(srv.app.db, "authz.decision");
+    expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.code])).toEqual([
+      [B, theirs, "session.act", false, "session.other_user", "forbidden"],
+      [B, unknown, "session.act", false, "session.unknown", "forbidden"],
+      [B, viewer, "session.act", false, "session.viewer", "forbidden"],
+      [B, mine, "session.act", false, "session.ended", "forbidden"],
+    ]);
+    // The row never names whose the ID is.
+    expect(JSON.stringify(got[0].detail)).not.toContain(A);
+  });
+
+  test("an HTTP `as` naming `human`, or a scope no principal owns, is refused as before and leaves one row each", async () => {
+    const b = await srv.login(B);
+    const human = await claimAs(b, "human");
+    expect(human.status).toBe(403);
+    expect(human.body.message).toBe(`claims are for agents; "human" is your Slack link`);
+    const ownerless = await claimAs(b, "nosuch/build");
+    expect(ownerless.status).toBe(403);
+    expect(ownerless.body.message).toBe(`you can't act as "nosuch/build": no principal owns its scope`);
+    const got = accessAudits(srv.app.db, "authz.decision");
+    expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.address])).toEqual([
+      [B, `person:${B}`, "act_as", false, "alias.human_reserved", `${B}/human`],
+      [B, "nosuch/build", "act_as", false, "scope.ownerless", "nosuch/build"],
+    ]);
+  });
+
+  test("binding `human` is refused as before and leaves one row, after the hosted rollback", async () => {
+    await srv.login(B);
+    const s = await srv.hosted(B, null);
+    await expect(s.call("bind", { name: "human", create: true })).rejects.toMatchObject({ code: "forbidden", message: HUMAN_RESERVED });
+    const got = accessAudits(srv.app.db, "authz.decision");
+    expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.name])).toEqual([[B, `person:${B}`, "alias.bind", false, "alias.human_reserved", "human"]]);
+    expect(typeof got[0].detail.session).toBe("string");
+  });
+
+  test("leaving a team one isn't in reads as not found, for an admin too, and leaves one row each", async () => {
+    const [a, c, root] = await Promise.all([srv.login(A), srv.login(C), srv.login(ROOT)]);
+    expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(c, "POST", "/api/teams/eng/leave")).status).toBe(404);
+    expect((await srv.api(root, "POST", "/api/teams/eng/leave")).status).toBe(404);
+    expect(srv.app.repo.teams.isMember(srv.app.repo.teams.findByName("eng")!.id, srv.app.repo.users.findByEmail(A)!.id)).toBe(true);
+    expect(rows().filter((r) => r.verb === "team.leave")).toEqual([
+      { actor: C, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
+      { actor: ROOT, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
+    ]);
   });
 });
