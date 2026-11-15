@@ -455,12 +455,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}", scope="${(status === 401 ? OAUTH_SCOPES : requiredScopes).join(" ")}"${error ? `, error="${error}"` : ""}`,
   });
   // A live access token and its user's email, by hash. Both reads are cached in the Repo on
-  // authGeneration (#853), so the hot path skips the token-grant-user join.
+  // authGeneration (#853), so the hot path skips the token-grant-user join, and share one read of it (#881).
   function activeAccess(accessHash: string): { access: OAuthAccess; email: string } | undefined {
-    const access = repo.oauth.findActiveAccess(accessHash, resource, [], now());
-    if (!access) return undefined;
-    const email = repo.users.activeEmail(access.userId);
-    return email === undefined ? undefined : { access, email };
+    return repo.authRead(() => {
+      const access = repo.oauth.findActiveAccess(accessHash, resource, [], now());
+      if (!access) return undefined;
+      const email = repo.users.activeEmail(access.userId);
+      return email === undefined ? undefined : { access, email };
+    });
   }
   return {
     issuer, resource, resourceMetadata,
