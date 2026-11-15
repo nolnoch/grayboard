@@ -485,10 +485,23 @@ export function createHostedSessions(application: Application, options: { now?: 
     const rows: Array<() => void> = [];
     return {
       defer: (write: () => void) => { rows.push(write); },
+      // Inside a write body (`withGate`'s settle body, whose own savepoint rolled back).
       flush() {
         for (const write of rows.splice(0)) {
-          try { write(); } catch (failure) { refusalRowsLost++; hostedFailure("hosted.refusal_row", failure); }
+          try { store.atomic(write); } catch (failure) { refusalRowsLost++; hostedFailure("hosted.refusal_row", failure); }
         }
+      },
+      // After a rejected write: the rows go through the queue in a body of their own (#807).
+      async flushQueued() {
+        if (!rows.length) return;
+        const pending = rows.splice(0);
+        try {
+          await store.write(() => {
+            for (const write of pending) {
+              try { store.atomic(write); } catch (failure) { refusalRowsLost++; hostedFailure("hosted.refusal_row", failure); }
+            }
+          });
+        } catch (failure) { refusalRowsLost += pending.length; hostedFailure("hosted.refusal_row", failure); }
       },
     };
   }
@@ -675,7 +688,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             return value;
           });
         } catch (error) {
-          late.flush();
+          await late.flushQueued();
           throw error;
         } finally { application.close(selected.session); }
       };
@@ -697,7 +710,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           guard();
           return value;
         } catch (error) {
-          late.flush();
+          await late.flushQueued();
           throw error;
         } finally { application.close(selected.session); }
       });
@@ -714,7 +727,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         let done = false;
         try {
           return await store.write(() => fn(attach(p, row), late.defer), result => { done = true; return committed ? committed(result) : result as unknown as R; });
-        } catch (error) { if (!done) late.flush(); throw error; }
+        } catch (error) { if (!done) await late.flushQueued(); throw error; }
       });
     },
     async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T): Promise<T> {
@@ -862,7 +875,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
           return { message: "registered", child: childId, root: root.session_id };
-        }); } catch (e) { later.flush(); throw e; }
+        }); } catch (e) { await later.flushQueued(); throw e; }
       };
       return locked(0);
     },
@@ -881,7 +894,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           // The caller's own session outside this root, or a missing ID: not a policy question, so no row.
           if (!candidate || candidate.ownership_id !== row.ownership_id || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
           candidate.root_session_id ? store.childEnd(target, now(), "closed") : store.end(target, "closed", now());
-        }); } catch (e) { later.flush(); throw e; }
+        }); } catch (e) { await later.flushQueued(); throw e; }
         return { ended: true };
       }, false, false);
     },
