@@ -201,16 +201,27 @@ export class HostedSession {
   // The agent's bind tool. A bind closes any open lease (its bind_gen
   // changes); like a hosted client, the session then opens a new one.
   async bind(name: string, { create = this.opts.create ?? true }: { create?: boolean } = {}): Promise<unknown> {
-    this.lease = undefined;
-    this.subscriber.capability = undefined;
-    this.seen = new Set(this.buffer.map((item) => item.id));
+    this.dropLease();
     const result = await this.call("bind", { name, create });
+    await this.reopen();
+    return result;
+  }
+
+  // After a bind or unbind made outside bind() (a raw tool call) that leaves
+  // holds: the server closed the lease, and a hosted client opens a new one.
+  async reopen(): Promise<void> {
+    this.dropLease();
     if (this.opts.delivery ?? true) {
       const lease = leaseOf(await this.subscriber.call("delivery_open", this.opts.context === false ? { context: false } : {}));
       this.subscriber.capability = lease.capability;
       this.lease = { ...lease, ttl: lease.expiresAt - Date.now() };
     }
-    return result;
+  }
+
+  private dropLease(): void {
+    this.lease = undefined;
+    this.subscriber.capability = undefined;
+    this.seen = new Set(this.buffer.map((item) => item.id));
   }
 
   // session_end: ends this ownership, its lease and its name with it.
