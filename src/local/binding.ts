@@ -53,7 +53,7 @@ export type HarnessRule = "env" | "ancestor";
 export type Harness = { pid: number; proc_start: string | null; rule: HarnessRule };
 
 // One row per session, however many aliases it holds (#284 S7). The holds
-// are sorted in JS, holdsOf's order: an aggregate ORDER BY needs SQLite 3.44,
+// are sorted in JS, holdsOf's order (HOLD_ORDER): an aggregate ORDER BY needs SQLite 3.44,
 // newer than some macOS system libraries Bun links against. A child
 // session's row (#539) is a copy of its root's liveness kept for older
 // releases (registerChild), never a session here: it is left out.

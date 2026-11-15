@@ -1129,9 +1129,12 @@ function matches(m: PeerMatch, fields: PeerMatch): boolean {
   return Object.entries(m).every(([k, v]) => fields[k as keyof PeerMatch]?.toLowerCase() === v.toLowerCase());
 }
 
+/** The order of a session's holds, oldest first (#284 S1, #370): every list of holds and every primary pick uses it. */
+export const HOLD_ORDER = "ORDER BY bound_at, address";
+
 /** SQL for session `id`'s primary hold (#284 S1): its oldest, or NULL. `id` is an SQL expression. */
 export function primaryHoldSql(id: string): string {
-  return `(SELECT address FROM alias_holds WHERE id = ${id} ORDER BY bound_at, address LIMIT 1)`;
+  return `(SELECT address FROM alias_holds WHERE id = ${id} ${HOLD_ORDER} LIMIT 1)`;
 }
 
 // The session an alias's facts come from (#284 S13): its holder, or once

@@ -7,7 +7,7 @@ import { channelInstructions, COORDINATION_INSTRUCTIONS, boardTools } from "./to
 import { SESSION_ID, crockford13 } from "./session_id.ts";
 import { addressParts, type ScopeKind } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
-import { boardAddress, normalizeBoard, type BoardUse, type UnboundPeer } from "./boards.ts";
+import { HOLD_ORDER, boardAddress, normalizeBoard, type BoardUse, type UnboundPeer } from "./boards.ts";
 
 export type BindingEvent = "bound" | "moved" | "released" | "refused";
 
@@ -136,7 +136,7 @@ export function holderOf(db: Database, address: string): string | null {
 
 /** The aliases session `id` holds, oldest hold first. */
 export function holdsOf(db: Database, id: string): string[] {
-  return (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
+  return (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ${HOLD_ORDER}`).all(id) as { address: string }[]).map((r) => r.address);
 }
 
 /** Session `id`'s address set (#284 S1): the aliases it holds, oldest first, then its ID. */
