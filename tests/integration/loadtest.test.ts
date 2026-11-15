@@ -6,17 +6,22 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { capsEnv, options, parseMetrics, perUserRate, slope, tooSlow } from "../../scripts/loadtest.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
+import { DEFAULT_HOSTED_REQUEST_LIMIT } from "../../src/server/rate_limit.ts";
 import { runCli } from "../support/cli.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 
 describe("loadtest sizing", () => {
-  test("the full profile fits the default per-user request bucket; the quick one raises it", () => {
+  test("the full profile fits both default per-user request buckets; the quick one raises the subscriber one", () => {
     const full = options([]);
-    expect(perUserRate(full)).toBeLessThan(10);
+    expect(perUserRate(full).total).toBeLessThan(10);
     expect(capsEnv(full).GRAYBOARD_HOSTED_REQUEST_PER_SEC).toBeUndefined();
+    expect(capsEnv(full).GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC).toBeUndefined();
     const quick = options(["--quick"]);
-    expect(Number(capsEnv(quick).GRAYBOARD_HOSTED_REQUEST_PER_SEC)).toBeGreaterThanOrEqual(Math.ceil(perUserRate(quick) * 2));
+    expect(Number(capsEnv(quick).GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC)).toBeGreaterThanOrEqual(Math.ceil(perUserRate(quick).subscriber * 2));
+    // Tool calls alone stay inside their default bucket even in the quick profile.
+    expect(perUserRate(quick).tools * 2).toBeLessThanOrEqual(DEFAULT_HOSTED_REQUEST_LIMIT.perSec);
+    expect(capsEnv(quick).GRAYBOARD_HOSTED_REQUEST_PER_SEC).toBeUndefined();
     // The caps cover the fleet with headroom, never below the shipped floors.
     expect(Number(capsEnv(full).GRAYBOARD_DELIVERY_LEASES_GLOBAL)).toBe(1250);
     expect(Number(capsEnv(quick).GRAYBOARD_DELIVERY_LEASES_GLOBAL)).toBe(256);

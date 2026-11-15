@@ -6,7 +6,7 @@
 // hosted store's lease, not a connection's grace.
 import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
 import { DEFAULT_HOSTED_CAPS } from "./config.ts";
-import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, resolveDelegation, sameUser } from "../core/delegation.ts";
@@ -83,6 +83,8 @@ export type ApplicationOptions = {
   slackRunning?: () => boolean;
   helloLimit?: RateLimit;
   hostedRequestLimit?: RateLimit;
+  // Delivery upkeep (role=subscriber) has a bucket of its own (#845).
+  hostedSubscriberLimit?: RateLimit;
   // delegate's limits (#252): per user, and the open requests one launcher may hold.
   delegateLimit?: RateLimit;
   delegateOpenCap?: number;
@@ -444,16 +446,20 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       });
     },
   };
-  const hostedRequestLimiter = new RateLimiter(opts.hostedRequestLimit ?? DEFAULT_HOSTED_REQUEST_LIMIT, {
+  // One per-user bucket per role: tool calls (native) and delivery upkeep (subscriber), so one user's
+  // delivery fan-out can't throttle that user's tool calls (#845). Each keeps its own refusal streak.
+  const hostedLimiter = (bucket: "native" | "subscriber", limit: RateLimit) => new RateLimiter(limit, {
     start: (email, _ctx, retryAfterMs) => {
-      console.error(`[grayboard] rate-limiting hosted requests from ${email}`);
-      writeAudit(repo, "hosted.rate_limited", email, null, { retry_after_ms: retryAfterMs });
+      console.error(`[grayboard] rate-limiting hosted ${bucket} requests from ${email}`);
+      writeAudit(repo, "hosted.rate_limited", email, null, { bucket, retry_after_ms: retryAfterMs });
     },
     end: (email, refused) => {
-      console.error(`[grayboard] hosted requests from ${email} no longer rate-limited; ${refused} refused`);
-      writeAudit(repo, "hosted.rate_limit_ended", email, null, { refused });
+      console.error(`[grayboard] hosted ${bucket} requests from ${email} no longer rate-limited; ${refused} refused`);
+      writeAudit(repo, "hosted.rate_limit_ended", email, null, { bucket, refused });
     },
   }, opts.now);
+  const hostedRequestLimiter = hostedLimiter("native", opts.hostedRequestLimit ?? DEFAULT_HOSTED_REQUEST_LIMIT);
+  const hostedSubscriberLimiter = hostedLimiter("subscriber", opts.hostedSubscriberLimit ?? DEFAULT_HOSTED_SUBSCRIBER_LIMIT);
   type Observer = { session: ApplicationSession; board: string; hooks: BoardObserver };
   const observers = new Set<Observer>();
   function removeObserver(observer: Observer) {
@@ -523,8 +529,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
-  function admitHosted(authed: AuthedUser, sessionId: string | null) {
-    const t = hostedRequestLimiter.take(authed.user_email, { session_id: sessionId, read_only: true, place: null });
+  function admitHosted(authed: AuthedUser, sessionId: string | null, role: "native" | "subscriber") {
+    const t = (role === "subscriber" ? hostedSubscriberLimiter : hostedRequestLimiter).take(authed.user_email, { session_id: sessionId, read_only: true, place: null });
     if (!t.ok) fail("rate_limited", `too many connections for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
   }
 
@@ -1095,9 +1101,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       for (const id of users) application.disconnectUser(id);
       recheckAliases(null, null);
     },
-    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hub.delegateLimiter.sweep(); },
+    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hostedSubscriberLimiter.sweep(); hub.delegateLimiter.sweep(); },
     /** How many users have a bind or hosted-request bucket, for tests. */
-    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size, delegate: hub.delegateLimiter.size }),
+    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size, subscriber: hostedSubscriberLimiter.size, delegate: hub.delegateLimiter.size }),
     stopExpiry() {
       expiry.stop();
       unsubscribeEnds();

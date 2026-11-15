@@ -169,7 +169,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     catch (error) { return metaRefusal("delivery_declaration", error); }
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
     try {
-      if (admit) application.admitHosted(principal.authed, "id" in routing ? routing.id : null);
+      if (admit) application.admitHosted(principal.authed, "id" in routing ? routing.id : null, role);
       selected = await hosted.snapshot(principal, routing);
     } catch (error) {
       const exchange = exchanges.getStore();
