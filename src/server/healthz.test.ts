@@ -86,6 +86,40 @@ test("healthz fails only on sustained event-loop lag, keeps the version, and rec
   } finally { errors.mockRestore(); }
 });
 
+// #941: Bun's socket loop can run tens of seconds of requests before any timer, so the sampler finishes no window
+// while /healthz is still answered. The window age, read at request time, fails the gate on its own.
+test("a sampler that has finished no window for the gate's span fails healthz, whatever the windows hold, and recovers", async () => {
+  const gate = { p99Ms: 1000, windows: 3 };
+  const fast = { p50: 0.001, p99: 0.1, max: 0.2 };
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    // Just under three windows' time plus the jitter allowance: ok, even with no finished window yet.
+    expect(healthz(store.repo, 50_000, gate, [], { ageMs: 30_999, windowMs: 10_000 }).status).toBe(200);
+    // Past them with none finished: lagging, though the last windows were fast and too few.
+    const stalled = healthz(store.repo, 50_000, gate, [fast], { ageMs: 41_500, windowMs: 10_000 });
+    expect(stalled.status).toBe(503);
+    expect(await stalled.json()).toMatchObject({ ok: false, code: "lagging" });
+    expect(errors.mock.calls.some(c => String(c[0]).includes("no lag window finished for 41.5 s"))).toBe(true);
+    // A window finished: the age resets and the gate recovers, with one line for each change.
+    expect(healthz(store.repo, 50_000, gate, [fast, fast], { ageMs: 5, windowMs: 10_000 }).status).toBe(200);
+    expect(errors.mock.calls.filter(c => String(c[0]).includes("healthz:"))).toHaveLength(2);
+    expect(String(errors.mock.calls.at(-1)?.[0])).toContain("recovered");
+    // p99Ms 0 turns this rule off too.
+    expect(healthz(store.repo, 50_000, { p99Ms: 0, windows: 3 }, [], { ageMs: 120_000, windowMs: 10_000 }).status).toBe(200);
+  } finally { errors.mockRestore(); }
+});
+
+// The wiring, end to end: a loop that never yields to its timers fails healthz through the real sampler's age.
+test("a loop blocked past the gate's span fails healthz from the real sampler before any window lands", () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  const stop = startLagSampler(20);
+  try {
+    const end = performance.now() + 120;
+    while (performance.now() < end) { /* block the loop: no timer runs */ }
+    expect(healthz(store.repo, 60_000, { p99Ms: 5, windows: 3 }).status).toBe(503);
+  } finally { stop(); errors.mockRestore(); }
+});
+
 // The wiring: the real sampler feeds healthz's default window source, its ring is capped, and a stop clears it.
 test("a really blocked loop fails healthz through the sampler's windows; the ring is capped and cleared on stop", async () => {
   const errors = spyOn(console, "error").mockImplementation(() => {});
@@ -96,7 +130,8 @@ test("a really blocked loop fails healthz through the sampler's windows; the rin
     await until(() => {
       const end = performance.now() + 30;
       while (performance.now() < end) { /* block the loop */ }
-      return healthz(store.repo, 30_000, gate).status === 503;
+      // No sampler (null): the windows alone carry this verdict, not the age rule (#941).
+      return healthz(store.repo, 30_000, gate, lagWindows(), null).status === 503;
     }, 5_000, "three blocked windows never failed healthz");
     // The same history with the gate off passes.
     expect(healthz(store.repo, 30_000, { p99Ms: 0, windows: 3 }).status).toBe(200);
