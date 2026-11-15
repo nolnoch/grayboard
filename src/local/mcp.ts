@@ -12,7 +12,7 @@ import { boardNotification, dmNotification, fenceChannel, type Pending } from ".
 import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote, wrapperNote } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -57,7 +57,7 @@ import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.
 import { z } from "zod";
 import { hooksDisabledBy, recordHookInstalled } from "../shared/claude_settings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
-import { isAlive, launcherName, procStart } from "../shared/proc.ts";
+import { isAlive, procStart, wrapperName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { LateCancels } from "../shared/latecancel.ts";
@@ -435,8 +435,8 @@ if (WRITES_AS) {
     } else startNotes.push(heldNote(SUGGESTED!, r.holder ?? r.error));
   }
   if (!held.length && !KEYED) {
-    const launcher = launcherName(process.ppid);
-    if (launcher) startNotes.push(launcherNote(launcher));
+    const wrapper = wrapperName(process.ppid);
+    if (wrapper) startNotes.push(wrapperNote(wrapper));
   }
   writeNames();
 }
