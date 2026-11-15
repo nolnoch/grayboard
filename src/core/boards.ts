@@ -1479,6 +1479,20 @@ export function read(
 
 // ── delivery ─────────────────────────────────────────────────────────────────
 
+// pendingFor's digest read: one row per digest subscription of the handle with nothing sent since its last catch-up.
+// latest_id is read only when unread > 0, so a counted post above the cursor exists, and latest_id is the newest
+// post counted (own and pushed posts can be newer): the index walks back from the board's end and stops at the
+// first one (#900). Queue-kind boards are excluded: their posts deliver to exactly one subscriber, so they never
+// count as digest unread for the others. Exported so a test pins its plan (#904); all nine parameters are the handle.
+export const DIGEST_SQL = `SELECT s.board, s.cursor,
+              (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor
+                 AND ${NOT_OWN} AND ${NOT_PUSHED}) AS unread,
+              (SELECT p.id FROM posts p WHERE p.board = s.board AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED}
+                ORDER BY p.id DESC LIMIT 1) AS latest_id
+         FROM subscriptions s
+        WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor
+          AND s.board NOT IN (SELECT name FROM boards WHERE kind = 'queue')`;
+
 // Everything this handle should be told about now. Call markDelivered (or
 // acknowledge) for each item after it's handed to the agent (at-least-once).
 // Items for boards the handle can no longer see are dropped here.
@@ -1518,22 +1532,9 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   }
   if (!opts.all && !out.some((i) => i.kind === "push" && !i.deferred)) return [];
 
-  // Digest: unread exists and nothing has been sent since the last catch-up.
-  // latest_id is read only when unread > 0, so a qualifying post above the cursor exists and the newest
-  // one is the board's newest: the index walks back from the end and stops there (#900).
-  // Queue-kind boards are excluded: their posts deliver to exactly one
-  // subscriber, so they never count as digest unread for the others.
+  // Digest: unread exists and nothing has been sent since the last catch-up (DIGEST_SQL).
   const digests = db
-    .prepare(
-      `SELECT s.board, s.cursor,
-              (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor
-                 AND ${NOT_OWN} AND ${NOT_PUSHED}) AS unread,
-              (SELECT p.id FROM posts p WHERE p.board = s.board AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED}
-                ORDER BY p.id DESC LIMIT 1) AS latest_id
-         FROM subscriptions s
-        WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor
-          AND s.board NOT IN (SELECT name FROM boards WHERE kind = 'queue')`,
-    )
+    .prepare(DIGEST_SQL)
     .all(handle, handle, handle, handle, handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
   for (const d of digests) {
     if (d.unread > 0 && d.latest_id !== null && visible(d.board)) {
