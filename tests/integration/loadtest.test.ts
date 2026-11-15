@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { capsEnv, options, parseMetrics, perUserRate, slope } from "../../scripts/loadtest.ts";
+import { capsEnv, options, parseMetrics, perUserRate, slope, tooSlow } from "../../scripts/loadtest.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
 import { runCli } from "../support/cli.ts";
 
@@ -42,6 +42,19 @@ describe("loadtest sizing", () => {
     expect(slope([[0, 50], [10, 30], [20, 10]])).toBeCloseTo(-2);
     expect(slope([[0, 7], [60, 7]])).toBe(0);
     expect(slope([[5, 1]])).toBe(0);
+  });
+
+  test("the pooled latency gate allows 1% slow calls rounded up, so a small pool tolerates one", () => {
+    expect(tooSlow(80, 79)).toBe(false);
+    expect(tooSlow(80, 78)).toBe(true);
+    expect(tooSlow(1000, 990)).toBe(false);
+    expect(tooSlow(1000, 989)).toBe(true);
+    expect(tooSlow(1050, 1039)).toBe(false);
+    expect(tooSlow(1050, 1038)).toBe(true);
+    // A fraction under .5: ceil, not round (1040 allows 11, round would allow 10).
+    expect(tooSlow(1040, 1029)).toBe(false);
+    expect(tooSlow(1040, 1028)).toBe(true);
+    expect(tooSlow(0, 0)).toBe(false);
   });
 
   test("--env overrides parse, and a malformed one is refused", () => {
