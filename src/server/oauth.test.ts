@@ -1075,3 +1075,31 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     expect(refused(e.bearer)).toBe(true); // isAuthorized checks the principal's expiry first; authenticate reaches the entry's
   } finally { query.mockRestore(); }
 });
+
+test("#881: one authorization reads the auth generation once, and a write between two still ends the second", async () => {
+  const { Database } = await import("bun:sqlite");
+  // The generation's statements are prepared once, when the database opens: open one under a spy that counts runs.
+  let reads = 0;
+  const query = Database.prototype.query;
+  const spy = spyOn(Database.prototype, "query").mockImplementation(function (this: InstanceType<typeof Database>, sql: string) {
+    const statement = query.call(this, sql);
+    if (sql === "PRAGMA data_version") { const get = statement.get.bind(statement); statement.get = (...args: never[]) => { reads++; return get(...args); }; }
+    return statement;
+  } as typeof query);
+  const counted = (() => { try { return openDatabase(config.dbPath, { blobDir: config.blobDir }); } finally { spy.mockRestore(); } })();
+  const saved = storage;
+  storage = counted;
+  const counting = makeService();
+  storage = saved;
+  try {
+    const { token } = issueOAuth(counted.repo, counting.resource, "generation@example.com", ["grayboard:tools"], clock, "native");
+    const p = counting.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+    if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
+    expect(counting.isAuthorized(p)).toBe(true);
+    reads = 0;
+    expect(counting.isAuthorized(p)).toBe(true);
+    expect(reads).toBe(1); // the token read and the user read share it; before #881, two
+    counted.repo.users.setDisabled(p.authed.user_id, true);
+    expect(counting.isAuthorized(p)).toBe(false);
+  } finally { counting.close(); counted.db.close(); }
+});

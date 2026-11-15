@@ -260,9 +260,11 @@ export function createHostedSessions(application: Application, options: { now?: 
     later(() => recordDecision(repo, { user: p.authed.user_email, session: from }, req, d));
     throw new ApplicationError(d.code, d.reason);
   }
-  function rowFor(p: OAuthPrincipal, context: SessionContext, later: (write: () => void) => void, create = true, wake = true, declare = true): HostedSession | undefined {
+  // `settled`: the row settle read in the transaction before this one and left unwritten (#881), so it isn't read
+  // twice; with none, it's read here.
+  function rowFor(p: OAuthPrincipal, context: SessionContext, later: (write: () => void) => void, create = true, wake = true, declare = true, settled?: { row: HostedSession | undefined }): HostedSession | undefined {
     if (!("id" in context)) return undefined;
-    let row = store.get(context.id);
+    let row = settled ? settled.row : store.get(context.id);
     if (row) ownRow(p, row, later);
     if (row && row.parked_at !== null && wake) row = unpark(p, row);
     if (!row && create) {
@@ -396,25 +398,33 @@ export function createHostedSessions(application: Application, options: { now?: 
     }
   }
   // The sweep's rules for one request's own rows (#399): its root (disabled, lease lapsed, idle with no hold and
-  // no lease) and, for a child, itself (idle: parked, its request waking it again).
-  function settle(id: string) {
-    if (stopped) return;
-    store.atomic(() => {
+  // no lease) and, for a child, itself (idle: parked, its request waking it again). `authed`: the user whose
+  // authorization the caller checked with no await since (#881); their root skips the disabled read, which a
+  // transaction takes uncached, since a disabled user no longer authorizes (activeAccess refuses one) and
+  // setDisabled ends their rows in the transaction that disables them. Returns the row as read when it wrote nothing, for the caller's next transaction (#881);
+  // undefined when it wrote, so the caller reads again.
+  function settle(id: string, authed?: number): { row: HostedSession | undefined } | undefined {
+    if (stopped) return undefined;
+    return store.atomic(() => {
       const row = store.get(id);
-      if (!row) return;
+      if (!row) return { row };
       const root = row.root_session_id ? store.get(row.root_session_id) : row;
+      let ended = false;
       if (root && !root.root_session_id) {
         const t = now();
-        if (repo.users.isDisabled(root.user_id)) store.end(root.session_id, "disabled", t);
-        else if (root.lease_deadline !== null && root.lease_deadline <= t) store.end(root.session_id, "expired", t, root.lease_deadline);
-        else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(root.session_id).length) store.end(root.session_id, "idle", t);
+        if (root.user_id !== authed && repo.users.isDisabled(root.user_id)) { store.end(root.session_id, "disabled", t); ended = true; }
+        else if (root.lease_deadline !== null && root.lease_deadline <= t) { store.end(root.session_id, "expired", t, root.lease_deadline); ended = true; }
+        else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(root.session_id).length) { store.end(root.session_id, "idle", t); ended = true; }
       }
-      const child = row.root_session_id ? store.get(row.session_id) : undefined;
+      // A root's end may have ended this child with it.
+      const child = !row.root_session_id ? undefined : ended ? store.get(row.session_id) : row;
       if (child && child.parked_at === null && idleAt(child)) {
         const parkedUnder = new Set<string>();
         park(child, parkedUnder);
         evictParked(parkedUnder);
+        return undefined;
       }
+      return ended ? undefined : { row };
     });
   }
   // The lease and idle clocks stop while the server is down (#423). A root
@@ -476,9 +486,10 @@ export function createHostedSessions(application: Application, options: { now?: 
       const id = before?.root_session_id ?? context.id;
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
         authorized(p);
-        settle(context.id);
+        // authorized(p) just passed, with no await since: settle skips p's own disabled read (#881).
+        const settled = settle(context.id, p.authed.user_id);
         const later = refusalRows();
-        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later.defer, true, wake, declare)!; touch(r); return r; }); } catch (e) { later.flush(); throw e; } })();
+        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later.defer, true, wake, declare, settled)!; touch(r); return r; }); } catch (e) { later.flush(); throw e; } })();
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         const ids = [...new Set([row.session_id, id])];
         for (const s of ids) inflight.set(s, (inflight.get(s) ?? 0) + 1);
