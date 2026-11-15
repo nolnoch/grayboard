@@ -9,6 +9,7 @@ import { DEFAULT_HOSTED_CAPS } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
+import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, resolveDelegation, sameUser } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
@@ -88,6 +89,8 @@ export type ApplicationOptions = {
   // delegate's limits (#252): per user, and the open requests one launcher may hold.
   delegateLimit?: RateLimit;
   delegateOpenCap?: number;
+  // Names per scope (#347, alias_cap.ts).
+  aliasScopeCap?: number;
   // Board observers server-wide: hosted resource watches are observers, so it is their global cap (#805).
   observerCap?: number;
   // The hub's clock: the rate limiters' and the write-dedup window's
@@ -206,6 +209,7 @@ type Hub = {
   delegateLimiter: RateLimiter;
   delegateRows: (() => void)[] | undefined;
   delegateOpenCap: number;
+  aliasScopeCap: number;
   now: () => number;
   boardChanged: (board: string) => void;
 };
@@ -438,6 +442,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }, opts.now, 10_000),
     delegateRows: undefined,
     delegateOpenCap: opts.delegateOpenCap ?? DELEGATE_OPEN_CAP,
+    aliasScopeCap: opts.aliasScopeCap ?? ALIAS_SCOPE_CAP,
     boardChanged(board) {
       afterCommit(db, () => {
         for (const observer of [...observers]) {
@@ -741,6 +746,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const why = tooManyHolds(session.holds);
       return refuse("bad_request", why, why);
     }
+    // A new name past its scope's cap (#347); checked here, not in the
+    // transaction below, so the refused binding event stays.
+    const capped = repo.aliases.find(address) ? null : aliasCapRefusal(repo, target.scope, hub.aliasScopeCap);
+    if (capped) return refuse("bad_request", capped, capped);
 
     repo.atomic(() => {
       createLazily(hub, authed, target, id);
@@ -900,7 +909,14 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         note(target.address, why);
         return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
-      if (create) createLazily(hub, authed, target, id);
+      if (create) {
+        const capped = repo.aliases.find(target.address) ? null : aliasCapRefusal(repo, target.scope, hub.aliasScopeCap);
+        if (capped) {
+          note(target.address, capped);
+          return fail("bad_request", capped);
+        }
+        createLazily(hub, authed, target, id);
+      }
       return target.address;
     },
     // The address a bind of `alias` would take, or undefined when bind will refuse it

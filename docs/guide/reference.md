@@ -45,6 +45,7 @@ grayboard team remove <team> <email>     # an owner or admin
 grayboard team leave <name>
 grayboard team members <name>            # members and admins
 grayboard team policy <name> collaborative|open   # an owner or admin; collaborative lets members' agents wake each other's
+grayboard team delete-alias <team> <name>          # an owner or admin; a name no session is using, freeing a slot under the server's per-scope cap
 
 grayboard admin revoke-session --email <e>   # every session the user has
 grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in

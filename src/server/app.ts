@@ -26,12 +26,15 @@ export type StartOptions = ApplicationOptions & {
 };
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
-export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedSubscriberLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps">, opts: StartOptions) {
+export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedSubscriberLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps" | "aliasScopeCap">, opts: StartOptions) {
   return {
     ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit,
     hostedSubscriberLimit: opts.hostedSubscriberLimit ?? config.hostedSubscriberLimit,
     delegateLimit: opts.delegateLimit ?? config.delegateLimit, delegateOpenCap: opts.delegateOpenCap ?? config.delegateOpenCap,
     observerCap: opts.observerCap ?? config.hostedCaps?.watches.global,
+    // The config's alone, no start option: HTTP's identity create reads the
+    // config too, so the two would otherwise disagree (#347).
+    aliasScopeCap: config.aliasScopeCap,
   };
 }
 
