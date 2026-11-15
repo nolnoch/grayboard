@@ -30,6 +30,8 @@ test("shutdown refuses a new call id_ended and a gate-queued call superseded", a
   // reaches the gate without yielding, so the ping's answer says it waits there.
   const queued = refusalCoded(s, "whoami");
   await s.c.ping();
+  // The socket whose removal below marks shutdown's start.
+  expect(existsSync(join(dir, "sock.alpha"))).toBe(true);
   const [child] = processDescendants(s.harnessPid);
   process.kill(child!.pid, "SIGTERM");
   // Shutdown removes the name sockets right after it marks the session ending.
