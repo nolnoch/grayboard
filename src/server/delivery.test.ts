@@ -346,6 +346,38 @@ test("one lease admits more than 1000 deliveries with bounded idempotent receipt
   expect(delivery.activeLeaseCount).toBe(1);
 });
 
+// The receipt history covers a lost receipt's retry: hosted-core re-sends at most its 100 admitted
+// keys (ADMITTED_LIMIT), so 200 per lease covers it twice over (#805).
+test("receipt history keeps the last 200 acknowledged ids per lease", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  for (let i = 0; i < 300; i++) await send(`message ${i}`);
+  const acked: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const batch = await delivery.pending(bob, context(bob), lease.capability);
+    await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
+    acked.push(...batch.map(item => item.id));
+  }
+  await delivery.receipt(bob, context(bob), lease.capability, acked.slice(100, 200));
+  await expect(delivery.receipt(bob, context(bob), lease.capability, [acked[99]!])).rejects.toHaveProperty("code", "not_found");
+});
+
+// A lease's receipt history held a clone of every acknowledged item, bodies included: 1000 leases
+// grew the heap by hundreds of MB an hour under the load test (#805).
+test("acknowledged items' bodies aren't retained by the receipt history", async () => {
+  const { fullGC, heapStats } = await import("bun:jsc");
+  const lease = await delivery.open(bob, context(bob));
+  for (let i = 0; i < 100; i++) await send(`${i} `.padEnd(32_000, "x"));
+  fullGC();
+  const before = heapStats().heapSize;
+  const batch = await delivery.pending(bob, context(bob), lease.capability);
+  expect(batch).toHaveLength(100);
+  await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
+  batch.length = 0;
+  fullGC();
+  // 100 bodies of 32 KB are 3.2 MB (6.4 MB as UTF-16); the history may keep ids and stamps only.
+  expect(heapStats().heapSize - before).toBeLessThan(1_000_000);
+});
+
 test("renew completes while a transfer holds the reader gate past the original deadline", async () => {
   const lease = await delivery.open(bob, context(bob));
   let entered!: () => void, release!: () => void;
