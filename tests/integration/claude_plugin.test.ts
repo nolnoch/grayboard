@@ -485,8 +485,9 @@ test("a prompt left unanswered (#497, #500): every signed-out call shows the use
   expect(s.c.getInstructions()).not.toContain(s.elicits[0]!.url);
   expect(await browse(srv.issuer, s.elicits[0]!.url, "Claude Code")).toContain("Signed in to grayboard");
   await signedIn(s);
-  // A finished flow's link is gone: no later call shows it.
-  expect(linkFile(s)).toBe(false);
+  // A finished flow's link is gone: no later call shows it. The grant is in
+  // the store before the flow's end removes its link, so a call can succeed first (#876).
+  await until(() => !linkFile(s), 5_000, "the ended flow's link removed");
   expect(shown(s)).toBeUndefined();
   await until(() => s.completed.length === 1, 10_000, "the elicitation's completion notice");
   // Completed, then its request withdrawn: Claude Code keeps no pending prompt (#501).
