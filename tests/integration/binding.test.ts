@@ -415,6 +415,27 @@ test("9: a DM sent mid-unbind is queued for the name's next holder, never consum
   await until(() => contents(third).includes("mid-unbind"));
 }, 30_000);
 
+// #148 18: a call touches last_seen at most once per 30 s per address, so a
+// read-only call soon after another writes nothing and another process's held
+// write lock (past the 5 s busy timeout) doesn't stall or fail it.
+test("read-only calls soon after another take no write lock, so a held lock doesn't stall them", async () => {
+  const s = await session("fe");
+  await s.call("claim_list", {});
+  const seen = () => rows<{ a: number; i: number }>(`SELECT (SELECT last_seen FROM aliases WHERE address = 'fe') AS a, (SELECT MAX(last_seen) FROM ids) AS i`)[0]!;
+  const before = seen();
+  const lock = new Database(join(dir, "bus.db"));
+  lock.exec("BEGIN IMMEDIATE");
+  try {
+    await s.call("claim_list", {});
+    await s.call("peer_list", {});
+    await s.call("board_list", {});
+  } finally {
+    lock.exec("ROLLBACK");
+    lock.close();
+  }
+  expect(seen()).toEqual(before);
+}, 30_000);
+
 // #374 (the #284 PR 4 audit's A4 fix): an unbind whose release transaction
 // fails leaves the hold, so the session answers on the name's socket again;
 // a DM sent after is delivered now, and a retried unbind releases it.
