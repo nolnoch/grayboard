@@ -924,12 +924,12 @@ test("a refused-refresh flood across addresses leaves the global bucket and ever
   expect(scopes()).toContain("token_address");
   expect(scopes()).not.toContain("global");
   // The org-wide bound that's left is on the refusal rows: at most the burst,
-  // even past the address limiter's 1000-key cap, where addresses go uncharged.
-  for (let a = 0; a < 1100; a++) expect(await refresh(`spread-${a}`, random())).toBe(400);
+  // even past the address limiter's 10,000-key cap, where addresses go uncharged.
+  for (let a = 0; a < 10_100; a++) expect(await refresh(`spread-${a}`, random())).toBe(400);
   const rows = (action: string) => storage.db.query(`SELECT 1 FROM access_log WHERE action = '${action}'`).all().length;
   expect(rows("oauth.request_refused")).toBe(5);
   // Past the cap a new address is neither charged nor refused.
-  for (let i = 0; i < 70; i++) expect(await refresh("spread-1099", random())).toBe(400);
+  for (let i = 0; i < 70; i++) expect(await refresh("spread-10099", random())).toBe(400);
   // An unlisted client's two rows share one decision, made after every await:
   // a concurrent batch writes at most the refilled burst of each.
   clock += 10_000_000;
@@ -946,6 +946,34 @@ test("a refused-refresh flood across addresses leaves the global bucket and ever
   expect((await service.fetch(new Request(base + "/oauth/unknown"), { key: "browse-x" }))!.status).toBe(429);
   expect(scopes()).toContain("global");
   expect(await refresh("office", second.refresh_token)).toBe(200);
+});
+
+// #274: an IPv6 caller's /48 is a second bucket beside its /64, SITE_LIMIT_FACTOR
+// times the size, so a prefix rotating its /64s can't outrun the address
+// limit or fill the key cap; IPv4 (site null) keys by address alone.
+test("OAuth address buckets have a /48 sibling: rotating /64s drain it, other /48s and IPv4 are untouched", async () => {
+  const tokens = await redeem(await issue());
+  service.close(); config.oauthGlobalLimit = { burst: 1000, perSec: 0.001 }; config.oauthLimit = { burst: 2, perSec: 0.001 };
+  service = makeService();
+  const browse = (key: string, site: string | null) => service.fetch(new Request(base + "/oauth/unknown"), { key, site }).then(r => r!.status);
+  // The /48 holds 2 x 4 = 8: four /64s spend it, the fifth is refused.
+  for (let n = 0; n < 4; n++) for (let i = 0; i < 2; i++) expect(await browse(`2001:db8:1:${n}::/64`, "2001:db8:1::/48")).toBe(405);
+  expect(await browse("2001:db8:1:9::/64", "2001:db8:1::/48")).toBe(429);
+  expect(await browse("2001:db8:2:9::/64", "2001:db8:2::/48")).toBe(405);
+  expect(await browse("192.0.2.1", null)).toBe(405);
+  const limited = () => storage.db.query<{ target: string; detail: string }, []>("SELECT target, detail FROM access_log WHERE action = 'oauth.rate_limited'").all().map(r => [r.target, JSON.parse(r.detail).scope]);
+  expect(limited()).toEqual([["2001:db8:1::/48", "site"]]);
+  // A /64 refused by its own bucket doesn't spend its /48.
+  for (let i = 0; i < 2; i++) expect(await browse("2001:db8:3:0::/64", "2001:db8:3::/48")).toBe(405);
+  for (let i = 0; i < 20; i++) expect(await browse("2001:db8:3:0::/64", "2001:db8:3::/48")).toBe(429);
+  for (let n = 1; n < 4; n++) for (let i = 0; i < 2; i++) expect(await browse(`2001:db8:3:${n}::/64`, "2001:db8:3::/48")).toBe(405);
+  // Token posts: only refused grants spend, the token buckets and their own /48.
+  const refresh = (key: string, site: string, token: string) => service.fetch(new Request(base + "/oauth/token", { method: "POST",
+    body: new URLSearchParams({ grant_type: "refresh_token", client_id: "native", refresh_token: token, resource: service.resource }) }), { key, site }).then(r => r!.status);
+  for (let n = 0; n < 4; n++) for (let i = 0; i < 2; i++) expect(await refresh(`2001:db8:1:${n}::/64`, "2001:db8:1::/48", random())).toBe(400);
+  expect(await refresh("2001:db8:1:9::/64", "2001:db8:1::/48", random())).toBe(429);
+  expect(limited().map(([, scope]) => scope)).toContain("token_site");
+  expect(await refresh("2001:db8:2:9::/64", "2001:db8:2::/48", tokens.refresh_token)).toBe(200);
 });
 
 // A page on another site can make every visitor's browser GET the browser

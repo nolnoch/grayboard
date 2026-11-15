@@ -91,7 +91,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     const limited = authGate.refuse(caller, path);
     if (limited) return limited;
 
-    const response = await oauth.fetch(req, { key: caller.key });
+    const response = await oauth.fetch(req, { key: caller.key, site: caller.site });
     if (response) return response;
     // The OAuth byte routes charge a refused bearer as /mcp does (#401).
     // The AS routes above authenticate clients by secret, not bearer, and
