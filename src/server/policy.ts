@@ -25,12 +25,15 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // alias.bind / act_as / scope.act: principal p acting in a scope, for a bind
 // or writes_as, an HTTP `as`, and visibility or the alias sweep; team.read /
 // team.manage: a user reading or changing a team's membership; admin: an
-// admin route.
+// admin route; msg.wake: whether a delivery written by one signed-in user
+// wakes a session of another (users by email: the writer recorded at write
+// time and the receiving session's user, never an address's spelling, F-01).
 export type AuthzRequest =
   | { verb: "msg.send" | "human.reach"; from: string; to: string }
   | { verb: "alias.bind" | "act_as" | "scope.act"; principal: Principal; scope: ActScope }
   | { verb: "team.read" | "team.manage"; user: { id: number; email: string }; team: Team | undefined }
-  | { verb: "admin"; email: string };
+  | { verb: "admin"; email: string }
+  | { verb: "msg.wake"; from_user: string; to_user: string };
 
 export type Decision =
   | { allow: true; rule: string }
@@ -70,6 +73,8 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       if (isAdmin(ctx, user.email)) return allow("admin.env");
       return deny("team.owner", `only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`);
     }
+    case "msg.wake":
+      return wakeRule(repo, req.from_user, req.to_user);
     case "admin": {
       if (isAdmin(ctx, req.email)) return allow("admin.env");
       const admins = ctx.admins ?? [];
@@ -93,6 +98,8 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
       return { target: req.team ? `team:${req.team.name}` : null, detail: { team: req.team?.name ?? null } };
     case "admin":
       return { target: null, detail: {} };
+    case "msg.wake":
+      return { target: req.to_user, detail: { from_user: req.from_user, to_user: req.to_user } };
   }
 }
 
@@ -158,6 +165,19 @@ function actIn(repo: Repo, p: Principal, scope: ActScope): Decision {
   return userId != null && team && repo.teams.isMember(team.id, userId)
     ? allow("scope.team_member")
     : deny("scope.team_member", `${p.name} isn't a member of team ${ref}`);
+}
+
+// Whether what one user's session wrote may wake another user's session
+// (security audit F-03, #103; vision.md principle 9). Sending stays open
+// (msg.send); without this grant the item is delivered as mail that doesn't
+// wake. A user's own agents wake each other; across users, only members of a
+// shared 'collaborative' team do. No admin exemption: admin is a server role,
+// not a messaging grant. One indexed lookup per decision (principle 11).
+function wakeRule(repo: Repo, fromUser: string, toUser: string): Decision {
+  if (fromUser === toUser) return allow("wake.same_user");
+  const a = repo.users.findByEmail(fromUser), b = repo.users.findByEmail(toUser);
+  if (a && b && repo.teams.shareCollaborative(a.id, b.id)) return allow("wake.team_policy");
+  return deny("wake.cross_user", `${fromUser} shares no collaborative team with ${toUser}; delivered as mail that doesn't wake their agent`);
 }
 
 // Whether the address `from` may wake `to` when `to` is a human

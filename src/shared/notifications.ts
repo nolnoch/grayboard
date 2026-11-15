@@ -21,13 +21,16 @@ export type Post = {
   // On a server's delivery to a session of another signed-in user than the
   // writer's (security audit F-10); absent otherwise and on reads.
   other_user?: true;
+  // On such a delivery when no grant lets the writer wake this session
+  // (security audit F-03, #806): shown, never a wake.
+  ungranted?: true;
 };
 
 export type Pending =
   | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true }
   | { kind: "digest"; board: string; unread: number; latest: Post };
 
-export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[]; other_user?: true };
+export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[]; other_user?: true; ungranted?: true };
 
 /**
  * A body made safe as `<channel>` content (#433, security audit F-07): the `<` of any
@@ -69,6 +72,7 @@ export function dmNotification(msg: DirectNotice, primary?: string): { content: 
   if (msg.parent_id !== null) meta.parent_id = String(msg.parent_id);
   if (msg.kind) meta.kind = msg.kind;
   if (msg.other_user) meta.other_user = "true";
+  if (msg.ungranted) meta.ungranted = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
@@ -87,6 +91,7 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
     if (p.via) meta.via = p.via;
     if (p.parent_id !== null) meta.parent_id = String(p.parent_id);
     if (p.other_user) meta.other_user = "true";
+    if (p.ungranted) meta.ungranted = "true";
     addFiles(meta, p.attachments);
     if (item.deferred) meta.deferred = "true";
     return { content: p.body, meta };

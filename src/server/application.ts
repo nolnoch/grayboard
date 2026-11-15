@@ -53,8 +53,9 @@ export class ApplicationError extends Error {
 export type DirectMessage = ReturnType<typeof showMessage<MessageRow>>;
 export type HistoryMessage = DirectMessage & { delivered?: boolean };
 export type DeliveryEvent =
-  // other_user: set only by pending(), a hosted lease's pull (security audit F-10).
-  | { kind: "direct"; message: DirectMessage & { other_user?: true } }
+  // other_user, ungranted: set only by pending(), a hosted lease's pull
+  // (security audit F-10, F-03).
+  | { kind: "direct"; message: DirectMessage & { other_user?: true; ungranted?: true } }
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
@@ -981,11 +982,25 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       // other_user, by the user recorded at write time, never the address's
       // spelling (a team alias or an ID names no user). The user isn't shown.
       const writers = repo.messages.writerUsers(messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
-      const other = (user: string | undefined) => user !== undefined && user !== session.authed.user_email;
-      const markPost = <P extends { id: number }>(post: P): P => other(writers.posts.get(post.id)) ? { ...post, other_user: true } : post;
+      const me = session.authed.user_email;
+      const other = (user: string | undefined) => user !== undefined && user !== me;
+      // Security audit F-03 (#103): another user's item wakes this session
+      // only under a grant (msg.wake, policy.ts); otherwise it is delivered
+      // marked ungranted and not actionable, so the host shows it without
+      // starting a turn. Decided per pull, so a revoked grant stops the next
+      // wake (vision.md principle 11); one decision per writer per pull.
+      const granted = new Map<string, boolean>();
+      const wakes = (user: string) => granted.get(user) ?? (granted.set(user, authorize(repo, {}, { verb: "msg.wake", from_user: user, to_user: me }).allow), granted.get(user)!);
+      const mark = <P extends { id: number }>(post: P, push: boolean, user: string | undefined): P =>
+        !other(user) ? post : { ...post, other_user: true, ...(push && !wakes(user!) ? { ungranted: true } : {}) };
       return [
-        ...messages.map((m): DeliveryEvent => ({ kind: "direct", message: other(writers.messages.get(m.id)) ? { ...showMessage(m), other_user: true } : showMessage(m) })),
-        ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push" ? { ...item, post: markPost(item.post) } : { ...item, latest: markPost(item.latest) } })),
+        ...messages.map((m): DeliveryEvent => {
+          const user = writers.messages.get(m.id);
+          return { kind: "direct", message: other(user) ? { ...showMessage(m), other_user: true, ...(wakes(user!) ? {} : { ungranted: true as const }) } : showMessage(m) };
+        }),
+        ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push"
+          ? { ...item, post: mark(item.post, true, writers.posts.get(item.post.id)) }
+          : { ...item, latest: mark(item.latest, false, writers.posts.get(item.latest.id)) } })),
       ];
     },
     boardCatalog(session: ApplicationSession, after?: string) {

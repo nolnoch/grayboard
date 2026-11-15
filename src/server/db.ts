@@ -44,6 +44,11 @@ export type Alias = { id: number; address: string; scope_kind: ScopeKind; scope_
 export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; user_id: number | null; team_id: number | null; parent_id: number | null; created_at: number };
 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
+// A team's wake policy (#806): 'open' (the default) isolates members' agents
+// from each other's wakes, as from anyone's; 'collaborative' grants members'
+// agents a wake across users (vision.md principle 9).
+export type TeamPolicy = "open" | "collaborative";
+export const TEAM_POLICIES: readonly TeamPolicy[] = ["open", "collaborative"];
 // attachments: present on reads when the message carries files.
 // delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
 // via: the child session (a harness subagent, #523) that wrote it under its root's addresses; null for a root's own write.
@@ -144,6 +149,11 @@ export interface Repo {
     listMembers(teamId: number): { user_id: number; email: string; role: TeamRole }[];
     listMemberUserIds(teamId: number): number[];
     isMember(teamId: number, userId: number): boolean;
+    // The previous policy, or null when the team is gone.
+    setPolicy(teamId: number, policy: TeamPolicy): TeamPolicy | null;
+    // Whether two users share a team whose policy is 'collaborative': the
+    // grant under which one's agents may wake the other's (#806).
+    shareCollaborative(userA: number, userB: number): boolean;
   };
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
@@ -434,6 +444,9 @@ function initSchema(db: Database): void {
       joined_at INTEGER NOT NULL,
       PRIMARY KEY (team_id, user_id)
     );
+    -- A user's teams, and whether two users share a collaborative one (the
+    -- msg.wake grant, #806), are indexed lookups (vision.md principle 11).
+    CREATE INDEX IF NOT EXISTS team_members_user ON team_members(user_id);
 
     CREATE TABLE IF NOT EXISTS messages (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -888,6 +901,22 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return !!db.query<{ x: number }, [number, number]>(
           "SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?",
         ).get(teamId, userId);
+      },
+      setPolicy(teamId, policy) {
+        return db.transaction(() => {
+          const row = db.query<{ policy: string }, [number]>("SELECT policy FROM teams WHERE id = ?").get(teamId);
+          if (!row) return null;
+          db.run("UPDATE teams SET policy = ? WHERE id = ?", [policy, teamId]);
+          return row.policy === "collaborative" ? "collaborative" : "open";
+        })();
+      },
+      shareCollaborative(userA, userB) {
+        return !!db.query<{ x: number }, [number, number]>(
+          `SELECT 1 AS x FROM team_members a
+           JOIN team_members b ON b.team_id = a.team_id AND b.user_id = ?
+           JOIN teams t ON t.id = a.team_id AND t.policy = 'collaborative'
+           WHERE a.user_id = ? LIMIT 1`,
+        ).get(userB, userA);
       },
     },
 
