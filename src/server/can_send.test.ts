@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canSend, canAdmin, reachesHuman, type SendTarget, type SendContext } from "./can_send.ts";
+import { canSend, canAdmin, reachesHuman, type SendTarget, type SendContext } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
 
 const FROM = "wade@example.com/fe";

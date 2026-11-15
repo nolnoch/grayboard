@@ -18,7 +18,7 @@ import {
 import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
-import { canSend, type HumanReach } from "./can_send.ts";
+import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
@@ -37,7 +37,7 @@ import type { AttachmentLimits } from "../shared/attachments.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
-import { mayActIn, principalCanSee } from "./access.ts";
+import { principalCanSee } from "./access.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import { afterCommit } from "../core/sqlite.ts";
 import type { Pending } from "../shared/notifications.ts";
@@ -328,10 +328,14 @@ function sessionsSeen(db: CoreDb, handles: string[]): Map<string, { last_seen: n
 
 // What a bind or a tools-only declaration's writes_as names (#284 S9): a bare name
 // in the caller's own person scope, or scope/name in a scope the caller may
-// act in (mayActIn). Never `human`: canSend treats any */human as a human.
+// act in (policy.ts, alias.bind). Never `human`: msg.send treats any */human as a human.
 // A refusal carries the address when the input parsed as one, so the
 // refusal is logged against it; an unparseable name has none.
-type Target = { address: string; scope: AliasScope & { scope_ref: string } } | { code: ErrorCode; error: string; address?: string };
+// A policy refusal carries its request and decision (`authz`), for the
+// caller that owns the act to record (policy.ts recordDecision).
+type Target =
+  | { address: string; scope: AliasScope & { scope_ref: string } }
+  | { code: ErrorCode; error: string; address?: string; authz?: { req: AuthzRequest; d: Decision } };
 
 function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
   const { repo } = hub;
@@ -352,8 +356,9 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
   }
   if (scope.name === HUMAN_NAME) return { code: "forbidden", error: HUMAN_RESERVED, address };
   const t = { ...scope, scope_ref: scope.scope_ref! };
-  const no = mayActIn(repo, userPrincipal(authed), t);
-  if (no) return { code: "forbidden", error: `you can't act as "${address}": ${no}; bind a name in your own scope, or in a team's you belong to`, address };
+  const req: AuthzRequest = { verb: "alias.bind", principal: userPrincipal(authed), scope: t };
+  const d = authorize(repo, {}, req);
+  if (!d.allow) return { code: "forbidden", error: `you can't act as "${address}": ${d.reason}; bind a name in your own scope, or in a team's you belong to`, address, authz: { req, d } };
   return { address, scope: t };
 }
 
@@ -383,6 +388,12 @@ function describeHolder(hub: Hub, id: string, asker: string): string {
 // the refusal's throw rolls back (#452, #467).
 function rowAfterRollback(session: ApplicationSession, write: () => void) {
   if (session.afterRollback) session.afterRollback(write); else write();
+}
+
+// Who asked, for a decision row (policy.ts): the session's user, the address
+// the act was for, and its ID; a Slack bridge human connection has none.
+function sessionActor(session: ApplicationSession, address?: string): Actor {
+  return { user: session.authed.user_email, address, session: session.sessionId || undefined };
 }
 
 export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptions = {}) {
@@ -564,7 +575,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // End each at start, as the grace sweep would have: holds and claims
   // released, mail bounced. A hosted ID is the hosted store's to end.
   endIds(unendedIds(db).filter((id) => !repo.hosted.owned(id)), "wss_removed");
-  // Re-checks the aliases that sessions act as (S9) against mayActIn, for
+  // Re-checks the aliases that sessions act as (S9) against policy.ts (scope.act), for
   // one principal's sessions or (null) every session's, and revokes the ones
   // it now refuses. by: the user whose act changed the access (an admin's
   // team removal, the principal's own leave), or null for the server's own
@@ -573,7 +584,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     const revoked: (AliasUse & { reason: string })[] = [];
     for (const u of aliasUses(db, principal)) {
       const p = repo.principals.findByName(u.principal);
-      const reason = p ? mayActIn(repo, p, u) : `principal ${u.principal} no longer exists`;
+      const d = p ? authorize(repo, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
+      const reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
       if (reason) revoked.push({ ...u, reason });
     }
     revokeAliases(revoked, by);
@@ -671,6 +683,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     const target = bindTarget(hub, authed, m.alias);
     if ("error" in target) {
       if (target.address) { const a = target.address; rowAfterRollback(session, () => logBinding(db, id, a, "refused", target.error)); }
+      if (target.authz) { const { req, d } = target.authz; rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, target.address), req, d)); }
       return fail(target.code, target.error);
     }
     const { address, scope } = target;
@@ -861,11 +874,17 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // principal may act in, never one another user's session uses (S7, S8); it may share the
     // alias with a holder. create: the first request makes the alias lazily.
     // `refused`: as `collided` above, for the refused binding row (`hostedRefused`).
-    hostedWritesAs(authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void): string {
+    // `later`: where a policy refusal's decision row goes, for the same reason (hosted's `later`).
+    hostedWritesAs(authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: () => void) => void): string {
       const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(db, id, address, "refused", detail); };
       const target = bindTarget(hub, authed, raw);
       if ("error" in target) {
         if (target.address) note(target.address, target.error);
+        if (target.authz) {
+          const { req, d } = target.authz;
+          const row = () => recordDecision(repo, { user: authed.user_email, address: target.address, session: id }, req, d);
+          if (later) later(row); else row();
+        }
         return fail(target.code, target.error);
       }
       const other = aliasUser(db, target.address, authed.user_email);
@@ -1207,8 +1226,12 @@ function prepareSend(
   if (to.kind === "team") fail("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
   if (to.kind === "alias" && !repo.aliases.find(to.address)) fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
-  const decision = canSend(from, { kind: "user", address: to.address }, { db: repo, now: hub.now(), humanReach: hub.humanReach });
-  if (!decision.allow) fail(decision.code, decision.reason);
+  const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
+  const decision = authorize(repo, { humanReach: hub.humanReach }, req);
+  if (!decision.allow) {
+    rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, from), req, decision));
+    fail(decision.code, decision.reason);
+  }
 
   if (parentId !== null) {
     const parent = repo.messages.getById(parentId);
@@ -1368,7 +1391,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     }
     // A throttled call is audited once per streak (delegation.throttled), not per call.
     if (e instanceof ApplicationError && e.code === "rate_limited") throw e;
-    // A refused send (canSend, a missing identity, a bad body) is a refusal,
+    // A refused send (policy.ts msg.send, a missing identity, a bad body) is a refusal,
     // not a request (#184 review 4).
     if (e instanceof ApplicationError) refused({ reason: e.message, to: picked });
     throw e;
