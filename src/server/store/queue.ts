@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 //
 // FIFO. An idle queue runs a body synchronously, inside run(), so a synchronous body is exactly the
 // transaction it was before the queue existed: nothing interleaves before its commit, and its afterCommit
-// effects flush before the next body starts. A body that returns a promise holds the queue until it settles.
+// effects flush before the next body starts. A body that returns a thenable holds the queue until it settles.
 //
 // The holder is tracked through its async continuations (AsyncLocalStorage: a thread-local that follows the
 // logical task across awaits, and into timers, listeners and promises the task starts), so `mine` is true for the
@@ -17,8 +17,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 const holder = new AsyncLocalStorage<object>();
 
 type Waiter = { fn: () => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void };
-const isThenable = (v: unknown): v is PromiseLike<unknown> =>
-  v !== null && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
 
 export class WriteQueue {
   private busy = false;
@@ -47,15 +45,22 @@ export class WriteQueue {
     if (this.busy && !this.mine) throw new Error("top-level transaction while another body holds the write queue: route it through write() (docs/future/postgres-server.md D4)");
   }
 
-  // Runs one body. True when it returned a thenable (any `then`, not only a Promise): it holds the queue until that
-  // settles, and its settling releases it. False when it finished synchronously, returning or throwing.
+  // Runs one body. True when it returned a thenable (any callable `then`, not only a Promise): it holds the queue until
+  // that settles, and its settling releases it. False when it finished synchronously, returning or throwing. `then` is
+  // read once and called here, inside the body's context and try: a lazy thenable's work runs as the holder, and a
+  // throwing `then` getter rejects this caller rather than escaping with the queue held.
   private start(w: Waiter): boolean {
     const token = this.current = {};
-    let out: unknown;
-    try { out = holder.run(token, w.fn); }
-    catch (error) { w.reject(error); return false; }
-    if (!isThenable(out)) { w.resolve(out); return false; }
-    Promise.resolve(out).finally(() => this.release()).then(w.resolve, w.reject);
+    let held: Promise<unknown> | undefined, out: unknown;
+    try {
+      holder.run(token, () => {
+        out = w.fn();
+        const then = out !== null && (typeof out === "object" || typeof out === "function") ? (out as { then?: unknown }).then : undefined;
+        if (typeof then === "function") held = new Promise((resolve, reject) => then.call(out, resolve, reject));
+      });
+    } catch (error) { w.reject(error); return false; }
+    if (!held) { w.resolve(out); return false; }
+    held.finally(() => this.release()).then(w.resolve, w.reject);
     return true;
   }
 

@@ -76,6 +76,26 @@ test("#925: a body that returns a thenable that isn't a Promise holds the queue 
   expect(q.held).toBe(false);
 });
 
+test("#925 audit: a lazy thenable's then runs as the holder; a throwing then getter rejects its caller and frees the queue", async () => {
+  const q = new WriteQueue();
+  let mineInThen: boolean | undefined;
+  const lazy = { then: (ok: (v: number) => unknown) => { mineInThen = q.mine; ok(4); } };
+  expect(await q.run(() => lazy as unknown as Promise<number>)).toBe(4);
+  expect(mineInThen).toBe(true);
+  const hostile = Object.defineProperty({}, "then", { get() { throw new Error("getter"); } });
+  await expect(q.run(() => hostile)).rejects.toThrow("getter");
+  expect(q.held).toBe(false);
+  let release!: () => void;
+  const head = q.run(() => new Promise<void>(r => { release = r; }));
+  const bad = q.run(() => hostile);
+  const after = q.run(() => 9);
+  release();
+  await head;
+  await expect(bad).rejects.toThrow("getter");
+  expect(await after).toBe(9);
+  expect(q.held).toBe(false);
+});
+
 test("#925: a synchronous body that throws in a backlog rejects only its caller; the drain goes on", async () => {
   const q = new WriteQueue();
   let release!: () => void;
