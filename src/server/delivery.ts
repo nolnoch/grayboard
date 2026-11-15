@@ -18,7 +18,7 @@ export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): bool
 type Issued = { item: PendingDelivery; ref?: PendingRef };
 // What a retried receipt of an acknowledged id re-checks, without the item's body (#805).
 type Acked = { ownership: number; bind_gen: number; address?: string; board?: string };
-// A lost receipt's retry re-sends at most hosted-core's 100 admitted keys (ADMITTED_LIMIT): twice that per lease.
+// A lost receipt's retry re-sends one call's ids (at most 100; hosted-core receipts one per call): twice that per lease.
 const ACKED_HISTORY = 200;
 const boardOf = (item: PendingDelivery) => item.event.kind === "board" ? (item.event.item.kind === "push" ? item.event.item.post.board : item.event.item.board) : undefined;
 type Lease = {

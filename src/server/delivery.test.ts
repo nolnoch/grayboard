@@ -346,8 +346,8 @@ test("one lease admits more than 1000 deliveries with bounded idempotent receipt
   expect(delivery.activeLeaseCount).toBe(1);
 });
 
-// The receipt history covers a lost receipt's retry: hosted-core re-sends at most its 100 admitted
-// keys (ADMITTED_LIMIT), so 200 per lease covers it twice over (#805).
+// The receipt history covers a lost receipt's retry, which re-sends one call's ids (at most 100):
+// 200 per lease covers it twice over (#805).
 test("receipt history keeps the last 200 acknowledged ids per lease", async () => {
   const lease = await delivery.open(bob, context(bob));
   for (let i = 0; i < 300; i++) await send(`message ${i}`);
