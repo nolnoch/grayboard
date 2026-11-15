@@ -558,7 +558,7 @@ test.each(modes)("a receipt that loses the lease: the next lease of the same bin
 // The real-host expiry case: an admitted key skips only the admission, so a
 // lease that can never renew spends the item's attempt budget and never
 // receipts the admission it couldn't prove.
-test.each(modes)("a lease that can't renew after admission never receipts it and stops at the attempt budget (%s)", async mode => {
+test.each(modes)("a lease that can't renew after admission never commits its receipt and stops at the attempt budget (%s)", async mode => {
   const r = runtime(mode);
   const c = r.make({ wait: async () => {} });
   try {

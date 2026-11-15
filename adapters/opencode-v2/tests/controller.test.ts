@@ -898,7 +898,7 @@ test("pause during awaited admission suppresses receipt without pretending host 
     expect(r.admissions[0]?.sessionID).toBe("R");
   } finally { await r.controller.close(); }
 });
-test.each(["session.archived", "session.deleted", "credential.switched", "rebind", "expiry"])("%s during host admission suppresses stale receipt", async mode => {
+test.each(["session.archived", "session.deleted", "credential.switched", "rebind", "expiry"])("%s during host admission never commits a stale receipt", async mode => {
   const r = runtime(); let unblock!: () => void;
   try {
     r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
