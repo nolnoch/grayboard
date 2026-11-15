@@ -31,7 +31,7 @@ import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from ".
 import { CoreError } from "../core/errors.ts";
 import { countRefusal } from "./metrics.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
-import { assertDeliverableId, endSession, Undeliverable } from "../core/session_end.ts";
+import { assertDeliverableId, coreRefusalCode, endSession, Undeliverable } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
@@ -180,7 +180,7 @@ function childState(session: ApplicationSession, tool: string): void {
 // A refused call's code and message: an ID that can't receive names its own
 // code (#284 S18); any other CoreError is a bad request.
 function coreRefusal(e: CoreError): ApplicationError {
-  return e instanceof Undeliverable ? new ApplicationError(e.code, e.detail) : new ApplicationError("bad_request", e.message);
+  return new ApplicationError(coreRefusalCode(e), e instanceof Undeliverable ? e.detail : e.message);
 }
 
 export type BoardObserver = {

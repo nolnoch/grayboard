@@ -16,6 +16,7 @@ import { forgetHandle } from "./boards.ts";
 import { holdsOf, logBinding, primaryOf } from "./bindings.ts";
 import { logEvent, release, sweepIn, type Claim } from "./claims.ts";
 import { CoreError } from "./errors.ts";
+import type { ErrorCode } from "../shared/protocol.ts";
 import { testPause } from "../shared/testpause.ts";
 
 /** The ended ID's mail, as its mode stores it. Calls run inside the end's transaction. */
@@ -180,6 +181,11 @@ export class Undeliverable extends CoreError {
   ) {
     super(`${code}: ${detail}`);
   }
+}
+
+/** A refused core call's wire code, both modes: an ID that can't receive names its own (#284 S18); any other CoreError is a bad request. */
+export function coreRefusalCode(e: CoreError): ErrorCode {
+  return e instanceof Undeliverable ? e.code : "bad_request";
 }
 
 /** Why `id` can't receive a send or mention (assertDeliverableId's refusal), or null when it can. */
