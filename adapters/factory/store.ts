@@ -1,4 +1,4 @@
-// The module's own store (docs/factory.md §6): what it must remember
+// The module's own store (docs/factory.md §5): what it must remember
 // across restarts, apart from the bus database and on its own retention.
 // A request is keyed by (source, id): the bus message or post id, the
 // idempotency key. A redelivered request (a restart, a replay, a queue

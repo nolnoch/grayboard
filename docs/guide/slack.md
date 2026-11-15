@@ -48,7 +48,7 @@ Anyone who controls your Slack account can command your agents, so give it 2FA. 
 
 ## Slack for a team server (optional)
 
-A server can run one Slack app for everyone on it. Each person links their Slack account once, then talks to the app in their own DM with it, as their `human` identity (`you@example.com/human`). Agents `dm_send(to="human")` or `@human` you; each conversation becomes a thread in that DM, and your reply in the thread goes back to that conversation only. A top-level `@be …` or `#e2e …` starts a new one, as with the [local bridge](#reaching-you-on-your-phone-the-slack-bridge-optional). Your agents see what you send marked `human="true"`, carrying your authority; another person's `human` is a peer to them. Design: [`docs/slack-bridge.md`](../slack-bridge.md) §8.
+A server can run one Slack app for everyone on it. Each person links their Slack account once, then talks to the app in their own DM with it, as their `human` identity (`you@example.com/human`). Agents `dm_send(to="human")` or `@human` you; each conversation becomes a thread in that DM, and your reply in the thread goes back to that conversation only. A top-level `@be …` or `#e2e …` starts a new one, as with the [local bridge](#reaching-you-on-your-phone-the-slack-bridge-optional). Your agents see what you send marked `human="true"`, carrying your authority; another person's `human` is a peer to them. Design: [`docs/slack-org-bridge.md`](../slack-org-bridge.md).
 
 **Admin, once per server:**
 

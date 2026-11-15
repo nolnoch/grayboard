@@ -1,4 +1,4 @@
-// Fan-out (docs/factory.md §7): a fleet task's one run either does the
+// Fan-out (docs/factory-fleets.md): a fleet task's one run either does the
 // task or returns a plan of independent subtasks. The model judges; this
 // code orchestrates. The plan is a fenced JSON block whose info string is
 // `factory-plan`, four backticks like a delegation's payload, so a subtask

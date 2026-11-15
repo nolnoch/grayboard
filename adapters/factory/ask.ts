@@ -1,4 +1,4 @@
-// Asking (#652, docs/factory.md §8): a run that can't finish without a fact
+// Asking (#652, docs/factory.md §6): a run that can't finish without a fact
 // or a decision only a person can give ends with a question instead of a
 // guess. Like a plan (fanout.ts), the question is a fenced JSON block that
 // is the whole reply, info string `factory-ask`, four backticks. Code parses
