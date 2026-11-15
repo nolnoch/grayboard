@@ -14,6 +14,7 @@ import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
+import type { HostedSession } from "./hosted-types.ts";
 import { domainData, HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -134,15 +135,17 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (ctx?.mcpReq.signal.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     return exchange.context;
   }
-  function authorize(context: Context, signal?: AbortSignal) {
+  // Returns the context's row as it stands after any settle, so a synchronous caller needn't read it again (#853).
+  function authorize(context: Context, signal?: AbortSignal): { row: HostedSession | undefined } {
     if (closed || context.request.signal.aborted || signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
     application.revalidateSession(context.session, true);
-    if ("id" in context.sessionContext) {
-      const row = hosted.row(context.sessionContext.id);
-      const root = row && hosted.rootOf(row);
-      if (root && root.lease_deadline !== null && root.lease_deadline <= now()) hosted.settle(root.session_id);
-    }
+    if (!("id" in context.sessionContext)) return { row: undefined };
+    const row = hosted.row(context.sessionContext.id);
+    const root = row && hosted.rootOf(row);
+    if (!root || root.lease_deadline === null || root.lease_deadline > now()) return { row };
+    hosted.settle(root.session_id);
+    return { row: hosted.row(context.sessionContext.id) };
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
   async function select(request: Request, admit = true): Promise<Context> {
@@ -211,9 +214,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return { user: context.principal.authed.user_id, email: context.principal.authed.user_email, grant: context.principal.grantId, role: context.role, identity: context.session.identityFull };
   }
   function matches(a: Binding, b: Binding) { return a.user === b.user && a.email === b.email && a.grant === b.grant && a.role === b.role; }
-  function bindingLive(context: Context) {
+  function bindingLive(context: Context, checked?: { row: HostedSession | undefined }) {
     if (!("id" in context.sessionContext)) return false;
-    const row = hosted.row(context.sessionContext.id);
+    const row = checked ? checked.row : hosted.row(context.sessionContext.id);
     if (!row) return false;
     const root = hosted.rootOf(row);
     return hosted.named(root) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
@@ -232,13 +235,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
     }
   });
-  function watchable(context: Context, uri: string): string | null {
-    authorize(context);
-    if (!bindingLive(context)) throw new ApplicationError("unbound", "ownership changed; subscribe again with current session context");
+  // `checked`: authorize's result for this context, taken this turn with no await since (#853).
+  function watchable(context: Context, uri: string, checked = authorize(context)): string | null {
+    if (!bindingLive(context, checked)) throw new ApplicationError("unbound", "ownership changed; subscribe again with current session context");
     if (context.role === "subscriber") {
       const cap = context.request.headers.get("X-Grayboard-Lease");
       if (uri !== "grayboard://inbox" || !cap || !/^[A-Za-z0-9_-]{43}$/.test(cap) ||
-          delivery.describe(context.principal, context.sessionContext, cap).identity.identity_full !== context.session.identityFull) {
+          delivery.describe(context.principal, context.sessionContext, cap, checked).identity.identity_full !== context.session.identityFull) {
         throw new ApplicationError("not_found", "resource not found");
       }
       return cap;
@@ -247,9 +250,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (!application.canReceiveBoard(context.session, board)) throw new ApplicationError("not_found", "resource not found");
     return null;
   }
+  // One authorize for the live's every uri: watchable and describe reuse its row (#853).
   function valid(live: Live) {
-    authorize(live.context);
-    for (const [uri, cap] of live.uris) if (watchable(live.context, uri) !== cap) throw new ApplicationError("not_found", "resource not found");
+    const checked = authorize(live.context);
+    for (const [uri, cap] of live.uris) if (watchable(live.context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
   }
   function addWatch(live: Live, uri: string) {
     if (live.context.role === "native") live.watches.push(resources.watch(live.context.session, uri, {
@@ -355,7 +359,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     server.server.registerCapabilities({ resources: { subscribe: true } });
     registerHostedResources(server, {
       role, current, issuer: oauth.issuer, resource: oauth.resource, resources, delivery, hosted, leaseHooks,
-      authorize() { authorize(current()); },
+      authorize() { return authorize(current()); },
     });
     if (legacy) {
       const control = async (uri: string, ctx: ServerContext, subscribe: boolean) => {
@@ -526,8 +530,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
     // An access expiry or revoke is an expected close, audited by streamClosed; only other failures are logged (#494 item 10).
     const unexpected = (e: unknown) => { if (!(e instanceof ApplicationError && e.code === "unauthenticated")) hostedFailure("mcp.stream", e); };
-    for (const live of [...lives]) { try { valid(live); } catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); } }
-    for (const [stream, context] of streamContexts) { try { authorize(context); } catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); } }
+    // A live's stream is in streamContexts too (wrap adds both): valid() just authorized its context (#853).
+    const checked = new Set<Context>();
+    for (const live of [...lives]) { checked.add(live.context); try { valid(live); } catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); } }
+    for (const [stream, context] of streamContexts) { if (checked.has(context)) continue; try { authorize(context); } catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); } }
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {
@@ -619,7 +625,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 const context = exchange.context = await select(req);
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
                 if (uris.length > caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
-                const authorized = new Map(uris.map(uri => [uri, watchable(context, uri)]));
+                const checked = authorize(context);
+                const authorized = new Map(uris.map(uri => [uri, watchable(context, uri, checked)]));
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
                 live = makeLive(context, authorized, ownHandler);
                 response = await ownHandler.fetch(req, { parsedBody: body.parsedBody });

@@ -6,6 +6,7 @@ import { ApplicationError, type ApplicationSession } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { Delivery } from "./delivery.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
+import type { HostedSession } from "./hosted-types.ts";
 import { parseBoardResourceUri, type Resources } from "./resources.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
@@ -91,20 +92,20 @@ export function registerHostedResources(server: McpServer, context: {
   role: HostedRole;
   current(ctx?: ServerContext): { principal: OAuthPrincipal; sessionContext: SessionContext; session: ApplicationSession; request: Request };
   issuer: string; resource: string; resources: Resources; delivery: Delivery; hosted: HostedSessions;
-  authorize(): void;
+  authorize(): { row: HostedSession | undefined };
   leaseHooks?: () => { changed(): void; closed(): void; bind(capability: string): void };
 }) {
   const { role, resources, delivery, hosted } = context;
   const authorize = (signal?: AbortSignal) => {
     if (signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
-    context.authorize();
+    return context.authorize();
   };
   const leaseCapability = (signal: AbortSignal) => {
-    authorize(signal);
+    const checked = authorize(signal);
     const { principal, sessionContext, session, request } = context.current();
     const capability = request.headers.get("X-Grayboard-Lease");
     if (!capability || !/^[A-Za-z0-9_-]{43}$/.test(capability) ||
-        delivery.describe(principal, sessionContext, capability).identity.identity_full !== session.identityFull) {
+        delivery.describe(principal, sessionContext, capability, checked).identity.identity_full !== session.identityFull) {
       throw new ApplicationError("not_found", "delivery lease or item not found");
     }
     return capability;
