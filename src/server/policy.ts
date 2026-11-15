@@ -26,7 +26,9 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // or writes_as, an HTTP `as`, and visibility or the alias sweep (a bind and an
 // `as` name the alias, which is never `human`; an `as` whose scope no
 // principal owns has a null scope); session.act: an HTTP `as` naming a session
-// ID, with that ID's row as the caller found it; team.read / team.manage /
+// ID, with that ID's row as the caller found it; hosted.session: a hosted MCP
+// request reaching a hosted session row (its own, or a session_end target), by
+// the requester's and the row's user ID and OAuth client; team.read / team.manage /
 // team.leave: a user reading, changing or leaving a team's membership; admin: an
 // admin route; msg.wake: whether a delivery written by one signed-in user
 // wakes a session of another (users by email: the writer recorded at write
@@ -37,6 +39,7 @@ export type AuthzRequest =
   | { verb: "alias.bind"; principal: Principal; scope: ActScope; name: string }
   | { verb: "act_as"; principal: Principal; address: string; name: string; scope: ActScope | null }
   | { verb: "session.act"; user: string; session: string; row: SessionFacts | undefined }
+  | { verb: "hosted.session"; session: string; user: number; client: string; row: { user: number; client: string } }
   | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
   | { verb: "admin"; email: string }
   | { verb: "msg.wake"; from_user: string; to_user: string };
@@ -75,6 +78,11 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       return actIn(repo, req.principal, req.scope);
     case "session.act":
       return sessionRule(req.user, req.session, req.row);
+    case "hosted.session":
+      // Another user's row and another client's of the same user read alike, as missing (#851).
+      if (req.row.user !== req.user) return deny("hosted.other_user", "session not found", "not_found");
+      if (req.row.client !== req.client) return deny("hosted.other_client", "session not found", "not_found");
+      return allow("hosted.own");
     case "team.leave":
       return req.team && repo.teams.isMember(req.team.id, req.user.id) ? allow("team.member") : deny("team.member", "not found", "not_found");
     case "team.read": {
@@ -116,6 +124,8 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
       return { target: req.scope ? `${req.scope.scope_kind}:${req.scope.scope_ref}` : req.address, detail: { principal: req.principal.name, scope_kind: req.scope?.scope_kind ?? null, scope_ref: req.scope?.scope_ref ?? null, name: req.name } };
     case "session.act":
       return { target: req.session, detail: { session_requested: req.session } };
+    case "hosted.session":
+      return { target: req.session, detail: { session_requested: req.session, client: req.client } };
     case "team.read":
     case "team.manage":
     case "team.leave":
