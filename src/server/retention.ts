@@ -1,4 +1,4 @@
-import type { Repo } from "./db.ts";
+import { queuedTx, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { pruneEndedIds, prunePosts, type CoreDb } from "../core/boards.ts";
 import { pruneUnbound, sweepBlobs } from "../core/attachments.ts";
@@ -37,27 +37,31 @@ export function reclaimFreePages(repo: Repo, maxPages = RECLAIM_PAGES_PER_RUN): 
 // then the bytes nothing names any more, then the free pages that left.
 type BoardsChanged = (boards: string[]) => void | Promise<void>;
 export async function runRetention(repo: Repo, db: CoreDb, config: Config, now = Date.now(), onBoardsChanged?: BoardsChanged): Promise<void> {
+  // Each prune is its own transaction through the write queue (#807 D4), short as the separate statements were,
+  // so requests interleave between them rather than wait out the whole run.
   try {
     // Board posts share the message retention window.
-    pruneMessages(repo, now - config.messageRetentionDays * 86_400_000);
-    const boards = prunePosts(db, now - config.messageRetentionDays * 86_400_000);
-    if (boards.length) {
-      try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
-    }
+    await repo.write(() => pruneMessages(repo, now - config.messageRetentionDays * 86_400_000));
+    await repo.write(() => prunePosts(db, now - config.messageRetentionDays * 86_400_000), boards => {
+      if (boards.length) {
+        try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
+      }
+    });
     // Ended sessions' rows share it too (#328): a keyed one leaves a
     // tombstone, so its key coming back is audited as reused.
-    pruneEndedIds(db, now - config.messageRetentionDays * 86_400_000, now);
-    pruneAudit(repo, now - config.auditRetentionDays * 86_400_000);
-    pruneUnbound(db, now - UNBOUND_TTL_MS);
-    repo.writeReceipts.prune(now - WRITE_DEDUP_WINDOW_MS);
+    await repo.write(() => pruneEndedIds(db, now - config.messageRetentionDays * 86_400_000, now));
+    await repo.write(() => pruneAudit(repo, now - config.auditRetentionDays * 86_400_000));
+    await repo.write(() => pruneUnbound(db, now - UNBOUND_TTL_MS));
+    await repo.write(() => repo.writeReceipts.prune(now - WRITE_DEDUP_WINDOW_MS));
   } catch (e) {
     console.error("[grayboard] retention failed:", e);
   }
   // Also finishes any sweep a crash or a failed delete left.
-  const swept = await sweepBlobs(db, repo.blobs);
+  const swept = await sweepBlobs(db, repo.blobs, queuedTx(repo));
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
   try {
-    reclaimFreePages(repo);
+    // As the queue's holder: no other write is mid-transaction while the pages go.
+    await repo.write(() => reclaimFreePages(repo));
   } catch (e) {
     console.error("[grayboard] retention: reclaiming free pages failed:", e);
   }

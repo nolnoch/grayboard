@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 
 import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
 import { CoreError } from "./errors.ts";
+import { immediateTx, type WriteTx } from "./sqlite.ts";
 
 export type Claim = {
   key: string;
@@ -306,6 +307,7 @@ export function claimExpiryTimer(
   db: Database,
   onWake: (handles: string[]) => void,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
+  tx: WriteTx = immediateTx(db),
 ): { arm(): void; stop(): void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
@@ -314,15 +316,18 @@ export function claimExpiryTimer(
     if (stopped) return;
     clearTimeout(timer);
     at = when;
-    timer = setTimeout(fire, Math.max(0, when - Date.now()));
+    timer = setTimeout(() => void fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e)), Math.max(0, when - Date.now()));
     timer.unref?.();
   };
-  const fire = () => {
+  const fire = async () => {
     if (stopped) return;
     timer = undefined;
     at = Infinity;
     try {
-      const { wake, boards } = sweepExpired(db);
+      // The server's queue may make the sweep wait (#807 D4): the clock is read inside it, and a stop while it
+      // waited still stops what follows.
+      const { wake, boards } = await tx(() => sweepChanges(db, Date.now()));
+      if (stopped) return;
       if (boards.length) {
         try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
       }

@@ -16,7 +16,7 @@ import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
 import { endSession, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
-import { afterCommit, guardTopLevel, openReader, openSqlite, reclaimFreePages, routeReads } from "../core/sqlite.ts";
+import { afterCommit, guardTopLevel, openReader, openSqlite, reclaimFreePages, routeReads, type WriteTx } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
@@ -99,6 +99,12 @@ function queued<T, R>(db: Database, fn: () => T, committed?: (value: T) => R): P
     const value = db.transaction(fn).immediate() as T;
     return { out: committed ? committed(value) : value as unknown as R };
   }).then(box => box.out) as Promise<Awaited<R>>;
+}
+
+// Core's shared writes (attachment store/release/sweep, claim expiry, #807 D4) through repo's write queue. Core's
+// bodies are synchronous, so the cast only restates that.
+export function queuedTx(repo: Repo): WriteTx {
+  return <T>(fn: () => T) => repo.write(fn as () => Sync<T>) as Promise<T>;
 }
 
 // A write at startup, before anything serves (a constructor's first sweep, #807 P1b-4): fn's transaction through the
