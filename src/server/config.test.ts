@@ -15,6 +15,7 @@ const KEYS = [
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
   "GRAYBOARD_RESOURCE_WATCHES_GLOBAL", "GRAYBOARD_RESOURCE_WATCHES_PER_SESSION",
+  "GRAYBOARD_HEALTHZ_LAG_P99_MS", "GRAYBOARD_HEALTHZ_LAG_WINDOWS",
 ];
 
 describe("loadConfig", () => {
@@ -216,6 +217,27 @@ describe("loadConfig", () => {
     for (const bad of [" 900 ", "1e3", "0", "1.5", "-3"]) {
       process.env.GRAYBOARD_HOSTED_IDLE_SECONDS = bad;
       expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_IDLE_SECONDS must be a positive whole number of seconds/);
+    }
+  });
+
+  test("the /healthz lag gate defaults to 1000 ms over 3 windows; 0 ms turns it off; else plain digits within bounds (#805)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().healthzLag).toEqual({ p99Ms: 1000, windows: 3 });
+    process.env.GRAYBOARD_HEALTHZ_LAG_P99_MS = "0";
+    expect(loadConfig().healthzLag?.p99Ms).toBe(0);
+    process.env.GRAYBOARD_HEALTHZ_LAG_P99_MS = "250";
+    process.env.GRAYBOARD_HEALTHZ_LAG_WINDOWS = "60";
+    expect(loadConfig().healthzLag).toEqual({ p99Ms: 250, windows: 60 });
+    process.env.GRAYBOARD_HEALTHZ_LAG_WINDOWS = "61";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_HEALTHZ_LAG_WINDOWS can be at most 60 windows/);
+    for (const bad of ["0", "1.5", " 3", "-1"]) {
+      process.env.GRAYBOARD_HEALTHZ_LAG_WINDOWS = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_HEALTHZ_LAG_WINDOWS must be a positive whole number of windows/);
+    }
+    delete process.env.GRAYBOARD_HEALTHZ_LAG_WINDOWS;
+    for (const bad of ["00", "1e3", "-5", "600001"]) {
+      process.env.GRAYBOARD_HEALTHZ_LAG_P99_MS = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_HEALTHZ_LAG_P99_MS (must be a positive whole number|can be at most)/);
     }
   });
 

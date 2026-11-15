@@ -9,6 +9,7 @@ import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts"
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
+import { DEFAULT_LAG_GATE, lagVerdict, lagWindows, type LagGate, type LagWindow } from "./metrics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
@@ -52,8 +53,8 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 // alike (#275): a flood costs one probe a second, and a down database logs one line a second. The probe is a
 // synchronous read, so no request can arrive while one is in flight and the cache alone is single-flight.
 export const HEALTH_TTL_MS = 1000;
-const health = new WeakMap<Repo, { at: number; ok: boolean }>();
-export function healthz(repo: Repo, now = performance.now()): Response {
+const health = new WeakMap<Repo, { at: number; ok: boolean; lagging?: boolean }>();
+export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows()): Response {
   let cached = health.get(repo);
   if (!cached || now - cached.at >= HEALTH_TTL_MS) {
     let ok = true;
@@ -64,10 +65,23 @@ export function healthz(repo: Repo, now = performance.now()): Response {
       console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
       ok = false;
     }
-    health.set(repo, cached = { at: now, ok });
+    // The lag verdict outlives the probe's window, so its state-change log line fires once, not every second.
+    health.set(repo, cached = { at: now, ok, lagging: cached?.lagging });
   }
+  if (!cached.ok) return jsonErr("internal", "db not reachable", 503);
+  // Sustained event-loop lag fails the check (#805), with the version kept so a deploy check still
+  // tells a restarted server from a stale one. The journal gets one line per change of state.
+  const lag = lagVerdict(windows, gate);
+  if (lag.lagging !== !!cached.lagging) {
+    cached.lagging = lag.lagging;
+    console.error(lag.lagging ? `[grayboard] healthz: failing on event-loop lag, p99 ${lag.p99s.map(p => p.toFixed(2)).join("/")} s over the last ${gate.windows} windows` : "[grayboard] healthz: event-loop lag recovered");
+  }
+  // The per-window p99s and the threshold go to the journal only: this route is public, and the scrape's bind is
+  // what guards the server's telemetry.
+  if (lag.lagging) return json({ ok: false, version: pkg.version, code: "lagging", message: "event loop lagging" }, 503);
+
   // The version lets a deploy check tell a restarted server from a stale one.
-  return cached.ok ? json({ ok: true, version: pkg.version }) : jsonErr("internal", "db not reachable", 503);
+  return json({ ok: true, version: pkg.version });
 }
 
 function authConfig(config: Config): Response {
@@ -665,7 +679,7 @@ export async function handleHttp(
   const path   = url.pathname;
   const method = req.method;
 
-  if (path === "/healthz" && method === "GET") return healthz(repo);
+  if (path === "/healthz" && method === "GET") return healthz(repo, performance.now(), config.healthzLag);
   if (path === "/api/auth/config"    && method === "GET")  return authConfig(config);
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);

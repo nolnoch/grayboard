@@ -49,6 +49,9 @@ export type LagWindow = { p50: number; p99: number; max: number };
 export const LAG_WINDOW_MS = 10_000;
 let lag: { histogram: ReturnType<typeof monitorEventLoopDelay>; timer: ReturnType<typeof setInterval>; users: number } | undefined;
 let lastLag: LagWindow | undefined;
+// The newest finished windows, oldest first, for the /healthz lag gate; at most LAG_HISTORY of them.
+export const LAG_HISTORY = 60;
+let lagHistory: LagWindow[] = [];
 
 export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
   if (!lag) {
@@ -56,7 +59,11 @@ export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
     histogram.enable();
     const timer = setInterval(() => {
       // Nanoseconds in, seconds out. A window with no tick (count 0) leaves the last one standing.
-      if (histogram.count > 0) lastLag = { p50: histogram.percentile(50) / 1e9, p99: histogram.percentile(99) / 1e9, max: histogram.max / 1e9 };
+      if (histogram.count > 0) {
+        lastLag = { p50: histogram.percentile(50) / 1e9, p99: histogram.percentile(99) / 1e9, max: histogram.max / 1e9 };
+        lagHistory.push(lastLag);
+        if (lagHistory.length > LAG_HISTORY) lagHistory.shift();
+      }
       histogram.reset();
     }, windowMs);
     timer.unref?.();
@@ -68,11 +75,25 @@ export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
     if (stopped || !lag) return;
     stopped = true;
     if (--lag.users > 0) return;
-    clearInterval(lag.timer); lag.histogram.disable(); lag = undefined; lastLag = undefined;
+    clearInterval(lag.timer); lag.histogram.disable(); lag = undefined; lastLag = undefined; lagHistory = [];
   };
 }
-// The last finished window: what the /healthz lag gate will read (#805, the PR after this one).
+// The last finished window, for the scrape.
 export function lagWindow(): LagWindow | undefined { return lastLag; }
+export function lagWindows(): readonly LagWindow[] { return lagHistory; }
+
+// The /healthz lag gate (#805): lagging when each of the last `windows` finished windows has a p99
+// over `p99Ms`. Pure over the window history, which is its clock: a server with fewer finished
+// windows than that is never lagging, so a restart passes install.sh's /healthz check, and one slow
+// window (a GC pause, a churn wave) never fails it. p99Ms 0 turns the gate off.
+export type LagGate = { p99Ms: number; windows: number };
+export const DEFAULT_LAG_GATE: LagGate = { p99Ms: 1000, windows: 3 };
+export function lagVerdict(history: readonly LagWindow[], gate: LagGate): { lagging: false } | { lagging: true; p99s: number[] } {
+  if (gate.p99Ms === 0 || gate.windows < 1 || history.length < gate.windows) return { lagging: false };
+  const recent = history.slice(-gate.windows);
+  if (!recent.every(w => w.p99 * 1000 > gate.p99Ms)) return { lagging: false };
+  return { lagging: true, p99s: recent.map(w => w.p99) };
+}
 export function lagSamplerUsers(): number { return lag?.users ?? 0; }
 
 // Gauges the caller reads at scrape time from O(1) getters. Keys are metric-name suffixes.

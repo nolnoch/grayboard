@@ -93,14 +93,19 @@ export type Access = {
   checkCreate(handle: string, scope: string | null): string | null;
   // The handle a mention token refers to, or null if unknown or ambiguous.
   // `strict`: a token that names a session that can't receive refuses the
-  // post instead of going unresolved.
-  resolveMention(token: string, author: string, board: Board, strict: boolean): string | null;
+  // post instead of going unresolved. `viewer` (the posting session's ID, else
+  // the author) is whose sight a refusal's name suggestions follow (#348).
+  resolveMention(token: string, author: string, board: Board, strict: boolean, viewer?: string): string | null;
   // Whether a post by `from` may reach `to` as a thread reply. Omitted: always.
   mayReach?(from: string, to: string): boolean;
   // Whether the principal of `handle` (the calling session's ID) may read an alias's labels (task, owner,
   // source board, spec hash, description) in peer_list: only inside a scope
   // it may act in (#284 S13).
   seesAliasMeta(handle: string, scope: Omit<AliasScope, "name">): boolean;
+  // Whether the principal of `handle` may see that an alias of a scope exists
+  // at all (peer_list rows, name suggestions): a team's names only inside the
+  // team (#348). Omitted: always.
+  seesAlias?(handle: string, scope: Omit<AliasScope, "name">): boolean;
   // The board only a human handle can start posts on, or null for none.
   announceBoard: string | null;
 };
@@ -640,12 +645,13 @@ function resolveMentions(
   author: string,
   board: Board,
   strict: boolean,
+  viewer: string,
 ): { handles: string[]; unresolved: string[] } {
   const a = access(db);
   const handles = new Set<string>();
   const unresolved: string[] = [];
   for (const t of mentionTokens(body)) {
-    const h = a.resolveMention(t, author, board, strict);
+    const h = a.resolveMention(t, author, board, strict, viewer);
     if (h && a.canSee(h, board)) handles.add(h);
     else unresolved.push(t);
   }
@@ -903,7 +909,7 @@ export function post(
     const queue = !announcement && parentId === null && !b.archived_at && (b.kind ?? "broadcast") === "queue";
     let unresolved: string[] = [];
     if (queue) {
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
       if (mentioned.length === 0) {
@@ -948,7 +954,7 @@ export function post(
         const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
         for (const m of muted) targets.delete(m.handle);
       }
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     }
@@ -1076,6 +1082,19 @@ export type Peer = {
  * notified lists: a `grayboard tail` session (ids.viewer, #284 S9). Read
  * once per call.
  */
+// Of `handles`, those whose existence `viewer` (a session ID or handle) may
+// see: a team's aliases only inside the team (#348), as peer_list lists them.
+// For results that echo a board's recipients (board_post's notified/deferred).
+export function seenHandles(db: Database, viewer: string, handles: string[]): string[] {
+  const acc = access(db);
+  if (!acc.seesAlias) return handles;
+  const scopeOf = db.prepare(`SELECT scope_kind, scope_ref FROM aliases WHERE address = ?`);
+  return handles.filter((h) => {
+    const r = scopeOf.get(h) as { scope_kind: AliasScope["scope_kind"] | null; scope_ref: string | null } | null;
+    return !r || r.scope_kind === null || acc.seesAlias!(viewer, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+  });
+}
+
 export function viewers(db: Database): (handle: string) => boolean {
   const ids = new Set((db.prepare(`SELECT id FROM ids WHERE viewer = 1`).all() as { id: string }[]).map((r) => r.id));
   return (h) => ids.has(h);
@@ -1131,7 +1150,8 @@ export const ALIAS_SESSION_SQL = `COALESCE(
 // session's, and clears when the session ends (#284 decision 11). An alias's
 // labels, and its session's facts, are shown only to a caller that may act
 // in its scope (#284 S13, F-12), and `match` filters after that cut, so a
-// hidden label or fact can't be probed.
+// hidden label or fact can't be probed. A team's aliases aren't listed at all
+// outside the team (#348), a cut made first.
 // `online` comes from the mode: a live session that will receive pushes
 // (local: its wakeup socket answers; server: an open connection).
 // `addresses`: the caller's address set, each row of which is its own and
@@ -1199,8 +1219,20 @@ export function who(
     if (v === undefined) seen.set(key, v = acc.seesAliasMeta(viewer, scope));
     return v;
   };
+  // Whether the row is listed at all: a team's alias only to the team's
+  // members (#348), before `match` and the offline count, so neither probes
+  // a hidden name. Memoized per scope as the label cut is.
+  const listed = new Map<string, boolean>();
+  const seesName = (scope: Omit<AliasScope, "name">): boolean => {
+    if (!acc.seesAlias) return true;
+    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+    let v = listed.get(key);
+    if (v === undefined) listed.set(key, v = acc.seesAlias(viewer, scope));
+    return v;
+  };
   for (const r of rows) {
     if (isViewer(r.handle)) continue;
+    if (r.scope_kind !== null && !own.has(r.handle) && !seesName({ scope_kind: r.scope_kind, scope_ref: r.scope_ref })) continue;
     const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
     // The session's facts (where it runs, its status, harness, model, effort,
     // launcher) follow the labels' cut: an alias's to a caller that may act
