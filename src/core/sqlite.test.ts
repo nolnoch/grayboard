@@ -73,9 +73,15 @@ test("run with bindings reuses the cached statement and still runs every stateme
   const db = openSqlite(":memory:", "PRAGMA foreign_keys = ON;", (d) => d.exec("CREATE TABLE t (a INTEGER)"));
   try {
     expect(db.run("INSERT INTO t (a) VALUES (?)", [1])).toEqual({ changes: 1, lastInsertRowid: 1 });
-    expect(db.prepare("INSERT INTO t (a) VALUES (?)")).toBe(db.query("INSERT INTO t (a) VALUES (?)"));
-    // A script with bindings: every statement runs, as plain `db.run` does.
-    db.run("INSERT INTO t (a) VALUES (?); INSERT INTO t (a) VALUES (5)", [4]);
+    const query = spyOn(db, "query");
+    try {
+      db.run("INSERT INTO t (a) VALUES (?)", [4]);
+      expect(query.mock.calls.map(([sql]) => sql)).toEqual(["INSERT INTO t (a) VALUES (?)"]);
+      // A script with bindings: not through a statement, which would compile only the first; every statement runs.
+      db.run("DELETE FROM t WHERE a = ?; INSERT INTO t (a) VALUES (5)", [4]);
+      expect(query).toHaveBeenCalledTimes(1);
+    } finally { query.mockRestore(); }
+    db.run("INSERT INTO t (a) VALUES (?)", [4]);
     expect(db.prepare("SELECT a FROM t ORDER BY a").all()).toEqual([1, 4, 5].map((a) => ({ a })));
   } finally { db.close(); }
 });
