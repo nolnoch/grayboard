@@ -25,7 +25,7 @@ import type { AuthedUser } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
   setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, normalizeBoard, getBoard,
-  type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type SnapshotOptions, type UnboundPeer,
+  type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -51,12 +51,11 @@ export class ApplicationError extends Error {
     super(message);
   }
 }
-export type DirectMessage = ReturnType<typeof showMessage<MessageRow>>;
+// other_user, ungranted: the writer marks every read and the pull carry (writerMarks; security audit F-10, F-03).
+export type DirectMessage = ReturnType<typeof showMessage<MessageRow>> & { other_user?: true; ungranted?: true };
 export type HistoryMessage = DirectMessage & { delivered?: boolean };
 export type DeliveryEvent =
-  // other_user, ungranted: set only by pending(), a hosted lease's pull
-  // (security audit F-10, F-03).
-  | { kind: "direct"; message: DirectMessage & { other_user?: true; ungranted?: true } }
+  | { kind: "direct"; message: DirectMessage }
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
@@ -994,29 +993,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         }
       }
       const boards = all.slice(0, limit - messages.length);
-      // Security audit F-10: what another signed-in user wrote is marked
-      // other_user, by the user recorded at write time, never the address's
-      // spelling (a team alias or an ID names no user). The user isn't shown.
-      const writers = repo.messages.writerUsers(messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
-      const me = session.authed.user_email;
-      const other = (user: string | undefined) => user !== undefined && user !== me;
-      // Security audit F-03 (#103): another user's item wakes this session
-      // only under a grant (msg.wake, policy.ts); otherwise it is delivered
-      // marked ungranted and not actionable, so the host shows it without
-      // starting a turn. Decided per pull, so a revoked grant stops the next
-      // wake (vision.md principle 11); one decision per writer per pull.
-      const granted = new Map<string, boolean>();
-      const wakes = (user: string) => granted.get(user) ?? (granted.set(user, authorize(repo, {}, { verb: "msg.wake", from_user: user, to_user: me }).allow), granted.get(user)!);
-      const mark = <P extends { id: number }>(post: P, push: boolean, user: string | undefined): P =>
-        !other(user) ? post : { ...post, other_user: true, ...(push && !wakes(user!) ? { ungranted: true } : {}) };
+      // A digest's latest post never wakes, so it carries other_user only.
+      const marks = writerMarks(repo, session, messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
       return [
-        ...messages.map((m): DeliveryEvent => {
-          const user = writers.messages.get(m.id);
-          return { kind: "direct", message: other(user) ? { ...showMessage(m), other_user: true, ...(wakes(user!) ? {} : { ungranted: true as const }) } : showMessage(m) };
-        }),
+        ...messages.map((m): DeliveryEvent => ({ kind: "direct", message: { ...showMessage(m), ...marks.message(m.id) } })),
         ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push"
-          ? { ...item, post: mark(item.post, true, writers.posts.get(item.post.id)) }
-          : { ...item, latest: mark(item.latest, false, writers.posts.get(item.latest.id)) } })),
+          ? { ...item, post: { ...item.post, ...marks.post(item.post.id) } }
+          : { ...item, latest: { ...item.latest, ...marks.post(item.latest.id, false) } } })),
       ];
     },
     boardCatalog(session: ApplicationSession, after?: string) {
@@ -1025,7 +1008,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
       valid(session, true);
-      return snapshot(db, reader(session, board), board, options);
+      // A resource read is a read like board_read, and carries its marks (#825).
+      const snap = snapshot(db, reader(session, board), board, options);
+      const marks = writerMarks(repo, session, [], snap.posts.map((p) => p.id));
+      return { ...snap, posts: snap.posts.map((p) => ({ ...p, ...marks.post(p.id) })) };
     },
     // O(1), for the metrics scrape (#805).
     get observerCount() { return observers.size; },
@@ -1538,6 +1524,12 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }
+  // board_read's posts carry the writer marks every read path does (#825).
+  if (tool === "board_read") {
+    const r = outcome.result as ReadResult;
+    const marks = writerMarks(hub.repo, session, [], r.posts.map((p) => p.id));
+    outcome = { ...outcome, result: { ...r, posts: r.posts.map((p) => ({ ...p, ...marks.post(p.id) })) } };
+  }
   // A hosted session with no name answers peer_list as its ID, but is nobody (#402).
   if (session.readOnly && tool === "peer_list" && outcome.result && typeof outcome.result === "object") delete (outcome.result as { you?: string }).you;
   for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(board);
@@ -1589,6 +1581,31 @@ function handleBoardPost(hub: Hub, session: ApplicationSession, me: string, args
   return r;
 }
 
+// Security audit F-10, F-03, #825: what another signed-in user wrote is
+// marked other_user, by the user recorded at write time, never the address's
+// spelling (a team alias or an ID names no user); the user isn't shown. One no
+// msg.wake grant covers is also marked ungranted: in a lease's pull it doesn't
+// wake (the host shows it without starting a turn), and on every read it's
+// data the instructions say not to act on without the user's approval
+// (vision.md principle 10). Every path marks the same way: the pull and the
+// pull-free reads (dm_inbox, dm_thread, dm_history, board_read, a board resource), so /clear or
+// a poll session loses no mark. Decided per call, so a revoked grant governs
+// the next one (principle 11); one decision per writer per call. Rows from
+// before the column carry no writer and no mark.
+type WriterMark = { other_user?: true; ungranted?: true };
+function writerMarks(repo: Repo, session: ApplicationSession, messageIds: number[], postIds: number[]) {
+  const writers = repo.messages.writerUsers(messageIds, postIds);
+  const me = session.authed.user_email;
+  const granted = new Map<string, boolean>();
+  const wakes = (user: string) => granted.get(user) ?? (granted.set(user, authorize(repo, {}, { verb: "msg.wake", from_user: user, to_user: me }).allow), granted.get(user)!);
+  const mark = (user: string | undefined, judged: boolean): WriterMark =>
+    user === undefined || user === me ? {} : { other_user: true, ...(judged && !wakes(user) ? { ungranted: true as const } : {}) };
+  return {
+    message: (id: number): WriterMark => mark(writers.messages.get(id), true),
+    post: (id: number, judged = true): WriterMark => mark(writers.posts.get(id), judged),
+  };
+}
+
 function handleHistory(hub: Hub, session: ApplicationSession, peer: string | undefined, limit: number | undefined, beforeId: number | undefined): HistoryMessage[] {
   const { repo } = hub;
   let lim: number;
@@ -1608,7 +1625,8 @@ function handleHistory(hub: Hub, session: ApplicationSession, peer: string | und
   const messages = repo.messages.history(mine, peerFull, lim, beforeId).reverse().map((m) =>
     mine.includes(m.sender) && m.recipient_type === "user" && !mine.includes(m.recipient) ? { ...m, delivered: m.delivered_at !== null || reached(m.recipient) >= m.id } : m,
   );
-  return messages.map(showMessage);
+  const marks = writerMarks(repo, session, messages.map((m) => m.id), []);
+  return messages.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
 }
 
 function handleInbox(hub: Hub, session: ApplicationSession, days: number | undefined): InboxResult {
@@ -1626,8 +1644,9 @@ function handleInbox(hub: Hub, session: ApplicationSession, days: number | undef
     const seen = lastSeen(db, u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(hub.now() - seen)} ago` } : {}) };
   });
+  const marks = writerMarks(repo, session, owed.map((m) => m.id), []);
   return {
-    unanswered: owed,
+    unanswered: owed.map((m) => ({ ...m, ...marks.message(m.id) })),
     ...(promises.length ? { promised: promises } : {}),
     ...(queued.length ? { undelivered_from_you: queued } : {}),
   };
@@ -1636,7 +1655,9 @@ function handleInbox(hub: Hub, session: ApplicationSession, days: number | undef
 function handleThread(session: ApplicationSession, messageId: number, repo: Repo): DirectMessage[] {
   const mine = (m: MessageRow | undefined): m is MessageRow => participant(m, session.addresses);
   if (!mine(repo.messages.getById(messageId))) fail("not_found", `message ${messageId} not found`);
-  return repo.messages.thread(messageId).filter(mine).map(showMessage);
+  const rows = repo.messages.thread(messageId).filter(mine);
+  const marks = writerMarks(repo, session, rows.map((m) => m.id), []);
+  return rows.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
 }
 
 // A receipt: the harness was handed these ids. Each stamps its delivery time
