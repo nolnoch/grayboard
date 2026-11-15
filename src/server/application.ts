@@ -527,7 +527,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (why?.code === "forbidden") throw why;
       fail("unauthenticated", "session is closed");
     }
-    if (repo.users.findById(session.authed.user_id)?.disabled_at != null) {
+    if (repo.users.isDisabled(session.authed.user_id)) {
       terminate(session, new ApplicationError("unauthenticated", "an admin signed this user out"));
       fail("unauthenticated", "an admin signed this user out");
     }
