@@ -7,7 +7,7 @@
 // helpers below are this module's own: nothing else calls them (policy.test.ts).
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { Principal } from "../core/resolver.ts";
-import { HUMAN_NAME } from "../shared/addressing.ts";
+import { HUMAN_NAME, HUMAN_RESERVED } from "../shared/addressing.ts";
 import { writeAudit } from "./audit.ts";
 import type { Repo, Team } from "./db.ts";
 import { RateLimiter, type RateLimit } from "./rate_limit.ts";
@@ -23,17 +23,27 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // The verb fixes the resource. msg.send: a requested DM (canSend);
 // human.reach: the same rule as a filter (mentions, thread replies);
 // alias.bind / act_as / scope.act: principal p acting in a scope, for a bind
-// or writes_as, an HTTP `as`, and visibility or the alias sweep; team.read /
-// team.manage: a user reading or changing a team's membership; admin: an
+// or writes_as, an HTTP `as`, and visibility or the alias sweep (a bind and an
+// `as` name the alias, which is never `human`; an `as` whose scope no
+// principal owns has a null scope); session.act: an HTTP `as` naming a session
+// ID, with that ID's row as the caller found it; team.read / team.manage /
+// team.leave: a user reading, changing or leaving a team's membership; admin: an
 // admin route; msg.wake: whether a delivery written by one signed-in user
 // wakes a session of another (users by email: the writer recorded at write
 // time and the receiving session's user, never an address's spelling, F-01).
 export type AuthzRequest =
   | { verb: "msg.send" | "human.reach"; from: string; to: string }
-  | { verb: "alias.bind" | "act_as" | "scope.act"; principal: Principal; scope: ActScope }
-  | { verb: "team.read" | "team.manage"; user: { id: number; email: string }; team: Team | undefined }
+  | { verb: "scope.act"; principal: Principal; scope: ActScope }
+  | { verb: "alias.bind"; principal: Principal; scope: ActScope; name: string }
+  | { verb: "act_as"; principal: Principal; address: string; name: string; scope: ActScope | null }
+  | { verb: "session.act"; user: string; session: string; row: SessionFacts | undefined }
+  | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
   | { verb: "admin"; email: string }
   | { verb: "msg.wake"; from_user: string; to_user: string };
+
+// What session.act judges of an ID's row: whose it is, and whether it's a
+// viewer's or has ended.
+export type SessionFacts = { principal: string | null; viewer: boolean; ended_at: number | null };
 
 export type Decision =
   | { allow: true; rule: string }
@@ -55,10 +65,18 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       const rule = humanRule(repo, ctx.humanReach ?? "team", req.from, req.to);
       return rule.allow ? allow(rule.rule) : deny(rule.rule, `${req.to} is a person's phone, reachable only by their teammates' agents`);
     }
-    case "alias.bind":
-    case "act_as":
     case "scope.act":
       return actIn(repo, req.principal, req.scope);
+    case "alias.bind":
+      return req.name === HUMAN_NAME ? deny("alias.human_reserved", HUMAN_RESERVED) : actIn(repo, req.principal, req.scope);
+    case "act_as":
+      if (req.name === HUMAN_NAME) return deny("alias.human_reserved", HUMAN_RESERVED);
+      if (!req.scope) return deny("scope.ownerless", `no principal owns the scope of "${req.address}"`);
+      return actIn(repo, req.principal, req.scope);
+    case "session.act":
+      return sessionRule(req.user, req.session, req.row);
+    case "team.leave":
+      return req.team && repo.teams.isMember(req.team.id, req.user.id) ? allow("team.member") : deny("team.member", "not found", "not_found");
     case "team.read": {
       const { team, user } = req;
       if (team && repo.teams.isMember(team.id, user.id)) return allow("team.member");
@@ -89,12 +107,18 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
     case "msg.send":
     case "human.reach":
       return { target: req.to, detail: { from: req.from, to: req.to } };
-    case "alias.bind":
-    case "act_as":
     case "scope.act":
       return { target: `${req.scope.scope_kind}:${req.scope.scope_ref}`, detail: { principal: req.principal.name, scope_kind: req.scope.scope_kind, scope_ref: req.scope.scope_ref } };
+    case "alias.bind":
+      return { target: `${req.scope.scope_kind}:${req.scope.scope_ref}`, detail: { principal: req.principal.name, scope_kind: req.scope.scope_kind, scope_ref: req.scope.scope_ref, name: req.name } };
+    case "act_as":
+      // The actor's address is the alias asked for; an ownerless one has no scope to name.
+      return { target: req.scope ? `${req.scope.scope_kind}:${req.scope.scope_ref}` : req.address, detail: { principal: req.principal.name, scope_kind: req.scope?.scope_kind ?? null, scope_ref: req.scope?.scope_ref ?? null, name: req.name } };
+    case "session.act":
+      return { target: req.session, detail: { session_requested: req.session } };
     case "team.read":
     case "team.manage":
+    case "team.leave":
       return { target: req.team ? `team:${req.team.name}` : null, detail: { team: req.team?.name ?? null } };
     case "admin":
       return { target: null, detail: {} };
@@ -165,6 +189,18 @@ function actIn(repo: Repo, p: Principal, scope: ActScope): Decision {
   return userId != null && team && repo.teams.isMember(team.id, userId)
     ? allow("scope.team_member")
     : deny("scope.team_member", `${p.name} isn't a member of team ${ref}`);
+}
+
+// Whether a user may act as a session ID over HTTP (an `as`, #284 S11): its
+// own live, non-viewer session. A missing row, a viewer's and another user's
+// read alike, so a refusal never says whose an ID is.
+function sessionRule(user: string, session: string, row: SessionFacts | undefined): Decision {
+  const notYours = `${session} isn't a session of yours`;
+  if (!row) return deny("session.unknown", notYours);
+  if (row.viewer) return deny("session.viewer", notYours);
+  if (row.principal !== user) return deny("session.other_user", notYours);
+  if (row.ended_at !== null) return deny("session.ended", `${session} ended at ${new Date(row.ended_at).toISOString()}`);
+  return allow("session.own");
 }
 
 // Whether what one user's session wrote may wake another user's session

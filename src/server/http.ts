@@ -196,20 +196,26 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   if (!input) return badRequest("as required: the address to act as");
   const p = addressParts(input);
   if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
+  // Security audit F-01 (#851): every refusal below is an `authz.decision` row.
   if (p.kind === "id") {
     const row = idRow(db, p.address);
-    if (!row || row.viewer || row.principal !== authed.user_email) return forbidden(`${p.address} isn't a session of yours`);
-    if (row.ended_at !== null) return forbidden(`${p.address} ended at ${new Date(row.ended_at).toISOString()}`);
+    const req: AuthzRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
+    const d = authorize(repo, {}, req);
+    if (!d.allow) {
+      recordDecision(repo, { user: authed.user_email }, req, d);
+      return forbidden(d.reason);
+    }
     return p.address;
   }
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
-  if (p.name === HUMAN_NAME) return forbidden(humanReason);
-  const owner = repo.resolver.principalOf(address);
-  if (!owner) return forbidden(`you can't act as "${address}": no principal owns its scope`);
-  const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, scope: { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
+  // The human check comes first (`humanReason`), before the scope's owner is known.
+  const owner = p.name === HUMAN_NAME ? null : repo.resolver.principalOf(address);
+  const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
   const d = authorize(repo, {}, req);
   if (!d.allow) {
     recordDecision(repo, { user: authed.user_email, address }, req, d);
+    if (d.rule === "alias.human_reserved") return forbidden(humanReason);
+    if (d.rule === "scope.ownerless") return forbidden(`you can't act as "${address}": no principal owns its scope`);
     return forbidden(`you can't act as "${address}": ${d.reason}`);
   }
   if (!repo.aliases.find(address)) {
@@ -426,10 +432,16 @@ function teamJoin(): Response {
   return forbidden("teams are invite-only; ask a member to run: grayboard team add <team> <your email>");
 }
 
-// A team the caller isn't in reads as not found, like its board.
+// A team the caller isn't in reads as not found, like its board; an admin
+// can't leave a team it isn't in. A refusal is recorded (policy.ts).
 function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | null {
-  const team = repo.teams.findByName(teamName.toLowerCase());
-  return team && repo.teams.isMember(team.id, authed.user_id) ? team : null;
+  const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const d = authorize(repo, {}, req);
+  if (!d.allow) {
+    recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+    return null;
+  }
+  return req.team!;
 }
 
 // Members read their team's roster; admins can read any team's. as_admin
