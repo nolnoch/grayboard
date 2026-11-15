@@ -12,7 +12,7 @@ import { boardNotification, dmNotification, fenceChannel, type Pending } from ".
 import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -925,8 +925,8 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       pending?: boolean;
     };
     const parent = parent_id === undefined ? undefined : getMessage(parent_id);
-    // `as` wins; a reply defaults to the held alias its parent reached or was
-    // sent as (#284 S4); else the primary.
+    // `as` wins (a reply's is checked below, #530); a reply defaults to the
+    // held alias its parent reached or was sent as (#284 S4); else the primary.
     const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, holds()) : null) ?? IDENTITY;
     checkBody(body);
     // A session ID is checked where the message is written (insertMessage).
@@ -947,6 +947,8 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     if (parent && peer !== recipient) {
       return { ...text(`error: ${replyPeerError(parent.id, peer!)}`), isError: true };
     }
+    const asError = parent ? replySenderError(parent, peer!, sender) : null;
+    if (asError !== null) return { ...text(`error: ${asError}`), isError: true };
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, WRITER, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }, via, rootLive));
     // The result names the sender whenever it isn't the primary.

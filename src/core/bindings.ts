@@ -225,6 +225,19 @@ export function replyPeerError(parentId: number, peer: string): string {
 }
 
 /**
+ * Why a reply may not go out as `sender` (#530 1), or null when it may: it
+ * goes out as the parent's party that isn't `peer`, so whoever holds that
+ * address later sees the whole thread. A party that is a session ID is the
+ * exception (#284 S4): no one else ever holds an ID, so its thread may move
+ * onto any address the session sends as.
+ */
+export function replySenderError(parent: { id: number; sender: string; recipient: string }, peer: string, sender: string): string | null {
+  const party = parent.sender === peer ? parent.recipient : parent.sender;
+  if (sender === party || addressParts(party)?.kind === "id") return null;
+  return `parent_id ${parent.id} is a thread you're in as ${party}, so a reply goes out as ${party}; to write as ${sender}, send without parent_id`;
+}
+
+/**
  * The address set a caller acting as `address` reads as (#284 S8), for a
  * server request that names one address (HTTP `?as=`, an attachment read):
  * `address` first, then the rest of the address set of the session it is or
