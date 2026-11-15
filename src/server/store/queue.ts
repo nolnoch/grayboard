@@ -9,10 +9,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 // effects flush before the next body starts. A body that returns a promise holds the queue until it settles.
 //
 // The holder is tracked through its async continuations (AsyncLocalStorage: a thread-local that follows the
-// logical task across awaits), so `mine` is true for the holding body's own code, sync or after an await, and
-// false for any other task that runs while the body is suspended. The store is a token per body, not the queue:
-// an async afterCommit effect a body started carries the context on past the body's release, and must not pass
-// for a later holder.
+// logical task across awaits, and into timers, listeners and promises the task starts), so `mine` is true for the
+// holding body and any task it started while holding, until it releases, and false for every other task. A timer
+// the body starts can therefore open a transaction while the body is suspended: the guard doesn't catch that. The
+// store is a token per body, not the queue: an async afterCommit effect a body started carries the context on
+// past the body's release, and must not pass for a later holder.
 const holder = new AsyncLocalStorage<object>();
 
 export class WriteQueue {
@@ -28,7 +29,8 @@ export class WriteQueue {
   // Whether a body holds the queue: true for the whole of a body's run, sync or async.
   get held(): boolean { return this.busy; }
 
-  // Whether the calling code is the holding body, or runs inside it (its afterCommit flush, its committed callback).
+  // Whether the calling code is the holding body or a task it started while holding (its afterCommit flush, its
+  // committed callback, a timer or un-awaited promise it began).
   get mine(): boolean { return this.busy && holder.getStore() === this.current; }
 
   // Throws when another task holds the queue: a transaction opened now would interleave with the holder's (D4).
