@@ -24,7 +24,7 @@ For each doc-relevant change, name the concept it touches and map it to its sing
   - doc-meta: <stated invariant or code-pointer now wrong, if any>
 ```
 
-- Server-only mechanics → `docs/architecture.md`; anything both modes share → `docs/boards.md`; Slack bridge → `docs/slack-bridge.md`; human steps → the owning `docs/guide/` page; commands, gotchas, release, hooks → `AGENTS.md`.
+- Server-only mechanics → `docs/architecture.md` or the `docs/server-*.md` file that owns them; anything both modes share → `docs/boards.md` or its owner file (`docs/CONTRACT.md` §4); Slack bridge → `docs/slack-bridge.md`; human steps → the owning `docs/guide/` page; commands, gotchas, release, hooks → `AGENTS.md`.
 - A change that builds something in `docs/future/` moves its as-built facts to the owner doc and deletes the future doc.
 - A bug or missing feature found along the way is a GitHub issue (`gh issue create`), not a doc section.
 
