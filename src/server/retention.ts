@@ -2,6 +2,7 @@ import { queuedTx, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { pruneEndedIds, prunePosts, type CoreDb } from "../core/boards.ts";
 import { pruneUnbound, sweepBlobs } from "../core/attachments.ts";
+import { queuedTx } from "./attachments.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
