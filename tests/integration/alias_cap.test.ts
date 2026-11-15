@@ -3,6 +3,7 @@
 // identity add); an existing name binds at any count; a team owner or an
 // admin deletes a team's unused name to free a slot.
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { endSession } from "../../src/core/session_end.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -29,6 +30,7 @@ afterEach(async () => {
 const names = (ref: string) => (srv.app.db.query(`SELECT name FROM aliases WHERE scope_ref = ? ORDER BY name`).all(ref) as { name: string }[]).map((r) => r.name);
 const deleted = () => (srv.app.db.query(`SELECT actor, target, detail FROM access_log WHERE action = 'alias.deleted' ORDER BY id`).all() as { actor: string; target: string; detail: string | null }[])
   .map((r) => ({ ...r, detail: r.detail ? JSON.parse(r.detail) : null }));
+const subs = (address: string) => srv.app.db.query(`SELECT * FROM subscriptions WHERE handle = ?`).all(address);
 const CAPPED = /already has 2 names, the server's cap of 2/;
 
 test("a team at its cap refuses a new name by bind and by writes_as; an existing name still binds", async () => {
@@ -38,12 +40,13 @@ test("a team at its cap refuses a new name by bind and by writes_as; an existing
     await s.unbind(`eng/${n}`);
   }
   await expect(srv.appSession(bob, "eng/c").connect()).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(/team "eng" already has 2 names.*grayboard team delete-alias eng <name>/) });
+  // The refused bind leaves its binding event.
+  expect(srv.app.db.query(`SELECT event FROM binding_events WHERE name = 'eng/c'`).all()).toEqual([{ event: "refused" }]);
   await expect(srv.appSession(bob, "eng/c", { push: false }).connect()).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(CAPPED) });
   expect(names("eng")).toEqual(["a", "b"]);
-  // The refused bind leaves its binding event.
-  expect(srv.app.db.query(`SELECT event FROM binding_events WHERE name = 'eng/c' ORDER BY id DESC LIMIT 1`).get()).toEqual({ event: "refused" });
-  // A name that exists binds at the cap.
+  // A name that exists binds, and is written as, at the cap.
   expect((await srv.appSession(bob, "eng/a").connect()).bind?.alias).toBe("eng/a");
+  await srv.appSession(bob, "eng/b", { push: false }).connect();
 });
 
 test("a user at the cap is refused a new identity over HTTP; the Slack human is not counted", async () => {
@@ -66,10 +69,22 @@ test("a team owner or an admin deletes an unused team name, freeing a slot; a me
   await b.unbind("eng/b");
 
   expect(await srv.api(bob, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toMatchObject({ status: 403 });
+  const carol = await srv.login("carol@example.com");
+  expect(await srv.api(carol, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toMatchObject({ status: 404 });
+  expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "human" })).toMatchObject({ status: 400, body: { message: expect.stringContaining("reserved") } });
+  expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "x/y" })).toMatchObject({ status: 400, body: { message: "invalid name" } });
+  // A tools-only session writing as the name holds it too.
+  const writer = srv.appSession(bob, "eng/b", { push: false });
+  await writer.connect();
+  expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toMatchObject({ status: 409, body: { code: "alias_held" } });
+  writer.close();
+  srv.app.repo.atomic(() => endSession(srv.app.db, srv.app.repo.mail, writer.id, { why: "exit", now: Date.now() }));
+  expect(subs("eng/b").length).toBeGreaterThan(0);
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "a" })).toMatchObject({ status: 409, body: { code: "alias_held", message: expect.stringContaining(held.id) } });
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "zzz" })).toMatchObject({ status: 404 });
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toEqual({ status: 200, body: { ok: true, deleted: "eng/b" } });
   expect(names("eng")).toEqual(["a"]);
+  expect(subs("eng/b")).toEqual([]);
 
   // The freed slot takes a new name; an admin outside the team deletes it.
   const c = srv.appSession(bob, "eng/c");

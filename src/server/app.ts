@@ -31,6 +31,8 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
     ...opts, helloLimit: opts.helloLimit ?? config.helloLimit, hostedRequestLimit: opts.hostedRequestLimit ?? config.hostedRequestLimit,
     delegateLimit: opts.delegateLimit ?? config.delegateLimit, delegateOpenCap: opts.delegateOpenCap ?? config.delegateOpenCap,
     observerCap: opts.observerCap ?? config.hostedCaps?.watches.global,
+    // The config's alone, no start option: HTTP's identity create reads the
+    // config too, so the two would otherwise disagree (#347).
     aliasScopeCap: config.aliasScopeCap,
   };
 }

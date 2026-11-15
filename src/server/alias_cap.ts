@@ -2,7 +2,7 @@ import type { Repo } from "./db.ts";
 import type { ScopeKind } from "../core/addresses.ts";
 
 // Names one scope (a user's, a team's) may hold (#347). Every create path a
-// client reaches (bind, writes_as, `grayboard identity add`) checks it before
+// client reaches (bind, writes_as, `grayboard identity create`) checks it before
 // a new name; an existing name binds at any count, so a server already past a
 // lowered cap keeps working. The Slack link's `human` is neither capped nor
 // counted. Fleet sessions mint a name per task and nothing prunes names, so

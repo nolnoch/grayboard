@@ -570,7 +570,8 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
   if (managed instanceof Response) return managed;
   if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
   const name = body.name.toLowerCase();
-  if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
+  if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved in every scope; no team has one`);
+  if (!isValidIdentityName(name)) return badRequest("invalid name");
   const existing = repo.aliases.find(`${managed.team.name}/${name}`);
   if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
   const user = aliasUser(db, existing.address);
