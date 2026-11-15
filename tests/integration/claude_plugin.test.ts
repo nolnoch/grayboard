@@ -684,6 +684,8 @@ test("a client without URL elicitation: the hook shows the link under its next c
   expect(shown(s)).toBe(`grayboard: open ${url} to sign in`);
   expect(await browse(srv.issuer, url, "Claude Code")).toContain("Signed in to grayboard");
   await signedIn(s);
+  // The grant is in the store before the flow's end removes its link, so a call can succeed first (#963).
+  await until(() => !linkFile(s), 5_000, "the signed-in flow's link removed");
   expect(shown(s)).toBeUndefined();
 }, 30_000);
 
