@@ -62,8 +62,21 @@ function everConnected(db: Database, to: string): boolean {
 
 // The refusal for a target in another user (security audit F-01).
 export function crossUserRefusal(to: string): string {
-  return `delegation stays within your own user in this slice; "${to}" belongs to another user (cross-user delegation needs an authority ruling, #184)`;
+  return `"${to}" belongs to another user, and you share no team whose policy is delegating with them (a team owner sets it: \`grayboard team policy <team> delegating\`; #256)`;
 }
+
+// How a requester may reach an explicit `to`: as its own user's launcher, under
+// a grant (a shared 'delegating' team on a server, #256), or not, with the
+// refusal. Auto-pick and the human fallback stay within the requester's user.
+export type DelegateReach = { ok: "own" | "granted" } | { refused: string };
+
+// A granted requester may fill at most this much of another user's launcher's
+// open cap, so a teammate's loop can't lock its owner out of their own launcher (#256).
+export const grantedCap = (cap: number): number => Math.max(1, Math.floor(cap / 2));
+
+// The default reach, and the only one locally (one user per bus): own user or refused.
+export const ownUserReach = (db: Database, principal: string | null) => (to: string): DelegateReach =>
+  sameUser(principal, to, db) ? { ok: "own" } : { refused: crossUserRefusal(to) };
 
 // Whether `candidate` is in the requester's own user. The user is the
 // authenticated principal, never an address's spelling: a team alias
@@ -75,10 +88,17 @@ export function crossUserRefusal(to: string): string {
 // bus. No session behind the candidate: not another user's; the roster and
 // launcher checks refuse it as unknown.
 export function sameUser(principal: string | null, candidate: string, db: Database): boolean {
+  const user = addressUser(db, candidate);
+  return user === undefined || user === principal;
+}
+
+// The user behind an address, by the rule above: an ID's principal, an
+// alias's holder's (or last holder's); undefined with no session behind it.
+export function addressUser(db: Database, candidate: string): string | null | undefined {
   const row = addressParts(candidate)?.kind === "id"
     ? db.prepare(`SELECT principal FROM ids WHERE id = ?`).get(candidate)
     : db.prepare(`SELECT i.principal FROM aliases a JOIN ids i ON i.id = ${ALIAS_SESSION_SQL} WHERE a.address = ?`).get(candidate);
-  return !row || (row as { principal: string | null }).principal === principal;
+  return row ? (row as { principal: string | null }).principal : undefined;
 }
 
 // Limits (#252). A requester spends one token per fresh delegation (a dedup
@@ -161,7 +181,7 @@ function humanFallbackHandle(
 export type Delegation = { to: string; body: string; humanFallback?: true };
 
 // Resolve the launcher and build the payload. Explicit `to` must be in the
-// requester's own user and a live launcher; without one, the first live
+// requester's own user, or granted (`reach`, #256), and a live launcher; without one, the first live
 // launcher (by name) of the requester's user takes it — rotation across
 // launchers is a follow-up. No live launcher: the request surfaces to the
 // requester's human instead (the issue's degrade path), if that human is
@@ -179,6 +199,7 @@ export function resolveDelegation(
   // A launcher's open delegation requests, against the cap (#252).
   open: (handle: string) => number = () => 0,
   cap: number = DELEGATE_OPEN_CAP,
+  reach: (to: string) => DelegateReach = ownUserReach(db, principal),
 ): Delegation {
   const persona = field(args.persona, "persona", MAX_PERSONA_CHARS);
   const task = field(args.task, "task", MAX_TASK_CHARS, true);
@@ -188,11 +209,13 @@ export function resolveDelegation(
   if (args.to !== undefined) {
     if (typeof args.to !== "string" || !args.to.trim()) throw new CoreError("to must be a string");
     const to = args.to.trim();
-    if (!sameUser(principal, to, db)) throw new CoreError(crossUserRefusal(to));
+    const r = reach(to);
+    if ("refused" in r) throw new CoreError(r.refused);
     if (!everConnected(db, to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
     if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
+    if (r.ok === "granted" && open(to) >= grantedCap(cap)) throw new CoreError(`"${to}" has ${open(to)} open delegation requests it hasn't taken; another user's requests stop at ${grantedCap(cap)}, half its cap, so its own user keeps the rest (#256); retry once it replies in one's thread`);
     if (open(to) >= cap) throw new CoreError(full(to, cap));
     return { to, body: delegationBody(brief) };
   }

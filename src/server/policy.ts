@@ -37,7 +37,10 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // team.leave: a user reading, changing or leaving a team's membership; admin: an
 // admin route; msg.wake: whether a delivery written by one signed-in user
 // wakes a session of another (users by email: the writer recorded at write
-// time and the receiving session's user, never an address's spelling, F-01).
+// time and the receiving session's user, never an address's spelling, F-01);
+// delegate.to: whether a user's session may name another user's launcher in
+// `delegate`'s `to` (#256; users by email, the target's from the session
+// that holds the address).
 export type AuthzRequest =
   | { verb: "msg.send" | "human.reach"; from: string; to: string }
   | { verb: "scope.act"; principal: Principal; scope: ActScope }
@@ -48,7 +51,7 @@ export type AuthzRequest =
   | { verb: "attachment.read"; identity: string; attachment: string; reach: AttachmentReach | undefined }
   | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
   | { verb: "admin"; email: string }
-  | { verb: "msg.wake"; from_user: string; to_user: string };
+  | { verb: "msg.wake" | "delegate.to"; from_user: string; to_user: string };
 
 // What session.act judges of an ID's row: whose it is, and whether it's a
 // viewer's or has ended.
@@ -114,6 +117,8 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
     }
     case "msg.wake":
       return wakeRule(repo, req.from_user, req.to_user);
+    case "delegate.to":
+      return delegateRule(repo, req.from_user, req.to_user);
     case "admin": {
       if (isAdmin(ctx, req.email)) return allow("admin.env");
       const admins = ctx.admins ?? [];
@@ -148,6 +153,7 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
     case "admin":
       return { target: null, detail: {} };
     case "msg.wake":
+    case "delegate.to":
       return { target: req.to_user, detail: { from_user: req.from_user, to_user: req.to_user } };
   }
 }
@@ -239,6 +245,17 @@ function wakeRule(repo: Repo, fromUser: string, toUser: string): Decision {
   const a = repo.users.findByEmail(fromUser), b = repo.users.findByEmail(toUser);
   if (a && b && repo.teams.shareCollaborative(a.id, b.id)) return allow("wake.team_policy");
   return deny("wake.cross_user", `${fromUser} shares no collaborative team with ${toUser}; delivered as mail that doesn't wake their agent`);
+}
+
+// Whether a user's session may hand a task to another user's launcher by
+// name (#256). A user's own launchers take it; across users, only members of
+// a shared 'delegating' team. The grant is the team's, set by its owner; an
+// owner-approved grant per launcher is #874. No admin exemption, as for wakes.
+function delegateRule(repo: Repo, fromUser: string, toUser: string): Decision {
+  if (fromUser === toUser) return allow("delegate.same_user");
+  const a = repo.users.findByEmail(fromUser), b = repo.users.findByEmail(toUser);
+  if (a && b && repo.teams.shareDelegating(a.id, b.id)) return allow("delegate.team_policy");
+  return deny("delegate.cross_user", `${fromUser} shares no team whose policy is delegating with ${toUser}`);
 }
 
 // Whether the address `from` may wake `to` when `to` is a human

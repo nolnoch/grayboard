@@ -10,7 +10,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySe
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
-import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, resolveDelegation, sameUser } from "../core/delegation.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
@@ -1412,10 +1412,30 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   // A launcher's open requests: the same window dm_inbox lists by default (#252).
   const since = hub.now() - inboxDays(undefined) * 86_400_000;
   const open = (h: string) => repo.messages.openDelegations(h, since);
-  // The limiter's streak rows from this call: written inside the dedup
-  // transaction they'd roll back with it, so they're written after it.
+  // The limiter's streak rows and the policy denies' decision rows from this
+  // call: written inside the dedup transaction they'd roll back with it, so
+  // they're written after it. A session with no afterRollback of its own (WSS)
+  // collects its refusal rows here for the call, so they reach the catch path
+  // below rather than being written into the transaction (#867).
   const rows: (() => void)[] = [];
   hub.delegateRows = rows;
+  const ownAfterRollback = session.afterRollback;
+  if (!ownAfterRollback) session.afterRollback = (w) => rows.push(w);
+  // Whether this user may name `to`'s launcher (#256): its own user's, or
+  // another's under a shared 'delegating' team (policy.ts delegate.to). The
+  // target's user is the session behind the address now, so a team alias
+  // that changed hands is judged by its holder at this call. A deny is a
+  // decision row (written after the rollback, above).
+  const reach = (to: string): DelegateReach => {
+    const owner = addressUser(db, to);
+    if (owner === undefined || owner === authed.user_email) return { ok: "own" };
+    if (owner === null) return { refused: crossUserRefusal(to) };
+    const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
+    const decision = authorize(repo, {}, req);
+    if (decision.allow) return { ok: "granted" };
+    rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, session.primary), req, decision, { launcher: to }));
+    return { refused: crossUserRefusal(to) };
+  };
   try {
     out = writeOnce(hub, session, "delegate", session.primary, args, m.resend === true, [], () => {
       // Checked and spent in here, so a dedup replay is neither charged nor
@@ -1423,7 +1443,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       // The user's bucket, not the address's (#252): the row names the session that tripped it.
       const t = hub.delegateLimiter.check(authed.user_email, { requester: session.primary, session_id: session.sessionId, ...byChild });
       if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
-      const d = resolveDelegation(db, session.primary, authed.user_email, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h), open, hub.delegateOpenCap);
+      const d = resolveDelegation(db, session.primary, authed.user_email, { ...m, to }, online, humanReachable, (h) => session.addresses.includes(h), open, hub.delegateOpenCap, reach);
       picked = d.to;
       const w = writeSend(hub, session, prepareSend(hub, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
@@ -1445,7 +1465,10 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       // An auto-pick repeat never named this target: say the first
       // delegation went, and how to delegate afresh (a fresh pick).
       const hint = m.to === undefined ? ` This repeat was not sent: your first call auto-picked "${stored.to}"; to delegate again with a fresh pick, call with resend: true.` : "";
-      if (!sameUser(authed.user_email, stored.to, db)) throw new CoreError(crossUserRefusal(stored.to) + hint);
+      // The grant is authority: one revoked (the team's policy, membership, or
+      // the alias's holder) since the first call refuses the replay (#256).
+      const r = reach(stored.to);
+      if ("refused" in r) throw new CoreError(r.refused + hint);
       const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
       const decision = authorize(repo, { humanReach: hub.humanReach }, req);
       if (!decision.allow) {
@@ -1455,6 +1478,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     });
   } catch (e) {
     hub.delegateRows = undefined;
+    if (!ownAfterRollback) session.afterRollback = undefined;
     for (const row of rows) rowAfterRollback(session, row);
     // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
@@ -1469,6 +1493,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     throw e;
   }
   hub.delegateRows = undefined;
+  if (!ownAfterRollback) session.afterRollback = undefined;
   // Committed with the write: kept, and written again should hosted's outer transaction roll back.
   for (const row of rows) { row(); session.afterRollback?.(row); }
   if ("replay" in out) return out.replay;
