@@ -147,6 +147,32 @@ test("behind the trusted loopback each X-Forwarded-For has its own bucket, trust
   expect([X, Y]).not.toContain(targets[0]);
 });
 
+// #274: through startServer, an IPv6 X-Forwarded-For spends its /64 and its
+// /48, on the auth gate and on the OAuth routes (app.ts passes caller.site).
+test("IPv6 /64s rotating under one /48 drain it on the auth gate and the OAuth routes; another /48 is unaffected", async () => {
+  const err = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.001 }, oauthLimit: { burst: 1, perSec: 0.001 } });
+    const v6 = (site: number, net: number) => `2001:db8:${site}:${net}::1`;
+    // Auth gate: the /48 holds 4, so four /64s each fail once and the fifth is refused before any lookup.
+    for (let net = 0; net < 4; net++) expect((await get(srv, "/api/whoami", `bad${net}`, v6(1, net))).status).toBe(401);
+    const refused = await get(srv, "/api/whoami", "bad9", v6(1, 9));
+    expect(refused.status).toBe(429);
+    expect(((await refused.json()) as { message: string }).message).toContain("this network (/48)");
+    expect((await get(srv, "/api/whoami", "bad9", v6(2, 9))).status).toBe(401);
+    expect(audit(srv, "auth.rate_limited").map((r) => r.target)).toEqual(["2001:db8:1::/48"]);
+    // OAuth: a browser route from four /64s of /48 3 spends its OAuth /48 sibling; the fifth is refused.
+    const browse = (from: string) => fetch(`${srv.base}/oauth/unknown`, { headers: { "X-Forwarded-For": from } }).then((r) => r.status);
+    for (let net = 0; net < 4; net++) expect(await browse(v6(3, net))).not.toBe(429);
+    expect(await browse(v6(3, 9))).toBe(429);
+    expect(await browse(v6(4, 9))).not.toBe(429);
+    const oauthScopes = audit(srv, "oauth.rate_limited").map((r) => [r.target, (r.detail as { scope: string }).scope]);
+    expect(oauthScopes).toEqual([["2001:db8:3::/48", "site"]]);
+  } finally {
+    err.mockRestore();
+  }
+});
+
 test("a run of refusals writes one row and one log line at its start and one at its end", async () => {
   const { srv, clock } = serve();
   // The limiter's own lines, out of everything else the server logs (#277).

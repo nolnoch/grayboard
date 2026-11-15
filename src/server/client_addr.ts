@@ -100,6 +100,16 @@ export function rateKey(ip: string): string {
   return `${expandV6(ip).slice(0, 4).map((g) => g.toString(16)).join(":")}::/64`;
 }
 
+/** The coarse limiter key for an address: an IPv6 address's /48, so a
+ *  prefix rotating through its /64s still spends one shared bucket (#274).
+ *  A /48 is often more than one site: an ISP's /48 holds 256 customers' /56s
+ *  or a carrier's devices' /64s, all of whom a drained /48 refuses. IPv4 has
+ *  none: null. */
+export function siteKey(ip: string): string | null {
+  if (isIP(ip) === 4) return null;
+  return `${expandV6(ip).slice(0, 3).map((g) => g.toString(16)).join(":")}::/48`;
+}
+
 // An IPv6 address's eight groups.
 function expandV6(ip: string): number[] {
   const groups = (part: string): number[] => {

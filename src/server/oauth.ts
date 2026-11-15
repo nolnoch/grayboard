@@ -10,6 +10,7 @@ import { writeAudit } from "./audit.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isTrustedOrigin } from "./origin.ts";
+import { SITE_LIMIT_FACTOR } from "./auth_gate.ts";
 
 // `sourceKey` is the `_meta` key that maps this client's hosted session source, or null
 // (unmapped: reads only). A pure function of the client ID and the startup config.
@@ -22,7 +23,9 @@ export type OAuthOptions = {
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
   exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<GoogleIdentity>;
 };
-export type OAuthNetworkContext = { key: string };
+// The auth gate's keys for the caller: its address (/64 for IPv6) and, for
+// IPv6, its /48 (#274), else null.
+export type OAuthNetworkContext = { key: string; site?: string | null };
 const random = () => randomBytes(32).toString("base64url");
 const challenge = (s: string) => createHash("sha256").update(s).digest("base64url");
 const escapeHTML = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -157,8 +160,16 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     },
   }, now, maxKeys);
   const globalLimit = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "global", 1);
-  const addressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "address", 1000);
-  const tokenAddressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "token_address", 1000);
+  const addressRate = config.oauthLimit ?? { burst: 60, perSec: 1 };
+  const addressLimit = limiter(addressRate, "address", 10_000);
+  const tokenAddressLimit = limiter(addressRate, "token_address", 10_000);
+  // The IPv6 /48 tier (#274), as on the auth gate: each address bucket has a
+  // /48 sibling, SITE_LIMIT_FACTOR times its size with its own cap, checked
+  // after it and spent with it. A new /64 bucket costs its /48 a token, so a
+  // prefix rotating /64s holds a bounded number and can't fill the cap.
+  const siteRate = { burst: addressRate.burst * SITE_LIMIT_FACTOR, perSec: addressRate.perSec * SITE_LIMIT_FACTOR };
+  const siteLimit = limiter(siteRate, "site", 10_000);
+  const tokenSiteLimit = limiter(siteRate, "token_site", 10_000);
   // Thins the audit rows of refused token posts org-wide (F-18, #931). It is
   // spent at the refusal and never checked before the work, so a flood of
   // bogus refreshes can't make a valid one wait; while it's empty a refusal
@@ -169,7 +180,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const sweep = () => {
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
-    globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep(); refusalRows.sweep();
+    globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep(); siteLimit.sweep(); tokenSiteLimit.sweep(); refusalRows.sweep();
     repo.oauth.cleanup(t);
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
@@ -185,15 +196,20 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // block refresh. Their work is indexed reads and an allowlisted, cached CIMD
   // client; their writes, the refusal audit rows, are thinned org-wide by
   // refusalRows. Every other route is charged on entry, against its address
-  // and the global one.
+  // and the global one. Either kind also spends its IPv6 /48 sibling (#274).
   type Buckets = readonly (readonly [RateLimiter, string])[];
-  const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets => token
-    ? [[tokenAddressLimit, context?.key ?? "unknown"]]
-    : [[addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]];
+  const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets => {
+    const key = context?.key ?? "unknown";
+    const site = context?.site;
+    return token
+      ? [[tokenAddressLimit, key], ...(site ? [[tokenSiteLimit, site] as const] : [])]
+      : [[addressLimit, key], ...(site ? [[siteLimit, site] as const] : []), [globalLimit, "global"]];
+  };
   const spend = (checks: Buckets, path: string) => { for (const [limit, key] of checks) limit.spend(key, { path: routeName(path) }); };
   const rate = (checks: Buckets, path: string): Response | undefined => {
-    // The address goes first and nothing is spent until both pass: a request
-    // its own address refuses must not drain the org-wide bucket.
+    // The address goes first, then its /48, then the org-wide bucket, and
+    // nothing is spent until all pass: a request its own address refuses
+    // must not drain its /48's or the org-wide bucket.
     for (const [limit, key] of checks) {
       const result = limit.check(key, { path: routeName(path) });
       if (!result.ok) return json({ error: "temporarily_unavailable" }, 429, { "Retry-After": String(retrySecs(result.retryAfterMs)) });
