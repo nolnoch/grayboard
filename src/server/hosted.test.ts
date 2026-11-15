@@ -912,7 +912,6 @@ test("a declared launcher is a delegation target, and only its own session's ini
 
 // #521 4 / #532 4: a declared launcher counts only while its delivery is live. Declared but with no lease (an
 // unenrolled or polling root), it's neither auto-picked nor accepted by name; once its delivery opens, it is.
-// Declaring grants nothing else: a launcher takes only its own user's requests, or a delegating team's (#256).
 test("a declared launcher with no live delivery is no delegation target until its delivery opens (#521 4)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const ctx = (raw: string, extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: raw, ...extra });
