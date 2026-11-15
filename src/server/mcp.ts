@@ -173,7 +173,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const row = hosted.row(context.sessionContext.id);
     const root = row && hosted.rootOf(row);
     if (!root || root.lease_deadline === null || root.lease_deadline > now()) return { row, root };
-    hosted.settle(root.session_id);
+    // authorize is sync: the settle is posted (#807 P1b-4b). One that waits behind another body's write ends this
+    // root when it runs; until then its lapsed lease already leaves the request no row, as the end will.
+    if (!application.repo.post(() => { hosted.settle(root.session_id); }, undefined, "hosted settle")) return { row: undefined };
     return { row: hosted.row(context.sessionContext.id) };
   }
   // authorize's checks that read no hosted row: the request, the token and grant, the session and its user.

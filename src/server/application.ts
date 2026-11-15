@@ -517,7 +517,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const addr = session.primary;
       if (addr && hub.registry.get(addr) === session) {
         hub.registry.delete(addr);
-        logBinding(db, HUMAN_NAME, addr, "released", "connection closed");
+        repo.post(() => logBinding(db, HUMAN_NAME, addr, "released", "connection closed"), undefined, "human release row");
       }
       return;
     }
@@ -525,7 +525,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
     const id = session.sessionId;
     detach(session);
-    if (session.writerId) touchId(db, session.writerId);
+    // Close runs from sync finally blocks and commit callbacks: the touch is posted, not awaited (#807 P1b-4b).
+    const writer = session.writerId;
+    if (writer) repo.post(() => touchId(db, writer), undefined, "last-seen touch");
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes.
@@ -556,14 +558,18 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (!t.ok) fail("rate_limited", `too many connections for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
   }
 
-  // Ends sessions, each in its own transaction (bounces, claim releases,
-  // holds released), then wakes what that changed and sweeps the freed
-  // upload bytes. One end that throws is logged and audited id.end_failed
-  // and leaves the others ended. Only a revoked alias's end is retried while
+  // Ends sessions in one write, each end its own savepoint inside it (bounces, claim releases, holds released; #807
+  // P1b-4b), then wakes what that changed and sweeps the freed upload bytes. One end that throws rolls back alone, is
+  // logged and audited id.end_failed, and leaves the others ended. Only a revoked alias's end is retried while
   // the server runs (revalidate re-checks it); a startup leftover's is
   // retried at the next start, and its holds stay until then (#475 item 2).
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
+    repo.post(() => endIdsIn(ids, why), ends => afterEnds(ends.woken, ends.bounced), "session ends");
+  }
+  type Ends = { woken: Set<string>; bounced: { id: string; at: number }[] };
+  // endIds's body, inside a write body.
+  function endIdsIn(ids: string[], why: string): Ends {
     const woken = new Set<string>(), bounced: { id: string; at: number }[] = [];
     for (const id of ids) {
       let ended;
@@ -581,7 +587,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       bounced.push({ id, at });
       if (ended.held.length) console.error(`[grayboard] session ${id} ended (${why}); released ${ended.held.join(", ")}`);
     }
-    afterEnds(woken, bounced);
+    return { woken, bounced };
   }
   // What follows ends, after their commit: a bounce goes to a live sender now, as a send does (a drain would
   // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go.
@@ -609,15 +615,24 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // it now refuses. by: the user whose act changed the access (an admin's
   // team removal, the principal's own leave), or null for the server's own
   // sweep; the revocations' audit actor.
+  // One write (#807 P1b-4b): the uses are read, and revoked, in its transaction; live holders follow after the commit.
+  // A caller's open transaction takes it in; a held queue makes it wait behind the holder.
   function recheckAliases(principal: string | null, by: string | null): void {
-    const revoked: (AliasUse & { reason: string })[] = [];
-    for (const u of aliasUses(db, principal)) {
-      const p = repo.principals.findByName(u.principal);
-      const d = p ? authorize(repo, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
-      const reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
-      if (reason) revoked.push({ ...u, reason });
-    }
-    revokeAliases(revoked, by);
+    repo.post(() => {
+      const revoked: (AliasUse & { reason: string })[] = [];
+      for (const u of aliasUses(db, principal)) {
+        const p = repo.principals.findByName(u.principal);
+        const d = p ? authorize(repo, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
+        const reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
+        if (reason) revoked.push({ ...u, reason });
+      }
+      return revokeAliases(revoked, by);
+    }, ({ resync, ends }) => {
+      // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
+      // address set and registry entries follow the database, as a bind or unbind's do.
+      for (const id of resync) for (const s of hub.sessions) if (!s.human && s.sessionId === id) setHolds(hub, s, holdsOf(db, id));
+      afterEnds(ends.woken, ends.bounced);
+    }, "alias recheck");
   }
   // Takes aliases from sessions whose principals may no longer act in their
   // scopes (S9). A holder keeps its ID and its other holds: only the revoked
@@ -627,9 +642,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // holder is rebuilt and its lease closed. HTTP has no frame to tell it, so the
   // loss is kept (#453): the root's next native whoami or tool result takes it
   // once, and its Controller's whoami reports it until the next delivery_open.
-  function revokeAliases(uses: (AliasUse & { reason: string })[], by: string | null): void {
-    if (!uses.length) return;
-    const ended: string[] = [];
+  // Inside recheckAliases's write body; returns what its commit hands on: the non-hosted holders to resync, the ends.
+  function revokeAliases(uses: (AliasUse & { reason: string })[], by: string | null): { resync: string[]; ends: Ends } {
+    const ended: string[] = [], resync: string[] = [];
+    if (!uses.length) return { resync, ends: { woken: new Set(), bounced: [] } };
     for (const u of uses) {
       const { reason } = u;
       const hosted = repo.hosted.owned(u.id);
@@ -660,12 +676,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (hosted) repo.hosted.atomic(revoke);
       else {
         repo.atomic(revoke);
-        // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
-        // address set and registry entries follow the database, as a bind or unbind's do.
-        for (const s of hub.sessions) if (!s.human && s.sessionId === u.id) setHolds(hub, s, holdsOf(db, u.id));
+        resync.push(u.id);
       }
     }
-    endIds(ended, "revoked");
+    return { resync, ends: endIdsIn(ended, "revoked") };
   }
 
   // The Slack bridge's in-process human (S16): no ID and no ids row.

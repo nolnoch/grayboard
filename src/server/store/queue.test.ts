@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterCommit } from "../../core/sqlite.ts";
 import { openDatabase } from "../db.ts";
+import { writeAudit } from "../audit.ts";
 import { queueFor, WriteQueue } from "./queue.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 
@@ -218,4 +219,78 @@ test("an async afterCommit effect a body started doesn't pass for a later holder
   expect(String(seen)).toContain("another body holds the write queue");
   release();
   await holder;
+});
+
+// post (#807 P1b-4b): a write no caller awaits.
+test("post runs now on an idle queue, through it, and throws its error there", () => {
+  const { db, repo } = open();
+  let mine = false;
+  expect(repo.post(() => { mine = queueFor(db).mine; repo.users.upsertByEmail("idle@example.com", null); })).toBe(true);
+  expect(mine).toBe(true);
+  expect(repo.users.findByEmail("idle@example.com")).toBeDefined();
+  expect(() => repo.post(() => { throw new Error("now"); })).toThrow("now");
+  expect(queueFor(db).held).toBe(false);
+});
+
+test("post waits behind another body's hold, lands after it, and outlives the holder's rollback", async () => {
+  const { db, repo } = open();
+  let release!: () => void;
+  const holder = queueFor(db).run(async () => {
+    await new Promise<void>(r => { release = r; });
+    try { repo.atomic(() => { repo.users.upsertByEmail("holder@example.com", null); throw new Error("holder rolls back"); }); } catch {}
+  });
+  const seen: string[] = [];
+  expect(repo.post(() => { repo.users.upsertByEmail("posted@example.com", null); }, () => seen.push("committed"))).toBe(false);
+  expect(repo.users.findByEmail("posted@example.com")).toBeUndefined();
+  release();
+  await holder;
+  await queueFor(db).run(() => {});
+  expect(repo.users.findByEmail("holder@example.com")).toBeUndefined();
+  expect(repo.users.findByEmail("posted@example.com")).toBeDefined();
+  expect(seen).toEqual(["committed"]);
+});
+
+test("post inside a write body is part of its transaction; committed runs after the commit", async () => {
+  const { repo } = open();
+  const seen: string[] = [];
+  await expect(repo.write(() => {
+    expect(repo.post(() => { repo.users.upsertByEmail("rolled@example.com", null); }, () => seen.push("never"))).toBe(true);
+    throw new Error("body rolls back");
+  })).rejects.toThrow("body rolls back");
+  expect(repo.users.findByEmail("rolled@example.com")).toBeUndefined();
+  await repo.write(() => {
+    repo.post(() => { repo.users.upsertByEmail("kept@example.com", null); }, () => seen.push("committed"));
+    seen.push("body");
+  });
+  expect(repo.users.findByEmail("kept@example.com")).toBeDefined();
+  expect(seen).toEqual(["body", "committed"]);
+});
+
+test("a post that waited and failed is logged as its `what`, not thrown", async () => {
+  const { db, repo } = open();
+  let release!: () => void;
+  const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
+  const logged: unknown[][] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  try {
+    expect(repo.post(() => { throw new Error("late"); }, undefined, "test write")).toBe(false);
+    release();
+    await holder;
+    await queueFor(db).run(() => {});
+    await Promise.resolve();
+  } finally { console.error = error; }
+  expect(logged.some(a => a[0] === "[grayboard] test write failed:" && String(a[1]).includes("late"))).toBe(true);
+});
+
+test("writeAudit under another body's hold waits for it rather than writing into it", async () => {
+  const { db, repo } = open();
+  let release!: () => void;
+  const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
+  writeAudit(repo, "hosted.stream_closed", null, "s-1", { reason: "test" });
+  expect(repo.audit.last("hosted.stream_closed", "s-1")).toBeUndefined();
+  release();
+  await holder;
+  await queueFor(db).run(() => {});
+  expect(repo.audit.last("hosted.stream_closed", "s-1")).toBeDefined();
 });

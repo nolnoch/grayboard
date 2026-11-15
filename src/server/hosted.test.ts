@@ -677,6 +677,26 @@ test("revoking one hosted hold releases only it, bumps the generation and closes
   await expect(delivery.receipt(principal, context("root"), lease.capability, [])).rejects.toHaveProperty("code", "not_found");
 });
 
+test("an alias revoke issued while another body holds the write queue waits behind it, then revokes and closes the lease (#807 P1b-4b)", async () => {
+  const team = database.repo.teams.create("ops", principal.authed.user_id);
+  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
+  await delivery.open(principal, context("root"));
+  const before = database.repo.hosted.get((context("root") as { id: string }).id)!;
+  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  let release!: () => void;
+  const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
+  application.accessChanged(principal.authed.user_email, "admin@example.com");
+  expect(database.repo.hosted.get(before.session_id)!.bind_gen).toBe(before.bind_gen);
+  expect(delivery.activeLeaseCount).toBe(1);
+  release();
+  await holder;
+  await queueFor(database.db).run(() => {});
+  expect(database.repo.hosted.get(before.session_id)!.bind_gen).toBeGreaterThan(before.bind_gen);
+  expect(delivery.activeLeaseCount).toBe(0);
+  expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'alias.revoked'").get()).toEqual({ n: 1 });
+});
+
 test("a revoked tools-only hosted root's ownership ends, audited once: a later recheck finds nothing to revoke again (#454)", async () => {
   const team = database.repo.teams.create("ops", principal.authed.user_id);
   database.repo.teams.addMember(team.id, principal.authed.user_id);
