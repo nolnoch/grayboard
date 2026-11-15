@@ -1,6 +1,6 @@
 // Turns off zod's cycle-support memoizer for the server process (#940). zod 4.6 installs it by default and it wraps
 // every container whose schema is recursive (the MCP SDK's JSON value and result-meta schemas among them) with a
-// per-parse WeakMap lookup, and clones issues on every miss: about 1% of server CPU at 1000 sessions, and about a third
+// per-parse WeakMap lookup, and clones issues on every failed parse: about 1% of server CPU at 1000 sessions, and about a third
 // of the SDK's message-parse time in a microbenchmark. It buys only parsing of cyclic object graphs, which JSON.parse
 // can't produce and JSON.stringify can't send. With it off, zod behaves as zod/mini does by default.
 //

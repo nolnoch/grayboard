@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { CallToolRequestSchema, CallToolResultSchema, JSONRPCMessageSchema } from "@modelcontextprotocol/core";
+import { globalConfig, memoizer } from "zod/v4/core";
 
 // #940: zod reads the memoizer when a schema is built, so zod_config.ts only takes effect if it runs before every
 // other module of the server: its first import.
@@ -18,6 +19,7 @@ const bad = { content: [{ type: "text" }], isError: "yes" };
 // Under the default memoizer (this process) and with it off (a child that loads zod_config.ts first), the SDK's
 // schemas give the same answers on the same JSON, failures included.
 test("with the memoizer off, the SDK's schemas parse JSON exactly as with it on", () => {
+  expect(globalConfig.memoizer).toBe(memoizer());
   const verdicts = () => [
     JSONRPCMessageSchema.safeParse(request), CallToolRequestSchema.safeParse(request),
     CallToolResultSchema.safeParse(result), CallToolResultSchema.safeParse(bad),
@@ -32,8 +34,9 @@ test("with the memoizer off, the SDK's schemas parse JSON exactly as with it on"
       .map((r) => (r.success ? { ok: true, data: r.data } : { ok: false, issues: r.error.issues }));
     console.log(JSON.stringify({ off: globalConfig.memoizer !== memoizer(), verdicts }));
   `;
-  const child = Bun.spawnSync([process.execPath, "-e", script], { cwd: join(import.meta.dir, "../.."), stderr: "pipe" });
+  const child = Bun.spawnSync([process.execPath, "-e", script], { cwd: join(import.meta.dir, "../.."), stderr: "pipe", timeout: 20_000 });
   expect(child.stderr.toString()).toBe("");
+  expect(child.exitCode).toBe(0);
   const out = JSON.parse(child.stdout.toString());
   expect(out.off).toBe(true);
   expect(out.verdicts).toEqual(JSON.parse(JSON.stringify(verdicts())));
