@@ -247,8 +247,8 @@ test("only a generic-key client's delivery declaration is read, and strictly", (
 
 test("a bind result follows the declared delivery: push has no lease note, poll has no channel lines and says to check, absent points at delivery_open", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
-  // A pushed session is told what other_user means (security audit F-10); a poll session gets no pushes to mark.
-  const general = (source: string | null) => () => source === null ? [] : [OTHER_USER_NOTE];
+  // Every session is told what other_user and ungranted mean (security audit F-10): a poll session's reads carry them too (#825).
+  const general = (_source: string | null) => () => [OTHER_USER_NOTE];
   const expected = (name: string, source: string | null, notes: string[]) => [`Bound to "${name}"; the instructions' note that this session has no bus name no longer applies.`, ...notes, ...boundInstructions(name, source, true, general(source), [])].join(" ");
   const cases = [
     ["push-run", { mode: "push", source: "grayboard-pi" }, "grayboard-pi", []],
@@ -265,17 +265,16 @@ test("a bind result follows the declared delivery: push has no lease note, poll 
   expect(texts["push-run"]).toContain(`<channel source="grayboard-pi" message_id="..."`);
   expect(texts["absent-run"]).toContain(`<channel source="grayboard" message_id="..."`);
   // A poll session's bind result reads as its `initialize` text does: no channel lines.
-  for (const line of ["<channel", "Pushes don't survive /clear", "delivery_open", "other_user"]) expect(texts["poll-run"]).not.toContain(line);
-  for (const name of ["push-run", "absent-run"]) expect(texts[name]).toContain(OTHER_USER_NOTE);
+  for (const line of ["<channel", "Pushes don't survive /clear", "delivery_open"]) expect(texts["poll-run"]).not.toContain(line);
+  for (const name of ["push-run", "absent-run", "poll-run"]) expect(texts[name]).toContain(OTHER_USER_NOTE);
   for (const line of COORDINATION_INSTRUCTIONS) expect(texts["poll-run"]).toContain(line);
-  // Unbind's result under a remaining name carries the same general lines: a pushed session keeps the other_user line, a poll one never gets it.
+  // Unbind's result under a remaining name carries the same general lines, the other_user line included.
   for (const [name, declared, source] of cases) {
     const ctx = sessionContext(generic, { [GRAYBOARD_SESSION_META]: name });
     await hosted.bind(generic, ctx, { name: `${name}-2`, create: true }, declared);
     const released = await hosted.unbind(generic, ctx, { name }, declared);
     const text = (released.structuredContent as { instructions: string[] }).instructions.join(" ");
-    if (source === null) expect(text).not.toContain("other_user");
-    else expect(text).toContain(OTHER_USER_NOTE);
+    expect(text).toContain(OTHER_USER_NOTE);
   }
 });
 
@@ -925,7 +924,7 @@ test("a bound session with no delivery declaration (OpenCode) gets initialize te
   expect(unleased).toContain("Poll dm_inbox");
   expect(unleased).toContain(note);
   expect(unleased).not.toContain("<channel");
-  expect(unleased).not.toContain("other_user");
+  expect(unleased).toContain(OTHER_USER_NOTE);
   // The launcher lines ride either, only with the flag.
   for (const leaseOpen of [false, true]) expect(hostedBoundInstruction(info, undefined, true, leaseOpen)).toContain("You're a launcher session");
   // A declaration outranks the lease.

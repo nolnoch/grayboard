@@ -5,7 +5,8 @@ import type { AttachmentInfo } from "./attachments.ts";
 type Msg = { id: number; sender: string; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at?: number | null; kind?: "bounce" | null; via?: string | null; attachments?: AttachmentInfo[] };
 
 // via (#523): the child session that wrote the message under its root's address.
-export type InboxItem = { id: number; from: string; via?: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
+// other_user, ungranted: a server marks another user's mail (#825); local mode has one user.
+export type InboxItem = { id: number; from: string; via?: string; to?: string; parent_id?: number; kind?: "bounce"; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[]; other_user?: true; ungranted?: true };
 // No kind: a bounce is stored pending = 0, so it is never a promise.
 export type PromiseItem = { id: number; to: string; via?: string; parent_id?: number; age: string; delivered_at?: number; body: string; attachments?: AttachmentInfo[] };
 
