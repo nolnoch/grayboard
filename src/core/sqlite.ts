@@ -107,7 +107,8 @@ export function routeReads(db: Database, reader: Database): void {
     return r;
   }) as Database["query"];
   const close = db.close.bind(db);
-  db.close = ((throwOnError?: boolean) => { try { close(throwOnError); } finally { reader.close(); } }) as Database["close"];
+  // Reader first: only the last connection to close checkpoints the WAL into the file, and a read-only one can't.
+  db.close = ((throwOnError?: boolean) => { try { reader.close(); } finally { close(throwOnError); } }) as Database["close"];
 }
 
 // Opens the read-only second connection on a file a writer already opened (WAL set, schema made).

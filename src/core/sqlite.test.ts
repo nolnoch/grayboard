@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -133,12 +133,32 @@ test("routeReads: writes, temp objects, pragmas and transaction control run on t
 });
 
 test("openReader: the reader is read-only, so a write misrouted to it fails loudly", () => {
-  const { reader } = routed();
+  const { db, reader } = routed();
   expect(() => reader.query("INSERT INTO t VALUES ('e', 6)").run()).toThrow(/readonly/);
+  db.close();
 });
 
-test("routeReads: closing the writer closes the reader", () => {
+test("routeReads: closing the writer closes the reader, then checkpoints the WAL into the file", () => {
   const { db, reader } = routed();
+  db.run("INSERT INTO t VALUES (?, ?)", ["f", 7]);
+  expect(db.prepare<{ v: number }, [string]>("SELECT v FROM t WHERE k = ?").get("f")?.v).toBe(7);
   db.close();
   expect(() => reader.query("SELECT 1").get()).toThrow();
+  expect(existsSync(join(dir, "a.db-wal"))).toBe(false);
+});
+
+test("routeReads: no reader statement holds a snapshot: each read after a commit sees it, whichever statement ran before", () => {
+  const { db, onReader } = routed();
+  const one = db.prepare<{ v: number }, [string]>("SELECT v FROM t WHERE k = ?");
+  const all = db.prepare<{ n: number }, []>("SELECT count(*) AS n FROM t");
+  expect(one.get("g")).toBeNull();
+  expect(all.get()?.n).toBe(0);
+  db.run("INSERT INTO t VALUES (?, ?)", ["g", 8]);
+  expect(all.get()?.n).toBe(1);
+  expect(one.get("g")?.v).toBe(8);
+  db.prepare("UPDATE t SET v = ? WHERE k = ?").run(9, "g");
+  expect(one.all("g")).toEqual([{ v: 9 }]);
+  expect(all.values()).toEqual([[1]]);
+  expect(new Set(onReader)).toEqual(new Set(["SELECT v FROM t WHERE k = ?", "SELECT count(*) AS n FROM t"]));
+  db.close();
 });
