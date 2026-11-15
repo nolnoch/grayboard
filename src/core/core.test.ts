@@ -296,6 +296,19 @@ test("posting does not mark others' unread posts as read", () => {
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["one", "two"]);
 });
 
+test("a digest's latest is the newest post it counts, past newer own and pushed posts, and the read uses the handle index (#900)", () => {
+  subscribe(db, "sim", "e2e", "digest");
+  post(db, "be", "e2e", "read already");
+  read(db, "sim", "e2e");
+  post(db, "be", "e2e", "first unread");
+  post(db, "be", "e2e", "newest counted");
+  post(db, "be", "e2e", "@sim pushed instead");
+  post(db, "sim", "e2e", "own, newer still");
+  expect(drain("sim", true)).toMatchObject([{ kind: "push", reason: "mention" }, { kind: "digest", unread: 2, latest: { body: "newest counted" } }]);
+  const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT board FROM subscriptions WHERE handle = ?`).all("sim") as { detail: string }[];
+  expect(plan.map((r) => r.detail).join("\n")).toContain("idx_subscriptions_handle");
+});
+
 test("a mention doesn't also count toward the mentioned subscriber's digest", () => {
   subscribe(db, "sim", "e2e", "digest");
   post(db, "be", "e2e", "@sim look at this");
