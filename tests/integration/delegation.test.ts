@@ -286,6 +286,67 @@ test("server: a team alias doesn't carry delegation to a teammate's launcher", a
   }
 }, 30_000);
 
+// #393 1 (docs/vision.md principle 11): a repeat inside the dedup window
+// re-checks authority over the launcher the first call picked, so a team
+// launcher name that has since moved to a teammate's session is refused,
+// not answered with the first call's result.
+test("server: a delegate repeat after its launcher's name moved to another user is refused, not replayed", async () => {
+  const srv = serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const aliceSim = await srv.connected(alice, "eng/sim");
+    const req = { persona: "a researcher", task: "t", to: "eng/builder" };
+    const first = await aliceSim.delegate(req);
+    expect(((await aliceSim.delegate(req)) as Delegated & { replayed?: unknown }).replayed).toBeDefined();
+
+    await aliceLauncher.unbind("eng/builder");
+    await srv.connected(bob, "eng/builder");
+    const replays = () => (srv.app.db.query(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'`).get() as { n: number }).n;
+    const before = replays();
+    await expect(aliceSim.delegate(req)).rejects.toThrow(/"eng\/builder" belongs to another user/);
+    expect(replays()).toBe(before);
+    const refused = srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid DESC LIMIT 1`).get() as { detail: string };
+    expect(JSON.parse(refused.detail)).toMatchObject({ to: "eng/builder" });
+    // The first call's message stands, and the receipt with it.
+    expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM messages WHERE id = ?`).get(first.message_id)).toEqual({ n: 1 });
+    expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'`).get()).toEqual({ n: 1 });
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// The auto-pick half: the caller never named the launcher, so the refusal
+// says what the first call picked and how to pick afresh, and the audit row
+// names the pick.
+test("server: an auto-pick delegate repeat after its pick moved to another user names the pick and resend", async () => {
+  const srv = serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const aliceSim = await srv.connected(alice, "eng/sim");
+    const req = { persona: "a researcher", task: "t" };
+    expect((await aliceSim.delegate(req)).to).toBe("eng/builder");
+
+    await aliceLauncher.unbind("eng/builder");
+    await srv.connected(bob, "eng/builder");
+    const refusedRows = () => srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused'`).all() as { detail: string }[];
+    const before = refusedRows().length;
+    await expect(aliceSim.delegate(req)).rejects.toThrow(/auto-picked "eng\/builder".*resend: true/);
+    const rows = refusedRows();
+    expect(rows.length).toBe(before + 1);
+    expect(JSON.parse(rows[rows.length - 1].detail)).toMatchObject({ to: "eng/builder" });
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
 test("local: a tools-only sidecar leaves the owner's launcher flag alone (review 5)", async () => {
   const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
   const sim = await localSession(dir, "sim");
