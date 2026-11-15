@@ -99,3 +99,18 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) test(`observer forwards ${s
     expect(() => process.kill(pid, 0)).toThrow();
   } finally { child.kill("SIGKILL"); }
 }, 10_000);
+
+test("cancellation gives the child's group its whole grace after the shell exits, then reaps it (#378 6)", async () => {
+  // The shell dies on SIGTERM at once; a descendant traps it and needs 300 ms to clean up, inside the 1 s grace.
+  const f = fixture('/bin/sh -c \'trap "sleep 0.3; printf cleaned > \\"$GRAYBOARD_MATRIX_PACKAGE/cleaned\\"; exit 0" TERM; printf "%s" "$$" > "$GRAYBOARD_MATRIX_PACKAGE/descendant-pid"; while :; do sleep 0.05; done\' &\nwhile [ ! -s "$GRAYBOARD_MATRIX_PACKAGE/descendant-pid" ]; do sleep 0.01; done\nprintf ready > "$GRAYBOARD_MATRIX_PACKAGE/ready"\nwait\n');
+  const child = Bun.spawn([join(f.path, "bin/sh"), "tests/real-run.sh"], { cwd: f.path, env: f.env, stdout: "pipe", stderr: "pipe" });
+  try {
+    const until = Date.now() + 5000;
+    while (!existsSync(join(f.path, "ready"))) { if (Date.now() > until) throw new Error("Fixture did not start"); await Bun.sleep(10); }
+    const pid = Number(readFileSync(join(f.path, "descendant-pid"), "utf8"));
+    child.kill("SIGTERM");
+    expect(await child.exited).toBe(143);
+    expect(readFileSync(join(f.path, "cleaned"), "utf8")).toBe("cleaned");
+    expect(() => process.kill(pid, 0)).toThrow();
+  } finally { child.kill("SIGKILL"); }
+}, 10_000);

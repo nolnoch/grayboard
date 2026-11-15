@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { repositoryGitEnv } from "./hosted-evidence.ts";
 
 const [checkout, scratch, output] = process.argv.slice(2);
 assert(checkout && scratch && output);
 const digest = (path: string) => new Bun.CryptoHasher("sha256").update(readFileSync(path)).digest("hex");
-const files = (directory: string): string[] => readdirSync(directory, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? files(join(directory, entry.name)) : entry.isFile() ? [join(directory, entry.name)] : []);
+// Tracked files only (#378 2): hosted-evidence.ts accepts a path only if `git ls-files` lists it, so an untracked
+// file (a new uncommitted src/foo.ts, a .DS_Store) listed from the filesystem failed every hosted gate.
+const files = (directory: string): string[] => {
+  const listed = Bun.spawnSync(["git", "ls-files", "-z", "--", relative(checkout, directory)], { cwd: checkout, env: repositoryGitEnv() });
+  assert.equal(listed.exitCode, 0, `Cannot enumerate tracked files under ${relative(checkout, directory)}`);
+  return listed.stdout.toString().split("\0").filter(Boolean).map(path => join(checkout, path));
+};
 const packageRoot = join(checkout, "adapters/opencode-v2");
 const installedFile = join(scratch, "installed.txt");
 const prepared = existsSync(installedFile) ? scratch : join(scratch, "prepared");
