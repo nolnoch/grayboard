@@ -2,6 +2,7 @@ import type { Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { pruneEndedIds, prunePosts, type CoreDb } from "../core/boards.ts";
 import { pruneUnbound, sweepBlobs } from "../core/attachments.ts";
+import { queuedTx } from "./attachments.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
@@ -54,7 +55,7 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
     console.error("[grayboard] retention failed:", e);
   }
   // Also finishes any sweep a crash or a failed delete left.
-  const swept = await sweepBlobs(db, repo.blobs);
+  const swept = await sweepBlobs(db, repo.blobs, queuedTx(repo));
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
   try {
     reclaimFreePages(repo);

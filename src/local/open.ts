@@ -89,6 +89,8 @@ function initLocalSchema(db: Database): void {
       created_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_messages_recipient_id ON messages(recipient, id);
+    -- undeliveredFrom and sentPending select by sender (#859).
+    CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender, id);
     CREATE TABLE IF NOT EXISTS cursors (
       reader        TEXT PRIMARY KEY,
       last_seen_id  INTEGER NOT NULL

@@ -21,6 +21,7 @@ import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/address
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
+import { queuedTx } from "./attachments.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, HOLD_ORDER, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
@@ -597,7 +598,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (to?.active) to.sink.deliver({ kind: "direct", message: showMessage(b) });
     }
     wake(hub, [...woken]);
-    void sweepBlobs(db, repo.blobs);
+    void sweepBlobs(db, repo.blobs, queuedTx(repo));
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
   // after-commit half for every hosted commit, whichever path released it.
@@ -1403,7 +1404,7 @@ function writeOnce<W extends Written>(
       });
     }
   }, recheck);
-  if ("replay" in out && uploads.length > 0) afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs); });
+  if ("replay" in out && uploads.length > 0) afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
   return out;
 }
 
@@ -1570,7 +1571,7 @@ function handleRetract(hub: Hub, session: ApplicationSession, id: number): { not
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (!repo.messages.retract(m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
-  afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs); });
+  afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
   return {};
 }
 

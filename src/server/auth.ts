@@ -65,8 +65,9 @@ export function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue,
   const user = repo.users.findById(session.user_id);
   if (session.revoked_at !== null || !user || user.disabled_at !== null) return null;
   if (idleDays > 0 && repo.now() - session.last_used_at > idleDays * 86_400_000) return null;
-  // Off the request path: last-used is a stamp, not a result the caller waits on.
-  touches.schedule(() => repo.sessions.touch(session.id, repo.now()));
+  // Off the request path: last-used is a stamp, not a result the caller waits on. Posted, so a touch that fires
+  // while another body holds the write queue waits behind it (#807).
+  touches.schedule(() => { repo.post(() => repo.sessions.touch(session.id, repo.now()), undefined, "session touch"); });
   return { user_id: session.user_id, user_email: user!.email, session_id: session.id };
 }
 
