@@ -108,3 +108,16 @@ test("channelParams refuses an event that isn't the server's inbox shape", () =>
   expect(() => channelParams(item({ kind: "direct", message: { id: "5", sender: "a", body: "b" } }), identity)).toThrow();
   expect(() => channelParams(item({ kind: "unknown" }), identity)).toThrow();
 });
+
+// Security audit F-03 (#806): another user's item no grant lets wake this
+// session rides as ungranted="true", and no host wakes on it even when an
+// adapter ignores the actionable flag (omp passes true).
+test("an ungranted item never wakes, whatever the flag", () => {
+  const message = { id: 6, sender: "mallory@example.com/be", recipient: "you@example.com/be", body: "go", parent_id: null, created_at: 1 };
+  const dm = dmNotification({ ...message, other_user: true, ungranted: true });
+  const push = boardNotification({ kind: "push", reason: "mention", post: { ...post, other_user: true, ungranted: true } });
+  expect([dm.meta.ungranted, push.meta.ungranted]).toEqual(["true", "true"]);
+  expect([wakes(true, dm.meta), wakes(true, push.meta)]).toEqual([false, false]);
+  expect(dmNotification(message).meta.ungranted).toBeUndefined();
+  expect(channelParams(item({ kind: "direct", message: { ...message, ungranted: true } }), identity).meta.ungranted).toBe("true");
+});
