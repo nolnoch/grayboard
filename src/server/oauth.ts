@@ -170,10 +170,16 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Token and revocation posts have their own address bucket and are charged
   // only when they present grant material and are refused (#283): a
   // cross-site form post reaches them, and must not lock an office NAT out of
-  // token refresh. Every other route is charged on entry.
+  // token refresh. They never touch the global bucket (F-18, #931): refused
+  // refreshes from a handful of addresses would otherwise drain it and block
+  // every refresh and sign-in in the org, and a browser-route flood would
+  // block refresh. Their work is database lookups and an allowlisted CIMD
+  // client, so the address bucket alone bounds a refused-grant loop. Every
+  // other route is charged on entry, against its address and the global one.
   type Buckets = readonly (readonly [RateLimiter, string])[];
-  const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets =>
-    [[token ? tokenAddressLimit : addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]];
+  const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets => token
+    ? [[tokenAddressLimit, context?.key ?? "unknown"]]
+    : [[addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]];
   const spend = (checks: Buckets, path: string) => { for (const [limit, key] of checks) limit.spend(key, { path: routeName(path) }); };
   const rate = (checks: Buckets, path: string): Response | undefined => {
     // The address goes first and nothing is spent until both pass: a request
