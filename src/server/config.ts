@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
+import { parseCimdClients } from "./oauth-cimd.ts";
 
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_LAG_GATE, LAG_HISTORY, type LagGate } from "./metrics.ts";
@@ -36,6 +37,8 @@ export type Config = {
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
+  // Metadata-document (CIMD) client IDs the server resolves; default OpenCode's only (F-16).
+  oauthCimdClients?: string[];
   // Who can reach another user's human; default "team".
   humanReach?: HumanReach;
   // Attachment size caps per file and per message; default local mode's.
@@ -107,6 +110,7 @@ export function loadConfig(): Config {
     cliTokenIdleDays: idleDays(process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
+    oauthCimdClients: parseCimdClients(process.env.GRAYBOARD_OAUTH_CIMD_CLIENTS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
     ...parseAttachmentLimits(process.env),
     helloLimit: parseRateLimit(process.env, "GRAYBOARD_HELLO", DEFAULT_HELLO_LIMIT, "hellos"),

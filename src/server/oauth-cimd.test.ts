@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { createCimdResolver, parseCimd, publicAddress } from "./oauth-cimd.ts";
+import { createCimdResolver, parseCimd, parseCimdClients, publicAddress } from "./oauth-cimd.ts";
+import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { matchesRedirect } from "./oauth-config.ts";
 import { until } from "../../tests/support/until.ts";
 
@@ -117,4 +118,13 @@ test("overlapping completions against a nearly full cache stay within its cap (#
   for (let n = 0; n < 128; n++) await resolver.resolve(doc(n));
   expect(reads).toBe(before);
   resolver.close();
+});
+
+test("GRAYBOARD_OAUTH_CIMD_CLIENTS: unset is OpenCode only, off is none, and a list takes only IDs the resolver would fetch (F-16)", () => {
+  expect(parseCimdClients(undefined)).toEqual([OPENCODE_CLIENT]);
+  expect(parseCimdClients(" off ")).toEqual([]);
+  expect(parseCimdClients(`${OPENCODE_CLIENT}, https://client.example/client.json`)).toEqual([OPENCODE_CLIENT, "https://client.example/client.json"]);
+  for (const raw of ["", "any", "http://client.example/c.json", "https://client.example:8443/c.json", "https://client.example/c.json?x=1", "https://127.0.0.1/c.json", "https://localhost/c.json", "https://Client.example/c.json", `${OPENCODE_CLIENT},`])
+    expect(() => parseCimdClients(raw), raw).toThrow("invalid GRAYBOARD_OAUTH_CIMD_CLIENTS entry");
+  expect(() => parseCimdClients(`${OPENCODE_CLIENT},${OPENCODE_CLIENT}`)).toThrow("duplicate GRAYBOARD_OAUTH_CIMD_CLIENTS entry");
 });

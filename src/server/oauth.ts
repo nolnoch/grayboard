@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { exchangeGoogleCode, googleSignIn, hashToken, type AuthedUser, type GoogleIdentity } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
-import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
@@ -107,9 +107,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const revoked = repo.oauth.revokePreBuiltinGrants(BUILTIN_CLIENT_IDS, now());
   if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
   const cimd = createCimdResolver({ ...options.cimd, now });
+  // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
+  // redirects that authorize errors follow, and a name the consent page shows.
+  const cimdClients = new Set(config.oauthCimdClients ?? [OPENCODE_CLIENT]);
   const resolveClient = async (id: string) => {
     const manual = clients.get(id);
     if (manual) return manual;
+    if (!cimdClients.has(id)) { writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
     let client: OAuthClient | undefined;
     try { client = await cimd.resolve(id); }
     catch (error) { writeAudit(repo, "oauth.cimd_failed", null, null, { category: error instanceof CimdUnavailable ? "unavailable" : "unexpected" }); throw error; }
@@ -236,8 +240,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const user = repo.users.findById(b!.userId)!;
     const f = flows.get(r.requestHash)!;
     const client = f.client;
-    const unverified = !clients.has(client.clientId) ? `<p>Unverified client: ${escapeHTML(new URL(client.clientId).host)}. The client name is self-declared.</p>` : "";
-    return html(`<h1>Authorize ${escapeHTML(client.name)}</h1>${unverified}<p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`, 200, new URL(r.redirectUri).origin);
+    // A metadata-document client is known by its host; the name in its document is its own claim.
+    const host = clients.has(client.clientId) ? undefined : new URL(client.clientId).host;
+    const headline = host ? `<h1>Authorize ${escapeHTML(host)}</h1><p>This client calls itself ${escapeHTML(client.name)}; that name is self-declared.</p>` : `<h1>Authorize ${escapeHTML(client.name)}</h1>`;
+    return html(`${headline}<p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`, 200, new URL(r.redirectUri).origin);
   };
   const exchange = options.exchangeGoogle ?? (async (input: { code: string; verifier: string; redirectUri: string; nonce: string }) =>
     exchangeGoogleCode(input.code, input.verifier, input.redirectUri, googleClient.clientId, googleClient.clientSecret, config.orgDomain, input.nonce));
@@ -253,7 +259,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       authorization_endpoint: endpoint("/oauth/authorize"), token_endpoint: endpoint("/oauth/token"), revocation_endpoint: endpoint("/oauth/revoke"),
       response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], scopes_supported: OAUTH_SCOPES,
       code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
-      revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: true, authorization_response_iss_parameter_supported: true,
+      revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: cimdClients.size > 0, authorization_response_iss_parameter_supported: true,
       // RFC 8414 §2 extension: an adapter tells an older server apart before it opens a browser (#429).
       grayboard_builtin_clients: BUILTIN_CLIENT_IDS });
     if (!path.startsWith("/oauth/")) return undefined;

@@ -2,7 +2,7 @@ import { lookup } from "node:dns/promises";
 import { Agent, request } from "node:https";
 import type { ConnectionOptions, TLSSocket } from "node:tls";
 import { BlockList, isIP } from "node:net";
-import { OAUTH_SCOPES, validateRedirect, type OAuthClient } from "./oauth-config.ts";
+import { OAUTH_SCOPES, OPENCODE_CLIENT, validateRedirect, type OAuthClient } from "./oauth-config.ts";
 
 export class CimdUnavailable extends Error {
   constructor() { super("CIMD temporarily unavailable"); }
@@ -26,6 +26,20 @@ function metadataUrl(id: string): URL {
   const u = new URL(id);
   if (u.protocol !== "https:" || u.username || u.password || u.hash || u.search || u.port || u.href !== id || isIP(u.hostname.replace(/^\[|\]$/g, "")) || !u.hostname.includes(".") || u.hostname.endsWith(".")) throw new Error("invalid CIMD identifier");
   return u;
+}
+// GRAYBOARD_OAUTH_CIMD_CLIENTS (security audit F-16): the metadata-document client IDs this
+// server resolves. Unset allows OpenCode's only; "off" none; otherwise a comma list of exact
+// IDs, each one the resolver would accept, so a typo stops the server rather than a sign-in.
+export function parseCimdClients(raw: string | undefined): string[] {
+  if (raw === undefined) return [OPENCODE_CLIENT];
+  if (raw.trim() === "off") return [];
+  const ids = raw.split(",").map(s => s.trim());
+  for (const id of ids) {
+    try { metadataUrl(id); }
+    catch { throw new Error(`invalid GRAYBOARD_OAUTH_CIMD_CLIENTS entry ${JSON.stringify(id)}: expected "off" or a comma list of https client metadata URLs`); }
+  }
+  if (new Set(ids).size !== ids.length) throw new Error("duplicate GRAYBOARD_OAUTH_CIMD_CLIENTS entry");
+  return ids;
 }
 type Address = { address: string; family: number };
 export type CimdOptions = {
