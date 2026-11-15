@@ -48,9 +48,10 @@ function trackCommits(db: Database): void {
 
 // Compiled statements per connection that `db.query` keeps, least recently used evicted. Bun's default
 // of 20 thrashed: the tree has ~250 prepare sites, and recompiling a statement on every call was ~15%
-// of server CPU at 1000 sessions (#912). The cap is Bun's static, read on every `query` call.
+// of server CPU at 1000 sessions (#912). The cap is Bun's static, read on every `query` call. The cast
+// is for older `@types/bun` (opencode-v2 pins one) that don't declare the static.
 export const STATEMENT_CACHE_SIZE = 512;
-Database.MAX_QUERY_CACHE_SIZE = STATEMENT_CACHE_SIZE;
+(Database as unknown as { MAX_QUERY_CACHE_SIZE: number }).MAX_QUERY_CACHE_SIZE = STATEMENT_CACHE_SIZE;
 
 // `db.prepare(sql)` returns the connection's cached statement for `sql` (Bun's `db.query`), so call
 // sites keep writing `prepare`. Sharing one statement between call sites is safe here because every
