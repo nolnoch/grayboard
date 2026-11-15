@@ -230,8 +230,8 @@ export function initCoreSchema(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_ids_viewer ON ids(id) WHERE viewer = 1`);
   // keyed: the ID came from a session key (#284 S10), so a later session can
   // present it again. Retention deletes an ended ids row (pruneEndedIds); a
-  // keyed one leaves a pruned_ids row, so a key re-used after the prune is
-  // audited id.reused rather than registering silently. Unkeyed IDs are
+  // keyed one leaves a pruned_ids row, so a key re-used after the prune, within
+  // TOMBSTONE_HORIZON_MS (#333), is audited id.reused rather than registering silently. Unkeyed IDs are
   // random and never come back, so they leave none.
   if (!idCols.has("keyed")) db.exec(`ALTER TABLE ids ADD COLUMN keyed INTEGER NOT NULL DEFAULT 0`);
   // Local conversation restore is opt-in; runner promotion never changes provenance.
