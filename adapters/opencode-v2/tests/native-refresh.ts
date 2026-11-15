@@ -124,6 +124,9 @@ const dirA = join(root, "project-a"), dirB = join(root, "project-b");
 const locA = { directory: dirA }, locB = { directory: dirB };
 const connected = (dir: string) => hostLog.filter(l => l.message === "mcp connected" && l.attributes?.server === "grayboard" && l.attributes?.directory === dir).length;
 let host: Awaited<ReturnType<typeof createFixtureHost>> | undefined;
+// An exit before PASS (a thrown wait, or the host exiting the process) still says where it stopped.
+let passed = false;
+process.on("exit", code => { if (!passed) console.error("FAIL_EXIT", JSON.stringify({ code, hostLog: hostLog.slice(-30) })); });
 try {
   host = await createFixtureHost({ log: { level: "debug", emit: entry => { hostLog.push({ message: entry.message, attributes: entry.attributes as Record<string, unknown> }); } }, plugins: [fromPromise(fixture), installed], database: { path: join(root, "host.sqlite") }, models: { fetch: false }, config: { directory: join(root, "native-config"), project: false, claude: false }, fs: { filewatcher: false } });
   await host.agent.list({ location: locA }); await host.agent.list({ location: locB });
@@ -225,5 +228,6 @@ try {
   // Another location is never reconnected.
   assert.equal(connected(dirB), connB0, "B never reconnected");
   assert.equal(switched.length, switched0);
+  passed = true;
   log("PASS", { seen, refreshes, codes, issued });
 } finally { await host?.close(); globalThis.fetch = fetch0; }

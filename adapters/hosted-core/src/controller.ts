@@ -55,8 +55,8 @@ const LOOKUPS = 1024;
 // ownership. Own-login adapters (pi, omp, Claude Code) never hit it: they
 // refresh 60 s early and end a grant as `login_required` or `refresh_outcome_unknown`.
 const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
-// Past the grace a root waits for the refresh (#661): it asks the host once
-// 401), then re-checks the stored credential, a local read, on this backoff,
+// Past the grace a root waits for the refresh (#661): it asks the host to
+// refresh (`credential.refresh`, once per expiry), then re-checks the stored credential, a local read, on this backoff,
 // for an hour of waits: after that the pause stands until a reload's restore.
 const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
 // A saved root restore couldn't prepare while the server was down (#424 6).
