@@ -129,7 +129,8 @@ test("#831: board and session observer indexes: a post tells its board's observe
   const seen: string[] = [];
   const watch = (s: typeof a, board: string, tag: string) =>
     application.observeBoard(s, board, { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
-  watch(a, "one", "a1"); watch(a, "two", "a2"); watch(b, "one", "b1"); watch(b, "two", "b2");
+  watch(a, "one", "a1"); watch(a, "two", "a2"); watch(b, "one", "b1");
+  const b2off = watch(b, "two", "b2");
   expect(application.observerCount).toBe(4);
   application.call(a, "board_post", { board: "one", body: "x" });
   expect(seen.sort()).toEqual(["a1+", "b1+"]);
@@ -143,7 +144,16 @@ test("#831: board and session observer indexes: a post tells its board's observe
   application.call(b, "board_post", { board: "two", body: "y" });
   expect(seen).toEqual(["b2+"]);
 
-  // b's last observer of "one" leaves; a new one on the emptied board is told.
+  // "two"'s last observer leaves, emptying its index entry; a new one on the emptied board is told.
+  b2off();
+  expect(application.observerIndexKeys).toEqual({ boards: 1, sessions: 1 });
+  watch(b, "two", "b2'");
+  expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
+  seen.length = 0;
+  application.call(b, "board_post", { board: "two", body: "u" });
+  expect(seen).toEqual(["b2'+"]);
+
+  // A second observer of "one" joins and leaves; the board's first is still told.
   seen.length = 0;
   const again = watch(b, "one", "b1'");
   application.call(b, "board_post", { board: "one", body: "z" });
