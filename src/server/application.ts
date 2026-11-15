@@ -10,7 +10,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, RateLimiter, retrySe
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
-import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, delegateOkFields, delegateThrottled, resolveDelegation } from "../core/delegation.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, resolveDelegation, sameUser } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
@@ -707,7 +707,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     const audit = serverAuditSink(repo);
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
-      if (meta) repo.atomic(() => setAliasMeta(db, address, meta, id, audit));
+      if (meta) repo.atomic(() => setAliasMeta(db, address, meta, id, audit, authed.user_email));
       return { alias: address, held: [...session.holds] };
     }
     if (session.holds.length >= MAX_HOLDS) {
@@ -749,7 +749,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       createLazily(hub, authed, target, id);
       holdAlias(db, address, id, now());
       logBinding(db, id, address, "bound", null);
-      if (meta) setAliasMeta(db, address, meta, id, audit);
+      if (meta) setAliasMeta(db, address, meta, id, audit, authed.user_email);
       touchAlias(db, address);
     });
 
@@ -1345,6 +1345,7 @@ function deliverSend(hub: Hub, msg: MessageRow): void {
 // afresh, and nothing will bind them), audited like any release.
 function writeOnce<W extends Written>(
   hub: Hub, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: () => Sync<W>,
+  recheck?: (stored: W["payload"]) => void,
 ): DedupOutcome<W> {
   const { repo } = hub;
   if (session.human) return { fresh: repo.atomic(write) };
@@ -1357,7 +1358,7 @@ function writeOnce<W extends Written>(
         identity: row.uploader, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
       });
     }
-  });
+  }, recheck);
   if ("replay" in out && uploads.length > 0) afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs); });
   return out;
 }
@@ -1434,13 +1435,30 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       });
       hub.delegateLimiter.spend(authed.user_email);
       return { payload, ref: w.ref, msg: w.msg };
+    }, (stored) => {
+      // A replay names the launcher the first call picked: the checks a
+      // fresh call makes of a named target that are authority, not routing,
+      // run again on it, so a replay never outlives a revocation (#393 1,
+      // docs/vision.md principle 11). Online state, the open cap and the
+      // limiter are routing and stay the first call's.
+      picked = stored.to;
+      // An auto-pick repeat never named this target: say the first
+      // delegation went, and how to delegate afresh (a fresh pick).
+      const hint = m.to === undefined ? ` This repeat was not sent: your first call auto-picked "${stored.to}"; to delegate again with a fresh pick, call with resend: true.` : "";
+      if (!sameUser(authed.user_email, stored.to, db)) throw new CoreError(crossUserRefusal(stored.to) + hint);
+      const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
+      const decision = authorize(repo, { humanReach: hub.humanReach }, req);
+      if (!decision.allow) {
+        rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, session.primary), req, decision));
+        fail(decision.code, decision.reason + hint);
+      }
     });
   } catch (e) {
     hub.delegateRows = undefined;
     for (const row of rows) rowAfterRollback(session, row);
     // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
-      refused({ reason: e.message, to: m.to });
+      refused({ reason: e.message, to: m.to ?? picked });
       throw coreRefusal(e);
     }
     // A throttled call is audited once per streak (delegation.throttled), not per call.
