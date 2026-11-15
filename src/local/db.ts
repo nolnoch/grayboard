@@ -1,4 +1,4 @@
-import { LOCAL_MSG_COLS, LOCAL_SENT_PENDING_SQL, LOCAL_UNDELIVERED_FROM_SQL } from "./binding.ts";
+import { LOCAL_MSG_COLS, LOCAL_SENT_PENDING_SQL, LOCAL_UNDELIVERED_FROM_SQL, localHistorySql } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 import { SqliteBlobs } from "./blobs.ts";
 import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments, type Uploader } from "../core/attachments.ts";
@@ -179,33 +179,11 @@ export function getHistory(
   limit: number,
   beforeId: number | undefined,
 ): (Message & { delivered?: boolean })[] {
-  const clauses: string[] = [];
-  const args: (string | number)[] = [];
   const set = JSON.stringify(me);
-  const ME = `(SELECT value FROM json_each(?))`;
-
-  if (peer) {
-    clauses.push(
-      `((sender IN ${ME} AND recipient = ?) OR (sender = ? AND recipient IN ${ME}))`,
-    );
-    args.push(set, peer, peer, set);
-  } else {
-    clauses.push(`(sender IN ${ME} OR recipient IN ${ME})`);
-    args.push(set, set);
-  }
-
-  if (beforeId !== undefined) {
-    clauses.push(`id < ?`);
-    args.push(beforeId);
-  }
-
-  const sql = `
-    SELECT ${MSG_COLS} FROM messages
-    WHERE ${clauses.join(" AND ")}
-    ORDER BY id DESC
-    LIMIT ?
-  `;
+  const args: (string | number)[] = peer ? [set, peer, peer, set] : [set, set];
+  if (beforeId !== undefined) args.push(beforeId);
   args.push(limit);
+  const sql = localHistorySql(!!peer, beforeId !== undefined);
   const rows = withAttachments(db, "message", db.prepare(sql).all(...args) as Message[]);
   return rows.reverse().map((m) =>
     me.includes(m.sender) && !me.includes(m.recipient) ? { ...m, delivered: m.delivered_at !== null || getCursor(m.recipient) >= m.id } : m,
