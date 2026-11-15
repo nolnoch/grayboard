@@ -11,13 +11,14 @@ import { direct } from "../support/events.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 
+const ADMIN = "dana@example.com";
 let srv: TestServer;
 let alice: string;
 let bob: string;
 let carol: string;
 
 beforeEach(async () => {
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = new TestServer({ admins: [ADMIN], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   alice = await srv.login("alice@example.com");
   bob = await srv.login("bob@example.com");
   carol = await srv.login("carol@example.com");
@@ -59,6 +60,11 @@ test("peer_list lists a team's aliases to its members only: global, include_offl
   const outsiderView = await outsider.call<WhoResult>("peer_list", {});
   expect(outsiderView.offline_hidden ?? 0).toBe((memberView.offline_hidden ?? 0) - 1);
 
+  // An admin outside the team sees no more than any non-member: admin is a server role, not a directory grant.
+  const admin = srv.appSession(await srv.login(ADMIN), "ops");
+  await admin.connect();
+  expect((await handles(admin, { include_offline: true })).filter((h) => h.startsWith("eng/"))).toEqual([]);
+
   // The holder always sees its own row.
   expect(await handles(build)).toContain("eng/build");
 });
@@ -98,6 +104,12 @@ test("a refused bare name suggests only full handles the sender may see; hidden 
   const absent = await refused(outsider, "nosuch");
   expect(hidden).toEqual({ code: absent.code, message: absent.message.replace(`"nosuch"`, `"build"`) });
   expect(hidden.message).not.toContain("eng/");
+  // history's peer resolves the same way.
+  const histRefused = async (peer: string) => {
+    try { await outsider.history({ peer }); } catch (e) { return (e as Error).message; }
+    throw new Error(`history of ${peer} answered`);
+  };
+  expect(await histRefused("build")).toBe((await histRefused("nosuch")).replace(`"nosuch"`, `"build"`));
   // A person's alias of the same name is still suggested to anyone.
   const bobBuild = srv.appSession(bob, "build");
   await bobBuild.connect();

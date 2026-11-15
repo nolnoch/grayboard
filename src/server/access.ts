@@ -61,6 +61,8 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
     // and roster do (#348); people's names are the open directory. A filter:
     // no decision rows.
     seesAlias(handle, scope) {
+      // A person's names are listed to every caller, as before #348.
+      if (scope.scope_kind === "person") return true;
       const p = repo.resolver.principalOf(handle);
       if (p === null || scope.scope_ref === null) return false;
       return authorize(repo, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;

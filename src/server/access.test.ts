@@ -182,7 +182,8 @@ test("seesAlias: a person scope to anyone signed in, a team's to its members and
   // A team alias acts for its team: its own team's names, not another's.
   expect(access.seesAlias!("eng/build", eng)).toBe(true);
   expect(access.seesAlias!("ops/run", eng)).toBe(false);
-  expect(access.seesAlias!(idAddress("f".repeat(64)), { scope_kind: "person", scope_ref: "wade@example.com" })).toBe(false);
+  expect(access.seesAlias!(idAddress("f".repeat(64)), { scope_kind: "person", scope_ref: "wade@example.com" })).toBe(true);
+  expect(access.seesAlias!(idAddress("f".repeat(64)), eng)).toBe(false);
   expect(access.seesAlias!(WADE_ID, { scope_kind: "team", scope_ref: null })).toBe(false);
 });
 
