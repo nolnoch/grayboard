@@ -1480,9 +1480,8 @@ export function read(
 // ── delivery ─────────────────────────────────────────────────────────────────
 
 // pendingFor's digest read: one row per digest subscription of the handle with nothing sent since its last catch-up.
-// latest_id is read only when unread > 0, so a counted post above the cursor exists, and latest_id is the newest
-// post counted (own and pushed posts can be newer): the index walks back from the board's end and stops at the
-// first one (#900). Queue-kind boards are excluded: their posts deliver to exactly one subscriber, so they never
+// Both subqueries share one predicate, so latest_id is the newest post counted (own and pushed posts can be newer);
+// it's used only when unread > 0, so the index's walk back from the board's end finds one and stops there (#900). Queue-kind boards are excluded: their posts deliver to exactly one subscriber, so they never
 // count as digest unread for the others. Exported so a test pins its plan (#904); all nine parameters are the handle.
 export const DIGEST_SQL = `SELECT s.board, s.cursor,
               (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor
