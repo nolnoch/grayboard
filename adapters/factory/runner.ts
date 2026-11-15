@@ -1,4 +1,4 @@
-// What a harness contributes (docs/factory.md §5): its agent roster
+// What a harness contributes (docs/factory-children.md §1): its agent roster
 // and a headless run of one agent on one request. The run loop is
 // harness-neutral; a runner is the only per-harness code.
 import { spawn } from "node:child_process";

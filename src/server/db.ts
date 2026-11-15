@@ -94,6 +94,13 @@ export interface Repo {
   now(): number;
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
+  // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
+  // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
+  authRead<T>(fn: () => Sync<T>): T;
+  // The auth cache's generation: authRead's pinned one inside its body, else read now; undefined inside a
+  // transaction. Equal values mean no committed write to oauth_tokens, oauth_grants or users from this connection,
+  // and no commit at all from another, came between them (#899).
+  authGeneration(): string | undefined;
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
@@ -747,7 +754,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const dataVersion = db.query<{ data_version: number }, []>("PRAGMA data_version");
   // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this connection or
   // another; undefined inside a transaction, whose writes may yet roll back (#853).
-  const authGeneration = () => db.inTransaction ? undefined : `${counter.get()!.n}:${dataVersion.get()!.data_version}`;
+  // `pinned`: the generation authRead read for its body (#881); null outside one.
+  let pinned: string | null = null;
+  const readGeneration = () => `${counter.get()!.n}:${dataVersion.get()!.data_version}`;
+  const authGeneration = () => db.inTransaction ? undefined : pinned ?? readGeneration();
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
   // Caches of what the auth tables say, cleared when authGeneration moves: a live access token only (an
   // unknown or dead one is re-read every time); a user row, or its absence, as read (#853). They sit
@@ -785,6 +795,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
+    authRead<T>(fn: () => Sync<T>): T {
+      if (pinned !== null || db.inTransaction) return fn() as T;
+      pinned = readGeneration();
+      try { return fn() as T; } finally { pinned = null; }
+    },
+    authGeneration,
 
     oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
     hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),

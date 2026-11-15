@@ -2,7 +2,7 @@
 // SLACK_APP_TOKEN + SLACK_BOT_TOKEN. Each linked user talks to the app in
 // their own DM with it, as their human identity "<email>/human". That identity
 // uses the hosted application directly, sharing delivery, cursors, policy.ts authorize()
-// and board access with agents. See docs/slack-bridge.md.
+// and board access with agents. See docs/slack-org-bridge.md.
 //
 // Linking proves both sides: `grayboard slack link` (a signed-in grayboard
 // user) gets a one-time code, and only the Slack account that sends it to the

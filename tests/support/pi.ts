@@ -694,6 +694,145 @@ export function piRunnerScenario(dir: string): Promise<void> {
   });
 }
 
+
+// A pi-subagents foreground child (#557 3): a session the root's pi process
+// opens in-process, here through a test extension doing what pi-subagents'
+// child-session.js does (a SessionManager whose header names the root's file
+// as parentSession, createAgentSession with the grayboard extension named
+// explicitly, bindExtensions, then session_shutdown and dispose). It acts as
+// the root's child: the root's name with its own ID as via, no second root.
+// A header naming a file no live session has, and a /fork of the root (whose
+// header names the session it left, ended first), are roots.
+const FOREGROUND_EXTENSION = (adapter: string, self: string) => `
+import { DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession } from "@earendil-works/pi-coding-agent";
+export default function (pi) {
+  pi.registerTool({
+    name: "spawn_child", label: "spawn_child", description: "run a foreground child",
+    parameters: { type: "object", properties: { prompt: { type: "string" }, parent: { type: "string" } }, required: ["prompt"] },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const agentDir = process.env.PI_CODING_AGENT_DIR;
+      const settingsManager = SettingsManager.create(ctx.cwd, agentDir);
+      const loader = new DefaultResourceLoader({ cwd: ctx.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: [${JSON.stringify(adapter)}, ${JSON.stringify(self)}] });
+      // As pi-subagents' resetExtensionCacheOnReload: the child loads its own
+      // module instances, not the root's cached ones.
+      loader.loaded = true;
+      await loader.reload();
+      const parentSession = params.parent ?? ctx.sessionManager.getSessionFile();
+      const sessionManager = SessionManager.create(ctx.cwd, undefined, parentSession ? { parentSession } : undefined);
+      const { session } = await createAgentSession({ cwd: ctx.cwd, agentDir, model: ctx.model, resourceLoader: loader, sessionManager, settingsManager, sessionStartEvent: { type: "session_start", reason: "startup" } });
+      await session.bindExtensions({ mode: "print" });
+      try {
+        await session.prompt(params.prompt);
+      } finally {
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        session.dispose();
+      }
+      return { content: [{ type: "text", text: "child " + sessionManager.getSessionId() }], details: {} };
+    },
+  });
+}
+`;
+
+export function piForegroundChildScenario(dir: string): Promise<void> {
+  const prefix = "mcp__grayboard__";
+  const whoami: Reply = { tool: prefix + "whoami", args: {} };
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("spawn child", [{ tool: "spawn_child", args: { prompt: "child one" } }]),
+      scripted("spawn stray", [{ tool: "spawn_child", args: { prompt: "child stray", parent: join(dir, "no-such-session.jsonl") } }]),
+      scripted("child one", [whoami, { tool: prefix + "dm_send", args: { to: "peer", body: "from the foreground child" } }, { tool: "spawn_child", args: { prompt: "grandchild" } }]),
+      scripted("grandchild", [whoami]),
+      scripted("child stray", [whoami]),
+      scripted("who", [whoami]),
+    ]);
+    let db: Database | undefined;
+    try {
+      const peer = await localSession(dir, "peer");
+      mkdirSync(join(dir, "pi-agent", "extensions"), { recursive: true });
+      const foreground = join(dir, "pi-agent", "extensions", "foreground.ts");
+      writeFileSync(foreground, FOREGROUND_EXTENSION(join(dir, "pi-agent", "extensions", "grayboard.ts"), foreground));
+      const pi = startPi(dir, model.port, procs, { persist: true });
+      const state = await pi.command({ type: "get_state" });
+      await until(async () => (await peer.call("peer_list")).peers.some((x: { handle: string }) => x.handle === "pi"), 15_000, "pi online");
+      db = new Database(join(dir, "bus.db"), { readonly: true });
+      const bus = db;
+      const idRow = (id: string) => bus.query<{ root_id: string | null; ended_at: number | null; harness_session: string | null }, [string]>(
+        `SELECT root_id, ended_at, harness_session FROM ids WHERE id = ?`).get(id);
+      const audit = (action: string) => bus.query<{ actor: string; target: string; detail: string }, [string]>(
+        `SELECT actor, target, detail FROM audit_log WHERE action = ? ORDER BY rowid`).all(action)
+        .map((r) => ({ ...r, detail: JSON.parse(r.detail) as Record<string, unknown> }));
+      const asked = (prompt: string) => model.requests.map((r) => r.body).filter((b) => b.messages.some((m) => m.role === "user" && promptText(m) === prompt));
+      const results = (prompt: string) => (asked(prompt).at(-1)?.messages ?? []).filter((m) => m.role === "tool").map(messageText);
+      // The run of `prompt` at the root: its tool's result reached the model.
+      const ran = async (prompt: string) => {
+        await until(() => asked(prompt).some((b) => b.messages.some((m) => m.role === "tool")), 60_000, `${prompt} returned`);
+        await idle(pi);
+      };
+      const liveRoots = () => bus.query<{ id: string; harness_session: string }, []>(
+        `SELECT id, harness_session FROM ids WHERE root_id IS NULL AND ended_at IS NULL AND harness_session IS NOT NULL`).all();
+      const root = liveRoots().find((r) => r.harness_session === state.sessionId)?.id;
+      if (root === undefined) throw new Error(`no live session recorded pi session ${state.sessionId}`);
+
+      await pi.command({ type: "prompt", message: "spawn child" });
+      await ran("spawn child");
+      const [who] = results("child one");
+      const child = JSON.parse(who!);
+      expect(child).toEqual({ id: child.id, primary: "pi", aliases: ["pi"], principal: null, root, child: true });
+      expect(audit("id.child_seen").filter((a) => a.target === child.id)).toEqual([{
+        actor: root, target: child.id,
+        detail: expect.objectContaining({ child: child.id, root, parent_session: state.sessionId }),
+      }]);
+      expect(bus.query(`SELECT sender, sender_id, via FROM messages WHERE body = 'from the foreground child'`).get()).toEqual({ sender: "pi", sender_id: child.id, via: child.id });
+      expect(idRow(child.id)?.root_id).toBe(root);
+      // Its own foreground child, a module instance of its own, resolves to the top root.
+      const grand = JSON.parse(results("grandchild")[0]!);
+      expect(grand).toEqual({ id: grand.id, primary: "pi", aliases: ["pi"], principal: null, root, child: true });
+      expect(grand.id).not.toBe(child.id);
+      expect(audit("id.child_seen").filter((a) => a.target === grand.id)).toEqual([{
+        actor: root, target: grand.id,
+        detail: expect.objectContaining({ child: grand.id, root, parent_session: state.sessionId }),
+      }]);
+      // Its shutdown ended it; the root alone holds the name, and no second root ran.
+      await until(() => idRow(child.id)?.ended_at, 15_000, "the foreground child ended");
+      expect(bus.query(`SELECT id FROM alias_holds WHERE address = 'pi'`).get()).toEqual({ id: root });
+      expect(liveRoots().map((r) => r.id)).toEqual([root]);
+      expect(audit("id.child_fallback")).toEqual([]);
+
+      // A header naming no live session: the child is a root of its own.
+      await pi.command({ type: "prompt", message: "spawn stray" });
+      await ran("spawn stray");
+      const stray = JSON.parse(results("child stray")[0]!);
+      expect(stray.child).toBeUndefined();
+      expect(stray.id).not.toBe(root);
+      expect(idRow(stray.id)?.root_id).toBeNull();
+      expect(audit("id.child_fallback")).toEqual([]);
+
+      // /fork: its header names the session it left, which ended first, so
+      // it is a root that carries the name, not a child falling back.
+      const { messages } = await pi.command({ type: "get_fork_messages" });
+      await pi.command({ type: "fork", entryId: messages[0].entryId });
+      const fork = await pi.command({ type: "get_state" });
+      expect(fork.sessionId).not.toBe(state.sessionId);
+      const nth = (await pi.messages()).filter((m) => m.role === "toolResult" && m.toolName === prefix + "whoami").length;
+      await pi.command({ type: "prompt", message: "who" });
+      const forked = JSON.parse(resultText(await toolResult(pi, "whoami", nth)));
+      await idle(pi);
+      expect(forked.child).toBeUndefined();
+      expect(forked.aliases).toEqual(["pi"]);
+      expect(idRow(forked.id)).toMatchObject({ root_id: null, harness_session: fork.sessionId });
+      expect(audit("id.child_fallback")).toEqual([]);
+      expect(model.unhandled).toEqual([]);
+      expect(pi.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      await pi.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+      db?.close();
+    }
+  });
+}
+
 // An enabled grayboard MCP entry would give pi a second grayboard with the same
 // tool names: the extension registers nothing, starts nothing, and says why.
 export function piReenabledScenario(dir: string, bin?: string): Promise<void> {

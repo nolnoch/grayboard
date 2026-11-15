@@ -1334,3 +1334,105 @@ test("a configured per-user session cap admits past the default and refuses at i
   expect(hostedRowCount(database.db)).toBe(300);
   await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
 });
+
+test("#881: a request reads its row once and skips its own user's disabled read; the sweep's settle still ends a disabled user's root", async () => {
+  const { Database } = await import("bun:sqlite");
+  const root = context("one-read");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  const query = spyOn(Database.prototype, "query");
+  try {
+    const count = (sql: string) => query.mock.calls.filter(([s]) => String(s) === sql).length;
+    const rowReads = () => count("SELECT * FROM hosted_sessions WHERE session_id = ?"), userReads = () => count("SELECT * FROM users WHERE id = ?");
+    query.mockClear();
+    await hosted.whoami(principal, root);
+    // withGate's before-gate read, settle's (rowFor reuses it) and touchAfter's; before #881, four and one user read.
+    expect(rowReads()).toBe(3);
+    expect(userReads()).toBe(0);
+    // Positive case: settle with no authorized user (the sweep's and mcp authorize's) still reads, and ends.
+    database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+    query.mockClear();
+    hosted.settle(root.id);
+    expect(userReads()).toBe(1);
+    expect(database.repo.hosted.get(root.id)).toBeUndefined();
+  } finally { query.mockRestore(); }
+});
+
+test("#881: a settle that ends a lapsed root stands when the same request is then refused", async () => {
+  const lapsed = context("lapsed"), other = context("other");
+  if (!("id" in lapsed)) throw new Error("fixture context");
+  await hosted.bind(principal, lapsed, { name: "be", create: true });
+  await delivery.open(principal, lapsed);
+  await hosted.whoami(principal, other);
+  delivery.close(); hosted.close();
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 1 } });
+  delivery = createDelivery(hosted, { isAuthorized: () => authorized });
+  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, lapsed.id]);
+  // settle ends the lapsed root; rowFor then starts a new row there, which the one-row cap refuses.
+  await expect(hosted.whoami(principal, lapsed)).rejects.toHaveProperty("code", "bad_request");
+  expect(database.repo.hosted.get(lapsed.id)).toBeUndefined();
+  expect(hostedRowCount(database.db)).toBe(1);
+});
+
+test("#902: a bound native call reads its root's holds once, for the bound check and its session alike", async () => {
+  const { Database } = await import("bun:sqlite");
+  const root = context("one-holds");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  const prepare = spyOn(Database.prototype, "prepare");
+  try {
+    await hosted.run(principal, root, "dm_send", session => application.send(session, "be", "held once"));
+    // Before #902, named() and snapshot() each read them: two.
+    expect(prepare.mock.calls.filter(([s]) => String(s) === "SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").length).toBe(1);
+  } finally { prepare.mockRestore(); }
+});
+
+// #907: a native tool call's gate reuses its exchange's verdict (`run`'s `prior`) only while the rows still read as
+// the exchange left them. Each change in the window between the two gates ends as it does with no verdict at all:
+// the same refusal, recovery, unpark and sender.
+const windows: [string, (m: { root: string; child: string; other: string; name: string }) => Promise<void> | void][] = [
+  ["nothing", () => {}],
+  // The child alone goes idle: the root stays live (touched, its lease renewed), so a miss here is the child's.
+  ["the child parked", ({ root, child }) => { now += 900_001; keepLive(root); hosted.sweep(); const row = database.repo.hosted.get(hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
+  ["the root's lease lapsed", ({ root }) => { database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, hostedId(root)]); }],
+  ["the root's generation moved", ({ root }) => database.repo.hosted.atomic(() => { const r = database.repo.hosted.get(hostedId(root))!; database.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); })],
+  ["the root ended and started again", async ({ root }) => { await hosted.end(principal, context(root)); await hosted.whoami(principal, context(root)); }],
+  ["the child moved to another root", async ({ root, other, child }) => { await hosted.end(principal, context(root), hostedId(child)); await hosted.register(principal, context(other), child); }],
+  ["the child's idle window passed", ({ root, child }) => { now += 900_001; keepLive(root); expect(database.repo.hosted.get(hostedId(child))).toBeDefined(); }],
+];
+function keepLive(root: string) {
+  database.repo.hosted.touch(hostedId(root), now);
+  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ? AND lease_deadline IS NOT NULL", [now + 30_000, hostedId(root)]);
+}
+for (const [change, apply] of windows) for (const caller of ["root", "child"] as const) {
+  test(`#907: a ${caller}'s call with its exchange's verdict ends as one without it when, between the gates, ${change}`, async () => {
+    const outcome = async (mode: "prior" | "full", parkedFirst: boolean) => {
+      const tag = `${mode}-${parkedFirst ? "p" : "a"}`;
+      const m = { root: `root-${tag}`, child: `child-${tag}`, other: `other-${tag}`, name: `be-${tag}` };
+      await hosted.bind(principal, context(m.root), { name: m.name, create: true });
+      await hosted.bind(principal, context(m.other), { name: `${m.name}-other`, create: true });
+      // A lease would lapse over the parking's idle window and end the root with it.
+      if (!parkedFirst) await delivery.open(principal, context(m.root));
+      await hosted.register(principal, context(m.root), m.child);
+      const self = caller === "root" ? m.root : m.child;
+      if (parkedFirst) { now += 900_001; hosted.sweep(); }
+      const { verdict } = await hosted.snapshot(principal, context(self), false);
+      await apply(m);
+      const body = `${mode} ${change} ${caller} ${parkedFirst}`;
+      const get = spyOn(database.repo.hosted, "get");
+      const result = await hosted.run(principal, context(self), "dm_send", session => application.send(session, m.name, body), undefined, mode === "prior" ? verdict : undefined)
+        .then(() => "ok", (e: { code?: string }) => e.code ?? "error").finally(() => { reads.push(get.mock.calls.length); get.mockRestore(); });
+      const sent = database.db.query<{ sender_id: string }, [string]>("SELECT sender_id FROM messages WHERE body = ?").get(body)?.sender_id;
+      const row = database.repo.hosted.get(hostedId(self));
+      return { result, sender: sent === undefined ? null : sent === hostedId(self), parked: row?.parked_at ?? null, root: row?.root_session_id === null ? "self" : row?.root_session_id === hostedId(m.root) ? "root" : row?.root_session_id === hostedId(m.other) ? "other" : "none", inflight: hosted.inflightCount };
+    };
+    const reads: number[] = [];
+    for (const parkedFirst of caller === "child" ? [false, true] : [false]) {
+      reads.length = 0;
+      const full = await outcome("full", parkedFirst);
+      expect(await outcome("prior", parkedFirst)).toEqual(full);
+      // With nothing changed, the verdict stands in for the full gate's settle and rowFor: fewer row reads.
+      if (change === "nothing" && !parkedFirst) expect(reads[1]).toBeLessThan(reads[0]);
+    }
+  });
+}

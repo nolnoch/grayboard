@@ -388,3 +388,18 @@ test("a configured per-session watch cap bounds an older-protocol session's reso
   expect(await client.subscribeResource({ uri: "grayboard://boards/one" })).toEqual({});
   await expect(client.subscribeResource({ uri: "grayboard://boards/two" })).rejects.toThrow();
 });
+
+// #881 passes a lease call's first authorization to the lease capability check instead of authorizing again.
+for (const method of ["renew", "inbox"] as const) test(`#902: a warm ${method} checks its grant ${method === "renew" ? 10 : 11} times`, async () => {
+  const headers = new Headers();
+  const client = await connect("2026-07-28", "subscriber", undefined, headers);
+  const opened = await client.callTool({ name: "delivery_open", arguments: {} });
+  headers.set("X-Grayboard-Lease", (JSON.parse((opened.content[0] as { text: string }).text) as { capability: string }).capability);
+  const call = () => method === "renew" ? client.callTool({ name: "delivery_renew", arguments: {} }) : client.readResource({ uri: "grayboard://inbox" });
+  await call();
+  const isActive = store.repo.oauth.findActiveAccess;
+  let calls = 0;
+  store.repo.oauth.findActiveAccess = (...args) => { calls++; return isActive(...args); };
+  try { await call(); } finally { store.repo.oauth.findActiveAccess = isActive; }
+  expect(calls).toBe(method === "renew" ? 10 : 11); // before #881, 11 and 12
+});

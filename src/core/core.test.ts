@@ -20,6 +20,7 @@ import {
   markDelivered,
   mentionTokens,
   openAccess,
+  DIGEST_SQL,
   pendingFor,
   post,
   prunePosts,
@@ -294,6 +295,23 @@ test("posting does not mark others' unread posts as read", () => {
   expect(listBoards(db, ["sim"])[0]!.unread).toBe(2);
   expect(drain("sim", true)).toMatchObject([{ kind: "digest", unread: 2 }]);
   expect(read(db, "sim", "e2e").posts.map((p) => p.body)).toEqual(["one", "two"]);
+});
+
+test("a digest's latest is the newest post it counts, past newer own and pushed posts, and its statement walks the handle and board indexes (#900, #904)", () => {
+  subscribe(db, "sim", "e2e", "digest");
+  post(db, "be", "e2e", "read already");
+  read(db, "sim", "e2e");
+  post(db, "be", "e2e", "first unread");
+  post(db, "be", "e2e", "newest counted");
+  post(db, "be", "e2e", "@sim pushed instead");
+  post(db, "sim", "e2e", "own, newer still");
+  expect(drain("sim", true)).toMatchObject([{ kind: "push", reason: "mention" }, { kind: "digest", unread: 2, latest: { body: "newest counted" } }]);
+  // The statement pendingFor runs (#904): subscriptions by handle, and both the count and latest_id walk the board's
+  // (board, id) range rather than scanning or sorting posts.
+  const plan = (db.prepare("EXPLAIN QUERY PLAN " + DIGEST_SQL).all(...Array(9).fill("sim")) as { detail: string }[]).map((r) => r.detail);
+  expect(plan).toContain("SEARCH s USING INDEX idx_subscriptions_handle (handle=?)");
+  expect(plan.filter((d) => d === "SEARCH p USING INDEX idx_posts_board_id (board=? AND id>?)")).toHaveLength(2);
+  expect(plan.filter((d) => /SCAN p\b|TEMP B-TREE/.test(d))).toEqual([]);
 });
 
 test("a mention doesn't also count toward the mentioned subscriber's digest", () => {

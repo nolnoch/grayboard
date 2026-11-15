@@ -13,7 +13,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Ident
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions, type Verdict } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
 import { domainData, HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
@@ -34,16 +34,17 @@ const ids = z.array(id);
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
-type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
+type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; verdict?: Verdict; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
 // A legacy session whose access token expired with its grant still active sleeps
 // (#476): its admission is released, its sid stays, and the binding's next
 // authenticated request re-admits it. `dormant` holds the separate dormant bound.
 // `controls`: the tail of this protocol session's subscribe/unsubscribe chain; each runs after the previous settles (#431).
 type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
+type Checked = { row: HostedSession | undefined; root?: HostedSession };
 type Live = { context: Context; rows: Set<string>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   let closed = false, posts = 0, busListeners = 0;
@@ -110,7 +111,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: principal => oauth.isAuthorized(principal) });
   const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now, caps: caps.leases });
-  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy };
+  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
@@ -136,16 +137,28 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return exchange.context;
   }
   // Returns the context's row as it stands after any settle, so a synchronous caller needn't read it again (#853).
-  function authorize(context: Context, signal?: AbortSignal): { row: HostedSession | undefined } {
-    if (closed || context.request.signal.aborted || signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
-    if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
-    application.revalidateSession(context.session, true);
+  // The grant and user checks share one auth-generation read (#902). `withRow: false` (a native tool, whose hosted
+  // gate reads and settles the row itself) skips the row.
+  // `root`: the row's root as read, when no settle wrote since (#899).
+  function authorize(context: Context, signal?: AbortSignal, withRow?: true): Checked;
+  function authorize(context: Context, signal: AbortSignal | undefined, withRow: false): void;
+  function authorize(context: Context, signal?: AbortSignal, withRow = true): Checked | void {
+    authCheck(context, signal);
+    if (!withRow) return;
     if (!("id" in context.sessionContext)) return { row: undefined };
     const row = hosted.row(context.sessionContext.id);
     const root = row && hosted.rootOf(row);
-    if (!root || root.lease_deadline === null || root.lease_deadline > now()) return { row };
+    if (!root || root.lease_deadline === null || root.lease_deadline > now()) return { row, root };
     hosted.settle(root.session_id);
     return { row: hosted.row(context.sessionContext.id) };
+  }
+  // authorize's checks that read no hosted row: the request, the token and grant, the session and its user.
+  function authCheck(context: Context, signal?: AbortSignal) {
+    if (closed || context.request.signal.aborted || signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
+    application.repo.authRead(() => {
+      if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
+      application.revalidateSession(context.session, true);
+    });
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
   async function select(request: Request, admit = true): Promise<Context> {
@@ -173,7 +186,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
     try {
       if (admit) application.admitHosted(principal.authed, "id" in routing ? routing.id : null, role);
-      selected = await hosted.snapshot(principal, routing);
+      // A native tool call's end is touched by its tool's gate, which also reuses this selection's verdict (#907).
+      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchanges.getStore()?.method === "tools/call"));
     } catch (error) {
       const exchange = exchanges.getStore();
       if (exchange && error instanceof ApplicationError && error.code === "rate_limited" && typeof error.extra.retry_after_ms === "number" && Number.isFinite(error.extra.retry_after_ms) && error.extra.retry_after_ms > 0) {
@@ -228,7 +242,33 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const row = hosted.row(context.sessionContext.id);
     return new Set([context.sessionContext.id, ...(row?.root_session_id ? [row.root_session_id] : [])]);
   }
+  // The stream timer re-reads a context's hosted rows only when they could have changed (#899): a commit notice
+  // naming one (`changedAt`, every context, idle lives too), a null notice (`allAt`), a moved auth generation (which
+  // another connection's commit also moves), a lease deadline passing, or `recheckMs` since its last full check.
+  // `seq` numbers the notices; a stamp keeps the one current when its check began.
+  let seq = 0, allAt = 0, prunedAt = now();
+  const changedAt = new Map<string, number>();
+  type Stamp = { gen: string; seq: number; at: number; recheckAt: number; rows: string[]; row: HostedSession | undefined };
+  const stamps = new WeakMap<Context, Stamp>();
+  const recheckMs = opts.streamRecheckMs ?? 30_000;
+  function stamp(context: Context, gen: string | undefined, at: number, start: number, checked: Checked) {
+    if (gen === undefined) { stamps.delete(context); return; }
+    const id = "id" in context.sessionContext ? context.sessionContext.id : undefined, { row, root } = checked;
+    const deadlines = [row?.lease_deadline, root?.lease_deadline].filter((d): d is number => d !== null && d !== undefined);
+    // A settle that wrote leaves no root: checked again next tick.
+    const recheckAt = id === undefined ? Infinity : root ? Math.min(Infinity, ...deadlines) : at;
+    const rows = id === undefined ? [] : [id, ...(row?.root_session_id ? [row.root_session_id] : [])];
+    stamps.set(context, { gen, seq: start, at, recheckAt, rows, row });
+  }
+  function fresh(context: Context, gen: string | undefined, t: number): Stamp | undefined {
+    const s = stamps.get(context);
+    if (!s || gen === undefined || s.gen !== gen || allAt > s.seq || t >= s.recheckAt || t - s.at >= recheckMs) return undefined;
+    for (const id of s.rows) if ((changedAt.get(id) ?? 0) > s.seq) return undefined;
+    return s;
+  }
   const unlistenHosted = hosted.listen(changed => {
+    seq++;
+    if (changed === null) allAt = seq; else changedAt.set(changed, seq);
     for (const live of [...lives]) {
       if (changed !== null && live.rows.size && !live.rows.has(changed)) continue;
       try { if (!idle(live) && !bindingLive(live.context)) live.stop(); }
@@ -238,6 +278,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // `checked`: authorize's result for this context, taken this turn with no await since (#853).
   function watchable(context: Context, uri: string, checked = authorize(context)): string | null {
     if (!bindingLive(context, checked)) throw new ApplicationError("unbound", "ownership changed; subscribe again with current session context");
+    return capability(context, uri, checked);
+  }
+  // watchable's check of the resource itself, past the binding: a subscriber's lease (in memory, against
+  // `checked.row`), a native session's board access.
+  function capability(context: Context, uri: string, checked: Checked): string | null {
     if (context.role === "subscriber") {
       const cap = context.request.headers.get("X-Grayboard-Lease");
       if (uri !== "grayboard://inbox" || !cap || !/^[A-Za-z0-9_-]{43}$/.test(cap) ||
@@ -251,9 +296,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return null;
   }
   // One authorize for the live's every uri: watchable and describe reuse its row (#853).
-  function valid(live: Live) {
+  function valid(live: Live): Checked {
     const checked = authorize(live.context);
     for (const [uri, cap] of live.uris) if (watchable(live.context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
+    return checked;
+  }
+  // valid for a live whose stamp is fresh (#899): every check but the binding's row, root and holds reads, which
+  // nothing could have changed; the lease is checked against the stamped row, unchanged since.
+  function validStamped(live: Live, s: Stamp) {
+    authCheck(live.context);
+    for (const [uri, cap] of live.uris) if (capability(live.context, uri, { row: s.row }) !== cap) throw new ApplicationError("not_found", "resource not found");
   }
   function addWatch(live: Live, uri: string) {
     if (live.context.role === "native") live.watches.push(resources.watch(live.context.session, uri, {
@@ -340,8 +392,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // The bound text follows the ownership: its launcher flag, and (with no declaration) its lease (#531).
   function boundInstruction(context: Context): string {
     if (!("id" in context.sessionContext)) return hostedBoundInstruction(context.info, context.declared);
-    const row = hosted.row(context.sessionContext.id);
-    const root = row && hosted.rootOf(row);
+    // The exchange's selection read the root moments ago (#907).
+    const row = context.verdict ? undefined : hosted.row(context.sessionContext.id);
+    const root = context.verdict?.root ?? (row && hosted.rootOf(row));
     return hostedBoundInstruction(context.info, context.declared, application.hostedLauncher(context.sessionContext.id), root?.lease_deadline != null);
   }
   function makeServer(context: Context, legacy?: Legacy) {
@@ -431,7 +484,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       server.server.setRequestHandler("resources/subscribe", (req, ctx) => serialized(req.params.uri, ctx, true));
       server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => serialized(req.params.uri, ctx, false));
     }
-    if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal); return context; }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
+    if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal, false); return context; }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
     return server;
   }
   const modernFactory = async () => {
@@ -531,9 +584,55 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     // An access expiry or revoke is an expected close, audited by streamClosed; only other failures are logged (#494 item 10).
     const unexpected = (e: unknown) => { if (!(e instanceof ApplicationError && e.code === "unauthenticated")) hostedFailure("mcp.stream", e); };
     // A live's stream is in streamContexts too (wrap adds both): valid() just authorized its context (#853).
-    const checked = new Set<Context>();
-    for (const live of [...lives]) { checked.add(live.context); try { valid(live); } catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); } }
-    for (const [stream, context] of streamContexts) { if (checked.has(context)) continue; try { authorize(context); } catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); } }
+    // Phase A, under one generation read (#899): a fresh stamp's checks, which read no hosted row and write none of
+    // the generation's tables. The rest wait for phase B's full check, whose settle may commit.
+    const checked = new Set<Context>(), full: Live[] = [], fullStreams: [OwnedStream, Context][] = [];
+    const t = now();
+    let gen: string | undefined;
+    try {
+      gen = application.repo.authRead(() => {
+        const gen = application.repo.authGeneration();
+        for (const live of [...lives]) {
+          if (live.stopped) continue;
+          checked.add(live.context);
+          const s = fresh(live.context, gen, t);
+          if (!s) { full.push(live); continue; }
+          try { validStamped(live, s); } catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); }
+        }
+        for (const [stream, context] of streamContexts) {
+          if (checked.has(context)) continue;
+          if (!fresh(context, gen, t)) { fullStreams.push([stream, context]); continue; }
+          try { authCheck(context); } catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); }
+        }
+        return gen;
+      });
+    } catch {
+      // The generation read failed: every context is stale, and phase B's own checks close the ones that fail.
+      gen = undefined;
+      full.length = 0; fullStreams.length = 0;
+      for (const live of lives) if (!live.stopped) full.push(live);
+      const owned = new Set(full.map(l => l.context));
+      for (const [stream, context] of streamContexts) if (!owned.has(context)) fullStreams.push([stream, context]);
+    }
+    // Phase B: a full check, stamped with the generation and notice number read before it.
+    for (const live of full) {
+      if (live.stopped) continue;
+      const start = seq, context = live.context;
+      try { stamp(context, gen, t, start, valid(live)); } catch (e) { stamps.delete(context); unexpected(e); streamClosed(context, e); live.stop(); }
+    }
+    for (const [stream, context] of fullStreams) {
+      if (!streamContexts.has(stream)) continue;
+      const start = seq;
+      try { stamp(context, gen, t, start, authorize(context)); } catch (e) { stamps.delete(context); unexpected(e); streamClosed(context, e); track(stream.stop()); }
+    }
+    // A notice older than every stamp can't make one stale.
+    if (t - prunedAt >= recheckMs) {
+      prunedAt = t;
+      let oldest = seq;
+      for (const live of lives) oldest = Math.min(oldest, stamps.get(live.context)?.seq ?? oldest);
+      for (const context of streamContexts.values()) oldest = Math.min(oldest, stamps.get(context)?.seq ?? oldest);
+      for (const [id, n] of changedAt) if (n <= oldest) changedAt.delete(id);
+    }
   }, 1000);
   timer.unref();
   function wrap(response: Response, context: Context | undefined, live?: Live, done?: () => void) {
@@ -604,8 +703,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         const body = post ? await readBody(original) : { request: original, parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
         const req = body.request;
-        const parsed = body.parsedBody as { id?: string | number | null; params?: { _meta?: unknown } } | undefined;
-        return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id }, async () => {
+        const parsed = body.parsedBody as { id?: string | number | null; method?: unknown; params?: { _meta?: unknown } } | undefined;
+        return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id, method: parsed?.method }, async () => {
           const exchange = exchanges.getStore()!;
           let live: Live | undefined;
           let ownHandler: McpHttpHandler | undefined;
@@ -773,7 +872,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
-      return said(text(await timeTool(tool, () => { const context = current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }); }) ?? "ok"), notice);
+      return said(text(await timeTool(tool, () => { const context = current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict); }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);

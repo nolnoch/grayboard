@@ -2,11 +2,13 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, normalize, resolve } from "node:path";
 import { repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
+import { brokenSectionRefs, resolves, sectionKeys, sectionRefs } from "./doc_sections.ts";
 
 // Every relative link and image in the repo's tracked markdown resolves to a
-// file, and every #anchor to a heading GitHub renders. A docs-only PR runs
-// only this test (test.yml scope, #601), so it is what keeps such a PR from
-// merging a broken link.
+// file, and every #anchor to a heading GitHub renders; every § reference to a
+// section (#886); every Tier-2 doc fits the CONTRACT §4 cap. A docs-only PR
+// runs only this test (test.yml scope, #601), so it is what keeps such a PR
+// from merging a broken link.
 
 const root = resolve(import.meta.dir, "../..");
 
@@ -74,4 +76,37 @@ test("every relative link and anchor in tracked markdown resolves", () => {
     }
   }
   expect(broken).toEqual([]);
+});
+
+const tracked = (...patterns: string[]) => {
+  const r = Bun.spawnSync(["git", "ls-files", ...patterns], { cwd: root, env: repositoryGitEnv(process.env), stdout: "pipe", stderr: "pipe" });
+  expect(r.exitCode).toBe(0);
+  return r.stdout.toString().split("\n").filter(Boolean);
+};
+
+test("sectionRefs binds a § to the adjacent file, a chained §, else the containing file; skips issues and RFCs", () => {
+  const refs = sectionRefs("`a.md` §3, §4 and §5. README §Install here. Then (§2) and `b.md`), x (§6). #523 §3a, RFC 8252 §7.3, §8.1. See [`c.md`](../c.md) §7.");
+  expect(refs.map(r => [r.file, r.also, r.section])).toEqual([
+    ["a.md", undefined, "3"], ["a.md", undefined, "4"], ["a.md", undefined, "5"], ["README.md", undefined, "Install here"],
+    [undefined, "README.md", "2"], [undefined, "b.md", "6"], ["../c.md", undefined, "7"],
+  ]);
+});
+
+test("resolves matches heading numbers and label word prefixes, headings, bold leads and top-level bullets", () => {
+  const keys = sectionKeys("# T\n## 3. Boards and posts\n**Legacy GET streams** (#431). x\n- **Hosted core** (x) y\n- opencode (`adapters/opencode/`): z\n  - Nested thing\n```\n## 9. fenced\n```\n");
+  for (const yes of ["3", "Boards", "Boards and posts", "Legacy GET streams", "Hosted core", "opencode", "Hosted core and more words"]) expect(resolves(keys, yes)).toBe(true);
+  for (const no of ["9", "3.1", "Boards and claims", "Nested", "Legacy POST"]) expect(resolves(keys, no)).toBe(false);
+});
+
+test("every § reference in tracked docs and code resolves to a section", () => {
+  const md = tracked("*.md");
+  const files = tracked("*.md", "*.ts", "*.sh", "*.mjs", "*.js", "*.yml")
+    .filter(f => !f.startsWith(".github/release-notes/") && !f.startsWith("tests/integration/doc_")); // the checker's own fixtures
+  expect(brokenSectionRefs(root, files, md)).toEqual([]);
+});
+
+// CONTRACT §4: a Tier-2 doc (docs/*.md; not the human guide/ or future/) stays at or under 25 KB.
+test("every Tier-2 doc fits the 25 KB cap", () => {
+  const over = tracked("docs/*.md").filter(f => !f.includes("/", 5)).map(f => [f, statSync(join(root, f)).size] as const).filter(([, n]) => n > 25 * 1024);
+  expect(over).toEqual([]);
 });

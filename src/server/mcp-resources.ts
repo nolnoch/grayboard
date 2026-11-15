@@ -100,8 +100,8 @@ export function registerHostedResources(server: McpServer, context: {
     if (signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     return context.authorize();
   };
-  const leaseCapability = (signal: AbortSignal) => {
-    const checked = authorize(signal);
+  // `checked`: the authorization its caller made with no await since (#881), so it isn't made twice.
+  const leaseCapability = (signal: AbortSignal, checked = authorize(signal)) => {
     const { principal, sessionContext, session, request } = context.current();
     const capability = request.headers.get("X-Grayboard-Lease");
     if (!capability || !/^[A-Za-z0-9_-]{43}$/.test(capability) ||
@@ -136,10 +136,10 @@ export function registerHostedResources(server: McpServer, context: {
   server.server.setRequestHandler("resources/read", async ({ params }, ctx) => {
     const { principal, sessionContext, session } = context.current(ctx);
     try {
-      authorize(ctx.mcpReq.signal);
+      const checked = authorize(ctx.mcpReq.signal);
       if (role === "subscriber") {
         if (params.uri !== inboxUri) throw new ApplicationError("not_found", "resource not found");
-        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(ctx.mcpReq.signal), 100) });
+        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(ctx.mcpReq.signal, checked), 100) });
       }
       const read = boardRead(params.uri);
       return json(params.uri, await hosted.run(principal, sessionContext, "board_read", session => resources.read(session, read.uri, read.options)));
@@ -150,11 +150,11 @@ export function registerHostedResources(server: McpServer, context: {
     }
   });
   if (role !== "subscriber") return;
-  const run = async (ctx: ServerContext, call: () => unknown | Promise<unknown>) => {
+  // `call` runs synchronously up to its first await, so it may use `checked` there (#881).
+  const run = async (ctx: ServerContext, call: (checked: { row: HostedSession | undefined }) => unknown | Promise<unknown>) => {
     try {
       context.current(ctx);
-      authorize(ctx.mcpReq.signal);
-      const value = await call();
+      const value = await call(authorize(ctx.mcpReq.signal));
       return { content: [{ type: "text" as const, text: JSON.stringify(value ?? { ok: true }) }] };
     } catch (error) {
       return toolError(error);
@@ -198,12 +198,12 @@ export function registerHostedResources(server: McpServer, context: {
   }));
   server.registerTool("delivery_renew", {
     description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx, () => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal))));
+  }, (_args, ctx) => run(ctx, checked => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked))));
   server.registerTool("delivery_receipt", {
     description: "Receipt issued delivery IDs only after durable host admission; not a DM handling acknowledgment.",
     inputSchema: z.strictObject({ ids: z.array(z.string().min(1).max(128)).max(100).refine(ids => new Set(ids).size === ids.length, "IDs must be distinct") }),
-  }, (args, ctx) => run(ctx, () => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal), args.ids)));
+  }, (args, ctx) => run(ctx, checked => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked), args.ids)));
   server.registerTool("delivery_release", {
     description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx, () => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal))));
+  }, (_args, ctx) => run(ctx, checked => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked))));
 }
