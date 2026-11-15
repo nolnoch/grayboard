@@ -702,7 +702,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     const audit = serverAuditSink(repo);
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
-      if (meta) repo.atomic(() => setAliasMeta(db, address, meta, id, audit));
+      if (meta) repo.atomic(() => setAliasMeta(db, address, meta, id, audit, authed.user_email));
       return { alias: address, held: [...session.holds] };
     }
     if (session.holds.length >= MAX_HOLDS) {
@@ -740,7 +740,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       createLazily(hub, authed, target, id);
       holdAlias(db, address, id, now());
       logBinding(db, id, address, "bound", null);
-      if (meta) setAliasMeta(db, address, meta, id, audit);
+      if (meta) setAliasMeta(db, address, meta, id, audit, authed.user_email);
       touchAlias(db, address);
     });
 
