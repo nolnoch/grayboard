@@ -24,6 +24,8 @@ export type SessionFacts = { model?: string; effort?: string };
 // `suggested`: the name the request's checkout suggests (#443), normalized.
 // `launcher`: the request declares its harness can spawn subagents (#473); any request of a root's ownership turns it on (#520), and it only
 // words the bind and initialize text afterwards.
+// The rows an exchange's selection read for its request (#907): the row and its root.
+export type Verdict = { row: HostedSession; root: HostedSession };
 export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; suggested?: string; launcher?: true } | { missing: string };
 export function hostedSessionId(user: number, client: string, raw: string): string {
   const hash = createHash("sha256");
@@ -237,8 +239,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     };
     return { call: <T>(fn: () => Promise<T>) => enter(false, fn), bind: <T>(fn: () => Promise<T>) => enter(true, fn) };
   };
+  // The row is read only for an audit with no principal to name the actor and client (#907).
   const audit = (id: string, action: AuditAction, detail: Record<string, unknown>, principal?: OAuthPrincipal) => {
-    const row = store.get(id);
+    const row = principal ? undefined : store.get(id);
     const actor = principal?.authed.user_email ?? (row && repo.users.findById(row.user_id)?.email) ?? null;
     writeAudit(repo, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
   };
@@ -479,7 +482,9 @@ export function createHostedSessions(application: Application, options: { now?: 
       },
     };
   }
-  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true): Promise<T> {
+  // `endTouch`: whether the call's end is touched (`touchAfter`); an exchange's selection for a tool call leaves it
+  // to the tool's own gate, which ends later (#907).
+  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true): Promise<T> {
     authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
@@ -498,11 +503,47 @@ export function createHostedSessions(application: Application, options: { now?: 
         try { return await fn(row); }
         finally {
           for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
-          touchAfter(row);
+          if (endTouch) touchAfter(row);
         }
       });
       if (result !== retry) return result as T;
     }
+  }
+  // A native tool call's gate after its exchange's (#907). The exchange's selection read and settled this request's
+  // rows under its own gate moments before (`prior`); while they still read as it left them, they stand in for this
+  // gate's settle and rowFor: one read of the row (and a child's root) in place of four. Any difference (an end, a
+  // park, a lapsed lease, a new ownership, root or generation, an idle window passed) runs the full gate instead, so
+  // every refusal and recovery stays on its one path. `rowFor`'s writes are a selection's, already made: a request's
+  // facts and launcher declaration are written only on a change, and its writes_as is fixed for the ownership.
+  const MISS = Symbol("prior stale");
+  async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>): Promise<T> {
+    authorized(p);
+    if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) return withGate(p, context, false, fn);
+    const id = prior.root.session_id;
+    const result = await gate(id).call(async () => {
+      authorized(p);
+      if (stopped) return MISS;
+      const row = store.atomic(() => {
+        const fresh = store.get(prior.row.session_id);
+        const root = !fresh ? undefined : fresh.root_session_id ? store.get(fresh.root_session_id) : fresh;
+        const t = now();
+        if (!fresh || !root || fresh.ownership_id !== prior.row.ownership_id || fresh.root_session_id !== prior.row.root_session_id || fresh.parked_at !== null
+          || root.session_id !== id || root.ownership_id !== prior.root.ownership_id || root.bind_gen !== prior.root.bind_gen || root.root_session_id
+          || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
+        store.touch(root.session_id, t);
+        if (fresh !== root) store.touch(fresh.session_id, t);
+        return fresh;
+      });
+      if (!row) return MISS;
+      const ids = [...new Set([row.session_id, id])];
+      for (const s of ids) inflight.set(s, (inflight.get(s) ?? 0) + 1);
+      try { return await fn(row); }
+      finally {
+        for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
+        touchAfter(row);
+      }
+    });
+    return result === MISS ? withGate(p, context, false, fn) : result as T;
   }
   function attach(p: OAuthPrincipal, row: HostedSession): HostedSession {
     authorized(p);
@@ -520,8 +561,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     return { ...fresh, grant_id: p.grantId };
   }
   // `held`: the root's holds, when the caller read them for this row with no await since (#902).
-  function snapshot(p: OAuthPrincipal, row?: HostedSession, held?: string[]) {
-    const root = row ? rootOf(row) : undefined;
+  // `known`: row's root, when the caller just read it.
+  function snapshot(p: OAuthPrincipal, row?: HostedSession, held?: string[], known?: HostedSession) {
+    const root = row ? known ?? rootOf(row) : undefined;
     // A child acts under its root's addresses, and its writes carry its own ID as `via` (#523).
     const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
     return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
@@ -582,10 +624,18 @@ export function createHostedSessions(application: Application, options: { now?: 
     listen(fn: (changed: string | null) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
     // Every MCP exchange's selection, before its tool runs: it doesn't wake a parked child (#566). The tool's own
     // gate does, except session_end's, so ending a parked child is never refused for capacity.
-    async snapshot(p: OAuthPrincipal, context: SessionContext) { return withGate(p, context, false, async row => snapshot(p, row), false); },
-    // `told` (a native tool call): gets the alias_lost notice, if any, for the result.
-    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T, told?: (notice: string) => void): Promise<T> {
+    // `verdict`: the rows it selected, for the same request's tool call (`run`'s `prior`, #907). `endTouch`: false
+    // for a tool call's exchange, whose tool gate touches its end.
+    async snapshot(p: OAuthPrincipal, context: SessionContext, endTouch = true) {
       return withGate(p, context, false, async row => {
+        const root = row ? rootOf(row) : undefined;
+        return { ...snapshot(p, row, undefined, root), verdict: row && root ? { row, root } as Verdict : undefined };
+      }, false, true, endTouch);
+    },
+    // `told` (a native tool call): gets the alias_lost notice, if any, for the result. `prior`: its exchange's
+    // verdict (#907).
+    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
+      const body = async (row: HostedSession | undefined) => {
         const taken = told ? takeLost(p, row, "agent") : [];
         if (taken.length) told!(lostNotice(p, row!, taken));
         const root = row ? rootOf(row) : undefined;
@@ -593,7 +643,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
           throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
         }
-        const selected = snapshot(p, row, held);
+        const selected = snapshot(p, row, held, root);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
         try {
@@ -602,14 +652,15 @@ export function createHostedSessions(application: Application, options: { now?: 
             fence(p, row, root);
             const value = fn(selected.session);
             if (value instanceof Promise) throw new Error("hosted native effects must be synchronous");
-            if (!writeReads.has(tool)) audit(row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as });
+            if (!writeReads.has(tool)) audit(row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
             return value;
           });
         } catch (error) {
           late.flush();
           throw error;
         } finally { application.close(selected.session); }
-      });
+      };
+      return prior ? withPrior(p, context, prior, body) : withGate(p, context, false, body);
     },
     async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: () => void) => Promise<T>): Promise<T> {
       return withGate(p, context, false, async row => {
