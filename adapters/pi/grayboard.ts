@@ -11,13 +11,15 @@
 // delivers the child's channel notifications into the session and puts its
 // instructions in the system prompt.
 //
-// Subagents (#523 step 5): pi-subagents' foreground children run in this
-// process with no ambient extensions (its child-launch.js loads them only
-// when the host is its runner), so they have none of these tools and never
-// write to the bus. Its detached runner is a process of its own that does
-// load this extension, so its child is told the id of the session that
-// launched it (BUS_PARENT_SESSION) and acts as that session's child while
-// that session lives, till it binds a name of its own.
+// Subagents (#523 step 5): pi-subagents' detached runner is a process of its
+// own that loads this extension, so its child is told the id of the session
+// that launched it (BUS_PARENT_SESSION) and acts as that session's child
+// while that session lives, till it binds a name of its own. Its foreground
+// children run in this process and get no ambient extensions, but an agent
+// can name this one explicitly (#557): such a child's session header names
+// the launching session's file (parentSession), which a process-wide map
+// resolves to that session's top root, and its own child is told that root's
+// id the same way.
 //
 // Install: copy into ~/.pi/agent/extensions/ (grayboard setup does this). The
 // command and env come from the mcpServers.grayboard entry in
@@ -116,6 +118,18 @@ delete ENV.BUS_PUSH;
 // (adapters/pi-family/entry-pi.ts).
 const PARENT_SESSION = (process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_SUBAGENT_PARENT_SESSION || undefined : undefined) ?? (ENV.BUS_PARENT_SESSION || undefined);
 
+// The live sessions of this pi process that run this extension, keyed by
+// session file (or "id:" + id for an in-memory one), each to the pi session
+// id of its top root, for a foreground subagent's lookup of its header's
+// parentSession (#557). A header names only a file, so a session without
+// one (pi --no-session) leaves its foreground children no parent to find:
+// they start as roots, as before #557. Every session gets its own instance of this
+// extension, maybe its own module, so the map sits on globalThis under a
+// namespaced Symbol.for, as the hosted pi adapter's does.
+const LIVE_KEY = Symbol.for("io.github.nolnoch.grayboard/pi-local-sessions");
+const LIVE: Map<string, string> = ((globalThis as unknown as Record<symbol, Map<string, string> | undefined>)[LIVE_KEY] ??= new Map());
+const sessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionFile() ?? `id:${ctx.sessionManager.getSessionId()}`;
+
 // The file whose entry pi's own MCP client would run, if one does: its tools
 // would collide with these by name (pi warns, and the last registration wins),
 // and its process would be a second grayboard for this session. Same merge as
@@ -196,9 +210,10 @@ export default function grayboard(pi: ExtensionAPI) {
   const owner = randomUUID();
   const mode = ARGS.indexOf("--mode");
   const local = !ARGS.some(arg => arg === "--server" || arg.startsWith("--server=") || (arg.startsWith("--mode=") && arg !== "--mode=local")) && (mode < 0 || ARGS[mode + 1] === "local");
-  const protocol = local && PARENT_SESSION === undefined && ENV.BUS_SESSION_KEY === undefined && ENV.BUS_HUMAN !== "1";
+  // A child (a runner's, or a foreground one, per selection) doesn't own delivery.
+  const owns = local && ENV.BUS_SESSION_KEY === undefined && ENV.BUS_HUMAN !== "1";
   let epoch = 0;
-  let selected: { id: string; epoch: number; ctx: ExtensionContext } | undefined;
+  let selected: { id: string; epoch: number; ctx: ExtensionContext; key: string; parent?: string } | undefined;
 
   const deliver = (params: ChannelParams) => {
     // Direct messages, mentions, thread replies: act on them (starts a turn
@@ -221,10 +236,11 @@ export default function grayboard(pi: ExtensionAPI) {
   const start = (ctx: ExtensionContext): Child => {
     const startedAt = Date.now();
     const selection = selected!;
+    const protocol = owns && selection.parent === undefined;
     // The session's own id, which its subagent runners' children find it by,
-    // and the launching session's id in a runner; set (or cleared) per start,
-    // since /new, /resume and fork change the id.
-    const env = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: PARENT_SESSION, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
+    // and its root's id in a child; set (or cleared) per start, since /new,
+    // /resume and fork change the id.
+    const env = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: selection.parent, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
     const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "inherit"] });
     const pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
     let next = 1;
@@ -392,7 +408,20 @@ export default function grayboard(pi: ExtensionAPI) {
     if (["new", "resume", "fork"].includes(event.reason)) restarts = 0;
     const id = ctx.sessionManager.getSessionId();
     if (selected?.id === id) selected.ctx = ctx;
-    else selected = { id, epoch: ++epoch, ctx };
+    else {
+      // A runner's env wins; else a foreground subagent's header names its
+      // launching session, live in this process (a fork's names the session
+      // it left, whose entry that session's shutdown deleted). Not found, it
+      // starts as a root. Only a session that would own its delivery looks:
+      // grayboard mcp refuses BUS_PARENT_SESSION with BUS_SESSION_KEY or
+      // BUS_HUMAN=1, so a keyed or human root's foreground child keeps
+      // starting as its own session.
+      const from = owns ? ctx.sessionManager.getHeader()?.parentSession : undefined;
+      const parent = PARENT_SESSION ?? (from ? LIVE.get(from) : undefined);
+      selected = { id, epoch: ++epoch, ctx, key: sessionKey(ctx), ...(parent ? { parent } : {}) };
+      // Its own subagents (grandchildren too) resolve to its top root.
+      LIVE.set(selected.key, parent ?? id);
+    }
     if (!registered && !refused) {
       const path = enabledEntry(ctx);
       if (path) {
@@ -422,6 +451,8 @@ export default function grayboard(pi: ExtensionAPI) {
     // /new, /resume, fork and quit must not leave a backoff that can spawn
     // a child for the outgoing session after the next session starts.
     restart?.cancel();
+    // First, before any await: a /fork's start must not find this session.
+    if (selected && LIVE.get(selected.key) === (selected.parent ?? selected.id)) LIVE.delete(selected.key);
     selected = undefined;
     instructions = undefined;
     // A child fail() killed must be gone before the next session's starts.
