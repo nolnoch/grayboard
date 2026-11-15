@@ -908,6 +908,46 @@ test("a drained browser-route bucket doesn't block token refresh from the same a
   expect(await tokenPost("/oauth/token", { grant_type: "refresh_token", client_id: "native", refresh_token: tokens.refresh_token, resource: service.resource })).toBe(200);
 });
 
+// F-18 (#931): refused refreshes spread over a few addresses must not drain
+// the org-wide bucket, and a drained global bucket must not block refresh.
+test("a refused-refresh flood across addresses leaves the global bucket and every other address's refresh and sign-in alone", async () => {
+  const tokens = await redeem(await issue()), second = await redeem(await issue());
+  service.close(); config.oauthGlobalLimit = { burst: 5, perSec: 0.001 }; config.oauthLimit = { burst: 3, perSec: 0.001 };
+  service = makeService();
+  const refresh = (key: string, token: string) => service.fetch(new Request(base + "/oauth/token", { method: "POST",
+    body: new URLSearchParams({ grant_type: "refresh_token", client_id: "native", refresh_token: token, resource: service.resource }) }), { key }).then(r => r!.status);
+  for (let a = 0; a < 20; a++) {
+    for (let i = 0; i < 3; i++) expect(await refresh(`flood-${a}`, random())).toBe(400);
+    expect(await refresh(`flood-${a}`, random())).toBe(429);
+  }
+  const scopes = () => storage.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'oauth.rate_limited'").all().map(r => JSON.parse(r.detail).scope);
+  expect(scopes()).toContain("token_address");
+  expect(scopes()).not.toContain("global");
+  // The org-wide bound that's left is on the refusal rows: at most the burst,
+  // even past the address limiter's 1000-key cap, where addresses go uncharged.
+  for (let a = 0; a < 1100; a++) expect(await refresh(`spread-${a}`, random())).toBe(400);
+  const rows = (action: string) => storage.db.query(`SELECT 1 FROM access_log WHERE action = '${action}'`).all().length;
+  expect(rows("oauth.request_refused")).toBe(5);
+  // Past the cap a new address is neither charged nor refused.
+  for (let i = 0; i < 70; i++) expect(await refresh("spread-1099", random())).toBe(400);
+  // An unlisted client's two rows share one decision, made after every await:
+  // a concurrent batch writes at most the refilled burst of each.
+  clock += 10_000_000;
+  const unlisted = (key: string) => service.fetch(new Request(base + "/oauth/token", { method: "POST",
+    body: new URLSearchParams({ grant_type: "refresh_token", client_id: "https://unlisted.example/client.json", refresh_token: random() }) }), { key }).then(r => r!.status);
+  expect(await Promise.all(Array.from({ length: 20 }, (_, i) => unlisted(`unlisted-${i % 3}`)))).toEqual(Array(20).fill(401));
+  expect(accessAudits(storage.db, "oauth.cimd_refused").map(a => a.detail)).toEqual(Array(5).fill({ reason: "not_allowed" }));
+  expect(rows("oauth.request_refused")).toBe(10);
+  expect(await refresh("office", tokens.refresh_token)).toBe(200);
+  expect((await service.fetch(new Request(authorization().url), { key: "office" }))!.status).toBe(303);
+  // The other direction: browser routes from several addresses drain the
+  // global bucket; a refresh still goes through.
+  for (let a = 0; a < 5; a++) await service.fetch(new Request(base + "/oauth/unknown"), { key: `browse-${a}` });
+  expect((await service.fetch(new Request(base + "/oauth/unknown"), { key: "browse-x" }))!.status).toBe(429);
+  expect(scopes()).toContain("global");
+  expect(await refresh("office", second.refresh_token)).toBe(200);
+});
+
 // A page on another site can make every visitor's browser GET the browser
 // routes as subresources (#404); only a top-level navigation, or a client that
 // sends no Sec-Fetch-Mode, spends the address bucket.

@@ -110,10 +110,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
   // redirects that authorize errors follow, and a name the consent page shows.
   const cimdClients = new Set(config.oauthCimdClients ?? [OPENCODE_CLIENT]);
-  const resolveClient = async (id: string) => {
+  // unlisted: the token routes are told instead of a row being written, and
+  // write it with their refusal row while refusalRows has room (F-18), so a
+  // bogus-post flood can't write one each.
+  const resolveClient = async (id: string, unlisted?: () => void) => {
     const manual = clients.get(id);
     if (manual) return manual;
-    if (!cimdClients.has(id)) { writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
+    if (!cimdClients.has(id)) { if (unlisted) unlisted(); else writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
     let client: OAuthClient | undefined;
     try { client = await cimd.resolve(id); }
     catch (error) { writeAudit(repo, "oauth.cimd_failed", null, null, { category: error instanceof CimdUnavailable ? "unavailable" : "unexpected" }); throw error; }
@@ -156,11 +159,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const globalLimit = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "global", 1);
   const addressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "address", 1000);
   const tokenAddressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "token_address", 1000);
+  // Thins the audit rows of refused token posts org-wide (F-18, #931). It is
+  // spent at the refusal and never checked before the work, so a flood of
+  // bogus refreshes can't make a valid one wait; while it's empty a refusal
+  // answers as usual but writes no row, and the streak's end row counts them.
+  // Past the address limiter's key cap this is the only bound on those writes.
+  const refusalRows = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "token_refusal", 1);
   let closed = false;
   const sweep = () => {
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
-    globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep();
+    globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep(); refusalRows.sweep();
     repo.oauth.cleanup(t);
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
@@ -170,10 +179,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Token and revocation posts have their own address bucket and are charged
   // only when they present grant material and are refused (#283): a
   // cross-site form post reaches them, and must not lock an office NAT out of
-  // token refresh. Every other route is charged on entry.
+  // token refresh. They never touch the global bucket (F-18, #931): refused
+  // refreshes from a handful of addresses would otherwise drain it and block
+  // every refresh and sign-in in the org, and a browser-route flood would
+  // block refresh. Their work is indexed reads and an allowlisted, cached CIMD
+  // client; their writes, the refusal audit rows, are thinned org-wide by
+  // refusalRows. Every other route is charged on entry, against its address
+  // and the global one.
   type Buckets = readonly (readonly [RateLimiter, string])[];
-  const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets =>
-    [[token ? tokenAddressLimit : addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]];
+  const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets => token
+    ? [[tokenAddressLimit, context?.key ?? "unknown"]]
+    : [[addressLimit, context?.key ?? "unknown"], [globalLimit, "global"]];
   const spend = (checks: Buckets, path: string) => { for (const [limit, key] of checks) limit.spend(key, { path: routeName(path) }); };
   const rate = (checks: Buckets, path: string): Response | undefined => {
     // The address goes first and nothing is spent until both pass: a request
@@ -198,7 +214,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!r) fail();
     return { h, f: f!, r: r!, c };
   };
-  const clientAuth = async (req: Request, p: URLSearchParams): Promise<OAuthClient> => {
+  const clientAuth = async (req: Request, p: URLSearchParams, unlisted: () => void): Promise<OAuthClient> => {
     if (p.has("client_secret")) fail("invalid_client", 401);
     const auth = req.headers.get("authorization");
     if (auth && auth.length > 8192) fail("invalid_client", 401);
@@ -214,7 +230,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         password = decodeURIComponent(decoded.slice(colon + 1).replace(/\+/g, " "));
       } catch { return fail("invalid_client", 401); }
     } else id = p.get("client_id") ?? "";
-    const c = await resolveClient(id!);
+    const c = await resolveClient(id!, unlisted);
     if (closed) fail("temporarily_unavailable", 503);
     if (!c) fail("invalid_client", 401);
     if (c!.tokenEndpointAuthMethod === "none") {
@@ -389,7 +405,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       // Set once the request presents grant material: before that it is
       // refused uncharged and unaudited, since a cross-site form post can
       // reach that far (#283), and clientAuth's CIMD fetch is never reached.
-      let material = false;
+      let material = false, unlisted = false;
       try {
         sameOrigin(req);
         strictQuery();
@@ -402,7 +418,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (submitted.has("access_token")) fail();
         if (!req.headers.has("authorization") && !(path === "/oauth/token" ? ["code", "refresh_token"] : ["token"]).some(k => submitted.has(k))) fail();
         material = true;
-        const client = await clientAuth(req, submitted);
+        const client = await clientAuth(req, submitted, () => { unlisted = true; });
         if (path === "/oauth/revoke") {
           const p = recognized(submitted, ["token", "token_type_hint"]);
           repo.oauth.revokeToken(hashToken(required(p, "token")), client.clientId, now());
@@ -445,7 +461,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       } catch (e) {
         if (!(e instanceof OAuthError)) throw e;
         if (!material) return refusal(e);
-        if (e.status < 500) spend(checks, path);
+        if (e.status < 500) {
+          spend(checks, path);
+          // One decision per refusal, after every await, for both its rows.
+          if (!refusalRows.take("global", { path: routeName(path) }).ok) return refusal(e);
+          if (unlisted) writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" });
+        }
         throw e;
       }
     }
