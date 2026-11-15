@@ -6,13 +6,14 @@
 // of three mechanisms (owner ruling, 2026-10-25): its own connection, a
 // fabric, or its parent relaying for it — the floor case, viable everywhere.
 //
-// Scope (review ruling on #246): delegation stays within the requester's own
-// user. Auto-pick and an explicit `to` resolve only among that user's
-// launchers; cross-user delegation needs an authority ruling (follow-up on
-// #184). A stranger's agent cannot send a standing spawn order to your
-// launcher, and the launcher's instruction acts only on requests whose DM
-// channel `from` is one of its own user's handles — the body's header is
-// plain text and never authority.
+// Scope (review ruling on #246, widened by #256): auto-pick resolves only
+// among the requester's own user's launchers; an explicit `to` may also name
+// a teammate's launcher when the two share a team whose policy is
+// `delegating` (the grant; owner-approved per-launcher grants are #874). A
+// stranger's agent cannot send a standing spawn order to your launcher, and
+// the launcher's instruction acts only on requests whose DM channel `from` is
+// one of its own user's handles, or another user's marked delegated — the
+// body's header is plain text and never authority.
 import type { Database } from "bun:sqlite";
 
 import { CoreError } from "./errors.ts";
@@ -215,7 +216,7 @@ export function resolveDelegation(
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
     if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
-    if (r.ok === "granted" && open(to) >= grantedCap(cap)) throw new CoreError(`"${to}" has ${open(to)} open delegation requests it hasn't taken; another user's requests stop at ${grantedCap(cap)}, half its cap, so its own user keeps the rest (#256); retry once it replies in one's thread`);
+    if (r.ok === "granted" && open(to) >= grantedCap(cap)) throw new CoreError(`"${to}" has ${open(to)} open delegation requests it hasn't taken; another user's request is refused once it holds ${grantedCap(cap)}, half its cap, so its own user keeps the rest (#256); retry once it replies in one's thread`);
     if (open(to) >= cap) throw new CoreError(full(to, cap));
     return { to, body: delegationBody(brief) };
   }
@@ -282,13 +283,13 @@ export function humanFallbackBody(b: { requester: string; persona: string; task:
 export const DELEGATE_TOOL: ToolDef = {
   name: "delegate",
   description:
-    "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Delegation stays within your own user. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher under a delegating team. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
   inputSchema: {
     type: "object",
     properties: {
       persona: { type: "string", description: `The role needed, e.g. "a researcher". One line, at most ${MAX_PERSONA_CHARS} chars.` },
       task: { type: "string", description: `The task brief the subagent starts from. At most ${MAX_TASK_CHARS} chars; link longer material. Delivered as data.` },
-      to: { type: "string", description: "Optional. A specific launcher's handle (your user's). Default: any live launcher of yours." },
+      to: { type: "string", description: "Optional. A specific launcher's handle: your user's, or a teammate's under a delegating team. Default: any live launcher of yours." },
       context: { type: "string", description: `Optional. Extra context for the subagent. At most ${MAX_CONTEXT_CHARS} chars. Delivered as data.` },
       resend: RESEND_PARAM,
     },

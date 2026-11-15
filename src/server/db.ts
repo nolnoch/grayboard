@@ -969,10 +969,20 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             .all(JSON.stringify(ids)).map((r) => [r.id, r.user] as const));
         return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds) };
       },
+      // The delegation.requested row is written in the message's own
+      // transaction on the same clock, so a window around created_at bounds
+      // the (action, target, at) index scan: access_log isn't pruned, and an
+      // unbounded join would read every request a launcher ever got per
+      // message (principle 11, #878 audit). The window's width only absorbs
+      // a slow transaction or a clock step. CROSS JOIN fixes the order
+      // (messages first), so the planner can't drive from access_log by
+      // action alone.
       delegationIds(messageIds) {
         return new Set(db.query<{ id: number }, [string]>(
           `SELECT m.id FROM messages m
-           JOIN access_log a ON a.action = 'delegation.requested' AND a.target = m.recipient AND json_extract(a.detail, '$.message_id') = m.id
+           CROSS JOIN access_log a ON a.action = 'delegation.requested' AND a.target = m.recipient
+             AND a.at BETWEEN m.created_at - 60000 AND m.created_at + 60000
+             AND json_extract(a.detail, '$.message_id') = m.id
            WHERE m.id IN (SELECT value FROM json_each(?))`,
         ).all(JSON.stringify(messageIds)).map((r) => r.id));
       },

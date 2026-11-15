@@ -252,7 +252,7 @@ function sessionRule(user: string, session: string, row: SessionFacts | undefine
 // (security audit F-03, #103; vision.md principle 9). Sending stays open
 // (msg.send); without this grant the item is delivered as mail that doesn't
 // wake. A user's own agents wake each other; across users, only members of a
-// shared 'collaborative' team do. No admin exemption: admin is a server role,
+// shared 'collaborative' or 'delegating' team do (delegating implies it, #256). No admin exemption: admin is a server role,
 // not a messaging grant. One indexed lookup per decision (principle 11).
 function wakeRule(repo: Repo, fromUser: string, toUser: string): Decision {
   if (fromUser === toUser) return allow("wake.same_user");

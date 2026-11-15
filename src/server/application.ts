@@ -1418,9 +1418,15 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   // another's under a shared 'delegating' team (policy.ts delegate.to). The
   // target's user is the session behind the address now, so a team alias
   // that changed hands is judged by its holder at this call. A deny is a
-  // decision row (written after the rollback, above).
-  const reach = (to: string): DelegateReach => {
+  // decision row (written after the rollback, above). An address no session
+  // stands behind (`undefined`: unknown, or an alias its last binder released
+  // while still live) reads as own on a fresh call, whose routing checks then
+  // refuse it by name; a replay's recheck refuses it, since the stored
+  // request's grant can't be judged against a holder that isn't there
+  // (security audit of #878).
+  const reach = (to: string, recheck = false): DelegateReach => {
     const owner = addressUser(db, to);
+    if (owner === undefined && recheck) return { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` };
     if (owner === undefined || owner === authed.user_email) return { ok: "own" };
     if (owner === null) return { refused: crossUserRefusal(to) };
     const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
@@ -1460,7 +1466,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
       const hint = m.to === undefined ? ` This repeat was not sent: your first call auto-picked "${stored.to}"; to delegate again with a fresh pick, call with resend: true.` : "";
       // The grant is authority: one revoked (the team's policy, membership, or
       // the alias's holder) since the first call refuses the replay (#256).
-      const r = reach(stored.to);
+      const r = reach(stored.to, true);
       if ("refused" in r) throw new CoreError(r.refused + hint);
       const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
       const decision = authorize(repo, { humanReach: hub.humanReach }, req);

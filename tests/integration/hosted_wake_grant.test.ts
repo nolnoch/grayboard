@@ -56,6 +56,30 @@ test("the msg.wake rule: same user, a shared collaborative team, else denied; ad
   expect(wake("nobody@example.com", A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
 });
 
+// 'delegating' implies 'collaborative' (#256): it grants wakes too. The
+// delegate.to rule is the narrower one: only 'delegating' grants it.
+test("a delegating team grants wakes and delegate.to; collaborative grants wakes only", async () => {
+  const repo = srv.app.repo;
+  const rule = (verb: "msg.wake" | "delegate.to", from: string, to: string) => authorize(repo, { admins: [B] }, { verb, from_user: from, to_user: to });
+  expect(rule("delegate.to", A, A)).toMatchObject({ allow: true, rule: "delegate.same_user" });
+  await team();
+  expect((await policy(alice, "eng", "collaborative")).status).toBe(200);
+  expect(rule("delegate.to", B, A)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
+  expect((await policy(alice, "eng", "delegating")).status).toBe(200);
+  expect(rule("msg.wake", B, A)).toMatchObject({ allow: true, rule: "wake.team_policy" });
+  expect(rule("delegate.to", B, A)).toMatchObject({ allow: true, rule: "delegate.team_policy" });
+  expect(rule("delegate.to", A, B)).toMatchObject({ allow: true, rule: "delegate.team_policy" });
+  // Carol shares no team; admin (B here) is no exemption either way.
+  expect(rule("delegate.to", C, A)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
+  expect(rule("delegate.to", B, C)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
+
+  // And a DM between the two now wakes: no ungranted mark.
+  const abe = await srv.hosted(A, "be");
+  const bfe = await srv.hosted(B, "fe");
+  await bfe.call("dm_send", { to: `${A}/be`, body: "delegating wakes" });
+  expect(ungranted((await abe.next(dm("delegating wakes"))).event)).toBeUndefined();
+});
+
 test("another user's DM arrives not actionable and ungranted; the same user's wakes; the sender is told", async () => {
   const abe = await srv.hosted(A, "be");
   const aqa = await srv.hosted(A, "qa");
@@ -131,10 +155,13 @@ test("POST /api/teams/<t>/policy: owner sets it (audited once per change), membe
   expect(srv.app.repo.teams.findByName("eng")!.policy).toBe("collaborative");
   // Setting the same value again writes no audit row.
   expect((await policy(alice, "eng", "collaborative")).status).toBe(200);
+  const deleg = await policy(alice, "eng", "delegating");
+  expect(deleg.body).toEqual({ ok: true, team: "eng", policy: "delegating", previous: "collaborative" });
   expect((await policy(alice, "eng", "open")).status).toBe(200);
   expect(accessAudits(srv.app.db, "team.policy_set").map((r) => [r.actor, r.target, r.detail])).toEqual([
     [A, "eng", { from: "open", to: "collaborative" }],
-    [A, "eng", { from: "collaborative", to: "open" }],
+    [A, "eng", { from: "collaborative", to: "delegating" }],
+    [A, "eng", { from: "delegating", to: "open" }],
   ]);
 });
 

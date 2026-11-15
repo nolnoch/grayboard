@@ -199,6 +199,11 @@ export class AppSession {
     return this.application.inbox(this.live(), days);
   }
 
+  // The hosted pull (application.pending()): what a lease's next pull carries, writer marks included.
+  async pending(limit?: number): Promise<DeliveryEvent[]> {
+    return this.application.pending(this.live(), limit);
+  }
+
   // A board or claim tool; resolves with the result the call publishes, after
   // its commit and before its deliveries. T is the shape the caller expects;
   // nothing checks it.
