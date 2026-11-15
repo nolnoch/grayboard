@@ -37019,21 +37019,17 @@ class Controller {
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
                 await wire.call("delivery_renew");
                 await this.guard(r, epoch, signal);
-                if (r.admitted.has(key)) {
-                  inItem = false;
+                if (r.admitted.has(key))
                   return;
-                }
                 await this.port.admit(e, item, stableID(e, item, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT)
                   r.admitted.delete(r.admitted.values().next().value);
                 await this.guard(r, epoch, signal);
-                await wire.call("delivery_renew");
-                await this.guard(r, epoch, signal);
-                inItem = false;
               }, async (ids) => {
                 await this.guard(r, epoch, signal);
                 await wire.call("delivery_receipt", { ids });
+                inItem = false;
                 for (const id of ids) {
                   attempts.delete(id);
                   r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`);

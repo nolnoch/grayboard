@@ -24,8 +24,8 @@ function runtime(mode: Mode) {
   // Holds the server took (#453), per session: the subscriber whoami reports them, and the next delivery_open
   // takes the reported ones, as the server does.
   const lost = new Map<string, { alias: string; reason: string; reported: boolean }[]>();
-  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
-  let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
+  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, receipts = 0, refreshBusy = 0, leaseLostAfter = Infinity, signedOut = false;
+  let receiptFault: { at: number; error: () => Error; then?: () => void } | undefined, receiptsLost = false;
   // Whether the fake server's delivery_open lists `context` (#854); an older server's doesn't.
   let takesContext = true;
   // While set, the credential's token() finds the access token ended for this reason.
@@ -82,10 +82,11 @@ function runtime(mode: Mode) {
       }
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
       if (name === "delivery_renew") {
-        if (++renews === renewFault?.at) { renewFault.then?.(); throw renewFault.error(); }
-        if (renews >= renewsLostFrom) throw new LeaseUnavailable();
+        if (++renews > leaseLostAfter) throw new LeaseUnavailable();
       }
       if (name === "delivery_receipt") {
+        if (++receipts === receiptFault?.at) { receiptFault.then?.(); throw receiptFault.error(); }
+        if (renews >= leaseLostAfter || receiptsLost) throw new LeaseUnavailable();
         if (failReceipt > 0) { failReceipt--; throw new Error("receipt lost"); }
         batches.set(this.sessionID, (batches.get(this.sessionID) ?? []).filter(item => !(args.ids as string[]).includes(item.id)));
       }
@@ -154,10 +155,13 @@ function runtime(mode: Mode) {
     refreshBusy: (n: number) => { refreshBusy = n; },
     // token() refuses with AccessExpired(reason) until called again without one.
     expireAccess: (reason?: AccessReason) => { accessFault = reason; },
-    // The nth delivery_renew throws `error` once, after running `then`.
-    failRenewAt: (at: number, error: () => Error, then?: () => void) => { renewFault = { at, error, ...(then ? { then } : {}) }; },
-    // Every delivery_renew from the nth on finds no live lease (an expired lease the server won't renew).
-    loseRenewsFrom: (at: number) => { renewsLostFrom = at; },
+    // The nth delivery_receipt throws `error` once, after running `then`.
+    failReceiptAt: (at: number, error: () => Error, then?: () => void) => { receiptFault = { at, error, ...(then ? { then } : {}) }; },
+    // The lease lapses after the nth delivery_renew: every later renew and receipt finds no live lease (an
+    // expired lease the server won't renew).
+    loseLeaseAfterRenew: (at: number) => { leaseLostAfter = at; },
+    // Every delivery_receipt finds no live lease while renews still succeed.
+    loseReceipts: () => { receiptsLost = true; },
     // The grant store is logged out: a capture finds no sign-in.
     signOut: () => { signedOut = true; },
     olderServer: () => { takesContext = false; },
@@ -496,30 +500,57 @@ test.each(modes)("a receipt hook that throws: each receipt still commits once, t
   } finally { await c.close(); await r.controller.close(); }
 });
 
-// The item's first renew is #2 (#1 is the pre-admission renew): it fails
-// after the host accepted the item.
-test.each(modes)("a post-admission renew that fails once (an outage) shows the item once and receipts it after reconnecting (%s)", async mode => {
+// One item costs one renew before admission and its receipt: no renew sits between admission and receipt,
+// since the server's receipt checks the lease itself (#845).
+test.each(modes)("an item's delivery calls are one renew then its receipt (%s)", async mode => {
   const r = runtime(mode);
   try {
-    r.failRenewAt(2, () => new ServerUnreachable(new Error("blip")));
+    r.batches.set("R", [r.item("direct:1"), r.item("direct:2")]);
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.batches.get("R")?.length === 0, 10_000);
+    expect(r.calls.filter(c => c.name.startsWith("delivery_")).map(c => c.name)).toEqual(["delivery_open", "delivery_renew", "delivery_receipt", "delivery_renew", "delivery_receipt"]);
+  } finally { await r.controller.close(); }
+});
+
+// A receipt that finds the lease gone still belongs to its item: it spends the item's attempt budget, not
+// the lease-recovery budget, which would pause the root after 3.
+test.each(modes)("receipts that keep losing the lease stop at the item's attempt budget, not the recovery limit (%s)", async mode => {
+  const r = runtime(mode);
+  const c = r.make({ wait: async () => {} });
+  try {
+    r.loseReceipts();
+    r.batches.set("R", [r.item("direct:1")]);
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "paused", 10_000);
+    expect(r.root(c)?.message).toStartWith("Retry limit reached for direct:1; item remains unreceipted");
+    expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
+    expect(r.named("delivery_receipt")).toHaveLength(8);
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+// The receipt is the first call after the host accepted the item.
+test.each(modes)("a receipt that fails once (an outage) shows the item once and receipts it after reconnecting (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    r.failReceiptAt(1, () => new ServerUnreachable(new Error("blip")));
     r.batches.set("R", [r.item("direct:1")]);
     await r.controller.enroll("R", ["be"], true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
-    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
+    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"]]); // the refused one, then the one that commits
     expect(r.named("delivery_open")).toHaveLength(2);
   } finally { await r.controller.close(); }
 });
 
-test.each(modes)("a post-admission renew that loses the lease: the next lease of the same bind_gen receipts without admitting again (%s)", async mode => {
+test.each(modes)("a receipt that loses the lease: the next lease of the same bind_gen receipts without admitting again (%s)", async mode => {
   const r = runtime(mode);
   try {
-    r.failRenewAt(2, () => new LeaseUnavailable());
+    r.failReceiptAt(1, () => new LeaseUnavailable());
     r.batches.set("R", [r.item("direct:1")]);
     await r.controller.enroll("R", ["be"], true);
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
-    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
+    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"]]); // the refused one, then the one that commits
     expect(r.named("delivery_open")).toHaveLength(2);
   } finally { await r.controller.close(); }
 });
@@ -527,17 +558,18 @@ test.each(modes)("a post-admission renew that loses the lease: the next lease of
 // The real-host expiry case: an admitted key skips only the admission, so a
 // lease that can never renew spends the item's attempt budget and never
 // receipts the admission it couldn't prove.
-test.each(modes)("a lease that can't renew after admission never receipts it and stops at the attempt budget (%s)", async mode => {
+test.each(modes)("a lease that can't renew after admission never commits its receipt and stops at the attempt budget (%s)", async mode => {
   const r = runtime(mode);
   const c = r.make({ wait: async () => {} });
   try {
-    r.loseRenewsFrom(2);
+    r.loseLeaseAfterRenew(1);
     r.batches.set("R", [r.item("direct:1")]);
     await c.enroll("R", ["be"], true);
     await until(() => r.root(c)?.state === "paused", 10_000);
     expect(r.root(c)?.message).toStartWith("Retry limit reached for direct:1; item remains unreceipted");
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
-    expect(r.named("delivery_receipt")).toEqual([]);
+    // The one receipt tried, under the lease that lapsed during admission, was refused; none commits.
+    expect(r.named("delivery_receipt")).toHaveLength(1);
     expect(r.batches.get("R")).toHaveLength(1);
   } finally { await c.close(); await r.controller.close(); }
 });
@@ -546,7 +578,7 @@ test.each(modes)("a lease lost after admission whose next lease has a new bind_g
   const r = runtime(mode);
   try {
     // The name was rebound meanwhile: the next lease and its inbox carry bind_gen 2.
-    r.failRenewAt(2, () => new LeaseUnavailable(), () => {
+    r.failReceiptAt(1, () => new LeaseUnavailable(), () => {
       const row = r.rows.get("R")!;
       r.rows.set("R", { held: row.held, ownership: row.ownership, generation: row.generation + 1 });
       r.batches.set("R", [{ ...r.item("direct:1"), bind_gen: 2 }]);
@@ -556,7 +588,7 @@ test.each(modes)("a lease lost after admission whose next lease has a new bind_g
     await until(() => r.batches.get("R")?.length === 0, 10_000);
     expect(r.admits.map(a => a.item)).toEqual(["direct:1", "direct:1"]);
     expect(r.admits[1]!.id).toBe(r.admits[0]!.id);
-    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
+    expect(r.named("delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"]]); // the refused one, then the one that commits
   } finally { await r.controller.close(); }
 });
 
