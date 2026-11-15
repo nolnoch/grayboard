@@ -10,8 +10,8 @@ export type Context = {
   peers: Record<string, Peer>;
   // A success's value; a refusal fails the scenario with the mode's text.
   ok(o: Outcome): any;
-  // A refusal. `code` is asserted in hosted mode; local refusals carry none yet (#954), so there the gap is recorded and
-  // printed. A scenario proves the refusal had no effect with a follow-up read, never by its wording.
+  // A refusal. `code` is asserted in both modes (#954). A scenario proves the refusal had no effect with a follow-up
+  // read, never by its wording.
   refused(o: Outcome, code?: string): void;
 };
 
@@ -19,11 +19,9 @@ export type Scenario = { name: string; peers: string[]; modes?: Mode[]; why?: st
 
 export function conformance(family: string, scenarios: Scenario[]): void {
   const skips: string[] = [];
-  const gaps = new Set<string>();
-  // Printed after the family's runs, so a skipped or code-less cell is visible in the test output.
+  // Printed after the family's runs, so a skipped cell is visible in the test output.
   afterAll(() => {
     if (skips.length) console.log(`conformance ${family}: skipped cells\n  ${skips.join("\n  ")}`);
-    if (gaps.size) console.log(`conformance ${family}: refusal-code gaps\n  ${[...gaps].join("\n  ")}`);
   });
   for (const make of DRIVERS) {
     const driver: Driver = make();
@@ -48,10 +46,7 @@ export function conformance(family: string, scenarios: Scenario[]): void {
               },
               refused(o, code) {
                 if (o.ok) throw new Error(`expected a refusal, got ${JSON.stringify(o.value)}`);
-                if (code === undefined) return;
-                // Local refusals carry no code yet (#954); hosted ones must.
-                if (o.code === undefined && driver.mode === "local") gaps.add(`${driver.mode}: no refusal code (${family}: ${s.name} expects ${code})`);
-                else expect(o.code).toBe(code);
+                if (code !== undefined) expect(o.code).toBe(code);
               },
             });
           } finally {

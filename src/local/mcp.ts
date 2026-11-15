@@ -2,6 +2,8 @@
 // this; it starts on import.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { ErrorCode } from "../shared/protocol.ts";
+import { coreRefusalCode } from "../core/session_end.ts";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -526,6 +528,10 @@ const text = (value: unknown) => ({
   ],
 });
 
+// A refusal: its text, and the code hosted gives the same refusal in structuredContent (#954), so a caller
+// branches on the code in both modes, never on the wording.
+const refusal = (why: string, code: ErrorCode = "bad_request") => ({ ...text(`error: ${why}`), structuredContent: { code }, isError: true as const });
+
 async function wakeAll(handles: string[]): Promise<void> {
   await Promise.all(handles.map((h) => poke(h)));
 }
@@ -572,7 +578,7 @@ function recordMissing(tool: string, toolUseId: unknown, cause: MissingCause) {
   const layer = hooksDisabledBy(process.cwd());
   writeCoreAudit(db, "claude.agent_record_missing", SESSION_ID, null, { tool_use_id: String(toolUseId).slice(0, 128), tool, cause, ...(layer ? { layer } : {}) });
   const why = layer ? `${MISSING_TEXT[cause]}; ${layer}` : MISSING_TEXT[cause];
-  return { ...text(`error: grayboard can't tell which Claude Code agent made this call (${why}), so it didn't run. Rerun \`grayboard setup\` and restart Claude Code.`), isError: true };
+  return refusal(`grayboard can't tell which Claude Code agent made this call (${why}), so it didn't run. Rerun \`grayboard setup\` and restart Claude Code.`);
 }
 // The child sessions this process has seen within the idle window (#523),
 // under its root: a runner child's subagents are its root's children, as
@@ -707,10 +713,10 @@ async function currentClaude(request?: IdentityRequest): Promise<{ instructions?
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) => {
   const { name, arguments: args = {} } = req.params;
-  if (shuttingDown) return { ...text("error: this session is ending"), isError: true };
+  if (shuttingDown) return refusal("this session is ending", "id_ended");
   if (CLAUDE_CURRENT && !claudePaused) await currentClaude();
   if (resumeBarrier) await resumeBarrier.promise;
-  if (claudeReady && !await claudeReady.promise) return { ...text(`error: Claude channel activation failed; queued mail remains pending: ${claudeActivationError}`), isError: true };
+  if (claudeReady && !await claudeReady.promise) return refusal(`Claude channel activation failed; queued mail remains pending: ${claudeActivationError}`, "internal");
   const callSession = SESSION_ID;
   const callEpoch = adapterEpoch;
   // A harness subagent's call (#523): harness-asserted, it makes the call the
@@ -731,7 +737,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
     }
   }
   const run = async () => {
-    if (shuttingDown || callSession !== SESSION_ID || callEpoch !== adapterEpoch) return { ...text("error: conversation changed before this call ran"), isError: true };
+    if (shuttingDown || callSession !== SESSION_ID || callEpoch !== adapterEpoch) return refusal("conversation changed before this call ran", "superseded");
     await testPauseAsync("local:tool:in-gate");
     // A runner child whose root isn't live (its parent harness exited while
     // this runner lives on) is its own session from here (#523 step 5).
@@ -739,12 +745,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
     touchSeen(WRITES_AS ? [WRITES_AS] : held);
     // A runner child's own call is its child session's.
     if (agent === undefined) return call(name, args, signal, liveParent === null ? undefined : SESSION_ID);
-    if (!validSourceId(agent)) return { ...text(`error: _meta["${GRAYBOARD_AGENT_META}"] must be a string of 1 to 1024 characters with no control characters`), isError: true };
+    if (!validSourceId(agent)) return refusal(`_meta["${GRAYBOARD_AGENT_META}"] must be a string of 1 to 1024 characters with no control characters`);
     let child: string;
     try {
       child = children.resolve(agent);
     } catch (e) {
-      if (e instanceof CoreError) return { ...text(`error: ${e.message}`), isError: true };
+      if (e instanceof CoreError) return refusal(e.message, coreRefusalCode(e));
       throw e;
     }
     return call(name, args, signal, child);
@@ -770,13 +776,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   if (!mine) return r;
   const extra = notices();
   let out = withNotices(r, extra);
-  if (instructionsStale && !out.structuredContent) {
+  // A refusal's structuredContent holds its code (#954); fresh instructions join it.
+  const instructed = (o: typeof out) => typeof o.structuredContent === "object" && o.structuredContent !== null && "instructions" in o.structuredContent;
+  if (instructionsStale && !instructed(out)) {
     instructionsStale = false;
-    out = { ...out, structuredContent: { name: heldName(), instructions: localInstructions(true) } };
+    out = { ...out, structuredContent: { ...(out.structuredContent as object | undefined), name: heldName(), instructions: localInstructions(true) } };
   }
   late.answer(requestId, () => {
-    if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
-    if (name === "unbind" && r.structuredContent) {
+    if (name === "bind" && !r.isError && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
+    if (name === "unbind" && !r.isError && r.structuredContent) {
       // The name the unbind resolved (lowercased), not the raw argument (#375).
       const n = bareName(String(args.name), "unbind");
       requeued.push(unbindMissed(n.ok ? n.name : String(args.name), "it was cancelled", r.content[0]!.text));
@@ -784,7 +792,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
     const l = landed(name, r);
     if (l) requeued.push(l);
     requeued.push(...extra);
-    if (out.structuredContent) instructionsStale = true;
+    if (instructed(out)) instructionsStale = true;
   });
   return out;
 });
@@ -792,12 +800,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
 // `child`: the child session making the call (#523), else the root itself.
 async function call(name: string, args: Record<string, unknown>, signal: AbortSignal, child?: string): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
   const bad = checkArgs(LOCAL_TOOLS, name, args);
-  if (bad) return { ...text(`error: ${bad}`), isError: true };
+  if (bad) return refusal(bad);
   try {
     return await dispatch(name, args, signal, child);
   } catch (err) {
     if (err instanceof CoreError) {
-      return { ...text(`error: ${err.message}`), isError: true };
+      return refusal(err.message, coreRefusalCode(err));
     }
     throw err;
   }
@@ -808,11 +816,11 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   // change, but for a runner child's bind, which promotes it (#523 step 5).
   if (child !== undefined && (name === "unbind" || (name === "bind" && child !== SESSION_ID))) {
     const whose = child === SESSION_ID ? "unbind is the root's; bind(name) makes this process its own session." : "bind and unbind are the root's. Call them from the root session.";
-    return { ...text(`error: child_session: this session acts under its root ${rootId()}; ${whose}`), isError: true };
+    return refusal(`child_session: this session acts under its root ${rootId()}; ${whose}`, "child_session");
   }
   // Nor does it take on or change the root's read state (its inbox, its subscriptions).
   const refused = child === undefined ? null : childStateRefusal(name, child, primary());
-  if (refused !== null) return { ...text(`error: child_session: ${refused}`), isError: true };
+  if (refused !== null) return refusal(`child_session: ${refused}`, "child_session");
   if (name === "bind") return bind(a, signal);
   if (name === "unbind") return unbind(a, signal);
   // Local mode has one implicit scope: no principal (#284 S6).
@@ -826,7 +834,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   // checks again in the write's own transaction (#557). The next call then
   // finds the root gone and runs as its own session.
   const rootLive = liveParent === null || child === undefined ? undefined : ((root: string, c: string) => () => {
-    if (!runnerRootLive(db, c, root)) throw new CoreError(`child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`);
+    if (!runnerRootLive(db, c, root)) throw new CoreError(`child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`, "child_session");
   })(liveParent, child);
 
   // With no name, the session acts as its ID (#284 S13).
@@ -858,7 +866,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // The requester's bucket (#252): checked before resolving, spent once the
     // request is written (a re-pick spends nothing more).
     const t = delegateLimiter.check(IDENTITY, byChild);
-    if (!t.ok) return { ...text(`error: ${delegateThrottled(DELEGATE_LIMIT, t.retryAfterMs, "this session")}`), isError: true };
+    if (!t.ok) return refusal(delegateThrottled(DELEGATE_LIMIT, t.retryAfterMs, "this session"), "rate_limited");
     // A launcher's open requests, over dm_inbox's default window (#252).
     const since = Date.now() - inboxDays(undefined) * 86_400_000;
     const open = (h: string) => countOpenDelegations(db, "audit_log", h, since);
@@ -868,7 +876,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     } catch (e) {
       if (e instanceof CoreError) {
         writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
-        return { ...text(`error: ${e.message}`), isError: true };
+        return refusal(e.message, coreRefusalCode(e));
       }
       throw e;
     }
@@ -934,23 +942,17 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // A session ID is checked where the message is written (insertMessage).
     const recipient = localRecipient(to);
     if (addressParts(recipient)?.kind !== "id" && !rosterHandles(db).includes(recipient)) {
-      return {
-        ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
-        isError: true,
-      };
+      return refusal(`no agent "${recipient}" has ever connected; peer_list shows exact handles`, "not_found");
     }
     if (parent_id !== undefined && !mine(parent)) {
-      return {
-        ...text(`error: parent_id ${parent_id} is not a message you sent or received`),
-        isError: true,
-      };
+      return refusal(`parent_id ${parent_id} is not a message you sent or received`, "not_found");
     }
     const peer = parent ? replyPeer(parent, ADDRS) : null;
     if (parent && peer !== recipient) {
-      return { ...text(`error: ${replyPeerError(parent.id, peer!)}`), isError: true };
+      return refusal(replyPeerError(parent.id, peer!));
     }
     const asError = parent ? replySenderError(parent, peer!, sender) : null;
-    if (asError !== null) return { ...text(`error: ${asError}`), isError: true };
+    if (asError !== null) return refusal(asError);
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, WRITER, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }, via, rootLive));
     // The result names the sender whenever it isn't the primary.
@@ -976,7 +978,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
 
   if (name === "dm_thread") {
     if (!mine(getMessage(a.thread as number))) {
-      return { ...text(`error: message ${a.thread} not found`), isError: true };
+      return refusal(`message ${a.thread} not found`, "not_found");
     }
     return text(getThread(a.thread as number).filter(mine).map(showMessage));
   }
@@ -998,7 +1000,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
 
   if (name === "dm_ack") {
     const ids = ackIds(a.message_id);
-    if (!ids) return { ...text("error: message_id must be a message_id or a list of them"), isError: true };
+    if (!ids) return refusal("message_id must be a message_id or a list of them");
     const acked: number[] = [], missing: number[] = [];
     for (const id of ids) {
       const m = getMessage(id);
@@ -1008,16 +1010,16 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       if (reader) { ackMessage(reader, id); acked.push(id); } else missing.push(id);
     }
     const r = ackResult(acked, missing);
-    return { ...text(r.text), ...(r.isError ? { isError: true } : {}) };
+    return { ...text(r.text), ...(r.isError ? { structuredContent: { code: "not_found" }, isError: true } : {}) };
   }
 
   if (name === "dm_retract") {
     const m = getMessage(a.message_id as number);
-    const refuse = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+    const refuse = (why: string, code: ErrorCode = "bad_request") => refusal(why, code);
     // A repeat whose first answer was lost (#254): it landed.
     const done = m ? undefined : retractedAt(ADDRS, a.message_id as number);
     if (done !== undefined) return text(`ok: ${alreadyRetracted(done)}`);
-    if (!m || !ADDRS.includes(m.sender)) return refuse(retractRefusal.notYours(a.message_id as number));
+    if (!m || !ADDRS.includes(m.sender)) return refuse(retractRefusal.notYours(a.message_id as number), "not_found");
     // A probe is a wakeup: a live recipient drains the message now.
     if (m.delivered_at !== null || getCursor(m.recipient) >= m.id || (await poke(m.recipient))) return refuse(retractRefusal.reached(m.id, m.recipient));
     if (!retractMessage(m.sender, m.id)) {
@@ -1032,7 +1034,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     const target = await saveTarget(a.dir, ROOTS, BUS_DIR);
     const row = getAttachment(db, id);
     if (!row || !canReadAttachment(db, IDENTITY, row, (m) => mine(getMessage(m)), { addresses: ADDRS, principal: null })) {
-      return { ...text(`error: no attachment ${id} on a message or post you can read`), isError: true };
+      return refusal(`no attachment ${id} on a message or post you can read`, "not_found");
     }
     const path = await saveAttachment(row, await blobs.get(row.sha256), target);
     return text({ path, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 });
@@ -1297,7 +1299,7 @@ function bareName(raw: string, verb: "bind" | "unbind"): { ok: true; name: strin
 // starts from its own cursor. It runs behind the gate, so no tool call
 // overlaps it (#182 audit 11). A name already held only takes its labels.
 async function bind(a: Record<string, unknown>, signal: AbortSignal) {
-  const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+  const fail = (why: string, code: ErrorCode = "bad_request") => refusal(why, code);
   if (!PUSH) return fail(TOOLS_ONLY_BIND);
   // The human's handle is a declaration, fixed for its bridge's session (#363), as the server's attachHuman session.
   if (HUMAN) return fail(`this is the human's session ("${primary()}", BUS_HUMAN=1); it binds nothing`);
@@ -1323,7 +1325,13 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     const promote = liveParent === null ? null : leaving();
     const r = await acquireName(db, promote?.leave.self.session_id ?? SESSION_ID, n.name, { create: a.create === true, meta, ...(promote ? { promote: promote.leave } : {}) });
     await deliverEnded(db, r.ended);
-    if (!r.ok) return fail(r.error);
+    // Hosted's codes and data for the same refusals (domainData): a name never used without create, with the
+    // closest names; a name another session holds, with its holder.
+    if (!r.ok) {
+      if (r.known) return { ...fail(r.error, "identity_unknown"), structuredContent: { code: "identity_unknown", known: r.known } };
+      if (r.holder) return { ...fail(r.error, "alias_held"), structuredContent: { code: "alias_held", holder: r.holder } };
+      return fail(r.error, r.forbidden ? "forbidden" : "bad_request");
+    }
     if (promote) becomeRoot(promote.key, `bound "${n.name}", promoted`);
     // The row holds the new name from here: so does this process, whatever
     // follows fails.
@@ -1356,7 +1364,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
 // still holds it (nobody can take the name with this socket answering), then
 // one transaction drops the hold. Its mail and claims stay with the name.
 async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
-  const fail = (why: string) => ({ ...text(`error: ${why}`), isError: true });
+  const fail = (why: string, code: ErrorCode = "bad_request") => refusal(why, code);
   if (!PUSH) return fail(TOOLS_ONLY_BIND);
   if (HUMAN) return fail(`this is the human's session ("${primary()}", BUS_HUMAN=1); it unbinds nothing`);
   const n = bareName(String(a.name), "unbind");

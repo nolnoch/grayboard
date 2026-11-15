@@ -202,15 +202,15 @@ function registerRows(db: Database, s: SessionRow, kind: SessionKind): void {
 export function registerChild(db: Database, root: string, child: string, raw: string | null, now = Date.now(), own?: RunnerFacts): void {
   db.transaction(() => {
     const prior = db.prepare(`SELECT root_id, ended_at FROM ids WHERE id = ?`).get(child) as { root_id: string | null; ended_at: number | null } | null;
-    if (prior && prior.root_id !== root) throw new CoreError(`id_collision: ${child} is another session's ID, not a child of ${root}`);
-    if (prior && prior.ended_at !== null) throw new CoreError(`id_ended: child session ${child} ended at ${new Date(prior.ended_at).toISOString()}`);
+    if (prior && prior.root_id !== root) throw new CoreError(`id_collision: ${child} is another session's ID, not a child of ${root}`, "id_collision");
+    if (prior && prior.ended_at !== null) throw new CoreError(`id_ended: child session ${child} ended at ${new Date(prior.ended_at).toISOString()}`, "id_ended");
     const { n } = db.prepare(`SELECT COUNT(*) AS n FROM ids WHERE root_id = ? AND id != ? AND ended_at IS NULL AND last_seen >= ?`)
       .get(root, child, now - DEFAULT_IDLE_SECONDS * 1000) as { n: number };
     if (n >= MAX_CHILDREN) throw new CoreError(childCapacity(root));
     if (prior) return;
     const live = db.prepare(`SELECT pid, proc_start, harness_pid, harness_rule FROM bindings WHERE session_id = ?`).get(root) as
       { pid: number; proc_start: string | null; harness_pid: number | null; harness_rule: string | null } | null;
-    if (!live) throw new CoreError(`id_ended: session ${root} has ended`);
+    if (!live) throw new CoreError(`id_ended: session ${root} has ended`, "id_ended");
     const r = db.prepare(`SELECT harness, cwd, keyed FROM ids WHERE id = ?`).get(root) as { harness: string | null; cwd: string | null; keyed: number } | null;
     const facts = own
       ? { harness: own.harness, cwd: own.cwd, keyed: false, harnessSession: own.harnessSession }
@@ -529,7 +529,7 @@ export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
 
 export type AcquireResult = (
   | { ok: true; name: string; restored: boolean }
-  | { ok: false; error: string; holder?: string; known?: string[] }
+  | { ok: false; error: string; holder?: string; known?: string[]; forbidden?: true }
 ) & {
   /** A dead holder this acquire ended. */
   ended: Ended;
@@ -591,13 +591,13 @@ export async function acquireName(
   return db.transaction((): AcquireResult => {
     const now = Date.now();
     let ended = nothingEnded();
-    const refuse = (error: string, extra: { holder?: string; known?: string[] } = {}): AcquireResult => {
+    const refuse = (error: string, extra: { holder?: string; known?: string[]; forbidden?: true } = {}): AcquireResult => {
       logBinding(db, opts.promote?.child ?? sessionId, name, "refused", extra.holder ?? error, now);
       return { ok: false, error, ...extra, ended };
     };
     testPause("bind:in-txn");
     if (!opts.allowHuman && (name === HUMAN_NAME || isHuman(db, name))) {
-      return refuse(`"${name}" is your user's handle; an agent session can't bind it`);
+      return refuse(`"${name}" is your user's handle; an agent session can't bind it`, { forbidden: true });
     }
     const held = holdsOf(db, sessionId);
     if (held.length >= MAX_HOLDS) return refuse(tooManyHolds(held));

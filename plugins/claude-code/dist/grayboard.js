@@ -34570,6 +34570,11 @@ import { basename, delimiter, extname, isAbsolute, join as join4, parse as parse
 
 // src/core/errors.ts
 class CoreError extends Error {
+  refusalCode;
+  constructor(message, refusalCode) {
+    super(message);
+    this.refusalCode = refusalCode;
+  }
 }
 
 class TooLargeError extends CoreError {
