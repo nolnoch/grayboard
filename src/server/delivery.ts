@@ -155,8 +155,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       attempts.delete(result);
     },
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
-      return hosted.control(p, context, false, row => {
-        const { lease, deadline } = store.atomic(() => {
+      return hosted.control(p, context, false, async row => {
+        const { lease, deadline } = await store.write(() => {
           const fresh = store.get(row.session_id);
           const lease = get(p, context, capability, fresh), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
@@ -190,7 +190,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
       return hosted.control(p, context, false, async () => {
         await testPauseAsync("hosted:receipt:before-txn");
-        const records = store.atomic(() => {
+        const records = await store.write(() => {
           testPause("hosted:receipt:in-txn");
           const row = "id" in context ? store.get(context.id) : undefined;
           const lease = get(p, context, capability, row);
@@ -222,8 +222,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       }).catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
-      return hosted.control(p, context, true, row => {
-        store.atomic(() => {
+      return hosted.control(p, context, true, async row => {
+        await store.write(() => {
           get(p, context, capability, store.get(row.session_id));
           store.end(row.session_id, "closed", now());
         });
@@ -239,7 +239,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       const capability = result.capability;
       await hosted.gate(lease.sessionId).bind(async () => {
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
-        store.atomic(() => {
+        await store.write(() => {
           if (matches(lease, store.get(lease.sessionId))) store.end(lease.sessionId, "closed", now());
         });
         hosted.settle(lease.sessionId);

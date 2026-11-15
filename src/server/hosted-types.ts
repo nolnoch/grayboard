@@ -19,6 +19,8 @@ export type HostedLost = { alias: string; reason: string; primary: boolean };
 export type LostReader = "agent" | "controller";
 export interface HostedStore {
   atomic<T>(fn: () => T): T;
+  // atomic through the server's write queue, for a transaction's outermost caller (Repo.write).
+  write<T>(fn: () => T): Promise<T>;
   // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
   // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
   subscribe(fn: (changed: string | null) => void): () => void;
