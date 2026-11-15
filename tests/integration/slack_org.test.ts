@@ -15,6 +15,7 @@ import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { queueFor } from "../../src/server/store/queue.ts";
 const DM = "D0ALICE";
 const ALICE_SLACK = "U0ALICE";
 
@@ -345,6 +346,60 @@ test("a thread reply reaches a human only as a DM could", async () => {
   await until(() => posted("now a teammate"));
   expect(posted("not a teammate")).toBe(false);
 }, 30_000);
+
+// #807 D4: an unlink is one transaction through the server's write queue, and the human goes offline only after it commits.
+function holdQueue(): { release: () => void; done: Promise<void> } {
+  let release!: () => void;
+  const done = queueFor(srv.app.db).run(() => new Promise<void>((r) => { release = r; }));
+  return { release, done };
+}
+const ticks = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+
+test("#807: an HTTP unlink while another body holds the write queue waits, then removes the link", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const holder = holdQueue();
+  const unlinked = api(alice, "POST", "/api/slack/unlink");
+  await ticks(20);
+  expect(srv.app.repo.slack.linkFor(userId)).toBeDefined();
+  holder.release();
+  await holder.done;
+  expect((await unlinked).status).toBe(200);
+  expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+});
+
+test("#807: a rolled-back unlink leaves the link and its human online", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const be = await hosted("alice@example.com", "be");
+  srv.app.db.run(`CREATE TRIGGER fail_unlink BEFORE INSERT ON access_log WHEN NEW.action = 'slack.unlinked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
+  const spy = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect((await api(alice, "POST", "/api/slack/unlink")).status).not.toBe(200);
+  } finally { spy.mockRestore(); }
+  expect(srv.app.repo.slack.linkFor(userId)).toBeDefined();
+  expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeDefined();
+  const sent = await be.call<SendResult>("dm_send", { to: "human", body: "still linked?" });
+  expect(sent.delivered_now).toBe(true);
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("still linked?")));
+});
+
+test("#807: a rolled-back link leaves no link, no human identity and nothing attached", async () => {
+  const alice = await login("alice@example.com");
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  srv.app.db.run(`CREATE TRIGGER fail_link BEFORE INSERT ON access_log WHEN NEW.action = 'slack.linked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
+  const spy = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const r = await api(alice, "POST", "/api/slack/link");
+    slack.say(`link ${r.body.code}`);
+    await until(() => spy.mock.calls.some((c) => c.map(String).join(" ").includes("audit refused")), 5000, "the link's failure was logged");
+  } finally { spy.mockRestore(); }
+  expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+  expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  expect((await api(alice, "GET", "/api/whoami")).body.identities).not.toContain("human");
+});
 
 test("thread replies while unlinked don't flood in at relink", async () => {
   const alice = await login("alice@example.com");

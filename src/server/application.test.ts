@@ -9,6 +9,7 @@ import { writeAudit } from "./audit.ts";
 import { tokenSession } from "../../tests/support/token_session.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { queueFor } from "./store/queue.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -440,4 +441,27 @@ test("a reply to anyone but the parent's other party is refused bad_request and 
     message: `parent_id ${root.message_id} is a thread with alice@example.com/be, so a reply goes to alice@example.com/be; to write to someone else, send without parent_id`,
   });
   expect(messages()).toBe(before);
+});
+
+// #807 D4: the Slack human's attach commits its alias, audit and binding row through the write queue; the registry
+// changes only after the commit.
+test("#807: attachHuman while another body holds the write queue waits, then binds", async () => {
+  let release!: () => void;
+  const done = queueFor(store.db).run(() => new Promise<void>(r => { release = r; }));
+  const attached = application.attachHuman(alice, delivery());
+  for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
+  expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([]);
+  expect(store.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  release();
+  await done;
+  expect((await attached).session.human).toBe(true);
+  expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([{ event: "bound" }]);
+});
+
+test("#807: a rolled-back attachHuman leaves the earlier bridge connection in place", async () => {
+  const first = (await application.attachHuman(alice, delivery())).session;
+  store.db.run(`CREATE TRIGGER fail_bind BEFORE INSERT ON binding_events BEGIN SELECT RAISE(ABORT, 'binding refused'); END`);
+  await expect(application.attachHuman(alice, delivery())).rejects.toThrow("binding refused");
+  expect(first.active).toBe(true);
+  expect(application.inbox(first)).toBeDefined();
 });

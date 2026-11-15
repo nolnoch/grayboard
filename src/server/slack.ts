@@ -60,7 +60,7 @@ export type SlackLinker = {
   // False once the bridge has stopped (failed to start, or Slack ended it).
   readonly running: boolean;
   newCode(authed: AuthedUser): { code: string; expires_in_s: number; linked: boolean };
-  unlink(userId: number): boolean;
+  unlink(userId: number): Promise<boolean>;
   // A user was disabled or enabled: take their human offline, or back.
   userChanged(userId: number): Promise<void>;
 };
@@ -125,22 +125,27 @@ export class SlackBridge implements SlackLinker {
     // exactly the death the owner must hear about (app.ts's catch). A
     // disabled user's human is offline by admin action, not the bridge's
     // death, so their row is skipped.
-    for (const link of this.o.repo.slack.links()) {
-      const user = this.o.repo.users.findById(link.user_id);
-      if (!user || user.disabled_at !== null) continue;
-      const target = `${link.email}/${HUMAN_NAME}`;
-      // Dedup against the last DELIVERED notice, not the last death: the
-      // unsuppressed row itself is what's owed, so a notice armed but not
-      // yet delivered survives a restart. `last()` before the insert and
-      // the clamp ride out clock skew in both directions.
-      const last = this.o.repo.audit.last("bridge.notified", target);
-      const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
-      writeAudit(this.o.repo, "bridge.stopped", null, target, {
-        reason: reason.detail,
-        at: new Date(at).toISOString(),
-        ...(prior ? { suppressed: true } : {}),
-      });
-    }
+    // One posted write (#807 D4): stop() is sync, called from startup's catch and Slack's close; the dedup read
+    // and the insert share its transaction.
+    const { repo } = this.o;
+    repo.post(() => {
+      for (const link of repo.slack.links()) {
+        const user = repo.users.findById(link.user_id);
+        if (!user || user.disabled_at !== null) continue;
+        const target = `${link.email}/${HUMAN_NAME}`;
+        // Dedup against the last DELIVERED notice, not the last death: the
+        // unsuppressed row itself is what's owed, so a notice armed but not
+        // yet delivered survives a restart. `last()` before the insert and
+        // the clamp ride out clock skew in both directions.
+        const last = repo.audit.last("bridge.notified", target);
+        const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
+        writeAudit(repo, "bridge.stopped", null, target, {
+          reason: reason.detail,
+          at: new Date(at).toISOString(),
+          ...(prior ? { suppressed: true } : {}),
+        });
+      }
+    }, undefined, "bridge.stopped audit");
   }
 
   // ── linking ────────────────────────────────────────────────────────────────
@@ -155,19 +160,22 @@ export class SlackBridge implements SlackLinker {
   }
 
   /** Remove a user's link and their human identity. False if they had none. */
-  unlink(userId: number): boolean {
+  // One transaction through the write queue (#807 D4); the human goes offline after it commits, so a rolled-back
+  // unlink leaves it linked and attached.
+  unlink(userId: number): Promise<boolean> {
     const { repo, db } = this.o;
-    const link = repo.slack.linkFor(userId);
-    if (!link) return false;
-    this.detach(userId);
-    repo.slack.unlink(userId);
-    // Unread DMs to an identity nobody reads would only pile up; a later link
-    // starts from the newest message (see linkUser).
-    const handle = `${link.email}/${HUMAN_NAME}`;
-    repo.aliases.remove(handle);
-    forgetHandle(db, handle);
-    writeAudit(repo, "slack.unlinked", link.email, link.slack_user);
-    return true;
+    return repo.write(() => {
+      const link = repo.slack.linkFor(userId);
+      if (!link) return false;
+      repo.slack.unlink(userId);
+      // Unread DMs to an identity nobody reads would only pile up; a later link
+      // starts from the newest message (see linkUser).
+      const handle = `${link.email}/${HUMAN_NAME}`;
+      repo.aliases.remove(handle);
+      forgetHandle(db, handle);
+      writeAudit(repo, "slack.unlinked", link.email, link.slack_user);
+      return true;
+    }, unlinked => { if (unlinked) this.detach(userId); return unlinked; });
   }
 
   async userChanged(userId: number): Promise<void> {
@@ -200,38 +208,53 @@ export class SlackBridge implements SlackLinker {
     // with the user's own email may redeem it (#805 F-05).
     const email = await this.slackEmail(slackUser);
     if (email === "unavailable") {
-      writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" });
+      await repo.write(() => writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" }));
       return this.say(channel, ts, "grayboard couldn't reach Slack to check this account's email, and the code is used up. Run `grayboard slack link` for a new one and try again.");
     }
     if (email === null) {
-      writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "no_email" });
+      await repo.write(() => writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "no_email" }));
       return this.say(channel, ts, "grayboard can't read your Slack account's email, so it can't check this link. Ask the server's admin to add the users:read and users:read.email scopes to the Slack app and reinstall it.");
     }
     if (email !== user.email) {
-      writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" });
+      await repo.write(() => writeAudit(repo, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" }));
       return this.say(channel, ts, `This Slack account's email isn't \`${user.email}\`; link from that account. The code is used up.`);
     }
 
-    const previous = repo.slack.linkFor(user.id);
-    this.detach(user.id);
-    repo.slack.link(user.id, slackUser, channel);
-    const moved = previous && previous.slack_user !== slackUser ? previous : undefined;
-    if (moved) writeAudit(repo, "slack.relinked", user.email, slackUser, { from: moved.slack_user });
-    const handle = `${user.email}/${HUMAN_NAME}`;
-    if (!repo.aliases.find(handle)) {
-      // Start from now: drop what queued for an earlier link's alias.
-      forgetHandle(db, handle);
-      repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
-      writeAudit(repo, "alias.created", user.email, handle, { slack: true });
-      onAliasCreated(db, repo, user.id, handle);
-      const newest = repo.messages.history([handle], undefined, 1)[0];
-      if (newest) repo.cursors.advance(handle, "direct", handle, newest.id);
+    // The link and its human identity commit in one transaction through the write queue (#807 D4). The Slack
+    // account is checked again inside it: the email check above awaited Slack. The old human goes offline and the
+    // new one attaches after the commit, with no await between them, so a concurrent unlink can't leave attach()
+    // without its link.
+    type Linked = { taken: SlackLink } | { moved: SlackLink | undefined; link: SlackLink };
+    const done = await repo.write((): Linked => {
+      const taken = repo.slack.linkBySlackUser(slackUser);
+      if (taken && taken.user_id !== user.id) return { taken };
+      const previous = repo.slack.linkFor(user.id);
+      repo.slack.link(user.id, slackUser, channel);
+      const moved = previous && previous.slack_user !== slackUser ? previous : undefined;
+      if (moved) writeAudit(repo, "slack.relinked", user.email, slackUser, { from: moved.slack_user });
+      const handle = `${user.email}/${HUMAN_NAME}`;
+      if (!repo.aliases.find(handle)) {
+        // Start from now: drop what queued for an earlier link's alias.
+        forgetHandle(db, handle);
+        repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
+        writeAudit(repo, "alias.created", user.email, handle, { slack: true });
+        onAliasCreated(db, repo, user.id, handle);
+        const newest = repo.messages.history([handle], undefined, 1)[0];
+        if (newest) repo.cursors.advance(handle, "direct", handle, newest.id);
+      }
+      markHuman(db, handle, true);
+      writeAudit(repo, "slack.linked", user.email, slackUser);
+      return { moved, link: repo.slack.linkFor(user.id)! };
+    }, (r): Linked & { attached?: Promise<void> } => {
+      if ("taken" in r) return r;
+      this.detach(user.id);
+      return { ...r, attached: this.attach(r.link) };
+    });
+    if ("taken" in done) {
+      return this.say(channel, ts, `This Slack account is linked to \`${done.taken.email}\`. Send \`unlink\` first.`);
     }
-    markHuman(db, handle, true);
-    writeAudit(repo, "slack.linked", user.email, slackUser);
-    // No await between link() and here: a concurrent unlink can't leave
-    // attach() without its link.
-    await this.attach(repo.slack.linkFor(user.id)!);
+    await done.attached;
+    const { moved } = done;
     if (moved) {
       // Moving a link is never silent: the account it leaves hears so.
       await this.say(moved.dm_channel, undefined, `\`${user.email}\` is now linked to another Slack account; this one no longer gets its agents' messages.`);
@@ -298,15 +321,17 @@ export class SlackBridge implements SlackLinker {
     const store: RelayStore = {
       thread: (kind, board, root) => repo.slack.thread(link.user_id, kind, board, root),
       byTs: (ts) => repo.slack.threadByTs(link.user_id, ts),
-      addThread: (row) => repo.slack.addThread(link.user_id, row),
-      advance: (ts, id, peer) => repo.slack.advanceThread(link.user_id, ts, id, peer),
+      // The store's writes are posted (#807 D4): RelayStore is sync, shared with the local bridge's store. Under
+      // SQLite a post runs at once; it goes async with the async Repo (Postgres).
+      addThread: (row) => { repo.post(() => repo.slack.addThread(link.user_id, row), undefined, "Slack thread row"); },
+      advance: (ts, id, peer) => { repo.post(() => repo.slack.advanceThread(link.user_id, ts, id, peer), undefined, "Slack thread advance"); },
       enqueue: (params) => {
         outbox.set(++next, params as ChannelParams);
         return next;
       },
       pending: () => [...outbox].map(([id, p]) => ({ id, params: JSON.stringify(p) })),
       progress: (id) => repo.slack.progress(link.user_id, ref(id)),
-      setProgress: (id, progress) => repo.slack.setProgress(link.user_id, ref(id), progress),
+      setProgress: (id, progress) => { const r = ref(id); repo.post(() => repo.slack.setProgress(link.user_id, r, progress), undefined, "Slack progress"); },
       done: (id) => {
         const p = outbox.get(id);
         const m = p?.meta ?? {};
@@ -317,7 +342,8 @@ export class SlackBridge implements SlackLinker {
         // Receipt is synchronous and validates the live session; retain progress on any refusal.
         if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
         else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)], { handed: posted });
-        repo.slack.clearProgress(link.user_id, ref(id));
+        const r = ref(id);
+        repo.post(() => repo.slack.clearProgress(link.user_id, r), undefined, "Slack progress clear");
         outbox.delete(id);
       },
     };
@@ -379,14 +405,14 @@ export class SlackBridge implements SlackLinker {
       retryMs: this.o.retryMs,
       label: (h) => (h.startsWith(prefix) ? h.slice(prefix.length) : h),
       attachmentLimits: repo.attachmentLimits,
-      onFileSent: (f) =>
+      onFileSent: (f) => void repo.post(() =>
         writeAudit(repo, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file, sha256: f.sha256,
-        }),
-      onFileRefused: (f) =>
+        }), undefined, "Slack file audit"),
+      onFileRefused: (f) => void repo.post(() =>
         writeAudit(repo, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, filename: f.name, reason: f.why, ...(f.sha256 ? { sha256: f.sha256 } : {}),
-        }),
+        }), undefined, "Slack file audit"),
     });
     try {
       ({ session } = await application.attachHuman(authed, sink));
@@ -427,7 +453,7 @@ export class SlackBridge implements SlackLinker {
       if (code) return this.linkUser(user, channel, ts, code[1]!);
       if (/^unlink$/i.test(text)) {
         const link = this.o.repo.slack.linkBySlackUser(user);
-        if (link) this.unlink(link.user_id);
+        if (link) await this.unlink(link.user_id);
         return this.say(channel, ts, link ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
       }
     }

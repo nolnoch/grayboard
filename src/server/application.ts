@@ -695,25 +695,30 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
   // The Slack bridge's in-process human (S16): no ID and no ids row.
   // It holds email/human and logs bind events under the literal `human`.
+  // Its alias, audit and binding row commit in one transaction through the write queue (#807 D4); the registry
+  // changes after the commit, so a rolled-back attach leaves an earlier connection in place.
   async function attachHuman(authed: AuthedUser, sink: DeliverySink): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
-    if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
-    if (!repo.aliases.find(addr)) {
-      repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
-      writeAudit(repo, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
-      onAliasCreated(db, repo, authed.user_id, addr);
-    }
-    const session = new ApplicationSession(authed, sink, true, true);
-    session.primary = addr;
-    session.addresses = [addr];
-    // A bridge connection never pongs: a newer one for the user replaces it.
-    const prev = hub.registry.get(addr);
-    if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
-    hub.sessions.add(session);
-    hub.registry.set(addr, session);
-    touchAlias(db, addr);
-    logBinding(db, HUMAN_NAME, addr, "bound");
-    return { session, ok: { id: HUMAN_NAME, ...helloOkFields(hub, authed) } };
+    return repo.write(() => {
+      if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
+      if (!repo.aliases.find(addr)) {
+        repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
+        writeAudit(repo, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
+        onAliasCreated(db, repo, authed.user_id, addr);
+      }
+      touchAlias(db, addr);
+      logBinding(db, HUMAN_NAME, addr, "bound");
+    }, () => {
+      const session = new ApplicationSession(authed, sink, true, true);
+      session.primary = addr;
+      session.addresses = [addr];
+      // A bridge connection never pongs: a newer one for the user replaces it.
+      const prev = hub.registry.get(addr);
+      if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
+      hub.sessions.add(session);
+      hub.registry.set(addr, session);
+      return { session, ok: { id: HUMAN_NAME, ...helloOkFields(hub, authed) } };
+    });
   }
 
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
