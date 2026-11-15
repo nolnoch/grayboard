@@ -545,7 +545,8 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
 }
 
 // A team's wake policy (#806): whether members' agents may wake each
-// other's across users ('collaborative') or not ('open', the default).
+// other's across users ('collaborative'; 'delegating' adds delegation to
+// each other's launchers, #256) or not ('open', the default).
 // Owners and admins set it, like membership; audited with before and after.
 async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ policy?: unknown }>(req);

@@ -1089,7 +1089,7 @@ teamCmd
 
 teamCmd
   .command("policy <name> <policy>")
-  .description("Set whether members' agents may wake each other's across users: collaborative, or open (the default: no cross-user wake). Team owners and admins")
+  .description("Set what members' agents may do across users: collaborative (wake each other's), delegating (that, and delegate to each other's launchers), or open (the default: neither). Team owners and admins")
   .action(async (name: string, policy: string) => {
     try { output(await makeClient().post(`/api/teams/${name}/policy`, { policy }), globalJson()); }
     catch (e) { handleApiError(e); }
