@@ -925,8 +925,8 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       pending?: boolean;
     };
     const parent = parent_id === undefined ? undefined : getMessage(parent_id);
-    // `as` wins; a reply defaults to the held alias its parent reached or was
-    // sent as (#284 S4); else the primary.
+    // `as` wins (a reply's is checked below, #530); a reply defaults to the
+    // held alias its parent reached or was sent as (#284 S4); else the primary.
     const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, holds()) : null) ?? IDENTITY;
     checkBody(body);
     // A session ID is checked where the message is written (insertMessage).

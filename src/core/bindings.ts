@@ -234,7 +234,7 @@ export function replyPeerError(parentId: number, peer: string): string {
 export function replySenderError(parent: { id: number; sender: string; recipient: string }, peer: string, sender: string): string | null {
   const party = parent.sender === peer ? parent.recipient : parent.sender;
   if (sender === party || addressParts(party)?.kind === "id") return null;
-  return `parent_id ${parent.id} reached you as ${party}, so a reply goes out as ${party}; to write as ${sender}, send without parent_id`;
+  return `parent_id ${parent.id} is a thread you're in as ${party}, so a reply goes out as ${party}; to write as ${sender}, send without parent_id`;
 }
 
 /**
