@@ -703,7 +703,7 @@ export function piRunnerScenario(dir: string): Promise<void> {
 // the root's child: the root's name with its own ID as via, no second root.
 // A header naming a file no live session has, and a /fork of the root (whose
 // header names the session it left, ended first), are roots.
-const FOREGROUND_EXTENSION = (adapter: string) => `
+const FOREGROUND_EXTENSION = (adapter: string, self: string) => `
 import { DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession } from "@earendil-works/pi-coding-agent";
 export default function (pi) {
   pi.registerTool({
@@ -712,7 +712,10 @@ export default function (pi) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const agentDir = process.env.PI_CODING_AGENT_DIR;
       const settingsManager = SettingsManager.create(ctx.cwd, agentDir);
-      const loader = new DefaultResourceLoader({ cwd: ctx.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: [${JSON.stringify(adapter)}] });
+      const loader = new DefaultResourceLoader({ cwd: ctx.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: [${JSON.stringify(adapter)}, ${JSON.stringify(self)}] });
+      // As pi-subagents' resetExtensionCacheOnReload: the child loads its own
+      // module instances, not the root's cached ones.
+      loader.loaded = true;
       await loader.reload();
       const parentSession = params.parent ?? ctx.sessionManager.getSessionFile();
       const sessionManager = SessionManager.create(ctx.cwd, undefined, parentSession ? { parentSession } : undefined);
@@ -738,7 +741,8 @@ export function piForegroundChildScenario(dir: string): Promise<void> {
     const model = startFakeModel([
       scripted("spawn child", [{ tool: "spawn_child", args: { prompt: "child one" } }]),
       scripted("spawn stray", [{ tool: "spawn_child", args: { prompt: "child stray", parent: join(dir, "no-such-session.jsonl") } }]),
-      scripted("child one", [whoami, { tool: prefix + "dm_send", args: { to: "peer", body: "from the foreground child" } }]),
+      scripted("child one", [whoami, { tool: prefix + "dm_send", args: { to: "peer", body: "from the foreground child" } }, { tool: "spawn_child", args: { prompt: "grandchild" } }]),
+      scripted("grandchild", [whoami]),
       scripted("child stray", [whoami]),
       scripted("who", [whoami]),
     ]);
@@ -746,7 +750,8 @@ export function piForegroundChildScenario(dir: string): Promise<void> {
     try {
       const peer = await localSession(dir, "peer");
       mkdirSync(join(dir, "pi-agent", "extensions"), { recursive: true });
-      writeFileSync(join(dir, "pi-agent", "extensions", "foreground.ts"), FOREGROUND_EXTENSION(join(dir, "pi-agent", "extensions", "grayboard.ts")));
+      const foreground = join(dir, "pi-agent", "extensions", "foreground.ts");
+      writeFileSync(foreground, FOREGROUND_EXTENSION(join(dir, "pi-agent", "extensions", "grayboard.ts"), foreground));
       const pi = startPi(dir, model.port, procs, { persist: true });
       const state = await pi.command({ type: "get_state" });
       await until(async () => (await peer.call("peer_list")).peers.some((x: { handle: string }) => x.handle === "pi"), 15_000, "pi online");
@@ -780,6 +785,14 @@ export function piForegroundChildScenario(dir: string): Promise<void> {
       }]);
       expect(bus.query(`SELECT sender, sender_id, via FROM messages WHERE body = 'from the foreground child'`).get()).toEqual({ sender: "pi", sender_id: child.id, via: child.id });
       expect(idRow(child.id)?.root_id).toBe(root);
+      // Its own foreground child, a module instance of its own, resolves to the top root.
+      const grand = JSON.parse(results("grandchild")[0]!);
+      expect(grand).toEqual({ id: grand.id, primary: "pi", aliases: ["pi"], principal: null, root, child: true });
+      expect(grand.id).not.toBe(child.id);
+      expect(audit("id.child_seen").filter((a) => a.target === grand.id)).toEqual([{
+        actor: root, target: grand.id,
+        detail: expect.objectContaining({ child: grand.id, root, parent_session: state.sessionId }),
+      }]);
       // Its shutdown ended it; the root alone holds the name, and no second root ran.
       await until(() => idRow(child.id)?.ended_at, 15_000, "the foreground child ended");
       expect(bus.query(`SELECT id FROM alias_holds WHERE address = 'pi'`).get()).toEqual({ id: root });

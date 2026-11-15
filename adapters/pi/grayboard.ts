@@ -121,7 +121,9 @@ const PARENT_SESSION = (process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_S
 // The live sessions of this pi process that run this extension, keyed by
 // session file (or "id:" + id for an in-memory one), each to the pi session
 // id of its top root, for a foreground subagent's lookup of its header's
-// parentSession (#557). Every session gets its own instance of this
+// parentSession (#557). A header names only a file, so a session without
+// one (pi --no-session) leaves its foreground children no parent to find:
+// they start as roots, as before #557. Every session gets its own instance of this
 // extension, maybe its own module, so the map sits on globalThis under a
 // namespaced Symbol.for, as the hosted pi adapter's does.
 const LIVE_KEY = Symbol.for("io.github.nolnoch.grayboard/pi-local-sessions");
@@ -410,8 +412,11 @@ export default function grayboard(pi: ExtensionAPI) {
       // A runner's env wins; else a foreground subagent's header names its
       // launching session, live in this process (a fork's names the session
       // it left, whose entry that session's shutdown deleted). Not found, it
-      // starts as a root.
-      const from = ctx.sessionManager.getHeader()?.parentSession;
+      // starts as a root. Only a session that would own its delivery looks:
+      // grayboard mcp refuses BUS_PARENT_SESSION with BUS_SESSION_KEY or
+      // BUS_HUMAN=1, so a keyed or human root's foreground child keeps
+      // starting as its own session.
+      const from = owns ? ctx.sessionManager.getHeader()?.parentSession : undefined;
       const parent = PARENT_SESSION ?? (from ? LIVE.get(from) : undefined);
       selected = { id, epoch: ++epoch, ctx, key: sessionKey(ctx), ...(parent ? { parent } : {}) };
       // Its own subagents (grandchildren too) resolve to its top root.
