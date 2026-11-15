@@ -4,10 +4,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
 import { accessAudits } from "../support/audit.ts";
+import { until } from "../support/until.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedToolError } from "../support/hosted_session.ts";
 import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { DENY_ROW_LIMIT } from "../../src/server/policy.ts";
+import { hostedSessionId } from "../../src/server/hosted.ts";
 import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
@@ -239,6 +241,89 @@ describe("pre-seam refusals", () => {
     expect(rows().filter((r) => r.verb === "team.leave")).toEqual([
       { actor: C, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
       { actor: ROOT, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
+    ]);
+  });
+
+  // A hosted session's own row: its server-side ID, from the user, the client and the raw ID it sends.
+  const hostedId = (email: string, raw: string) => hostedSessionId(srv.app.repo.users.findByEmail(email)!.id, HOSTED_CLIENT, raw);
+  // A copy of row `from` under ID `id`, with `set`'s columns changed: the state only a hash collision (or another
+  // client's session) could give.
+  const forgeRow = (id: string, from: string, set: Record<string, string | number>) => {
+    const cols = srv.app.db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('hosted_sessions')").all().map((c) => c.name);
+    const picked = cols.map((c) => (c === "session_id" || c in set ? "?" : c)).join(", ");
+    const values = cols.filter((c) => c === "session_id" || c in set).map((c) => (c === "session_id" ? id : set[c]!));
+    srv.app.db.run(`INSERT INTO hosted_sessions (${cols.join(", ")}) SELECT ${picked} FROM hosted_sessions WHERE session_id = ?`, [...values, from]);
+  };
+
+  test("session_end naming another user's or another client's hosted session reads as not found and leaves one row each, after the hosted rollback", async () => {
+    const [a, b] = await Promise.all([srv.hosted(A, "fe"), srv.hosted(B, "be")]);
+    const [theirs, mine] = [hostedId(A, a.sessionId), hostedId(B, b.sessionId)];
+    // B's session through another OAuth client: a copy of B's row under that client's ID.
+    const otherClient = hostedSessionId(srv.app.repo.users.findByEmail(B)!.id, "another-client", b.sessionId);
+    forgeRow(otherClient, mine, { client_id: "another-client" });
+    const unknown = hostedSessionId(1, HOSTED_CLIENT, "nobody");
+    for (const id of [theirs, otherClient, unknown]) {
+      await expect(b.subscriber.call("session_end", { session: id })).rejects.toMatchObject({ code: "not_found" });
+      expect(srv.app.repo.hosted.get(id)?.session_id ?? null).toBe(id === unknown ? null : id);
+    }
+    const got = accessAudits(srv.app.db, "authz.decision");
+    // A missing ID isn't a policy question: no row.
+    expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.code, r.detail.session, r.detail.client])).toEqual([
+      [B, theirs, "hosted.session", false, "hosted.other_user", "not_found", mine, HOSTED_CLIENT],
+      [B, otherClient, "hosted.session", false, "hosted.other_client", "not_found", mine, HOSTED_CLIENT],
+    ]);
+    expect(JSON.stringify(got[0].detail)).not.toContain(A);
+  });
+
+  test("a request whose own hosted row is another user's reads as not found and leaves a row per request", async () => {
+    await srv.login(A);
+    const b = await srv.hosted(B, "be");
+    // Forged under the ID B's next session will send, owned by A.
+    const forged = hostedId(B, "forged");
+    forgeRow(forged, hostedId(B, b.sessionId), { user_id: srv.app.repo.users.findByEmail(A)!.id });
+    // Refused while the exchange selects its row, before any tool runs: the HTTP 404 it always was.
+    const e = await srv.hosted(B, null, { sessionId: "forged" }).then(() => null, (x: Error) => x);
+    expect(e?.message).toContain(`{"code":"not_found","message":"resource not found"}`);
+    // One row per refused request: the session's native wire and its subscriber each sent one.
+    const row = { actor: B, target: forged, verb: "hosted.session", allow: false, rule: "hosted.other_user" };
+    // connect() rejects on the first refusal; the second request's row may land after.
+    await until(() => rows().filter((r) => r.verb === "hosted.session").length === 2);
+    expect(rows().filter((r) => r.verb === "hosted.session")).toEqual([row, row]);
+  });
+
+  test("registering a child whose hosted row is another user's reads as not found and leaves one row, after the hosted rollback", async () => {
+    await srv.login(A);
+    const b = await srv.hosted(B, "be");
+    const mine = hostedId(B, b.sessionId), forged = hostedId(B, "child");
+    forgeRow(forged, mine, { user_id: srv.app.repo.users.findByEmail(A)!.id });
+    await expect(b.subscriber.call("session_register", { child: "child" })).rejects.toMatchObject({ code: "not_found" });
+    const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "hosted.session");
+    expect(got.map((r) => [r.actor, r.target, r.detail.rule, r.detail.session])).toEqual([[B, forged, "hosted.other_user", mine]]);
+  });
+
+  test("a download another identity can't read reads as missing, as before, and leaves its download_refused row and one decision row; a readable one leaves none", async () => {
+    const aToken = await srv.login(A);
+    expect((await srv.api(aToken, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const [a, b, c] = await Promise.all([srv.hosted(A, "be"), srv.hosted(B, "fe"), srv.hosted(C, "sim")]);
+    const up = async (name: string) => (await a.uploadRaw(name, "hello")).body.id as number;
+    const [unsent, onDm, onPost] = [await up("u.txt"), await up("d.txt"), await up("p.txt")];
+    await a.call("dm_send", { to: `${B}/fe`, body: "file", attachment_ids: [onDm] });
+    await a.call("board_create", { name: "plans", purpose: "p", team: "eng" });
+    await a.call("board_post", { board: "plans", body: "file", attachment_ids: [onPost] });
+    expect((await b.attachmentRaw("GET", `/${onDm}`)).status).toBe(200);
+    const unknown = 999_999;
+    for (const id of [unsent, onDm, onPost, unknown]) {
+      const r = await c.attachmentRaw("GET", `/${id}`);
+      expect(r.status).toBe(404);
+      expect(await r.json()).toEqual({ code: "not_found", message: `no attachment ${id} on a message or post you can read` });
+    }
+    expect(accessAudits(srv.app.db, "attachment.download_refused").map((r) => [r.actor, r.target])).toEqual([unsent, onDm, onPost, unknown].map((id) => [C, `attachment:${id}`]));
+    const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "attachment.read");
+    expect(got.map((r) => [r.actor, r.target, r.detail.allow, r.detail.rule, r.detail.code, r.detail.identity, r.detail.address])).toEqual([
+      [C, `attachment:${unsent}`, false, "attachment.uploader", "not_found", `${C}/sim`, `${C}/sim`],
+      [C, `attachment:${onDm}`, false, "attachment.dm_party", "not_found", `${C}/sim`, `${C}/sim`],
+      [C, `attachment:${onPost}`, false, "attachment.board_visible", "not_found", `${C}/sim`, `${C}/sim`],
+      [C, `attachment:${unknown}`, false, "attachment.unknown", "not_found", `${C}/sim`, `${C}/sim`],
     ]);
   });
 });

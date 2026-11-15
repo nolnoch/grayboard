@@ -8,12 +8,13 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const ROOT = join(import.meta.dir, "..", "..");
-const HELPERS = /\b(canSend|mayActIn|canAdmin|reachesHuman)\b/;
+const HELPERS = /\b(canSend|mayActIn|canAdmin|reachesHuman|canReadAttachment|attachmentReach)\b/;
 
 test("no source file outside policy.ts calls a pre-seam rule helper", () => {
   const offenders: string[] = [];
   for (const file of new Glob("src/**/*.ts").scanSync({ cwd: ROOT })) {
-    if (file.endsWith(".test.ts") || file === "src/server/policy.ts") continue;
+    // Core defines the attachment rule; local mode calls it directly; the server's one caller builds its request.
+    if (file.endsWith(".test.ts") || ["src/server/policy.ts", "src/core/attachments.ts", "src/local/mcp.ts", "src/server/attachments.ts"].includes(file)) continue;
     const text = readFileSync(join(ROOT, file), "utf8");
     text.split("\n").forEach((line, i) => { if (HELPERS.test(line)) offenders.push(`${file}:${i + 1}: ${line.trim()}`); });
   }

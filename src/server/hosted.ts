@@ -15,6 +15,7 @@ import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
+import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
 import { countRefusal } from "./metrics.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
@@ -244,10 +245,20 @@ export function createHostedSessions(application: Application, options: { now?: 
   // don't, so ending one is never refused for capacity.
   // `declare`: whether the request's launcher declaration counts; session_end's doesn't (#532), since its end clears
   // the flag in the same request and would leave an `on: true` audit row for a launcher that never was one.
+  // Security audit F-01 (#851): a hosted row of another user or client reads as missing, and its refusal is an
+  // `authz.decision` row, handed to `later` (the throw rolls back a row written inside). `from`: the requesting
+  // session, when it isn't the row itself.
+  function ownRow(p: OAuthPrincipal, row: HostedSession, later: (write: () => void) => void, from = row.session_id) {
+    const req: AuthzRequest = { verb: "hosted.session", session: row.session_id, user: p.authed.user_id, client: p.clientId, row: { user: row.user_id, client: row.client_id } };
+    const d = authorize(repo, {}, req);
+    if (d.allow) return;
+    later(() => recordDecision(repo, { user: p.authed.user_email, session: from }, req, d));
+    throw new ApplicationError(d.code, d.reason);
+  }
   function rowFor(p: OAuthPrincipal, context: SessionContext, later: (write: () => void) => void, create = true, wake = true, declare = true): HostedSession | undefined {
     if (!("id" in context)) return undefined;
     let row = store.get(context.id);
-    if (row && (row.user_id !== p.authed.user_id || row.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
+    if (row) ownRow(p, row, later);
     if (row && row.parked_at !== null && wake) row = unpark(p, row);
     if (!row && create) {
       admit(p.authed.user_id, []);
@@ -732,7 +743,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           // a rebind of the same ownership (bind_gen) is what the gate made it wait for, not a change.
           if (before && root.ownership_id !== before.ownership_id) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
           const existing = store.get(childId);
-          if (existing && (existing.user_id !== p.authed.user_id || existing.client_id !== p.clientId)) throw new ApplicationError("not_found", "session not found");
+          if (existing) ownRow(p, existing, later.defer, root.session_id);
           const childHolds = existing ? application.hostedHolds(childId) : [];
           if (existing && (childHolds.length || existing.writes_as)) throw new ApplicationError("child_bound", `session ${childId} holds ${childHolds.length ? childHolds.map(h => `"${h}"`).join(", ") : `nothing, writing as "${existing.writes_as}",`} as its own root (bound ${new Date(existing.created_at).toISOString()}${existing.place ? `, in ${existing.place}` : ""}); end it with session_end from that session, or leave it as its own root.`);
           if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
@@ -766,12 +777,15 @@ export function createHostedSessions(application: Application, options: { now?: 
         const target = session ?? row.session_id;
         if (row.root_session_id && target !== row.session_id) rootOnly(row);
         const root = rootOf(row);
-        store.atomic(() => {
+        const later = refusalRows();
+        try { store.atomic(() => {
           fence(p, row, root);
           const candidate = store.get(target);
-          if (!candidate || candidate.user_id !== p.authed.user_id || candidate.client_id !== p.clientId || candidate.ownership_id !== row.ownership_id || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
+          if (candidate) ownRow(p, candidate, later.defer, row.session_id);
+          // The caller's own session outside this root, or a missing ID: not a policy question, so no row.
+          if (!candidate || candidate.ownership_id !== row.ownership_id || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
           candidate.root_session_id ? store.childEnd(target, now(), "closed") : store.end(target, "closed", now());
-        });
+        }); } catch (e) { later.flush(); throw e; }
         return { ended: true };
       }, false, false);
     },

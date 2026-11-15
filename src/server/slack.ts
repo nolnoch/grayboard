@@ -15,7 +15,7 @@ import { HUMAN_NAME } from "../shared/addressing.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
 import { SocketMode } from "../bridge/socket.ts";
 import { SlackError, SlackWeb } from "../bridge/web.ts";
-import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
+import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { Repo, SlackLink } from "./db.ts";
@@ -344,11 +344,9 @@ export class SlackBridge implements SlackLinker {
       // In process: the read check the download route makes, and the store an
       // upload makes, audited the same way.
       async attachment(id) {
-        const row = readableAttachment(repo, db, handle, id, null, link.email);
-        if (!row) {
-          writeAudit(repo, "attachment.download_refused", link.email, `attachment:${id}`, { identity: handle, via: "slack" });
-          throw new Error(`no attachment ${id} on a message or post you can read`);
-        }
+        const read = requestAttachment(repo, db, handle, String(id), null, { user: link.email, address: handle }, { via: "slack" });
+        if ("refused" in read) throw new Error(read.refused);
+        const { row } = read;
         return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: await repo.blobs.get(row.sha256) };
       },
       // Files the relay checked (checkFile), stored as the HTTP upload route
