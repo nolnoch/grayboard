@@ -51,6 +51,8 @@ const LOOKUPS = 1024;
 // ownership. Own-login adapters (pi, omp, Claude Code) never hit it: they
 // refresh 60 s early and end a grant as `login_required` or `refresh_outcome_unknown`.
 const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
+// A saved root restore couldn't prepare while the server was down (#424 6).
+const UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
     if (signal.aborted) return resolve();
@@ -97,6 +99,8 @@ export class Controller<E extends Enrollment = Enrollment> {
   // save drops their records (`prune`). An edited record stays, and every
   // restore reports it, since it may be another location's (#660).
   private readonly skipped = new Set<string>();
+  // Restore retries in flight (#424 6): close waits them out, so none writes after it.
+  private readonly retries = new Set<Promise<void>>();
   constructor(readonly port: HostPort<E>, options: ControllerOptions = {}) {
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep;
@@ -668,12 +672,49 @@ export class Controller<E extends Enrollment = Enrollment> {
         if (this.roots.get(id) !== r) continue;
         await this.watch(e);
         await this.rotated(spent, () => this.prepare(r, true, true));
-      } catch {
-        const r = this.roots.get(id);
-        if (r) { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
+      } catch (caught) {
+        const r = this.roots.get(id), error = this.expired(caught);
+        if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+          this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+          this.retryRestore(r);
+        } else if (r) { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
         else this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
       }
     }
+  }
+  // A saved root a retry may still prepare: nothing (a stop, pause, drift,
+  // shutdown, native bind, resume or session end) has taken it since `epoch`.
+  private restorable(r: Root<E>, epoch: number) {
+    return !this.stopped && !this.drifted && !this.ending.has(r.e.sessionID) && !r.paused && !r.task && r.epoch === epoch && this.roots.get(r.e.sessionID) === r;
+  }
+  // A saved root whose restore found the server unreachable (a host restarted
+  // during a server upgrade) retries its prepare on the run loop's outage
+  // backoff, without limit, instead of pausing until the next reload (#424 6).
+  // Each attempt runs in the control queue, as resume's does; anything that
+  // takes the root meanwhile ends the retry, and close ends its wait.
+  private retryRestore(r: Root<E>) {
+    const epoch = r.epoch;
+    const retry = (async () => {
+      for (let attempt = 1; ; attempt++) {
+        await this.wait(Math.min(8000, 250 * 2 ** attempt), this.closing.signal);
+        const done = await this.serial(async () => {
+          if (!this.restorable(r, epoch)) return true;
+          try {
+            if (!this.watches.has(r.e.sessionID)) await this.watch(r.e);
+            await this.rotated({ ms: 0 }, () => this.prepare(r, true, true));
+            return true;
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (!this.restorable(r, epoch)) return true;
+            if (error instanceof ServerUnreachable) { this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error)); return false; }
+            r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+            return true;
+          }
+        });
+        if (done) return;
+      }
+    })().catch(error => this.failure("restore", error, r)).finally(() => this.retries.delete(retry));
+    this.retries.add(retry);
   }
   // Before a native call: a descendant registers under its root first; a root's
   // own bind stops delivery until afterCall reconciles it.
@@ -754,6 +795,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.stopped = true; this.closing.abort();
     for (const r of this.roots.values()) r.abort?.abort();
     await this.controls;
+    while (this.retries.size) await Promise.all(this.retries);
     for (const r of this.roots.values()) await this.stop(r);
     for (const watch of this.watches.values()) await watch.dispose().catch(error => this.failure("watch_dispose", error));
     this.watches.clear();

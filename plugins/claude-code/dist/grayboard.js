@@ -36533,6 +36533,7 @@ var ADMITTED_LIMIT = 100;
 var LOOKUPS = 1024;
 var ROTATION_POLL_MS = 500;
 var ROTATION_GRACE_MS = 1e4;
+var UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
     if (signal.aborted)
@@ -36577,6 +36578,7 @@ class Controller {
   configured;
   context;
   skipped = new Set;
+  retries = new Set;
   constructor(port, options = {}) {
     this.port = port;
     this.Transport = options.Transport ?? Wire;
@@ -37252,9 +37254,12 @@ class Controller {
           continue;
         await this.watch(e);
         await this.rotated(spent, () => this.prepare(r, true, true));
-      } catch {
-        const r = this.roots.get(id);
-        if (r) {
+      } catch (caught) {
+        const r = this.roots.get(id), error = this.expired(caught);
+        if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+          this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+          this.retryRestore(r);
+        } else if (r) {
           r.paused = true;
           await this.stop(r);
           this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
@@ -37262,6 +37267,42 @@ class Controller {
           this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
       }
     }
+  }
+  restorable(r, epoch) {
+    return !this.stopped && !this.drifted && !this.ending.has(r.e.sessionID) && !r.paused && !r.task && r.epoch === epoch && this.roots.get(r.e.sessionID) === r;
+  }
+  retryRestore(r) {
+    const epoch = r.epoch;
+    const retry = (async () => {
+      for (let attempt = 1;; attempt++) {
+        await this.wait(Math.min(8000, 250 * 2 ** attempt), this.closing.signal);
+        const done = await this.serial(async () => {
+          if (!this.restorable(r, epoch))
+            return true;
+          try {
+            if (!this.watches.has(r.e.sessionID))
+              await this.watch(r.e);
+            await this.rotated({ ms: 0 }, () => this.prepare(r, true, true));
+            return true;
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (!this.restorable(r, epoch))
+              return true;
+            if (error instanceof ServerUnreachable) {
+              this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+              return false;
+            }
+            r.paused = true;
+            await this.stop(r);
+            this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+            return true;
+          }
+        });
+        if (done)
+          return;
+      }
+    })().catch((error) => this.failure("restore", error, r)).finally(() => this.retries.delete(retry));
+    this.retries.add(retry);
   }
   async beforeCall(event) {
     const path = await this.path(event.sessionID);
@@ -37356,6 +37397,8 @@ class Controller {
     for (const r of this.roots.values())
       r.abort?.abort();
     await this.controls;
+    while (this.retries.size)
+      await Promise.all(this.retries);
     for (const r of this.roots.values())
       await this.stop(r);
     for (const watch of this.watches.values())
