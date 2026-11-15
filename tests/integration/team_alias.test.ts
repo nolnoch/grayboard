@@ -254,7 +254,8 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   const build = srv.appSession(bob, "eng/build", { bind: { create: true, meta: { task: "ENG-142", source_board: "#E2E" } }, harness: "opus" });
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
   expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
-  expect(metaSets("eng/build")).toEqual([{ actor: build.id, detail: { address: "eng/build", fields: { task: "ENG-142", source_board: "e2e" }, session: build.id } }]);
+  // The actor is the signed-in user, as on every user-initiated server row (#373); the session is in the detail.
+  expect(metaSets("eng/build")).toEqual([{ actor: B, detail: { address: "eng/build", fields: { task: "ENG-142", source_board: "e2e" }, session: build.id } }]);
   const boundAt = () => rows(`SELECT bound_at FROM alias_holds WHERE address = 'eng/build'`);
   const at = boundAt();
   const bound = () => rows(`SELECT event FROM binding_events WHERE name = 'eng/build'`).length;
@@ -265,7 +266,7 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   expect(metaSets("eng/build")).toHaveLength(1);
   expect(await build.bind("eng/build", { meta: { task: "" } })).toMatchObject({ alias: "eng/build" });
   expect(labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
-  expect(metaSets("eng/build").at(-1)!.detail).toEqual({ address: "eng/build", fields: { task: null }, session: build.id });
+  expect(metaSets("eng/build").at(-1)).toEqual({ actor: B, detail: { address: "eng/build", fields: { task: null }, session: build.id } });
   expect(boundAt()).toEqual(at);
   expect(bound()).toBe(events);
 
