@@ -272,6 +272,10 @@ for (const fail of [false, true]) test(`native post-list activation ${fail ? "re
   const call = await b.s.c.callTool({ name: "whoami", arguments: {} });
   if (fail) {
     expect(call.isError).toBe(true);
+    const text = (call.content as { text: string }[])[0]!.text;
+    expect(text).toStartWith("error: Claude channel activation failed; queued mail remains pending: ");
+    expect(text).toContain("native activation refused");
+    expect((call.structuredContent as { code?: unknown } | undefined)?.code).toBe("internal");
     expect(b.s.stderr()).toContain("native activation refused");
     expect(delivery()).toBeNull();
     expect(cursor()).toBe(0);

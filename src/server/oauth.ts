@@ -107,7 +107,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const now = options.now ?? Date.now;
   // Before any request, and only once the config parsed: a grant an operator client issued
   // under a now-built-in ID (before #429) would otherwise act as a built-in's.
-  const revoked = repo.oauth.revokePreBuiltinGrants(BUILTIN_CLIENT_IDS, now());
+  const revoked = repo.writeNow(() => repo.oauth.revokePreBuiltinGrants(BUILTIN_CLIENT_IDS, now()));
   if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
   const cimd = createCimdResolver({ ...options.cimd, now });
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
@@ -181,7 +181,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
     globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep(); siteLimit.sweep(); tokenSiteLimit.sweep(); refusalRows.sweep();
-    repo.oauth.cleanup(t);
+    repo.post(() => repo.oauth.cleanup(t), undefined, "oauth cleanup");
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
   const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("oauth.sweep", e); } }, 60_000);
@@ -341,9 +341,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const c = cookies(req);
       const binding = c.binding ?? random();
       const id = random(), csrf = random(), t = now();
-      const request = repo.oauth.createRequest({ clientId: client.clientId, redirectUri, resource, scopes: selected, codeChallenge,
+      const request = await repo.write(() => repo.oauth.createRequest({ clientId: client.clientId, redirectUri, resource, scopes: selected, codeChallenge,
         requestHash: hashToken(id), browserHash: hashToken(binding), csrfHash: hashToken(csrf), stateHash: hashToken(state),
-        consentSessionHash: null, createdAt: t, expiresAt: t + OAUTH_TTL.request }, t);
+        consentSessionHash: null, createdAt: t, expiresAt: t + OAUTH_TTL.request }, t));
       if (request.status !== "ok") fail("temporarily_unavailable", 429);
       const f: Flow = { client, state, csrf, expiresAt: t + OAUTH_TTL.request };
       flows.set(hashToken(id), f);
@@ -381,13 +381,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       catch (e) { hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email) || identity!.email.split("@")[1] !== config.orgDomain) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
-      const signedIn = googleSignIn(repo, identity!, { client_id: r.clientId });
+      const signedIn = await repo.write(() => googleSignIn(repo, identity!, { client_id: r.clientId }));
       if ("refused" in signedIn) fail("access_denied", 403);
       const { user } = signedIn;
       if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); fail("access_denied", 403); }
       const session = random(), t = now();
-      const created = repo.oauth.createBrowserSession({ sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
-        c.session && hashToken(c.session));
+      const created = await repo.write(() => repo.oauth.createBrowserSession({ sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
+        c.session && hashToken(c.session)));
       if (created.status !== "ok") fail("temporarily_unavailable", 503);
       const response = redirect(endpoint("/oauth/consent") + "?request=" + id);
       response.headers.append("Set-Cookie", cookie("session", session, OAUTH_TTL.browser / 1000));
@@ -396,7 +396,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     }
     if (path === "/oauth/consent" && req.method === "GET") {
       const p = parameters(u.search.slice(1), ["request"]);
-      return consent(req, required(p, "request"));
+      // The session check and its bind are one transaction; a refusal binds nothing.
+      return repo.write(() => consent(req, required(p, "request")));
     }
     if (path === "/oauth/consent" && req.method === "POST") {
       sameOrigin(req, true);
@@ -407,11 +408,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const decision = required(p, "decision");
       if (!["approve", "deny"].includes(decision) || !c.session) fail();
       const sessionHash = hashToken(c.session!);
-      const b = repo.oauth.findBrowserSession(sessionHash, now());
-      if (!b) fail();
       const code = random(), t = now();
-      const result = repo.oauth.decideRequest({ requestHash: r.requestHash, browserHash: r.browserHash, sessionHash, csrfHash: hashToken(required(p, "csrf")),
-        approve: decision === "approve", code: { ...r, codeHash: hashToken(code), userId: b!.userId, createdAt: t, expiresAt: t + OAUTH_TTL.code } }, t);
+      // The browser session is read in the decision's transaction, so it can't lapse between them.
+      const { b, result } = await repo.write(() => {
+        const b = repo.oauth.findBrowserSession(sessionHash, now());
+        if (!b) fail();
+        return { b: b!, result: repo.oauth.decideRequest({ requestHash: r.requestHash, browserHash: r.browserHash, sessionHash, csrfHash: hashToken(required(p, "csrf")),
+          approve: decision === "approve", code: { ...r, codeHash: hashToken(code), userId: b!.userId, createdAt: t, expiresAt: t + OAUTH_TTL.code } }, t) };
+      });
       if (result.status !== "ok") fail();
       writeAudit(repo, decision === "approve" ? "oauth.consent_approved" : "oauth.consent_denied", repo.users.findById(b!.userId)?.email ?? null, null, { client_id: r.clientId });
       flows.delete(r.requestHash);
@@ -437,7 +441,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         const client = await clientAuth(req, submitted, () => { unlisted = true; });
         if (path === "/oauth/revoke") {
           const p = recognized(submitted, ["token", "token_type_hint"]);
-          repo.oauth.revokeToken(hashToken(required(p, "token")), client.clientId, now());
+          const token = hashToken(required(p, "token"));
+          await repo.write(() => repo.oauth.revokeToken(token, client.clientId, now()));
           writeAudit(repo, "oauth.revoke_requested", null, null, { client_id: client.clientId });
           return new Response(null, { status: 200, headers });
         }
@@ -449,7 +454,6 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if ((optional(p, "resource") ?? resource) !== resource) fail("invalid_grant");
         const t = now();
         const access = random(), refresh = random();
-        let selected: string[];
         let result;
         const pair = (selected: string[]) => ({ clientId: client.clientId, resource, scopes: selected, accessHash: hashToken(access), refreshHash: hashToken(refresh),
           accessExpiresAt: t + OAUTH_TTL.access, refreshExpiresAt: t + OAUTH_TTL.refresh });
@@ -457,19 +461,26 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           const verifier = required(p, "code_verifier");
           if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) fail("invalid_grant");
           const codeHash = hashToken(required(p, "code")), redirectUri = required(p, "redirect_uri");
-          selected = repo.oauth.findCodeScopes(codeHash, client.clientId, resource, redirectUri, t) ?? [];
-          if (!selected.length) fail("invalid_grant");
-          if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
-          result = repo.oauth.redeemCode({ clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash,
-            grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected) }, t);
+          // The code's scopes are read in the redemption's transaction. A refusal before the redemption writes
+          // nothing; the redemption's own (a replay revokes the grant) commits and is checked after.
+          result = await repo.write(() => {
+            const selected = repo.oauth.findCodeScopes(codeHash, client.clientId, resource, redirectUri, t) ?? [];
+            if (!selected.length) fail("invalid_grant");
+            if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
+            return repo.oauth.redeemCode({ clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash,
+              grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected) }, t);
+          });
         } else {
           if (!client.allowRefresh) fail("invalid_grant");
           const refreshHash = hashToken(required(p, "refresh_token"));
-          const grant = repo.oauth.findRefreshGrant(refreshHash, client.clientId, resource, t);
-          if (!grant) fail("invalid_grant");
-          selected = scopes(optional(p, "scope"), grant!.scopes);
-          if (!selected.every(s => grant!.scopes.includes(s))) fail("invalid_scope");
-          result = repo.oauth.rotateRefresh({ clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected) }, t);
+          // As the code above: the grant is read in the rotation's transaction.
+          result = await repo.write(() => {
+            const grant = repo.oauth.findRefreshGrant(refreshHash, client.clientId, resource, t);
+            if (!grant) fail("invalid_grant");
+            const selected = scopes(optional(p, "scope"), grant!.scopes);
+            if (!selected.every(s => grant!.scopes.includes(s))) fail("invalid_scope");
+            return repo.oauth.rotateRefresh({ clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected) }, t);
+          });
         }
         if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
         return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),
