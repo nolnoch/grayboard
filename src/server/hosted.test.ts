@@ -20,6 +20,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { createDelivery } from "./delivery.ts";
 import { claim, listClaims } from "../core/claims.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 let database: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -32,7 +33,7 @@ let blobDir: string;
 const context = (raw: string) => sessionContext(principal, { [OPENCODE_SESSION_META]: raw });
 beforeEach(() => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-hosted-"));
-  database = openDatabase(":memory:", { blobDir });
+  database = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(database.repo, database.db);
   const user = database.repo.users.upsertByEmail("you@example.com", null);
   principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
@@ -181,7 +182,7 @@ test("native metadata is mapped only for the registered client", () => {
 });
 
 test("the authenticated client selects the source key and harness; nothing else maps", async () => {
-  const oauth = createOAuthServer(database.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, oauthClients: [
+  const oauth = createOAuthServer(database.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, oauthClients: [
     { clientId: "broker", name: "Broker", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", sessionSource: true },
     { clientId: "plain", name: "Plain", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none" },
   ] });

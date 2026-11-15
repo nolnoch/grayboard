@@ -8,13 +8,14 @@ import { openDatabase, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { storeAttachment } from "../core/attachments.ts";
 import { createBoard, post, snapshot } from "../core/boards.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 let blobDir: string;
 beforeEach(() => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-blobs-"));
 });
 afterEach(() => rmSync(blobDir, { recursive: true, force: true }));
-const open = () => openDatabase(":memory:", { blobDir });
+const open = () => openDatabase(scratchDbPath(), { blobDir });
 
 describe("retention pruning", () => {
   let repo: Repo;

@@ -9,6 +9,7 @@ import { runRetention } from "./retention.ts";
 import { dedupWrite, fingerprint, type DedupCall } from "./write_dedup.ts";
 import { canonicalJson, WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { CoreDb } from "../core/boards.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 describe("canonicalJson", () => {
   test("sorts keys at every depth and emits no whitespace", () => {
@@ -58,7 +59,7 @@ describe("dedupWrite", () => {
   let db: CoreDb;
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "gb-dedup-"));
-    ({ repo, db } = openDatabase(":memory:", { blobDir: join(dir, "blobs") }));
+    ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: join(dir, "blobs") }));
   });
   afterEach(() => {
     db.close();

@@ -5,11 +5,12 @@ import { join } from "node:path";
 import { openDatabase } from "./db.ts";
 import { storeUpload } from "./attachments.ts";
 import { checkFile } from "../shared/attachments.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 // Guarded callers must not turn cleanup persistence failures into auth refusals.
 test("guarded upload cleanup errors propagate instead of returning the refusal", async () => {
   const blobDir = mkdtempSync(join(tmpdir(), "gb-upload-guard-"));
-  const { db, repo } = openDatabase(":memory:", { blobDir });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir });
   const blobs = new Map<string, Uint8Array>();
   repo.blobs.put = async (hash, data) => { blobs.set(hash, data); };
   repo.blobs.delete = async hash => { blobs.delete(hash); };

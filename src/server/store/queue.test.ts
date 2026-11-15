@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { afterCommit } from "../../core/sqlite.ts";
 import { openDatabase } from "../db.ts";
 import { queueFor, WriteQueue } from "./queue.ts";
+import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 
-const open = () => openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+const open = () => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
 
 test("an idle queue runs a synchronous body before run() returns", async () => {
   const q = new WriteQueue();

@@ -8,6 +8,7 @@ import type { AuthedUser } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
 import { tokenSession } from "../../tests/support/token_session.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -26,7 +27,7 @@ async function connect(user: AuthedUser, alias: string | null, opts: Constructor
 const isDirect = (e: { kind: string }) => e.kind === "direct";
 beforeEach(() => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-application-"));
-  store = openDatabase(":memory:", { blobDir });
+  store = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(store.repo, store.db);
   const user = (email: string): AuthedUser => {
     const u = store.repo.users.upsertByEmail(email, null);

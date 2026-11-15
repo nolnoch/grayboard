@@ -6,12 +6,13 @@ import { openDatabase } from "./db.ts";
 import { HEALTH_TTL_MS, healthz } from "./http.ts";
 import { LAG_HISTORY, lagWindows, startLagSampler } from "./metrics.ts";
 import { until } from "../../tests/support/until.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-healthz-"));
-  store = openDatabase(":memory:", { blobDir: dir });
+  store = openDatabase(scratchDbPath(), { blobDir: dir });
 });
 afterEach(() => {
   store.db.close();
@@ -45,7 +46,7 @@ test("a failed probe is cached too: one 503 and one log line per window, then re
 });
 
 test("each repo has its own cache", () => {
-  const other = openDatabase(":memory:", { blobDir: dir });
+  const other = openDatabase(scratchDbPath(), { blobDir: dir });
   try {
     const failing = spyOn(other.repo.users, "findByEmail").mockImplementation(() => { throw new Error("gone"); });
     const log = spyOn(console, "error").mockImplementation(() => {});

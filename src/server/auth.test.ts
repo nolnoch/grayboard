@@ -6,6 +6,7 @@ import { createTouchQueue, googleSignIn, hashToken, mintToken, verifySessionToke
 import { accessAudits } from "../../tests/support/audit.ts";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWTPayload } from "jose";
 import { openDatabase, type Repo } from "./db.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 test("Google JWT verification preserves issuer/audience/domain and requires verified typed email and bound nonce", async () => {
   const { privateKey, publicKey } = await generateKeyPair("RS256");
@@ -57,7 +58,7 @@ describe("verifySessionToken", () => {
   const touches = createTouchQueue();
 
   beforeEach(() => {
-    ({ repo, db } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
+    ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
   });
 
   test("valid token returns authed user", () => {
@@ -124,7 +125,7 @@ describe("verifySessionToken", () => {
 
 // Security audit F-13: each refusal says what the admin runs, and audits why.
 test("googleSignIn refuses a reassigned or changed email with the admin's fix, and audits each outcome", () => {
-  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   repo.users.upsertByEmail("old@example.com", null);
   expect(googleSignIn(repo, { email: "old@example.com", subject: "s-old", displayName: null }, { ip: "1.2.3.4" })).toMatchObject({ user: { email: "old@example.com" } });
   expect(accessAudits(db, "auth.subject_linked").map(r => [r.actor, r.detail])).toEqual([["old@example.com", { ip: "1.2.3.4" }]]);
