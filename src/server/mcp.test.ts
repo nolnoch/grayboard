@@ -1242,6 +1242,23 @@ for (const { label, initMeta } of UNBOUND_GETS) test(`an unbound legacy GET (${l
   } finally { await raw.close(); }
 });
 
+// #939: the attach re-indexes the GET by its new binding rows, so a later commit to those rows still reaches it.
+test("an idle legacy GET attached by a subscribe ends when its new binding does", async () => {
+  const raw = await rawLegacyGet(token);
+  const fresh = { "ai.opencode/sessionID": "fresh-root" };
+  try {
+    expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
+    expect((await raw.call("bind", { name: "fe", create: true }, fresh)).text).not.toContain("isError\":true");
+    expect((await raw.call("board_create", { name: "attach", purpose: "legacy attach" }, fresh)).text).not.toContain("isError\":true");
+    expect((await raw.subscribe("grayboard://boards/attach", fresh)).text).not.toContain("\"error\"");
+    expect(hosted.activeGetStreams).toBe(1);
+    // Unbinding the last name is a commit to the attached binding's row. The reconcile runs inside that commit, so
+    // the stop shows as soon as the call returns, not at the stream timer's next check.
+    expect((await raw.call("unbind", { name: "fe" }, fresh)).text).not.toContain("isError\":true");
+    expect(hosted.activeGetStreams).toBe(0);
+  } finally { await raw.close(); }
+});
+
 test("a legacy GET closed while a subscribe attaches it ends quietly; the subscription stays registered", async () => {
   const raw = await rawLegacyGet(token);
   const fresh = { "ai.opencode/sessionID": "fresh-root" };

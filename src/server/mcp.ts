@@ -98,6 +98,19 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const legacyAll = new Set<Legacy>();
   const legacyDormant = new Set<Legacy>();
   const lives = new Set<Live>();
+  // Indexes over `lives` (#939), so a lease's inbox change and a hosted row's commit touch only the lives they
+  // concern, not every live: by inbox capability (`live.uris`' inbox entry), and by binding row (`live.rows`),
+  // with the lives that read no row in `rowless`, which every commit checks. Kept by `index`/`unindex` wherever
+  // `lives`, `live.uris` or `live.rows` change.
+  const byInbox = new Map<string, Set<Live>>();
+  const byRow = new Map<string, Set<Live>>();
+  const rowless = new Set<Live>();
+  const put = <K>(map: Map<K, Set<Live>>, key: K, live: Live) => { let set = map.get(key); if (!set) map.set(key, set = new Set()); set.add(live); };
+  const unput = <K>(map: Map<K, Set<Live>>, key: K, live: Live) => { const set = map.get(key); if (set?.delete(live) && !set.size) map.delete(key); };
+  function indexInbox(live: Live) { const cap = live.uris.get("grayboard://inbox"); if (cap) put(byInbox, cap, live); }
+  function indexRows(live: Live) { if (!live.rows.size) rowless.add(live); for (const row of live.rows) put(byRow, row, live); }
+  function unindexRows(live: Live) { rowless.delete(live); for (const row of live.rows) unput(byRow, row, live); }
+  function unindex(live: Live) { const cap = live.uris.get("grayboard://inbox"); if (cap) unput(byInbox, cap, live); unindexRows(live); }
   const forwarding = new Set<OwnedStream>();
   const streamContexts = new Map<OwnedStream, Context>();
   const closing = new Set<Promise<unknown>>();
@@ -269,8 +282,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const unlistenHosted = hosted.listen(changed => {
     seq++;
     if (changed === null) allAt = seq; else changedAt.set(changed, seq);
-    for (const live of [...lives]) {
-      if (changed !== null && live.rows.size && !live.rows.has(changed)) continue;
+    // A snapshot: stop() unindexes as it goes.
+    const affected = changed === null ? [...lives] : [...(byRow.get(changed) ?? []), ...rowless];
+    for (const live of affected) {
+      if (live.stopped) continue;
       try { if (!idle(live) && !bindingLive(live.context)) live.stop(); }
       catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
     }
@@ -333,7 +348,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
     if (live.stopped || !idle(live)) { next.finish(); return; }
     const previous = live.context;
+    unindexRows(live);
     live.context = next; live.rows = bindingRows(next);
+    indexRows(live);
     if (live.stream) streamContexts.set(live.stream, next);
     previous.finish();
   }
@@ -351,6 +368,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (live.stopped) return;
         live.stopped = true;
         lives.delete(live);
+        unindex(live);
         const context = live.context;
         if (legacy && context.role === "native") {
           // A lost board must not poison every later GET on this protocol session.
@@ -370,6 +388,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       },
     };
     lives.add(live);
+    indexInbox(live); indexRows(live);
     try { for (const uri of uris.keys()) addWatch(live, uri); }
     catch (error) { live.stop(); throw error; }
     return live;
@@ -380,11 +399,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       bind(cap: string) { capability = cap; },
       changed() {
         if (!capability) return;
-        for (const live of [...lives]) if (live.uris.get("grayboard://inbox") === capability) live.hint("grayboard://inbox");
+        for (const live of [...(byInbox.get(capability) ?? [])]) live.hint("grayboard://inbox");
       },
       closed() {
         if (!capability) return;
-        for (const live of [...lives]) if (live.uris.get("grayboard://inbox") === capability) live.stop();
+        for (const live of [...(byInbox.get(capability) ?? [])]) live.stop();
         for (const legacy of [...legacyAll, ...legacyDormant]) if (legacy.subscriptions.get("grayboard://inbox") === capability) legacy.subscriptions.delete("grayboard://inbox");
       },
     };
@@ -451,7 +470,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               }
               if (compatible) {
                 // Publish registration only after observer installation succeeds.
-                if (!stream.uris.has(uri)) { addWatch(stream, uri); stream.uris.set(uri, cap); }
+                if (!stream.uris.has(uri)) { addWatch(stream, uri); stream.uris.set(uri, cap); indexInbox(stream); }
               } else {
                 // The current POST owns registration; an incompatible GET must recover
                 // with fresh credentials rather than inherit this request's snapshot.
