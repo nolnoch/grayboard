@@ -892,7 +892,7 @@ test("a declared launcher is a delegation target, and only its own session's ini
   expect(instructions(bound)).toContain("You're a launcher session");
   expect(instructions(plain)).not.toContain("You're a launcher session");
   const info = { identity_full: "you@example.com/lead", teams: [], human: { linked: false } } as never;
-  expect(hostedBoundInstruction(info, undefined, true)).toContain("You're a launcher session");
+  expect(hostedBoundInstruction(info, undefined, true, true)).toContain("You're a launcher session");
   expect(hostedBoundInstruction(info)).not.toContain("You're a launcher session");
   // The requester is a third session of the same user: the declared launcher takes the request, the other is not a target.
   await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
@@ -910,6 +910,25 @@ test("a declared launcher is a delegation target, and only its own session's ini
   expect(instructions(plainUnbound)).not.toContain("You're a launcher session");
 });
 
+// #521 4 / #532 4: a declared launcher counts only while its delivery is live. Declared but with no lease (an
+// unenrolled or polling root), it's neither auto-picked nor accepted by name; once its delivery opens, it is.
+test("a declared launcher with no live delivery is no delegation target until its delivery opens (#521 4)", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = (raw: string, extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: raw, ...extra });
+  const lead = ctx("idle-lead", { [GRAYBOARD_LAUNCHER_META]: true });
+  await hosted.bind(generic, lead, { name: "idle-lead", create: true });
+  await hosted.bind(generic, ctx("idle-req"), { name: "idle-req", create: true });
+  const delegate = (to?: string) => hosted.run(generic, ctx("idle-req"), "delegate", session => application.delegate(session, { persona: "researcher", task: `t ${to ?? "auto"}`, ...(to ? { to } : {}) }));
+  await expect(delegate("idle-lead")).rejects.toThrow('"you@example.com/idle-lead" is a launcher but offline');
+  await expect(delegate()).rejects.toThrow("no live launcher session");
+  await delivery.open(generic, lead);
+  expect(await delegate("idle-lead")).toMatchObject({ to: "you@example.com/idle-lead" });
+  expect(await delegate()).toMatchObject({ to: "you@example.com/idle-lead" });
+  // A launcher declared poll is told nothing about launching: its bind text carries no launcher lines.
+  const polled = await hosted.bind(generic, ctx("poll-lead", { [GRAYBOARD_LAUNCHER_META]: true }), { name: "poll-lead", create: true }, { mode: "poll", source: "x" });
+  expect((polled.structuredContent as { instructions: string[] }).instructions.join(" ")).not.toContain("You're a launcher session");
+});
+
 test("a bound session with no delivery declaration (OpenCode) gets initialize text that follows its lease, as bind's does; a declaration still decides (#531)", () => {
   const info = { identity_full: "you@example.com/fe", teams: [], human: { linked: false } } as never;
   const channel = `<channel source="${DEFAULT_CHANNEL_SOURCE}"`;
@@ -925,8 +944,12 @@ test("a bound session with no delivery declaration (OpenCode) gets initialize te
   expect(unleased).toContain(note);
   expect(unleased).not.toContain("<channel");
   expect(unleased).toContain(OTHER_USER_NOTE);
-  // The launcher lines ride either, only with the flag.
-  for (const leaseOpen of [false, true]) expect(hostedBoundInstruction(info, undefined, true, leaseOpen)).toContain("You're a launcher session");
+  // The launcher lines ride only a pushed session, and only with the flag: a polling launcher is never a
+  // delegation target (#521 4).
+  expect(hostedBoundInstruction(info, undefined, true, true)).toContain("You're a launcher session");
+  expect(hostedBoundInstruction(info, { mode: "push", source: "pi" }, true, false)).toContain("You're a launcher session");
+  expect(hostedBoundInstruction(info, undefined, true, false)).not.toContain("You're a launcher session");
+  expect(hostedBoundInstruction(info, { mode: "poll", source: "x" }, true, true)).not.toContain("You're a launcher session");
   // A declaration outranks the lease.
   const poll = hostedBoundInstruction(info, { mode: "poll", source: "x" }, false, true);
   expect(poll).not.toContain("<channel");
