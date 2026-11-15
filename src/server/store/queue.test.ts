@@ -42,6 +42,75 @@ test("a body that throws or rejects releases the queue and rejects its caller", 
   expect(await q.run(() => 2)).toBe(2);
 });
 
+test("#925: a backlog of synchronous bodies drains in a loop, not one stack frame per body", async () => {
+  const q = new WriteQueue();
+  const N = 200_000;
+  let release!: () => void;
+  const head = q.run(() => new Promise<void>(r => { release = r; }));
+  let ran = 0, inOrder = true;
+  const tail = Array.from({ length: N }, (_, i) => q.run(() => { if (ran !== i) inOrder = false; ran++; return i; }));
+  release();
+  await head;
+  const out = await Promise.all(tail);
+  expect(ran).toBe(N);
+  expect(inOrder).toBe(true);
+  expect(out[N - 1]).toBe(N - 1);
+  expect(q.held).toBe(false);
+});
+
+test("#925: a body that returns a thenable that isn't a Promise holds the queue until it settles", async () => {
+  const q = new WriteQueue();
+  const seen: string[] = [];
+  let settle!: (v: number) => void;
+  const inner = new Promise<number>(r => { settle = r; });
+  const thenable = { then: (ok: (v: number) => unknown, bad?: (e: unknown) => unknown) => inner.then(ok, bad) };
+  const first = q.run(() => thenable as unknown as Promise<number>);
+  const second = q.run(() => { seen.push("b"); });
+  expect(q.held).toBe(true);
+  await Promise.resolve();
+  expect(seen).toEqual([]);
+  settle(5);
+  expect(await first).toBe(5);
+  await second;
+  expect(seen).toEqual(["b"]);
+  expect(q.held).toBe(false);
+});
+
+test("#925 audit: a lazy thenable's then runs as the holder; a throwing then getter rejects its caller and frees the queue", async () => {
+  const q = new WriteQueue();
+  let mineInThen: boolean | undefined;
+  const lazy = { then: (ok: (v: number) => unknown) => { mineInThen = q.mine; ok(4); } };
+  expect(await q.run(() => lazy as unknown as Promise<number>)).toBe(4);
+  expect(mineInThen).toBe(true);
+  const hostile = Object.defineProperty({}, "then", { get() { throw new Error("getter"); } });
+  await expect(q.run(() => hostile)).rejects.toThrow("getter");
+  expect(q.held).toBe(false);
+  let release!: () => void;
+  const head = q.run(() => new Promise<void>(r => { release = r; }));
+  const bad = q.run(() => hostile);
+  const after = q.run(() => 9);
+  release();
+  await head;
+  await expect(bad).rejects.toThrow("getter");
+  expect(await after).toBe(9);
+  expect(q.held).toBe(false);
+});
+
+test("#925: a synchronous body that throws in a backlog rejects only its caller; the drain goes on", async () => {
+  const q = new WriteQueue();
+  let release!: () => void;
+  const head = q.run(() => new Promise<void>(r => { release = r; }));
+  const a = q.run(() => 1);
+  const b = q.run(() => { throw new Error("b"); });
+  const c = q.run(() => 3);
+  release();
+  await head;
+  expect(await a).toBe(1);
+  await expect(b).rejects.toThrow("b");
+  expect(await c).toBe(3);
+  expect(q.held).toBe(false);
+});
+
 test("Repo.write commits a transaction, rolls it back on a throw, and refuses inside an open one", async () => {
   const { repo } = open();
   await repo.write(() => repo.users.upsertByEmail("a@example.com", null));

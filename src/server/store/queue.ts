@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 //
 // FIFO. An idle queue runs a body synchronously, inside run(), so a synchronous body is exactly the
 // transaction it was before the queue existed: nothing interleaves before its commit, and its afterCommit
-// effects flush before the next body starts. A body that returns a promise holds the queue until it settles.
+// effects flush before the next body starts. A body that returns a thenable holds the queue until it settles.
 //
 // The holder is tracked through its async continuations (AsyncLocalStorage: a thread-local that follows the
 // logical task across awaits, and into timers, listeners and promises the task starts), so `mine` is true for the
@@ -16,14 +16,20 @@ import { AsyncLocalStorage } from "node:async_hooks";
 // past the body's release, and must not pass for a later holder.
 const holder = new AsyncLocalStorage<object>();
 
+type Waiter = { fn: () => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void };
+
 export class WriteQueue {
   private busy = false;
   private current: object = {};
-  private readonly waiters: (() => void)[] = [];
+  private readonly waiters: Waiter[] = [];
 
-  run<T>(fn: () => T | Promise<T>): Promise<T> {
-    if (!this.busy) return this.start(fn);
-    return new Promise<T>((resolve, reject) => { this.waiters.push(() => { this.start(fn).then(resolve, reject); }); });
+  run<T>(fn: () => T | PromiseLike<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const w = { fn, resolve, reject } as Waiter;
+      if (this.busy) { this.waiters.push(w); return; }
+      this.busy = true;
+      if (!this.start(w)) this.release();
+    });
   }
 
   // Whether a body holds the queue: true for the whole of a body's run, sync or async.
@@ -39,21 +45,33 @@ export class WriteQueue {
     if (this.busy && !this.mine) throw new Error("top-level transaction while another body holds the write queue: route it through write() (docs/future/postgres-server.md D4)");
   }
 
-  private start<T>(fn: () => T | Promise<T>): Promise<T> {
-    this.busy = true;
+  // Runs one body. True when it returned a thenable (any callable `then`, not only a Promise): it holds the queue until
+  // that settles, and its settling releases it. False when it finished synchronously, returning or throwing. `then` is
+  // read once and called here, inside the body's context and try: a lazy thenable's work runs as the holder, and a
+  // throwing `then` getter rejects this caller rather than escaping with the queue held.
+  private start(w: Waiter): boolean {
     const token = this.current = {};
-    let out: T | Promise<T>;
-    try { out = holder.run(token, fn); }
-    catch (error) { this.release(); return Promise.reject(error); }
-    if (out instanceof Promise) return out.finally(() => this.release());
-    this.release();
-    return Promise.resolve(out);
+    let held: Promise<unknown> | undefined, out: unknown;
+    try {
+      holder.run(token, () => {
+        out = w.fn();
+        const then = out !== null && (typeof out === "object" || typeof out === "function") ? (out as { then?: unknown }).then : undefined;
+        if (typeof then === "function") held = new Promise((resolve, reject) => then.call(out, resolve, reject));
+      });
+    } catch (error) { w.reject(error); return false; }
+    if (!held) { w.resolve(out); return false; }
+    held.finally(() => this.release()).then(w.resolve, w.reject);
+    return true;
   }
 
+  // Hands the queue on. Synchronous bodies drain in this loop, so a backlog of N costs one stack frame, not N (#925);
+  // it stops at a body that holds the queue past its return.
   private release(): void {
-    const next = this.waiters.shift();
-    if (next) next();
-    else this.busy = false;
+    for (;;) {
+      const next = this.waiters.shift();
+      if (!next) { this.busy = false; return; }
+      if (this.start(next)) return;
+    }
   }
 }
 
