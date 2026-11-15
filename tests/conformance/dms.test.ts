@@ -72,11 +72,13 @@ conformance("dms", [
   },
   {
     name: "a DM to an unknown handle is refused and delivers nothing",
-    peers: ["be", "fe"],
+    peers: ["be", "qa"],
     async run(ctx) {
-      const { refused, peers } = ctx;
+      const { ok, refused, peers } = ctx;
       refused(await peers.be!.call("dm_send", { to: "nobody-here", body: "lost" }), "not_found");
-      expect(await unanswered(ctx, "fe")).toEqual([]);
+      // Read where a DM that slipped through would land: the name's first holder (#956).
+      ok(await peers.qa!.call("bind", { name: "nobody-here", create: true }));
+      expect(await unanswered(ctx, "qa")).toEqual([]);
     },
   },
   {

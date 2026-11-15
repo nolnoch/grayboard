@@ -35,6 +35,8 @@ export function conformance(family: string, scenarios: Scenario[]): void {
         }
         test(s.name, async () => {
           const bus = await driver.bus();
+          // A close error is reported only when the body passed: it must never replace the scenario's own failure (#956).
+          let passed = false;
           try {
             const peers: Record<string, Peer> = {};
             for (const name of s.peers) peers[name] = await bus.peer(name);
@@ -49,8 +51,14 @@ export function conformance(family: string, scenarios: Scenario[]): void {
                 if (code !== undefined) expect(o.code).toBe(code);
               },
             });
+            passed = true;
           } finally {
-            await bus.close();
+            try {
+              await bus.close();
+            } catch (e) {
+              if (passed) throw e;
+              console.error(`conformance ${family} [${driver.mode}] ${s.name}: close failed after the scenario failed:`, e);
+            }
           }
         }, 30_000);
       }
