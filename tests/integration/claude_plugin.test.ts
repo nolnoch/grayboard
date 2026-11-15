@@ -33,6 +33,7 @@ import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
+import { accessAudits } from "../support/audit.ts";
 import { closeSessions, mcpSession, stopSession, type ClientShape, type Session } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
 import { descendants } from "../support/claude_code.ts";
@@ -152,6 +153,8 @@ test("a flagged interactive session: discover is refused, the handshake stays be
   expect(bound.texts[0]).toStartWith(`Bound to "alpha"`);
   await until(() => row("sess-alpha")?.lease_deadline != null, 10_000, "alpha's lease");
   expect(row("sess-alpha")!.name).toBe("alpha");
+  // Claude Code starts a turn for every channel push, so its lease withholds non-waking items (#854).
+  expect(accessAudits(srv.app.db, "hosted.lease_opened").map(r => r.detail.context)).toEqual([false]);
   expect(existsSync(deliveryPath(data, srv.resource, CLIENT_ID, "sess-alpha"))).toBe(true);
 
   const beta = await plugin("sess-beta");

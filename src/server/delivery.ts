@@ -26,9 +26,8 @@ const boardOf = (item: PendingDelivery) => item.event.kind === "board" ? (item.e
 type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number;
   session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Acked>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
-  // `drained`: this lease's first pull is done, so a host without context (`context: false`) gets non-waking
-  // items only alongside a waking one (#854). A reconnect keeps its lease; a new lease drains once, as a start.
-  context: boolean; drained: boolean;
+  // `context: false`: a host that starts a turn for every item (#854; `drained` below).
+  context: boolean;
 };
 const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); } };
 class StaleCapability extends ApplicationError {
@@ -61,9 +60,16 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     attempts.set(result, { lease, version, created, hooks });
     return result;
   }
+  // Security audit F-03 (#854): the `session:ownership` pairs whose first drain a host admitted (a receipt, or
+  // a pull with nothing to give). Kept past a lease, so a lease replaced within one ownership (a bind, an unbind,
+  // a revoked alias, which another user can cause) never drains withheld items again; dropped with the ownership.
+  // In memory: a server restart drains once more, which no sender can cause.
+  const drained = new Set<string>();
+  const drainKey = (lease: Lease) => `${lease.sessionId}:${lease.ownership}`;
   let stopped = false;
   function finish(lease: Lease) {
     if (!leases.delete(lease.capability)) return;
+    if (store.get(lease.sessionId)?.ownership_id !== lease.ownership) drained.delete(drainKey(lease));
     if (bySession.get(lease.sessionId) === lease) bySession.delete(lease.sessionId);
     const user = lease.principal.authed.user_id, n = (perUser.get(user) ?? 1) - 1;
     if (n) perUser.set(user, n); else perUser.delete(user);
@@ -111,7 +117,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
         const expiresAt = now() + ttl;
         store.update({ ...row, lease_deadline: expiresAt, last_seen_at: now() });
-        hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null });
+        hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null, ...(openOptions.context === false ? { context: false } : {}) });
         return { row, expiresAt };
       }, result => {
         if ("capability" in result) return opened(result, false, hooks);
@@ -124,7 +130,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         }, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
           ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false,
-          context: openOptions.context ?? true, drained: false };
+          context: openOptions.context ?? true };
         track(lease);
         return opened(lease, true, hooks);
       });
@@ -161,15 +167,15 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         get(p, context, capability);
         let items = application.pending(lease.session, limit).map(event => itemOf(event, lease));
         // Security audit F-03 (#854): a host without context starts a turn for every item it's given, so
-        // after the lease's first pull (local mode's first drain) a lone non-waking item (ungranted,
+        // after the ownership's first drain (local mode's) a lone non-waking item (ungranted,
         // deferred, a digest) stays unreceipted until a waking one arrives to carry it. A full page with
         // none waking goes out anyway: a direct item is receipted only in order, so holding it back would
-        // starve every item behind it (it costs a sender `limit` unwoken items per turn).
-        if (!lease.context && lease.drained && items.length < limit && !items.some(item => item.actionable)) items = [];
+        // starve every item behind it (so a sender who fills a page can still start turns).
+        if (!lease.context && drained.has(drainKey(lease)) && items.length < limit && !items.some(item => item.actionable)) items = [];
         const unseen = items.filter(item => !lease.issued.has(item.id));
         if (lease.issued.size + unseen.length > 1000) { countRefusal("delivery_receipts"); throw new ApplicationError("receipt_capacity", "delivery lease receipt capacity reached; release and reopen"); }
         for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
-        lease.drained = true;
+        if (!items.length) drained.add(drainKey(lease));
         return items;
       }).catch(error => refused(p, context, error));
     },
@@ -203,6 +209,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           records.lease.issued.delete(item.id);
           records.lease.acknowledged.set(item.id, { ownership: item.ownership, bind_gen: item.bind_gen, ...(item.address !== undefined ? { address: item.address } : {}), ...(boardOf(item) !== undefined ? { board: boardOf(item) } : {}) });
         }
+        drained.add(drainKey(records.lease));
         while (records.lease.acknowledged.size > ACKED_HISTORY) records.lease.acknowledged.delete(records.lease.acknowledged.keys().next().value!);
       }).catch(error => refused(p, context, error));
     },

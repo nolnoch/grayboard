@@ -87,6 +87,50 @@ test("the lease's first pull drains a non-waking backlog; a new lease drains aga
   expect((await third.next(dm("after the drain"))).actionable).toBe(false);
 });
 
+test("a lease replaced within one ownership (a bind) doesn't drain withheld items again", async () => {
+  const abe = await srv.hosted(A, "be", { context: false });
+  await abe.none(any);
+  const bfe = await srv.hosted(B, "fe");
+  await bfe.call("dm_send", { to: `${A}/be`, body: "from bob" });
+  await abe.none(dm("from bob"), 300);
+  // The bind bumps bind_gen: the lease closes and a new one opens under the same ownership.
+  await abe.bind("qa");
+  await abe.none(dm("from bob"), 300);
+  const own = await srv.hosted(A, "fe");
+  await own.call("dm_send", { to: "be", body: "wake" });
+  expect((await abe.next(dm("from bob"))).actionable).toBe(false);
+});
+
+test("a team alias revoked by another user doesn't replay withheld items as a drain", async () => {
+  expect((await srv.api(await srv.login(B), "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(await srv.login(B), "POST", "/api/teams/eng/add", { email: A })).status).toBe(200);
+  const abe = await srv.hosted(A, "be", { context: false });
+  await abe.bind("eng/x");
+  await abe.none(any);
+  const bfe = await srv.hosted(B, "fe");
+  await bfe.call("dm_send", { to: `${A}/be`, body: "before revoke" });
+  await abe.none(dm("before revoke"), 300);
+  // Bob's removal revokes eng/x: bind_gen moves and the lease closes; the session opens a new one.
+  expect((await srv.api(await srv.login(B), "POST", "/api/teams/eng/remove", { email: A })).status).toBe(200);
+  await abe.bind("be");
+  await abe.none(dm("before revoke"), 300);
+});
+
+test("the first drain ends at its receipt: an unreceipted first pull is offered again", async () => {
+  const first = await srv.hosted(A, "be", { context: false });
+  await first.close();
+  const bfe = await srv.hosted(B, "fe");
+  await bfe.call("dm_send", { to: `${A}/be`, body: "backlog" });
+  const abe = await srv.hosted(A, "be", { context: false, receipt: "manual" });
+  const offered = await abe.inbox();
+  expect(ids(offered)).toHaveLength(1);
+  // Lost before admission: the next pull offers it again.
+  expect(ids(await abe.inbox())).toEqual(ids(offered));
+  await abe.receipt(ids(offered));
+  await bfe.call("dm_send", { to: `${A}/be`, body: "after receipt" });
+  expect(await abe.inbox()).toEqual([]);
+});
+
 test("a withheld item stays unreceipted: the direct cursor doesn't move", async () => {
   const abe = await srv.hosted(A, "be", { context: false, receipt: "manual" });
   expect(await abe.inbox()).toEqual([]);
