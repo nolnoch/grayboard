@@ -112,7 +112,7 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
     case "alias.bind":
       return { target: `${req.scope.scope_kind}:${req.scope.scope_ref}`, detail: { principal: req.principal.name, scope_kind: req.scope.scope_kind, scope_ref: req.scope.scope_ref, name: req.name } };
     case "act_as":
-      // The actor's address is the alias asked for; an ownerless one has no scope to name.
+      // The actor's address is the alias asked for; an ownerless one has no scope, so the target is the address.
       return { target: req.scope ? `${req.scope.scope_kind}:${req.scope.scope_ref}` : req.address, detail: { principal: req.principal.name, scope_kind: req.scope?.scope_kind ?? null, scope_ref: req.scope?.scope_ref ?? null, name: req.name } };
     case "session.act":
       return { target: req.session, detail: { session_requested: req.session } };

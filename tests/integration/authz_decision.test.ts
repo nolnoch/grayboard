@@ -177,25 +177,29 @@ describe("pre-seam refusals", () => {
   const claimAs = (token: string, as: string) => srv.api(token, "POST", "/api/claims/call", { as, tool: "claim_take", args: { key: "k" } });
   const idOf = (email: string) => srv.app.db.query<{ id: string }, [string]>("SELECT id FROM ids WHERE principal = ? ORDER BY rowid DESC").get(email)!.id;
 
-  test("an HTTP `as` naming another user's, an unknown or an ended session ID is refused alike and leaves one row each", async () => {
+  test("an HTTP `as` naming another user's, an unknown, a viewer's or an ended session ID is refused alike and leaves one row each", async () => {
     const [a, b] = await Promise.all([srv.login(A), srv.login(B)]);
     await srv.connected(a, "fe");
     const theirs = idOf(A);
     await srv.connected(b, "be");
     const mine = idOf(B);
     srv.app.db.run("UPDATE ids SET ended_at = 1000 WHERE id = ?", [mine]);
+    await srv.connected(b, "viewer");
+    const viewer = idOf(B);
+    srv.app.db.run("UPDATE ids SET viewer = 1 WHERE id = ?", [viewer]);
     const unknown = "id:0000000000000";
     const texts: string[] = [];
-    for (const id of [theirs, unknown, mine]) {
+    for (const id of [theirs, unknown, viewer, mine]) {
       const r = await claimAs(b, id);
       expect(r.status).toBe(403);
       texts.push(r.body.message);
     }
-    expect(texts).toEqual([`${theirs} isn't a session of yours`, `${unknown} isn't a session of yours`, `${mine} ended at ${new Date(1000).toISOString()}`]);
+    expect(texts).toEqual([`${theirs} isn't a session of yours`, `${unknown} isn't a session of yours`, `${viewer} isn't a session of yours`, `${mine} ended at ${new Date(1000).toISOString()}`]);
     const got = accessAudits(srv.app.db, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.code])).toEqual([
       [B, theirs, "session.act", false, "session.other_user", "forbidden"],
       [B, unknown, "session.act", false, "session.unknown", "forbidden"],
+      [B, viewer, "session.act", false, "session.viewer", "forbidden"],
       [B, mine, "session.act", false, "session.ended", "forbidden"],
     ]);
     // The row never names whose the ID is.
@@ -212,7 +216,7 @@ describe("pre-seam refusals", () => {
     expect(ownerless.body.message).toBe(`you can't act as "nosuch/build": no principal owns its scope`);
     const got = accessAudits(srv.app.db, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.address])).toEqual([
-      [B, `${B}/human`, "act_as", false, "alias.human_reserved", `${B}/human`],
+      [B, `person:${B}`, "act_as", false, "alias.human_reserved", `${B}/human`],
       [B, "nosuch/build", "act_as", false, "scope.ownerless", "nosuch/build"],
     ]);
   });

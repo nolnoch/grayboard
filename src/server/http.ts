@@ -196,7 +196,7 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   if (!input) return badRequest("as required: the address to act as");
   const p = addressParts(input);
   if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
-  // Security audit F-01 (#851): every refusal below is an `authz.decision` row.
+  // Security audit F-01 (#851): every policy refusal below is an `authz.decision` row.
   if (p.kind === "id") {
     const row = idRow(db, p.address);
     const req: AuthzRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
@@ -208,8 +208,8 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
     return p.address;
   }
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
-  // The human check comes first (`humanReason`), before the scope's owner is known.
-  const owner = p.name === HUMAN_NAME ? null : repo.resolver.principalOf(address);
+  // authorize() decides the human name first (`humanReason`), before the scope's owner.
+  const owner = repo.resolver.principalOf(address);
   const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
   const d = authorize(repo, {}, req);
   if (!d.allow) {
