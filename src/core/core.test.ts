@@ -1070,6 +1070,8 @@ test("peer_status queue param is the explicit rotation opt-out; status text neve
   callBoardTool(db, "fe", "peer_status", { text: "", queue: "on" });
   expect(who(db, "be", {}, () => true).peers.find((p) => p.handle === "fe")?.queue_off).toBeUndefined();
   expect(() => callBoardTool(db, "fe", "peer_status", { text: "", queue: "busy" })).toThrow(/queue/);
+  // An ID has no opt-out flag (#284 S13); the refusal names the way out of the rotation it does have (#340 2).
+  expect(() => callBoardTool(db, "id:00000000000fe", "peer_status", { text: "", queue: "off" })).toThrow(`board_subscribe(board, "quiet") to leave that board's rotation`);
 });
 
 // #284 decision 11: a session's facts sit on its ID, an alias's on the alias.
