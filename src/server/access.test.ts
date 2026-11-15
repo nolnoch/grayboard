@@ -168,6 +168,25 @@ test("seesAliasMeta: only a principal that may act in the alias's scope", () => 
   expect(access.seesAliasMeta(idAddress("f".repeat(64)), { scope_kind: "team", scope_ref: "eng" })).toBe(false);
 });
 
+// #348: a team's alias names reach the team and its members; people's names
+// are the open directory. No admin exemption, and an unknown address sees none.
+test("seesAlias: a person scope to anyone signed in, a team's to its members and its own aliases", () => {
+  const eveId = idAddress("e".repeat(64));
+  registerId(db, { id: eveId, principal: "eve@example.com", launcher: false });
+  repo.aliases.create(team("eng", "build"), "wade@example.com");
+  repo.aliases.create(team("ops", "run"), "eve@example.com");
+  const eng = { scope_kind: "team" as const, scope_ref: "eng" };
+  expect(access.seesAlias!(WADE_ID, eng)).toBe(true);
+  expect(access.seesAlias!(eveId, eng)).toBe(false);
+  expect(access.seesAlias!(eveId, { scope_kind: "person", scope_ref: "wade@example.com" })).toBe(true);
+  // A team alias acts for its team: its own team's names, not another's.
+  expect(access.seesAlias!("eng/build", eng)).toBe(true);
+  expect(access.seesAlias!("ops/run", eng)).toBe(false);
+  expect(access.seesAlias!(idAddress("f".repeat(64)), { scope_kind: "person", scope_ref: "wade@example.com" })).toBe(true);
+  expect(access.seesAlias!(idAddress("f".repeat(64)), eng)).toBe(false);
+  expect(access.seesAlias!(WADE_ID, { scope_kind: "team", scope_ref: null })).toBe(false);
+});
+
 test("mayActIn: a user acts in its own person scope and its teams' scopes; service scopes wait for #270", () => {
   const bob = { kind: "user" as const, name: "bob@example.com" };
   const may = (p: Parameters<typeof mayActIn>[1], kind: "person" | "team" | "service", ref: string) => mayActIn(repo, p, { scope_kind: kind, scope_ref: ref });

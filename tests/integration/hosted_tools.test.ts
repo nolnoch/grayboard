@@ -144,9 +144,10 @@ test("peer_list shows a session's facts only inside a scope the caller may act i
   expect(shown(byAlice, "eng/deploy")).toEqual(FACTS);
   expect(await b.call<WhoResult>("peer_list").then((r) => shown(r, `${B}/fe`))).toEqual(FACTS);
 
-  // carol is in no team: only her own row shows facts.
+  // carol is in no team: only her own row shows facts, and eng's alias isn't listed to her at all (#348).
   const byCarol = await c.call<WhoResult>("peer_list");
-  expect([`${A}/be`, `${B}/fe`, "eng/deploy"].map((h) => shown(byCarol, h))).toEqual([[], [], []]);
+  expect([`${A}/be`, `${B}/fe`].map((h) => shown(byCarol, h))).toEqual([[], []]);
+  expect(byCarol.peers.find((p) => p.handle === "eng/deploy")).toBeUndefined();
 
   // A hidden fact can't be probed with match.
   expect((await c.call<WhoResult>("peer_list", { match: { model: "model-b" } })).peers).toEqual([]);
