@@ -121,8 +121,9 @@ const fastShare = (h: { buckets: number[]; count: number }) => h.count ? h.bucke
 const mergeHist = (into: Hist, h: Hist) => { h.buckets.forEach((b, i) => into.buckets[i]! += b); into.count += h.count; into.sum += h.sum; into.errors += h.errors; };
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
 // The 99% latency gate on a pool of any size: more slow calls than 1% of the pool, rounded up, so a pool under 100
-// calls tolerates one (a smoke run's 80 calls failed CI on a single 101 ms call, #858). Integer math: a float
-// 1% of 1000 rounds up to 11.
+// calls tolerates one (a smoke run's 80 calls failed CI on a single 101 ms call, #858). Never stricter than the old
+// `fast / count < 0.99`; one more slow call allowed when count isn't a multiple of 100. `count / 100` is exact for an
+// integer count, where `(1 - 0.99) * count` would round 1000 up to 11.
 export function tooSlow(count: number, fast: number): boolean {
   return count - fast > Math.ceil(count / 100);
 }
