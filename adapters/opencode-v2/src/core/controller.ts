@@ -31,13 +31,16 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // `admitted` holds `ownership:bind_gen:item` keys admitted but not yet
 // receipted, across reconnects in this process: a receipt failure goes straight
 // to the receipt on the next read instead of showing the item again. A key
-// joins as soon as the host accepted the item, before the post-admission renew
-// and guard, so a renew that fails (an outage, a lost lease, this Controller's
-// own stop) never shows it twice. An admitted key skips only the admission: the
-// pre-admission renew still proves the current lease first, so a lease that
-// can't renew never receipts (it spends the item's attempt budget instead). A
-// new lease under another ownership or bind_gen has another key, so it admits
-// the item again.
+// joins as soon as the host accepted the item, before the guard and receipt,
+// so a receipt that fails (an outage, a lost lease, this Controller's own stop)
+// never shows it twice. There's no renew between admission and receipt: the
+// server's receipt checks the lease itself (#845). The item lasts through its
+// receipt, so a lost lease there spends the item's attempt budget, not the
+// recovery budget. An admitted key skips only the admission: the pre-admission
+// renew still proves the current lease first, so a lease that can't renew
+// never receipts (it spends the item's attempt budget instead). A new lease
+// under another ownership or bind_gen has another key, so it admits the item
+// again.
 type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 const ADMITTED_LIMIT = 100;
 // Ancestry lookups `childRoot` keeps for sessions not (yet) routed.
@@ -484,17 +487,15 @@ export class Controller<E extends Enrollment = Enrollment> {
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
-                if (r.admitted.has(key)) { inItem = false; return; }
+                if (r.admitted.has(key)) return;
                 await this.port.admit(e, item, stableID(e, item, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 await this.guard(r, epoch, signal);
-                await wire!.call("delivery_renew");
-                await this.guard(r, epoch, signal);
-                inItem = false;
               }, async ids => {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
+                inItem = false;
                 for (const id of ids) { attempts.delete(id); r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`); }
                 failures = 0; throttles = 0; recoveries = 0; unreachable = 0; pendingItem = undefined;
                 try { this.port.receipted?.(e, ids); } catch (error) { this.failure("receipt_hook", error, r); }

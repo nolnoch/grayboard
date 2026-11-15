@@ -91,7 +91,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname.startsWith(new URL(resource).pathname + "/attachments")) byteRequests.push({ method: req.method, path: url.pathname, session: req.headers.get("X-Grayboard-Session") });
   if (subscriberOutage && req.headers.get("X-Grayboard-Client") === "subscriber") {
     const fail = async () => { throw new Error("Real backend subscriber network deliberately unavailable"); };
-    if (b?.method === "tools/call" && b.params?.name === "delivery_renew") return expiryContinuation.observe(fail);
+    if (b?.method === "tools/call" && ["delivery_renew", "delivery_receipt"].includes(b.params?.name)) return expiryContinuation.observe(fail);
     return fail();
   }
   if (b?.method === "tools/call") {
@@ -728,7 +728,7 @@ try {
   await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": a.id }), { name: "final", create: true });
   held = false; release?.();
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "out-of-band real service rebind observed after old host admission");
-  assert.equal(receiptAttempts, staleReceipts); assert(app.repo.cursors.directFor("you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
+  assert(receiptAttempts - staleReceipts <= 1, "at most the one stale receipt the server refuses (#845)"); assert(app.repo.cursors.directFor("you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
   assert((await host.session.context({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id) || (await host.session.inbox.list({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id));
   console.log("REAL_OLD_BATCH_REBIND_STALE_RECEIPT_SUPPRESSED_OK");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit approval of successor real binding");

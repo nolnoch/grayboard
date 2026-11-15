@@ -893,10 +893,15 @@ test("#284 S4: a reply goes as the held alias its parent reached or was sent as;
   expect(inbox.find((m) => m.id === toA.message_id)?.to).toBeUndefined();
   const r1 = await s.call("dm_send", { to: "peer", body: "r1", parent_id: toB.message_id });
   expect([senderOf(r1.message_id as number), r1.sent_as]).toEqual(["b", "b"]);
-  // as wins.
-  const r2 = await s.call("dm_send", { to: "peer", body: "r2", parent_id: toB.message_id, as: "a" });
-  expect([senderOf(r2.message_id as number), r2.sent_as]).toEqual(["a", undefined]);
-  // Its own thread, as its sender.
+  // #530 1: a reply goes out as the parent's party, so as another alias is
+  // refused, writing nothing; a thread that reached the ID takes any `as`.
+  const before = rows<{ n: number }>(`SELECT count(*) AS n FROM messages`)[0]!.n;
+  expect(await refusal(s, "dm_send", { to: "peer", body: "r2", parent_id: toB.message_id, as: "a" })).toBe(`error: parent_id ${toB.message_id} is a thread you're in as b, so a reply goes out as b; to write as a, send without parent_id`);
+  expect(rows<{ n: number }>(`SELECT count(*) AS n FROM messages`)[0]!.n).toBe(before);
+  const r2 = await s.call("dm_send", { to: "peer", body: "r2", parent_id: toId.message_id, as: "b" });
+  expect([senderOf(r2.message_id as number), r2.sent_as]).toEqual(["b", "b"]);
+  // Its own thread, as its sender, and only as it.
+  expect(await refusal(s, "dm_send", { to: "peer", body: "x", parent_id: r1.message_id, as: "a" })).toBe(`error: parent_id ${r1.message_id} is a thread you're in as b, so a reply goes out as b; to write as a, send without parent_id`);
   const r3 = await s.call("dm_send", { to: "peer", body: "r3", parent_id: r1.message_id });
   expect(senderOf(r3.message_id as number)).toBe("b");
   // #524: a reply goes to the parent's other party, never a third.

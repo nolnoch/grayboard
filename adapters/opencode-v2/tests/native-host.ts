@@ -123,7 +123,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json(b.id, result({ capability: s.capability, ownership: s.ownership, bind_gen: s.gen, expiresAt: Date.now() + 60_000, identity: { user_email: "you@example.com", identity_full: address(s.held[0]!) } }));
   }
   if (name.startsWith("delivery_")) {
-    if (durable?.invalid.has(session) && name === "delivery_renew") return json(b.id, { resultType: "complete", isError: true, structuredContent: { code: "not_found" }, content: [{ type: "text", text: "no live delivery lease" }] });
+    if (durable?.invalid.has(session)) return json(b.id, { resultType: "complete", isError: true, structuredContent: { code: "not_found" }, content: [{ type: "text", text: "no live delivery lease" }] });
     assert.equal(req.headers.get("X-Grayboard-Lease"), s.capability);
     if (durable && name === "delivery_receipt") {
       try { durable.receipt(session, args.ids); } catch {

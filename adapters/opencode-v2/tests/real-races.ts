@@ -114,7 +114,8 @@ export async function realRace(f: {
       await until(() => app.repo.cursors.directFor("you@example.com/race") === message.id, "replayed original acknowledged under the new lease");
       assert.equal(f.receipts(), beforeReceipts + 1, "Exactly one receipt, from the replay");
     } else {
-      assert.equal(f.receipts(), beforeReceipts, "No stale receipt attempt");
+      // A server-side end the client can't see (a rebind, a revoke) surfaces at the receipt, which the server refuses (#845).
+      assert(f.receipts() - beforeReceipts <= 1, "At most one stale receipt attempt, refused");
       assert.equal(app.repo.cursors.directFor("you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
     }
     assert.deepEqual(await host.session.inbox.list({ sessionID: other }), []);

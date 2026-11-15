@@ -1,7 +1,7 @@
 // One load-test driver process (#805): a slice of the fleet's hosted sessions, run the way
 // hosted-core's controller runs one (adapters/hosted-core/src/controller.ts: a lease renewed
-// every 10 s and the inbox read after it, a read on every hint, two renews per item, one receipt
-// per batch), plus agent traffic on a wall-clock schedule. Started by scripts/loadtest.ts, which
+// every 10 s and the inbox read after it, a read on every hint, then per item a renew and its
+// receipt (#845)), plus agent traffic on a wall-clock schedule. Started by scripts/loadtest.ts, which
 // writes its config as one JSON line on stdin and then sends commands, one per line: "report <n>"
 // (emit window n: everything since the last report, so driver and coordinator windows cover the
 // same span), "churn <f>", "quiesce" (stop sending, keep draining), "close" (release every
@@ -102,7 +102,7 @@ function itemsOf(read: unknown): { id: string; event: unknown }[] {
   return read.items;
 }
 
-// One inbox pass, as the controller makes it: read, two renews per new item, one receipt.
+// One inbox pass, as the controller makes it: read, then per item a renew and its receipt.
 async function drain(l: Live) {
   const read = await timed("inbox", () => l.s.subscriber.read("grayboard://inbox"));
   // A failed read leaves the items on the server: try again shortly rather than at the next renewal.
@@ -127,9 +127,8 @@ async function drain(l: Live) {
       }
     }
     await timed("renew", () => l.s.subscriber.call("delivery_renew"));
-    await timed("renew", () => l.s.subscriber.call("delivery_renew"));
+    await timed("receipt", () => l.s.receipt([item.id]));
   }
-  await timed("receipt", () => l.s.receipt(items.map(i => i.id)));
   if (items.length === 100) l.dirty = true;
 }
 
