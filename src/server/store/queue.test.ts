@@ -266,6 +266,17 @@ test("post inside a write body is part of its transaction; committed runs after 
   expect(seen).toEqual(["body", "committed"]);
 });
 
+test("post from the holder outside a transaction (its committed callback) opens its own", async () => {
+  const { db, repo } = open();
+  let inTxn: boolean | undefined;
+  await repo.write(() => 1, () => {
+    expect(db.inTransaction).toBe(false);
+    expect(repo.post(() => { inTxn = db.inTransaction; repo.users.upsertByEmail("committed-post@example.com", null); })).toBe(true);
+  });
+  expect(inTxn).toBe(true);
+  expect(repo.users.findByEmail("committed-post@example.com")).toBeDefined();
+});
+
 test("a post that waited and failed is logged as its `what`, not thrown", async () => {
   const { db, repo } = open();
   let release!: () => void;

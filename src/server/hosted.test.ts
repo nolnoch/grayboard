@@ -697,6 +697,30 @@ test("an alias revoke issued while another body holds the write queue waits behi
   expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'alias.revoked'").get()).toEqual({ n: 1 });
 });
 
+test("one alias revoke that throws rolls back alone, audited alias.revoke_failed; the recheck's other revokes land (#807 P1b-4b)", async () => {
+  const team = database.repo.teams.create("ops", principal.authed.user_id);
+  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
+  await hosted.bind(principal, context("other"), { name: "ops/dev", create: true });
+  const ids = ["root", "other"].map(r => (context(r) as { id: string }).id);
+  const before = ids.map(id => database.repo.hosted.get(id)!.bind_gen);
+  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  const lose = database.repo.hosted.lose.bind(database.repo.hosted);
+  let calls = 0;
+  const spy = spyOn(database.repo.hosted, "lose").mockImplementation((...args) => { if (calls++ === 0) throw new Error("bad row"); return lose(...args); });
+  const error = spyOn(console, "error").mockImplementation(() => {});
+  try { application.accessChanged(principal.authed.user_email, "admin@example.com"); }
+  finally { spy.mockRestore(); error.mockRestore(); }
+  const audits = (action: string) => database.db.query("SELECT target FROM access_log WHERE action = ?").all(action) as { target: string }[];
+  expect(audits("alias.revoked")).toHaveLength(1);
+  expect(audits("alias.revoke_failed")).toHaveLength(1);
+  const bumped = ids.map((id, i) => database.repo.hosted.get(id)!.bind_gen > before[i]!);
+  expect(bumped.filter(Boolean)).toHaveLength(1);
+  // The failed use rolled back whole: its root still holds the alias it was to lose.
+  const failedTarget = audits("alias.revoke_failed")[0]!.target;
+  expect(aliasUser(database.db, failedTarget)).toBe(ids[bumped.indexOf(false)]!);
+});
+
 test("a revoked tools-only hosted root's ownership ends, audited once: a later recheck finds nothing to revoke again (#454)", async () => {
   const team = database.repo.teams.create("ops", principal.authed.user_id);
   database.repo.teams.addMember(team.id, principal.authed.user_id);

@@ -81,6 +81,7 @@ export type AuditAction =
   | "id.collision"
   | "id.detached"
   | "id.end_failed"
+  | "alias.revoke_failed"
   | "id.ended"
   | "id.child_fallback"
   | "id.child_seen"
