@@ -1078,7 +1078,8 @@ test("children parked in one sweep past the ceiling are evicted by last activity
   hosted.limits.parked = 1;
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   for (const raw of ["c", "a", "b"]) await hosted.register(principal, context("root"), raw);
-  now += 1000; await hosted.whoami(principal, context("c"));
+  // Past the touch window (5 s, #912): activity inside it doesn't move last_seen_at.
+  now += 10_000; await hosted.whoami(principal, context("c"));
   now += 900_001; hosted.sweep();
   expect(database.repo.hosted.children(hostedId("root")).map(r => r.session_id)).toEqual([hostedId("c")]);
   const evicted = childAudits("hosted.child_released").map(a => a.child);
@@ -1437,3 +1438,50 @@ for (const [change, apply] of windows) for (const caller of ["root", "child"] as
     }
   });
 }
+
+test("a call within the touch window leaves last_seen_at; one past it moves it, and the window shrinks to a tenth of a short idle (#912)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const seen = (raw: string) => database.repo.hosted.get(hostedId(raw))!.last_seen_at;
+  const touches = spyOn(database.repo.hosted, "touch");
+  const start = seen("root");
+  now += 4_999; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(start);
+  expect(touches).not.toHaveBeenCalled();
+  now += 1; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(now);
+  touches.mockRestore();
+
+  hosted.close();
+  hosted = createHostedSessions(application, { now: () => now, idleSeconds: 2, isAuthorized: () => authorized });
+  const before = seen("root");
+  now += 199; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(before);
+  now += 1; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(before + 200);
+});
+
+test("a child's native tool call under its exchange's verdict coalesces its touches and its root's (#912)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  const seen = (raw: string) => database.repo.hosted.get(hostedId(raw))!.last_seen_at;
+  const call = async () => {
+    const { verdict } = await hosted.snapshot(principal, context("child"), false);
+    const touches = spyOn(database.repo.hosted, "touch");
+    try { await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[0]); }
+    finally { touches.mockRestore(); }
+  };
+  const start = [seen("root"), seen("child")];
+  now += 4_999;
+  // The exchange's selection is past the window's start, so this call's own touches are the gate's only writes.
+  expect(await call()).toEqual([]);
+  expect([seen("root"), seen("child")]).toEqual(start);
+  now += 5_000;
+  const { verdict } = await hosted.snapshot(principal, context("child"), false);
+  now += 5_000;
+  const touches = spyOn(database.repo.hosted, "touch");
+  await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", "late"), undefined, verdict);
+  const touched = touches.mock.calls.map(c => c[0]).sort();
+  touches.mockRestore();
+  expect(touched).toEqual([hostedId("child"), hostedId("root")].sort());
+  expect([seen("root"), seen("child")]).toEqual([now, now]);
+});

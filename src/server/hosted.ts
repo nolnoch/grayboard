@@ -183,6 +183,9 @@ const DELIVERY_TTL_MS = 30_000;
 const TICK_MS = 250;
 const IDLE_EVERY = 20;
 const RECONCILE_EVERY = 120;
+// Activity writes coalesce (#912): a touch skips a row whose last_seen_at is within this of now, at most a tenth
+// of the idle window, so the idle sweep sees a row at most that much older than its last call.
+const TOUCH_EVERY_MS = 5_000;
 export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
@@ -190,6 +193,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   const rawIdle = options.idleSeconds ?? DEFAULT_IDLE_SECONDS;
   if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("hosted idle seconds must be a positive integer");
   const idle = rawIdle * 1000;
+  const touchEvery = Math.min(TOUCH_EVERY_MS, Math.floor(idle / 10));
+  const touchRow = (r: HostedSession, t: number) => { if (t - r.last_seen_at >= touchEvery) store.touch(r.session_id, t); };
   // A delivery lease's TTL (createDelivery reads it from the service); the
   // restart credit caps a deadline at one TTL past startup (#423).
   const leaseTtl = DELIVERY_TTL_MS;
@@ -305,8 +310,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   function touch(row: HostedSession) {
     const root = rootOf(row), t = now();
-    store.touch(root.session_id, t);
-    if (row.session_id !== root.session_id) store.touch(row.session_id, t);
+    touchRow(root, t);
+    if (row.session_id !== root.session_id) touchRow(row, t);
   }
   // A call's end is activity too (#584), so the idle window runs from it. Only a row still as the call found it,
   // under the same root ownership: a call that ended its own session or whose root was replaced touches nothing.
@@ -318,8 +323,8 @@ export function createHostedSessions(application: Application, options: { now?: 
       const current = store.get(row.session_id), root = row.root_session_id ? store.get(row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
       const t = now();
-      store.touch(root.session_id, t);
-      if (current !== root) store.touch(current.session_id, t);
+      touchRow(root, t);
+      if (current !== root) touchRow(current, t);
     }); } catch (failure) { console.error(`hosted ${row.session_id}: end-of-call touch not written: ${failure instanceof Error ? failure.message : String(failure)}`); }
   }
   // A parked child acts again (#566): admitted against its root's child capacity and the user's and global rows,
@@ -530,8 +535,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (!fresh || !root || fresh.ownership_id !== prior.row.ownership_id || fresh.root_session_id !== prior.row.root_session_id || fresh.parked_at !== null
           || root.session_id !== id || root.ownership_id !== prior.root.ownership_id || root.bind_gen !== prior.root.bind_gen || root.root_session_id
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
-        store.touch(root.session_id, t);
-        if (fresh !== root) store.touch(fresh.session_id, t);
+        touchRow(root, t);
+        if (fresh !== root) touchRow(fresh, t);
         return fresh;
       });
       if (!row) return MISS;
