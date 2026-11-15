@@ -104,6 +104,10 @@ export interface Repo {
     clearSubject(userId: number): void;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
+    // findById(id)?.disabled_at != null, cached on authGeneration (#853).
+    isDisabled(userId: number): boolean;
+    // The user's email while it exists and isn't disabled, cached on authGeneration (#853).
+    activeEmail(userId: number): string | undefined;
     setDisabled(userId: number, disabled: boolean): void;
   };
   sessions: {
@@ -324,9 +328,22 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     recordChildRoots(d);
     seedSchema(d, first);
   });
+  authGenerationTriggers(db);
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, opts.now);
   setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
   return { db, repo };
+}
+
+// #853: a connection-local counter every write to the authorization tables bumps, by trigger, so no
+// write site can forget to. TEMP objects live and die with this connection, outside the schema, and
+// roll back with their transaction: authGeneration (makeRepo) reads the counter only outside one.
+function authGenerationTriggers(db: Database): void {
+  db.exec(`CREATE TEMP TABLE IF NOT EXISTS auth_generation(n INTEGER NOT NULL);
+    INSERT INTO auth_generation(n) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM auth_generation)`);
+  for (const table of ["oauth_tokens", "oauth_grants", "users"]) for (const op of ["INSERT", "UPDATE", "DELETE"]) {
+    db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS auth_generation_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
+      BEGIN UPDATE auth_generation SET n = n + 1; END`);
+  }
 }
 
 // #451: a hosted root holds aliases like any session, in alias_holds, whose address
@@ -709,13 +726,53 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   };
   const hosted = makeHostedStore(db);
   const oauth = makeOAuthStore(db, hosted);
+  // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
+  // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
+  // on every cached auth read.
+  const counter = db.query<{ n: number }, []>("SELECT n FROM temp.auth_generation");
+  const dataVersion = db.query<{ data_version: number }, []>("PRAGMA data_version");
+  // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this connection or
+  // another; undefined inside a transaction, whose writes may yet roll back (#853).
+  const authGeneration = () => db.inTransaction ? undefined : `${counter.get()!.n}:${dataVersion.get()!.data_version}`;
+  const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+  // Caches of what the auth tables say, cleared when authGeneration moves: a live access token only (an
+  // unknown or dead one is re-read every time); a user row, or its absence, as read (#853). They sit
+  // here, under the store's own methods, so a test that replaces one of those methods replaces the cache too.
+  let userGeneration: string | undefined;
+  const users = new Map<number, User | null>();
+  const cachedUser = (userId: number): User | undefined => {
+    const g = authGeneration();
+    if (g === undefined) return userById(userId);
+    if (g !== userGeneration) { users.clear(); userGeneration = g; }
+    let u = users.get(userId);
+    if (u === undefined) users.set(userId, u = userById(userId) ?? null);
+    return u ?? undefined;
+  };
+  // A live access token by hash: held while the generation is unchanged and both the token and its grant
+  // are unexpired, the join's own time conditions; required scopes are checked against the held scopes.
+  let accessGeneration: string | undefined;
+  const accesses = new Map<string, OAuthAccess>();
+  const findActiveAccess: OAuthStore["findActiveAccess"] = (h, resource, requiredScopes, now) => {
+    const g = authGeneration();
+    if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(h, resource, requiredScopes, now);
+    if (g !== accessGeneration) { accesses.clear(); accessGeneration = g; }
+    const key = `${resource}\n${h}`;
+    let a = accesses.get(key);
+    if (!a || !(now < a.expiresAt && now < a.grantExpiresAt)) {
+      a = oauth.findActiveAccess(h, resource, [], now);
+      if (!a) { accesses.delete(key); return undefined; }
+      accesses.set(key, a);
+    }
+    const held = a;
+    return requiredScopes.every(s => held.scopes.includes(s)) ? held : undefined;
+  };
   return {
     now: clock,
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
 
-    oauth: { ...oauth, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
+    oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
     hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
       end: marks(hosted.end, session => session), childEnd: marks(hosted.childEnd, session => session),
       park: marks(hosted.park, session => session), unpark: marks(hosted.unpark, session => session),
@@ -758,8 +815,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
       },
-      findById(userId) {
-        return db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+      findById: userById,
+      isDisabled(userId) {
+        return cachedUser(userId)?.disabled_at != null;
+      },
+      activeEmail(userId) {
+        const u = cachedUser(userId);
+        return u && u.disabled_at === null ? u.email : undefined;
       },
       setDisabled(userId, disabled) {
         db.transaction(() => {
@@ -1471,8 +1533,8 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
     findActiveAccess(h, resource, requiredScopes, now) {
       if (!time(now) || !hash(h) || !Array.isArray(requiredScopes)) return undefined;
       // One read snapshot binds token, grant and user liveness.
-      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null }, [string, number, number]>(`
-        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes FROM oauth_tokens t
+      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null; grant_expiry: number }, [string, number, number]>(`
+        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes, g.expires_at AS grant_expiry FROM oauth_tokens t
         JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
         WHERE t.hash = ? AND t.kind = 'access' AND t.revoked_at IS NULL AND t.expires_at > ?
           AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now, now);
@@ -1483,7 +1545,7 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
       if (!scopes(accessScopes) || !accessScopes.every(s => g.scopes.includes(s)) ||
           g.resource !== resource || !requiredScopes.every(s => accessScopes.includes(s))) return undefined;
       const a: OAuthAccess = { tokenHash: h, grantId: g.id, userId: g.userId, clientId: g.clientId,
-        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry };
+        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry, grantExpiresAt: row.grant_expiry };
       return a;
     },
     isGrantActive(id, now) {

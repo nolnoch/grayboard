@@ -93,17 +93,21 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     if (error instanceof StaleCapability) hosted.audit(id, "hosted.stale_capability", {}, p);
     throw error;
   }
-  function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession) {
+  // `authorized`: the caller checked p's token this turn, with no await since (#853).
+  function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, authorized = false) {
     const lease = leases.get(capability);
     if (stopped || !lease || !("id" in context) || context.id !== lease.sessionId ||
       p.authed.user_id !== lease.principal.authed.user_id || p.clientId !== lease.principal.clientId || p.grantId !== lease.principal.grantId ||
-      !matches(lease, row ?? store.get(lease.sessionId)) || !options.isAuthorized(p)) return stale(p, context, capability);
+      !matches(lease, row ?? store.get(lease.sessionId)) || (!authorized && !options.isAuthorized(p))) return stale(p, context, capability);
     return lease;
   }
   const describe = (l: Lease): DeliveryLease => ({ capability: l.capability, identity: structuredClone(l.identity), expiresAt: l.expiresAt, ownership: l.ownership, bind_gen: l.generation });
   const service = {
     get activeLeaseCount() { return leases.size; },
-    describe(p: DeliveryPrincipal, context: SessionContext, capability: string) { try { return describe(get(p, context, capability)); } catch (error) { return refused(p, context, error); } },
+    // `checked`: the caller's row for context.id, read after it authorized p with no await since (#853).
+    describe(p: DeliveryPrincipal, context: SessionContext, capability: string, checked?: { row: HostedSession | undefined }) {
+      try { return describe(get(p, context, capability, checked?.row, !!checked)); } catch (error) { return refused(p, context, error); }
+    },
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, row => {
