@@ -36,7 +36,7 @@ export const REFUSED_TOKEN_TTL_MS = 60_000;
 // charged again if it comes back.
 export const REFUSED_TOKEN_MAX = 10_000;
 
-type Refused = { until: number; status: number; headers: [string, string][]; body: ArrayBuffer };
+type Refused = { until: number; status: number; headers: [string, string][]; body: Promise<ArrayBuffer> };
 
 export type AuthGateOptions = {
   limit: RateLimit;
@@ -110,34 +110,52 @@ export class AuthGate {
     this.limiter.spend(c.key, { addr: c.ip, path, reason, ua: userAgent(req) });
   }
 
-  /** The remembered 401 for a token refused on `path`, or null to go on. Charges nothing. */
-  replayRefused(req: Request, path: string): Response | null {
-    const bearer = extractBearer(req);
-    if (!bearer || this.refused.size === 0) return null;
-    const key = refusedKey(path, bearer);
-    const r = this.refused.get(key);
-    if (!r) return null;
-    if (r.until <= this.now()) { this.refused.delete(key); return null; }
-    return new Response(r.body, { status: r.status, headers: r.headers });
+  /**
+   * The remembered 401 for this request's token on this path and query, or
+   * null to go on. Charges nothing. `url` is the request's, already parsed.
+   */
+  replayRefused(req: Request, url: URL): Promise<Response> | null {
+    if (this.refused.size === 0 || !extractBearer(req)) return null;
+    const key = refusedKey(req, url);
+    const r = this.live(key);
+    return r ? r.body.then((body) => new Response(body, { status: r.status, headers: r.headers })) : null;
   }
 
-  /** Charge the caller if `res` refused a token `req` presented, and remember the refusal; passes `res` through. */
-  async chargeRefusedToken(c: Caller, req: Request, path: string, res: Response): Promise<Response> {
-    const bearer = res.status === 401 ? extractBearer(req) : null;
-    if (!bearer) return res;
+  /**
+   * Charge the caller if `res` refused a token `req` presented, and remember
+   * the refusal; passes `res` through. A token already remembered isn't
+   * charged again, so requests that were in flight together cost one.
+   */
+  chargeRefusedToken(c: Caller, req: Request, path: string, res: Response): Promise<Response> | Response {
+    if (res.status !== 401 || !extractBearer(req)) return res;
+    const key = refusedKey(req, new URL(req.url));
+    const known = this.live(key);
+    if (known) return res;
     this.charge(c, req, path, "refused token");
-    const body = await res.arrayBuffer();
-    const key = refusedKey(path, bearer);
-    this.refused.delete(key);
+    // Remembered before the body is read, so a concurrent refusal sees it.
     if (this.refused.size >= this.refusedMax) this.refused.delete(this.refused.keys().next().value!);
     const headers = [...res.headers];
+    const body = res.arrayBuffer();
     this.refused.set(key, { until: this.now() + this.refusedTtlMs, status: res.status, headers, body });
-    return new Response(body, { status: res.status, statusText: res.statusText, headers });
+    return body.then((b) => new Response(b, { status: res.status, statusText: res.statusText, headers }));
   }
 
-  /** Drop refilled buckets, ending their runs: every 30s, with the hello sweep (app.ts). */
+  // The live entry under `key`, dropping it if expired.
+  private live(key: string): Refused | undefined {
+    const r = this.refused.get(key);
+    if (r && r.until <= this.now()) { this.refused.delete(key); return undefined; }
+    return r;
+  }
+
+  /** Drop refilled buckets, ending their runs, and expired refusals: every 30s, with the hello sweep (app.ts). */
   sweep(): void {
     this.limiter.sweep();
+    // Entries share one TTL and are inserted in time order, so the expired are a prefix.
+    const t = this.now();
+    for (const [key, r] of this.refused) {
+      if (r.until > t) break;
+      this.refused.delete(key);
+    }
   }
 
   /** How many refused tokens are remembered, for tests. */
@@ -151,4 +169,7 @@ export class AuthGate {
   }
 }
 
-const refusedKey = (path: string, bearer: string) => `${path}\n${hashToken(bearer)}`;
+// The path, query and Authorization header exactly as sent, hashed: a fixed
+// size whatever the client sends, and a token presented in another shape (or
+// beside an access_token query) is a different entry from the token itself.
+const refusedKey = (req: Request, url: URL) => hashToken(`${url.pathname}${url.search}\n${req.headers.get("authorization")}`);

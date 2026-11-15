@@ -186,7 +186,8 @@ test("the hosted attachment byte routes charge a refused bearer to the address g
       expect(response.status).toBe(401);
       expect(await response.text()).not.toContain(bad);
     }
-    const blocked = await bytes("A".repeat(43));
+    // Another token: a repeated refused one is answered from memory, uncharged (#923).
+    const blocked = await bytes("B".repeat(43));
     expect(blocked.status).toBe(429);
     expect((await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(429);
     expect(srv.app.db.query("SELECT target, detail FROM access_log WHERE action = 'auth.rate_limited'").all()).toEqual([
@@ -204,8 +205,9 @@ test("native HTTP charges only presented invalid tokens in the shared address ga
     const token = await srv.login("alice@example.com");
     now = 10_000;
     for (let n = 0; n < 3; n++) expect((await fetch(`${srv.base}/mcp`)).status).toBe(401);
+    // Two distinct tokens: a repeated refused one is answered from memory, uncharged (#923).
     for (let n = 0; n < 2; n++) {
-      const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: "Bearer not-a-token" } });
+      const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer not-a-token-${n}` } });
       expect(response.status).toBe(401);
       expect(await response.text()).not.toContain("not-a-token");
     }

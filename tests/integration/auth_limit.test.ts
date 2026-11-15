@@ -13,6 +13,7 @@ import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
+import { REFUSED_TOKEN_TTL_MS } from "../../src/server/auth_gate.ts";
 
 const A = "alice@example.com";
 const cleanup: (() => void)[] = [];
@@ -31,6 +32,9 @@ function serve(o: ConstructorParameters<typeof TestServer>[0] = {}) {
   let lookups = 0;
   const find = srv.app.repo.sessions.findByTokenHash.bind(srv.app.repo.sessions);
   srv.app.repo.sessions.findByTokenHash = (h: string) => (lookups++, find(h));
+  // The hosted MCP's access-token lookup too.
+  const access = srv.app.repo.oauth.findActiveAccess.bind(srv.app.repo.oauth);
+  srv.app.repo.oauth.findActiveAccess = (...a: Parameters<typeof access>) => (lookups++, access(...a));
   return { srv, clock, lookups: () => lookups };
 }
 
@@ -194,15 +198,35 @@ test("a stale token looping from a shared address is answered from memory: one l
   // Remembered per path: the same token elsewhere is looked up and charged again.
   expect((await get(srv, "/api/claims", "stale", X)).status).toBe(401);
   expect(srv.app.authGate.refusedSize).toBe(2);
-  // Once forgotten it's charged again, one token a minute, under any allowed refill.
-  clock.t += 60_000;
+  expect(lookups()).toBe(3);  // the stale token on each path, and alice's valid one
+  // Once forgotten it's looked up and charged again, one token a minute, under any allowed refill.
+  clock.t += REFUSED_TOKEN_TTL_MS;
   expect((await get(srv, "/api/whoami", "stale", X)).status).toBe(401);
+  expect(lookups()).toBe(4);
+  // The heartbeat's sweep drops expired entries.
+  clock.t += REFUSED_TOKEN_TTL_MS;
+  srv.app.sweepLimits();
+  expect(srv.app.authGate.refusedSize).toBe(0);
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
   // Distinct bad tokens still drain the bucket, as a scan does.
   for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", `scan${i}`, X);
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
-  // The stale token still gets its 401, not the 429, uncharged.
-  expect((await get(srv, "/api/whoami", "stale", X)).status).toBe(401);
+  // A remembered token still gets its 401, not the 429, uncharged.
+  expect((await get(srv, "/api/whoami", "scan0", X)).status).toBe(401);
+});
+
+test("a stale token sent in parallel stays one entry; the same token in another shape or query is its own entry", async () => {
+  const { srv } = serve();
+  const alice = await srv.login(A);
+  const all = await Promise.all(Array.from({ length: 6 }, () => get(srv, "/api/whoami", "stale", X)));
+  expect(all.map((r) => r.status)).toEqual([401, 401, 401, 401, 401, 401]);
+  expect(srv.app.authGate.refusedSize).toBe(1);
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
+  // A refusal of a mangled header or an extra query never shadows the token as sent correctly.
+  expect((await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer  ${alice}`, "X-Forwarded-For": Y } })).status).toBe(200);
+  expect((await get(srv, "/api/whoami?x=1", "stale", X)).status).toBe(401);
+  expect(srv.app.authGate.refusedSize).toBe(2);
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
 });
 
 test("a hosted MCP refusal is replayed with its WWW-Authenticate, so an OAuth client still re-authorizes", async () => {
@@ -214,6 +238,7 @@ test("a hosted MCP refusal is replayed with its WWW-Authenticate, so an OAuth cl
   expect(challenge).toContain("resource_metadata=");
   const body = await first.text();
   const before = lookups();
+  expect(before).toBeGreaterThan(0);
   for (let i = 0; i < 5; i++) {
     const r = await mcpList(srv, stale, X);
     expect(r.status).toBe(401);
