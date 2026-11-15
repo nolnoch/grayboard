@@ -13,6 +13,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/r
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { GRAYBOARD_EFFORT_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
+import { scratchDbPath } from "../support/scratch_db.ts";
 
 const A = "alice@example.com";
 let app: ReturnType<typeof startServer>;
@@ -21,7 +22,7 @@ let blobDir: string;
 const clients: Client[] = [];
 beforeEach(() => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-facts-"));
-  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443/hosted", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [A], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  app = startServer({ dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443/hosted", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [A], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {

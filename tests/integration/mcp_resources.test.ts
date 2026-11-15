@@ -15,6 +15,7 @@ import { hashToken } from "../../src/server/auth.ts";
 import { type AppSession, signedIn } from "../support/app_session.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
+import { scratchDbPath } from "../support/scratch_db.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string, dir: string, clock: number;
@@ -24,7 +25,7 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 beforeEach(() => {
   clock = Date.now();
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-resources-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, helloLimit: { burst: 1000, perSec: 1000 }, oauth: { now: () => clock } });
+  app = startServer({ dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, helloLimit: { burst: 1000, perSec: 1000 }, oauth: { now: () => clock } });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {

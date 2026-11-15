@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
 import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -142,7 +143,7 @@ describe("Repo", () => {
 
   beforeEach(() => {
     // Use an in-memory DB for each test
-    const { repo: r } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+    const { repo: r } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
     repo = r;
   });
 
@@ -308,7 +309,7 @@ describe("Repo", () => {
 
 // #284 decision 5: users, teams and service principals share one namespace.
 test("principals: a sign-in and a team create insert one; a team can't take another principal's name", () => {
-  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const u = repo.users.upsertByEmail("a@example.com", null);
   repo.users.upsertByEmail("a@example.com", "A");
   const eng = repo.teams.create("eng", u.id);
@@ -326,7 +327,7 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
 // Security audit F-13: users are matched by IdP subject first, so a reassigned
 // email can't inherit an account.
 test("signIn: a subject owns its user; a reassigned or changed email is refused; clearSubject hands the email on", () => {
-  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const legacy = repo.users.upsertByEmail("old@example.com", null);
   expect(legacy.idp_subject).toBeNull();
   // A user from before the column links on its next sign-in.
@@ -348,7 +349,7 @@ test("signIn: a subject owns its user; a reassigned or changed email is refused;
 });
 
 test("signIn: a disabled account without a subject isn't bound to whoever signs in", () => {
-  const { repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const departed = repo.users.upsertByEmail("gone@example.com", null);
   repo.users.setDisabled(departed.id, true);
   expect(repo.users.signIn("gone@example.com", "s-hire", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
@@ -358,7 +359,7 @@ test("signIn: a disabled account without a subject isn't bound to whoever signs 
 // ── #130: the undeliveredFrom plan ────────────────────────────────────────────
 
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", () => {
-  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   repo.users.upsertByEmail("a@example.com", null);
   repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
   repo.users.upsertByEmail("b@example.com", null);
@@ -376,7 +377,7 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
 // user DM per call; at 130K messages each churned session's start spent ~100 ms there, stalling the loop for seconds.
 // Both sender-keyed statements must seek by sender.
 test("undeliveredFrom and sentPending search messages by sender, never by recipient_type alone", () => {
-  const { db } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const detail = (sql: string, ...args: (string | number)[]) =>
     (db.prepare("EXPLAIN QUERY PLAN " + sql).all(...args) as { detail: string }[]).map((p) => p.detail).join(" ");
   for (const plan of [detail(UNDELIVERED_FROM_SQL, JSON.stringify(["a@example.com/fe"]), Number.MAX_SAFE_INTEGER),
@@ -388,7 +389,7 @@ test("undeliveredFrom and sentPending search messages by sender, never by recipi
 
 // #284 audit: queuedTo and retract read the read point by its key too.
 test("queuedTo and retract look the read point up by its key, never a mailbox_cursors scan", () => {
-  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   repo.users.upsertByEmail("a@example.com", null);
   repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
   repo.users.upsertByEmail("b@example.com", null);
@@ -407,7 +408,7 @@ test("queuedTo and retract look the read point up by its key, never a mailbox_cu
 
 // #295: audit.last searches access_log by (action, target) and reads it newest first, with no scan or sort.
 test("audit.last searches access_log by (action, target), never a scan or a sort", () => {
-  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const detail = (db.prepare("EXPLAIN QUERY PLAN " + ACCESS_LOG_LAST_SQL).all("dm.retract", "7") as { detail: string }[]).map((p) => p.detail).join(" ");
   expect(detail).toContain("SEARCH access_log USING INDEX idx_access_log_action_target (action=? AND target=?)");
   expect(detail).not.toContain("SCAN");

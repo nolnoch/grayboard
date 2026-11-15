@@ -15,6 +15,7 @@ import { createTouchQueue, type AuthedUser } from "./auth.ts";
 import { runRetention } from "./retention.ts";
 import type { Config } from "./config.ts";
 import { handleHttp } from "./http.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -40,7 +41,7 @@ async function select(user: AuthedUser, name = "be", push = false) {
 }
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
-  store = openDatabase(":memory:", { blobDir: dir });
+  store = openDatabase(scratchDbPath(), { blobDir: dir });
   application = createApplication(store.repo, store.db);
   revoked = new Set();
   resources = createResources(application, { isAuthorized: s => !revoked.has(s) });
@@ -242,7 +243,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
   resources.watch(a, boardResourceUri("private"), privateHint);
   resources.watch(b, boardResourceUri("private"), removedHint);
   const config: Config = {
-    dbPath: ":memory:", blobDir: dir, httpPort: 0,
+    dbPath: scratchDbPath(), blobDir: dir, httpPort: 0,
     devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
     messageRetentionDays: 90, auditRetentionDays: 90, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
   };

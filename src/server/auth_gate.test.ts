@@ -5,9 +5,10 @@ import { join } from "node:path";
 
 import { AuthGate, REFUSED_TOKEN_TTL_MS, UNKNOWN_PEER_KEY } from "./auth_gate.ts";
 import { openDatabase } from "./db.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 function gate(maxKeys?: number, refusedMax?: number, burst = 1) {
-  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const clock = { t: 1_000_000 };
   const g = new AuthGate(repo, { limit: { burst, perSec: 0.1 }, trustedProxies: [], now: () => clock.t, maxKeys, refusedMax });
   const audit = (action: string) => db.query(`SELECT target, detail FROM access_log WHERE action = ?`).all(action) as { target: string | null; detail: string }[];

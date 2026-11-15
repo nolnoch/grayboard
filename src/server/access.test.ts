@@ -10,6 +10,7 @@ import { registerId, type Board, type CoreDb } from "../core/boards.ts";
 import { serverAccess } from "./access.ts";
 import { mayActIn } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 const team = (ref: string, name: string) => ({ scope_kind: "team" as const, scope_ref: ref, name });
@@ -25,7 +26,7 @@ let db: CoreDb;
 let access: ReturnType<typeof serverAccess>;
 
 beforeEach(() => {
-  ({ repo, db } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
+  ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
   const wade = repo.users.upsertByEmail("wade@example.com", null);
   const bob = repo.users.upsertByEmail("bob@example.com", null);
   const eve = repo.users.upsertByEmail("eve@example.com", null);

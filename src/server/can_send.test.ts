@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canSend, canAdmin, reachesHuman, type SendTarget, type SendContext } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 const FROM = "wade@example.com/fe";
 
 describe("canSend", () => {
   let ctx: SendContext;
   beforeEach(() => {
-    const { repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+    const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
     ctx = { db: repo, now: Date.now(), humanReach: "team" };
   });
 
@@ -35,7 +36,7 @@ describe("canSend", () => {
 describe("reachesHuman", () => {
   let repo: Repo;
   beforeEach(() => {
-    repo = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
+    repo = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
     const wade = repo.users.upsertByEmail("wade@example.com", null);
     const bob = repo.users.upsertByEmail("bob@example.com", null);
     repo.users.upsertByEmail("eve@example.com", null);

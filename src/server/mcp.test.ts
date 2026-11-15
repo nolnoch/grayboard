@@ -18,6 +18,7 @@ import { OAUTH_TTL } from "./oauth-types.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
 const issuedOAuth = (repo: Parameters<typeof issueOAuth>[0], resource: string, email = "alice@example.com", scopes = ["grayboard:tools"]) => issueOAuth(repo, resource, email, scopes, Date.now(), OPENCODE_CLIENT);
 
@@ -31,9 +32,9 @@ let blobDir: string;
 const clients: Client[] = [];
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
-  store = openDatabase(":memory:", { blobDir });
+  store = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
-  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+  oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = issuedOAuth(store.repo, oauth.resource);
   token = issued.token;
@@ -764,7 +765,7 @@ test("global POST admission remains bounded across distinct authenticated users"
 async function clocked(limits?: McpLimits, streamRecheckMs?: number) {
   await hosted.close(); oauth.close();
   const time = { now: Date.now() };
-  oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
+  oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
   const intervals: (() => void)[] = [];
   const interval = globalThis.setInterval;
   const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {

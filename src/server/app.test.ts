@@ -13,6 +13,7 @@ import { until } from "../../tests/support/until.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 const hostname = "127.0.0.1";
 
@@ -22,7 +23,7 @@ for (const trusted of [true, false]) test(`OAuth address limits use the actual a
   let clock = Date.now();
   try {
     app = startServer({
-      dbPath: ":memory:", blobDir: dir, httpPort: 0,
+      dbPath: scratchDbPath(), blobDir: dir, httpPort: 0,
       googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://rate.example.com",
       messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT,
       trustedProxies: trusted ? DEFAULT_TRUSTED_PROXIES : [], oauthLimit: { burst: 1, perSec: 1 }, oauthGlobalLimit: { burst: 10, perSec: 1 },
@@ -219,7 +220,7 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
   let app: ReturnType<typeof startServer> | undefined;
   try {
     app = startServer({
-      dbPath: ":memory:", blobDir: dir, httpPort: 0,
+      dbPath: scratchDbPath(), blobDir: dir, httpPort: 0,
       googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl,
       messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     }, { hostname, background: false });

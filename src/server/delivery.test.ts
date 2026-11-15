@@ -11,6 +11,7 @@ import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { openDatabase } from "./db.ts";
 import { createBoard, post, subscribe } from "../core/boards.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -25,7 +26,7 @@ let authorized: boolean;
 const context = (p: DeliveryPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-delivery-"));
-  store = openDatabase(":memory:", { blobDir: dir });
+  store = openDatabase(scratchDbPath(), { blobDir: dir });
   application = createApplication(store.repo, store.db);
   const principal = (email: string): DeliveryPrincipal => {
     const user = store.repo.users.upsertByEmail(email, null);

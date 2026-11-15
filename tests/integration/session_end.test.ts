@@ -12,13 +12,14 @@ import { join } from "node:path";
 import { runRetention } from "../../src/server/retention.ts";
 import { direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
+import { scratchDbPath } from "../support/scratch_db.ts";
 
 const A = "alice@example.com";
 let srv: TestServer;
 let clock: number;
 let dbDir: string;
 
-const start = (dbPath = ":memory:") => new TestServer({ dbPath, admins: ["root@example.com"] }, { now: () => clock });
+const start = (dbPath = scratchDbPath()) => new TestServer({ dbPath, admins: ["root@example.com"] }, { now: () => clock });
 
 beforeEach(() => {
   clock = Date.now();

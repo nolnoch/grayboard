@@ -13,6 +13,7 @@ import { sessionContext } from "../../src/server/hosted.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { withMeta } from "../helpers/hosted.ts";
+import { scratchDbPath } from "../support/scratch_db.ts";
 
 let app: ReturnType<typeof startServer>, dir: string, base: string;
 // The hosted clock runs `skew` ahead of the wall clock, so a test can pass the idle window (#566).
@@ -20,7 +21,7 @@ let skew = 0;
 const clients: Client[] = [];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-hosted-end-"));
-  app = startServer({ dbPath: ":memory:", blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, now: () => Date.now() + skew });
+  app = startServer({ dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, now: () => Date.now() + skew });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {

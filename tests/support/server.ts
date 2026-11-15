@@ -20,7 +20,7 @@ import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession, type HostedOptions } from 
 
 function serverConfig(dir: string, overrides: Partial<Config>): Config {
   return {
-    dbPath: ":memory:",
+    dbPath: join(dir, "bus.db"),
     blobDir: join(dir, "blobs"),
     httpPort: 0,
     googleClientId: "dev",
