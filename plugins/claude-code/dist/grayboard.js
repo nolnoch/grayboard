@@ -34967,6 +34967,8 @@ function dmNotification(msg, primary) {
     meta.kind = msg.kind;
   if (msg.other_user)
     meta.other_user = "true";
+  if (msg.ungranted)
+    meta.ungranted = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
@@ -34986,6 +34988,8 @@ function boardNotification(item) {
       meta.parent_id = String(p.parent_id);
     if (p.other_user)
       meta.other_user = "true";
+    if (p.ungranted)
+      meta.ungranted = "true";
     addFiles(meta, p.attachments);
     if (item.deferred)
       meta.deferred = "true";

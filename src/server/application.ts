@@ -53,8 +53,9 @@ export class ApplicationError extends Error {
 export type DirectMessage = ReturnType<typeof showMessage<MessageRow>>;
 export type HistoryMessage = DirectMessage & { delivered?: boolean };
 export type DeliveryEvent =
-  // other_user: set only by pending(), a hosted lease's pull (security audit F-10).
-  | { kind: "direct"; message: DirectMessage & { other_user?: true } }
+  // other_user, ungranted: set only by pending(), a hosted lease's pull
+  // (security audit F-10, F-03).
+  | { kind: "direct"; message: DirectMessage & { other_user?: true; ungranted?: true } }
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
@@ -981,11 +982,25 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       // other_user, by the user recorded at write time, never the address's
       // spelling (a team alias or an ID names no user). The user isn't shown.
       const writers = repo.messages.writerUsers(messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
-      const other = (user: string | undefined) => user !== undefined && user !== session.authed.user_email;
-      const markPost = <P extends { id: number }>(post: P): P => other(writers.posts.get(post.id)) ? { ...post, other_user: true } : post;
+      const me = session.authed.user_email;
+      const other = (user: string | undefined) => user !== undefined && user !== me;
+      // Security audit F-03 (#103): another user's item wakes this session
+      // only under a grant (msg.wake, policy.ts); otherwise it is delivered
+      // marked ungranted and not actionable, so the host shows it without
+      // starting a turn. Decided per pull, so a revoked grant stops the next
+      // wake (vision.md principle 11); one decision per writer per pull.
+      const granted = new Map<string, boolean>();
+      const wakes = (user: string) => granted.get(user) ?? (granted.set(user, authorize(repo, {}, { verb: "msg.wake", from_user: user, to_user: me }).allow), granted.get(user)!);
+      const mark = <P extends { id: number }>(post: P, push: boolean, user: string | undefined): P =>
+        !other(user) ? post : { ...post, other_user: true, ...(push && !wakes(user!) ? { ungranted: true } : {}) };
       return [
-        ...messages.map((m): DeliveryEvent => ({ kind: "direct", message: other(writers.messages.get(m.id)) ? { ...showMessage(m), other_user: true } : showMessage(m) })),
-        ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push" ? { ...item, post: markPost(item.post) } : { ...item, latest: markPost(item.latest) } })),
+        ...messages.map((m): DeliveryEvent => {
+          const user = writers.messages.get(m.id);
+          return { kind: "direct", message: other(user) ? { ...showMessage(m), other_user: true, ...(wakes(user!) ? {} : { ungranted: true as const }) } : showMessage(m) };
+        }),
+        ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push"
+          ? { ...item, post: mark(item.post, true, writers.posts.get(item.post.id)) }
+          : { ...item, latest: mark(item.latest, false, writers.posts.get(item.latest.id)) } })),
       ];
     },
     boardCatalog(session: ApplicationSession, after?: string) {
@@ -1261,8 +1276,9 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
     ...(p.from !== session.primary ? { sent_as: p.from } : {}),
   };
   const seen = lastSeen(db, p.to);
-  const payload: SendResult = registry.get(p.to)?.active
-    ? { message_id: msg.id, delivered_now: true, ...f }
+  const live = registry.get(p.to);
+  const payload: SendResult = live?.active
+    ? { message_id: msg.id, delivered_now: true, ...f, ...unwoken(repo, session, live, p.to) }
     : {
         message_id: msg.id,
         delivered_now: false,
@@ -1270,11 +1286,31 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
         ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
         undelivered_from_you: repo.messages.undeliveredFrom(session.addresses).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
+        ...unwoken(repo, session, live, p.to),
       };
   for (const a of msg.attachments ?? []) {
     writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: msg.sender, message_id: msg.id, recipient: msg.recipient });
   }
   return { payload, ref: { kind: "message", id: msg.id }, msg };
+}
+
+// Security audit F-03 (#806): `wakes: false` and why, when the recipient is
+// known to be another user whom no grant lets this sender wake, so the sender
+// doesn't wait on an agent that won't act. Known: the user of the session
+// holding the address now, else a person alias's user; a team or service
+// alias or an ID with no live holder says nothing, as does a human (a person
+// reads it; msg.send already decided reach). Each pull decides again
+// (pending()), so this reflects the grant at send time, not a promise.
+function unwoken(repo: Repo, session: ApplicationSession, live: ApplicationSession | undefined, to: string): { wakes?: false; wake_note?: string } {
+  if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return {};
+  const toUser = live?.authed.user_email ?? (() => { const a = repo.aliases.find(to); return a?.scope_kind === "person" ? a.scope_ref : undefined; })();
+  if (toUser === undefined) return {};
+  const decision = authorize(repo, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
+  if (decision.allow) return {};
+  // Named only when the address already names them (a person alias): a team
+  // alias's or an ID's holder is a handle, not a user (security audit F-12).
+  const whose = to.startsWith(`${toUser}/`) ? `${toUser}'s agent` : "its holder (another user's agent)";
+  return { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` };
 }
 
 // Only after the outermost commit, never on a replay.

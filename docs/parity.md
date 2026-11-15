@@ -43,6 +43,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 15 | Delegation launcher declaration | yes | yes | yes | yes | yes | yes | yes | yes |
 | 16 | Update | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 17 | Repo-name suggestion while unbound | yes | yes | yes | yes | yes | yes | yes | yes |
+| 18 | Another user's item wakes only under a grant (`msg.wake`) | n/a | yes | n/a | yes | n/a | yes | n/a | gap ([#854](https://github.com/nolnoch/grayboard/issues/854)) |
 
 ## Evidence by row
 
@@ -176,3 +177,11 @@ Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only
 - Local (all four): `grayboard mcp` offers `sessionIdentity` first among an unbound session's candidates (boards.md §3). Proof: `tests/integration/binding.test.ts`.
 - pi H, omp H, CC H: the adapter's `HostedClient` sends `sessionIdentity(env, cwd)` for its root on every wire (#522); the server offers it first while free (architecture.md §Hosted MCP). Proof: `tests/integration/hosted_core_wire.test.ts` ("a wire's suggested name reaches the server"), `src/server/hosted.test.ts` (suggested name).
 - OC V2: its `HostPort.suggested` sends `sessionIdentity({}, directory)` for the plugin's directory on every wire, from a generated copy of `src/shared/naming.ts` (#696; the `name` plugin option, not `BUS_IDENTITY`, is its explicit name). Proof: `adapters/opencode-v2/tests/instructions.test.ts` ("the suggested name is local mode's", and the native fetcher's meta), with the server half above.
+
+### 18. Another user's item wakes only under a grant (`msg.wake`)
+
+- Local (all four): n/a. Local mode is single-user (`vision.md` §1): every session is the same user's.
+- Server side, every hosted cell: `application.pending()` marks another user's DM or push that no grant covers `ungranted` and not actionable, per pull (architecture.md §5 `msg.wake`, #806). Proof: `tests/integration/hosted_wake_grant.test.ts`.
+- pi H, omp H: hosted-core's `wakes()` refuses an `ungranted` item whatever the actionable flag (boards.md §9 Hosted core). Proof: `adapters/hosted-core/tests/channel.test.ts` ("an ungranted item never wakes…").
+- OC V2: admits the item with `resume: item.actionable` (`adapters/opencode-v2/src/lifecycle.ts`), so it lands as context. Proof: the server half above; no host test sends a cross-user item.
+- CC H: gap ([#854](https://github.com/nolnoch/grayboard/issues/854)). Claude Code wakes on any channel notification and the plugin notifies every item, so an ungranted item still starts a turn, as a digest or deferred push does.

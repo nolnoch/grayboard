@@ -31,9 +31,10 @@ class StaleCapability extends ApplicationError {
 }
 function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
   const stamp = { ownership: lease.ownership, bind_gen: lease.generation };
-  if (event.kind === "direct") return { id: `direct:${event.message.id}`, actionable: true, event, ...stamp, ...(event.message.recipient === lease.sessionId ? {} : { address: event.message.recipient }) };
+  // An ungranted item (another user's, no msg.wake grant: security audit F-03) is shown, never acted on.
+  if (event.kind === "direct") return { id: `direct:${event.message.id}`, actionable: !event.message.ungranted, event, ...stamp, ...(event.message.recipient === lease.sessionId ? {} : { address: event.message.recipient }) };
   const item = event.item;
-  return { id: item.kind === "push" ? `push:${item.post.id}` : `digest:${item.board}:${item.latest.id}`, actionable: item.kind === "push" && !item.deferred, event, ...stamp };
+  return { id: item.kind === "push" ? `push:${item.post.id}` : `digest:${item.board}:${item.latest.id}`, actionable: item.kind === "push" && !item.deferred && !item.post.ungranted, event, ...stamp };
 }
 export function createDelivery(hosted: HostedSessions, options: DeliveryOptions) {
   const application = hosted.application, store = application.repo.hosted;

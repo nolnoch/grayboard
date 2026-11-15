@@ -102,6 +102,7 @@ export type AuditAction =
   | "slack.unlinked"
   | "team.created"
   | "team.member_added"
+  | "team.policy_set"
   | "team.member_removed"
   | "team.role_changed"
   | "delegation.requested"

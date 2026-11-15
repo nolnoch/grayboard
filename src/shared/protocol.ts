@@ -31,6 +31,9 @@ export type SendResult  = {
   // When not delivered now: the recipient's last session, e.g. "14d ago", and
   // how many of your messages are queued for them, this one included.
   recipient_last_seen?: string; undelivered_from_you?: number; note?: string;
+  // Another user's agent no grant lets this send wake (#806): it arrives as
+  // mail; wake_note says why.
+  wakes?: false; wake_note?: string;
   replayed?: Replayed;
 };
 // A delegation's result: the ordinary fields plus which launcher took it

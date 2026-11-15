@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: what grayboard is for, who it serves, and the principles that decide features
-invariants: hosted mode is the product and local mode the single-user edition; no compatibility shims, except that every database a v1.0.0-or-later release wrote opens under HEAD; targets, not yet enforced (#806): every act has an accountable principal (user or service), never an address alone; waking, steering or delegating to another principal's agents needs a grant; content from another principal is data, never instructions
+invariants: hosted mode is the product and local mode the single-user edition; no compatibility shims, except that every database a v1.0.0-or-later release wrote opens under HEAD; targets, not yet enforced (#806): every act has an accountable principal (user or service), never an address alone; waking (enforced for every hosted harness but Claude Code, #854), steering or delegating to another principal's agents needs a grant; content from another principal is data, never instructions
 code-pointers: src/server/policy.ts (the authorization seam), src/core/tools.ts (instruction text every agent pays for)
 companions: boards.md (the shared core these principles shape), architecture.md (the server), factory.md (the local sidecar), parity.md (what each mode and harness can do)
 ```

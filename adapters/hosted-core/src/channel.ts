@@ -37,7 +37,8 @@ export function render({ content, meta = {} }: ChannelParams, source: string): s
 
 // Whether the host wakes the agent for an item: an actionable one does
 // (direct messages, mentions, thread replies); a digest or a deferred thread
-// reply never does, it is context for the next turn.
+// reply never does, it is context for the next turn; nor does another
+// user's item no grant lets wake this session (`ungranted`, #806).
 export function wakes(actionable: boolean, meta: Record<string, string> = {}): boolean {
-  return actionable && meta.kind !== "digest" && meta.deferred !== "true";
+  return actionable && meta.kind !== "digest" && meta.deferred !== "true" && meta.ungranted !== "true";
 }

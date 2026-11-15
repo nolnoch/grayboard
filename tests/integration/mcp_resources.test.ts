@@ -265,6 +265,8 @@ test("wire board receipts bind the issued snapshot and reject removed private-bo
   expect(state.cursor).toBe(0);
   expect(state.notified_id).toBe(issued.event.item.latest.id);
   expect(state.notified_id).toBeLessThan(latest.post_id);
+  // Alice's mention wakes bob's agent only under a grant (#806).
+  app.repo.teams.setPolicy(team.id, "collaborative");
   value(await call(sender.client, "board_post", { board: "private", body: "@bob@example.com/be private" }));
   const privateItem = (await read(sub.client, "grayboard://inbox")).items.find((i: { event: { kind: string; item?: { kind: string; post?: { board: string } } } }) => i.event.kind === "board" && i.event.item?.kind === "push" && i.event.item.post?.board === "private");
   expect(privateItem).toMatchObject({ actionable: true, event: { kind: "board", item: { kind: "push" } } });
