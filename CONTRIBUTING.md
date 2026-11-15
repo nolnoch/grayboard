@@ -4,9 +4,9 @@ grayboard is maintained through issues and pull requests. Open an issue first fo
 
 ## Keep harnesses at parity
 
-Every harness (Claude Code, omp, opencode, pi) gets the same capabilities in each mode (local and team server). [`docs/parity.md`](docs/parity.md) is the matrix of those capabilities, per harness and mode, with the test that proves each cell. Every cell is currently supported or marked n/a with a reason, and changes must keep it that way:
+Every harness (Claude Code, omp, opencode, pi) gets the same capabilities in each mode (local and team server). [`docs/parity.md`](docs/parity.md) is the matrix of those capabilities, per harness and mode; `docs/parity-delivery.md` and `docs/parity-access.md` hold the test that proves each cell. Every cell is currently supported or marked n/a with a reason, and changes must keep it that way:
 
-- A feature or fix PR that changes what a harness or mode can do names the cells it changes (row and column) and updates `docs/parity.md` in the same PR.
+- A feature or fix PR that changes what a harness or mode can do names the cells it changes (row and column) and updates `docs/parity.md` and the row's proof in `docs/parity-delivery.md` or `docs/parity-access.md` in the same PR.
 - A new capability lands in every cell where it applies. A cell it can't reach yet gets its own gap issue, linked from the cell.
 - Parity by addition: making one cell work never takes a capability away from another.
 

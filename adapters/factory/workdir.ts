@@ -1,4 +1,4 @@
-// Working directories (docs/factory.md §5, #641): where a child runs.
+// Working directories (docs/factory-children.md §1, #641): where a child runs.
 // A profile picks the mode. `scratch` (the default) gives each task tree a
 // directory of its own and each subtask one inside it, so parallel subtasks
 // can't overwrite each other and a task never sees another's leftovers.

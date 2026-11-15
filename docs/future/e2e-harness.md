@@ -4,7 +4,7 @@
 owns: the design of the e2e regression harness (#158): real harness hosts, real Slack, upgrades and released binaries
 invariants: `*.e2e.ts` is outside `bun test` discovery, so harness, slow and secret-bearing suites run only through `scripts/e2e.sh`; never the production Slack app; recorded Slack fixtures keep only allowlisted fields (public repo); upgrade checks derive tables from the old DB, not a hand-kept list
 code-pointers: tests/integration/, tests/support/, tests/integration/fake_slack.ts, tests/integration/pi.test.ts, .github/workflows/test.yml, .github/workflows/release.yml, .github/workflows/e2e.yml, scripts/e2e.sh, install.sh, src/cli/update.ts, src/cli/main.ts (setup), src/server/http.ts (healthz)
-companions: adapters.md (delivery owner per harness), slack-bridge.md §9 (what's unverified against Slack), server-deploy.md (build and deploy)
+companions: adapters.md (delivery owner per harness), slack-bridge.md §8 (what's unverified against Slack), server-deploy.md (build and deploy)
 trigger: PRs 0–2 (enablers, shared test support, upgrade tier) are built; PR 3 (harness tier) is buildable now; the real-Slack tier waits on a test workspace (Owner decisions)
 last-verified: 2026-10-31
 ```
@@ -97,7 +97,7 @@ Each is a measured run recorded on this issue; the design above changes if one f
 - **P1 Claude Code:** (a) `-p` against a fake Anthropic server that logs and 404s every route: which routes does Claude Code need? (b) interactive dev-channels session under a PTY, dialogs accepted by keystroke, with the fake and a dummy key, then with a real credential: does a push start a turn? Decides whether the wake scenarios run per push or nightly, and which credential (#157). Answered 2026-10-31 by #281 on 2.1.316: (a) measured interactively, not under `-p`: only `POST /v1/messages` under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; (b) a push starts a turn against the fake and a dummy key, so no credential.
 - **P2 OpenCode V1:** package name, latest version, engines, install size; is `@ai-sdk/openai-compatible` bundled or fetched at runtime (CI network); do the plugin's `config`/`event`/`dispose` run under `serve`; does `promptAsync` wake an HTTP-created session; does `dispose` kill the child on SIGTERM?
 - **P3 omp:** package name, latest version, engines, install size, offline after install; RPC mode with the adapter and fake model: does `mcp_notification` fire and `triggerTurn` start a model call?
-- **P4 Slack:** event shape and timing of a user-token file upload (the live `message.im`/`message.groups` event, still unmeasured per `docs/slack-bridge.md` §9); whether the bot can delete a user's file; whether app-level tokens expire; `getUploadURLExternal`'s rate tier.
+- **P4 Slack:** event shape and timing of a user-token file upload (the live `message.im`/`message.groups` event, still unmeasured per `docs/slack-bridge.md` §8); whether the bot can delete a user's file; whether app-level tokens expire; `getUploadURLExternal`'s rate tier.
 - **P4 also:** `conversations.history`/`replies` rate tier on the test app.
 - **P5 cost:** install time and size for each harness on the Linux runner (cold and cached), per-scenario wall time, and the upgrade test's download and run time, checked against the budget under *Layout and tiers*.
 

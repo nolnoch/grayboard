@@ -1,4 +1,4 @@
-// The factory's Claude Code runner (#293, docs/factory.md §5) against the
+// The factory's Claude Code runner (#293, docs/factory-children.md §1) against the
 // pinned Claude Code (tests/support/claude_code.ts) and a scripted fake
 // Anthropic API: the agent runs headless with the prompt on stdin, and the
 // operator's own settings never widen a child. Run it through
