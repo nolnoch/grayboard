@@ -12,7 +12,7 @@ import {
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
-import { immediateTx, type WriteTx } from "./sqlite.ts";
+import { immediateTx, type WriteTx } from "./write_tx.ts";
 
 export type AttachmentRow = AttachmentInfo & {
   uploader: string;

@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 
 import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
 import { CoreError } from "./errors.ts";
-import { immediateTx, type WriteTx } from "./sqlite.ts";
+import { immediateTx, type WriteTx } from "./write_tx.ts";
 
 export type Claim = {
   key: string;

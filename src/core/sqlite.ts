@@ -10,12 +10,6 @@ function flush(effect: CommitEffect): void {
   catch (error) { console.error("postcommit effect failed", error); }
 }
 
-// Runs one write transaction, for core code both modes share (attachments, claim expiry). Local mode runs it now
-// (immediateTx); the server queues it behind its other writes (#807 D4), so the caller awaits it. fn is synchronous:
-// nothing awaits inside a transaction.
-export type WriteTx = <T>(fn: () => T) => T | Promise<T>;
-export const immediateTx = (db: Database): WriteTx => fn => db.transaction(fn).immediate();
-
 export function afterCommit(db: Database, effect: CommitEffect): void {
   const frame = effects.get(db)?.at(-1);
   if (frame) frame.push(effect);
