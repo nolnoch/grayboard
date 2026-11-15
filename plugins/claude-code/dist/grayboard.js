@@ -35037,7 +35037,7 @@ class DeliveryStopped extends Error {
 var key = "diagnostics:v1";
 var fields = ["state", "message", "sessionID", "time", "held", "ownership", "operation", "code", "failure"];
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
-var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link"];
+var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link", "recover"];
 var operations = new Set(OPERATIONS);
 var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
@@ -36533,7 +36533,11 @@ var ADMITTED_LIMIT = 100;
 var LOOKUPS = 1024;
 var ROTATION_POLL_MS = 500;
 var ROTATION_GRACE_MS = 1e4;
+var RECOVERY_FIRST_MS = 1000;
+var RECOVERY_MAX_MS = 30000;
+var RECOVERY_BUDGET_MS = 60 * 60000;
 var UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
+var UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
     if (signal.aborted)
@@ -36619,6 +36623,7 @@ class Controller {
     this.drifted = true;
     for (const r of this.roots.values()) {
       r.paused = true;
+      r.awaiting = undefined;
       r.epoch++;
       r.abort?.abort();
       this.set(r, "paused", message);
@@ -36940,10 +36945,13 @@ class Controller {
     });
     r.task = this.run(r, e, epoch, abort.signal, ready).catch((caught) => {
       const error = this.expired(caught);
-      if (!abort.signal.aborted) {
-        r.paused = true;
+      if (abort.signal.aborted)
+        return;
+      r.paused = true;
+      if (error instanceof AccessExpired && error.reason === "expired")
+        this.awaitRefresh(r, "subscriber");
+      else
         this.set(r, "paused", failureMessage(error, this.hint), "subscriber", failureCode(error));
-      }
     }).finally(ready);
     return started;
   }
@@ -36989,6 +36997,7 @@ class Controller {
         await this.guard(r, epoch, signal);
         r.lease = lease;
         wire.capability = lease.capability;
+        r.recovery = undefined;
         this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
         let dirty = true, wake, closed = false;
@@ -37150,6 +37159,7 @@ class Controller {
     return this.serial(async () => {
       for (const r of this.roots.values()) {
         r.paused = true;
+        r.awaiting = undefined;
         await this.stop(r);
         await this.release(r).catch((error) => this.failure("session_end", error, r));
         await this.save(r, false).catch((error) => this.failure("pause_save", error, r));
@@ -37165,6 +37175,7 @@ class Controller {
       const r = this.roots.get(sessionID);
       if (r) {
         r.paused = true;
+        r.awaiting = undefined;
         await this.stop(r);
       }
       const carried = o.carry ? await this.carried(sessionID) : undefined;
@@ -37247,7 +37258,10 @@ class Controller {
             continue;
           const cause = this.expired(error);
           r.paused = true;
-          this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
+          if (cause instanceof AccessExpired && cause.reason === "expired")
+            this.awaitRefresh(r, "restore");
+          else
+            this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
           continue;
         }
         if (this.roots.get(id) !== r)
@@ -37259,6 +37273,9 @@ class Controller {
         if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
           this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
           this.retryRestore(r);
+        } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
+          r.paused = true;
+          this.awaitRefresh(r, "restore");
         } else if (r) {
           r.paused = true;
           await this.stop(r);
@@ -37308,6 +37325,79 @@ class Controller {
     })().catch((error) => this.failure("restore", error, r)).finally(() => this.retries.delete(retry));
     this.retries.add(retry);
   }
+  awaitingSet(r, operation) {
+    this.set(r, "paused", `Access expired; delivery resumes once ${this.port.harness} refreshes it, approval retained (or ${this.port.loginAction})`, operation, "native_access_expired");
+  }
+  awaitRefresh(r, operation) {
+    const mark = r.awaiting = {}, id = r.e.sessionID;
+    const awaiting = () => this.awaitingSet(r, operation);
+    awaiting();
+    const live = () => r.awaiting === mark && !this.stopped && !this.drifted && !this.ending.has(id) && this.roots.get(id) === r;
+    const recovery = (async () => {
+      const progress = r.recovery ??= { attempt: 0, spent: 0 };
+      while (live()) {
+        if (progress.spent >= RECOVERY_BUDGET_MS) {
+          r.awaiting = undefined;
+          this.set(r, "paused", `Access still expired after an hour; ${this.hint}`, "recover", "native_access_expired");
+          return;
+        }
+        if (this.port.credential.refresh)
+          await this.port.credential.refresh(r.e).catch((error) => this.failure("recover", error));
+        const ms = Math.min(RECOVERY_MAX_MS, RECOVERY_FIRST_MS * 2 ** progress.attempt++);
+        await this.wait(ms, this.closing.signal);
+        progress.spent += ms;
+        const done = await this.serial(async () => {
+          if (!live())
+            return true;
+          if (r.binding)
+            return false;
+          try {
+            await this.port.credential.check(r.e);
+            await this.port.credential.token(r.e);
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (!live())
+              return true;
+            if (error instanceof AccessExpired && error.reason === "expired")
+              return false;
+            r.awaiting = undefined;
+            this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
+            return true;
+          }
+          r.awaiting = undefined;
+          await this.stop(r);
+          r.lease = undefined;
+          r.paused = false;
+          this.set(r, "retrying", "Access refreshed; recovering ownership, approval retained", "recover");
+          try {
+            if (!this.watches.has(id))
+              await this.watch(r.e);
+            await this.prepare(r, true);
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r)
+              return true;
+            if (error instanceof AccessExpired && error.reason === "expired") {
+              r.paused = true;
+              r.awaiting = mark;
+              awaiting();
+              return false;
+            }
+            if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+              this.set(r, "retrying", UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
+              this.retryRestore(r);
+              return true;
+            }
+            this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
+          }
+          return true;
+        });
+        if (done)
+          return;
+      }
+    })().catch((error) => this.failure("recover", error, r)).finally(() => this.retries.delete(recovery));
+    this.retries.add(recovery);
+  }
   async beforeCall(event) {
     const path = await this.path(event.sessionID);
     if (path.root !== event.sessionID)
@@ -37316,6 +37406,7 @@ class Controller {
       await this.serial(async () => {
         const current = this.roots.get(path.root);
         if (current) {
+          current.binding = (current.binding ?? 0) + 1;
           this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind");
           await this.stop(current);
         } else
@@ -37325,9 +37416,26 @@ class Controller {
   async afterCall(event) {
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
-      if (!r || r.paused || this.drifted || this.stopped)
+      const own = event.tool === "bind" || event.tool === "unbind";
+      if (r && own && r.binding)
+        r.binding--;
+      if (!r || this.drifted || this.stopped)
+        return;
+      let resumed = false;
+      if (r.paused && r.awaiting && (event.tool === "bind" || event.tool === "unbind")) {
+        if (event.result.status !== "completed") {
+          this.awaitingSet(r, "after");
+          return;
+        }
+        r.awaiting = undefined;
+        r.paused = false;
+        resumed = true;
+      }
+      if (r.paused)
         return;
       try {
+        if (resumed && !this.watches.has(r.e.sessionID))
+          await this.watch(r.e);
         if (event.tool !== "bind" && event.tool !== "unbind") {
           const output = event.result.status === "completed" ? event.result.output : undefined;
           if (output?.unbound === true && r.e.held?.length) {
@@ -37379,6 +37487,7 @@ class Controller {
     const r = this.roots.get(path.root);
     if (sessionID === path.root && r) {
       r.paused = true;
+      r.awaiting = undefined;
       r.epoch++;
       r.abort?.abort();
       await this.serial(async () => {

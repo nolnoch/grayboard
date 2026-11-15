@@ -92,11 +92,13 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     catch (error) { this.binding.called(event.id); throw error; }
   }
   async after(event: Invocation & ({ status: "completed"; result: { output?: unknown } } | { status: "error" })) {
-    this.binding.called(event.id);
-    const tool = await this.native(event.tool);
-    if (tool === undefined) return;
-    try { await this.afterCall({ sessionID: event.sessionID, tool, result: event.status === "completed" ? { status: "completed", output: event.result.output } : { status: "error" } }); }
-    finally { if (tool === "bind" || tool === "unbind") this.bindingChanged?.(event.sessionID); }
+    // In flight until afterCall settles, so no reconnect lands between (#661).
+    try {
+      const tool = await this.native(event.tool);
+      if (tool === undefined) return;
+      try { await this.afterCall({ sessionID: event.sessionID, tool, result: event.status === "completed" ? { status: "completed", output: event.result.output } : { status: "error" } }); }
+      finally { if (tool === "bind" || tool === "unbind") this.bindingChanged?.(event.sessionID); }
+    } finally { this.binding.called(event.id); }
   }
   // A native bind or unbind ran for this session: its server instructions may have changed (#531).
   bindingChanged?: (sessionID: string) => void;

@@ -764,6 +764,25 @@ test.each(modes)("a native unbind that completes during the wait sets the holds:
     expect(o.r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
   } finally { await o.c.close(); await o.r.controller.close(); }
 });
+// Audit F (#661): the token refreshed while a native unbind is still in flight; a recovery check then must not rebind its name.
+test.each(modes)("a recovery check while a native unbind is in flight waits for its completion, never rebinding the name (%s)", async mode => {
+  const o = await expiredPause(mode, async (n, r, c) => {
+    if (n === 1) {
+      // The native call's own 401 refreshed the token, and the unbind committed server-side; afterCall hasn't run.
+      r.expireAccess();
+      await c.beforeCall({ sessionID: "R", tool: "unbind" });
+      r.rows.get("R")!.held = [];
+    }
+    if (n === 2) await c.afterCall({ sessionID: "R", tool: "unbind", result: { status: "completed", output: { name: null, ownership: 1, instructions: [] } } });
+  });
+  try {
+    await until(() => o.r.root(o.c)?.state === "unbound");
+    await o.c.close();
+    expect(o.recovering()).toBe(2);
+    expect(o.after().some(c => c.name === "bind")).toBe(false);
+    expect(o.r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
 // A drift clears the wait; a later enroll of another root clears the controller's drift, which must not revive it.
 test.each(modes)("a drift during the wait ends it even after another root enrolls: a refresh then resumes nothing (%s)", async mode => {
   const o = await expiredPause(mode, async (n, r, c) => { if (n === 1) { r.drift(); r.expireAccess(); await c.enroll("B", ["fe"], true); } });

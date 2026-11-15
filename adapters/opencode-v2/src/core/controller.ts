@@ -45,7 +45,9 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // recovery loop is live (#661); anything that takes the root clears it.
 // `recovery` is that wait's backoff, kept until delivery is active again, so a
 // recovery whose delivery expires again before it opens never starts over.
-type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease; awaiting?: object; recovery?: { attempt: number; spent: number } };
+// `binding` counts the root's own native binds and unbinds between beforeCall
+// and afterCall: the recovery never resumes under one, whose completion sets the holds.
+type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease; awaiting?: object; recovery?: { attempt: number; spent: number }; binding?: number };
 const ADMITTED_LIMIT = 100;
 // Ancestry lookups `childRoot` keeps for sessions not (yet) routed.
 const LOOKUPS = 1024;
@@ -63,6 +65,7 @@ const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
 const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
 // A saved root restore couldn't prepare while the server was down (#424 6).
 const UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
+const UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
     if (signal.aborted) return resolve();
@@ -748,8 +751,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   // resume does: its remembered holds rebind with create:false, and one held
   // elsewhere is recorded, never taken. Any other refusal (a changed account or
   // grant, a sign-out, a rejected token) is the pause's cause from then on. A
-  // pause, drift, shutdown, session end, enroll or resume clears `awaiting` or
-  // replaces the root, which ends the loop; close ends its wait.
+  // pause, drift, shutdown, session end, enroll, resume or completed native
+  // bind clears `awaiting` or replaces the root, which ends the loop; close
+  // ends its wait. While a native bind is in flight it only keeps waiting.
   private awaitingSet(r: Root<E>, operation: Operation) {
     this.set(r, "paused", `Access expired; delivery resumes once ${this.port.harness} refreshes it, approval retained (or ${this.port.loginAction})`, operation, "native_access_expired");
   }
@@ -773,6 +777,8 @@ export class Controller<E extends Enrollment = Enrollment> {
         progress.spent += ms;
         const done = await this.serial(async () => {
           if (!live()) return true;
+          // A native bind in flight: its afterCall sets the holds and ends the wait.
+          if (r.binding) return false;
           // token(), not check(): only it reads the access token's expiry.
           try { await this.port.credential.check(r.e); await this.port.credential.token(r.e); }
           catch (caught) {
@@ -793,6 +799,8 @@ export class Controller<E extends Enrollment = Enrollment> {
             const error = this.expired(caught);
             if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r) return true;
             if (error instanceof AccessExpired && error.reason === "expired") { r.paused = true; r.awaiting = mark; awaiting(); return false; }
+            // An outage now: restore's retry, on the outage backoff (#424 6).
+            if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) { this.set(r, "retrying", UNREACHABLE_AT_RECOVER, "recover", failureCode(error)); this.retryRestore(r); return true; }
             this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
           }
           return true;
@@ -809,7 +817,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     if (path.root !== event.sessionID) await this.enlist(path);
     if ((event.tool === "bind" || event.tool === "unbind") && path.root === event.sessionID) await this.serial(async () => {
       const current = this.roots.get(path.root);
-      if (current) { this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind"); await this.stop(current); }
+      if (current) { current.binding = (current.binding ?? 0) + 1; this.set(current, "rebinding", "Delivery stopped before native bind", "before_bind"); await this.stop(current); }
       else this.diagnostics.record({ state: "rebinding", sessionID: path.root, message: this.port.approval ? "Native bind pending; receiving requires approval" : "Native bind pending", operation: "before_bind" });
     });
   }
@@ -818,17 +826,22 @@ export class Controller<E extends Enrollment = Enrollment> {
   async afterCall(event: { sessionID: string; tool: string; result: CallOutcome }): Promise<void> {
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
+      const own = event.tool === "bind" || event.tool === "unbind";
+      if (r && own && r.binding) r.binding--;
       if (!r || this.drifted || this.stopped) return;
+      let resumed = false;
       // A native bind or unbind that completed while the root awaited a refresh
       // (its own 401 refreshed the token) sets the holds: delivery restarts
       // under them, so the recovery never rebinds a name just unbound (#661).
       // One that failed leaves the wait as it was.
       if (r.paused && r.awaiting && (event.tool === "bind" || event.tool === "unbind")) {
         if (event.result.status !== "completed") { this.awaitingSet(r, "after"); return; }
-        r.awaiting = undefined; r.paused = false;
+        r.awaiting = undefined; r.paused = false; resumed = true;
       }
       if (r.paused) return;
       try {
+        // A wait restore entered never watched the credential; delivery doesn't run unwatched.
+        if (resumed && !this.watches.has(r.e.sessionID)) await this.watch(r.e);
         if (event.tool !== "bind" && event.tool !== "unbind") {
           const output = event.result.status === "completed" ? event.result.output as { unbound?: unknown } | undefined : undefined;
           if (output?.unbound === true && r.e.held?.length) {
