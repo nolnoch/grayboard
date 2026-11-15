@@ -16,7 +16,7 @@ import { endLocalSession } from "../../src/local/binding.ts";
 import { runCli } from "../support/cli.ts";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
-import { closeSessions, localSession, stopSession, type Session, refusal } from "../support/mcp.ts";
+import { closeSessions, localSession, stopSession, type Session, refusal, refusalCoded } from "../support/mcp.ts";
 import { sigkill } from "../support/procs.ts";
 import { releaseBinaries } from "../support/releases.ts";
 import { until } from "../support/until.ts";
@@ -165,7 +165,8 @@ test("a DM to an ID that never existed is not_found; to an ended one, id_ended n
   const r = await runCli(["claims"], { cwd: dir, env: localEnv(dir) });
   expect(r.code).toBe(0);
   expect(endedAt(id)).not.toBeNull();
-  const err = await refusal(be, "dm_send", { to: id, body: "x" });
+  const { text: err, code } = await refusalCoded(be, "dm_send", { to: id, body: "x" });
+  expect(code).toBe("id_ended");
   expect(err).toContain(`id_ended: ${id} ended at`);
   expect(err).toContain("it held `fe`");
 }, 30_000);
@@ -190,10 +191,10 @@ test("an @id: mention reaches that session whatever it's bound to; an unknown, e
   const tools = await localSession(dir, "sim", { extra: { BUS_PUSH: "off" } });
   await tools.call("peer_list", {});
   const toolsId = rows<{ id: string }>(`SELECT id FROM ids WHERE delivery = 'none'`)[0]!.id;
-  expect(await refusal(be, "board_post", { board: "e2e", body: `@${toolsId} hi` })).toBe(`error: no_delivery: ${toolsId} is a tools-only session and receives nothing; send to sim`);
+  expect(await refusalCoded(be, "board_post", { board: "e2e", body: `@${toolsId} hi` })).toEqual({ text: `error: no_delivery: ${toolsId} is a tools-only session and receives nothing; send to sim`, code: "no_delivery" });
   await sigkill(pidOfId(id));
   await session();
-  expect(await refusal(be, "board_post", { board: "e2e", body: `@${id} hi` })).toContain(`error: id_ended: ${id} ended at`);
+  expect(await refusalCoded(be, "board_post", { board: "e2e", body: `@${id} hi` })).toMatchObject({ text: expect.stringContaining(`error: id_ended: ${id} ended at`), code: "id_ended" });
   expect((await be.call("board_read", { board: "e2e" })).posts.length).toBe(before);
 }, 30_000);
 
@@ -277,13 +278,13 @@ test("race: a send that reaches the write lock after the end is refused with id_
   // only then does the send go on. A check made outside the send's
   // transaction would pass and store mail to an ended ID (audit P4: the send
   // must provably start before the end commits, or the test proves nothing).
-  const send = refusal(be, "dm_send", { to: id, body: "too late" });
+  const send = refusalCoded(be, "dm_send", { to: id, body: "too late" });
   await until(() => be.stderr().includes("test pause hit: send:before-txn"));
   const opener = spawnCli(["claims"], pauseEnv("end:in-txn"));
   await until(() => opener.stderr().includes("test pause hit: end:in-txn"));
   release("send:before-txn");
   release("end:in-txn");
-  expect(await send).toContain(`id_ended: ${id} ended at`);
+  expect(await send).toMatchObject({ text: expect.stringContaining(`id_ended: ${id} ended at`), code: "id_ended" });
   expect(await opener.p.exited).toBe(0);
   expect(be.pushes.filter((p) => p.meta.kind === "bounce")).toEqual([]);
 }, 30_000);
@@ -323,11 +324,12 @@ async function asChild<T = unknown>(s: Session, raw: unknown, name: string, args
 }
 type Who = { id: string; primary?: string; aliases?: string[]; principal?: string | null; root?: string; child?: true };
 type Sent = { message_id: number; delivered_now: boolean };
-async function childRefusal(s: Session, raw: unknown, name: string, args: Record<string, unknown> = {}): Promise<string> {
+// A child's refused call: its text and its structuredContent code (#959).
+async function childRefusal(s: Session, raw: unknown, name: string, args: Record<string, unknown> = {}): Promise<{ text: string; code: unknown }> {
   const r = await childCall(s, raw, name, args);
   const text = (r.content as { text: string }[])[0]!.text;
   if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
+  return { text, code: (r.structuredContent as { code?: unknown } | undefined)?.code };
 }
 const childSeen = () => rows<{ actor: string; target: string; detail: string }>(`SELECT actor, target, detail FROM audit_log WHERE action = 'id.child_seen' ORDER BY rowid`)
   .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
@@ -402,16 +404,16 @@ test("a subagent's call is its root's child: its DM and post are stored with its
 test("a child's bind and unbind are refused child_session; its raw ID must be 1–1024 characters with no control characters", async () => {
   const fe = await session("fe");
   const root = (await fe.call("whoami")).id as string;
-  const refused = `error: child_session: this session acts under its root ${root}; bind and unbind are the root's. Call them from the root session.`;
-  expect(await childRefusal(fe, "reviewer-1", "bind", { name: "qa", create: true })).toBe(refused);
-  expect(await childRefusal(fe, "reviewer-1", "unbind", { name: "fe" })).toBe(refused);
+  const refused = { text: `error: child_session: this session acts under its root ${root}; bind and unbind are the root's. Call them from the root session.`, code: "child_session" };
+  expect(await childRefusal(fe, "reviewer-1", "bind", { name: "qa", create: true })).toEqual(refused);
+  expect(await childRefusal(fe, "reviewer-1", "unbind", { name: "fe" })).toEqual(refused);
   // The root's names are untouched.
   expect(await fe.call("whoami")).toMatchObject({ id: root, primary: "fe", aliases: ["fe"] });
   expect(rows(`SELECT address, id FROM alias_holds`)).toEqual([{ address: "fe", id: root }]);
 
-  const invalid = `error: _meta["${GRAYBOARD_AGENT_META}"] must be a string of 1 to 1024 characters with no control characters`;
+  const invalid = { text: `error: _meta["${GRAYBOARD_AGENT_META}"] must be a string of 1 to 1024 characters with no control characters`, code: "bad_request" };
   for (const raw of ["", "bad\nid", "tab\tid", "del\x7f", "x".repeat(1025), 42, null, { id: "x" }]) {
-    expect(await childRefusal(fe, raw, "dm_send", { to: "fe", body: "never" })).toBe(invalid);
+    expect(await childRefusal(fe, raw, "dm_send", { to: "fe", body: "never" })).toEqual(invalid);
   }
   expect(rows(`SELECT 1 FROM messages`)).toEqual([]);
   // Only the valid one is a child: first sight registers it whatever the call, so its refused bind did.
@@ -447,7 +449,7 @@ test("a runner child acts under the root its harness started; a subagent calling
   expect(rows(`SELECT id, root_id FROM ids WHERE root_id IS NOT NULL ORDER BY rowid`)).toEqual([{ id: who.id, root_id: root }, { id: nested.id, root_id: root }]);
   await asChild<Sent>(runner, "worker-1", "dm_send", { to: "be", body: "from the nested subagent" });
   expect(rows(`SELECT sender, sender_id, via FROM messages WHERE body = 'from the nested subagent'`)).toEqual([{ sender: "fe", sender_id: nested.id, via: nested.id }]);
-  expect(await childRefusal(runner, "worker-1", "bind", { name: "qa", create: true })).toBe(`error: child_session: this session acts under its root ${root}; bind and unbind are the root's. Call them from the root session.`);
+  expect(await childRefusal(runner, "worker-1", "bind", { name: "qa", create: true })).toEqual({ text: `error: child_session: this session acts under its root ${root}; bind and unbind are the root's. Call them from the root session.`, code: "child_session" });
   await until(() => be.pushes.some((p) => p.content === "from the nested subagent"));
   expect(be.pushes.find((p) => p.content === "from the nested subagent")!.meta).toMatchObject({ from: "fe", via: nested.id });
 }, 30_000);
@@ -514,7 +516,7 @@ test("a DM or @mention to a child's ID is refused child_session naming its root'
   expect(await refusal(be, "board_post", { board: "e2e", body: `@${child.toUpperCase()} look` })).toBe(refused);
   // Nor can the child's sibling reach it by its ID.
   const sibling = (await asChild<Who>(fe, "reviewer-2", "whoami")).id;
-  expect(await childRefusal(fe, "reviewer-2", "dm_send", { to: child, body: "sibling" })).toBe(refused);
+  expect(await childRefusal(fe, "reviewer-2", "dm_send", { to: child, body: "sibling" })).toEqual({ text: refused, code: "child_session" });
   expect(rows(`SELECT 1 FROM messages`)).toEqual([]);
   expect(rows(`SELECT 1 FROM posts`)).toEqual([]);
   // peer_list never offers it as an address.
@@ -566,7 +568,7 @@ for (const [point, tool, body] of [["send:before-txn", "dm_send", "dm after the 
     const be = await localSession(dir, "be");
     const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1", ...pauseEnv(point) } });
     const child = ((await runner.call("whoami")) as Who).id;
-    const write = refusal(runner, tool, tool === "dm_send" ? { to: "be", body } : { board: "e2e", body });
+    const write = refusalCoded(runner, tool, tool === "dm_send" ? { to: "be", body } : { board: "e2e", body });
     await until(() => runner.stderr().includes(`test pause hit: ${point}`));
     // The root's harness here is this test process, which outlives it, so
     // its end comes as another opener's would: through endLocalSession.
@@ -575,7 +577,7 @@ for (const [point, tool, body] of [["send:before-txn", "dm_send", "dm after the 
     try { w.run("PRAGMA busy_timeout = 5000"); endLocalSession(w, root); } finally { w.close(); }
     expect(endedAt(root)).not.toBeNull();
     release(point);
-    expect(await write).toBe(`error: child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`);
+    expect(await write).toEqual({ text: `error: child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`, code: "child_session" });
     expect(rows(`SELECT id FROM messages WHERE body = ?`, body)).toEqual([]);
     expect(rows(`SELECT id FROM posts WHERE body = ?`, body)).toEqual([]);
     const own = (await runner.call("whoami")) as Who;
@@ -667,15 +669,15 @@ test("a child reads its root's boards and mail without consuming them; dm_inbox,
   expect((await asChild<{ id: number }[]>(fe, "reviewer-1", "dm_history", { peer: "be" })).map((m) => m.id)).toEqual([sent.message_id]);
   expect((await asChild<{ id: number }[]>(fe, "reviewer-1", "dm_thread", { thread: sent.message_id })).map((m) => m.id)).toEqual([sent.message_id]);
   // dm_inbox and dm_ack are the root's.
-  const refused = `error: child_session: ${child} is a subagent of fe; its root owns this inbox. dm_thread a thread you wrote to see its replies.`;
-  expect(await childRefusal(fe, "reviewer-1", "dm_inbox")).toBe(refused);
-  expect(await childRefusal(fe, "reviewer-1", "dm_ack", { message_id: sent.message_id })).toBe(refused);
-  expect(await childRefusal(fe, "reviewer-1", "dm_ack", { message_id: [sent.message_id] })).toBe(refused);
+  const refused = { text: `error: child_session: ${child} is a subagent of fe; its root owns this inbox. dm_thread a thread you wrote to see its replies.`, code: "child_session" };
+  expect(await childRefusal(fe, "reviewer-1", "dm_inbox")).toEqual(refused);
+  expect(await childRefusal(fe, "reviewer-1", "dm_ack", { message_id: sent.message_id })).toEqual(refused);
+  expect(await childRefusal(fe, "reviewer-1", "dm_ack", { message_id: [sent.message_id] })).toEqual(refused);
   // So are its board subscriptions and thread mutes.
-  const subs = `error: child_session: ${child} is a subagent of fe; its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.`;
-  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "push" })).toBe(subs);
-  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "off" })).toBe(subs);
-  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "off", thread: first.post_id })).toBe(subs);
+  const subs = { text: `error: child_session: ${child} is a subagent of fe; its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.`, code: "child_session" };
+  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "push" })).toEqual(subs);
+  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "off" })).toEqual(subs);
+  expect(await childRefusal(fe, "reviewer-1", "board_subscribe", { board: "e2e", mode: "off", thread: first.post_id })).toEqual(subs);
 
   // Nothing the child did moved the root's read state.
   expect(readState()).toEqual(before);
@@ -710,7 +712,7 @@ test("a child's delegation audit rows name the child; the root's don't", async (
   const child = (await asChild<Who>(fe, "reviewer-1", "whoami")).id;
   const task = { persona: "a reviewer", task: "review the diff" };
   const sent = await asChild<Sent>(fe, "reviewer-1", "delegate", task);
-  expect(await childRefusal(fe, "reviewer-1", "delegate", { ...task, to: "ad" })).toContain("isn't a launcher session");
+  expect((await childRefusal(fe, "reviewer-1", "delegate", { ...task, to: "ad" })).text).toContain("isn't a launcher session");
   const own = await fe.call("delegate", { ...task, task: "the root's own" });
   const audits = rows<{ action: string; actor: string; target: string | null; detail: string }>(`SELECT action, actor, target, detail FROM audit_log WHERE action LIKE 'delegation.%' ORDER BY rowid`)
     .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));

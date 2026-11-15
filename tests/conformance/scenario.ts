@@ -12,7 +12,7 @@ export type Context = {
   ok(o: Outcome): any;
   // A refusal. `code` is asserted in both modes (#954). A scenario proves the refusal had no effect with a follow-up
   // read, never by its wording.
-  refused(o: Outcome, code?: string): void;
+  refused(o: Outcome, code?: string): Extract<Outcome, { ok: false }>;
 };
 
 export type Scenario = { name: string; peers: string[]; modes?: Mode[]; why?: string; run(ctx: Context): Promise<void> };
@@ -49,6 +49,7 @@ export function conformance(family: string, scenarios: Scenario[]): void {
               refused(o, code) {
                 if (o.ok) throw new Error(`expected a refusal, got ${JSON.stringify(o.value)}`);
                 if (code !== undefined) expect(o.code).toBe(code);
+                return o;
               },
             });
             passed = true;

@@ -37,7 +37,9 @@ conformance("identity", [
     name: "bind of a never-used name needs create; without it nothing is bound",
     peers: ["be"],
     async run(ctx) {
-      ctx.refused(await ctx.peers.be!.call("bind", { name: "be-alt" }), "identity_unknown");
+      const r = ctx.refused(await ctx.peers.be!.call("bind", { name: "be-alt" }), "identity_unknown");
+      // Both modes name the closest known names (#959); `be` is one edit away.
+      expect(r.data?.known).toContain("be");
       expect(await held(ctx, "be")).toEqual(["be"]);
     },
   },
@@ -63,7 +65,8 @@ conformance("identity", [
     peers: ["be", "fe"],
     async run(ctx) {
       ctx.ok(await ctx.peers.be!.call("bind", { name: "be-alt", create: true }));
-      ctx.refused(await ctx.peers.fe!.call("bind", { name: "be-alt" }), "alias_held");
+      // `holder` describes the holding session (#959); its wording is the mode's, its session id common.
+      expect(ctx.refused(await ctx.peers.fe!.call("bind", { name: "be-alt" }), "alias_held").data?.holder).toMatch(/session id:\w+/);
       expect(await held(ctx, "fe")).toEqual(["fe"]);
       expect(await held(ctx, "be")).toEqual(["be", "be-alt"]);
     },
@@ -95,6 +98,14 @@ conformance("identity", [
       // Past this the modes differ on purpose (handles.md: local acts as its ID with the full surface; hosted MCP
       // reads only, primary null), so only the held set is common.
       expect(await held(ctx, "be")).toEqual([]);
+    },
+  },
+  {
+    name: "bind of the human handle is refused forbidden and binds nothing",
+    peers: ["be"],
+    async run(ctx) {
+      ctx.refused(await ctx.peers.be!.call("bind", { name: "human", create: true }), "forbidden");
+      expect(await held(ctx, "be")).toEqual(["be"]);
     },
   },
 ]);

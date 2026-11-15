@@ -595,6 +595,7 @@ test("rotation bounces declined direct-ID mail and refuses the ended ID without 
   const refused = await peer.c.callTool({ name: "dm_send", arguments: { to: a.id, body: "not-a-live-id" } });
   expect(refused.isError).toBe(true);
   expect((refused.content as { text: string }[])[0]!.text).toContain("id_ended:");
+  expect(refused.structuredContent).toEqual({ code: "id_ended" });
   await ready(s, 1);
   const aliasMail = await peer.call("dm_send", { to: "alias", body: "alias-survives-switch" });
   await until(() => s.pushes.length === 2);

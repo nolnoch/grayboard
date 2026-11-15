@@ -553,6 +553,38 @@ test("audit 7: a cancel that crosses the bind's result on the wire still gets th
   expect((await s.c.callTool({ name: "peer_list", arguments: {} })).structuredContent).toBeUndefined();
 }, 30_000);
 
+// #959: the fresh instructions a crossed cancel leaves for the next result join a refusal's code (#954), not replace it.
+test("after a cancelled bind, the next result's refusal carries its code and the fresh instructions", async () => {
+  const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
+  const abort = new AbortController();
+  const bind = s.c.callTool({ name: "bind", arguments: { name: "fe", create: true } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: bind:after-acquire"));
+  abort.abort();
+  await expect(bind).rejects.toThrow();
+  release("bind:after-acquire");
+  const r = await s.c.callTool({ name: "dm_send", arguments: { to: "nobody-here", body: "x" } });
+  expect(r.isError).toBe(true);
+  expect(r.structuredContent).toMatchObject({ code: "not_found", name: "old", instructions: expect.arrayContaining([`You are identity "old" on the grayboard bus, which coordinates between agents.`]) });
+  expect((r.content as { text: string }[]).slice(1).map((c) => c.text).join(" ")).toContain(`bind("fe") completed after it was cancelled.`);
+}, 30_000);
+
+// #959: the late-cancel guard: a cancelled bind that was refused changed nothing, so the next result
+// reports no completion and carries no fresh instructions.
+test("a cancelled bind that was refused is not reported as completed", async () => {
+  // Unbound, so the only acquire to pass the pause is the bind below.
+  const s = await session(undefined, { extra: pauseEnv("bind:before-txn") });
+  const abort = new AbortController();
+  const bind = s.c.callTool({ name: "bind", arguments: { name: "never-used" } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: bind:before-txn"));
+  abort.abort();
+  await expect(bind).rejects.toThrow();
+  release("bind:before-txn");
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  expect((r.content as { text: string }[]).map((c) => c.text).join(" ")).not.toContain("completed after it was cancelled");
+  expect(r.structuredContent).toBeUndefined();
+  expect(holderOf("never-used")).toBeUndefined();
+}, 30_000);
+
 // #523 audit (PR #556): a name has a session from the moment its hold
 // commits, before the binder listens: a DM sent then queues, and the binder
 // gets it once it does, instead of the sender being told the name never connected.

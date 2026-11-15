@@ -12,7 +12,8 @@ export type Mode = "local" | "hosted";
 
 // A tool call's result: the parsed JSON (or text) of a success, or a refusal with the code the mode reported,
 // if it reports one. Message text is never compared: two cores may word a refusal differently.
-export type Outcome = { ok: true; value: any } | { ok: false; code?: string; text: string };
+// `data` is the rest of a refusal's structuredContent (`known`, `holder`…), normalized like a success's value.
+export type Outcome = { ok: true; value: any } | { ok: false; code?: string; data?: Record<string, any>; text: string };
 
 export type Peer = { readonly name: string; call(tool: string, args?: Record<string, unknown>): Promise<Outcome> };
 
@@ -24,8 +25,9 @@ export type Driver = { readonly mode: Mode; bus(): Promise<Bus>; stop(): Promise
 function outcome(r: { content: unknown; isError?: unknown; structuredContent?: unknown }, strip: (s: string) => string): Outcome {
   const text = (r.content as { type: string; text?: string }[]).find(c => c.type === "text")?.text ?? "";
   if (r.isError) {
-    const code = (r.structuredContent as { code?: unknown } | undefined)?.code;
-    return { ok: false, text, ...(typeof code === "string" ? { code } : {}) };
+    const { code, ...rest } = (r.structuredContent ?? {}) as Record<string, unknown>;
+    const data = Object.keys(rest).length ? { data: normalize(rest, strip) as Record<string, any> } : {};
+    return { ok: false, text, ...(typeof code === "string" ? { code } : {}), ...data };
   }
   let value: unknown;
   try { value = JSON.parse(text); } catch { value = text; }

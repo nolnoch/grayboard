@@ -8,6 +8,8 @@ import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAcce
 import { claim, watch } from "../core/claims.ts";
 import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
 import { procStart } from "../shared/proc.ts";
+import { CoreError } from "../core/errors.ts";
+import { coreRefusalCode } from "../core/session_end.ts";
 import { openLocalDb } from "./open.ts";
 
 // #182 audit 29: two processes that read the same dead row both reap it;
@@ -264,6 +266,12 @@ test("registerChild records a child once, audited; another root's ID or an ended
   db.prepare(`UPDATE ids SET ended_at = 5 WHERE id = ?`).run(child);
   expect(() => registerChild(db, root, child, "reviewer-1")).toThrow(`id_ended: child session ${child} ended at 1970-01-01T00:00:00.005Z`);
   expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: 1 });
+  // Each refusal carries its code to the tool result (#959): the MCP layer answers coreRefusalCode's.
+  const code = (f: () => void) => { try { f(); } catch (e) { if (e instanceof CoreError) return coreRefusalCode(e); throw e; } throw new Error("no refusal"); };
+  expect(code(() => registerChild(db, root, other, "reviewer-2"))).toBe("id_collision");
+  expect(code(() => registerChild(db, root, child, "reviewer-1"))).toBe("id_ended");
+  // A root with no liveness row has ended: its child can't be registered.
+  expect(code(() => registerChild(db, "id:0123456789abf", "id:0123456789abg", "reviewer-3"))).toBe("id_ended");
 });
 
 // #523 step 5: a runner's root is the live session that recorded its parent
