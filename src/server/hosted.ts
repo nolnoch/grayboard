@@ -400,8 +400,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   // The sweep's rules for one request's own rows (#399): its root (disabled, lease lapsed, idle with no hold and
   // no lease) and, for a child, itself (idle: parked, its request waking it again). `authed`: the user whose
   // authorization the caller checked with no await since (#881); their root skips the disabled read, which a
-  // transaction takes uncached, since a disabled user's token no longer authorizes (setDisabled revokes it and
-  // ends their rows). Returns the row as read when it wrote nothing, for the caller's next transaction (#881);
+  // transaction takes uncached, since a disabled user no longer authorizes (activeAccess refuses one) and
+  // setDisabled ends their rows in the transaction that disables them. Returns the row as read when it wrote nothing, for the caller's next transaction (#881);
   // undefined when it wrote, so the caller reads again.
   function settle(id: string, authed?: number): { row: HostedSession | undefined } | undefined {
     if (stopped) return undefined;
