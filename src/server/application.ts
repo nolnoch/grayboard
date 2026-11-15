@@ -1276,8 +1276,9 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
     ...(p.from !== session.primary ? { sent_as: p.from } : {}),
   };
   const seen = lastSeen(db, p.to);
-  const payload: SendResult = registry.get(p.to)?.active
-    ? { message_id: msg.id, delivered_now: true, ...f }
+  const live = registry.get(p.to);
+  const payload: SendResult = live?.active
+    ? { message_id: msg.id, delivered_now: true, ...f, ...unwoken(repo, session, live, p.to) }
     : {
         message_id: msg.id,
         delivered_now: false,
@@ -1285,11 +1286,27 @@ function writeSend(hub: Hub, session: ApplicationSession, p: PreparedSend): Writ
         ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
         undelivered_from_you: repo.messages.undeliveredFrom(session.addresses).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
+        ...unwoken(repo, session, live, p.to),
       };
   for (const a of msg.attachments ?? []) {
     writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: msg.sender, message_id: msg.id, recipient: msg.recipient });
   }
   return { payload, ref: { kind: "message", id: msg.id }, msg };
+}
+
+// Security audit F-03 (#806): `wakes: false` and why, when the recipient is
+// known to be another user whom no grant lets this sender wake, so the sender
+// doesn't wait on an agent that won't act. Known: the user of the session
+// holding the address now, else a person alias's user; a team or service
+// alias or an ID with no live holder says nothing, as does a human (a person
+// reads it; msg.send already decided reach). Each pull decides again
+// (pending()), so this reflects the grant at send time, not a promise.
+function unwoken(repo: Repo, session: ApplicationSession, live: ApplicationSession | undefined, to: string): { wakes?: false; wake_note?: string } {
+  if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return {};
+  const toUser = live?.authed.user_email ?? (() => { const a = repo.aliases.find(to); return a?.scope_kind === "person" ? a.scope_ref : undefined; })();
+  if (toUser === undefined) return {};
+  const decision = authorize(repo, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
+  return decision.allow ? {} : { wakes: false, wake_note: `Delivered as mail: ${toUser}'s agent won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` };
 }
 
 // Only after the outermost commit, never on a replay.
