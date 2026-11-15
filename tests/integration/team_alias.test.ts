@@ -250,7 +250,7 @@ const peerRow = async (c: AppSession, match?: Record<string, string>) =>
 // #284 S12, S13 on the server: bind's meta labels a team alias; a re-bind of
 // a held alias changes only labels that differ; the labels reach only members.
 // hosted twin: #451 (a team alias on a session, bind's meta)
-test("bind's meta on a session: set, checked, cleared and audited; a held re-bind keeps bound_at; a non-member sees no labels", async () => {
+test("bind's meta on a session: set, checked, cleared and audited; a held re-bind keeps bound_at; a non-member sees no row", async () => {
   const build = srv.appSession(bob, "eng/build", { bind: { create: true, meta: { task: "ENG-142", source_board: "#E2E" } }, harness: "opus" });
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
   expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
@@ -283,16 +283,13 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   await expect(outsider.bind("eng/build", { meta: { task: "mine" } })).rejects.toMatchObject({ code: "forbidden" });
   expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
 
-  // The labels and the session's facts reach a member; a non-member's row has neither (F-12), and match can't probe them.
+  // The labels and the session's facts reach a member (F-12); a non-member
+  // isn't listed the team's alias at all (#348), so match can't probe them.
   const member = srv.appSession(alice, "fe");
   await member.connect();
   expect(await peerRow(member)).toMatchObject({ task: "ENG-142", source_board: "e2e", harness: "opus" });
   expect(await peerRow(member, { task: "eng-142" })).toBeDefined();
-  const seen = (await peerRow(outsider))!;
-  expect(seen).toMatchObject({ handle: "eng/build" });
-  expect(seen.harness).toBeUndefined();
-  expect(seen.task).toBeUndefined();
-  expect(seen.source_board).toBeUndefined();
+  expect(await peerRow(outsider)).toBeUndefined();
   expect(await peerRow(outsider, { task: "ENG-142" })).toBeUndefined();
 });
 

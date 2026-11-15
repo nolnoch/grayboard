@@ -17,6 +17,7 @@ import {
   setStatus,
   subscribe,
   viewers,
+  seenHandles,
   parseMatch,
   who,
   type BoardPredicate,
@@ -508,12 +509,15 @@ export function callBoardTool(
         { online: ctx.online, author_id: ctx.session, author_user: ctx.user, via: ctx.via, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
       );
       const isViewer = viewers(db);
+      // The result names only recipients the poster may see exist (#348).
+      const seen = (hs: string[]) => seenHandles(db, ctx.session ?? handle, hs);
+      const shownDeferred = seen(deferred);
       const result: BoardPostResult = {
         post_id: p.id,
         board: p.board,
         ...(p.attachments ? { attachments: p.attachments } : {}),
-        notified: wake.filter((h) => !isViewer(h)),
-        ...(deferred.length ? { deferred } : {}),
+        notified: seen(wake.filter((h) => !isViewer(h))),
+        ...(shownDeferred.length ? { deferred: shownDeferred } : {}),
         ...(unresolved.length ? { unresolved } : {}),
       };
       return { result, wake, boards: [p.board] };

@@ -41,6 +41,8 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // delegate.to: whether a user's session may name another user's launcher in
 // `delegate`'s `to` (#256; users by email, the target's from the session
 // that holds the address).
+// alias.see: whether principal p may see that an alias of a scope exists (a
+// filter for listings and name suggestions, #348).
 export type AuthzRequest =
   | { verb: "msg.send" | "human.reach"; from: string; to: string }
   | { verb: "scope.act"; principal: Principal; scope: ActScope }
@@ -51,7 +53,8 @@ export type AuthzRequest =
   | { verb: "attachment.read"; identity: string; attachment: string; reach: AttachmentReach | undefined }
   | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
   | { verb: "admin"; email: string }
-  | { verb: "msg.wake" | "delegate.to"; from_user: string; to_user: string };
+  | { verb: "msg.wake" | "delegate.to"; from_user: string; to_user: string }
+  | { verb: "alias.see"; principal: Principal; scope: ActScope };
 
 // What session.act judges of an ID's row: whose it is, and whether it's a
 // viewer's or has ended.
@@ -119,6 +122,15 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       return wakeRule(repo, req.from_user, req.to_user);
     case "delegate.to":
       return delegateRule(repo, req.from_user, req.to_user);
+    case "alias.see":
+      // The directory of people's names is open in the org (vision.md
+      // principle 9); a team's names are its members' (and the team's own),
+      // as its boards and roster are: to anyone else the team reads as
+      // missing (#348). No admin exemption: admin is a server role, not a
+      // directory grant (as for msg.wake).
+      if (req.scope.scope_kind === "person") return allow("alias.see_person");
+      if (req.principal.kind === "team" && req.scope.scope_kind === "team" && req.principal.name === req.scope.scope_ref) return allow("alias.see_own_team");
+      return actIn(repo, req.principal, req.scope);
     case "admin": {
       if (isAdmin(ctx, req.email)) return allow("admin.env");
       const admins = ctx.admins ?? [];
@@ -155,6 +167,8 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
     case "msg.wake":
     case "delegate.to":
       return { target: req.to_user, detail: { from_user: req.from_user, to_user: req.to_user } };
+    case "alias.see":
+      return { target: `${req.scope.scope_kind}:${req.scope.scope_ref}`, detail: { principal: req.principal.name, scope_kind: req.scope.scope_kind, scope_ref: req.scope.scope_ref } };
   }
 }
 
