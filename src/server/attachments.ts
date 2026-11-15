@@ -8,18 +8,13 @@ import { participant, type Repo } from "./db.ts";
 import { addressSet } from "../core/bindings.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest } from "./policy.ts";
 
-// Attachment `id`, if `handle` may read it: on a post on a board it can see,
+// The read request for attachment `idText`, judged by authorize(): `handle` may read it on a post on a board it can see,
 // on a direct message it sent or received, or its own unsent upload. A
 // session's files are its whole address set's (#284 S8): `principal` names
 // the caller, whose session holding `handle` (or held by it) joins the set;
 // null for the Slack bridge's humans, which have no session. `user` is the
 // reading user's email, always set on a server: an unsent upload is readable
 // only by the user who made it, not by whoever holds its address next (#367).
-export function readableAttachment(repo: Repo, db: CoreDb, handle: string, id: number, principal: string | null, user: string): AttachmentRow | undefined {
-  const { row, req } = readRequest(repo, db, handle, String(id), principal, user);
-  return row && authorize(repo, {}, req).allow ? row : undefined;
-}
-
 function readRequest(repo: Repo, db: CoreDb, handle: string, idText: string, principal: string | null, user: string) {
   const id = Number(idText);
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
@@ -29,7 +24,7 @@ function readRequest(repo: Repo, db: CoreDb, handle: string, idText: string, pri
   return { row, req };
 }
 
-// A requested read (the download route's, the Slack bridge's): readableAttachment, with a refusal recorded as both
+// A requested read (the download route's and its recheck, the Slack bridge's): the row if readable, with a refusal recorded as both
 // its `attachment.download_refused` row and an `authz.decision` row (security audit F-01, #851). `detail` joins the
 // first. Outside any transaction, so neither row needs deferring.
 export function requestAttachment(repo: Repo, db: CoreDb, handle: string, idText: string, principal: string | null, actor: Actor & { user: string }, detail: Record<string, unknown> = {}): { row: AttachmentRow } | { refused: string } {

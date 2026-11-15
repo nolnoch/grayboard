@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
 import { accessAudits } from "../support/audit.ts";
+import { until } from "../support/until.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedToolError } from "../support/hosted_session.ts";
 import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
@@ -285,6 +286,8 @@ describe("pre-seam refusals", () => {
     expect(e?.message).toContain(`{"code":"not_found","message":"resource not found"}`);
     // One row per refused request: the session's native wire and its subscriber each sent one.
     const row = { actor: B, target: forged, verb: "hosted.session", allow: false, rule: "hosted.other_user" };
+    // connect() rejects on the first refusal; the second request's row may land after.
+    await until(() => rows().filter((r) => r.verb === "hosted.session").length === 2);
     expect(rows().filter((r) => r.verb === "hosted.session")).toEqual([row, row]);
   });
 

@@ -5,7 +5,7 @@ import {
   verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
-import { readableAttachment, releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
+import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
@@ -368,8 +368,9 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   return db.transaction(() => {
   guard?.();
   if (guard) {
-    const current = readableAttachment(repo, db, handle, row.id, authed.user_email, authed.user_email);
-    if (!current || current.sha256 !== row.sha256) return notFound();
+    // A refusal here is a decision too (#851); the transaction returns, so its rows commit.
+    const current = requestAttachment(repo, db, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
+    if ("refused" in current || current.row.sha256 !== row.sha256) return notFound();
   }
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
   return new Response(data, {
