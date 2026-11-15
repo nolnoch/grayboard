@@ -35,8 +35,9 @@ test("the Bun pin lives in .bun-version, and every copy that can't read it match
     }
   }
   expect(asserted).toBeGreaterThan(0);
-  // The user guide states the Bun the hosted OpenCode package is tested with.
-  const guide = [...read("docs/guide/harnesses.md").matchAll(/\bBun (\d+\.\d+\.\d+)/g)].map((m) => m[1]);
+  // The user guide states the Bun the hosted OpenCode package is tested with ("with Bun x", "use Bun x");
+  // a note on one release's behaviour ("Bun x can …") is not a pin.
+  const guide = [...read("docs/guide/harnesses.md").matchAll(/\b(?:with|use) Bun (\d+\.\d+\.\d+)/g)].map((m) => m[1]);
   expect(guide.length).toBeGreaterThan(0);
   for (const version of guide) expect(version).toBe(BUN_VERSION);
 });
@@ -63,4 +64,12 @@ test("the hosted suite list agrees across hosted-evidence.ts, hosted-e2e.sh, e2e
   const options: string[] = nightly.on.workflow_dispatch.inputs.suite.options;
   for (const s of NETWORK) expect(options).toContain(`hosted-${s}`);
   for (const s of options) expect([...accepted, "hosted-network"]).toContain(s);
+});
+
+test("the MCP client pin agrees across the root, hosted-core and the hosted OpenCode package", () => {
+  // Dependabot moves the hosted OpenCode package's pin alone; hosted-core's modules ship vendored into it,
+  // so a pin that moved in one place fails here and the bump PR finishes the others.
+  const pin = (path: string) => { const pkg = JSON.parse(read(path)); return pkg.dependencies?.["@modelcontextprotocol/client"] ?? pkg.devDependencies?.["@modelcontextprotocol/client"]; };
+  const pins = ["package.json", "adapters/hosted-core/package.json", "adapters/opencode-v2/package.json"].map((path) => [path, pin(path)]);
+  for (const [path, pin] of pins) expect(`${path}: ${pin}`).toBe(`${path}: ${pins[0]![1]}`);
 });
