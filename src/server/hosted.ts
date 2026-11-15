@@ -495,12 +495,15 @@ export function createHostedSessions(application: Application, options: { now?: 
       async flushQueued() {
         if (!rows.length) return;
         const pending = rows.splice(0);
+        let failed = 0;
         try {
           await store.write(() => {
+            failed = 0;
             for (const write of pending) {
-              try { store.atomic(write); } catch (failure) { refusalRowsLost++; hostedFailure("hosted.refusal_row", failure); }
+              try { store.atomic(write); } catch (failure) { failed++; hostedFailure("hosted.refusal_row", failure); }
             }
           });
+          refusalRowsLost += failed;
         } catch (failure) { refusalRowsLost += pending.length; hostedFailure("hosted.refusal_row", failure); }
       },
     };
@@ -516,16 +519,23 @@ export function createHostedSessions(application: Application, options: { now?: 
       const id = before?.root_session_id ?? context.id;
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
         const later = refusalRows();
+        // Checked outside the transaction, where the auth cache serves it (#853); an idle queue runs the body below
+        // inside write(), with no await since. Only a body that waited behind another checks again, in the
+        // transaction (uncached), so settle's premise holds either way.
+        authorized(p);
+        let waited = false;
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.
-        const selected = await store.write(() => {
-          authorized(p);
-          // authorized(p) just passed, in this body: settle skips p's own disabled read (#881).
+        const pending = store.write(() => {
+          if (waited) authorized(p);
+          // authorized(p) passed with no await since: settle skips p's own disabled read (#881).
           const settled = settle(context.id, p.authed.user_id);
           try { return { row: store.atomic(() => { const r = rowFor(p, context, later.defer, true, wake, declare, settled)!; touch(r); return r; }) }; }
           catch (error) { later.flush(); return { error }; }
         });
+        waited = true;
+        const selected = await pending;
         if ("error" in selected) throw selected.error;
         const row = selected.row;
         if ((row.root_session_id ?? row.session_id) !== id) return retry;

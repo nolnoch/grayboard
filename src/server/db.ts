@@ -106,7 +106,8 @@ function queued<T, R>(db: Database, fn: () => T, committed?: (value: T) => R): P
 // the queue is held: a request, timer or callback path awaits write() instead.
 function queuedNow<T>(db: Database, fn: () => T): T {
   const queue = queueFor(db);
-  if (queue.held || db.inTransaction) throw new Error("writeNow while the write queue is held: only startup calls it; await write() instead");
+  if (queue.held) throw new Error("writeNow while the write queue is held: only startup calls it; await write() instead");
+  if (db.inTransaction) throw new Error("writeNow inside an open transaction: nested code calls atomic");
   let box: { value: T } | { error: unknown } | undefined;
   void queue.run(() => { try { box = { value: db.transaction(fn).immediate() as T }; } catch (error) { box = { error }; } });
   if (!box) throw new Error("writeNow: the idle queue didn't run its body synchronously");
@@ -125,7 +126,7 @@ export interface Repo {
   // the queue's next body: in-memory state the transaction's readers see changes there, not after the await.
   write<T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // write's transaction run now, for startup only (a constructor, before anything serves): returns fn's value, throws
-  // its error, and throws when the queue is held.
+  // its error, and throws when the queue is held or a transaction is open.
   writeNow<T>(fn: () => Sync<T>): T;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().

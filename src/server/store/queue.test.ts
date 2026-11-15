@@ -131,7 +131,7 @@ test("#807: writeNow runs its transaction now through an idle queue, and refuses
   expect(() => repo.writeNow(() => { repo.users.upsertByEmail("rolled@example.com", null); throw new Error("boom"); })).toThrow("boom");
   expect(repo.users.findByEmail("rolled@example.com")).toBeUndefined();
   expect(queueFor(db).held).toBe(false);
-  expect(() => repo.atomic(() => repo.writeNow(() => 1))).toThrow("writeNow while the write queue is held");
+  expect(() => repo.atomic(() => repo.writeNow(() => 1))).toThrow("writeNow inside an open transaction");
   let release!: () => void;
   const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
   expect(() => repo.writeNow(() => repo.users.upsertByEmail("held@example.com", null))).toThrow("writeNow while the write queue is held");

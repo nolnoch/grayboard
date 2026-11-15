@@ -250,7 +250,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         });
       });
     },
-    revalidate() { hosted.sweep(); },
+    revalidate() { hosted.sweep().catch(e => hostedFailure("hosted.sweep", e)); },
     close() {
       stopped = true; unlisten();
       // The capability is dropped, but the lease row stays; a restart credits it with the downtime (#423).
