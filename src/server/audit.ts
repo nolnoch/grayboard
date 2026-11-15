@@ -81,6 +81,7 @@ export type AuditAction =
   | "id.collision"
   | "id.detached"
   | "id.end_failed"
+  | "alias.revoke_failed"
   | "id.ended"
   | "id.child_fallback"
   | "id.child_seen"
@@ -125,13 +126,10 @@ export function writeAudit(
   target: string | null,
   detail?: Record<string, unknown>,
 ): void {
-  repo.audit.write({
-    at: repo.now(),
-    actor,
-    action,
-    target,
-    detail: detail ? JSON.stringify(detail) : null,
-  });
+  const row = { at: repo.now(), actor, action, target, detail: detail ? JSON.stringify(detail) : null };
+  // Part of the caller's transaction when one is open; else through the write queue, waiting behind another
+  // body's transaction rather than landing inside it (#807 P1b-4b).
+  repo.post(() => repo.audit.write(row), undefined, `audit ${action}`);
 }
 
 /** Core's audit rows, written on the server: access_log through the Repo (#342). */

@@ -104,15 +104,42 @@ function queued<T, R>(db: Database, fn: () => T, committed?: (value: T) => R): P
 // A write at startup, before anything serves (a constructor's first sweep, #807 P1b-4): fn's transaction through the
 // write queue, run now, its value returned and its error thrown, as the synchronous transaction it was. It throws when
 // the queue is held: a request, timer or callback path awaits write() instead.
-function queuedNow<T>(db: Database, fn: () => T): T {
+function queuedNow<T>(db: Database, fn: () => T, committed?: (value: T) => unknown): T {
   const queue = queueFor(db);
   if (queue.held) throw new Error("writeNow while the write queue is held: only startup calls it; await write() instead");
   if (db.inTransaction) throw new Error("writeNow inside an open transaction: nested code calls atomic");
   let box: { value: T } | { error: unknown } | undefined;
-  void queue.run(() => { try { box = { value: db.transaction(fn).immediate() as T }; } catch (error) { box = { error }; } });
+  void queue.run(() => {
+    try { box = { value: db.transaction(fn).immediate() as T }; } catch (error) { box = { error }; return; }
+    // Before the queue's next body, as write()'s committed (D4); its throw is the caller's, the commit stands.
+    try { committed?.(box.value); } catch (error) { box = { error }; }
+  });
   if (!box) throw new Error("writeNow: the idle queue didn't run its body synchronously");
   if ("error" in box) throw box.error;
   return box.value;
+}
+
+// A write no caller waits for (an audit row, a closing session's last-seen touch, a lapsed lease's settle; #807 P1b-4b),
+// for code that can't await: a sync finally, a timer, a sync check on the request path. It runs now as part of the
+// caller's open transaction (the queue's holder's, or an unqueued one a caller opened at top level), as its own
+// transaction when the caller holds the queue outside one, or through the idle queue; when another body holds the
+// queue it waits behind it, and its failure is logged as `what` failed. True when it ran now (its error thrown,
+// `committed` run after the open transaction's commit or at once), false when it waits.
+function posted<T>(db: Database, fn: () => T, committed: ((value: T) => unknown) | undefined, what: string): boolean {
+  const queue = queueFor(db);
+  if (db.inTransaction && (queue.mine || !queue.held)) {
+    const value = fn();
+    if (committed) afterCommit(db, () => { committed(value); });
+    return true;
+  }
+  if (queue.mine) {
+    const value = db.transaction(fn).immediate() as T;
+    committed?.(value);
+    return true;
+  }
+  if (!queue.held) { queuedNow(db, fn, committed); return true; }
+  void queued(db, fn, committed).catch(error => console.error(`[grayboard] ${what} failed:`, error));
+  return false;
 }
 
 export interface Repo {
@@ -128,6 +155,9 @@ export interface Repo {
   // write's transaction run now, for startup only (a constructor, before anything serves): returns fn's value, throws
   // its error, and throws when the queue is held or a transaction is open.
   writeNow<T>(fn: () => Sync<T>): T;
+  // A write no caller awaits, for code that can't (posted, above): true when it ran now, false when it waits behind
+  // another body, its failure then logged as `what` failed.
+  post<T>(fn: () => Sync<T>, committed?: (value: T) => unknown, what?: string): boolean;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
   authRead<T>(fn: () => Sync<T>): T;
@@ -834,6 +864,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
     write: <T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     writeNow: <T>(fn: () => Sync<T>) => queuedNow(db, fn) as T,
+    post: <T>(fn: () => Sync<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn as () => T, committed, what),
     authRead<T>(fn: () => Sync<T>): T {
       if (pinned !== null || db.inTransaction) return fn() as T;
       pinned = readGeneration();
