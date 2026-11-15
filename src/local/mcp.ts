@@ -737,8 +737,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
     // A runner child whose root isn't live (its parent harness exited while
     // this runner lives on) is its own session from here (#523 step 5).
     if (liveParent !== null && !runnerRootLive(db, SESSION_ID, liveParent)) await rootGone();
-    for (const a of WRITES_AS ? [WRITES_AS] : held) touchAlias(db, a);
-    touchId(db, SESSION_ID);
+    touchSeen(WRITES_AS ? [WRITES_AS] : held);
     // A runner child's own call is its child session's.
     if (agent === undefined) return call(name, args, signal, liveParent === null ? undefined : SESSION_ID);
     if (!validSourceId(agent)) return { ...text(`error: _meta["${GRAYBOARD_AGENT_META}"] must be a string of 1 to 1024 characters with no control characters`), isError: true };
@@ -1056,10 +1055,12 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // Bound in the post's transaction; a refused post releases the uploads.
     const { result, wake } = await withUploads(actor, files, (ids) => {
       testPause("board:before-txn");
-      return db.transaction(() => {
+      const run = db.transaction(() => {
         rootLive?.();
         return callBoardTool(db, actor, name, ids.length ? { ...args, attachment_ids: ids } : args, ctx);
-      }).immediate();
+      });
+      // A read takes no write lock (#148 18): in WAL it reads a snapshot while another process writes.
+      return READ_ONLY_BOARD_TOOLS.has(name) ? run.deferred() : run.immediate();
     });
     await wakeAll(wake);
     // board_post and a taken claim are writes; a claim held by someone else is a refusal.
@@ -1391,6 +1392,25 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
   }
 }
 
+
+// A call's last_seen touches (#148 18), at most one per address per
+// TOUCH_EVERY_MS: each is a write, and a write waits out another process's
+// write lock (busy_timeout, 5 s) even for a read-only call. Presence ages are
+// minutes and the stale-recipient warning an hour, so the lag doesn't show.
+const TOUCH_EVERY_MS = 30_000;
+// The board tools that only read, so a call needs no write lock at all.
+const READ_ONLY_BOARD_TOOLS = new Set(["board_list", "peer_list", "claim_list"]);
+const touchedAt = new Map<string, number>();
+function touchSeen(aliases: string[], now = Date.now()): void {
+  const due = (address: string) => {
+    const at = touchedAt.get(address);
+    if (at !== undefined && now - at < TOUCH_EVERY_MS) return false;
+    touchedAt.set(address, now);
+    return true;
+  };
+  for (const a of aliases) if (due(a)) touchAlias(db, a, now);
+  if (due(SESSION_ID)) touchId(db, SESSION_ID, now);
+}
 
 // Startup: the name (if any) is already acquired. Connect MCP so
 // notifications are accepted, listen on the name's wakeup socket, and replay
