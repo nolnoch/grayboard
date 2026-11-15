@@ -101,6 +101,10 @@ export type Access = {
   // source board, spec hash, description) in peer_list: only inside a scope
   // it may act in (#284 S13).
   seesAliasMeta(handle: string, scope: Omit<AliasScope, "name">): boolean;
+  // Whether the principal of `handle` may see that an alias of a scope exists
+  // at all (peer_list rows, name suggestions): a team's names only inside the
+  // team (#348). Omitted: always.
+  seesAlias?(handle: string, scope: Omit<AliasScope, "name">): boolean;
   // The board only a human handle can start posts on, or null for none.
   announceBoard: string | null;
 };
@@ -1131,7 +1135,8 @@ export const ALIAS_SESSION_SQL = `COALESCE(
 // session's, and clears when the session ends (#284 decision 11). An alias's
 // labels, and its session's facts, are shown only to a caller that may act
 // in its scope (#284 S13, F-12), and `match` filters after that cut, so a
-// hidden label or fact can't be probed.
+// hidden label or fact can't be probed. A team's aliases aren't listed at all
+// outside the team (#348), a cut made first.
 // `online` comes from the mode: a live session that will receive pushes
 // (local: its wakeup socket answers; server: an open connection).
 // `addresses`: the caller's address set, each row of which is its own and
@@ -1199,8 +1204,20 @@ export function who(
     if (v === undefined) seen.set(key, v = acc.seesAliasMeta(viewer, scope));
     return v;
   };
+  // Whether the row is listed at all: a team's alias only to the team's
+  // members (#348), before `match` and the offline count, so neither probes
+  // a hidden name. Memoized per scope as the label cut is.
+  const listed = new Map<string, boolean>();
+  const seesName = (scope: Omit<AliasScope, "name">): boolean => {
+    if (!acc.seesAlias) return true;
+    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+    let v = listed.get(key);
+    if (v === undefined) listed.set(key, v = acc.seesAlias(viewer, scope));
+    return v;
+  };
   for (const r of rows) {
     if (isViewer(r.handle)) continue;
+    if (r.scope_kind !== null && !own.has(r.handle) && !seesName({ scope_kind: r.scope_kind, scope_ref: r.scope_ref })) continue;
     const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
     // The session's facts (where it runs, its status, harness, model, effort,
     // launcher) follow the labels' cut: an alias's to a caller that may act

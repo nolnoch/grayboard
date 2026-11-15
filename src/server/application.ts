@@ -1178,7 +1178,8 @@ function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
 // and only that (as @name does in a post): another user's or team's alias is
 // named in full, so a bare name never wakes someone else's agent by accident
 // (security audit F-08; vision principle 9). The refusal names the full
-// handles that do exist. Shared with delegate's `to` resolution (#184 review
+// handles that do exist and the sender may see: a team's only to its members
+// (alias.see, #348), so with none visible it reads as a name nobody has. Shared with delegate's `to` resolution (#184 review
 // 7): both take bare and mixed-case names through the same path.
 type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
 function resolvePeer(repo: Repo, from: string, input: string): Peer {
@@ -1194,7 +1195,10 @@ function resolvePeer(repo: Repo, from: string, input: string): Peer {
     // full handle, as peer_list shows it.
     fail("not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
   }
-  const all = repo.aliases.findAllByName(p.name).map((i) => i.address).sort();
+  const viewer = repo.resolver.principalOf(from);
+  const all = repo.aliases.findAllByName(p.name)
+    .filter((a) => viewer !== null && authorize(repo, {}, { verb: "alias.see", principal: viewer, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow)
+    .map((i) => i.address).sort();
   const which = all.length ? `"${p.name}" isn't in your scope; name it in full: ${all.join(", ")}` : `no identity is named "${p.name}"`;
   return fail("not_found", `${which}; peer_list shows exact handles`);
 }

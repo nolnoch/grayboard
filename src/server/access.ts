@@ -57,6 +57,15 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
       return p !== null && scope.scope_ref !== null && actsIn(repo, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
     },
 
+    // A team's alias names reach only the team and its members, as its boards
+    // and roster do (#348); people's names are the open directory. A filter:
+    // no decision rows.
+    seesAlias(handle, scope) {
+      const p = repo.resolver.principalOf(handle);
+      if (p === null || scope.scope_ref === null) return false;
+      return authorize(repo, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
+    },
+
     // No server #announce yet (#24): a team board named announce stays ordinary.
     announceBoard: null,
 
