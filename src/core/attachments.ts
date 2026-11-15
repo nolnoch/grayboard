@@ -48,6 +48,11 @@ export interface BlobStore {
   delete(sha256: string): Promise<void>;
 }
 
+// Runs one write transaction. Local mode runs it now (immediateTx); the server queues it behind its other writes
+// (#807 D4), so a store, release or sweep awaits it. fn is synchronous: nothing awaits inside a transaction.
+export type WriteTx = <T>(fn: () => T) => T | Promise<T>;
+export const immediateTx = (db: Database): WriteTx => fn => db.transaction(fn).immediate();
+
 // Uploads and sweeps of one sha256 run one at a time in this process, so a
 // sweep can't delete bytes an upload has just put. A store other processes
 // share must also refuse to delete bytes an attachment row names.
@@ -80,14 +85,15 @@ export async function storeAttachment(
   blobs: BlobStore,
   uploader: string,
   file: AttachmentFile,
-  opts: { now?: number; quota?: UploadQuota; guard?: () => void } = {},
+  opts: { now?: number; quota?: UploadQuota; guard?: () => void; tx?: WriteTx } = {},
 ): Promise<AttachmentRow> {
   const now = opts.now ?? Date.now();
+  const tx = opts.tx ?? immediateTx(db);
   const sha256 = sha256Hex(file.data);
   let unnamed = false;
   try {
     return await withBlob(sha256, async () => {
-      const row = db.transaction(() => {
+      const row = await tx(() => {
         opts.guard?.();
         unnamed = pruneUnbound(db, now - UNBOUND_TTL_MS) > 0;
         const q = opts.quota;
@@ -106,19 +112,19 @@ export async function storeAttachment(
              VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
           )
           .get(sha256, file.filename, file.type, file.data.length, uploader, q?.principal ?? null, now) as AttachmentRow;
-      }).immediate();
+      });
       try {
         // Put even when the catalog knew this sha256: it heals bytes a crash lost.
         await blobs.put(sha256, file.data);
       } catch (e) {
-        db.prepare(`DELETE FROM attachments WHERE id = ?`).run(row.id);
+        await tx(() => db.prepare(`DELETE FROM attachments WHERE id = ?`).run(row.id));
         unnamed = true;
         throw e;
       }
       return row;
     });
   } finally {
-    if (unnamed) await sweepBlobs(db, blobs);
+    if (unnamed) await sweepBlobs(db, blobs, tx);
   }
 }
 
@@ -283,12 +289,14 @@ function heldBlob(db: Database, principal: string, sha256: string, unbound: bool
 // uploading. Null if it isn't theirs (any address of `from`, made by its user,
 // #367) or a message or post already carries it. guard: a hosted transfer's
 // binding check, run inside the delete's transaction.
-export async function releaseUpload(db: Database, blobs: BlobStore, id: number, from: Uploader, guard?: () => void): Promise<AttachmentRow | null> {
-  const row = db.transaction(() => {
+export async function releaseUpload(
+  db: Database, blobs: BlobStore, id: number, from: Uploader, guard?: () => void, tx: WriteTx = immediateTx(db),
+): Promise<AttachmentRow | null> {
+  const row = await tx(() => {
     guard?.();
     return db.prepare(`DELETE FROM attachments WHERE ${UNSENT} RETURNING *`).get(...unsentArgs([id], from)) as AttachmentRow | null;
-  }).immediate();
-  if (row) await sweepBlobs(db, blobs);
+  });
+  if (row) await sweepBlobs(db, blobs, tx);
   return row;
 }
 
@@ -304,7 +312,7 @@ const UNNAMED = `NOT EXISTS (SELECT 1 FROM attachments a WHERE a.sha256 = attach
 // names. A crash between the two leaves an entry the next sweep finishes,
 // never bytes nothing names. Never throws: a failure is logged and left for
 // the next sweep. Returns how many went.
-export async function sweepBlobs(db: Database, blobs: BlobStore): Promise<number> {
+export async function sweepBlobs(db: Database, blobs: BlobStore, tx: WriteTx = immediateTx(db)): Promise<number> {
   let shas: string[];
   try {
     shas = (db.prepare(`SELECT sha256 FROM attachment_blobs WHERE ${UNNAMED}`).all() as { sha256: string }[]).map((r) => r.sha256);
@@ -318,7 +326,7 @@ export async function sweepBlobs(db: Database, blobs: BlobStore): Promise<number
       await withBlob(sha256, async () => {
         if (db.prepare(`SELECT 1 FROM attachments WHERE sha256 = ?`).get(sha256)) return;
         await blobs.delete(sha256);
-        swept += db.prepare(`DELETE FROM attachment_blobs WHERE sha256 = ? AND ${UNNAMED}`).run(sha256).changes;
+        swept += await tx(() => db.prepare(`DELETE FROM attachment_blobs WHERE sha256 = ? AND ${UNNAMED}`).run(sha256).changes);
       });
     } catch (e) {
       console.error(`[grayboard] blob sweep: ${sha256}: ${(e as Error).message}`);
