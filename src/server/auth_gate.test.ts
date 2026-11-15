@@ -133,6 +133,45 @@ test("a /64 its own bucket refuses doesn't count against its /48, and IPv4 has n
   expect(g.refuse(g.caller(req(), v6(1, 0xff)), "/api/whoami")?.status).toBe(429);
 });
 
+test("the /64 is checked first: when both are drained the streak that starts is the /64's, and the /48 starts none", () => {
+  const err = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const { g, audit } = gate(undefined, undefined, 1);
+    // Drain the /48 from other /64s, then drain one more /64 by its own charge.
+    for (let net = 0; net < SITE_LIMIT_FACTOR; net++) g.charge(g.caller(req(), v6(1, net)), req(), "/api/whoami", "refused token");
+    expect(g.refuse(g.caller(req(), v6(1, 0)), "/api/whoami")?.status).toBe(429);
+    expect(audit("auth.rate_limited").map((r) => r.target)).toEqual(["2001:db8:1:0::/64"]);
+  } finally {
+    err.mockRestore();
+  }
+});
+
+test("over time a /48 rotating /64s holds at most about its burst plus its refill over a sweep interval", () => {
+  const err = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const { g, clock } = gate(undefined, undefined, 2);
+    const site = { burst: 2 * SITE_LIMIT_FACTOR, perSec: 0.1 * SITE_LIMIT_FACTOR };
+    let net = 0, peak = 0;
+    // Ten minutes of a client failing from a fresh /64 whenever the /48 lets it, swept every 30s.
+    for (let s = 0; s < 600; s++) {
+      clock.t += 1000;
+      for (;;) {
+        const c = g.caller(req(), v6(1, net));
+        if (g.refuse(c, "/api/whoami")) break;
+        g.charge(c, req(), "/api/whoami", "refused token");
+        net++;
+      }
+      peak = Math.max(peak, g.size);
+      if (s % 30 === 29) g.sweep();
+    }
+    // A /64 charged once refills in burst/perSec (20s here), so it lives a sweep interval plus that.
+    expect(peak).toBeLessThanOrEqual(site.burst + Math.ceil(site.perSec * (30 + 2 / 0.1)) + 1);
+    expect(net).toBeGreaterThan(site.burst);
+  } finally {
+    err.mockRestore();
+  }
+});
+
 test("a client looping on one refused token costs its /48 one charge, as it does its /64 (#923)", async () => {
   const { g } = gate(undefined, undefined, 1);
   const c = g.caller(req(), v6(1, 0));

@@ -111,11 +111,12 @@ export class AuthGate {
     // The address first: a request its own bucket refuses doesn't count
     // against its site's.
     let t = this.limiter.check(c.key, { addr: c.ip, path });
-    if (t.ok && c.site) t = this.siteLimiter.check(c.site, { addr: c.ip, path });
+    let from = "this address";
+    if (t.ok && c.site) { t = this.siteLimiter.check(c.site, { addr: c.ip, path }); from = "this network (/48)"; }
     if (t.ok) return null;
     const secs = retrySecs(t.retryAfterMs);
     return Response.json(
-      { code: "rate_limited", message: `too many authentication failures from this address; retry in ${secs}s`, retry_after_ms: t.retryAfterMs },
+      { code: "rate_limited", message: `too many authentication failures from ${from}; retry in ${secs}s`, retry_after_ms: t.retryAfterMs },
       { status: 429, headers: { "Retry-After": String(secs) } },
     );
   }
