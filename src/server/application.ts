@@ -1306,7 +1306,11 @@ function unwoken(repo: Repo, session: ApplicationSession, live: ApplicationSessi
   const toUser = live?.authed.user_email ?? (() => { const a = repo.aliases.find(to); return a?.scope_kind === "person" ? a.scope_ref : undefined; })();
   if (toUser === undefined) return {};
   const decision = authorize(repo, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
-  return decision.allow ? {} : { wakes: false, wake_note: `Delivered as mail: ${toUser}'s agent won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` };
+  if (decision.allow) return {};
+  // Named only when the address already names them (a person alias): a team
+  // alias's or an ID's holder is a handle, not a user (security audit F-12).
+  const whose = to.startsWith(`${toUser}/`) ? `${toUser}'s agent` : "its holder (another user's agent)";
+  return { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` };
 }
 
 // Only after the outermost commit, never on a replay.

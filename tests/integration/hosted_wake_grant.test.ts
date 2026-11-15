@@ -137,3 +137,40 @@ test("POST /api/teams/<t>/policy: owner sets it (audited once per change), membe
     [A, "eng", { from: "collaborative", to: "open" }],
   ]);
 });
+
+test("the send result: an offline person alias says wakes:false; a team alias's holder isn't named; a human gets nothing", async () => {
+  await team();
+  const abe = await srv.hosted(A, "be");
+  await abe.close();
+  const cfe = await srv.hosted(C, "fe");
+  const offline = await cfe.call<{ wakes?: false; wake_note?: string; delivered_now: boolean }>("dm_send", { to: `${A}/be`, body: "while away" });
+  expect(offline.delivered_now).toBe(false);
+  expect(offline.wakes).toBe(false);
+  expect(offline.wake_note).toContain(A);
+  // Bob holds the team alias; Carol, outside the team, mustn't learn whose it is.
+  await srv.hosted(B, "eng/deploy");
+  const toTeam = await cfe.call<{ wakes?: false; wake_note?: string }>("dm_send", { to: "eng/deploy", body: "deploy?" });
+  expect(toTeam.wakes).toBe(false);
+  expect(toTeam.wake_note).not.toContain(B);
+  // A team alias no one holds names no user: nothing said.
+  srv.app.repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "idle" }, A);
+  expect(await cfe.call<{ wakes?: false }>("dm_send", { to: "eng/idle", body: "anyone?" })).not.toHaveProperty("wakes");
+  // A human reads it: reach is msg.send's call, not a wake.
+  const bfe = await srv.hosted(B, "fe");
+  const aliceHuman = srv.app.repo.users.findByEmail(A)!;
+  const human = (await srv.app.application.attachHuman({ user_id: aliceHuman.id, user_email: A, session_id: 0 }, { deliver() {}, closed() {} })).session;
+  expect(await bfe.call<{ wakes?: false }>("dm_send", { to: `${A}/human`, body: "to alice's phone" })).not.toHaveProperty("wakes");
+  srv.app.application.close(human);
+});
+
+test("resetting the policy to open revokes the grant at the next pull", async () => {
+  await team();
+  expect((await policy(alice, "eng", "collaborative")).status).toBe(200);
+  const abe = await srv.hosted(A, "be");
+  const bfe = await srv.hosted(B, "fe");
+  await bfe.call("dm_send", { to: `${A}/be`, body: "granted" });
+  expect((await abe.next(dm("granted"))).actionable).toBe(true);
+  expect((await policy(alice, "eng", "open")).status).toBe(200);
+  await bfe.call("dm_send", { to: `${A}/be`, body: "revoked" });
+  expect((await abe.next(dm("revoked"))).actionable).toBe(false);
+});
