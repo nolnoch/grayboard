@@ -229,7 +229,7 @@ export function loadConfig(dataDir: string, env: Record<string, string | undefin
   const gb = env.FACTORY_GRAYBOARD?.trim() ? env.FACTORY_GRAYBOARD.trim().split(/\s+/) : strs("grayboard", ["grayboard"]);
   if (gb.length === 0) throw new Error(`${path}: "grayboard" must not be empty`);
   const identity = str("identity", DEFAULTS.identity);
-  // A bus name (boards.md §3); anything else could never be bound.
+  // A bus name (handles.md §1); anything else could never be bound.
   if (!/^[a-z0-9_-]{1,32}$/.test(identity)) throw new Error(`${path}: "identity" must be 1-32 characters of a-z 0-9 _ -`);
   const human = raw.human !== undefined ? str("human", "") : undefined;
   if (human !== undefined && !/^[a-z0-9_-]{1,32}$/.test(human)) throw new Error(`${path}: "human" must be a bus handle, 1-32 characters of a-z 0-9 _ -`);

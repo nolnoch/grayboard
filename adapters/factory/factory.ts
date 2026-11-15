@@ -260,7 +260,7 @@ export class Factory {
     if (!this.store.admit(r, agent.name, o)) { this.o.log(`${r.source} ${r.id} already taken; redelivery ignored`); return; }
     const seq = this.store.get(r)!.seq, hold = this.holdNote(seq);
     const where = hold ? `queued, ${hold}` : this.running < this.o.maxConcurrent ? "starting now" : `queued, ${this.store.queuedAhead(r)} ahead`;
-    // §13's launcher contract: say it was taken before the work starts. On a
+    // delegation.md's launcher contract: say it was taken before the work starts. On a
     // queue board this reply also acks the claim, so the rotation never
     // redelivers a task that's running. Not stored: a lost acknowledgement
     // costs nothing the outcome won't say.

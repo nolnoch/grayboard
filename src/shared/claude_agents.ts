@@ -21,8 +21,8 @@
 //                         plugin's server writes and its post-tool-use hook shows
 //
 // Records and facts are harness-asserted, in a same-user directory. A forged
-// record can only attribute a call to a child of the same root (docs/boards.md
-// §3). Any same-user process can write any session's facts, so a forged fact
+// record can only attribute a call to a child of the same root (docs/child-sessions.md).
+// Any same-user process can write any session's facts, so a forged fact
 // misreports that session's display model or effort: facts grant nothing, and
 // it is the records' boundary and #229's.
 //

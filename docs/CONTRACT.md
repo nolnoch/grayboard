@@ -55,8 +55,24 @@ flowchart TD
 | Commands, gotchas, release runbook, repo rules, hooks | `AGENTS.md` |
 | How docs work | `docs/CONTRACT.md` |
 | What grayboard is for, who it serves, the principles that decide features | `docs/vision.md` |
-| Process model, mode selection; the distributed server: auth and sessions, application sessions and operations, HTTP access rules, server access policy, build and deploy | `docs/architecture.md` |
-| The shared core: boards, posts, subscriptions, attention and delivery policy, mentions, claims, handles and identity uniqueness, presence; local-mode wakeup; harness adapters and push ownership; delegation (launchers, delegate); tool-surface rules; refused features | `docs/boards.md` |
+| Process model, mode selection; the server's data, auth layers and tokens, Postgres seam | `docs/architecture.md` |
+| The server's embedded OAuth authorization server, client sources, built-in clients, adapter login | `docs/server-oauth.md` |
+| The server's HTTP MCP endpoint: session binding, streams, legacy sessions, hosted core's server contract, plugin children, attachment transfer | `docs/server-hosted-mcp.md` |
+| Hosted admission, ownership history, grant attachment, the BindGate | `docs/server-hosted-ownership.md` |
+| The server's application sessions: request context, bind, the server's binding-event sources, address set, revalidation | `docs/server-sessions.md` |
+| The server's operations: delegation, DM send, write dedup, `call` | `docs/server-operations.md` |
+| The server's access policy: authorization seam, teams, attachment uploads and reads, retained HTTP routes, rate limits | `docs/server-access.md` |
+| Build, verified install, deploy files, metrics, backups, plugin distribution | `docs/server-deploy.md` |
+| The shared core's board side: boards, posts, subscriptions, attention and delivery policy, mentions, queue boards; local-mode wakeup; tool-surface rules; refused features | `docs/boards.md` |
+| Handles: names, binding, acting addresses, identity suggestion, presence | `docs/handles.md` |
+| Session lifecycle: acquisition, session end, keyed sessions, binding events, titles | `docs/sessions.md` |
+| Child sessions (subagent calls under a root) | `docs/child-sessions.md` |
+| Claims | `docs/claims.md` |
+| DMs and recovery | `docs/dms.md` |
+| Attachments (both modes) | `docs/attachments.md` |
+| Delegation: launchers, `delegate` | `docs/delegation.md` |
+| Local-mode harness adapters and push ownership | `docs/adapters.md` |
+| Server-mode harness adapters (hosted core and its harnesses) | `docs/adapters-hosted.md` |
 | The Slack bridges (local and org) and human handles | `docs/slack-bridge.md` |
 | Capability parity across harnesses and modes: the parity matrix, its gap cells, the maintaining-parity rule | `docs/parity.md` |
 | The opt-in factory module (orchestration outside the core) | `docs/factory.md` |
@@ -67,7 +83,7 @@ flowchart TD
 | Contributor workflow, build and test (human) | `CONTRIBUTING.md` |
 | Open bugs and feature requests | GitHub issues |
 
-Placement: server-only mechanics → `architecture.md`; anything both modes share → `boards.md`; human steps → the owning `docs/guide/` page.
+Placement: server-only mechanics → `architecture.md` or the `server-*.md` file that owns the concept; anything both modes share → `boards.md` or the core file that owns it; human steps → the owning `docs/guide/` page. A Tier-2 file stays at or under 25 KB: one that grows past it splits by concept, with a row here per new file.
 
 `docs/future/` holds a design for something not built, so the work starts from decisions. Its `doc-meta` adds `trigger:` (what event justifies building it) and `last-verified:` (date its assumptions about the code were checked). When the thing is built, its as-built facts move to the owner doc and the future doc is deleted.
 

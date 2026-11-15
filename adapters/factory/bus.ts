@@ -87,8 +87,8 @@ export class LocalBus implements FactoryBus {
   static async start(o: LocalBusOptions): Promise<LocalBus> {
     const [command, ...prefix] = o.command;
     if (!command) throw new Error("no grayboard command");
-    // Push on (the module is the delivery owner, boards.md §9) and launcher:
-    // delegation auto-pick finds it like any launcher session (§13).
+    // Push on (the module is the delivery owner, adapters.md) and launcher:
+    // delegation auto-pick finds it like any launcher session (delegation.md).
     const env = { ...sessionFree(o.env ?? process.env), BUS_IDENTITY: o.identity, BUS_LAUNCHER: "1", ...(o.harnessSession ? { BUS_HARNESS_SESSION: o.harnessSession } : {}) };
     const transport = new StdioClientTransport({ command, args: [...prefix, "mcp", "--mode", "local"], env, ...(o.cwd ? { cwd: o.cwd } : {}), stderr: "inherit" });
     const client = new Client({ name: "grayboard-factory", version: o.version }, { capabilities: {} });

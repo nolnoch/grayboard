@@ -1,4 +1,4 @@
-// Reading a delegation request off the public message shape (boards.md §13):
+// Reading a delegation request off the public message shape (delegation.md):
 // the header line, then the four-backtick fenced JSON block the core builds
 // (src/core/delegation.ts delegationBody). The core's parser isn't on the
 // module's allowlist, so the module reads the bytes as an outside
