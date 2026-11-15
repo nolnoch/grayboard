@@ -19,7 +19,8 @@ export type Post = {
   // Present on reads and pushes when the post carries files.
   attachments?: AttachmentInfo[];
   // On a server's delivery to a session of another signed-in user than the
-  // writer's (security audit F-10); absent otherwise and on reads.
+  // writer's (security audit F-10), on a pushed post and on every read of one
+  // (#825); absent otherwise.
   other_user?: true;
   // On such a delivery when no grant lets the writer wake this session
   // (security audit F-03, #806): shown, never a wake.
