@@ -97,6 +97,10 @@ export interface Repo {
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
   authRead<T>(fn: () => Sync<T>): T;
+  // The auth cache's generation: authRead's pinned one inside its body, else read now; undefined inside a
+  // transaction. Equal values mean no committed write to oauth_tokens, oauth_grants or users from this connection,
+  // and no commit at all from another, came between them (#899).
+  authGeneration(): string | undefined;
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
@@ -796,6 +800,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       pinned = readGeneration();
       try { return fn() as T; } finally { pinned = null; }
     },
+    authGeneration,
 
     oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
     hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
