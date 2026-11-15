@@ -101,6 +101,20 @@ function queued<T, R>(db: Database, fn: () => T, committed?: (value: T) => R): P
   }).then(box => box.out) as Promise<Awaited<R>>;
 }
 
+// A write at startup, before anything serves (a constructor's first sweep, #807 P1b-4): fn's transaction through the
+// write queue, run now, its value returned and its error thrown, as the synchronous transaction it was. It throws when
+// the queue is held: a request, timer or callback path awaits write() instead.
+function queuedNow<T>(db: Database, fn: () => T): T {
+  const queue = queueFor(db);
+  if (queue.held) throw new Error("writeNow while the write queue is held: only startup calls it; await write() instead");
+  if (db.inTransaction) throw new Error("writeNow inside an open transaction: nested code calls atomic");
+  let box: { value: T } | { error: unknown } | undefined;
+  void queue.run(() => { try { box = { value: db.transaction(fn).immediate() as T }; } catch (error) { box = { error }; } });
+  if (!box) throw new Error("writeNow: the idle queue didn't run its body synchronously");
+  if ("error" in box) throw box.error;
+  return box.value;
+}
+
 export interface Repo {
   // The server's clock, for rows written outside the Repo too (writeAudit).
   now(): number;
@@ -111,6 +125,9 @@ export interface Repo {
   // the queue its own transaction holds; nested code calls atomic. `committed(value)` runs after the commit, before
   // the queue's next body: in-memory state the transaction's readers see changes there, not after the await.
   write<T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // write's transaction run now, for startup only (a constructor, before anything serves): returns fn's value, throws
+  // its error, and throws when the queue is held or a transaction is open.
+  writeNow<T>(fn: () => Sync<T>): T;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
   authRead<T>(fn: () => Sync<T>): T;
@@ -816,6 +833,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       return db.transaction(fn).immediate() as T;
     },
     write: <T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R) => queued(db, fn, committed),
+    writeNow: <T>(fn: () => Sync<T>) => queuedNow(db, fn) as T,
     authRead<T>(fn: () => Sync<T>): T {
       if (pinned !== null || db.inTransaction) return fn() as T;
       pinned = readGeneration();
@@ -1695,6 +1713,7 @@ function makeHostedStore(db: Database): HostedStore {
   const store: HostedStore = {
     atomic: fn => db.transaction(fn).immediate(),
     write: (fn, committed) => queued(db, fn, committed),
+    writeNow: fn => queuedNow(db, fn),
     subscribe: () => () => {},
     get,
     owned: (id) => db.query<{ n: number }, [string, string]>(
