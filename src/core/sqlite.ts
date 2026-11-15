@@ -46,6 +46,28 @@ function trackCommits(db: Database): void {
   };
 }
 
+// Compiled statements per connection that `db.query` keeps, least recently used evicted. Bun's default
+// of 20 thrashed: the tree has ~250 prepare sites, and recompiling a statement on every call was ~15%
+// of server CPU at 1000 sessions (#912). The cap is Bun's static, read on every `query` call.
+export const STATEMENT_CACHE_SIZE = 512;
+Database.MAX_QUERY_CACHE_SIZE = STATEMENT_CACHE_SIZE;
+
+// `db.prepare(sql)` returns the connection's cached statement for `sql` (Bun's `db.query`), so call
+// sites keep writing `prepare`. Sharing one statement between call sites is safe here because every
+// use runs to completion synchronously (`all`/`get`/`run`) and none sets per-statement modes
+// (`as`, `safeIntegers`, `iterate`, `finalize`). `prepare(sql, params)` binds, so it stays uncached.
+// `db.run(sql, ...params)` compiles natively per call too, so with bindings it runs the cached statement,
+// unless `sql` has a second statement: a statement compiles only its first, where `db.run` runs them all.
+// (A `;` inside a string literal also takes the uncached path, which is only slower.) Without bindings
+// `db.run` is `exec`: schema scripts, run once.
+const multiStatement = /;\s*\S/;
+function cacheStatements(db: Database): void {
+  const prepare = db.prepare.bind(db), run = db.run.bind(db);
+  db.prepare = ((sql: string, params?: unknown) => params === undefined ? db.query(sql) : prepare(sql, params as never)) as Database["prepare"];
+  db.run = ((sql: string, ...params: unknown[]) =>
+    params.length && !multiStatement.test(sql) ? db.query(sql).run(...(params as never[])) : run(sql, ...(params as never[]))) as Database["run"];
+}
+
 // SQLITE_BUSY and its extended codes (_RECOVERY, _SNAPSHOT, _TIMEOUT): Bun's
 // `code` names the extended code, the primary code is errno's low byte.
 const isBusy = (e: unknown) => e instanceof SQLiteError && (e.errno & 0xff) === 5;
@@ -80,6 +102,7 @@ export function journalModeWarning(path: string, pragmas: string, actual: string
 export function openSqlite(path: string, pragmas: string, schema: (db: Database) => void): Database {
   const db = new Database(path);
   trackCommits(db);
+  cacheStatements(db);
   const start = Date.now();
   let retries = 0;
   let step = "pragmas";

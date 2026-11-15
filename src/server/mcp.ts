@@ -286,7 +286,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (context.role === "subscriber") {
       const cap = context.request.headers.get("X-Grayboard-Lease");
       if (uri !== "grayboard://inbox" || !cap || !/^[A-Za-z0-9_-]{43}$/.test(cap) ||
-          delivery.describe(context.principal, context.sessionContext, cap, checked).identity.identity_full !== context.session.identityFull) {
+          delivery.identityFull(context.principal, context.sessionContext, cap, checked) !== context.session.identityFull) {
         throw new ApplicationError("not_found", "resource not found");
       }
       return cap;

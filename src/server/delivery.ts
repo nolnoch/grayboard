@@ -108,6 +108,10 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     describe(p: DeliveryPrincipal, context: SessionContext, capability: string, checked?: { row: HostedSession | undefined }) {
       try { return describe(get(p, context, capability, checked?.row, !!checked)); } catch (error) { return refused(p, context, error); }
     },
+    // `describe`'s check without its copy of the identity: the per-request lease check reads one field (#912).
+    identityFull(p: DeliveryPrincipal, context: SessionContext, capability: string, checked?: { row: HostedSession | undefined }): string {
+      try { return get(p, context, capability, checked?.row, !!checked).identity.identity_full; } catch (error) { return refused(p, context, error); }
+    },
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, row => {
