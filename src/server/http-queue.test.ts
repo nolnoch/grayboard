@@ -8,6 +8,10 @@ import { openDatabase } from "./db.ts";
 import { createTouchQueue, hashToken, verifySessionToken } from "./auth.ts";
 import { queueFor } from "./store/queue.ts";
 import { TestServer } from "../../tests/support/server.ts";
+import { handleHttp } from "./http.ts";
+import type { Config } from "./config.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
+import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { until } from "../../tests/support/until.ts";
 
 const cleanups: (() => unknown)[] = [];
@@ -29,7 +33,7 @@ test("#807: a session touch that fires while another body holds the write queue 
     const user = repo.users.upsertByEmail("you@example.com", null);
     return repo.sessions.create(user.id, hashToken("raw-token"), "test");
   });
-  const before = repo.sessions.findById(session.id)!.last_used_at;
+  db.run("UPDATE sessions SET last_used_at = 0 WHERE id = ?", [session.id]);
   const lastUsed = () => repo.sessions.findById(session.id)!.last_used_at;
   const touched = spyOn(repo.sessions, "touch");
   const holder = hold(db);
@@ -40,7 +44,7 @@ test("#807: a session touch that fires while another body holds the write queue 
   holder.release();
   await holder.done;
   await until(() => touched.mock.calls.length > 0, 5000, "the touch ran after the holder released");
-  expect(lastUsed()).toBeGreaterThanOrEqual(before);
+  expect(lastUsed()).toBeGreaterThan(0);
   touched.mockRestore();
 });
 
@@ -59,3 +63,45 @@ test("#807: a team route that arrives while another body holds the write queue w
   expect(srv.app.repo.teams.findByName("core")).toBeTruthy();
   write.mockRestore();
 });
+
+for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["disable-user", "auth.user_disabled"]] as const) {
+  test(`#807: an admin ${route} whose transaction rolls back leaves the user's live sessions connected`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-admin-"));
+    const { db, repo } = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }), () => db.close());
+    const touches = createTouchQueue();
+    cleanups.push(() => touches.cancelAll());
+    const config: Config = {
+      dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0,
+      devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
+      messageRetentionDays: 90, auditRetentionDays: 90, admins: ["root@example.com"], helloLimit: DEFAULT_HELLO_LIMIT,
+      authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
+    };
+    const disconnected: number[] = [];
+    const hooks = { disconnectUser: (id: number) => { disconnected.push(id); }, accessChanged: () => {} };
+    const call = (path: string, body: unknown, token?: string) => handleHttp(
+      new Request(`http://localhost${path}`, { method: "POST", body: JSON.stringify(body), headers: token ? { Authorization: `Bearer ${token}` } : {} }),
+      repo, db, config, touches, () => {}, undefined, hooks, "127.0.0.1");
+    const login = async (email: string) => (await (await call("/api/auth/dev-login", { email })).json() as { session_token: string }).session_token;
+    const root = await login("root@example.com");
+    const bobToken = await login("bob@example.com");
+    // The change lands, then the audit row after it fails: the transaction rolls back.
+    const write = repo.audit.write.bind(repo.audit);
+    const audit = spyOn(repo.audit, "write").mockImplementation(row => {
+      if (row.action === action) throw new Error("disk full");
+      write(row);
+    });
+    await expect(call(`/api/admin/${route}`, { email: "bob@example.com" }, root)).rejects.toThrow("disk full");
+    audit.mockRestore();
+    expect(disconnected).toEqual([]);
+    const bob = repo.users.findByEmail("bob@example.com")!;
+    // Rolled back: no audit row, bob still enabled and signed in.
+    expect(repo.audit.last(action, "bob@example.com")).toBeUndefined();
+    expect(bob.disabled_at).toBeNull();
+    expect((await handleHttp(new Request("http://localhost/api/whoami", { headers: { Authorization: `Bearer ${bobToken}` } }),
+      repo, db, config, touches, () => {}, undefined, hooks, "127.0.0.1")).status).toBe(200);
+    const ok = await call(`/api/admin/${route}`, { email: "bob@example.com" }, root);
+    expect(ok.status).toBe(200);
+    expect(disconnected).toEqual([bob.id]);
+  });
+}

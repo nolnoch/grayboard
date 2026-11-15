@@ -639,14 +639,15 @@ function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: C
 async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, disconnectUser: (userId: number) => void): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
-  return repo.write(() => {
+  // The live sessions go after the commit: a rolled-back revoke leaves them up, as it leaves their tokens valid.
+  const target = await repo.write(() => {
     const target = repo.users.findByEmail(body.email.toLowerCase());
-    if (!target) return notFound();
+    if (!target) return null;
     repo.sessions.revokeAllForUser(target.id);
-    disconnectUser(target.id);
     writeAudit(repo, "auth.session_revoked", authed.user_email, body.email);
-    return json({ ok: true });
-  });
+    return target;
+  }, target => { if (target) disconnectUser(target.id); return target; });
+  return target ? json({ ok: true }) : notFound();
 }
 
 async function adminDisableUser(
@@ -658,10 +659,9 @@ async function adminDisableUser(
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
     repo.users.setDisabled(target.id, true);
-    disconnectUser(target.id);
     writeAudit(repo, "auth.user_disabled", authed.user_email, body.email);
     return target;
-  });
+  }, target => { if (target) disconnectUser(target.id); return target; });
   if (!target) return notFound();
   await slack?.userChanged(target.id);
   return json({ ok: true });
