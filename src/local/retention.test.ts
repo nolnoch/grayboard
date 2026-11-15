@@ -73,11 +73,15 @@ describe("runLocalRetention", () => {
     row(2, NOW - 91 * DAY, false);
     row(3, NOW - 89 * DAY, true);
     row(4, null, true);
+    // Tombstones from earlier prunes: one past the one-year horizon goes, one inside it stays (#333).
+    const tomb = db.prepare(`INSERT INTO pruned_ids (id, ended_at, pruned_at) VALUES (?, 0, ?)`);
+    tomb.run(id(5), NOW - 366 * DAY);
+    tomb.run(id(6), NOW - 364 * DAY);
 
     expect(await runLocalRetention(db, blobs, 90, NOW)).toBe(true);
 
     expect((db.prepare(`SELECT id FROM ids ORDER BY id`).all() as { id: string }[]).map((r) => r.id)).toEqual([id(3), id(4)]);
-    expect(db.prepare(`SELECT id, ended_at, pruned_at FROM pruned_ids`).all()).toEqual([{ id: id(1), ended_at: NOW - 91 * DAY, pruned_at: NOW }]);
+    expect(db.prepare(`SELECT id, ended_at, pruned_at FROM pruned_ids ORDER BY id`).all()).toEqual([{ id: id(1), ended_at: NOW - 91 * DAY, pruned_at: NOW }, { id: id(6), ended_at: 0, pruned_at: NOW - 364 * DAY }]);
     expect(() => assertDeliverableId(db, id(1))).toThrow(`not_found: no session ${id(1)}`);
     expect(() => assertDeliverableId(db, id(3))).toThrow(`id_ended: ${id(3)}`);
   });

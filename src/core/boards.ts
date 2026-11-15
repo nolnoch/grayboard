@@ -223,6 +223,13 @@ export class IdCollision extends CoreError {
   }
 }
 
+/**
+ * How long a pruned keyed ID's tombstone lasts (#333): a key re-presented
+ * later registers silently, without id.reused. A fixed year, not a multiple
+ * of the retention window, so a short window doesn't shorten it.
+ */
+export const TOMBSTONE_HORIZON_MS = 365 * 24 * 60 * 60 * 1000;
+
 /** A keyed ID retention pruned (#284 S10), which a new session has presented again. */
 export type ReusedId = { ended_at: number; pruned_at: number };
 
@@ -245,11 +252,13 @@ export function registerId(db: Database, f: IdFacts, now = Date.now()): ReusedId
  * Retention for session IDs (#284 S10, decision 4): delete the ids rows of
  * sessions that ended before `olderThanMs`. Nothing else names an ended ID
  * but provenance text (binding_events, sender_id, audit rows), which stays.
- * A keyed row leaves a pruned_ids tombstone. Returns how many it deleted.
+ * A keyed row leaves a pruned_ids tombstone, kept TOMBSTONE_HORIZON_MS past
+ * its prune (#333). Returns how many ids rows it deleted.
  */
 export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now()): number {
   return db.transaction(() => {
     db.prepare(`INSERT OR REPLACE INTO pruned_ids (id, ended_at, pruned_at) SELECT id, ended_at, ? FROM ids WHERE ended_at < ? AND keyed = 1`).run(now, olderThanMs);
+    db.prepare(`DELETE FROM pruned_ids WHERE pruned_at < ?`).run(now - TOMBSTONE_HORIZON_MS);
     return db.prepare(`DELETE FROM ids WHERE ended_at < ?`).run(olderThanMs).changes;
   }).immediate();
 }
@@ -1129,9 +1138,12 @@ function matches(m: PeerMatch, fields: PeerMatch): boolean {
   return Object.entries(m).every(([k, v]) => fields[k as keyof PeerMatch]?.toLowerCase() === v.toLowerCase());
 }
 
+/** The order of a session's holds, oldest first (#284 S1, #370): every list of holds and every primary pick uses it. */
+export const HOLD_ORDER = "ORDER BY bound_at, address";
+
 /** SQL for session `id`'s primary hold (#284 S1): its oldest, or NULL. `id` is an SQL expression. */
 export function primaryHoldSql(id: string): string {
-  return `(SELECT address FROM alias_holds WHERE id = ${id} ORDER BY bound_at, address LIMIT 1)`;
+  return `(SELECT address FROM alias_holds WHERE id = ${id} ${HOLD_ORDER} LIMIT 1)`;
 }
 
 // The session an alias's facts come from (#284 S13): its holder, or once

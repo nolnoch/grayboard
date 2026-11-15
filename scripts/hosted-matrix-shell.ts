@@ -17,7 +17,7 @@ async function main() {
   // Noninteractive matrix children get a group so targeted termination reaches their descendants.
   let child: ReturnType<typeof spawn> | undefined;
   const signals = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"] as const;
-  let interrupted: NodeJS.Signals | undefined, cleanup: ReturnType<typeof setTimeout> | undefined;
+  let interrupted: NodeJS.Signals | undefined, cleanup: ReturnType<typeof setTimeout> | undefined, grace: Promise<void> | undefined;
   const forward = (signal: NodeJS.Signals) => { if (child?.pid) { try { process.kill(-child.pid, signal); } catch {} } };
   const handlers = signals.map(signal => {
     const handler = () => {
@@ -25,18 +25,25 @@ async function main() {
       interrupted = signal;
       forward(signal);
       // Only cancellation cleanup; normal case deadlines and execution remain untouched.
-      cleanup = setTimeout(() => forward("SIGKILL"), 1000);
+      grace = new Promise(done => { cleanup = setTimeout(() => { forward("SIGKILL"); done(); }, 1000); });
     };
     process.on(signal, handler); return handler;
   });
-  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((accept, reject) => {
-    child = spawn(shell, args, { env: process.env, stdio: "inherit", detached: true });
-    child.once("error", () => reject(new Error("Shell launch failed")));
-    child.once("exit", (code, signal) => accept({ code, signal }));
-  }).finally(() => {
+  let result: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    result = await new Promise((accept, reject) => {
+      child = spawn(shell, args, { env: process.env, stdio: "inherit", detached: true });
+      child.once("error", () => reject(new Error("Shell launch failed")));
+      child.once("exit", (code, signal) => accept({ code, signal }));
+    });
+    // The shell's exit doesn't end the grace (#378 6): its group's descendants keep the rest of it to clean up before
+    // the SIGKILL, and the handlers stay installed meanwhile so a repeated signal can't kill this observer first.
+    // A SIGKILL of the observer itself can't be handled here: the group then keeps running until its own end.
+    await grace;
+  } finally {
     if (cleanup) clearTimeout(cleanup);
     signals.forEach((signal, index) => process.removeListener(signal, handlers[index]!));
-  });
+  }
   const signal = interrupted ?? result.signal;
   const code = signal ? 128 + constants.signals[signal] : result.code;
   if (code === null || code === undefined || code < 0 || code > 255) throw new Error("Invalid child exit");

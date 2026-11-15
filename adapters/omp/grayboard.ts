@@ -207,7 +207,7 @@ function callResult(value: unknown): { content: Content[]; isError: boolean; ins
   return { content, isError: r.isError === true, ...(instructions ? { instructions } : {}) };
 }
 
-// A launcher's argv unwrapped to the program it runs: a package runner
+// A wrapper's argv unwrapped to the program it runs: a package runner
 // (bunx, npx, pnpx, `bun x`, `npm exec`, `pnpm dlx`, `yarn dlx`) and its
 // flags, `env` and its assignments, `exec`, or a shell's `-c` line.
 function unwrap(argv: string[]): string[] {
@@ -229,7 +229,7 @@ function unwrap(argv: string[]): string[] {
 }
 
 // Whether an MCP server runs `grayboard mcp`: a stdio server whose program,
-// past any launcher, is a grayboard binary or package with an `mcp`
+// past any wrapper, is a grayboard binary or package with an `mcp`
 // argument, or whose argv up to `mcp` is this extension's own
 // (`bun <checkout>/src/cli/main.ts` from source).
 function runsGrayboard(server: { type?: string; command?: string; args?: string[] }, own: Config): boolean {

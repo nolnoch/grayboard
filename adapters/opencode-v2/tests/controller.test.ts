@@ -642,6 +642,63 @@ test.each([false, true])("a native access expiry pause doesn't survive a restart
     expect(r.storage.get("paused:B")).toBe(false);
   } finally { await restarted?.close(); await r.controller.close(); }
 });
+// The host restarts while the server is down (a release's upgrade): the first `refused` connects are refused.
+async function restoredDuringOutage(refused: number, waited?: (restarted: Controller, r: ReturnType<typeof runtime>) => Promise<void>) {
+  const r = runtime({}, async () => {});
+  r.bind("B", "be");
+  await r.controller.enroll("B");
+  await until(() => r.controller.status().state === "active");
+  await r.controller.close();
+  r.observe(async operation => { if (operation === "connect" && refused > 0) { refused--; throw new ServerUnreachable(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })); } });
+  const waits: number[] = [], states: string[] = [];
+  const restarted: Controller = r.restart(async ms => {
+    waits.push(ms);
+    states.push(restarted.status().roots.find(root => root.sessionID === "B")!.state);
+    await waited?.(restarted, r);
+  });
+  const start = r.calls.length;
+  await restarted.restore();
+  return { r, restarted, waits, states, calls: () => r.calls.slice(start) };
+}
+test("a restore during a server outage retries on the outage backoff, never pausing, and resumes the same ownership (#424 6)", async () => {
+  const o = await restoredDuringOutage(4);
+  try {
+    expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ operation: "restore", code: "server_unreachable" });
+    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "active", ownership: 1 });
+    expect(o.waits).toEqual([500, 1000, 2000, 4000]);
+    expect(o.states).toEqual(Array(4).fill("retrying"));
+    expect(o.calls().filter(c => c.name === "delivery_open").map(c => c.sessionID)).toEqual(["B"]);
+    expect(o.calls().some(c => c.name === "bind")).toBe(false);
+  } finally { await o.restarted.close(); await o.r.controller.close(); }
+});
+test("a token that expires during a restore's outage retry waits for the host's refresh, never pausing (#424 6)", async () => {
+  let seen: unknown, waited = 0;
+  const o = await restoredDuringOutage(1, async (restarted, r) => {
+    if (++waited === 1) r.f.expire();
+    else { seen = restarted.status().roots.find(root => root.sessionID === "B"); r.f.rotate("fake-access-two"); }
+  });
+  try {
+    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(seen).toMatchObject({ state: "retrying", operation: "restore", code: "native_access_expired" });
+    expect(o.waits).toEqual([500, 1000]);
+    expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "active", ownership: 1 });
+    expect(o.calls().filter(c => c.name === "delivery_open").map(c => c.sessionID)).toEqual(["B"]);
+  } finally { await o.restarted.close(); await o.r.controller.close(); }
+});
+test("a shutdown during a restore's outage retry ends it: nothing opens once the server is back (#424 6)", async () => {
+  let shut = false;
+  const o = await restoredDuringOutage(1, async restarted => { if (!shut) { shut = true; await restarted.shutdown("B", "detach"); } });
+  try {
+    await until(() => shut);
+    // close waits out the control queue, so the retry's last check has run.
+    await o.restarted.close();
+    expect(o.calls().some(c => c.name === "delivery_open")).toBe(false);
+    expect(o.waits).toHaveLength(1);
+    // The shutdown's record stands: the retry wrote nothing after it.
+    expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "paused", operation: "session_end" });
+  } finally { await o.restarted.close(); await o.r.controller.close(); }
+});
 test.each(["account", "revoked"])("a genuine refusal at restart keeps a native access expiry pause, for good (%s)", async refusal => {
   const r = runtime({}, async () => {}); let restarted: Controller | undefined, again: Controller | undefined;
   try {

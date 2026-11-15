@@ -46,14 +46,14 @@ export type SessionRow = {
   attached_start: string | null;
 };
 
-/** How a keyed session's harness was found: BUS_HARNESS_PID, or its first non-launcher ancestor. */
+/** How a keyed session's harness was found: BUS_HARNESS_PID, or its first non-wrapper ancestor. */
 export type HarnessRule = "env" | "ancestor";
 
 /** A keyed session's harness: the process whose exit ends it. */
 export type Harness = { pid: number; proc_start: string | null; rule: HarnessRule };
 
 // One row per session, however many aliases it holds (#284 S7). The holds
-// are sorted in JS, holdsOf's order: an aggregate ORDER BY needs SQLite 3.44,
+// are sorted in JS, holdsOf's order (HOLD_ORDER): an aggregate ORDER BY needs SQLite 3.44,
 // newer than some macOS system libraries Bun links against. A child
 // session's row (#539) is a copy of its root's liveness kept for older
 // releases (registerChild), never a session here: it is left out.
@@ -100,7 +100,7 @@ export function thisSession(sessionId: string, harness: Harness | null = null, c
 /**
  * A keyed session's harness (#284 decision 3): `BUS_HARNESS_PID` when the
  * orchestrator that minted the key set it, else this process's first
- * non-launcher ancestor. An error string when neither names a live process.
+ * non-wrapper ancestor. An error string when neither names a live process.
  */
 export function keyedHarness(env: Record<string, string | undefined> = process.env): Harness | string {
   const raw = env.BUS_HARNESS_PID;

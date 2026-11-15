@@ -159,14 +159,14 @@ export function commandName(pid: number): string | null {
 }
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "env"]);
-const LAUNCHERS = /(?:^|[\s/])(npx|bunx|pnpx|uvx|npm|pnpm|yarn)(?=\s|$)/;
+const WRAPPERS = /(?:^|[\s/])(npx|bunx|pnpx|uvx|npm|pnpm|yarn)(?=\s|$)/;
 
 /**
- * The launcher `pid` is (a shell, or a package runner such as npx or bunx),
+ * The wrapper `pid` is (a shell, or a package runner such as npx or bunx),
  * or null if it looks like the harness itself. A package runner's command
  * name is often just "node", so its command line decides.
  */
-export function launcherName(pid: number): string | null {
+export function wrapperName(pid: number): string | null {
   const comm = commandName(pid);
   if (comm && SHELLS.has(comm)) return comm;
   const args = process.platform === "linux"
@@ -178,14 +178,14 @@ export function launcherName(pid: number): string | null {
         }
       })()
     : (ps("args", [pid])?.get(pid) ?? "");
-  return LAUNCHERS.exec(args)?.[1] ?? null;
+  return WRAPPERS.exec(args)?.[1] ?? null;
 }
 
 /**
  * The harness this process runs under: its first ancestor that isn't a
- * launcher (launcherName), or null when every ancestor is one. Its parent
+ * wrapper (wrapperName), or null when every ancestor is one. Its parent
  * alone may be a shell or package runner that exits with it.
  */
 export function harnessAncestor(pid = process.pid): number | null {
-  return ancestors(pid).find((p) => launcherName(p) === null) ?? null;
+  return ancestors(pid).find((p) => wrapperName(p) === null) ?? null;
 }

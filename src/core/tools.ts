@@ -540,9 +540,9 @@ export function callBoardTool(
       if (queue !== undefined && queue !== "on" && queue !== "off") {
         throw new CoreError(`queue must be "on" or "off"`);
       }
-      // The opt-out is a name's flag; an ID is always in its queues' rotation.
+      // The opt-out is a name's flag (#284 S13); an ID leaves a rotation by leaving push (#340 2).
       if (queue !== undefined && addressParts(handle)?.kind === "id") {
-        throw new CoreError(`queue opt-out is a name's; bind(name) first, or leave queue unset`);
+        throw new CoreError(`queue opt-out is a name's; bind(name) first, or board_subscribe(board, "quiet") to leave that board's rotation`);
       }
       setStatus(db, handle, str(a, "text"));
       if (queue !== undefined) setQueueParticipation(db, handle, queue === "on");

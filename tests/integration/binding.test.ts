@@ -415,6 +415,27 @@ test("9: a DM sent mid-unbind is queued for the name's next holder, never consum
   await until(() => contents(third).includes("mid-unbind"));
 }, 30_000);
 
+// #148 18: a call touches last_seen at most once per 30 s per address, so a
+// read-only call soon after another writes nothing and another process's held
+// write lock (past the 5 s busy timeout) doesn't stall or fail it.
+test("read-only calls soon after another take no write lock, so a held lock doesn't stall them", async () => {
+  const s = await session("fe");
+  await s.call("claim_list", {});
+  const seen = () => rows<{ a: number; i: number }>(`SELECT (SELECT last_seen FROM aliases WHERE address = 'fe') AS a, (SELECT MAX(last_seen) FROM ids) AS i`)[0]!;
+  const before = seen();
+  const lock = new Database(join(dir, "bus.db"));
+  lock.exec("BEGIN IMMEDIATE");
+  try {
+    await s.call("claim_list", {});
+    await s.call("peer_list", {});
+    await s.call("board_list", {});
+  } finally {
+    lock.exec("ROLLBACK");
+    lock.close();
+  }
+  expect(seen()).toEqual(before);
+}, 30_000);
+
 // #374 (the #284 PR 4 audit's A4 fix): an unbind whose release transaction
 // fails leaves the hold, so the session answers on the name's socket again;
 // a DM sent after is delivered now, and a retried unbind releases it.
@@ -686,7 +707,7 @@ test("#211: a restore is verified in the transaction that binds: a bind that lan
   expect(next.c.getInstructions()).toContain(`This grayboard process restarted and took back "api", but another session bound it in between, so the earlier peer status wasn't carried over; peer_status sets it again.`);
 }, 30_000);
 
-test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {
+test("11: a restart under the same harness takes its name back; a fresh harness, or a wrapper parent, starts unbound", async () => {
   // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
   let s = await session("be");
   await s.call("bind", { name: "api", create: true });
@@ -718,16 +739,16 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   expect(fresh.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
   expect(fresh.c.getInstructions()).not.toContain("restarted");
 
-  // A launcher between harness and grayboard is a new parent on each restart,
+  // A wrapper between harness and grayboard is a new parent on each restart,
   // so the name can't come back; the instructions say why.
   const sh = ["sh", "-c", `"$@"; exit $?`, "sh", process.execPath];
   let l = await localSession(dir, undefined, { via: sh });
-  const launcherNote = "Its parent process is a launcher (sh), so if this grayboard process restarts, its name won't come back";
-  expect(l.c.getInstructions()).toContain(launcherNote);
+  const wrapperNote = "Its parent process is a wrapper (sh), so if this grayboard process restarts, its name won't come back";
+  expect(l.c.getInstructions()).toContain(wrapperNote);
   await l.call("bind", { name: "web", create: true });
   l = await l.restart("reconnect");
   expect(l.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
-  expect(l.c.getInstructions()).toContain(launcherNote);
+  expect(l.c.getInstructions()).toContain(wrapperNote);
 }, 60_000);
 
 test("#284 S10: a restart takes back every name in its record, in order; one held by another is named in a note", async () => {

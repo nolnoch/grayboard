@@ -277,7 +277,7 @@ The installer also refreshes the release's deploy files (see the install step ab
 
 ## Limitations and non-goals (distributed mode)
 
-- Single backend instance. A restart drops clients for a few seconds; they reconnect and re-drain. Hosted delivery leases and idle-ownership timers don't count a longer outage: on start the server pushes a live lease out by the time it was down (at most one lease TTL past the restart) and an idle timer by the same amount (at most to the restart) (#423).
+- Single backend instance. A restart drops clients for a few seconds; they reconnect and re-drain. Hosted delivery leases and idle-ownership timers don't count a longer outage: on start the server pushes a live lease out by the time it was down (at most one lease TTL past the restart) and an idle timer by the same amount (at most to the restart) (#423). An OpenCode V2 host that restarts while the server is down retries each saved root on its outage backoff instead of pausing it until a reload (#424); hosted pi, omp and Claude Code don't yet (#895).
 - No HA, no multi-AZ, no horizontal scaling.
 - No web admin UI — CLI only.
 - No quotas on messages or posts. What is limited: each user's binds, authentication failures per client address ([§3](#3-configure)), and each user's attachments: bytes uploaded but unsent, and bytes stored in all (`GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES`).

@@ -57,7 +57,7 @@ export function endSession(
   const now = opts.now ?? Date.now();
   const row = db.prepare(`SELECT ended_at, principal FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; principal: string | null } | null;
   if (row?.ended_at != null) return NOT_ENDED;
-  const holds = (db.prepare(`SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address`).all(id) as { address: string }[]).map((r) => r.address);
+  const holds = holdsOf(db, id);
   const held = [...new Set([...holds, ...(opts.legacyNames ?? [])])];
   db.prepare(`UPDATE ids SET ended_at = ?, held_aliases_json = ? WHERE id = ?`).run(now, JSON.stringify(held), id);
   // A send that reaches the write lock after this point is refused with

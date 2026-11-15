@@ -326,6 +326,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     initCoreSchema(d);
     migrateHostedHolds(d);
     recordChildRoots(d);
+    sweepStaleLaunchers(d, (opts.now ?? Date.now)());
     seedSchema(d, first);
   });
   authGenerationTriggers(db);
@@ -378,6 +379,19 @@ function recordChildRoots(db: Database): void {
     UPDATE ids SET root_id = (SELECT h.root_session_id FROM hosted_sessions h WHERE h.session_id = ids.id)
       WHERE root_id IS NULL AND id IN (SELECT session_id FROM hosted_sessions WHERE root_session_id IS NOT NULL);
   `);
+}
+
+// #521 5: a server sets ids.launcher only for a live hosted root's ownership (hostedDeclareLauncher), and that
+// ownership's end clears it. A mark on any other row is stale: a pre-upgrade WSS launcher's, or a hosted root's
+// that ended before #532 cleared the flag at the end. It kept `peer_list` showing `launcher: true` on an offline
+// alias whose last holder it was, and `delegate(to:)` answering "a launcher but offline". One statement clears
+// them on every open (normally none); each cleared ID is audited `handle.launcher_set {on: false, reason: "stale"}`,
+// actor its principal (no ownership or client to name, unlike an end's row).
+function sweepStaleLaunchers(db: Database, now: number): void {
+  const cleared = db.prepare(`UPDATE ids SET launcher = 0 WHERE launcher = 1
+      AND NOT EXISTS (SELECT 1 FROM hosted_sessions h WHERE h.session_id = ids.id AND h.root_session_id IS NULL)
+      RETURNING id, principal`).all() as { id: string; principal: string | null }[];
+  for (const { id, principal } of cleared) insertAudit(db, now, principal, "handle.launcher_set", id, JSON.stringify({ on: false, reason: "stale" }));
 }
 
 function initSchema(db: Database): void {
