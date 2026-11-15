@@ -94,8 +94,8 @@ test("private board visibility is checked again after reading the blob", async (
   app.repo.teams.addMember(team.id, bob.authed.user_id);
   const { ensureTeamBoard, onTeamJoined, onTeamLeft } = await import("../../src/server/teams.ts");
   ensureTeamBoard(app.db, team, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, alice.authed.user_id, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, bob.authed.user_id, "bob@example.com");
+  onTeamJoined(app.db, app.repo, team, "alice@example.com");
+  onTeamJoined(app.db, app.repo, team, "bob@example.com");
   const id = (await (await attachment(alice.token)).json() as { id: number }).id;
   expect((await a.callTool({ name: "board_post", arguments: { board: "private", body: "team file", attachment_ids: [id] } })).isError).not.toBe(true);
   expect((await b.readResource({ uri: "grayboard://boards/private" })).contents.length).toBe(1);
@@ -106,7 +106,7 @@ test("private board visibility is checked again after reading the blob", async (
   const reading = attachment(bob.token, "GET", id);
   await Promise.race([entered, reading.then(response => { throw new Error(`blob read was bypassed: ${response.status}`); })]);
   app.repo.teams.removeMember(team.id, bob.authed.user_id);
-  onTeamLeft(app.db, app.repo, team, bob.authed.user_id, "bob@example.com");
+  onTeamLeft(app.db, app.repo, team, "bob@example.com");
   resume();
   const response = await reading;
   expect(response.status).toBe(404);
@@ -115,15 +115,11 @@ test("private board visibility is checked again after reading the blob", async (
 
 test("old API remains session-only and OAuth cannot become admin or WS credentials", async () => {
   const alice = issue();
-  app.repo.aliases.create({ scope_kind: "person", scope_ref: alice.authed.user_email, name: "be" }, alice.authed.user_email);
   const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const legacy = (await login.json() as { session_token: string }).session_token;
-  const oldUpload = await fetch(`${base}/api/attachments?as=be&filename=report.txt`, { method: "POST", headers: { Authorization: `Bearer ${legacy}`, "Content-Length": String(bytes.length) }, body: bytes });
-  expect(oldUpload.status).toBe(201);
-  const id = (await oldUpload.json() as { id: number }).id;
-  expect((await fetch(`${base}/api/attachments/${id}?as=be`, { headers: { Authorization: `Bearer ${legacy}` } })).status).toBe(200);
-  expect((await attachment(legacy, "GET", id)).status).toBe(401);
-  for (const path of ["/api/attachments/1?as=be", "/api/identities", "/api/admin/users", "/api/teams"]) {
+  expect((await attachment(legacy)).status).toBe(401);
+  expect((await attachment(legacy, "GET", 1)).status).toBe(401);
+  for (const path of ["/api/identities", "/api/admin/users", "/api/teams"]) {
     const response = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${alice.token}` } });
     expect(response.status).toBe(401);
     await response.arrayBuffer();

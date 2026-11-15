@@ -924,6 +924,14 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
     return result.structuredContent ?? JSON.parse(text);
   };
   await call("bind", { name: "peer", create: true });
+  // The peer is another user, and its DMs must wake alice's agent: they
+  // share a collaborative team, the cross-user wake grant (#806).
+  const repo = srv.app.repo;
+  const alice = repo.users.upsertByEmail("alice@example.com", null), bob = repo.users.findByEmail("bob@example.com")!;
+  const team = repo.teams.findByName("peers") ?? repo.teams.create("peers", alice.id);
+  repo.teams.addMember(team.id, alice.id, "owner");
+  repo.teams.addMember(team.id, bob.id);
+  repo.teams.setPolicy(team.id, "collaborative");
   return { dir: home, reports, call, close: () => proxy.close() };
 }
 

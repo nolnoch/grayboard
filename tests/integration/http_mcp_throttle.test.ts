@@ -49,7 +49,7 @@ test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion i
     await srv.appSession(token, "qa").connect();
     const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${otherHostedToken}` } });
     expect(response.status).toBe(405);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(0);
+    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'bind.rate_limited'").all()).toHaveLength(0);
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
   } finally { await client.close(); await srv.stop(); }
 }, 60_000);
@@ -90,7 +90,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(error).toMatchObject({ code: -32000, data: { code: "rate_limited" } });
     expect(last!.body).not.toContain(user.email);
     expect(srv.app.mcp.activeContexts).toBe(srv.app.mcp.activeGetStreams);
-    expect(() => srv.app.application.admitHosted(authed, null)).toThrow(expect.objectContaining({ code: "rate_limited" }));
+    expect(() => srv.app.application.admitHosted(authed, null, "native")).toThrow(expect.objectContaining({ code: "rate_limited" }));
     expect(hostedRowCount(srv.app.db)).toBe(0);
     const before = srv.app.db.query("SELECT * FROM boards").all();
     await expect(client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "must not dispatch" } })).rejects.toThrow();
@@ -154,7 +154,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
       expect([finds, lists]).toEqual(before);
     }
     for (const method of ["GET", "DELETE", "OPTIONS", "HEAD"]) {
-      const blocked = await fetch(`${srv.base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "MCP-Protocol-Version": version, ...(legacySession ? { "Mcp-Session-Id": legacySession } : {}) } });
+      const blocked = await fetch(`${srv.base}/mcp`, { method, headers: { Authorization: `Bearer ${token}`, "MCP-Protocol-Version": version, ...(legacySession ? { "Mcp-Session-Id": legacySession as string } : {}) } });
       expect(blocked.status).toBe(429);
       expect(blocked.headers.get("Retry-After")).toBe("1");
       await blocked.text();
@@ -215,6 +215,45 @@ test("native HTTP charges only presented invalid tokens in the shared address ga
     expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'auth.rate_limited'").all()).toHaveLength(1);
     now += 2000;
     expect((await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(200);
+  } finally {
+    await srv.stop();
+  }
+});
+
+// Delivery upkeep draws on its own per-user bucket (#845): a user's spent tool-call bucket doesn't
+// refuse their subscriber requests, nor the reverse, and each bucket's refusal run is audited apart.
+test("subscriber-role requests and tool calls draw on separate per-user buckets (#845)", async () => {
+  let now = 0;
+  const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, hostedSubscriberLimit: { burst: 3, perSec: 1 }, now: () => now });
+  try {
+    const tools = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"]).token;
+    const delivery = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:delivery"]).token;
+    const version = "2026-07-28";
+    const call = async (token: string, id: number, role?: string) => {
+      const response = await fetch(`${srv.base}/mcp`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "MCP-Protocol-Version": version, "Mcp-Method": "tools/list", "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(role ? { "X-Grayboard-Client": role } : {}) },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/list", params: { _meta: { [PROTOCOL_VERSION_META_KEY]: version, [CLIENT_INFO_META_KEY]: { name: "fixture", version: "1" }, [CLIENT_CAPABILITIES_META_KEY]: {} } } }),
+      });
+      await response.text();
+      return response.status;
+    };
+    expect([await call(tools, 1), await call(tools, 2), await call(tools, 3)]).toEqual([200, 200, 429]);
+    // The tool bucket is spent; delivery upkeep still has its own three.
+    expect([await call(delivery, 4, "subscriber"), await call(delivery, 5, "subscriber"), await call(delivery, 6, "subscriber"), await call(delivery, 7, "subscriber")]).toEqual([200, 200, 200, 429]);
+    expect(await call(tools, 8)).toBe(429);
+    const runs = srv.app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.rate_limited' ORDER BY id").all();
+    expect(runs.map(r => JSON.parse(r.detail).bucket)).toEqual(["native", "subscriber"]);
+    now += 1000;
+    expect(await call(tools, 9)).toBe(200);
+    expect(await call(delivery, 10, "subscriber")).toBe(200);
+    expect(srv.app.application.limiterSizes()).toMatchObject({ hosted: 1, subscriber: 1 });
+    // Refilled buckets are swept, and each run's end is audited with its bucket.
+    now += 10_000;
+    srv.app.application.sweepHellos();
+    expect(srv.app.application.limiterSizes()).toMatchObject({ hosted: 0, subscriber: 0 });
+    const ends = srv.app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.rate_limit_ended' ORDER BY id").all();
+    expect(ends.map(r => JSON.parse(r.detail).bucket).sort()).toEqual(["native", "subscriber"]);
   } finally {
     await srv.stop();
   }

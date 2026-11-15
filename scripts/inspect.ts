@@ -126,7 +126,7 @@ function users() {
 }
 
 function audit() {
-  return all(`SELECT id, at, actor, action, target, detail FROM access_log ORDER BY id DESC LIMIT 500`);
+  return all(`SELECT id, at, actor, action, target, detail, ip, ua FROM access_log ORDER BY id DESC LIMIT 500`);
 }
 
 function api(url: URL): unknown {
@@ -392,7 +392,7 @@ async function auditView() {
   render(h("h2", {}, "Audit log"),
     rows.length ? table([
       ["When", (r) => fmt(r.at)], ["Action", (r) => chip(r.action)], ["Actor", (r) => r.actor || ""],
-      ["Target", (r) => r.target || ""], ["Detail", (r) => h("span", { class: "muted" }, r.detail || "")],
+      ["Target", (r) => r.target || ""], ["From", (r) => [r.ip || "", r.ua ? [" ", h("span", { class: "muted" }, r.ua)] : null]], ["Detail", (r) => h("span", { class: "muted" }, r.detail || "")],
     ], rows) : h("p", { class: "muted" }, "None."));
 }
 

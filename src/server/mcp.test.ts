@@ -32,7 +32,7 @@ const clients: Client[] = [];
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(":memory:", { blobDir });
-  application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 } });
+  application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
   oauth = createOAuthServer(store.repo, { dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = issuedOAuth(store.repo, oauth.resource);
@@ -106,9 +106,13 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
   return client;
 }
 
-// #410: tool reads with no session key judge visibility by the user's
-// principal (own and team boards, never another team's) and change nothing.
-for (const mapped of [true, false]) test(`unbound native resource catalog and snapshots match nonconsuming tools, mapped=${mapped}`, async () => {
+// Subscriptions and outbox rows: what a consuming read would change.
+const deliveryState = () => store.db.prepare(`SELECT (SELECT json_group_array(json_array(board, handle, mode, cursor)) FROM subscriptions) AS subs, (SELECT json_group_array(json_array(handle, post_id, delivered_at)) FROM outbox) AS outbox`).get();
+
+// An owner's general and team-only boards, each with a post and a board
+// claim, and an unbound reader: the owner's own principal when mapped, an
+// unrelated user's otherwise.
+async function unboundReader(mapped: boolean) {
   const owner = await connect();
   expect((await owner.callTool({ name: "board_create", arguments: { name: "general", purpose: "visible catalog" } })).isError).not.toBe(true);
   expect((await owner.callTool({ name: "board_post", arguments: { board: "general", body: "open hello" } })).isError).not.toBe(true);
@@ -124,15 +128,27 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
     requestInit: { headers: { Authorization: `Bearer ${access}` } },
     fetch: (input, init) => hosted.fetch(new Request(input, init)),
   }));
-  const state = () => store.db.prepare(`SELECT (SELECT json_group_array(json_array(board, handle, mode, cursor)) FROM subscriptions) AS subs, (SELECT json_group_array(json_array(handle, post_id, delivered_at)) FROM outbox) AS outbox`).get();
-  const before = state();
+  return client;
+}
+
+for (const mapped of [true, false]) test(`unbound native resource catalog lists and reads a visible board, mapped=${mapped}`, async () => {
+  const client = await unboundReader(mapped);
+  const before = deliveryState();
+  const resources = await client.listResources();
+  expect(resources.resources.some(resource => resource.uri === "grayboard://boards/general")).toBe(true);
+  expect((await client.readResource({ uri: "grayboard://boards/general" })).contents.length).toBeGreaterThan(0);
+  expect(deliveryState()).toEqual(before);
+});
+
+// #410: tool reads with no session key judge visibility by the user's
+// principal (own and team boards, never another team's) and change nothing.
+for (const mapped of [true, false]) test(`#410: unbound tool reads judge visibility by principal and change nothing, mapped=${mapped}`, async () => {
+  const client = await unboundReader(mapped);
+  const before = deliveryState();
   const text = (r: { isError?: boolean; content: unknown }) => {
     expect(r.isError).not.toBe(true);
     return JSON.parse((r.content as { text: string }[])[0]!.text);
   };
-  const resources = await client.listResources();
-  expect(resources.resources.some(resource => resource.uri === "grayboard://boards/general")).toBe(true);
-  expect((await client.readResource({ uri: "grayboard://boards/general" })).contents.length).toBeGreaterThan(0);
   const listed = text(await client.callTool({ name: "board_list", arguments: {} })) as { name: string; mode: unknown; unread: number }[];
   const names = listed.map(b => b.name);
   expect(names).toContain("general");
@@ -146,7 +162,7 @@ for (const mapped of [true, false]) test(`unbound native resource catalog and sn
   const claims = text(await client.callTool({ name: "claim_list", arguments: { prefix: "lane:" } })) as { key: string; board: string | null }[];
   expect(claims.map(c => [c.key, c.board])).toEqual([["lane:general", "general"], ["lane:secret", mapped ? "secret" : null]]);
   expect(text(await client.callTool({ name: "peer_list", arguments: { board: "general" } }))).toHaveProperty("peers");
-  expect(state()).toEqual(before);
+  expect(deliveryState()).toEqual(before);
   expect((await client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "unbound" } })).isError).toBe(true);
   expect((await client.callTool({ name: "bind", arguments: { name: "refused", create: true } })).isError).toBe(true);
 });
@@ -166,7 +182,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   expect(peers.peers).toContainEqual(expect.objectContaining({ handle: "alice@example.com/fe", online: true, status: "working", where: "owner" }));
   expect(store.repo.cursors.directFor(owner.session.identityFull)).toBe(0);
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-  await expect(new AppSession(application, user, "fe", { probe: "silent" }).connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
+  await expect(new AppSession(application, user, "fe").connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
 });
 
 test("Origin policy precedes authentication and context creation on every HTTP method", async () => {
@@ -1267,4 +1283,38 @@ for (const { label, initMeta } of UNBOUND_GETS) test(`peer_list doesn't show an 
     expect(listed.text).not.toContain("unbound_sessions");
     expect(hosted.activeGetStreams).toBe(1);
   } finally { await raw.close(); }
+});
+
+test("an unbound native hosted session lists itself once in peer_list's unbound_sessions (#489)", async () => {
+  const raw = await rawLegacyGet(token);
+  const fresh = { "ai.opencode/sessionID": "lone-root" };
+  try {
+    const listed = await raw.call("peer_list", {}, fresh);
+    const data = JSON.parse(listed.text.split("\n").find(line => line.startsWith("data: "))!.slice(6));
+    const unbound = JSON.parse(data.result.content[0].text).unbound_sessions as { session_id: string; self?: true }[];
+    expect(unbound).toHaveLength(1);
+    expect(unbound[0]).toMatchObject({ self: true });
+  } finally { await raw.close(); }
+});
+
+// #399: a hosted commit names the row it changed, and only the listens reading that row re-check their binding.
+test("an unbind stops only its own session's listen, through the per-row notice (#399)", async () => {
+  const first = await connect(), second = await otherClient();
+  expect((await first.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
+  expect((await first.callTool({ name: "board_create", arguments: { name: "mine", purpose: "first's watch" } })).isError).not.toBe(true);
+  expect((await second.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).not.toBe(true);
+  expect((await second.callTool({ name: "board_create", arguments: { name: "theirs", purpose: "second's watch" } })).isError).not.toBe(true);
+  const kept = await first.listen({ resourceSubscriptions: ["grayboard://boards/mine"] });
+  await second.listen({ resourceSubscriptions: ["grayboard://boards/theirs"] });
+  expect(hosted.activeListens).toBe(2);
+  // A binding change committed outside any request of either session, so only the notice can reach the listens.
+  const rebind = (email: string) => store.repo.hosted.atomic(() => {
+    const row = store.repo.hosted.all().find(r => store.repo.users.findById(r.user_id)?.email === email)!;
+    store.repo.hosted.update({ ...row, bind_gen: row.bind_gen + 1 });
+  });
+  rebind("bob@example.com");
+  await untilHosted(() => hosted.activeListens === 1);
+  rebind("alice@example.com");
+  await untilHosted(() => hosted.activeListens === 0);
+  await kept.close();
 });

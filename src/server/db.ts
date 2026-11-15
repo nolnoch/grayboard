@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
+import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
 import { testPause } from "../shared/testpause.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -9,18 +9,34 @@ import { dropHold, logBinding } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
+import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
-import type { MailPort } from "../core/session_end.ts";
-import { afterCommit, openSqlite } from "../core/sqlite.ts";
+import { countOpenDelegations } from "../core/delegation.ts";
+import { endSession, type MailPort } from "../core/session_end.ts";
+import type { AuditSink } from "../core/audit.ts";
+import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
-import type { HumanReach } from "./can_send.ts";
+import type { HumanReach } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
+import { requestOrigin } from "./request_context.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess } from "./oauth-types.ts";
 
 // Row types
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null };
+// idp_subject: the IdP's stable account ID (Google `sub`), set at the first
+// sign-in that carries one; null for a dev-auth user and one not signed in since
+// (security audit F-13).
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_subject: string | null };
+// What an IdP sign-in resolved to (security audit F-13). `linked`: the user had
+// no subject yet and now has this one. Refusals: `subject_mismatch`, the email's
+// user belongs to another IdP account (the email was reassigned);
+// `email_changed`, this IdP account's user has another email.
+export type IdpSignIn =
+  | { status: "ok"; user: User; linked: boolean }
+  | { status: "subject_mismatch" | "email_changed"; user: User };
+// The label `grayboard login --dev` sessions carry: a server started without dev auth revokes them (#805 F-04).
+export const DEV_SESSION_LABEL = "dev";
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 // An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
 // ref is the user's email; a team or service scope's is the principal's name.
@@ -29,6 +45,13 @@ export type Alias = { id: number; address: string; scope_kind: ScopeKind; scope_
 export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; user_id: number | null; team_id: number | null; parent_id: number | null; created_at: number };
 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
+// A team's wake policy (#806): 'open' (the default) isolates members' agents
+// from each other's wakes, as from anyone's; 'collaborative' grants members'
+// agents a wake across users (vision.md principle 9); 'delegating' (#256)
+// is collaborative and also lets a member's session name another member's
+// launcher in `delegate`'s `to`.
+export type TeamPolicy = "open" | "collaborative" | "delegating";
+export const TEAM_POLICIES: readonly TeamPolicy[] = ["open", "collaborative", "delegating"];
 // attachments: present on reads when the message carries files.
 // delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
 // via: the child session (a harness subagent, #523) that wrote it under its root's addresses; null for a root's own write.
@@ -67,14 +90,24 @@ const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 
 export interface Repo {
+  // The server's clock, for rows written outside the Repo too (writeAudit).
+  now(): number;
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
     upsertByEmail(email: string, displayName: string | null): User;
+    // An IdP sign-in: matches the subject first, then the email (F-13).
+    signIn(email: string, subject: string, displayName: string | null): IdpSignIn;
+    // Forgets a user's IdP subject, so the next sign-in with the email links its account.
+    clearSubject(userId: number): void;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
+    // findById(id)?.disabled_at != null, cached on authGeneration (#853).
+    isDisabled(userId: number): boolean;
+    // The user's email while it exists and isn't disabled, cached on authGeneration (#853).
+    activeEmail(userId: number): string | undefined;
     setDisabled(userId: number, disabled: boolean): void;
   };
   sessions: {
@@ -83,6 +116,8 @@ export interface Repo {
     findById(sessionId: number): Session | undefined;
     revoke(sessionId: number): void;
     revokeAllForUser(userId: number): void;
+    // Revokes every live dev-auth session (`grayboard login --dev`); returns how many.
+    revokeDev(): number;
     touch(sessionId: number, now: number): void;
   };
   principals: {
@@ -97,6 +132,8 @@ export interface Repo {
     create(scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
     find(address: string): Alias | undefined;
     listForScope(kind: ScopeKind, ref: string): Alias[];
+    // The scope's names less the Slack link's human, for the cap (#347).
+    countForScope(kind: ScopeKind, ref: string): number;
     // Every scope's alias of this name.
     findAllByName(name: string): Alias[];
     // Also deletes the alias's read points.
@@ -108,11 +145,27 @@ export interface Repo {
     create(name: string, createdBy: number): Team;
     findByName(name: string): Team | undefined;
     listForUser(userId: number): Team[];
-    addMember(teamId: number, userId: number): void;
+    // Adds a member with an explicit role; an existing member is left as is
+    // (false). Roles change through setRole.
+    addMember(teamId: number, userId: number, role?: TeamRole): boolean;
+    // Both throw LastOwner rather than leave a team with members and no
+    // owner (security audit F-02); the check and the write share one
+    // transaction. A team that already has no owner isn't guarded.
     removeMember(teamId: number, userId: number): void;
-    listMembers(teamId: number): { user_id: number; email: string }[];
+    // The member's previous role, or null when it isn't a member.
+    setRole(teamId: number, userId: number, role: TeamRole): TeamRole | null;
+    isOwner(teamId: number, userId: number): boolean;
+    listMembers(teamId: number): { user_id: number; email: string; role: TeamRole }[];
     listMemberUserIds(teamId: number): number[];
     isMember(teamId: number, userId: number): boolean;
+    // The previous policy, or null when the team is gone.
+    setPolicy(teamId: number, policy: TeamPolicy): TeamPolicy | null;
+    // Whether two users share a team whose policy is 'collaborative' or
+    // 'delegating': the grant under which one's agents may wake the other's (#806).
+    shareCollaborative(userA: number, userB: number): boolean;
+    // Whether two users share a team whose policy is 'delegating': the grant
+    // under which one's session may delegate to the other's launcher (#256).
+    shareDelegating(userA: number, userB: number): boolean;
   };
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
@@ -121,15 +174,22 @@ export interface Repo {
     // the ids and their uploader travel together, so the type requires one
     // with the other (#391). senderId: the sending session's ID (#284); null
     // for a writer with no session. via: the child session that wrote it
-    // (#523), else null.
+    // (#523), else null. senderUser: the writer's signed-in user (security
+    // audit F-10), kept out of reads like sender_id.
     insert(
       sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
-      files?: MessageFiles, senderId?: string | null, via?: string | null,
+      files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null,
     ): MessageRow;
+    // The writer's signed-in user of each message and post that has one
+    // recorded (rows from before F-10, bounces and system posts have none).
+    writerUsers(messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
+    // Which of these messages `delegate` wrote: each has a delegation.requested row targeting its recipient (#256).
+    delegationIds(messageIds: number[]): Set<number>;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
-    bouncesFrom(id: string): MessageRow[];
+    // since: only an end's own bounces, made at or after its time (a reopened ID can end again, #475).
+    bouncesFrom(id: string, since?: number): MessageRow[];
     // A session's direct messages, sent or received by any of its addresses
     // (#284 S8): with peer, only those between the set and peer.
     history(addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
@@ -145,11 +205,15 @@ export interface Repo {
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(senders: string[], since: number): MessageRow[];
     ack(reader: string, id: number): void;
+    // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
+    openDelegations(launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
     markDelivered(id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
-    // and has no reply. False if any of that doesn't hold.
-    retract(sender: string, id: number): boolean;
+    // and has no reply. False if any of that doesn't hold. Audited as
+    // message.retracted in the delete's transaction (#306), as local's
+    // retractMessage is, so every caller writes the row a repeat is answered from.
+    retract(sender: string, id: number, by: { actor: string | null; session: string | null }): boolean;
     prune(olderThanMs: number): void;
   };
   // An ended session's mail, as core endSession reaches it (#284 decision 4).
@@ -199,6 +263,13 @@ export interface Repo {
     pruneSession(session: string, before: number): number;
     prune(before: number): number;
   };
+  // The database file's free pages (#137).
+  storage: {
+    // Returns up to `maxPages` (> 0) free pages to the filesystem with
+    // `PRAGMA incremental_vacuum`. A file without auto_vacuum=INCREMENTAL
+    // (created before #170) reclaims nothing until a one-time VACUUM converts it.
+    reclaimFreePages(maxPages: number): { reclaimed: number; remaining: number; incremental: boolean };
+  };
   // Attachment bytes, by sha256; the attachment rows are metadata in this database.
   blobs: BlobStore;
   // The server's per-file and per-message caps; insert binds files under them.
@@ -207,16 +278,19 @@ export interface Repo {
   attachmentUserQuota: number;
 }
 
-export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number };
+// `now` is the hub's clock (application.ts): rows, audit and write receipts read one clock, so a test clock moves them together (#297).
+export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number };
 
 // undeliveredFrom: messages a sender has sent that the recipient's read point
 // hasn't reached. The read point is the last delivered-and-handled message id
 // (mailbox_cursors.last_seen_id); unread = `id > read point` — a message is counted
 // undelivered iff `id > read point`. Exported so the EXPLAIN pin asserts the
 // plan of the exact statement the code executes, not a hand-copied drift.
+// The unary `+` on recipient_type keeps the planner, which has no ANALYZE stats, off
+// idx_msg_recipient: that index on recipient_type alone is a pass over every user DM (#805).
 export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
              LEFT JOIN mailbox_cursors c ON c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient
-            WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient_type = 'user' AND m.recipient != m.sender
+            WHERE m.sender IN (SELECT value FROM json_each(?)) AND +m.recipient_type = 'user' AND m.recipient != m.sender
               AND m.id > COALESCE(c.last_seen_id, 0) AND m.delivered_at IS NULL AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
 
@@ -227,13 +301,21 @@ export const QUEUED_TO_SQL = `SELECT m.recipient, COUNT(*) AS n FROM messages m
               AND m.id > COALESCE((SELECT c.last_seen_id FROM mailbox_cursors c WHERE c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
             GROUP BY m.recipient`;
 
+// sentPending: the sender's pending DMs, unacked. Exported for the same EXPLAIN pin; `+` as in undeliveredFrom.
+export const SENT_PENDING_SQL = `SELECT ${M_MSG_COLS} FROM messages m
+            WHERE +m.recipient_type = 'user' AND m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
+              AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
+            ORDER BY m.id ASC`;
+
 // retract: the sender's message, still unread and unanswered. Exported for
 // the same EXPLAIN pin.
-export const RETRACTABLE_SQL = `SELECT 1 AS x FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
+export const RETRACTABLE_SQL = `SELECT recipient FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
                AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
                                    WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0) AND delivered_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`;
 
+// audit.last: the newest row for (action, target), searched by idx_access_log_action_target (#295).
+export const ACCESS_LOG_LAST_SQL = `SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1`;
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
   // auto_vacuum must precede the first page write.
@@ -244,11 +326,25 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     initCoreSchema(d);
     migrateHostedHolds(d);
     recordChildRoots(d);
+    sweepStaleLaunchers(d, (opts.now ?? Date.now)());
     seedSchema(d, first);
   });
-  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA);
+  authGenerationTriggers(db);
+  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, opts.now);
   setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
   return { db, repo };
+}
+
+// #853: a connection-local counter every write to the authorization tables bumps, by trigger, so no
+// write site can forget to. TEMP objects live and die with this connection, outside the schema, and
+// roll back with their transaction: authGeneration (makeRepo) reads the counter only outside one.
+function authGenerationTriggers(db: Database): void {
+  db.exec(`CREATE TEMP TABLE IF NOT EXISTS auth_generation(n INTEGER NOT NULL);
+    INSERT INTO auth_generation(n) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM auth_generation)`);
+  for (const table of ["oauth_tokens", "oauth_grants", "users"]) for (const op of ["INSERT", "UPDATE", "DELETE"]) {
+    db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS auth_generation_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
+      BEGIN UPDATE auth_generation SET n = n + 1; END`);
+  }
 }
 
 // #451: a hosted root holds aliases like any session, in alias_holds, whose address
@@ -285,6 +381,19 @@ function recordChildRoots(db: Database): void {
   `);
 }
 
+// #521 5: a server sets ids.launcher only for a live hosted root's ownership (hostedDeclareLauncher), and that
+// ownership's end clears it. A mark on any other row is stale: a pre-upgrade WSS launcher's, or a hosted root's
+// that ended before #532 cleared the flag at the end. It kept `peer_list` showing `launcher: true` on an offline
+// alias whose last holder it was, and `delegate(to:)` answering "a launcher but offline". One statement clears
+// them on every open (normally none); each cleared ID is audited `handle.launcher_set {on: false, reason: "stale"}`,
+// actor its principal (no ownership or client to name, unlike an end's row).
+function sweepStaleLaunchers(db: Database, now: number): void {
+  const cleared = db.prepare(`UPDATE ids SET launcher = 0 WHERE launcher = 1
+      AND NOT EXISTS (SELECT 1 FROM hosted_sessions h WHERE h.session_id = ids.id AND h.root_session_id IS NULL)
+      RETURNING id, principal`).all() as { id: string; principal: string | null }[];
+  for (const { id, principal } of cleared) insertAudit(db, now, principal, "handle.launcher_set", id, JSON.stringify({ on: false, reason: "stale" }));
+}
+
 function initSchema(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS hosted_ownerships (
@@ -300,6 +409,7 @@ function initSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_hosted_grant ON hosted_sessions(grant_id);
     CREATE INDEX IF NOT EXISTS idx_hosted_ownership ON hosted_sessions(ownership_id);
     CREATE INDEX IF NOT EXISTS idx_hosted_deadline ON hosted_sessions(lease_deadline);
+    CREATE INDEX IF NOT EXISTS idx_hosted_user ON hosted_sessions(user_id);
     -- A hosted root's holds are alias_holds rows (#451); the unique index on its old single name goes (migrateHostedHolds).
     DROP INDEX IF EXISTS idx_hosted_name;
     -- A hosted root's holds the server took (#453, revokeAliases), one row per alias (a second loss restates it).
@@ -383,6 +493,9 @@ function initSchema(db: Database): void {
       joined_at INTEGER NOT NULL,
       PRIMARY KEY (team_id, user_id)
     );
+    -- A user's teams, and whether two users share a collaborative one (the
+    -- msg.wake grant, #806), are indexed lookups (vision.md principle 11).
+    CREATE INDEX IF NOT EXISTS team_members_user ON team_members(user_id);
 
     CREATE TABLE IF NOT EXISTS messages (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -437,6 +550,8 @@ function initSchema(db: Database): void {
       detail TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_at ON access_log(at);
+    -- audit.last's (action, target) lookup, newest first: a repeated dm_retract asks it each time (#295).
+    CREATE INDEX IF NOT EXISTS idx_access_log_action_target ON access_log(action, target, at);
 
     -- The Slack bridge (src/server/slack.ts): who is linked, and which Slack
     -- thread holds which grayboard thread. board is '' for a dm, so the
@@ -497,6 +612,10 @@ function initSchema(db: Database): void {
     ["oauth_tokens", "access_scopes", "TEXT"],
     ["oauth_codes", "grant_id", "TEXT REFERENCES oauth_grants(id) ON DELETE CASCADE"],
   ];
+  // users.idp_subject (security audit F-13): unique among the users that have one.
+  const userColumns = db.query<{ name: string }, []>(`PRAGMA table_info(users)`).all();
+  if (!userColumns.some(c => c.name === "idp_subject")) db.exec(`ALTER TABLE users ADD COLUMN idp_subject TEXT`);
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_idp_subject ON users(idp_subject) WHERE idp_subject IS NOT NULL");
   for (const [table, column, definition] of oauthColumns) {
     const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
     if (!columns.some(c => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -515,6 +634,28 @@ function initSchema(db: Database): void {
   // via: the child session (a harness subagent, #523) that wrote it under its
   // root's addresses; null for a root's own write.
   if (!msgCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE messages ADD COLUMN via TEXT`);
+  // sender_user: the writer's signed-in user (security audit F-10), so a
+  // recipient of another user can be told so; null before it and for bounces.
+  if (!msgCols.some((c) => c.name === "sender_user")) db.exec(`ALTER TABLE messages ADD COLUMN sender_user TEXT`);
+  // role: 'owner' or 'member' (security audit F-02); null on rows from
+  // before it, read through OWNER_SQL.
+  const tmCols = db.prepare(`PRAGMA table_info(team_members)`).all() as { name: string }[];
+  if (!tmCols.some((c) => c.name === "role")) db.exec(`ALTER TABLE team_members ADD COLUMN role TEXT`);
+  // ip, ua: the client address and user agent of the request that wrote the
+  // row (security audit F-19, request_context.ts); null for work no request
+  // caused and on rows from before it.
+  const logCols = db.prepare(`PRAGMA table_info(access_log)`).all() as { name: string }[];
+  if (!logCols.some((c) => c.name === "ip")) db.exec(`ALTER TABLE access_log ADD COLUMN ip TEXT`);
+  if (!logCols.some((c) => c.name === "ua")) db.exec(`ALTER TABLE access_log ADD COLUMN ua TEXT`);
+}
+
+/**
+ * Every access_log row goes in here: it stamps the client address and user
+ * agent of the request whose handling wrote it (security audit F-19).
+ */
+function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
+  const o = requestOrigin();
+  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua) VALUES (?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null]);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -539,35 +680,120 @@ function seedSchema(db: Database, first: boolean): void {
 }
 
 /** A team's name another principal already has (#284 decision 5). */
+// A team member's role (security audit F-02). Owners (and admins) manage
+// membership; members read. A row written before roles existed has a null
+// role and reads as owner only for the team's creator (OWNER_SQL), so no
+// backfill is needed; every write since stores an explicit role.
+export type TeamRole = "owner" | "member";
+const OWNER_SQL = `(tm.role = 'owner' OR (tm.role IS NULL AND tm.user_id = (SELECT created_by FROM teams WHERE id = tm.team_id)))`;
+
+export class LastOwner extends Error {
+  constructor(readonly team: string) {
+    super(`the last owner of team "${team}" can't leave while others remain; make another member an owner first: grayboard team add ${team} <email> --role owner`);
+  }
+}
+
 export class PrincipalTaken extends Error {
   constructor(readonly name: string) {
     super(`the name "${name}" belongs to another team or service principal`);
   }
 }
 
-function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number): Repo {
+function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
   const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
+  // Refuses to take `userId`'s ownership away when it is the team's last
+  // owner and other members remain. A sole member may leave; a team with
+  // no owner (its creator left before roles existed) has nothing to guard.
+  const guardLastOwner = (teamId: number, userId: number): void => {
+    const c = db.query<{ owners: number; members: number; me: number }, [number, number]>(
+      `SELECT COALESCE(SUM(${OWNER_SQL}), 0) AS owners, COUNT(*) AS members,
+              COALESCE(SUM(tm.user_id = ? AND ${OWNER_SQL}), 0) AS me
+       FROM team_members tm WHERE tm.team_id = ?`,
+    ).get(userId, teamId)!;
+    if (c.me && c.owners === 1 && c.members > 1) {
+      throw new LastOwner(db.query<{ name: string }, [number]>("SELECT name FROM teams WHERE id = ?").get(teamId)!.name);
+    }
+  };
+  // Whether two users share a team whose policy is one of `policies`: one indexed lookup (principle 11).
+  const sharePolicy = (userA: number, userB: number, policies: readonly TeamPolicy[]): boolean =>
+    !!db.query<{ x: number }, (number | string)[]>(
+      `SELECT 1 AS x FROM team_members a
+       JOIN team_members b ON b.team_id = a.team_id AND b.user_id = ?
+       JOIN teams t ON t.id = a.team_id AND t.policy IN (${policies.map(() => "?").join(", ")})
+       WHERE a.user_id = ? LIMIT 1`,
+    ).get(userB, ...policies, userA);
   const principalByName = (name: string): PrincipalRow | undefined =>
     db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
-  const observers = new Set<() => void>();
-  const changed = () => afterCommit(db, () => { for (const fn of observers) { try { fn(); } catch (error) { console.error("hosted invalidation failed", error); } } });
+  // Each changed row tells the observers after its transaction commits (#399); a rollback drops the notice with
+  // the change. `null`: any row may have changed (a grant or a user), so observers check every one.
+  const observers = new Set<(changed: string | null) => void>();
+  const changed = (id: string | null) => afterCommit(db, () => { for (const fn of observers) { try { fn(id); } catch (error) { console.error("hosted invalidation failed", error); } } });
   const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
     const value = fn(...args);
-    changed();
+    changed(null);
     return value;
   };
-  const oauth = makeOAuthStore(db);
+  const marks = <A extends unknown[], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R => {
+    const value = fn(...args);
+    changed(id(...args));
+    return value;
+  };
   const hosted = makeHostedStore(db);
+  const oauth = makeOAuthStore(db, hosted);
+  // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
+  // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
+  // on every cached auth read.
+  const counter = db.query<{ n: number }, []>("SELECT n FROM temp.auth_generation");
+  const dataVersion = db.query<{ data_version: number }, []>("PRAGMA data_version");
+  // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this connection or
+  // another; undefined inside a transaction, whose writes may yet roll back (#853).
+  const authGeneration = () => db.inTransaction ? undefined : `${counter.get()!.n}:${dataVersion.get()!.data_version}`;
+  const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+  // Caches of what the auth tables say, cleared when authGeneration moves: a live access token only (an
+  // unknown or dead one is re-read every time); a user row, or its absence, as read (#853). They sit
+  // here, under the store's own methods, so a test that replaces one of those methods replaces the cache too.
+  let userGeneration: string | undefined;
+  const users = new Map<number, User | null>();
+  const cachedUser = (userId: number): User | undefined => {
+    const g = authGeneration();
+    if (g === undefined) return userById(userId);
+    if (g !== userGeneration) { users.clear(); userGeneration = g; }
+    let u = users.get(userId);
+    if (u === undefined) users.set(userId, u = userById(userId) ?? null);
+    return u ?? undefined;
+  };
+  // A live access token by hash: held while the generation is unchanged and both the token and its grant
+  // are unexpired, the join's own time conditions; required scopes are checked against the held scopes.
+  let accessGeneration: string | undefined;
+  const accesses = new Map<string, OAuthAccess>();
+  const findActiveAccess: OAuthStore["findActiveAccess"] = (h, resource, requiredScopes, now) => {
+    const g = authGeneration();
+    if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(h, resource, requiredScopes, now);
+    if (g !== accessGeneration) { accesses.clear(); accessGeneration = g; }
+    const key = `${resource}\n${h}`;
+    let a = accesses.get(key);
+    if (!a || !(now < a.expiresAt && now < a.grantExpiresAt)) {
+      a = oauth.findActiveAccess(h, resource, [], now);
+      if (!a) { accesses.delete(key); return undefined; }
+      accesses.set(key, a);
+    }
+    const held = a;
+    return requiredScopes.every(s => held.scopes.includes(s)) ? held : undefined;
+  };
   return {
+    now: clock,
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
 
-    oauth: { ...oauth, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
-    hosted: { ...hosted, atomic: change(hosted.atomic), subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
+    oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
+    hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
+      end: marks(hosted.end, session => session), childEnd: marks(hosted.childEnd, session => session),
+      park: marks(hosted.park, session => session), unpark: marks(hosted.unpark, session => session),
+      subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
     users: {
       upsertByEmail(email, displayName) {
-        const now = Date.now();
+        const now = clock();
         return db.transaction(() => {
           db.run(
             `INSERT INTO users (email, display_name, created_at) VALUES (?, ?, ?)
@@ -579,30 +805,58 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return user;
         })();
       },
+      signIn(email, subject, displayName) {
+        return db.transaction((): IdpSignIn => {
+          const bySubject = db.query<User, [string]>("SELECT * FROM users WHERE idp_subject = ?").get(subject);
+          if (bySubject) {
+            if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
+            db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
+            return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+          }
+          const byEmail = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email);
+          if (byEmail?.idp_subject) return { status: "subject_mismatch", user: byEmail };
+          // A disabled account is refused by the caller: a refused sign-in
+          // must not bind it to whoever tried (security audit F-13).
+          if (byEmail && byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
+          const user = this.upsertByEmail(email, displayName);
+          db.run("UPDATE users SET idp_subject = ? WHERE id = ?", [subject, user.id]);
+          return { status: "ok", user: { ...user, idp_subject: subject }, linked: byEmail !== null && byEmail !== undefined };
+        }).immediate();
+      },
+      clearSubject(userId) {
+        db.run("UPDATE users SET idp_subject = NULL WHERE id = ?", [userId]);
+      },
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
       },
-      findById(userId) {
-        return db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+      findById: userById,
+      isDisabled(userId) {
+        return cachedUser(userId)?.disabled_at != null;
+      },
+      activeEmail(userId) {
+        const u = cachedUser(userId);
+        return u && u.disabled_at === null ? u.email : undefined;
       },
       setDisabled(userId, disabled) {
         db.transaction(() => {
-          const now = Date.now();
+          const now = clock();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);
           if (disabled) {
-            endHostedWhere(db, "disabled", now, row => row.user_id === userId);
+            // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
+            db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
+            endHostedWhere(hosted, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
             db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
           }
         }).immediate();
-        changed();
+        changed(null);
       },
     },
 
     sessions: {
       create(userId, tokenHash, label) {
-        const now = Date.now();
+        const now = clock();
         const r = db.run(
           `INSERT INTO sessions (user_id, token_hash, created_at, last_used_at, label) VALUES (?, ?, ?, ?, ?)`,
           [userId, tokenHash, now, now, label],
@@ -621,17 +875,20 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(sessionId) ?? undefined;
       },
       revoke(sessionId) {
-        db.run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [Date.now(), sessionId]);
+        db.run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [clock(), sessionId]);
       },
       revokeAllForUser(userId) {
         db.transaction(() => {
-          const now = Date.now();
+          const now = clock();
           db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
-          endHostedWhere(db, "revoked", now, row => row.user_id === userId);
+          endHostedWhere(hosted, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         }).immediate();
-        changed();
+        changed(null);
+      },
+      revokeDev() {
+        return db.run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
       },
       touch(sessionId, now) {
         db.run("UPDATE sessions SET last_used_at = ? WHERE id = ?", [now, sessionId]);
@@ -662,7 +919,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return db.query<Alias, [string, string, string, string, string, number]>(
           `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
            VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
-        ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, Date.now())!;
+        ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;
       },
       find(address) {
         return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
@@ -671,6 +928,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return db.query<Alias, [string, string]>(
           `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
         ).all(ref, kind);
+      },
+      countForScope(kind, ref) {
+        return db.query<{ n: number }, [string, string, string]>(
+          `SELECT COUNT(*) AS n FROM aliases WHERE scope_ref = ? AND scope_kind = ? AND name != ?`,
+        ).get(ref, kind, HUMAN_NAME)!.n;
       },
       findAllByName(name) {
         return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
@@ -686,7 +948,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     teams: {
       create(name, createdBy) {
         return db.transaction(() => {
-          const now = Date.now();
+          const now = clock();
           if (db.query<{ x: number }, [string]>("SELECT 1 AS x FROM principals WHERE name = ?").get(name)) throw new PrincipalTaken(name);
           const team = db.query<Team, [string, number, number]>(
             "INSERT INTO teams (name, created_by, created_at) VALUES (?, ?, ?) RETURNING *",
@@ -703,20 +965,39 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`,
         ).all(userId);
       },
-      addMember(teamId, userId) {
-        db.run(
-          "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at) VALUES (?, ?, ?)",
-          [teamId, userId, Date.now()],
-        );
+      addMember(teamId, userId, role = "member") {
+        return db.run(
+          "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at, role) VALUES (?, ?, ?, ?)",
+          [teamId, userId, clock(), role],
+        ).changes > 0;
       },
       removeMember(teamId, userId) {
-        db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
+        db.transaction(() => {
+          guardLastOwner(teamId, userId);
+          db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
+        })();
+      },
+      setRole(teamId, userId, role) {
+        return db.transaction(() => {
+          const row = db.query<{ owner: number }, [number, number]>(
+            `SELECT ${OWNER_SQL} AS owner FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ?`,
+          ).get(teamId, userId);
+          if (!row) return null;
+          if (role === "member") guardLastOwner(teamId, userId);
+          db.run("UPDATE team_members SET role = ? WHERE team_id = ? AND user_id = ?", [role, teamId, userId]);
+          return row.owner ? "owner" : "member";
+        })();
+      },
+      isOwner(teamId, userId) {
+        return !!db.query<{ x: number }, [number, number]>(
+          `SELECT 1 AS x FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ? AND ${OWNER_SQL}`,
+        ).get(teamId, userId);
       },
       listMembers(teamId) {
-        return db.query<{ user_id: number; email: string }, [number]>(
-          `SELECT u.id as user_id, u.email FROM users u
+        return db.query<{ user_id: number; email: string; owner: number }, [number]>(
+          `SELECT u.id as user_id, u.email, ${OWNER_SQL} AS owner FROM users u
            JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ?`,
-        ).all(teamId);
+        ).all(teamId).map(({ owner, ...m }) => ({ ...m, role: owner ? "owner" : "member" }));
       },
       listMemberUserIds(teamId) {
         return db.query<{ user_id: number }, [number]>(
@@ -728,15 +1009,29 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           "SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?",
         ).get(teamId, userId);
       },
+      setPolicy(teamId, policy) {
+        return db.transaction(() => {
+          const row = db.query<{ policy: string }, [number]>("SELECT policy FROM teams WHERE id = ?").get(teamId);
+          if (!row) return null;
+          db.run("UPDATE teams SET policy = ? WHERE id = ?", [policy, teamId]);
+          return (TEAM_POLICIES as readonly string[]).includes(row.policy) ? row.policy as TeamPolicy : "open";
+        })();
+      },
+      shareCollaborative(userA, userB) {
+        return sharePolicy(userA, userB, ["collaborative", "delegating"]);
+      },
+      shareDelegating(userA, userB) {
+        return sharePolicy(userA, userB, ["delegating"]);
+      },
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null) {
+      insert(sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
         return db.transaction(() => {
-          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null]>(
-            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
-          ).get(sender, senderId, recipientType, recipient, body, parentId, Date.now(), pending ? 1 : 0, via)!;
+          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null]>(
+            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
+          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via, senderUser)!;
           const attachments = files ? bindAttachments(db, files.ids, files.uploader, { message_id: row.id }, attachmentLimits) : [];
           return attachments.length ? { ...row, attachments } : row;
         })();
@@ -744,8 +1039,31 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       getById(id) {
         return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
       },
-      bouncesFrom(id) {
-        return db.query<MessageRow, [string]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' ORDER BY id`).all(id);
+      writerUsers(messageIds, postIds) {
+        const pairs = (table: "messages" | "posts", column: "sender_user" | "author_user", ids: number[]) => new Map(ids.length === 0 ? [] :
+          db.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
+            .all(JSON.stringify(ids)).map((r) => [r.id, r.user] as const));
+        return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds) };
+      },
+      // The delegation.requested row is written in the message's own
+      // transaction on the same clock, so a window around created_at bounds
+      // the (action, target, at) index scan: access_log isn't pruned, and an
+      // unbounded join would read every request a launcher ever got per
+      // message (principle 11, #878 audit). The window's width only absorbs
+      // a slow transaction or a clock step. CROSS JOIN fixes the order
+      // (messages first), so the planner can't drive from access_log by
+      // action alone.
+      delegationIds(messageIds) {
+        return new Set(db.query<{ id: number }, [string]>(
+          `SELECT m.id FROM messages m
+           CROSS JOIN access_log a ON a.action = 'delegation.requested' AND a.target = m.recipient
+             AND a.at BETWEEN m.created_at - 60000 AND m.created_at + 60000
+             AND json_extract(a.detail, '$.message_id') = m.id
+           WHERE m.id IN (SELECT value FROM json_each(?))`,
+        ).all(JSON.stringify(messageIds)).map((r) => r.id));
+      },
+      bouncesFrom(id, since = 0) {
+        return db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);
       },
       history(addresses, peer, limit = 20, beforeId) {
         const set = JSON.stringify(addresses);
@@ -818,27 +1136,28 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       sentPending(senders, since) {
         return att(db.query<MessageRow, [string, number]>(
-          `SELECT ${M_MSG_COLS} FROM messages m
-            WHERE m.recipient_type = 'user' AND m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
-              AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
-            ORDER BY m.id ASC`,
+          SENT_PENDING_SQL,
         ).all(JSON.stringify(senders), since));
       },
+      openDelegations(launcher, since) {
+        return countOpenDelegations(db, "access_log", launcher, since);
+      },
       ack(reader, id) {
-        db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, Date.now()]);
+        db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
       },
       markDelivered(id, at) {
         db.run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
       },
-      retract(sender, id) {
+      retract(sender, id, by) {
         return db.transaction(() => {
-          const retractable = db.query<{ x: number }, [number, string]>(
+          const retractable = db.query<{ recipient: string }, [number, string]>(
             RETRACTABLE_SQL,
           ).get(id, sender);
           if (!retractable) return false;
           dropAttachments(db, "message", "?", id);
           db.run("DELETE FROM messages WHERE id = ?", [id]);
           db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
+          insertAudit(db, clock(), by.actor, "message.retracted", `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: retractable.recipient, session: by.session }));
           return true;
         })();
       },
@@ -859,27 +1178,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
-    mail: {
-      unread(id) {
-        return db.query<{ id: number; sender: string }, [string]>(
-          `SELECT m.id, m.sender FROM messages m
-            WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
-              AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                    WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
-            ORDER BY m.id`,
-        ).all(id);
-      },
-      bounce(from, to, parentId, body, now) {
-        db.query(
-          `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
-           VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
-        ).run(from, to, body, parentId, now);
-      },
-      dropReader(id) {
-        db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
-        db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
-      },
-    },
+    mail: mailPort(db),
 
     cursors: {
       get(address, streamType, streamRef) {
@@ -906,16 +1205,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     audit: {
       write(row) {
-        db.run(
-          "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)",
-          [row.at, row.actor, row.action, row.target, row.detail],
-        );
+        insertAudit(db, row.at, row.actor, row.action, row.target, row.detail);
       },
       last(action, target) {
         return (
           db
             .query<AccessLogRow, [string, string]>(
-              "SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1",
+              ACCESS_LOG_LAST_SQL,
             )
             .get(action, target) ?? undefined
         );
@@ -954,7 +1250,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run(
             `INSERT INTO slack_links (user_id, slack_user, dm_channel, linked_at) VALUES (?, ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET slack_user = excluded.slack_user, dm_channel = excluded.dm_channel, linked_at = excluded.linked_at`,
-            [userId, slackUser, dmChannel, Date.now()],
+            [userId, slackUser, dmChannel, clock()],
           );
         })();
       },
@@ -1031,16 +1327,22 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
+    storage: {
+      reclaimFreePages(maxPages) {
+        return reclaimFreePages(db, maxPages);
+      },
+    },
+
     blobs,
     attachmentLimits,
     attachmentUserQuota,
   };
 }
 
-function makeOAuthStore(db: Database): OAuthStore {
+function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
-    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail })]);
+    insertAudit(db, now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail }));
   };
   const invalid = { status: "invalid" } as const;
   const missing = { status: "not_found" } as const;
@@ -1087,7 +1389,7 @@ function makeOAuthStore(db: Database): OAuthStore {
   const revokeGrant = (id: string, now: number) => {
     testPause("hosted:revoke:in-txn");
     db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, id]);
-    endHostedWhere(db, "revoked", now, row => row.grant_id === id);
+    endHostedWhere(hosted, "revoked", now, row => row.grant_id === id);
   };
   type Token = { hash: string; grant_id: string; kind: string; expires_at: number; spent_at: number | null; revoked_at: number | null; created_at: number };
   const token = (h: string) => db.query<Token, [string]>("SELECT * FROM oauth_tokens WHERE hash = ?").get(h);
@@ -1245,8 +1547,8 @@ function makeOAuthStore(db: Database): OAuthStore {
     findActiveAccess(h, resource, requiredScopes, now) {
       if (!time(now) || !hash(h) || !Array.isArray(requiredScopes)) return undefined;
       // One read snapshot binds token, grant and user liveness.
-      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null }, [string, number, number]>(`
-        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes FROM oauth_tokens t
+      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null; grant_expiry: number }, [string, number, number]>(`
+        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes, g.expires_at AS grant_expiry FROM oauth_tokens t
         JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
         WHERE t.hash = ? AND t.kind = 'access' AND t.revoked_at IS NULL AND t.expires_at > ?
           AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now, now);
@@ -1257,7 +1559,7 @@ function makeOAuthStore(db: Database): OAuthStore {
       if (!scopes(accessScopes) || !accessScopes.every(s => g.scopes.includes(s)) ||
           g.resource !== resource || !requiredScopes.every(s => accessScopes.includes(s))) return undefined;
       const a: OAuthAccess = { tokenHash: h, grantId: g.id, userId: g.userId, clientId: g.clientId,
-        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry };
+        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry, grantExpiresAt: row.grant_expiry };
       return a;
     },
     isGrantActive(id, now) {
@@ -1296,12 +1598,49 @@ function makeOAuthStore(db: Database): OAuthStore {
   };
 }
 
+// The server's mail as core's session end reads it (a MailPort): the repo's, and the hosted store's child ends (#475).
+function mailPort(db: Database): MailPort {
+  return {
+    unread(id) {
+      return db.query<{ id: number; sender: string }, [string]>(
+        `SELECT m.id, m.sender FROM messages m
+          WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
+            AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                  WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
+          ORDER BY m.id`,
+      ).all(id);
+    },
+    bounce(from, to, parentId, body, now) {
+      db.query(
+        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
+         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
+      ).run(from, to, body, parentId, now);
+    },
+    dropReader(id) {
+      db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
+      db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
+    },
+  };
+}
+
 function makeHostedStore(db: Database): HostedStore {
   const get = (id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
   const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
     const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
       WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
-    db.run("INSERT INTO access_log(at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", [now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null })]);
+    insertAudit(db, now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null }));
+  };
+  // A released child's ID ends in the release's transaction, with its reason (#475 item 1): left unended,
+  // nothing owns it, and the next start would end it as a WSS leftover. The ends' wakes wait in `ended`,
+  // queued at commit, for the application to run (`takeEnded`).
+  const mail = mailPort(db);
+  const coreAudit = (now: number): AuditSink => (action, actor, target, detail) =>
+    insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
+  let ended: EndedChild[] = [];
+  const endChild = (child: string, why: string, now: number) => {
+    const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
+    // Queued at commit, so a rolled-back release wakes nobody and bounces nothing.
+    if (end.ended) afterCommit(db, () => { ended.push({ id: child, at: now, wake: end.wake }); });
   };
   // The hosted_alias_lost column each reader's take marks (#453).
   const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
@@ -1324,7 +1663,12 @@ function makeHostedStore(db: Database): HostedStore {
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
     ).get(id, id) !== null,
     all: () => db.query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all(),
+    counts: (user) => db.query<{ total: number; user: number }, [number]>(
+      "SELECT (SELECT count(*) FROM hosted_sessions WHERE parked_at IS NULL) AS total, (SELECT count(*) FROM hosted_sessions WHERE user_id = ?1 AND parked_at IS NULL) AS user").get(user)!,
+    ofOwnership: (ownership) => db.query<HostedSession, [number]>("SELECT * FROM hosted_sessions WHERE ownership_id = ? AND parked_at IS NULL").all(ownership),
     children: (root) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
+    roots: (user) => db.query<HostedSession, [number]>(
+      "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
     park(session, now) {
       db.run("UPDATE hosted_sessions SET parked_at = ? WHERE session_id = ? AND root_session_id IS NOT NULL AND parked_at IS NULL", [now, session]);
     },
@@ -1345,11 +1689,28 @@ function makeHostedStore(db: Database): HostedStore {
       db.run("UPDATE hosted_sessions SET grant_id = ?, bind_gen = ?, root_session_id = ?, ownership_id = ?, place = ?, lease_deadline = ?, last_seen_at = ? WHERE session_id = ?",
         [row.grant_id, row.bind_gen, row.root_session_id, row.ownership_id, row.place, row.lease_deadline, row.last_seen_at, row.session_id]);
     },
+    touch(session, now) {
+      db.run("UPDATE hosted_sessions SET last_seen_at = ? WHERE session_id = ?", [now, session]);
+    },
+    // The unary `+` keeps the planner off idx_hosted_root, which every root matches, so these two read
+    // idx_hosted_deadline and idx_hosted_user (#399).
+    expired: (now) => db.query<HostedSession, [number]>(
+      "SELECT * FROM hosted_sessions WHERE lease_deadline <= ? AND +root_session_id IS NULL").all(now),
+    idle: (cutoff) => db.query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
+      AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
+    disabled: () => db.query<HostedSession, []>(
+      "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
     childEnd(session, now, reason) {
       const row = get(session);
       if (!row?.root_session_id) return;
       db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
       audit(row.root_session_id, "hosted.child_released", { child: session, reason }, now);
+      endChild(session, reason, now);
+    },
+    takeEnded() {
+      const taken = ended;
+      ended = [];
+      return taken;
     },
     end(session, reason, now, deadline) {
       const row = get(session);
@@ -1357,7 +1718,7 @@ function makeHostedStore(db: Database): HostedStore {
       testPause(reason === "expired" ? "hosted:lease-expire:in-txn" : "hosted:release:in-txn");
       const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id);
       db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
-      // A hosted ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
+      // A hosted root's ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
       // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it. The
       // launcher flag (#473) is the ownership's too: a resumed session that no longer declares one isn't one. Clearing
       // it is audited as its setting is (#532), so the trail shows when a hosted launcher stopped being one.
@@ -1369,7 +1730,10 @@ function makeHostedStore(db: Database): HostedStore {
         dropHold(db, address, session);
         logBinding(db, session, address, "released", reason, now);
       }
-      for (const child of children) if (child.root_session_id) audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
+      for (const child of children) if (child.root_session_id) {
+        audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
+        endChild(child.session_id, reason, now);
+      }
       if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
       return true;
     },
@@ -1396,7 +1760,8 @@ function makeHostedStore(db: Database): HostedStore {
   return store;
 }
 
-function endHostedWhere(db: Database, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
-  const hosted = makeHostedStore(db);
+// The repo's own hosted store, never a fresh one: a child's end queues its wakes in that store's `ended`,
+// which the application drains (#475 item 1).
+function endHostedWhere(hosted: HostedStore, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
   for (const row of hosted.all()) if (!row.root_session_id && predicate(row)) hosted.end(row.session_id, reason, now);
 }

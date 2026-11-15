@@ -14168,7 +14168,7 @@ var package_default = {
   scripts: {
     server: "bun src/server/main.ts",
     cli: "bun src/cli/main.ts",
-    typecheck: "tsc --noEmit",
+    typecheck: "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
     test: "bun test --timeout 30000 ./src ./tests",
     "test:opencode": "bash scripts/e2e.sh hosted-strict",
     "test:opencode:host": "bash scripts/e2e.sh hosted-host",
@@ -14180,7 +14180,7 @@ var package_default = {
   dependencies: {
     "@modelcontextprotocol/core": "2.4.0",
     "@modelcontextprotocol/server": "2.4.0",
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
     commander: "^12.0.0",
     jose: "^5.0.0",
     "jsonc-parser": "^3.3.1",
@@ -31576,6 +31576,14 @@ class SubscriberError extends Error {
   }
 }
 var shownText = (value) => typeof value === "string" && value.length > 0 && value.length <= 2048 && !/[\x00-\x1f\x7f-\x9f\u202A-\u202E\u2066-\u2069]/.test(value);
+var SERVER_TEXT_LIMIT = 512;
+var serverText = (text) => text.length <= SERVER_TEXT_LIMIT ? text : `${text.slice(0, SERVER_TEXT_LIMIT)}\u2026 (${text.length - SERVER_TEXT_LIMIT} more characters cut)`;
+function capServerText(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof Error && e.message.length > SERVER_TEXT_LIMIT)
+      e.message = serverText(e.message);
+  }
+}
 
 class LeaseUnavailable extends SubscriberError {
   constructor(code = "not_found") {
@@ -31603,7 +31611,7 @@ class ConnectRefused extends SubscriberError {
     super(typeof code === "string" && domainCodes.has(code) ? code : "invalid_response");
     this.status = status;
     this.body = body;
-    this.message = `Server refused the connection (HTTP ${status}): ${body}`;
+    this.message = `Server refused the connection (HTTP ${status}): ${serverText(body)}`;
   }
 }
 
@@ -31752,6 +31760,7 @@ class Connection {
     try {
       return await pending;
     } catch (error) {
+      capServerText(error);
       if (!(error instanceof ConnectRefused) && scopeRefusal(error))
         throw new InsufficientScope(error);
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
@@ -31801,6 +31810,17 @@ class Wire extends Connection {
     if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== "text")
       throw new Error("Invalid delivery response");
     return JSON.parse(content[0].text);
+  }
+  async takes(tool, arg) {
+    let cursor;
+    do {
+      const page = await this.reachable(this.client.listTools(cursor === undefined ? {} : { cursor }, this.options()));
+      const found = page.tools.find((t) => t.name === tool);
+      if (found)
+        return Object.hasOwn(found.inputSchema.properties ?? {}, arg);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return false;
   }
   async listen() {
     const subscription = await this.reachable(this.client.listen({ resourceSubscriptions: ["grayboard://inbox"] }, this.options()));
@@ -31873,7 +31893,7 @@ function isOwnHuman(event, identity) {
 }
 
 // adapters/hosted-core/src/model.ts
-var ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
+var ADDRESS = /^[^\x00-\x20\x7f-\x9f\u202a-\u202e\u2066-\u2069]{1,160}$/;
 var MAX_HELD = 64;
 var validAddress = (value) => typeof value === "string" && ADDRESS.test(value);
 var validHeld = (value) => Array.isArray(value) && value.length <= MAX_HELD && value.every(validAddress) && new Set(value).size === value.length;
@@ -33046,24 +33066,32 @@ function warnOnce(key, text) {
 function procStarts(pids) {
   const out = new Map;
   if (process.platform !== "linux") {
-    const starts = ps("lstart", pids);
+    const lines = ps("stat=,lstart", pids);
     for (const pid of pids) {
-      const start = starts ? starts.get(pid) : null;
-      if (start !== undefined)
-        out.set(pid, start);
+      const m = lines?.get(pid)?.match(/^(\S+)\s+(.*)$/);
+      if (m && exited(m[1]))
+        continue;
+      if (m)
+        out.set(pid, m[2]);
       else if (pidExists(pid))
         out.set(pid, null);
     }
     return out;
   }
   for (const pid of pids) {
-    const start = statFields(pid)?.[19];
+    const fields = statFields(pid);
+    if (fields && exited(fields[0]))
+      continue;
+    const start = fields?.[19];
     if (start)
       out.set(pid, start);
     else if (pidExists(pid))
       out.set(pid, null);
   }
   return out;
+}
+function exited(state) {
+  return state.startsWith("Z") || state.startsWith("X");
 }
 function procStart(pid) {
   const starts = procStarts([pid]);
@@ -34890,6 +34918,11 @@ var ATTACHMENTS_PARAM = {
   items: { type: "string" },
   description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`
 };
+var ATTACHMENT_IDS_PARAM = {
+  type: "array",
+  items: { type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+};
 var ATTACHMENT_GET_TOOL = {
   name: "attachment_get",
   description: "attachment_get(id, dir?): save a file attached to a message or post you can read (ids are in its attachments) and return the saved path.",
@@ -34921,6 +34954,9 @@ function attachmentsDir(env = process.env) {
 }
 
 // src/shared/notifications.ts
+function fenceChannel(content) {
+  return content.replace(/<(?=\s*\/?\s*channel)/gi, "&lt;");
+}
 function viaLabel(via) {
   return `subagent ${via}, harness-asserted`;
 }
@@ -34940,6 +34976,12 @@ function dmNotification(msg, primary) {
     meta.parent_id = String(msg.parent_id);
   if (msg.kind)
     meta.kind = msg.kind;
+  if (msg.other_user)
+    meta.other_user = "true";
+  if (msg.ungranted)
+    meta.ungranted = "true";
+  if (msg.delegated)
+    meta.delegated = "true";
   addFiles(meta, msg.attachments);
   return { content: msg.body, meta };
 }
@@ -34957,6 +34999,10 @@ function boardNotification(item) {
       meta.via = p.via;
     if (p.parent_id !== null)
       meta.parent_id = String(p.parent_id);
+    if (p.other_user)
+      meta.other_user = "true";
+    if (p.ungranted)
+      meta.ungranted = "true";
     addFiles(meta, p.attachments);
     if (item.deferred)
       meta.deferred = "true";
@@ -34966,22 +35012,17 @@ function boardNotification(item) {
   const from = item.latest.via ? `${item.latest.author} (${viaLabel(item.latest.via)})` : item.latest.author;
   return {
     content: `#${item.board} has ${item.unread} unread post${item.unread === 1 ? "" : "s"}. Latest from ${from}: "${snippet}${item.latest.body.length > 160 ? "\u2026" : ""}" Call board_read if it's relevant.`,
-    meta: { board: item.board, kind: "digest", unread: String(item.unread) }
+    meta: { board: item.board, kind: "digest", unread: String(item.unread), ...item.latest.other_user ? { other_user: "true" } : {} }
   };
 }
 
 // adapters/hosted-core/src/channel.ts
 function channelParams(item, identity) {
   const event = InboxEvent.parse(item.event);
-  if (event.kind === "direct") {
-    const params = dmNotification(event.message, identity.identity_full);
-    if (isOwnHuman(event, identity))
-      params.meta.human = "true";
-    return params;
-  }
-  const params = boardNotification(event.item);
+  const params = event.kind === "direct" ? dmNotification(event.message, identity.identity_full) : boardNotification(event.item);
   if (isOwnHuman(event, identity))
     params.meta.human = "true";
+  params.content = fenceChannel(params.content);
   return params;
 }
 
@@ -35285,6 +35326,27 @@ var native_tools_default = [
     }
   },
   {
+    name: "board_archive",
+    description: "board_archive(board, archived?): retire a board you created once its work is done: it leaves board_list and takes no new top-level posts, while replies, reads by name and subscriptions go on. archived false reopens it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: {
+          type: "string",
+          description: 'Board name, with or without the "#": "e2e" or "#e2e".'
+        },
+        archived: {
+          type: "boolean",
+          description: "Default true; false reopens the board."
+        }
+      },
+      required: [
+        "board"
+      ],
+      additionalProperties: false
+    }
+  },
+  {
     name: "board_post",
     description: "board_post(board, body, parent_id?, attachment_ids?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
     inputSchema: {
@@ -35302,16 +35364,7 @@ var native_tools_default = [
           type: "number",
           description: "Optional. post_id to reply to."
         },
-        resend: {
-          type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes."
-        },
-        as: {
-          type: "string",
-          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
-        },
         attachment_ids: {
-          $schema: "https://json-schema.org/draft/2020-12/schema",
           type: "array",
           items: {
             type: "integer",
@@ -35319,6 +35372,14 @@ var native_tools_default = [
             maximum: 9007199254740991
           },
           description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+        },
+        resend: {
+          type: "boolean",
+          description: "true sends again even if an identical call landed in the last 10 minutes."
+        },
+        as: {
+          type: "string",
+          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
         }
       },
       required: [
@@ -35536,20 +35597,23 @@ var native_tools_default = [
   },
   {
     name: "dm_send",
-    description: "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
+    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
     inputSchema: {
       type: "object",
       properties: {
         to: {
-          type: "string"
+          type: "string",
+          description: "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
         },
         body: {
-          type: "string"
+          type: "string",
+          description: "Message body. Plain text or markdown."
         },
         parent_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Optional. message_id this is replying to; sets the thread parent."
         },
         pending: {
           type: "boolean",
@@ -35577,7 +35641,6 @@ var native_tools_default = [
         "to",
         "body"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     },
     _meta: {
@@ -35586,7 +35649,7 @@ var native_tools_default = [
   },
   {
     name: "delegate",
-    description: "delegate(persona, task, to?, context?, resend?): hand work to a launcher session \u2014 one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Delegation stays within your own user. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    description: "delegate(persona, task, to?, context?, resend?): hand work to a launcher session \u2014 one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher under a delegating team. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
     inputSchema: {
       type: "object",
       properties: {
@@ -35600,7 +35663,7 @@ var native_tools_default = [
         },
         to: {
           type: "string",
-          description: "Optional. A specific launcher's handle (your user's). Default: any live launcher of yours."
+          description: "Optional. A specific launcher's handle: your user's, or a teammate's under a delegating team. Default: any live launcher of yours."
         },
         context: {
           type: "string",
@@ -35620,42 +35683,44 @@ var native_tools_default = [
   },
   {
     name: "dm_history",
-    description: "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
+    description: "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
     inputSchema: {
       type: "object",
       properties: {
         peer: {
-          type: "string"
+          type: "string",
+          description: "Optional. Only return messages between you and this peer identity."
         },
         limit: {
-          type: "number"
+          type: "number",
+          description: "Max messages to return (default 20, max 200)."
         },
         before_id: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Return messages with id strictly less than this; use for pagination."
         }
       },
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     }
   },
   {
     name: "dm_thread",
-    description: "A whole direct-message thread you participate in.",
+    description: "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     inputSchema: {
       type: "object",
       properties: {
         thread: {
           type: "integer",
           exclusiveMinimum: 0,
-          maximum: 9007199254740991
+          maximum: 9007199254740991,
+          description: "Any message_id in the thread."
         }
       },
       required: [
         "thread"
       ],
-      $schema: "https://json-schema.org/draft/2020-12/schema",
       additionalProperties: false
     },
     _meta: {
@@ -35751,7 +35816,7 @@ class AttachmentRefused extends Error {
   status;
   code;
   constructor(status, code, message) {
-    super(message);
+    super(serverText(message));
     this.status = status;
     this.code = code;
   }
@@ -35912,7 +35977,7 @@ function hostTools(native) {
 }
 function withPaths(tool) {
   const properties = Object.fromEntries(Object.entries(tool.inputSchema.properties ?? {}).map(([key, value]) => key === "attachment_ids" ? ["attachments", ATTACHMENTS_PARAM] : [key, value]));
-  const description = tool.description?.replace("attachment_ids?", "attachments?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.");
+  const description = tool.description?.replace("attachment_ids?", "attachments?");
   return { ...tool, ...description === undefined ? {} : { description }, inputSchema: { ...tool.inputSchema, properties } };
 }
 var text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
@@ -36510,12 +36575,15 @@ class Controller {
   place;
   wait;
   configured;
+  context;
   skipped = new Set;
   constructor(port, options = {}) {
     this.port = port;
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep5;
     this.configured = options.configured;
+    if (options.context === false)
+      this.context = false;
     this.place = port.place();
     const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
     this.state = { state: "unenrolled", message: idle, roots: [] };
@@ -36908,7 +36976,7 @@ class Controller {
           throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
         let lease;
         try {
-          lease = leaseOf(await wire.call("delivery_open"), e);
+          lease = leaseOf(await wire.call("delivery_open", this.context === false && await wire.takes("delivery_open", "context") ? { context: false } : {}), e);
         } catch (error) {
           if (!(error instanceof Refusal) || reidentified)
             throw error;
@@ -36953,21 +37021,17 @@ class Controller {
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
                 await wire.call("delivery_renew");
                 await this.guard(r, epoch, signal);
-                if (r.admitted.has(key)) {
-                  inItem = false;
+                if (r.admitted.has(key))
                   return;
-                }
                 await this.port.admit(e, item, stableID(e, item, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT)
                   r.admitted.delete(r.admitted.values().next().value);
                 await this.guard(r, epoch, signal);
-                await wire.call("delivery_renew");
-                await this.guard(r, epoch, signal);
-                inItem = false;
               }, async (ids) => {
                 await this.guard(r, epoch, signal);
                 await wire.call("delivery_receipt", { ids });
+                inItem = false;
                 for (const id of ids) {
                   attempts.delete(id);
                   r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`);
@@ -37488,7 +37552,7 @@ class RootDelivery {
       this.begun = await this.epoch();
       if (this.closed)
         return;
-      const controller = this.controller = new Controller(this.port(), { sink: this.sink });
+      const controller = this.controller = new Controller(this.port(), { sink: this.sink, ...this.o.context === false ? { context: false } : {} });
       await controller.restore();
       if (this.closed)
         return;
@@ -38250,6 +38314,7 @@ function createPlugin(o) {
     stateDir: config.dataDir,
     place: () => place,
     push,
+    context: false,
     ...configured && "name" in configured ? { configured: configured.name } : {},
     admit: async (item, _stableID, identity, signal) => {
       if (!initialized)

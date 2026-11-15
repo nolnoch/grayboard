@@ -22,6 +22,8 @@ function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  // The mode above applies only to a new file; an existing one keeps its own (#88).
+  chmodSync(file, 0o600);
 }
 
 function output(data: unknown, json: boolean): void {
@@ -363,8 +365,13 @@ program
   .action(async () => {
     // Local credentials go regardless; what the server did decides the message.
     let outcome = "Logged out. The server closed this sign-in's open MCP connections.";
+    const creds = loadCredentials();
+    const server = process.env.GRAYBOARD_SERVER ?? creds?.server;
     try {
-      await makeClient().post("/api/auth/logout");
+      // A file that's corrupt, already signed out or names no server has no
+      // sign-in to revoke; it's still cleared below (#87).
+      if (!server || !creds?.session_token) outcome = "No valid sign-in was stored; the local credentials file is cleared.";
+      else await makeClient().post("/api/auth/logout");
     } catch (e) {
       outcome = e instanceof ApiError
         ? e.status === 401
@@ -576,7 +583,7 @@ slackCmd
 
 // ── mcp / setup ──────────────────────────────────────────────────────────────
 
-// The refusal a `--mode server` gets, and what an old 2.x client's hello is answered with (src/server/ws_refusal.ts).
+// The refusal a `--mode server` gets: the WebSocket transport it dialed is gone (#282).
 function refuseServerMode(mode: string | undefined): void {
   if (mode === "server") {
     console.error(`[grayboard] ${UPGRADE_REFUSAL}`);
@@ -634,7 +641,10 @@ program
   .action((opts: OpenCodeSetupOptions) => {
     try {
       const result = setupOpenCode(opts, OC_PLUGIN.source);
-      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.grayboard and plugin source${result.changed ? " (changes required/applied)" : " (unchanged)"}${result.migrated ? "; recognized migration with backups" : ""}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
+      const config = result.changed ? (result.dryRun ? "config changes required" : "config changes applied") : "config unchanged";
+      const adapters = result.adapters ? `; ${result.adapters} carried adapter${result.adapters === 1 ? "" : "s"} ${result.dryRun ? "to disable" : "disabled"}` : "";
+      const migration = result.migrated ? (result.dryRun ? "; recognized migration required" : "; recognized migration") : "";
+      console.log(`${result.dryRun ? "Dry run:" : "Configured:"} native mcp.servers.${result.mcpName ?? "grayboard"} and plugin source (${config})${adapters}${migration}${result.launcher ? `; launcher ${result.launcher}` : ""}.`);
       for (const path of result.backups ?? []) console.log(`Retained backup: ${path}`);
       console.log("Sign-in PENDING: open OpenCode /mcps, select grayboard, and sign in. No connection was verified; OpenCode owns OAuth and refresh.");
       console.log("Only the selected config and its sibling were checked; ancestor, managed, or other scope overrides remain possible. The plugin revalidates effective configuration.");
@@ -764,7 +774,13 @@ program
     }
     const ocGuard = opts.register && opencode && !server ? opencodeShimGuard(OC_DIR) : { skip: false };
     if (ocGuard.warning) console.warn(`[grayboard] ${ocGuard.warning}`);
-    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true))) {
+    // The prompt can wait indefinitely: classify again after it, so a hosted migration finished meanwhile never gains a second delivery owner.
+    const ocRecheck = () => {
+      const guard = opencodeShimGuard(OC_DIR);
+      if (guard.skip && guard.warning) console.warn(`[grayboard] ${guard.warning}`);
+      return !guard.skip;
+    };
+    if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
       if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
@@ -778,6 +794,7 @@ program
     const piCli = !!Bun.which("pi");
     if (opts.register && piCli && (await confirm("Make grayboard available in every pi project?", true))) await installHarness(PI);
 
+    for (const w of undeliveredEntries()) console.warn(`[grayboard] ${w}`);
     if (failed) return;
     const others = [omp && "omp", opencode && "opencode", piCli && "pi"].filter(Boolean).join(" or ");
     console.log(
@@ -791,6 +808,33 @@ program
       ` To bind a name at start, set BUS_IDENTITY in the launch command${server && opencode ? " (OpenCode: grayboard setup-opencode --name)" : ""}.`,
     );
   });
+
+/**
+ * omp, opencode and pi drop MCP notifications, so their grayboard entry must
+ * stay disabled with BUS_PUSH=off and an adapter must deliver (#95). An
+ * enabled push-mode entry with no adapter of either variant runs a delivery
+ * owner whose pushes go nowhere: messages are consumed unseen while senders
+ * see delivered_now. Returns one warning per such harness.
+ */
+function undeliveredEntries(): string[] {
+  const out: string[] = [];
+  const present = (p: string) => { try { lstatSync(p); return true; } catch { return false; } };
+  const harnesses: { name: string; config: HarnessConfig; env: string; adapters: string[] }[] = [
+    { name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] },
+    { name: "opencode", config: OC_CONFIG, env: "environment", adapters: [OC_PLUGIN.path] },
+    { name: "pi", config: PI.config, env: "env", adapters: [PI.local, PI.hosted] },
+  ];
+  for (const h of harnesses) {
+    let e: Entry | undefined;
+    try { e = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})?.[h.config.section]?.grayboard; } catch { continue; }
+    // A remote entry (hosted opencode) runs no `grayboard mcp`.
+    if (!e || typeof e !== "object" || e.enabled === false || e.type === "remote") continue;
+    if ((e[h.env] as Record<string, unknown> | undefined)?.BUS_PUSH === "off") continue;
+    if (h.adapters.some(present)) continue;
+    out.push(`${h.name}: the grayboard entry in ${h.config.path} is enabled with push on, but no grayboard adapter is installed, so ${h.name} drops its pushes and messages to its sessions are consumed unseen. Run \`grayboard setup\` to install the adapter, or remove the entry.`);
+  }
+  return out;
+}
 
 /** A failed adapter refresh step: printed with what to do, and the run fails. */
 function adapterFailed(e: unknown): void {
@@ -921,6 +965,7 @@ program
         for (const note of r.notes) console.log(note);
       } catch (e) { adapterFailed(e); }
     }
+    for (const w of undeliveredEntries()) console.log(`[grayboard] ${w}`);
     refreshClaude();
   });
 
@@ -1003,7 +1048,7 @@ teamCmd
 
 teamCmd
   .command("create <name>")
-  .description("Create a team (you are auto-added as a member; teams are invite-only)")
+  .description("Create a team (you are its first owner; teams are invite-only)")
   .action(async (name: string) => {
     try { output(await makeClient().post("/api/teams", { name }), globalJson()); }
     catch (e) { handleApiError(e); }
@@ -1011,15 +1056,16 @@ teamCmd
 
 teamCmd
   .command("add <team> <email>")
-  .description("Add someone to a team you're in, or any team if you're an admin (they must have signed in once)")
-  .action(async (team: string, email: string) => {
-    try { output(await makeClient().post(`/api/teams/${team}/add`, { email }), globalJson()); }
+  .description("Add someone to a team you own, or any team if you're an admin (they must have signed in once); --role changes an existing member's role")
+  .option("--role <role>", "owner or member (owners add and remove members)")
+  .action(async (team: string, email: string, opts: { role?: string }) => {
+    try { output(await makeClient().post(`/api/teams/${team}/add`, opts.role === undefined ? { email } : { email, role: opts.role }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 
 teamCmd
   .command("remove <team> <email>")
-  .description("Remove someone from a team you're in, or any team if you're an admin")
+  .description("Remove someone from a team you own, or any team if you're an admin")
   .action(async (team: string, email: string) => {
     try { output(await makeClient().post(`/api/teams/${team}/remove`, { email }), globalJson()); }
     catch (e) { handleApiError(e); }
@@ -1038,6 +1084,22 @@ teamCmd
   .description("List team members")
   .action(async (name: string) => {
     try { output(await makeClient().get(`/api/teams/${name}/members`), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
+teamCmd
+  .command("policy <name> <policy>")
+  .description("Set what members' agents may do across users: collaborative (wake each other's), delegating (that, and delegate to each other's launchers), or open (the default: neither). Team owners and admins")
+  .action(async (name: string, policy: string) => {
+    try { output(await makeClient().post(`/api/teams/${name}/policy`, { policy }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
+teamCmd
+  .command("delete-alias <team> <name>")
+  .description("Delete a team's name no session is using, freeing a slot under the server's per-scope cap. Team owners and admins")
+  .action(async (team: string, name: string) => {
+    try { output(await makeClient().post(`/api/teams/${team}/delete-alias`, { name }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 
@@ -1071,6 +1133,15 @@ adminCmd
   .requiredOption("--email <email>", "Target user email")
   .action(async (opts: { email: string }) => {
     try { output(await makeClient().post("/api/admin/enable-user", { email: opts.email }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
+adminCmd
+  .command("unlink-idp")
+  .description("Forget a user's Google account, so the next Google sign-in with the email takes the account over")
+  .requiredOption("--email <email>", "Target user email")
+  .action(async (opts: { email: string }) => {
+    try { output(await makeClient().post("/api/admin/unlink-idp", { email: opts.email }), globalJson()); }
     catch (e) { handleApiError(e); }
   });
 

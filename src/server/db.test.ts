@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -84,6 +84,45 @@ test("opening a database from before ids.root_id backfills each live hosted chil
     ]);
   } finally {
     reopened.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #521 5: a server marks ids.launcher only for a live hosted root's ownership. Opening the file clears every other
+// mark (a pre-upgrade WSS launcher's, an ended hosted root's from before #532, a child's) and audits each cleared ID
+// once; a live root's mark survives, and a second open finds nothing to clear.
+test("opening a database clears launcher marks no live hosted root holds, auditing each once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-launcher-db-"));
+  const path = join(dir, "db.sqlite");
+  const opts = { blobDir: join(dir, "blobs") };
+  const old = openDatabase(path, opts);
+  const user = old.repo.users.upsertByEmail("you@example.com", null);
+  const now = Date.now();
+  const [root, child, wss, ended, plain] = ["id:r000000000000", "id:c000000000000", "id:w000000000000", "id:e000000000000", "id:p000000000000"];
+  for (const id of [root, child, wss, ended, plain]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen, launcher) VALUES (?, ?, ?, ?, ?)`).run(id, user.email, now, now, id === plain ? 0 : 1);
+  const own = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at, ended_at) VALUES (?, ?, ?, ?, ?) RETURNING id`);
+  const live = own.get(root, user.id, "grayboard-pi", now, null) as { id: number };
+  own.get(ended, user.id, "grayboard-pi", now, now);
+  const row = old.db.prepare(`INSERT INTO hosted_sessions (session_id, ownership_id, user_id, client_id, grant_id, source_session_id, root_session_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  row.run(root, live.id, user.id, "grayboard-pi", "G1", "root-run", null, now, now);
+  row.run(child, live.id, user.id, "grayboard-pi", "G1", "child-run", root, now, now);
+  old.db.close();
+  const swept = () => openDatabase(path, opts);
+  const first = swept();
+  const audits = (db: typeof first.db) => db.query(`SELECT actor, target, detail FROM access_log WHERE action = 'handle.launcher_set' ORDER BY target`).all();
+  try {
+    expect(first.db.query(`SELECT id FROM ids WHERE launcher = 1`).all()).toEqual([{ id: root }]);
+    const cleared = [child, ended, wss].map((target) => ({ actor: user.email, target, detail: JSON.stringify({ on: false, reason: "stale" }) }));
+    expect(audits(first.db)).toEqual(cleared);
+    first.db.close();
+    const second = swept();
+    try {
+      expect(audits(second.db)).toEqual(cleared);
+      expect(second.db.query(`SELECT id FROM ids WHERE launcher = 1`).all()).toEqual([{ id: root }]);
+    } finally {
+      second.db.close();
+    }
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -284,6 +323,38 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
   ]);
 });
 
+// Security audit F-13: users are matched by IdP subject first, so a reassigned
+// email can't inherit an account.
+test("signIn: a subject owns its user; a reassigned or changed email is refused; clearSubject hands the email on", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const legacy = repo.users.upsertByEmail("old@example.com", null);
+  expect(legacy.idp_subject).toBeNull();
+  // A user from before the column links on its next sign-in.
+  expect(repo.users.signIn("old@example.com", "s-old", "Old")).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_subject: "s-old" } });
+  expect(repo.users.signIn("old@example.com", "s-old", "Old 2")).toMatchObject({ status: "ok", linked: false, user: { id: legacy.id, display_name: "Old 2" } });
+  // A new user is created with its subject.
+  const fresh = repo.users.signIn("new@example.com", "s-new", null);
+  expect(fresh).toMatchObject({ status: "ok", linked: false, user: { email: "new@example.com", idp_subject: "s-new" } });
+  // Another IdP account presenting the email is refused, and nothing changes.
+  expect(repo.users.signIn("old@example.com", "s-intruder", null)).toMatchObject({ status: "subject_mismatch", user: { id: legacy.id } });
+  // The same IdP account reporting another email is refused, and no user is created.
+  expect(repo.users.signIn("renamed@example.com", "s-old", null)).toMatchObject({ status: "email_changed", user: { id: legacy.id } });
+  expect(repo.users.findByEmail("renamed@example.com")).toBeUndefined();
+  expect(repo.users.findById(legacy.id)!.idp_subject).toBe("s-old");
+  // An admin's unlink lets the next account to present the email take it.
+  repo.users.clearSubject(legacy.id);
+  expect(repo.users.signIn("old@example.com", "s-intruder", null)).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_subject: "s-intruder" } });
+  expect(() => db.run("UPDATE users SET idp_subject = 's-new' WHERE id = ?", [legacy.id])).toThrow(/UNIQUE/);
+});
+
+test("signIn: a disabled account without a subject isn't bound to whoever signs in", () => {
+  const { repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const departed = repo.users.upsertByEmail("gone@example.com", null);
+  repo.users.setDisabled(departed.id, true);
+  expect(repo.users.signIn("gone@example.com", "s-hire", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
+  expect(repo.users.findById(departed.id)!.idp_subject).toBeNull();
+});
+
 // ── #130: the undeliveredFrom plan ────────────────────────────────────────────
 
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", () => {
@@ -299,6 +370,20 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
   const detail = plan.map(p => p.detail).join(" ");
   expect(detail).toContain("SEARCH c USING INDEX sqlite_autoindex_mailbox_cursors_1");
   expect(detail).not.toContain("SCAN c");
+});
+
+// #805: without ANALYZE the planner took idx_msg_recipient on `recipient_type = 'user'` alone, a pass over every
+// user DM per call; at 130K messages each churned session's start spent ~100 ms there, stalling the loop for seconds.
+// Both sender-keyed statements must seek by sender.
+test("undeliveredFrom and sentPending search messages by sender, never by recipient_type alone", () => {
+  const { db } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const detail = (sql: string, ...args: (string | number)[]) =>
+    (db.prepare("EXPLAIN QUERY PLAN " + sql).all(...args) as { detail: string }[]).map((p) => p.detail).join(" ");
+  for (const plan of [detail(UNDELIVERED_FROM_SQL, JSON.stringify(["a@example.com/fe"]), Number.MAX_SAFE_INTEGER),
+                      detail(SENT_PENDING_SQL, JSON.stringify(["a@example.com/fe"]), 0)]) {
+    expect(plan).toContain("SEARCH m USING INDEX idx_msg_sender (sender=?)");
+    expect(plan).not.toContain("idx_msg_recipient");
+  }
 });
 
 // #284 audit: queuedTo and retract read the read point by its key too.
@@ -318,4 +403,15 @@ test("queuedTo and retract look the read point up by its key, never a mailbox_cu
   const retract = detail(RETRACTABLE_SQL, 1, "a@example.com/fe");
   expect(retract).toContain("SEARCH mailbox_cursors USING INDEX sqlite_autoindex_mailbox_cursors_1");
   expect(retract).not.toContain("SCAN mailbox_cursors");
+});
+
+// #295: audit.last searches access_log by (action, target) and reads it newest first, with no scan or sort.
+test("audit.last searches access_log by (action, target), never a scan or a sort", () => {
+  const { db, repo } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const detail = (db.prepare("EXPLAIN QUERY PLAN " + ACCESS_LOG_LAST_SQL).all("dm.retract", "7") as { detail: string }[]).map((p) => p.detail).join(" ");
+  expect(detail).toContain("SEARCH access_log USING INDEX idx_access_log_action_target (action=? AND target=?)");
+  expect(detail).not.toContain("SCAN");
+  expect(detail).not.toContain("TEMP B-TREE");
+  for (const [at, target] of [[1, "7"], [3, "7"], [2, "7"], [4, "8"]] as const) db.prepare("INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, 'a', 'dm.retract', ?, ?)").run(at, target, `row ${at}`);
+  expect(repo.audit.last("dm.retract", "7")?.detail).toBe("row 3");
 });

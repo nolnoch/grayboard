@@ -12,22 +12,28 @@ export type AuditAction =
   | "attachment.upload_failed"
   | "attachment.upload_refused"
   | "attachment.uploaded"
+  | "auth.dev_login_refused"
+  | "auth.dev_sessions_revoked"
   | "auth.login"
   | "auth.logout"
   | "auth.rate_limit_ended"
   | "auth.rate_limit_full"
   | "auth.rate_limited"
   | "auth.session_revoked"
+  | "auth.subject_cleared"
+  | "auth.subject_linked"
+  | "auth.subject_refused"
   | "auth.user_disabled"
   | "auth.user_enabled"
+  | "auth.user_refused"
   | "bridge.notified"
   | "bridge.stopped"
   | "alias.created"
   | "alias.meta_set"
   | "alias.revoked"
   | "alias.deleted"
-  | "hello.rate_limit_ended"
-  | "hello.rate_limited"
+  | "bind.rate_limit_ended"
+  | "bind.rate_limited"
   | "hosted.alias_lost_notified"
   | "hosted.alias_lost_seen"
   | "hosted.capacity_refused"
@@ -82,19 +88,29 @@ export type AuditAction =
   | "id.promoted"
   | "id.reattached"
   | "id.registered"
+  | "id.reopened"
   | "id.reused"
   | "id.signed_in_local"
   | "message.retracted"
+  | "request.receipt_stale"
   | "request.replayed"
   | "request.resent"
   | "server.started"
+  | "slack.link_refused"
   | "slack.linked"
+  | "slack.relinked"
   | "slack.unlinked"
   | "team.created"
   | "team.member_added"
+  | "team.policy_set"
   | "team.member_removed"
+  | "team.role_changed"
   | "delegation.requested"
+  | "authz.decision"
+  | "authz.suppressed"
   | "delegation.refused"
+  | "delegation.throttled"
+  | "delegation.throttle_ended"
   | "handle.launcher_set";
 
 /** A request's user agent as audit rows and sessions carry it: at most 120 characters. */
@@ -110,7 +126,7 @@ export function writeAudit(
   detail?: Record<string, unknown>,
 ): void {
   repo.audit.write({
-    at: Date.now(),
+    at: repo.now(),
     actor,
     action,
     target,

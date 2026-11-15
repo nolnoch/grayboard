@@ -43,6 +43,8 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 15 | Delegation launcher declaration | yes | yes | yes | yes | yes | yes | yes | yes |
 | 16 | Update | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 17 | Repo-name suggestion while unbound | yes | yes | yes | yes | yes | yes | yes | yes |
+| 18 | Another user's item wakes only under a grant (`msg.wake`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
+| 19 | Delegation to another user's launcher under a grant (`delegate.to`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 
 ## Evidence by row
 
@@ -55,7 +57,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 
 - pi L, omp L, OC V1: DMs, mentions and thread replies start a turn; digests and deferred pushes are context only (boards.md §9). Proof: `tests/integration/pi.test.ts` piScenario, `tests/integration/omp.test.ts` omp local task run (a peer's DM reaches main once), `tests/integration/opencode.test.ts` ("an unbound session acts as its ID…": the DM arrives as a prompt).
 - CC L: channel notifications, only while Claude Code's channel gate registers the server; gate off → tools-only, reason in instructions and first result (`claudeChannels`, boards.md §9). Proof: `tests/integration/local.test.ts` (pushes at the MCP level; "a Claude Code session whose channels are off runs tools-only and is warned why").
-- pi H, omp H, CC H: hosted-core lease and `RootDelivery` (boards.md §9 Hosted core). Proof: `tests/integration/pi.test.ts` "pi hosted: …", `tests/integration/omp.test.ts` "omp hosted: …", `tests/integration/claude_plugin.test.ts` ("a flagged interactive session: … a DM arrives as one channel push"), e2e `claude-hosted` (`tests/e2e/claude_hosted.e2e.ts`).
+- pi H, omp H, CC H: hosted-core lease and `RootDelivery` (boards.md §9 Hosted core). CC H's lease is `context: false`, so a digest or deferred push waits for a waking item instead of starting a turn (#854). Proof: `tests/integration/pi.test.ts` "pi hosted: …", `tests/integration/omp.test.ts` "omp hosted: …", `tests/integration/claude_plugin.test.ts` ("a flagged interactive session: … a DM arrives as one channel push"), e2e `claude-hosted` (`tests/e2e/claude_hosted.e2e.ts`).
 - OC V2: delivery opens only on a human-enrolled, bound root (#226; `docs/guide/harnesses.md` §OpenCode V2). Proof: `adapters/opencode-v2` `test:host` (`adapters/opencode-v2/tests/host.ts`).
 
 ### 3. Current instructions on push-started turns
@@ -125,9 +127,9 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 
 ### 12. Human handle reach and human authority marking
 
-- Local (all four): the declared human (`grayboard human`, local Slack bridge) is a peer every session can DM; `<channel human="true">` marks the human's messages, and the adapters' renderers escape a body's `<channel` so it can't be forged (slack-bridge.md §3; boards.md §9 Hosted core). Proof: `tests/integration/local.test.ts` ("the human's handle…", "grayboard announce reaches live sessions marked human…").
-- pi H, omp H, CC H: the org bridge's `email/human` (slack-bridge.md §8), reachable per `canSend` (architecture.md §5); the adapter marks only its own user's human (`HostPort.admit`, `adapters/hosted-core/src/port.ts`). Proof: `tests/integration/pi_family.test.ts` ("… marked human only from the user's own human"), `tests/integration/delegation.test.ts` (server human fallback end to end).
-- OC V2: the authenticated lease identity reaches the JSON admission renderer; only own-human direct messages and board pushes carry `human="true"` on the adapter's outer channel envelope. Payload `<` is JSON-escaped without changing parsed values; digests, peers, foreign humans and malformed events remain explicitly untrusted (`boards.md` §9). Proof: `adapters/opencode-v2/tests/unit.test.ts` (JSON admission trust, forgery and serialized-limit boundaries), `adapters/opencode-v2/tests/host.ts` (`human-authority`, `REAL_OWN_HUMAN_AUTHORITY_OK`, scratch `human-authority-evidence.json`: real `application.attachHuman`, exact outer marker, inbox JSON round trip and model-visible requests). This closes only #388 item 11's own-human authority portion; aggregate drain size and the other roll-up items remain open.
+- Local (all four): the declared human (`grayboard human`, local Slack bridge) is a peer every session can DM; `<channel human="true">` marks the human's messages, and a body's `<channel` is escaped in every push, Claude Code's included, so it can't be forged (slack-bridge.md §3; boards.md §9 Hosted core). Proof: `tests/integration/local.test.ts` ("a pushed DM or post can't open a channel element…", "the human's handle…", "grayboard announce reaches live sessions marked human…").
+- pi H, omp H, CC H: the org bridge's `email/human` (slack-bridge.md §8), reachable per `msg.send` (architecture.md §5); the adapter marks only its own user's human (`HostPort.admit`, `adapters/hosted-core/src/port.ts`), and `channelParams` escapes a body's `<channel`, which Claude Code 2.1.316 doesn't (#805). Proof: `tests/integration/pi_family.test.ts` ("… marked human only from the user's own human"), `adapters/hosted-core/tests/channel.test.ts` ("channelParams fences…"), `tests/e2e/claude_hosted.e2e.ts` (a forged opening tag in a DM reaches the model escaped), `tests/integration/delegation.test.ts` (server human fallback end to end). Another signed-in user's DMs, posts and digests carry `other_user="true"` in `channelParams` (boards.md §9 Hosted core; #805). Proof: `tests/integration/hosted_other_user.test.ts`, `adapters/hosted-core/tests/channel.test.ts` ("channelParams carries the server's other_user mark…").
+- OC V2: the authenticated lease identity reaches the JSON admission renderer; only own-human direct messages and board pushes carry `human="true"` on the adapter's outer channel envelope. Payload `<` is JSON-escaped without changing parsed values; digests, peers, foreign humans and malformed events remain explicitly untrusted (`boards.md` §9). Proof: `adapters/opencode-v2/tests/unit.test.ts` (JSON admission trust, forgery and serialized-limit boundaries), `adapters/opencode-v2/tests/host.ts` (`human-authority`, `REAL_OWN_HUMAN_AUTHORITY_OK`, scratch `human-authority-evidence.json`: real `application.attachHuman`, exact outer marker, inbox JSON round trip and model-visible requests). Another user's writes carry `other_user: true` inside the JSON payload, already labeled untrusted (#805). This closes only #388 item 11's own-human authority portion; aggregate drain size and the other roll-up items remain open.
 
 ### 13. Presence and `whoami`
 
@@ -158,12 +160,13 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
 - OC V1: N root sessions in one opencode process share one binding (boards.md §9 opencode).
 - On a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus, and prints the `setup-opencode` command that reaches the server, with the URL's credentials stripped (#474); the entry's `grayboard mcp` already says on stderr that it serves the local bus (#491). Proof: `src/cli/opencode-setup.test.ts` ("(#474)").
+- #475: an ID whose session ended comes back differently per mode, on purpose: hosted reopens its row (the ID is the harness's own and can't change), local refuses it `id_collision` (`registerId`).
 - #427: pi's `pi update --extensions` doesn't refresh the loose-file adapter; only `grayboard update` does.
 
 ## Maintaining parity
 
 - A feature or fix PR names the cells it changes (row number and column) and updates this doc in the same change.
-- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply.
+- A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply. Local mode is the single-user edition (`vision.md` §1): a capability that only means something with more than one principal (roles, grants, service principals, cross-user policy) is n/a in every local cell, not a gap.
 - Parity by addition: moving a cell to supported never removes a capability from another cell.
 
 ## Not covered
@@ -175,3 +178,18 @@ Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only
 - Local (all four): `grayboard mcp` offers `sessionIdentity` first among an unbound session's candidates (boards.md §3). Proof: `tests/integration/binding.test.ts`.
 - pi H, omp H, CC H: the adapter's `HostedClient` sends `sessionIdentity(env, cwd)` for its root on every wire (#522); the server offers it first while free (architecture.md §Hosted MCP). Proof: `tests/integration/hosted_core_wire.test.ts` ("a wire's suggested name reaches the server"), `src/server/hosted.test.ts` (suggested name).
 - OC V2: its `HostPort.suggested` sends `sessionIdentity({}, directory)` for the plugin's directory on every wire, from a generated copy of `src/shared/naming.ts` (#696; the `name` plugin option, not `BUS_IDENTITY`, is its explicit name). Proof: `adapters/opencode-v2/tests/instructions.test.ts` ("the suggested name is local mode's", and the native fetcher's meta), with the server half above.
+
+### 18. Another user's item wakes only under a grant (`msg.wake`)
+
+- Local (all four): n/a. Local mode is single-user (`vision.md` §1): every session is the same user's.
+- Server side, every hosted cell: `application.pending()` marks another user's DM or push that no grant covers `ungranted` and not actionable, per pull (architecture.md §5 `msg.wake`, #806). The pull-free reads (`dm_inbox`, `dm_thread`, `dm_history`, `board_read`, a board resource's snapshot) carry the same `other_user`/`ungranted` fields per call, and every hosted session's instructions, poll, unbound and child ones included, say not to act on `ungranted` content without the user's approval (#825). Proof: `tests/integration/hosted_wake_grant.test.ts`, `tests/integration/hosted_read_marks.test.ts`, `src/server/hosted.test.ts` (bind result and initialize text).
+- pi H, omp H: hosted-core's `wakes()` refuses an `ungranted` item whatever the actionable flag (boards.md §9 Hosted core). Proof: `adapters/hosted-core/tests/channel.test.ts` ("an ungranted item never wakes…").
+- OC V2: admits the item with `resume: item.actionable` (`adapters/opencode-v2/src/lifecycle.ts`), so it lands as context. Proof: the server half above; no host test sends a cross-user item.
+- CC H: Claude Code wakes on any channel notification, so the plugin opens its lease with `context: false` and the server withholds a lone non-waking item, ungranted among them, until a waking one carries it (#854; boards.md §9 Hosted Claude Code). Not a wake bound: a full page of 100 non-waking items still goes out, each item its own channel notification, so a sender who fills a page can still start turns. Proof: `tests/integration/hosted_context_off.test.ts`, `adapters/hosted-core/tests/controller.test.ts` ("context: false opens the lease…"); no Claude Code test sends a cross-user item.
+
+### 19. Delegation to another user's launcher under a grant (`delegate.to`)
+
+- Local (all four): n/a. Local mode is single-user (`vision.md` §1).
+- Server side, every hosted cell: an explicit `to` naming another user's launcher is refused unless the two share a `delegating` team (boards.md §13, #256); the launcher's reads and pull mark such a request `delegated` per call, and the launcher instruction acts on another user's request only with that mark. Proof: `tests/integration/delegation_grant.test.ts`.
+- pi H, omp H, CC H: hosted-core's `channelParams` carries `delegated="true"` (`dmNotification`, `src/shared/notifications.ts`). Proof: `adapters/hosted-core/tests/channel.test.ts` ("channelParams carries the server's delegated mark…").
+- OC V2: the item's JSON carries the field as the server sent it; no host test sends a cross-user delegation.

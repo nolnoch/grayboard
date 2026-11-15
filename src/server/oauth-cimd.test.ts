@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { createCimdResolver, parseCimd, publicAddress } from "./oauth-cimd.ts";
 import { matchesRedirect } from "./oauth-config.ts";
+import { until } from "../../tests/support/until.ts";
 
 test("production HTTPS lookup preserves both callback shapes, pinning and TLS/response guards", async () => {
   const proc = Bun.spawn([process.execPath, new URL("../../tests/support/cimd-transport.ts", import.meta.url).pathname], { stdout: "pipe", stderr: "pipe" });
@@ -92,4 +93,28 @@ test("DNS and TLS outages remain transient and are negatively cached separately"
       expect(calls).toBe(1);
     } finally { resolver.close(); }
   }
+});
+test("the IPv6 check is 2000::/3 itself, not a hextet prefix (#269)", () => {
+  for (const address of ["2000::1", "2400:cb00::1", "3ffe:ffff::1", "2A00:1450::1"]) expect(publicAddress(address)).toBe(true);
+  for (const address of ["2::1", "3::1", "20::1", "3ff::1", "1fff:ffff::1", "4000::1"]) expect(publicAddress(address)).toBe(false);
+});
+test("overlapping completions against a nearly full cache stay within its cap (#269)", async () => {
+  const doc = (n: number) => `https://c${n}.example/client.json`;
+  const gates = new Map<string, () => void>();
+  let reads = 0;
+  const resolver = createCimdResolver({
+    resolve: async () => [{ address: "93.184.216.34", family: 4 }],
+    read: async url => { reads++; const n = Number(url.hostname.slice(1, url.hostname.indexOf("."))); if (n >= 120) await new Promise<void>(r => gates.set(url.href, r)); return document(doc(n)); },
+  });
+  for (let n = 0; n < 120; n++) expect((await resolver.resolve(doc(n)))?.clientId).toBe(doc(n));
+  const overlapping = Array.from({ length: 8 }, (_, i) => resolver.resolve(doc(120 + i)));
+  await expect(resolver.resolve(doc(200))).rejects.toThrow("CIMD temporarily unavailable");
+  await until(() => gates.size === 8, 5000, "all 8 overlapping reads started");
+  for (const open of gates.values()) open();
+  expect((await Promise.all(overlapping)).every(Boolean)).toBe(true);
+  await expect(resolver.resolve(doc(201))).rejects.toThrow("CIMD temporarily unavailable");
+  const before = reads;
+  for (let n = 0; n < 128; n++) await resolver.resolve(doc(n));
+  expect(reads).toBe(before);
+  resolver.close();
 });

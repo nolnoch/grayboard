@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
 import { CoreError } from "./errors.ts";
 
 export type Claim = {
@@ -42,6 +42,13 @@ function validKey(key: string): string {
   return k;
 }
 
+// A claim note is a line of status (#76): stored on the claim and every
+// claim_events row, and announced on its board.
+export const MAX_NOTE_CHARS = 1000;
+function validNote(note: string | undefined): void {
+  if (note !== undefined && note.length > MAX_NOTE_CHARS) throw new CoreError(`note must be at most ${MAX_NOTE_CHARS} chars`);
+}
+
 type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
 
 // One claim_events row; callers are inside the claim's transaction.
@@ -53,12 +60,15 @@ export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Par
 
 // The calling session (#284): `addresses` is its address set, the primary
 // first; `session` its ID, recorded on the posts it makes (S8); `via` the
-// child session acting under those addresses (#523), recorded beside it.
-export type ClaimCtx = { addresses?: string[]; session?: string; via?: string };
+// child session acting under those addresses (#523), recorded beside it;
+// `user` the signed-in user on a server, recorded as the post's author_user.
+export type ClaimCtx = { addresses?: string[]; session?: string; via?: string; user?: string };
 
-function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}): ClaimChanges {
+// A new claim can't announce on an archived board (#635); its update, release
+// or expiry, ending what's already there, can (`ending`).
+function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true): ClaimChanges {
   if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via });
+  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending });
   return { wake: result.wake, boards: [result.post.board] };
 }
 
@@ -85,6 +95,7 @@ export function claim(
   opts: { ttl_minutes?: number; until?: string; note?: string; board?: string } & ClaimCtx = {},
 ): ClaimResult {
   const key = validKey(keyInput);
+  validNote(opts.note);
   // The queue: keyspace is the delivery machinery's: only claimQueuePost
   // mints these keys, against a post that exists on a board the lane can
   // see. A public take would let any handle squat a future post's key - the
@@ -99,6 +110,9 @@ export function claim(
   const addresses = opts.addresses ?? [handle];
 
   return db.transaction((): ClaimResult => {
+    // A board that doesn't exist, or that `handle` can't see, refuses as a
+    // post to it would (#81), not as the claims row's foreign key failing.
+    if (board && !canSeeBoard(db, handle, board)) throw new CoreError(`no such board #${board}; see board_list`);
     const now = Date.now();
     let expires = expiresAt(now, opts.ttl_minutes, opts.until);
     // Announce a lapsed claim before anyone takes it over.
@@ -125,9 +139,14 @@ export function claim(
          RETURNING *`,
       )
       .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
+    // A renewal that moves the claim onto an archived board would start new
+    // business there (#635), like a fresh [claim]; it rolls back instead.
+    if (renewed && row.board && row.board !== cur.board && getBoard(db, row.board)?.archived_at) {
+      throw new CoreError(`#${row.board} is archived; a claim can't move onto it`);
+    }
     logEvent(db, renewed ? "renew" : "take", as, row, now);
     const changed = !renewed
-      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts)
+      ? announce(db, as, row.board, `[claim] ${key}${row.note ? ` — ${row.note}` : ""}`, opts, false)
       : opts.note !== undefined && opts.note !== cur.note && row.board && canSeeBoard(db, as, row.board)
         ? announce(db, as, row.board, `[update] ${key} — ${opts.note}${watchersCc(db, key, false)}`, opts)
         : { wake: [], boards: [] };
@@ -163,6 +182,7 @@ export function release(
   ctx: ClaimCtx = {},
 ): ClaimChanges & { releasedAt?: number } {
   const key = validKey(keyInput);
+  validNote(note);
   const addresses = ctx.addresses ?? [handle];
   return db.transaction(() => {
     const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;

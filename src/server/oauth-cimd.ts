@@ -12,10 +12,13 @@ class InvalidMetadata extends Error {}
 const blocked = new BlockList();
 for (const [address, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 3]] as const) blocked.addSubnet(address, prefix);
 for (const [address, prefix] of [["2001::", 23], ["2001:db8::", 32], ["2002::", 16], ["3fff::", 20]] as const) blocked.addSubnet(address, prefix, "ipv6");
+// Global unicast is 2000::/3; a prefix test on the text would also take a short first hextet (`2::1` is 0002::).
+const globalUnicast = new BlockList();
+globalUnicast.addSubnet("2000::", 3, "ipv6");
 export function publicAddress(address: string): boolean {
   const family = isIP(address);
   if (family === 4) return !blocked.check(address, "ipv4");
-  if (family !== 6 || !/^[23][0-9a-f]{0,3}:/i.test(address)) return false;
+  if (family !== 6 || !globalUnicast.check(address, "ipv6")) return false;
   return !blocked.check(address, "ipv6");
 }
 function metadataUrl(id: string): URL {
@@ -103,6 +106,8 @@ export function createCimdResolver(options: CimdOptions = {}) {
           };
           const client = await Promise.race([load(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("CIMD timeout")); }, 5000); })]);
           if (closed) return;
+          // Admission counts pending work against the cap, but the cap holds here too, whatever completes together (#269).
+          while (cache.size >= 128) cache.delete(cache.keys().next().value!);
           cache.set(id, { until: now() + 300_000, client });
           return client;
         } catch (error) {

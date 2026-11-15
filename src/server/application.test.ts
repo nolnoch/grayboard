@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,7 @@ let blobDir: string;
 let alice: AuthedUser;
 let bob: AuthedUser;
 function delivery(): DeliverySink {
-  return { deliver: () => {}, probe: async () => true, closed: () => {} };
+  return { deliver: () => {}, closed: () => {} };
 }
 // A connected AppSession: it registers like a hosted session and binds `alias`.
 async function connect(user: AuthedUser, alias: string | null, opts: ConstructorParameters<typeof AppSession>[3] = {}): Promise<AppSession> {
@@ -141,7 +141,7 @@ test("bind budget is per user and spent before an alias is created or a hold tak
   await expect(a.bind("refused")).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
   expect(store.repo.aliases.listForScope("person", alice.user_email).map(x => x.name)).toEqual(["be"]);
   expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([{ event: "bound" }]);
-  expect(store.db.query("SELECT * FROM access_log WHERE action = 'hello.rate_limited'").all()).toHaveLength(1);
+  expect(store.db.query("SELECT * FROM access_log WHERE action = 'bind.rate_limited'").all()).toHaveLength(1);
   expect((await application.attachHuman(alice, delivery())).session.human).toBe(true);
   // Per user: bob's bind spends his own budget.
   expect((await connect(bob, "fe")).session.holds).toEqual(["bob@example.com/fe"]);
@@ -187,12 +187,13 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
   expect(() => application.pending(b)).toThrow("an admin signed this user out");
 });
 
+// Judged by the bundler's import scan, not the source text (#385 item 21): comments, strings and erased
+// type-only imports are no runtime dependency.
 test("hosted Slack has no dependency on the transitional wire adapter", async () => {
   const source = await Bun.file(new URL("./slack.ts", import.meta.url)).text();
-  expect(source).not.toContain("shared/protocol");
-  expect(source).not.toContain("JSON.parse");
-  expect(source).not.toContain("HumanConn");
-  expect(source).toContain("application.attachHuman");
+  const imports = new Bun.Transpiler({ loader: "ts" }).scanImports(source).map(i => i.path);
+  expect(imports).toContain("./application.ts");
+  expect(imports.filter(path => /(^|\/)shared\/protocol(\.[jt]s)?$/.test(path))).toEqual([]);
 });
 
 // An unbound hosted session acts as no address (#229): its reads are judged
@@ -228,7 +229,28 @@ test("unbound hosted reads never use the human address and still list and read b
   application.close(bobBe);
 });
 
+test("a hosted session whose hello facts throw is left unregistered (#385 item 9)", async () => {
+  const pushed: unknown[] = [];
+  const teams = spyOn(store.repo.teams, "listForUser").mockImplementation(() => { throw new Error("db gone"); });
+  try {
+    expect(() => application.hostedSession(alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).toThrow("db gone");
+  } finally { teams.mockRestore(); }
+  // An unheld "be": a DM to it is pushed only to a session the hub routes it to.
+  store.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
+  const sender = await connect(alice, "sender");
+  await sender.send("alice@example.com/be", "no route left behind");
+  expect(pushed).toEqual([]);
+  sender.close();
+});
+
 test("unbound hosted sessions cannot use named operations or persist synthetic handles", async () => {
+  // A hosted root's row: peer_list reads unbound roots from the store (#475).
+  const now = Date.now();
+  const ownership = store.repo.hosted.start("hosted-unbound", alice.user_id, "test", now);
+  store.repo.hosted.insert({
+    session_id: "hosted-unbound", ownership_id: ownership, user_id: alice.user_id, client_id: "test", grant_id: "grant", source_session_id: "hosted-unbound",
+    writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null,
+  });
   const { session, info } = application.hostedSession(alice, "hosted-unbound", [], null, null, delivery());
   expect(session.writerId).toBeUndefined();
   expect(info.candidates).toEqual([]);
@@ -264,7 +286,7 @@ test("hold sessions block binding and candidates without push or online presence
   await owner.call("peer_status", { text: "working" });
   const tools = await connect(alice, "held", { push: false });
   const observer = application.hostedSession(alice, "hosted-observer", [], null, null, delivery()).session;
-  expect((application.call(observer, "peer_list", { include_offline: true }) as { peers: unknown[] }).peers).toMatchObject([{ online: false, status: "working" }]);
+  expect((application.call(observer, "peer_list", { include_offline: true }) as { peers: unknown[] }).peers).toMatchObject([{ online: false }]);
   expect(tools.session.toolsOnly).toBe(true);
   expect(tools.session.holds).toEqual([]);
   await expect(connect(alice, "held")).rejects.toMatchObject({ code: "alias_held", extra: { holder: expect.stringContaining(owner.id) } });

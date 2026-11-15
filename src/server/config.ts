@@ -1,14 +1,22 @@
 import { dirname, join } from "node:path";
-import { parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
+import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 
-import type { HumanReach } from "./can_send.ts";
-import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, type RateLimit } from "./rate_limit.ts";
+import type { HumanReach } from "./policy.ts";
+import { DEFAULT_LAG_GATE, LAG_HISTORY, type LagGate } from "./metrics.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
+import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
+// Hosted session rows, delivery leases and resource watches (#805, F-06); docs/guide/server.md §Sizing the caps.
+export type HostedCaps = { sessions: { global: number; perUser: number }; leases: { global: number; perUser: number }; watches: { global: number; perSession: number } };
+export const DEFAULT_HOSTED_CAPS: HostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
+// Every cap may be raised to this: a guard against a typo, not a tested size.
+const CAP_CEILING = 1_000_000;
 
 export type Config = {
   dbPath: string;
@@ -23,6 +31,8 @@ export type Config = {
   messageRetentionDays: number;
   auditRetentionDays: number;
   devAuth: boolean;
+  // Days a CLI session token may go unused before it's refused (security audit F-14); 0 never.
+  cliTokenIdleDays?: number;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -35,14 +45,26 @@ export type Config = {
   // Hellos per user: the burst, and the refill per second (#210).
   helloLimit: RateLimit;
   hostedRequestLimit?: RateLimit;
+  hostedSubscriberLimit?: RateLimit;
+  // /healthz fails on sustained event-loop lag (#805): p99Ms 0 is off.
+  healthzLag?: LagGate;
+  // delegate's limits (#252): GRAYBOARD_DELEGATE_BURST/_PER_SEC (per user) and
+  // GRAYBOARD_DELEGATE_OPEN_CAP; defaults in src/core/delegation.ts.
+  delegateLimit?: RateLimit;
+  delegateOpenCap?: number;
+  // Names per scope (#347): GRAYBOARD_ALIAS_SCOPE_CAP; default in src/server/alias_cap.ts.
+  aliasScopeCap?: number;
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
   authFailLimit: RateLimit;
   oauthLimit?: RateLimit;
   oauthGlobalLimit?: RateLimit;
   mcpLimits?: McpLimits;
+  hostedCaps?: HostedCaps;
   // How long an unbound, or bound but never-delivering, hosted session may idle (src/server/hosted.ts); default 900.
   hostedIdleSeconds?: number;
+  // GRAYBOARD_METRICS_ADDR (#805): where the metrics listener binds; unset, there is none.
+  metricsAddr?: { hostname: string; port: number };
   trustedProxies: readonly string[];
   // The org Slack bridge (src/server/slack.ts); off unless both tokens are set.
   slack?: { appToken: string; botToken: string; apiUrl?: string };
@@ -60,6 +82,12 @@ export function loadConfig(): Config {
   const dbPath    = requireEnv("GRAYBOARD_DB_PATH");
   const publicUrl = requireEnv("GRAYBOARD_PUBLIC_URL");
 
+  // Dev sign-in lets anyone who reaches the server act as anyone (#805 F-04): a
+  // public URL means others can reach it, so it's for local development only.
+  if (devAuth && !isLoopback(urlHostname(publicUrl))) {
+    throw new Error(`GRAYBOARD_DEV_AUTH=1 needs a loopback GRAYBOARD_PUBLIC_URL (localhost, 127.0.0.1 or [::1]), not ${publicUrl}: dev sign-in lets anyone who reaches the server act as anyone`);
+  }
+
   const googleClientId     = devAuth ? (process.env.GOOGLE_OAUTH_CLIENT_ID ?? "dev") : requireEnv("GOOGLE_OAUTH_CLIENT_ID");
   const googleClientSecret = devAuth ? "" : requireEnv("GOOGLE_OAUTH_CLIENT_SECRET");
   const orgDomain          = devAuth ? (process.env.GRAYBOARD_ORG_DOMAIN ?? "example.com") : requireEnv("GRAYBOARD_ORG_DOMAIN");
@@ -76,18 +104,29 @@ export function loadConfig(): Config {
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
+    cliTokenIdleDays: idleDays(process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
     ...parseAttachmentLimits(process.env),
     helloLimit: parseRateLimit(process.env, "GRAYBOARD_HELLO", DEFAULT_HELLO_LIMIT, "hellos"),
     hostedRequestLimit: parseRateLimit(process.env, "GRAYBOARD_HOSTED_REQUEST", DEFAULT_HOSTED_REQUEST_LIMIT, "requests"),
+    hostedSubscriberLimit: parseRateLimit(process.env, "GRAYBOARD_HOSTED_SUBSCRIBER", DEFAULT_HOSTED_SUBSCRIBER_LIMIT, "requests"),
     authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
     oauthLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH", { burst: 60, perSec: 1 }, "requests"),
     oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),
+    delegateLimit: parseRateLimit(process.env, "GRAYBOARD_DELEGATE", DELEGATE_LIMIT, "requests"),
+    delegateOpenCap: positiveInt(process.env, "GRAYBOARD_DELEGATE_OPEN_CAP", DELEGATE_OPEN_CAP, MAX_BURST, "requests"),
+    aliasScopeCap: positiveInt(process.env, "GRAYBOARD_ALIAS_SCOPE_CAP", ALIAS_SCOPE_CAP, CAP_CEILING, "names"),
     mcpLimits: parseMcpLimits(process.env),
+    hostedCaps: parseHostedCaps(process.env),
     ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
+    healthzLag: {
+      p99Ms: process.env.GRAYBOARD_HEALTHZ_LAG_P99_MS === "0" ? 0 : positiveInt(process.env, "GRAYBOARD_HEALTHZ_LAG_P99_MS", DEFAULT_LAG_GATE.p99Ms, 600_000, "milliseconds"),
+      windows: positiveInt(process.env, "GRAYBOARD_HEALTHZ_LAG_WINDOWS", DEFAULT_LAG_GATE.windows, LAG_HISTORY, "windows"),
+    },
+    ...(process.env.GRAYBOARD_METRICS_ADDR ? { metricsAddr: parseMetricsAddr(process.env.GRAYBOARD_METRICS_ADDR) } : {}),
     ...slackConfig(),
   };
 }
@@ -97,11 +136,26 @@ function parseMcpLimits(env: Record<string, string | undefined>): McpLimits {
   for (const kind of ["listen", "legacy", "post"] as const) {
     const prefix = `GRAYBOARD_MCP_${kind.toUpperCase()}`;
     const defaults = DEFAULT_MCP_LIMITS[kind];
-    const global = positiveInt(env, `${prefix}_GLOBAL`, defaults.global, defaults.global, "requests");
-    const perUser = positiveInt(env, `${prefix}_PER_USER`, Math.min(defaults.perUser, global), global, "requests");
-    limits[kind] = { global, perUser };
+    const { global, scoped } = globalAndScoped(env, prefix, "PER_USER", defaults.global, defaults.perUser, "requests");
+    limits[kind] = { global, perUser: scoped };
   }
   return limits;
+}
+
+function parseHostedCaps(env: Record<string, string | undefined>): HostedCaps {
+  const d = DEFAULT_HOSTED_CAPS;
+  const sessions = globalAndScoped(env, "GRAYBOARD_HOSTED_SESSIONS", "PER_USER", d.sessions.global, d.sessions.perUser, "sessions");
+  const leases = globalAndScoped(env, "GRAYBOARD_DELIVERY_LEASES", "PER_USER", d.leases.global, d.leases.perUser, "leases");
+  const watches = globalAndScoped(env, "GRAYBOARD_RESOURCE_WATCHES", "PER_SESSION", d.watches.global, d.watches.perSession, "watches");
+  return { sessions: { global: sessions.global, perUser: sessions.scoped }, leases: { global: leases.global, perUser: leases.scoped }, watches: { global: watches.global, perSession: watches.scoped } };
+}
+
+// A server-wide cap and a narrower one (per user or per session), which can't exceed it. An unset narrower cap
+// keeps its default, lowered to the server-wide one when that is set below it.
+function globalAndScoped(env: Record<string, string | undefined>, prefix: string, scope: string, global0: number, scoped0: number, unit: string) {
+  const global = positiveInt(env, `${prefix}_GLOBAL`, global0, CAP_CEILING, unit);
+  const scoped = positiveInt(env, `${prefix}_${scope}`, Math.min(scoped0, global), global, unit);
+  return { global, scoped };
 }
 
 function mcpGoogleConfig(): Pick<Config, "mcpGoogle"> {
@@ -192,6 +246,10 @@ function parseList(raw: string | undefined): string[] {
   return (raw ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 }
 
+function urlHostname(raw: string): string {
+  try { return new URL(raw).hostname; } catch { return ""; }
+}
+
 function requireEnv(name: string): string {
   const val = process.env[name];
   if (!val) throw new Error(`Required env var ${name} is not set`);
@@ -206,6 +264,27 @@ function retentionDays(name: string, raw: string | undefined, fallback: number):
   const days = parseRetentionDays(raw, fallback);
   if (days === null) throw new Error(`${name} must be a whole number of days, not "${raw}"`);
   return days;
+}
+
+// GRAYBOARD_METRICS_ADDR: `host:port`, `[v6]:port`, or a bare port (binds 127.0.0.1). Unset: no listener.
+export function parseMetricsAddr(raw: string | undefined): { hostname: string; port: number } | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const m = /^(?:(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+):)?(\d+)$/.exec(raw);
+  const port = m ? Number(m[2]) : NaN;
+  if (!m || port > 65535) throw new Error(`GRAYBOARD_METRICS_ADDR must be host:port or a port, not "${raw}"`);
+  const host = m[1] ?? "127.0.0.1";
+  return { hostname: host.startsWith("[") ? host.slice(1, -1) : host, port };
+}
+
+// CLI token idle days: unset or empty is the default, 0 is never, else a
+// whole number of days up to ten years. Plain digits, as elsewhere here.
+export const DEFAULT_CLI_TOKEN_IDLE_DAYS = 30;
+function idleDays(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_CLI_TOKEN_IDLE_DAYS;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3650) {
+    throw new Error(`GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days from 0 (never expire) to 3650, not "${raw}"`);
+  }
+  return Number(raw);
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so

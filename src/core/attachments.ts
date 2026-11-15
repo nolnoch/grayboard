@@ -228,12 +228,25 @@ export function canReadAttachment(
   dmVisible: (messageId: number) => boolean,
   from: Uploader = { addresses: [handle], principal: null },
 ): boolean {
+  return attachmentReach(db, handle, a, dmVisible, from).readable;
+}
+
+// canReadAttachment's answer and which carrier decided it, for the server's
+// authorize() to name its rule (#851).
+export type AttachmentReach = { carrier: "post" | "message" | "unbound"; readable: boolean };
+export function attachmentReach(
+  db: Database,
+  handle: string,
+  a: AttachmentRow,
+  dmVisible: (messageId: number) => boolean,
+  from: Uploader = { addresses: [handle], principal: null },
+): AttachmentReach {
   if (a.post_id !== null) {
     const p = getPost(db, a.post_id);
-    return !!p && canSeeBoard(db, handle, p.board);
+    return { carrier: "post", readable: !!p && canSeeBoard(db, handle, p.board) };
   }
-  if (a.message_id !== null) return dmVisible(a.message_id);
-  return from.addresses.includes(a.uploader) && (from.principal === null || a.uploader_principal === from.principal);
+  if (a.message_id !== null) return { carrier: "message", readable: dmVisible(a.message_id) };
+  return { carrier: "unbound", readable: from.addresses.includes(a.uploader) && (from.principal === null || a.uploader_principal === from.principal) };
 }
 
 // Deletes the attachments of the messages or posts `ownersSql` selects (a

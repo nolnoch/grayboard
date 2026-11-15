@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { openDatabase } from "./db.ts";
 import { createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
@@ -82,19 +83,21 @@ test("actual HTTP delegation audit rollback cannot publish a launcher request", 
 });
 
 test("live sink sees committed message and both delegation audits on a separate connection", async () => {
-  const reader = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
+  // A plain read-only connection: a second openDatabase would run the schema step, whose launcher sweep (#521 5)
+  // clears the mark AppSession declares without a hosted row.
+  const reader = new Database(join(dir, "bus.db"), { readonly: true });
   let visible = false;
   recipient.session.sink.deliver = event => {
     expect(database.db.inTransaction).toBe(false);
     expect(event.kind).toBe("direct");
-    expect(reader.repo.messages.history(["you@example.com/launcher"])).toHaveLength(1);
-    expect(reader.db.query("SELECT action FROM access_log WHERE action IN ('hosted.write', 'delegation.requested')").all()).toHaveLength(2);
+    expect(reader.query("SELECT id FROM messages WHERE recipient = 'you@example.com/launcher'").all()).toHaveLength(1);
+    expect(reader.query("SELECT action FROM access_log WHERE action IN ('hosted.write', 'delegation.requested')").all()).toHaveLength(2);
     visible = true; events.push(event);
   };
   try {
     await mcp.sessions.run(principal, context(), "delegate", delegate);
     expect(visible).toBe(true); expect(events).toHaveLength(1);
-  } finally { reader.db.close(); }
+  } finally { reader.close(); }
 });
 
 test("postcommit sink failure cannot fail or roll back a committed native message", async () => {
@@ -112,26 +115,36 @@ test("postcommit sink failure cannot fail or roll back a committed native messag
 test("nested savepoint success waits for outer transaction commit; outer rollback discards payload and invalidation", () => {
   let invalidations = 0;
   const unsubscribe = database.repo.hosted.subscribe(() => { invalidations++; });
+  const id = context().id!;
+  // The hub's view of the session (its live holder) changes only after a commit: reconcile closes it then.
+  const closed = spyOn(application, "close");
   try {
     expect(() => database.db.transaction(() => {
       database.repo.hosted.atomic(() => {
         application.send(recipient.session, "launcher", "rolled back nested");
         database.repo.hosted.end(context().id!, "closed", Date.now());
       });
-      expect(application.hostedHolder("you@example.com/fe")?.active).toBe(true);
+      expect(closed).not.toHaveBeenCalled();
       expect(events).toEqual([]); expect(invalidations).toBe(0);
       throw new Error("outer rollback");
     }).immediate()).toThrow("outer rollback");
     expect(events).toEqual([]); expect(invalidations).toBe(0);
-    expect(application.hostedHolder("you@example.com/fe")?.active).toBe(true);
+    expect(closed).not.toHaveBeenCalled();
     expect(database.repo.hosted.get(context().id!)).toBeDefined();
     expect(application.history(recipient.session)).toEqual([]);
+    // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
     database.db.transaction(() => {
-      database.repo.hosted.atomic(() => application.send(recipient.session, "launcher", "committed nested"));
+      database.repo.hosted.atomic(() => { application.send(recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(id, Date.now()); });
       expect(events).toEqual([]); expect(invalidations).toBe(0);
     }).exclusive();
-    expect(events).toHaveLength(1); expect(invalidations).toBe(1);
-  } finally { unsubscribe(); }
+    expect(events).toHaveLength(1); expect(invalidations).toBe(0);
+    database.db.transaction(() => {
+      database.repo.hosted.atomic(() => database.repo.hosted.end(id, "closed", Date.now()));
+      expect(invalidations).toBe(0);
+    }).exclusive();
+    expect(invalidations).toBe(1);
+    expect(closed).toHaveBeenCalled();
+  } finally { unsubscribe(); closed.mockRestore(); }
 });
 
 test("caught inner rollback discards only inner effects and preserves outer effect ordering", () => {

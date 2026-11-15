@@ -1,9 +1,9 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { exchangeGoogleCode, hashToken, type AuthedUser } from "./auth.ts";
+import { exchangeGoogleCode, googleSignIn, hashToken, type AuthedUser, type GoogleIdentity } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
-import { OAUTH_TTL, type OAuthRequest } from "./oauth-types.ts";
+import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
 import { writeAudit } from "./audit.ts";
@@ -20,7 +20,7 @@ export type OAuthOptions = {
   now?: () => number;
   cimd?: CimdOptions;
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
-  exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<{ email: string; displayName: string | null }>;
+  exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<GoogleIdentity>;
 };
 export type OAuthNetworkContext = { key: string };
 const random = () => randomBytes(32).toString("base64url");
@@ -338,12 +338,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       upstream.delete(stateHash);
       delete f.upstream;
       if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); flows.delete(r.requestHash); return returnToClient(r, f, { error: "access_denied" }); }
-      let identity: { email: string; displayName: string | null };
+      let identity: GoogleIdentity;
       try { identity = await exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint("/oauth/google/callback") }); }
       catch (e) { hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email) || identity!.email.split("@")[1] !== config.orgDomain) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
-      const user = repo.users.upsertByEmail(identity!.email, identity!.displayName);
+      const signedIn = googleSignIn(repo, identity!, { client_id: r.clientId });
+      if ("refused" in signedIn) fail("access_denied", 403);
+      const { user } = signedIn;
       if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); fail("access_denied", 403); }
       const session = random(), t = now();
       const created = repo.oauth.createBrowserSession({ sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
@@ -452,6 +454,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const bearerError = (status: 401 | 403, error: string | undefined, requiredScopes: string[]) => json({ error: error ?? "unauthorized" }, status, {
     "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}", scope="${(status === 401 ? OAUTH_SCOPES : requiredScopes).join(" ")}"${error ? `, error="${error}"` : ""}`,
   });
+  // A live access token and its user's email, by hash. Both reads are cached in the Repo on
+  // authGeneration (#853), so the hot path skips the token-grant-user join.
+  function activeAccess(accessHash: string): { access: OAuthAccess; email: string } | undefined {
+    const access = repo.oauth.findActiveAccess(accessHash, resource, [], now());
+    if (!access) return undefined;
+    const email = repo.users.activeEmail(access.userId);
+    return email === undefined ? undefined : { access, email };
+  }
   return {
     issuer, resource, resourceMetadata,
     async fetch(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
@@ -470,19 +480,18 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
       if (u.searchParams.has("access_token") || !auth || !/^Bearer [A-Za-z0-9_-]{43}$/i.test(auth)) return bearerError(401, auth ? "invalid_token" : undefined, requiredScopes);
       const accessHash = hashToken(auth.slice(7));
-      const access = repo.oauth.findActiveAccess(accessHash, resource, [], now());
-      if (!access) return bearerError(401, "invalid_token", requiredScopes);
+      const found = activeAccess(accessHash);
+      if (!found) return bearerError(401, "invalid_token", requiredScopes);
+      const { access, email } = found;
       if (!requiredScopes.every(s => access.scopes.includes(s))) return bearerError(403, "insufficient_scope", requiredScopes);
-      const user = repo.users.findById(access.userId);
-      if (!user || user.disabled_at !== null) return bearerError(401, "invalid_token", requiredScopes);
-      return { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
-        sourceKey: sourceKeyFor(access.clientId, clients), scopes: access.scopes, accessHash, accessExpiry: access.expiresAt };
+      return { authed: { user_id: access.userId, user_email: email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
+        sourceKey: sourceKeyFor(access.clientId, clients), scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
     },
     isGrantActive(grantId: string): boolean { return !closed && repo.oauth.isGrantActive(grantId, now()); },
     isAuthorized(principal: OAuthPrincipal): boolean {
       if (closed || principal.accessExpiry <= now()) return false;
-      const a = repo.oauth.findActiveAccess(principal.accessHash, resource, principal.scopes, now());
-      return !!a && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
+      const a = activeAccess(principal.accessHash)?.access;
+      return !!a && principal.scopes.every(s => a.scopes.includes(s)) && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
     },
     close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); },
   };

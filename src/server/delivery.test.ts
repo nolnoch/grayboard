@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { refusalCount } from "./metrics.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -54,6 +55,13 @@ test("stale receipt audit survives rollback exactly once without committing any 
   expect(JSON.stringify(rows)).not.toContain(lease.capability);
   await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
   expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
+});
+
+test("shutdown detaches each accepted lease with one hosted.lease_detached row naming its session (#424)", async () => {
+  const lease = await delivery.open(bob, context(bob)); delivery.accept(lease);
+  delivery.close();
+  const rows = store.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'hosted.lease_detached'").all();
+  expect(rows.map(r => [r.actor, r.target, JSON.parse(r.detail)])).toEqual([[bob.authed.user_email, store.repo.hosted.all()[0]!.session_id, { reason: "shutdown", client_id: OPENCODE_CLIENT }]]);
 });
 
 test("a DM to the session's own ID is pushed unstamped, an alias DM carries its alias (#451: the client checks held addresses only)", async () => {
@@ -277,6 +285,46 @@ test("per-user delivery capacity refuses without attaching another grant or drop
   expect(delivery.describe(bob, context(bob), first.capability).capability).toBe(first.capability);
 });
 
+test("the per-user lease count frees a slot on release and never double-counts a reopen (#805)", async () => {
+  const contexts = [context(bob)];
+  for (let i = 1; i < 32; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    contexts.push(c);
+  }
+  const leases = [];
+  for (const c of contexts) leases.push(await delivery.open(bob, c));
+  // Reopening a held lease reuses its slot.
+  for (const c of contexts.slice(0, 4)) await delivery.open(bob, c);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  const counted = refusalCount("delivery_lease");
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+  expect(refusalCount("delivery_lease")).toBe(counted + 1);
+  await delivery.release(bob, contexts[5]!, leases[5]!.capability);
+  expect(delivery.activeLeaseCount).toBe(31);
+  await delivery.open(bob, contender);
+  expect(delivery.activeLeaseCount).toBe(32);
+  const another = context(bob, "another");
+  await hosted.bind(bob, another, { name: "another", create: true });
+  await expect(delivery.open(bob, another)).rejects.toThrow("delivery lease capacity reached");
+});
+
+test("a user at the lease cap can reopen every lease under a new grant, and the count stays exact (#805)", async () => {
+  const contexts = [context(bob)];
+  for (let i = 1; i < 32; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    contexts.push(c);
+  }
+  for (const c of contexts) await delivery.open(bob, c);
+  for (const c of contexts) await delivery.open({ ...bob, grantId: "G2" }, c);
+  expect(delivery.activeLeaseCount).toBe(32);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+});
+
 test("one lease admits more than 1000 deliveries with bounded idempotent receipt history", async () => {
   const lease = await delivery.open(bob, context(bob));
   for (let i = 0; i < 1100; i++) await send(`message ${i}`);
@@ -296,6 +344,38 @@ test("one lease admits more than 1000 deliveries with bounded idempotent receipt
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
   expect((await delivery.open(bob, context(bob))).capability).toBe(lease.capability);
   expect(delivery.activeLeaseCount).toBe(1);
+});
+
+// The receipt history covers a lost receipt's retry, which re-sends one call's ids (at most 100):
+// 200 per lease covers it twice over (#805).
+test("receipt history keeps the last 200 acknowledged ids per lease", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  for (let i = 0; i < 300; i++) await send(`message ${i}`);
+  const acked: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const batch = await delivery.pending(bob, context(bob), lease.capability);
+    await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
+    acked.push(...batch.map(item => item.id));
+  }
+  await delivery.receipt(bob, context(bob), lease.capability, acked.slice(100, 200));
+  await expect(delivery.receipt(bob, context(bob), lease.capability, [acked[99]!])).rejects.toHaveProperty("code", "not_found");
+});
+
+// A lease's receipt history held a clone of every acknowledged item, bodies included: 1000 leases
+// grew the heap by hundreds of MB an hour under the load test (#805).
+test("acknowledged items' bodies aren't retained by the receipt history", async () => {
+  const { fullGC, heapStats } = await import("bun:jsc");
+  const lease = await delivery.open(bob, context(bob));
+  for (let i = 0; i < 100; i++) await send(`${i} `.padEnd(32_000, "x"));
+  fullGC();
+  const before = heapStats().heapSize;
+  const batch = await delivery.pending(bob, context(bob), lease.capability);
+  expect(batch).toHaveLength(100);
+  await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
+  batch.length = 0;
+  fullGC();
+  // 100 bodies of 32 KB are 3.2 MB (6.4 MB as UTF-16); the history may keep ids and stamps only.
+  expect(heapStats().heapSize - before).toBeLessThan(1_000_000);
 });
 
 test("renew completes while a transfer holds the reader gate past the original deadline", async () => {
@@ -326,4 +406,19 @@ test("reattachment on successful open invalidates old grant capabilities", async
   expect(replacement.ownership).toBe(lease.ownership);
   expect(delivery.activeLeaseCount).toBe(1);
   await expect(delivery.pending(bob, context(bob), lease.capability)).rejects.toHaveProperty("code", "not_found");
+});
+
+test("a configured per-user lease cap admits past the default and refuses at its size (#805 F-06)", async () => {
+  delivery.close();
+  delivery = createDelivery(hosted, { isAuthorized: () => authorized, caps: { global: 256, perUser: 40 } });
+  await delivery.open(bob, context(bob));
+  for (let i = 1; i < 40; i++) {
+    const c = context(bob, `root-${i}`);
+    await hosted.bind(bob, c, { name: `worker-${i}`, create: true });
+    await delivery.open(bob, c);
+  }
+  expect(delivery.activeLeaseCount).toBe(40);
+  const contender = context(bob, "contender");
+  await hosted.bind(bob, contender, { name: "contender", create: true });
+  await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
 });

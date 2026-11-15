@@ -2,7 +2,8 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pruneMessages, pruneAudit, runRetention } from "./retention.ts";
+import { Database } from "bun:sqlite";
+import { pruneMessages, pruneAudit, reclaimFreePages, runRetention } from "./retention.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { storeAttachment } from "../core/attachments.ts";
@@ -99,5 +100,65 @@ describe("retention pruning", () => {
   test("pruneAudit does not throw", () => {
     repo.audit.write({ at: Date.now() - 1000, actor: "system", action: "auth.login", target: null, detail: null });
     expect(() => pruneAudit(repo, Date.now())).not.toThrow();
+  });
+});
+
+// #137: the nightly run returns freed pages to the filesystem, bounded per run.
+describe("reclaiming free pages", () => {
+  // A file database with `rows` 4 KB rows written and then deleted: that many free pages, or more.
+  const freed = (db: import("bun:sqlite").Database, rows: number) => {
+    db.run("CREATE TABLE IF NOT EXISTS filler (x BLOB)");
+    db.transaction(() => { for (let i = 0; i < rows; i++) db.run("INSERT INTO filler VALUES (randomblob(4000))"); })();
+    db.run("DELETE FROM filler");
+  };
+  const freeCount = (db: import("bun:sqlite").Database) => db.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count;
+  const quiet = <T>(f: () => T): { value: T; lines: string[] } => {
+    const lines: string[] = [];
+    const real = console.error;
+    console.error = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+    try { return { value: f(), lines }; } finally { console.error = real; }
+  };
+
+  test("reclaimFreePages returns at most maxPages, and refuses a non-positive count", () => {
+    const { db, repo } = openDatabase(join(blobDir, "bus.db"), { blobDir: join(blobDir, "blobs") });
+    freed(db, 300);
+    const before = freeCount(db);
+    expect(before).toBeGreaterThanOrEqual(300);
+    expect(repo.storage.reclaimFreePages(100)).toEqual({ reclaimed: 100, remaining: before - 100, incremental: true });
+    expect(freeCount(db)).toBe(before - 100);
+    // incremental_vacuum(0) means every page: never passed through.
+    expect(() => repo.storage.reclaimFreePages(0)).toThrow(RangeError);
+    expect(freeCount(db)).toBe(before - 100);
+    db.close();
+  });
+
+  test("runRetention reclaims the free pages and says how many", async () => {
+    const { db, repo } = openDatabase(join(blobDir, "bus.db"), { blobDir: join(blobDir, "blobs") });
+    freed(db, 300);
+    const before = freeCount(db);
+    const lines: string[] = [];
+    const real = console.error;
+    console.error = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+    try { await runRetention(repo, db, { messageRetentionDays: 90, auditRetentionDays: 90 } as Config); } finally { console.error = real; }
+    expect(freeCount(db)).toBe(0);
+    expect(lines).toContain(`[grayboard] retention: reclaimed ${before} free database pages (0 left)`);
+    db.close();
+  });
+
+  test("a database from before #170 (auto_vacuum=NONE) reclaims nothing and says how to convert it", () => {
+    const path = join(blobDir, "old.db");
+    const old = new Database(path);
+    old.exec("PRAGMA journal_mode = WAL;");
+    freed(old, 500);
+    old.close();
+    // Opening adds the schema, which reuses some of those pages.
+    const { db, repo } = openDatabase(path, { blobDir: join(blobDir, "blobs") });
+    const before = freeCount(db);
+    expect(before).toBeGreaterThan(0);
+    const { value, lines } = quiet(() => reclaimFreePages(repo));
+    expect(value).toBeUndefined();
+    expect(freeCount(db)).toBe(before);
+    expect(lines).toEqual([`[grayboard] retention: the database has ${before} free pages it can't reclaim (auto_vacuum is not INCREMENTAL); a one-time VACUUM converts it (docs/guide/server.md §Reclaiming disk space)`]);
+    db.close();
   });
 });

@@ -176,6 +176,8 @@ export function initCoreSchema(db: Database): void {
       detail  TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(at);
+    -- lastCoreAudit's (action, target) lookup, newest first (#295).
+    CREATE INDEX IF NOT EXISTS idx_audit_log_action_target ON audit_log(action, target, at);
 
     -- File attachments (src/core/attachments.ts). The catalog of stored
     -- blobs, one per content hash; the bytes are in the mode's BlobStore. A
@@ -273,6 +275,8 @@ export function initCoreSchema(db: Database): void {
       pruned_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_ids_ended ON ids(ended_at) WHERE ended_at IS NOT NULL;
+    -- Live rows only: every local open's orphan and tools-only probes (liveSessions) read just these (#338).
+    CREATE INDEX IF NOT EXISTS idx_ids_live ON ids(id) WHERE ended_at IS NULL;
   `);
 
   // The 1.x roster's later columns, which each mode's alias seed reads.
@@ -292,6 +296,10 @@ export function initCoreSchema(db: Database): void {
   // null for a root's own writes. Stored at write time: a hosted child's
   // source row is gone once it ends, so childhood can't be derived at read.
   if (!postCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE posts ADD COLUMN via TEXT`);
+  // The writer's signed-in user on a server (security audit F-10), so a reader
+  // of another user can be told so; null locally, for posts from before it,
+  // and for system posts. Never shown on reads (POST_COLS).
+  if (!postCols.some((c) => c.name === "author_user")) db.exec(`ALTER TABLE posts ADD COLUMN author_user TEXT`);
 
   // The principal an upload counts against (#284 decision 13): a server
   // user's email, null in local mode. Backfilled from the uploader's "email/"
@@ -321,4 +329,9 @@ export function initCoreSchema(db: Database): void {
   // Queue boards deliver each post to exactly one subscriber (the claim IS the
   // delivery); broadcast (the default) fans out to every push subscriber.
   if (!cols.some((c) => c.name === "kind")) db.exec(`ALTER TABLE boards ADD COLUMN kind TEXT NOT NULL DEFAULT 'broadcast'`);
+
+  // An archived board (#635): out of board_list, closed to new top-level
+  // posts, readable by name. NULL means open.
+  if (!cols.some((c) => c.name === "archived_at")) db.exec(`ALTER TABLE boards ADD COLUMN archived_at INTEGER`);
+  if (!cols.some((c) => c.name === "archived_by")) db.exec(`ALTER TABLE boards ADD COLUMN archived_by TEXT`);
 }

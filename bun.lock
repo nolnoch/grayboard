@@ -6,7 +6,7 @@
       "name": "grayboard",
       "dependencies": {
         "@modelcontextprotocol/core": "2.4.0",
-        "@modelcontextprotocol/sdk": "^1.32.1",
+        "@modelcontextprotocol/sdk": "1.32.1",
         "@modelcontextprotocol/server": "2.4.0",
         "commander": "^12.0.0",
         "jose": "^5.0.0",

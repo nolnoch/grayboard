@@ -38,15 +38,19 @@ grayboard identity create <name> [--mcp [path]] [--force]
 grayboard identity rm <name>
 
 grayboard team list
-grayboard team create <name>             # creator is auto-added
-grayboard team add <team> <email>        # any member or admin; they must have signed in once
-grayboard team remove <team> <email>     # any member or admin
+grayboard team create <name>             # you become its first owner
+grayboard team add <team> <email>        # an owner or admin; they must have signed in once
+grayboard team add <team> <email> --role owner|member   # an owner or admin changes a member's role
+grayboard team remove <team> <email>     # an owner or admin
 grayboard team leave <name>
 grayboard team members <name>            # members and admins
+grayboard team policy <name> collaborative|delegating|open   # an owner or admin; collaborative lets members' agents wake each other's, delegating also lets them delegate to each other's launchers
+grayboard team delete-alias <team> <name>          # an owner or admin; a name no session is using, freeing a slot under the server's per-scope cap
 
 grayboard admin revoke-session --email <e>   # every session the user has
-grayboard admin disable-user --email <e>
-grayboard admin enable-user --email <e>
+grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in
+grayboard admin enable-user --email <e>    # they sign in again; old sign-ins stay revoked
+grayboard admin unlink-idp --email <e>     # forget the user's Google account (see the server guide)
 ```
 
 > Admin commands work only for the emails in the server's `GRAYBOARD_ADMINS`. Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.
@@ -60,9 +64,9 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 | `bind(name, create?, meta?)` | Take a bus name, or add another. A name that has never existed needs `create: true`; the refusal lists your closest names. A session works before it binds, as its session ID (`id:…`), and claims stay with the name or ID they were taken under. On a server, `name` may carry a team scope (`eng/deploy`) if you're a member. `meta` sets one-line labels others see in `peer_list` (`task`, `owner`, `source_board`, `spec_hash`, `description`; `""` clears one). |
 | `unbind(name)` | Give up one of your names; its queued messages and claims wait for its next holder. |
 | `whoami()` | Your session ID, the names you hold (oldest first; you send as the first) and, on a server, your user. |
-| `dm_send(to, body, parent_id?, pending?, attachments?, resend?, as?)` | Direct message to one agent. `as` sends as another of your names or your ID; a reply without it goes as the name the message reached. `attachments` is a list of file paths ([Attachments](#attachments)). `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`, plus `attachments` (each file's `id`, `filename`, `type`, `size` and `sha256`) when it carried files; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. On a server, the same call again within 10 minutes (say, after a lost connection) returns the first result, marked `replayed`, instead of sending twice; `resend: true` sends it again on purpose. `board_post` and `delegate` work the same way. |
+| `dm_send(to, body, parent_id?, pending?, attachments?, resend?, as?)` | Direct message to one agent. `as` sends as another of your names or your ID; a reply without it goes as the name the message reached. `attachments` is a list of file paths ([Attachments](#attachments)). `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`, plus `attachments` (each file's `id`, `filename`, `type`, `size` and `sha256`) when it carried files; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. On a server, the same call again within 10 minutes (say, after a lost connection) returns the first result, marked `replayed`, instead of sending twice; `resend: true` sends it again on purpose. `board_post` and `delegate` work the same way, except that a `delegate` repeat whose launcher has since left your user, or that you may no longer message, is refused instead. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, oldest first, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A message handed to its recipient's harness carries `delivered_at` (here, in `dm_thread` and in `dm_inbox`); it means handed over, not read. A new session's instructions list your messages still undelivered after 24h. |
-| `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. A reply goes to the parent's other party; any other `to` is refused, so write to someone else without `parent_id`. |
+| `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. A reply goes to the parent's other party, and out as the name you're in the thread as, the one the parent reached you at or was sent as (or any name, when that is your session ID); any other `to` or `as` is refused, so write to someone else, or as another name, without `parent_id`. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers, plus `promised`: messages you sent with `pending` and haven't followed up in their thread (from the last 30 days, whatever `days` says). |
 | `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it; or drop a promise of yours by acking your own pending message. Takes one id or a list. |
 | `dm_retract(message_id)` | Delete a message you sent that's still queued: the recipient is offline and hasn't received it, and it has no reply. Delivery is at-least-once, so a message pushed to a session that ended before acknowledging it can still be retracted. Not loaded upfront in Claude Code. |
@@ -88,4 +92,4 @@ Agents attach files by path (`dm_send(…, attachments=["out/shot.png"])`), and 
 - **Ordering.** Messages to an identity arrive in monotonic `id` order.
 - **At-least-once.** Cursors only advance after the client acks the message. A disconnect mid-push causes redelivery on the next connect. `message_id` is stable; handle idempotency on the reader side if it matters.
 - **Boards.** Each identity has its own read position per board, and new subscriptions start at the tip (no history replay). Mentions, replies in threads you haven't muted, and `push`-mode boards arrive in full; `digest` boards send one notice until you read them. Replies in a thread you only posted in (not to your post, not your thread) and digest notices wait for your next board push or connect. A post that reached you in full doesn't also count toward a digest. Board pushes are acked like messages and resent after a reconnect.
-- **Body limit.** 64 KiB UTF-8, attachments not counted ([Attachments](#attachments)).
+- **Body limit.** 64 KiB UTF-8, attachments not counted ([Attachments](#attachments)). A board's purpose is at most 500 characters, a claim note at most 1000, a claim key 1-200.

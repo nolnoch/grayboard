@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
-import type { AppSession } from "../support/app_session.ts";
+import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
@@ -28,11 +28,7 @@ const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestS
 
 // A connected application session declared a launcher, as a hosted
 // request's launcher declaration does (#473).
-async function launcher(srv: TestServer, token: string, identity: string): Promise<AppSession> {
-  const s = srv.appSession(token, identity, { launcher: true });
-  await s.connect();
-  return s;
-}
+const launcher = (srv: TestServer, token: string, identity: string): Promise<AppSession> => srv.connected(token, identity, { launcher: true });
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "grayboard-delegate-"));
@@ -113,6 +109,23 @@ test("local: a delegate request lands on the live launcher, harness-neutral, tra
   }
 }, 30_000);
 
+// #337: a fresh launcher can take work before it picks a name: delegation
+// reaches it by its session ID, by auto-pick and by an explicit to.
+test("local: an unbound launcher is delegable by its ID", async () => {
+  const fresh = await localSession(dir, undefined, { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim");
+  const id = (await call(fresh.c, "whoami")).id as string;
+  expect(id).toMatch(/^id:/);
+
+  const auto = await call(sim.c, "delegate", { persona: "a researcher", task: "t1" });
+  expect(auto.to).toBe(id);
+  expect(auto.delivered_now).toBe(true);
+  const named = await call(sim.c, "delegate", { persona: "a researcher", task: "t2", to: id });
+  expect(named.to).toBe(id);
+  await until(() => fresh.pushes.length >= 2, 10_000, "both requests pushed to the unbound launcher");
+  expect(String(fresh.pushes[0]!.content)).toContain("[delegation request from sim]");
+}, 30_000);
+
 test("local: an explicit to that isn't a launcher is refused, naming the flag", async () => {
   const sim = await localSession(dir, "sim");
   await localSession(dir, "ad"); // live, not a launcher
@@ -121,6 +134,16 @@ test("local: an explicit to that isn't a launcher is refused, naming the flag", 
     throw new Error("expected a refusal");
   } catch (e) {
     expect((e as Error).message).toContain("isn't a launcher session");
+  }
+}, 20_000);
+
+test("local: a launcher naming itself is refused as self-delegation, not as offline (#253)", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  try {
+    await call(be.c, "delegate", { persona: "p", task: "t", to: "be" });
+    throw new Error("expected a refusal");
+  } catch (e) {
+    expect((e as Error).message).toContain("can't delegate to itself");
   }
 }, 20_000);
 
@@ -185,6 +208,22 @@ test("server: the launcher flag on a session's ID records the capability; delega
   }
 }, 30_000);
 
+test("server: a launcher naming itself is refused as self-delegation, and nothing is sent (#253)", async () => {
+  const srv = serve();
+  try {
+    const token = await srv.login("you@example.com");
+    const be = await launcher(srv, token, "be");
+    // Its primary, and a second alias it holds: before the fix the second
+    // was online to the server and the request went to the session itself.
+    expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be" }))).message).toContain("can't delegate to itself");
+    await be.bind("be2", { create: true });
+    expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be2" }))).message).toContain("can't delegate to itself");
+    expect((srv.app.db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n).toBe(0);
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
 test("server: delegation stays within the requester's user (review 1-2)", async () => {
   const srv = serve();
   try {
@@ -203,7 +242,7 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     expect(r.human_fallback).toBeUndefined();
 
     // An explicit cross-user `to` is refused, naming the scope...
-    await expect(bobSim.call("delegate", { persona: "p", task: "t", to: "alice@example.com/be" })).rejects.toThrow(/own user|authority ruling/);
+    await expect(bobSim.call("delegate", { persona: "p", task: "t", to: "alice@example.com/be" })).rejects.toThrow(/belongs to another user/);
     // ...and nothing landed on alice's launcher.
     await aliceBe.none(direct());
 
@@ -211,6 +250,98 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     const audits = srv.app.db.query(`SELECT action, actor, target FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
     expect(audits.some((a) => a.action === "delegation.requested" && a.target === "bob@b.com/be")).toBe(true);
     expect(audits.some((a) => a.action === "delegation.refused")).toBe(true);
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// Security audit F-01: a team alias is shared by every member, so a
+// requester on `eng/sim` is judged by its signed-in user, not by the
+// `eng/` its handle shares with a teammate's launcher.
+test("server: a team alias doesn't carry delegation to a teammate's launcher", async () => {
+  const srv = serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const bobLauncher = await launcher(srv, bob, "eng/launcher");
+    const aliceSim = await srv.hosted("alice@example.com", "eng/sim");
+
+    // Auto-pick finds no launcher of alice's (bob's is live, and shares the
+    // scope), and alice has no reachable human: refused, nothing sent.
+    await expect(aliceSim.call("delegate", { persona: "a researcher", task: "t" })).rejects.toThrow(/no live launcher session/);
+    // Naming bob's launcher is refused as another user's.
+    await expect(aliceSim.call("delegate", { persona: "p", task: "t", to: "eng/launcher" })).rejects.toThrow(/belongs to another user/);
+    await bobLauncher.none(direct());
+
+    // Alice's own launcher under a team name takes it.
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const r = await aliceSim.call<Delegated>("delegate", { persona: "a researcher", task: "t" });
+    expect(r.to).toBe("eng/builder");
+    expect((await aliceLauncher.next(direct())).message.sender).toBe("eng/sim");
+    await bobLauncher.none(direct());
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// #393 1 (docs/vision.md principle 11): a repeat inside the dedup window
+// re-checks authority over the launcher the first call picked, so a team
+// launcher name that has since moved to a teammate's session is refused,
+// not answered with the first call's result.
+test("server: a delegate repeat after its launcher's name moved to another user is refused, not replayed", async () => {
+  const srv = serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const aliceSim = await srv.connected(alice, "eng/sim");
+    const req = { persona: "a researcher", task: "t", to: "eng/builder" };
+    const first = await aliceSim.delegate(req);
+    expect(((await aliceSim.delegate(req)) as Delegated & { replayed?: unknown }).replayed).toBeDefined();
+
+    await aliceLauncher.unbind("eng/builder");
+    await srv.connected(bob, "eng/builder");
+    const replays = () => (srv.app.db.query(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'`).get() as { n: number }).n;
+    const before = replays();
+    await expect(aliceSim.delegate(req)).rejects.toThrow(/"eng\/builder" belongs to another user/);
+    expect(replays()).toBe(before);
+    const refused = srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid DESC LIMIT 1`).get() as { detail: string };
+    expect(JSON.parse(refused.detail)).toMatchObject({ to: "eng/builder" });
+    // The first call's message stands, and the receipt with it.
+    expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM messages WHERE id = ?`).get(first.message_id)).toEqual({ n: 1 });
+    expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'`).get()).toEqual({ n: 1 });
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// The auto-pick half: the caller never named the launcher, so the refusal
+// says what the first call picked and how to pick afresh, and the audit row
+// names the pick.
+test("server: an auto-pick delegate repeat after its pick moved to another user names the pick and resend", async () => {
+  const srv = serve();
+  try {
+    const alice = await srv.login("alice@example.com");
+    const bob = await srv.login("bob@b.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@b.com" })).status).toBe(200);
+    const aliceLauncher = await launcher(srv, alice, "eng/builder");
+    const aliceSim = await srv.connected(alice, "eng/sim");
+    const req = { persona: "a researcher", task: "t" };
+    expect((await aliceSim.delegate(req)).to).toBe("eng/builder");
+
+    await aliceLauncher.unbind("eng/builder");
+    await srv.connected(bob, "eng/builder");
+    const refusedRows = () => srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused'`).all() as { detail: string }[];
+    const before = refusedRows().length;
+    await expect(aliceSim.delegate(req)).rejects.toThrow(/auto-picked "eng\/builder".*resend: true/);
+    const rows = refusedRows();
+    expect(rows.length).toBe(before + 1);
+    expect(JSON.parse(rows[rows.length - 1].detail)).toMatchObject({ to: "eng/builder" });
   } finally {
     await srv.stop();
   }
@@ -319,6 +450,7 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     // Link, so the human is really reachable: the bridge is running and the
     // user is linked (review 10's reachability, not a last_seen row).
     const r = await srv.api(token, "POST", "/api/slack/link");
+    slack.emails.set("U0ALICE", "alice@example.com");
     slack.say(`link ${r.body.code}`);
     await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
 
@@ -353,6 +485,19 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     await srv.stop();
     slack.stop();
   }
+}, 40_000);
+
+// #272: a local `to` resolves as the server resolves it: case doesn't matter,
+// for delegate and dm_send alike.
+test("local: a mixed-case to reaches the launcher, by delegate and by dm_send", async () => {
+  const be = await localSession(dir, "be", { extra: { BUS_LAUNCHER: "1" } });
+  const sim = await localSession(dir, "sim");
+  const r = await call(sim.c, "delegate", { persona: "p", task: "mixed t", to: "Be" });
+  expect(r).toMatchObject({ to: "be", delivered_now: true });
+  await until(() => be.pushes.some((p) => String(p.content).includes('"task": "mixed t"')), 10_000, "the delegate push");
+  const d = await call(sim.c, "dm_send", { to: "BE", body: "mixed dm" });
+  expect(d).toMatchObject({ delivered_now: true });
+  await until(() => be.pushes.some((p) => String(p.content).includes("mixed dm")), 10_000, "the dm push");
 }, 40_000);
 
 // #284 PR 4: the launcher flag is the session's, so it stands behind every

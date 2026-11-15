@@ -1,15 +1,16 @@
 import pkg from "../../package.json" with { type: "json" };
-import { PrincipalTaken, type Repo, type Team } from "./db.ts";
-import { mayActIn } from "./access.ts";
-import type { Config } from "./config.ts";
+import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type Team, type TeamPolicy, type TeamRole, type User } from "./db.ts";
+import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
-  verifySessionToken, extractBearer, exchangeGoogleCode,
+  verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
-import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
+import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
-import { canAdmin } from "./can_send.ts";
+import { isLoopbackIp } from "./client_addr.ts";
+import { DEFAULT_LAG_GATE, lagVerdict, lagWindows, type LagGate, type LagWindow } from "./metrics.ts";
+import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
@@ -19,6 +20,7 @@ import { listClaims } from "../core/claims.ts";
 import { addressSet, aliasHeldText, aliasUser, idRow } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
+import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
 
@@ -35,10 +37,10 @@ function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
 function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
-function requireAuth(req: Request, repo: Repo, touches: TouchQueue): AuthedUser | null {
+function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number): AuthedUser | null {
   const raw = extractBearer(req);
   if (!raw) return null;
-  return verifySessionToken(raw, repo, touches);
+  return verifySessionToken(raw, repo, touches, idleDays);
 }
 
 async function parseBody<T>(req: Request): Promise<T | null> {
@@ -47,16 +49,39 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 
 // ── route handlers ────────────────────────────────────────────────────────────
 
-async function healthz(repo: Repo): Promise<Response> {
-  try {
-    repo.users.findByEmail("__healthz__");
-    // The version lets a deploy check tell a restarted server from a stale one.
-    return json({ ok: true, version: pkg.version });
-  } catch (e) {
-    // A deploy check that sees this 503 needs the cause in the journal.
-    console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
-    return jsonErr("internal", "db not reachable", 503);
+// /healthz is unauthenticated, so its database probe is cached per repo for HEALTH_TTL_MS, success and failure
+// alike (#275): a flood costs one probe a second, and a down database logs one line a second. The probe is a
+// synchronous read, so no request can arrive while one is in flight and the cache alone is single-flight.
+export const HEALTH_TTL_MS = 1000;
+const health = new WeakMap<Repo, { at: number; ok: boolean; lagging?: boolean }>();
+export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows()): Response {
+  let cached = health.get(repo);
+  if (!cached || now - cached.at >= HEALTH_TTL_MS) {
+    let ok = true;
+    try {
+      repo.users.findByEmail("__healthz__");
+    } catch (e) {
+      // A deploy check that sees this 503 needs the cause in the journal.
+      console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
+      ok = false;
+    }
+    // The lag verdict outlives the probe's window, so its state-change log line fires once, not every second.
+    health.set(repo, cached = { at: now, ok, lagging: cached?.lagging });
   }
+  if (!cached.ok) return jsonErr("internal", "db not reachable", 503);
+  // Sustained event-loop lag fails the check (#805), with the version kept so a deploy check still
+  // tells a restarted server from a stale one. The journal gets one line per change of state.
+  const lag = lagVerdict(windows, gate);
+  if (lag.lagging !== !!cached.lagging) {
+    cached.lagging = lag.lagging;
+    console.error(lag.lagging ? `[grayboard] healthz: failing on event-loop lag, p99 ${lag.p99s.map(p => p.toFixed(2)).join("/")} s over the last ${gate.windows} windows` : "[grayboard] healthz: event-loop lag recovered");
+  }
+  // The per-window p99s and the threshold go to the journal only: this route is public, and the scrape's bind is
+  // what guards the server's telemetry.
+  if (lag.lagging) return json({ ok: false, version: pkg.version, code: "lagging", message: "event loop lagging" }, 503);
+
+  // The version lets a deploy check tell a restarted server from a stale one.
+  return json({ ok: true, version: pkg.version });
 }
 
 function authConfig(config: Config): Response {
@@ -80,17 +105,22 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   if (!body?.code || !body.code_verifier || !body.redirect_uri) {
     return badRequest("code, code_verifier, redirect_uri required");
   }
-  let email: string, displayName: string | null;
+  let identity: GoogleIdentity;
   try {
-    ({ email, displayName } = await exchangeGoogleCode(
+    identity = await exchangeGoogleCode(
       body.code, body.code_verifier, body.redirect_uri,
       config.googleClientId, config.googleClientSecret, config.orgDomain,
-    ));
+    );
   } catch (e) {
     return jsonErr("forbidden", String(e), 403);
   }
+  const email = identity.email;
   if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
-  const user = repo.users.upsertByEmail(email, displayName ?? null);
+  const signedIn = googleSignIn(repo, identity, { ip: ip ?? undefined });
+  if ("refused" in signedIn) return jsonErr("forbidden", signedIn.refused, 403);
+  const { user } = signedIn;
+  const disabled = refuseDisabled(repo, user, { ip: ip ?? undefined });
+  if (disabled) return disabled;
   const raw  = mintToken();
   const ua   = userAgent(req);
   repo.sessions.create(user.id, hashToken(raw), ua);
@@ -101,14 +131,31 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
 
+// A disabled user gets no CLI token (security audit F-14); OAuth refuses the
+// same way at consent (oauth.user_refused).
+function refuseDisabled(repo: Repo, user: User, detail: Record<string, unknown>): Response | null {
+  if (user.disabled_at === null) return null;
+  writeAudit(repo, "auth.user_refused", user.email, null, detail);
+  return jsonErr("forbidden", "this account is disabled; ask a grayboard admin to run admin enable-user", 403);
+}
+
 async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Response> {
+  // The loopback public URL (config.ts) doesn't stop a remote client: the
+  // server listens on every interface, and a proxy forwards to it. Only a
+  // client on this host may sign in as anyone (security audit F-04).
+  if (!ip || !isLoopbackIp(ip)) {
+    writeAudit(repo, "auth.dev_login_refused", null, null, { ip: ip ?? undefined });
+    return jsonErr("forbidden", "dev sign-in answers only clients on the server's own host", 403);
+  }
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
   const user  = repo.users.upsertByEmail(email, null);
+  const disabled = refuseDisabled(repo, user, { dev: true, ip: ip ?? undefined });
+  if (disabled) return disabled;
   const raw   = mintToken();
-  repo.sessions.create(user.id, hashToken(raw), "dev");
+  repo.sessions.create(user.id, hashToken(raw), DEV_SESSION_LABEL);
   writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
   return json({ session_token: raw, user_email: email, expires_at: null });
 }
@@ -164,19 +211,28 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   if (!input) return badRequest("as required: the address to act as");
   const p = addressParts(input);
   if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
+  // Security audit F-01 (#851): every policy refusal below is an `authz.decision` row.
   if (p.kind === "id") {
     const row = idRow(db, p.address);
-    if (!row || row.viewer || row.principal !== authed.user_email) return forbidden(`${p.address} isn't a session of yours`);
-    if (row.ended_at !== null) return forbidden(`${p.address} ended at ${new Date(row.ended_at).toISOString()}`);
+    const req: AuthzRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
+    const d = authorize(repo, {}, req);
+    if (!d.allow) {
+      recordDecision(repo, { user: authed.user_email }, req, d);
+      return forbidden(d.reason);
+    }
     return p.address;
   }
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
-  if (p.name === HUMAN_NAME) return forbidden(humanReason);
+  // authorize() decides the human name first (`humanReason`), before the scope's owner.
   const owner = repo.resolver.principalOf(address);
-  const no = owner
-    ? mayActIn(repo, { kind: "user", name: authed.user_email }, { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name })
-    : "no principal owns its scope";
-  if (no) return forbidden(`you can't act as "${address}": ${no}`);
+  const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
+  const d = authorize(repo, {}, req);
+  if (!d.allow) {
+    recordDecision(repo, { user: authed.user_email, address }, req, d);
+    if (d.rule === "alias.human_reserved") return forbidden(humanReason);
+    if (d.rule === "scope.ownerless") return forbidden(`you can't act as "${address}": no principal owns its scope`);
+    return forbidden(`you can't act as "${address}": ${d.reason}`);
+  }
   if (!repo.aliases.find(address)) {
     return jsonErr("unknown_identity", `no session has used "${address}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }
@@ -191,15 +247,15 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
 const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 
 async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
-  const body = await parseBody<{ identity?: string; tool?: string; args?: Record<string, unknown> }>(req);
-  if (!body?.identity || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("identity and a claim tool required");
-  const handle = ownAddress(body.identity, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
+  const body = await parseBody<{ as?: string; tool?: string; args?: Record<string, unknown> }>(req);
+  if (!body?.as || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("as and a claim tool required");
+  const handle = ownAddress(body.as, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
   if (handle instanceof Response) return handle;
-  if (body.args?.as !== undefined) return badRequest("name the address to act as in identity, not args.as");
+  if (body.args?.as !== undefined) return badRequest("name the address to act as in as, not args.as");
   try {
-    // As the session the identity is or is held by: its claims under any of
+    // As the session the address is or is held by: its claims under any of
     // its addresses are its own here (#360).
-    const outcome = callBoardTool(db, handle, body.tool, body.args ?? {}, { addresses: addressSet(db, handle, authed.user_email) });
+    const outcome = callBoardTool(db, handle, body.tool, body.args ?? {}, { addresses: addressSet(db, handle, authed.user_email), user: authed.user_email });
     if (outcome.boards?.length) {
       try { void Promise.resolve(onBoardsChanged?.(outcome.boards)).catch(() => {}); } catch {}
     }
@@ -217,7 +273,7 @@ function identityList(authed: AuthedUser, repo: Repo): Response {
   return json(repo.aliases.listForScope("person", authed.user_email).map(i => ({ name: i.name, created_at: i.created_at })));
 }
 
-async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
   const body = await parseBody<{ name: string }>(req);
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
@@ -225,6 +281,8 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
   if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
   const existing = repo.aliases.find(`${authed.user_email}/${name}`);
   if (existing) return conflict(`identity "${name}" already exists`);
+  const capped = aliasCapRefusal(repo, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
+  if (capped) return badRequest(capped);
   const identity = repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
   writeAudit(repo, "alias.created", authed.user_email, identity.address);
   onAliasCreated(db, repo, authed.user_id, identity.address);
@@ -248,14 +306,16 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
 
 // ── attachments ──────────────────────────────────────────────────────────────
 
-// The address named by ?as=. The Slack bridge's human stores its files
-// in-process, not here.
+// The address named by ?as=, which the hosted byte routes
+// (src/server/mcp-attachments.ts) set to the session's bound name; no HTTP
+// route takes it from a client (#475). The Slack bridge's human stores its
+// files in-process, not here.
 function queryAs(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): string | Response {
   return ownAddress(url.searchParams.get("as"), authed, repo, db, HUMAN_RESERVED);
 }
 
-// POST /api/attachments?as=&filename=, the file's bytes as the body.
-// The session's MCP process has already checked the path it came from; this
+// An upload (`?as=&filename=`), the file's bytes as the body, for the hosted
+// byte route's POST. The client has already checked the path it came from; this
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
@@ -304,16 +364,14 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
   }
 }
 
-// GET /api/attachments/<id>?as=: the file, for an identity that can
+// A download (`<id>?as=`), for the hosted byte route's GET: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
   if (handle instanceof Response) return handle;
-  const row = readableAttachment(repo, db, handle, Number(idStr), authed.user_email, authed.user_email);
-  if (!row) {
-    writeAudit(repo, "attachment.download_refused", authed.user_email, `attachment:${idStr.slice(0, 32)}`, { identity: handle });
-    return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);
-  }
+  const read = requestAttachment(repo, db, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
+  if ("refused" in read) return jsonErr("not_found", read.refused, 404);
+  const { row } = read;
   // Audited once the bytes are in hand, so a failed read isn't logged as a download.
   let data: Uint8Array<ArrayBuffer>;
   try {
@@ -327,8 +385,9 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   return db.transaction(() => {
   guard?.();
   if (guard) {
-    const current = readableAttachment(repo, db, handle, row.id, authed.user_email, authed.user_email);
-    if (!current || current.sha256 !== row.sha256) return notFound();
+    // A refusal here is a decision too (#851); the transaction returns, so its rows commit.
+    const current = requestAttachment(repo, db, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
+    if ("refused" in current || current.row.sha256 !== row.sha256) return notFound();
   }
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
   return new Response(data, {
@@ -343,7 +402,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   }).immediate();
 }
 
-// DELETE /api/attachments/<id>?as=: drops an upload of that identity's
+// A release (`<id>?as=`), for the hosted byte route's DELETE: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
 export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
@@ -376,11 +435,11 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: Core
     if (e instanceof PrincipalTaken) return conflict(e.message);
     throw e;
   }
-  repo.teams.addMember(team.id, authed.user_id);
+  repo.teams.addMember(team.id, authed.user_id, "owner");
   ensureTeamBoard(db, team, authed.user_email);
   onTeamJoined(db, repo, team, authed.user_email);
   writeAudit(repo, "team.created", authed.user_email, name);
-  writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email });
+  writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
   return json({ name: team.name, created_at: team.created_at }, 201);
 }
 
@@ -389,26 +448,56 @@ function teamJoin(): Response {
   return forbidden("teams are invite-only; ask a member to run: grayboard team add <team> <your email>");
 }
 
-// A team the caller isn't in reads as not found, like its board.
+// A team the caller isn't in reads as not found, like its board; an admin
+// can't leave a team it isn't in. A refusal is recorded (policy.ts).
 function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | null {
-  const team = repo.teams.findByName(teamName.toLowerCase());
-  return team && repo.teams.isMember(team.id, authed.user_id) ? team : null;
+  const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const d = authorize(repo, {}, req);
+  if (!d.allow) {
+    recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+    return null;
+  }
+  return req.team!;
 }
 
-// Members manage their team; admins can manage any team, e.g. one whose last
-// member left. as_admin marks the audit row when an admin isn't a member.
+// Members read their team's roster; admins can read any team's. as_admin
+// marks the audit row when an admin isn't a member. A denial is recorded
+// (policy.ts), and reads as not found.
 function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
-  const team = memberTeam(teamName, authed, repo);
-  if (team) return { team, audit: {} };
-  if (!canAdmin(authed.user_email, config.admins).allow) return null;
-  const any = repo.teams.findByName(teamName.toLowerCase());
-  return any ? { team: any, audit: { as_admin: true } } : null;
+  const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const d = authorize(repo, { admins: config.admins }, req);
+  if (!d.allow) {
+    recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+    return null;
+  }
+  return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
 }
+
+// Owners change their team's membership; admins can change any team's, e.g.
+// one whose last member left or whose creator left before roles existed
+// (security audit F-02: a member could remove the creator, then bind the
+// team names the creator lost). as_admin marks an admin acting without
+// owning. A non-member still reads not found; a member who isn't an owner
+// is refused, naming who can. Every decision is recorded (policy.ts).
+function ownedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
+  const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const d = authorize(repo, { admins: config.admins }, req);
+  recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+  if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
+  return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
+}
+
+const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
 
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb, sessions: SessionHooks): Response {
   const team = memberTeam(teamName, authed, repo);
   if (!team) return notFound();
-  repo.teams.removeMember(team.id, authed.user_id);
+  try {
+    repo.teams.removeMember(team.id, authed.user_id);
+  } catch (e) {
+    if (e instanceof LastOwner) return lastOwner(e);
+    throw e;
+  }
   onTeamLeft(db, repo, team, authed.user_email);
   sessions.accessChanged(authed.user_email, authed.user_email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
@@ -416,36 +505,96 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb,
 }
 
 async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
-  const managed = managedTeam(teamName, authed, repo, config);
-  if (!managed) return notFound();
+  // Read the body before the ownership check (security audit F-02): an owner
+  // demoted while a slow body trickles in must not act on a stale check.
+  const body = await parseBody<{ email: string; role?: unknown }>(req);
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
   const { team } = managed;
-  const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
+  if (body.role !== undefined && body.role !== "owner" && body.role !== "member") return badRequest(`role must be "owner" or "member"`);
+  const role = body.role as TeamRole | undefined;
   const email = body.email.toLowerCase();
   const user  = repo.users.findByEmail(email);
   if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
-  repo.teams.addMember(team.id, user.id);
-  onTeamJoined(db, repo, team, email);
-  writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, ...managed.audit });
+  if (repo.teams.addMember(team.id, user.id, role ?? "member")) {
+    onTeamJoined(db, repo, team, email);
+    writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
+    return json({ ok: true });
+  }
+  // Already a member: a role changes only when one is asked for.
+  if (role === undefined) return json({ ok: true });
+  let from: TeamRole | null;
+  try {
+    from = repo.teams.setRole(team.id, user.id, role);
+  } catch (e) {
+    if (e instanceof LastOwner) return lastOwner(e);
+    throw e;
+  }
+  if (from !== null && from !== role) writeAudit(repo, "team.role_changed", authed.user_email, team.name, { member: email, role, from, ...managed.audit });
   return json({ ok: true });
 }
 
 async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config, sessions: SessionHooks): Promise<Response> {
-  const managed = managedTeam(teamName, authed, repo, config);
-  if (!managed) return notFound();
+  const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
   const { team } = managed;
-  const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   const user  = repo.users.findByEmail(email);
   if (!user || !repo.teams.isMember(team.id, user.id)) {
     return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
   }
-  repo.teams.removeMember(team.id, user.id);
+  try {
+    repo.teams.removeMember(team.id, user.id);
+  } catch (e) {
+    if (e instanceof LastOwner) return lastOwner(e);
+    throw e;
+  }
   onTeamLeft(db, repo, team, email);
   sessions.accessChanged(email, authed.user_email);
   writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
   return json({ ok: true });
+}
+
+// A team's wake policy (#806): whether members' agents may wake each
+// other's across users ('collaborative'; 'delegating' adds delegation to
+// each other's launchers, #256) or not ('open', the default).
+// Owners and admins set it, like membership; audited with before and after.
+async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
+  const body = await parseBody<{ policy?: unknown }>(req);
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
+  const policy = body?.policy;
+  if (typeof policy !== "string" || !(TEAM_POLICIES as readonly string[]).includes(policy)) return badRequest(`policy must be one of ${TEAM_POLICIES.map(p => `"${p}"`).join(", ")}`);
+  const from = repo.teams.setPolicy(managed.team.id, policy as TeamPolicy);
+  if (from === null) return notFound();
+  if (from !== policy) writeAudit(repo, "team.policy_set", authed.user_email, managed.team.name, { from, to: policy, ...managed.audit });
+  return json({ ok: true, team: managed.team.name, policy, previous: from });
+}
+
+// A team's name, deleted by a team owner or an admin (#347), as a user
+// deletes their own (identityDelete): refused while a session holds or
+// writes as it, so no session outlives the name it acts as. Its queued
+// mail and claims stay with the address, as on unbind, for a member who
+// binds the name again.
+async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+  const body = await parseBody<{ name?: unknown }>(req); // before the ownership check, as in teamAdd
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
+  if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
+  const name = body.name.toLowerCase();
+  if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved in every scope; no team has one`);
+  if (!isValidIdentityName(name)) return badRequest("invalid name");
+  const existing = repo.aliases.find(`${managed.team.name}/${name}`);
+  if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
+  const user = aliasUser(db, existing.address);
+  if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
+  repo.aliases.remove(existing.address);
+  forgetHandle(db, existing.address);
+  writeAudit(repo, "alias.deleted", authed.user_email, existing.address, { team: managed.team.name, ...managed.audit });
+  return json({ ok: true, deleted: existing.address });
 }
 
 function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Response {
@@ -494,6 +643,19 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
   return json({ ok: true });
 }
 
+// Forgets a user's Google account (security audit F-13), so the next Google
+// sign-in with the email takes the account over: for a person whose Google
+// account was recreated, or an email an admin chooses to hand on.
+async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+  const body = await parseBody<{ email: string }>(req);
+  if (!body?.email) return badRequest("email required");
+  const target = repo.users.findByEmail(body.email.toLowerCase());
+  if (!target) return notFound();
+  repo.users.clearSubject(target.id);
+  writeAudit(repo, "auth.subject_cleared", authed.user_email, target.email, { had_subject: target.idp_subject !== null });
+  return json({ ok: true });
+}
+
 // ── main router ──────────────────────────────────────────────────────────────
 
 // What the server does when an HTTP action changes who a user's
@@ -506,22 +668,24 @@ export type SessionHooks = {
 };
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, uploads: UploadGate, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
+  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
   sessions: SessionHooks,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
+  // The request's URL when the caller already parsed it (the server's fetch does, #278).
+  parsed?: URL,
 ): Promise<Response> {
-  const url    = new URL(req.url);
+  const url    = parsed ?? new URL(req.url);
   const path   = url.pathname;
   const method = req.method;
 
-  if (path === "/healthz" && method === "GET") return healthz(repo);
+  if (path === "/healthz" && method === "GET") return healthz(repo, performance.now(), config.healthzLag);
   if (path === "/api/auth/config"    && method === "GET")  return authConfig(config);
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);
 
-  const authed = requireAuth(req, repo, touches);
+  const authed = requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);
@@ -530,16 +694,8 @@ export async function handleHttp(
   if (path === "/api/claims" && method === "GET") return claimList(url, db);
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
 
-  if (path === "/api/attachments" && method === "POST") return attachmentUpload(req, url, authed, repo, db, uploads);
-  if (path.startsWith("/api/attachments/") && method === "GET") {
-    return attachmentDownload(path.slice("/api/attachments/".length), url, authed, repo, db);
-  }
-  if (path.startsWith("/api/attachments/") && method === "DELETE") {
-    return attachmentRelease(path.slice("/api/attachments/".length), url, authed, repo, db);
-  }
-
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
-  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db);
+  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db, config);
   if (path.startsWith("/api/identities/") && method === "DELETE") {
     return identityDelete(path.slice("/api/identities/".length), authed, repo, db);
   }
@@ -567,15 +723,20 @@ export async function handleHttp(
     if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, db, config);
     if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db, config, sessions);
     if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo, config);
+    if (action === "policy"  && method === "POST") return teamPolicy(teamName, req, authed, repo, config);
+    if (action === "delete-alias" && method === "POST") return teamDeleteAlias(teamName, req, authed, repo, db, config);
   }
 
   if (path.startsWith("/api/admin/")) {
-    const decision = canAdmin(authed.user_email, config.admins);
+    const req: AuthzRequest = { verb: "admin", email: authed.user_email };
+    const decision = authorize(repo, { admins: config.admins }, req);
+    recordDecision(repo, { user: authed.user_email }, req, decision, { route: path });
     if (!decision.allow) return forbidden(decision.reason);
   }
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
+  if (path === "/api/admin/unlink-idp"     && method === "POST") return adminUnlinkIdp(req, authed, repo);
 
   return notFound();
 }

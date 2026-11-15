@@ -19,6 +19,9 @@ export type ControllerOptions = {
   // The host's own session-ID shape: restored diagnostics for such IDs skip the
   // active-root lookup (OpenCode passes `ses_…`).
   knownRoot?: RegExp;
+  // A host that starts a turn for every item it admits (Claude Code): the lease withholds non-waking items
+  // until a waking one carries them (#854), where the server knows the option.
+  context?: false;
 };
 // A forwarded native tool call's outcome, as a host reports it to afterCall:
 // the tool's parsed result object, or a failure.
@@ -26,13 +29,16 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // `admitted` holds `ownership:bind_gen:item` keys admitted but not yet
 // receipted, across reconnects in this process: a receipt failure goes straight
 // to the receipt on the next read instead of showing the item again. A key
-// joins as soon as the host accepted the item, before the post-admission renew
-// and guard, so a renew that fails (an outage, a lost lease, this Controller's
-// own stop) never shows it twice. An admitted key skips only the admission: the
-// pre-admission renew still proves the current lease first, so a lease that
-// can't renew never receipts (it spends the item's attempt budget instead). A
-// new lease under another ownership or bind_gen has another key, so it admits
-// the item again.
+// joins as soon as the host accepted the item, before the guard and receipt,
+// so a receipt that fails (an outage, a lost lease, this Controller's own stop)
+// never shows it twice. There's no renew between admission and receipt: the
+// server's receipt checks the lease itself (#845). The item lasts through its
+// receipt, so a lost lease there spends the item's attempt budget, not the
+// recovery budget. An admitted key skips only the admission: the pre-admission
+// renew still proves the current lease first, so a lease that can't renew
+// never receipts (it spends the item's attempt budget instead). A new lease
+// under another ownership or bind_gen has another key, so it admits the item
+// again.
 type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
 const ADMITTED_LIMIT = 100;
 // Ancestry lookups `childRoot` keeps for sessions not (yet) routed.
@@ -86,6 +92,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   private readonly place: string;
   private readonly wait: Wait;
   private readonly configured?: { name: string; create: boolean };
+  private readonly context?: false;
   // Saved roots restore skipped because their session had ended: the next
   // save drops their records (`prune`). An edited record stays, and every
   // restore reports it, since it may be another location's (#660).
@@ -94,6 +101,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.Transport = options.Transport ?? Wire;
     this.wait = options.wait ?? sleep;
     this.configured = options.configured;
+    if (options.context === false) this.context = false;
     this.place = port.place();
     const idle = port.approval ? "Approve an active root; approval does not bind a name" : "No active root";
     this.state = { state: "unenrolled", message: idle, roots: [] };
@@ -443,7 +451,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           await this.guard(r, epoch, signal);
         } else if (!sameHeld(current.held, e.held)) throw new Refusal("identity", `Root holds changed without a native completion; ${this.hint}`);
         let lease: Lease;
-        try { lease = leaseOf(await wire.call("delivery_open"), e); }
+        try { lease = leaseOf(await wire.call("delivery_open", this.context === false && await wire.takes("delivery_open", "context") ? { context: false } : {}), e); }
         catch (error) {
           // The primary revoked between this whoami and delivery_open (#453) gives a lease naming another
           // identity: the next iteration's whoami reports the loss. Once; a second refusal pauses.
@@ -477,17 +485,15 @@ export class Controller<E extends Enrollment = Enrollment> {
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
                 await wire!.call("delivery_renew");
                 await this.guard(r, epoch, signal);
-                if (r.admitted.has(key)) { inItem = false; return; }
+                if (r.admitted.has(key)) return;
                 await this.port.admit(e, item, stableID(e, item, lease.identity), lease.identity, signal);
                 r.admitted.add(key);
                 while (r.admitted.size > ADMITTED_LIMIT) r.admitted.delete(r.admitted.values().next().value!);
                 await this.guard(r, epoch, signal);
-                await wire!.call("delivery_renew");
-                await this.guard(r, epoch, signal);
-                inItem = false;
               }, async ids => {
                 await this.guard(r, epoch, signal);
                 await wire!.call("delivery_receipt", { ids });
+                inItem = false;
                 for (const id of ids) { attempts.delete(id); r.admitted.delete(`${lease.ownership}:${lease.bind_gen}:${id}`); }
                 failures = 0; throttles = 0; recoveries = 0; unreachable = 0; pendingItem = undefined;
                 try { this.port.receipted?.(e, ids); } catch (error) { this.failure("receipt_hook", error, r); }

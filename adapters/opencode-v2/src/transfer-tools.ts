@@ -73,7 +73,7 @@ export async function attachmentTools(ctx: Context, controller: OpenCodeControll
         const input = tool.input as InputSchema;
         if (input.type !== "object") throw new Error("Grayboard native attachment tool must have an object input schema");
         tool.input = { ...input, properties: { ...input.properties, attachments: ATTACHMENTS_PARAM } };
-        tool.description = tool.description.replace("attachment_ids?", "attachments?, attachment_ids?").replace(" Attachments are uploaded IDs, not paths.", " Attachments are local file paths.") + " attachments takes local file paths; attachment_ids takes already uploaded IDs. Use one, not both.";
+        tool.description = tool.description.replace("attachment_ids?", "attachments?, attachment_ids?") + " attachments takes local file paths; attachment_ids takes already uploaded IDs. Use one, not both.";
         const execute = tool.execute;
         tool.execute = async (raw: unknown, context: ToolContext) => {
           const args = raw as Record<string, unknown>;

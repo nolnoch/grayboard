@@ -1,22 +1,17 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { startServer } from "../../src/server/app.ts";
+import { TestServer } from "../support/server.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
-import { verifySessionToken } from "../../src/server/auth.ts";
-import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
-import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
-import { AppSession, type AppSessionOptions } from "../support/app_session.ts";
+import { type AppSession, type AppSessionOptions, signedIn } from "../support/app_session.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
+import { GRAYBOARD_LAUNCHER_META } from "../../src/shared/session_meta.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 
-let app: ReturnType<typeof startServer>;
+let srv: TestServer;
+let app: TestServer["app"];
 let base: string;
-let blobDir: string;
 let clock: number | undefined;
 const clients: Client[] = [];
 const appSessions: AppSession[] = [];
@@ -24,16 +19,14 @@ const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
 beforeEach(() => {
   clock = undefined;
-  blobDir = mkdtempSync(join(tmpdir(), "gb-http-mcp-"));
-  app = startServer({ dbPath: ":memory:", blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: ["alice@example.com"], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { now: () => clock ?? Date.now() } });
+  srv = new TestServer({ publicUrl, admins: ["alice@example.com"] }, { hostname: "127.0.0.1", oauth: { now: () => clock ?? Date.now() } });
+  app = srv.app;
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
   for (const s of appSessions.splice(0)) s.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
-  await app.stop();
-  app.db.close();
-  rmSync(blobDir, { recursive: true, force: true });
+  await srv.stop();
 });
 async function login(email = "alice@example.com", scopes = ["grayboard:tools"]) {
   return issueOAuth(app.repo, app.oauth.resource, email, scopes, Date.now(), OPENCODE_CLIENT).token;
@@ -50,9 +43,7 @@ async function legacyLogin(email = "alice@example.com") {
 // An application session (#282) signed in with a session token: the launcher
 // the hosted MCP has no form of yet (#451).
 function appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-  const authed = verifySessionToken(token, app.repo, app.touches);
-  if (!authed) throw new Error("appSession: the token doesn't authenticate");
-  const s = new AppSession(app.application, authed, identity, opts);
+  const s = signedIn(app, token, identity, opts);
   appSessions.push(s);
   return s;
 }
@@ -216,9 +207,10 @@ test("invalid schemas and local paths fail without mutation; application errors 
 test("attachment IDs bind only the caller's uploads and downloads stay access checked", async () => {
   const [alice, bob, carol] = await Promise.all([login(), login("bob@example.com"), login("carol@example.com")]);
   const [a, b, c] = await Promise.all([connect(alice), connect(bob), connect(carol)]);
-  const uploaded = await fetch(`${base}/api/attachments?as=be&filename=note.txt`, {
-    method: "POST", headers: { Authorization: `Bearer ${await legacyLogin()}` }, body: "public fixture text",
-  });
+  // The hosted byte routes act as the session the header names: each user's connection is keyed "be".
+  const bytes = (token: string, path: string, init: RequestInit = {}) =>
+    fetch(`${base}/mcp/attachments${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Session": "be" } });
+  const uploaded = await bytes(alice, "?filename=note.txt", { method: "POST", body: "public fixture text" });
   expect(uploaded.status).toBe(201);
   const attachment = await uploaded.json() as { id: number };
   expect((await c.callTool({ name: "dm_send", arguments: { to: "bob@example.com/be", body: "stolen", attachment_ids: [attachment.id] } })).isError).toBe(true);
@@ -226,12 +218,23 @@ test("attachment IDs bind only the caller's uploads and downloads stay access ch
   expect(sent.attachments).toMatchObject([{ id: attachment.id }]);
   const thread = value(await b.callTool({ name: "dm_thread", arguments: { thread: sent.message_id } }));
   expect(thread[0].attachments).toMatchObject([{ id: attachment.id }]);
-  for (const [token, status] of [[await legacyLogin("bob@example.com"), 200], [await legacyLogin("carol@example.com"), 404]] as const) {
-    const download = await fetch(`${base}/api/attachments/${attachment.id}?as=be`, { headers: { Authorization: `Bearer ${token}` } });
+  for (const [token, status] of [[bob, 200], [carol, 404]] as const) {
+    const download = await bytes(token, `/${attachment.id}`);
     expect(download.status).toBe(status);
     if (status === 200) expect(await download.text()).toBe("public fixture text");
+    else await download.body?.cancel();
   }
   expect((await a.callTool({ name: "dm_send", arguments: { to: "bob@example.com/be", body: "reuse", attachment_ids: [attachment.id] } })).isError).toBe(true);
+});
+
+// #475: the session-token attachment routes (`/api/attachments?as=`) are gone; files travel only through the hosted byte routes.
+test("the old /api/attachments routes answer 404", async () => {
+  const token = await legacyLogin();
+  for (const [method, path] of [["POST", "/api/attachments?as=be&filename=note.txt"], ["GET", "/api/attachments/1?as=be"], ["DELETE", "/api/attachments/1?as=be"]] as const) {
+    const response = await fetch(`${base}${path}`, { method, headers: { Authorization: `Bearer ${token}` }, ...(method === "POST" ? { body: "x" } : {}) });
+    expect([method, response.status]).toEqual([method, 404]);
+    await response.body?.cancel();
+  }
 });
 
 test("revocation is checked on subsequent calls, including legacy", async () => {
@@ -370,4 +373,34 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
   } finally { app.repo.oauth.findActiveAccess = original; }
   expect(app.repo.aliases.find("alice@example.com/unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
+});
+
+// #521 item 6: the launcher declaration rides a real HTTP request's `_meta` and is stored for that session; the
+// next initialize carries the launcher sentence only once delivery is live (#521 4).
+test("HTTP: a launcher declared in _meta is stored for its session; an unleased initialize carries no launcher sentence", async () => {
+  const token = await login();
+  const open = async (raw: string, launcher: boolean) => {
+    const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+    clients.push(client);
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+      requestInit: { headers: { Authorization: `Bearer ${token}` } },
+      fetch: async (input, init) => {
+        const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, raw);
+        return fetch(launcher ? await withMeta(req, GRAYBOARD_LAUNCHER_META, true) : req);
+      },
+    }));
+    return client;
+  };
+  const sentence = "You're a launcher session";
+  const lead = await open("lead-root", true), plain = await open("plain-root", false);
+  await bindFixture(lead, "lead");
+  await bindFixture(plain, "plain");
+  // The declaration reached the server: the flag is stored for lead's session only.
+  const flags = (app.db.query(`SELECT i.launcher FROM aliases a JOIN alias_holds h ON h.address = a.address JOIN ids i ON i.id = h.id WHERE a.address IN ('alice@example.com/lead', 'alice@example.com/plain') ORDER BY a.address`).all() as { launcher: number }[]).map((r) => r.launcher);
+  expect(flags).toEqual([1, 0]);
+  // A second initialize of each session, with no declaration on the wire and no delivery lease: neither carries
+  // the sentence, since a launcher whose delivery isn't live is no delegation target (#521 4). With a lease, the
+  // text follows the stored flag (src/server/hosted.test.ts, #473 and #531 cases).
+  expect((await open("lead-root", false)).getInstructions()).not.toContain(sentence);
+  expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
 });

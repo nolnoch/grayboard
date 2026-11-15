@@ -15,6 +15,7 @@ export type CoreDb = Database;
 
 export const BOARD_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 export const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_PURPOSE_CHARS = 500;
 
 // A post's or direct message's body, checked alike in both modes (#75).
 export function checkBody(body: unknown): string {
@@ -43,7 +44,21 @@ export type Board = {
   created_by: string;
   created_at: number;
   kind?: string;
+  // Set only on an archived board (#635); open boards carry neither.
+  archived_at?: number;
+  archived_by?: string;
 };
+
+// A boards row as callers see it: an open board's NULL archive columns are
+// dropped, so every board_list row doesn't pay for them.
+function showBoard<T extends Board>(b: T): T {
+  const row = b as T & { archived_at?: number | null; archived_by?: string | null };
+  if (row.archived_at == null) {
+    delete row.archived_at;
+    delete row.archived_by;
+  }
+  return b;
+}
 
 // A post's columns as readers see them. author_id (#284) is the writing
 // session's provenance, kept in the database and left out of reads and pushes;
@@ -78,14 +93,19 @@ export type Access = {
   checkCreate(handle: string, scope: string | null): string | null;
   // The handle a mention token refers to, or null if unknown or ambiguous.
   // `strict`: a token that names a session that can't receive refuses the
-  // post instead of going unresolved.
-  resolveMention(token: string, author: string, board: Board, strict: boolean): string | null;
+  // post instead of going unresolved. `viewer` (the posting session's ID, else
+  // the author) is whose sight a refusal's name suggestions follow (#348).
+  resolveMention(token: string, author: string, board: Board, strict: boolean, viewer?: string): string | null;
   // Whether a post by `from` may reach `to` as a thread reply. Omitted: always.
   mayReach?(from: string, to: string): boolean;
   // Whether the principal of `handle` (the calling session's ID) may read an alias's labels (task, owner,
   // source board, spec hash, description) in peer_list: only inside a scope
   // it may act in (#284 S13).
   seesAliasMeta(handle: string, scope: Omit<AliasScope, "name">): boolean;
+  // Whether the principal of `handle` may see that an alias of a scope exists
+  // at all (peer_list rows, name suggestions): a team's names only inside the
+  // team (#348). Omitted: always.
+  seesAlias?(handle: string, scope: Omit<AliasScope, "name">): boolean;
   // The board only a human handle can start posts on, or null for none.
   announceBoard: string | null;
 };
@@ -316,9 +336,16 @@ export function setPlace(db: Database, id: string, place: string | null): void {
 
 const MAX_STATUS = 200;
 
-/** Text as one line: whitespace runs to a space, other control characters dropped, trimmed. */
+// Bidi marks, embeddings, overrides and isolates (U+061C, U+200E-F,
+// U+202A-E, U+2066-9) and zero-width characters (U+200B, U+2060, U+FEFF):
+// they reorder or hide what a peer reads (#372). ZWJ (U+200D) builds emoji
+// sequences and ZWNJ (U+200C) is orthographic in Persian and Indic text, so
+// both stay; that's why this isn't all of \p{Cf}.
+const INVISIBLE = /[\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
+
+/** Text as one line: whitespace runs to a space, other control and bidi/zero-width characters dropped, trimmed. */
 export function oneLine(text: string): string {
-  return text.replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
+  return text.replace(INVISIBLE, "").replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
 }
 
 // One line saying what the session holding `handle` is doing; empty clears
@@ -371,6 +398,8 @@ export function createBoard(
 ): Board {
   const board = normalizeBoard(name);
   if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  // One line, shown in every board_list (#76).
+  if (purpose.length > MAX_PURPOSE_CHARS) throw new CoreError(`purpose must be at most ${MAX_PURPOSE_CHARS} chars`);
   const kind = opts.kind ?? "broadcast";
   if (kind !== "broadcast" && kind !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
   const denied = access(db).checkCreate(handle, scope);
@@ -381,9 +410,42 @@ export function createBoard(
        ON CONFLICT(name) DO NOTHING`,
     )
     .run(board, purpose.trim(), scope, handle, Date.now(), kind);
-  if (res.changes === 0) throw new CoreError(`board #${board} already exists`);
+  if (res.changes === 0) {
+    const old = getBoard(db, board);
+    throw new CoreError(old?.archived_at && sees(db, handle, old) ? `board #${board} already exists, archived; board_archive(board, false) reopens it` : `board #${board} already exists`);
+  }
   subscribe(db, handle, board, "push");
   return getBoard(db, board)!;
+}
+
+// Archive or reopen a board (#635). An archived board leaves board_list,
+// refuses new top-level posts (replies still land, so open threads finish) and
+// stays readable by name; subscriptions, cursors and claims are untouched.
+// Archiving isn't an edit (principle 5): no post changes, and it reverses.
+// Only the board's creator (any of the caller's addresses) or a human may;
+// a mode's own boards (#announce, a team's board) never archive.
+export function archiveBoard(
+  db: Database,
+  handle: string,
+  boardInput: string,
+  archived: boolean,
+  opts: { addresses?: string[]; human?: boolean } = {},
+): { board: Board; note?: string } {
+  const b = visibleBoard(db, handle, boardInput);
+  if (b.name === access(db).announceBoard || b.scope === `team:${b.name}`) {
+    throw new CoreError(`#${b.name} belongs to the bus itself and can't be archived`);
+  }
+  const addresses = opts.addresses ?? [handle];
+  if (!opts.human && !isHuman(db, handle) && !addresses.includes(b.created_by)) {
+    throw new CoreError(`only #${b.name}'s creator (${b.created_by}) or your user can archive or reopen it`);
+  }
+  // A repeat is answered from state (#254), never written twice.
+  if (archived && b.archived_at) {
+    return { board: b, note: `#${b.name} was already archived at ${new Date(b.archived_at).toISOString()} by ${b.archived_by}` };
+  }
+  if (!archived && !b.archived_at) return { board: b, note: `#${b.name} isn't archived` };
+  db.prepare(`UPDATE boards SET archived_at = ?, archived_by = ? WHERE name = ?`).run(archived ? Date.now() : null, archived ? handle : null, b.name);
+  return { board: getBoard(db, b.name)! };
 }
 
 // For a mode's own bookkeeping (e.g. a team's board), not agent requests:
@@ -406,7 +468,8 @@ export function ensureBoard(
 
 // Unchecked lookup, for modes and policies. Tools go through visibleBoard.
 export function getBoard(db: Database, name: string): Board | undefined {
-  return db.prepare(`SELECT * FROM boards WHERE name = ?`).get(name) as Board | undefined;
+  const b = db.prepare(`SELECT * FROM boards WHERE name = ?`).get(name) as Board | null;
+  return b ? showBoard(b) : undefined;
 }
 
 // A board you can't see reads as missing, so its existence doesn't leak.
@@ -467,10 +530,12 @@ export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts
 export type BoardUse = "read" | "subscribe" | "post";
 
 // Each of `handles`' view of the boards it can see (of `board` alone, when given).
+// A board summary's columns before mode and unread, shared by both list paths.
+const BOARD_COLUMNS = `b.*, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts`;
+
 function boardViews(db: Database, handles: string[], board: string | null): { handle: string; row: BoardSummary }[] {
   const q = db.prepare(
-    `SELECT b.*, s.mode AS mode,
-            (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts,
+    `SELECT ${BOARD_COLUMNS}, s.mode AS mode,
             CASE WHEN s.handle IS NULL THEN 0 ELSE
               (SELECT COUNT(*) FROM posts p
                 WHERE p.board = b.name AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED_YET}) END AS unread
@@ -480,7 +545,7 @@ function boardViews(db: Database, handles: string[], board: string | null): { ha
       ORDER BY b.name`,
   );
   const a = access(db);
-  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row })));
+  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row: showBoard(row) })));
 }
 
 // The view a use acts as, from one board's views in address order.
@@ -496,7 +561,7 @@ export function boardAddress(db: Database, board: string, handles: string[], use
 }
 
 /**
- * The boards `handles` can see: each row is the view of the address
+ * The open boards `handles` can see (an archived one is read by name, #635): each row is the view of the address
  * board_read without `as` would act as (boardAddress's "read"), so its mode
  * and unread count are that address's subscription's. A predicate (an
  * addressless reader) sees rows with no mode and nothing unread.
@@ -504,13 +569,13 @@ export function boardAddress(db: Database, board: string, handles: string[], use
 export function listBoards(db: Database, handles: string[] | BoardPredicate): BoardSummary[] {
   if (typeof handles === "function") {
     const rows = db.prepare(
-      `SELECT b.*, NULL AS mode, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts, 0 AS unread
-         FROM boards b ORDER BY b.name`,
+      `SELECT ${BOARD_COLUMNS}, NULL AS mode, 0 AS unread
+         FROM boards b WHERE b.archived_at IS NULL ORDER BY b.name`,
     ).all() as BoardSummary[];
-    return rows.filter(handles);
+    return rows.map(showBoard).filter(handles);
   }
   const byBoard = new Map<string, { handle: string; row: BoardSummary }[]>();
-  for (const v of boardViews(db, handles, null)) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
+  for (const v of boardViews(db, handles, null)) if (v.row.archived_at === undefined) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
   return [...byBoard.values()].map((views) => pickView(views, "read")!.row).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 }
 
@@ -580,12 +645,13 @@ function resolveMentions(
   author: string,
   board: Board,
   strict: boolean,
+  viewer: string,
 ): { handles: string[]; unresolved: string[] } {
   const a = access(db);
   const handles = new Set<string>();
   const unresolved: string[] = [];
   for (const t of mentionTokens(body)) {
-    const h = a.resolveMention(t, author, board, strict);
+    const h = a.resolveMention(t, author, board, strict, viewer);
     if (h && a.canSee(h, board)) handles.add(h);
     else unresolved.push(t);
   }
@@ -618,6 +684,7 @@ export type PostResult = { post: Post; wake: string[]; deferred: string[]; unres
 // carry, bound in the post's transaction under the mode's size caps (send),
 // if the mode's user (send.principal) made them.
 // author_id: the posting session's ID (#284), when the writer is a session.
+// author_user: the writer's signed-in user, on a server.
 // via: the child session writing it (#523), a harness subagent acting under
 // its root's addresses; author_id is then the child's ID too.
 // addresses: the poster's address set (#284 S5), `handle` the one it posts as; a
@@ -626,12 +693,16 @@ export type PostOpts = {
   online?: (handle: string) => boolean;
   addresses?: string[];
   author_id?: string;
+  author_user?: string;
   via?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; send?: FileSend };
   // An author's own words: an @id: that can't receive refuses the post.
   // Unset (system posts), it goes unresolved.
   strictIds?: boolean;
+  // A system post ending something already announced on the board (a claim's
+  // release, update or expiry) still lands once the board is archived (#635).
+  allowArchived?: boolean;
 };
 
 // Eligible lanes for a queue board's rotation, least-recently-woken first
@@ -741,10 +812,15 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
 }
 
 // What decides whether `handle` may post (or reply) on a board now: it can see
-// it, the parent is a post on it, and only a human starts an announcement.
+// it, the parent is a post on it, only a human starts an announcement, and an
+// archived board takes replies only, unless the caller is the system ending
+// something already on it (`allowArchived`: a claim's release or expiry).
 // Throws CoreError; writes nothing.
-function postGate(db: Database, handle: string, boardInput: string, parentId: number | null) {
+function postGate(db: Database, handle: string, boardInput: string, parentId: number | null, allowArchived = false) {
   const b = visibleBoard(db, handle, boardInput);
+  if (b.archived_at && parentId === null && !allowArchived) {
+    throw new CoreError(`#${b.name} is archived; reply in one of its threads, or reopen it with board_archive(board, false) if you created it`);
+  }
   if (parentId !== null) {
     const parent = getPost(db, parentId);
     if (!parent || parent.board !== b.name) {
@@ -783,7 +859,7 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId);
+  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived);
   const board = b.name;
   checkBody(body);
   if (announcement && !opts.online) throw new CoreError(`posting on #${board} needs live sessions from the mode`);
@@ -798,10 +874,10 @@ export function post(
     const now = Date.now();
     const p = showPost(db
       .prepare(
-        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
       )
-      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null, opts.via ?? null) as PostRow);
+      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null, opts.via ?? null, opts.author_user ?? null) as PostRow);
     const { send } = files;
     const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
     // Nobody is told of, or handed, their own post: the poster's address set,
@@ -828,10 +904,12 @@ export function post(
     // least-recently-woken eligible subscriber and claims the post (TTL
     // takeover releases it to the next wake). Replies follow thread semantics
     // and release the claimer's claim.
-    const queue = !announcement && parentId === null && (b.kind ?? "broadcast") === "queue";
+    // An archived queue board takes no new work (#635): a claim's [release]
+    // or [expired] post landing there is a broadcast, never a delivery.
+    const queue = !announcement && parentId === null && !b.archived_at && (b.kind ?? "broadcast") === "queue";
     let unresolved: string[] = [];
     if (queue) {
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
       if (mentioned.length === 0) {
@@ -876,7 +954,7 @@ export function post(
         const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
         for (const m of muted) targets.delete(m.handle);
       }
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     }
@@ -963,9 +1041,10 @@ export function parseAliasMeta(v: unknown): AliasMetaSet {
  * Set an alias's labels from a parsed `meta`, as `session` binding it.
  * Only the fields whose value changes are written, and audited as one
  * alias.meta_set; those fields are returned (empty: nothing changed). Call
- * inside the bind's write transaction.
+ * inside the bind's write transaction. `actor` is who the row names: the
+ * signed-in user on a server (#373), the session locally, where no user is.
  */
-export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink): AliasMetaSet {
+export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string = session): AliasMetaSet {
   const keys = Object.keys(meta) as (keyof AliasMetaSet)[];
   if (!keys.length) return {};
   const cur = db.prepare(`SELECT ${ALIAS_META_KEYS.join(", ")} FROM aliases WHERE address = ?`).get(address) as Record<string, string | null> | null;
@@ -975,7 +1054,7 @@ export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, 
   const changed = Object.keys(fields) as (keyof AliasMetaSet)[];
   if (!changed.length) return {};
   db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => fields[k] ?? null), address);
-  audit("alias.meta_set", session, address, { address, fields, session });
+  audit("alias.meta_set", actor, address, { address, fields, session });
   return fields;
 }
 
@@ -1003,6 +1082,19 @@ export type Peer = {
  * notified lists: a `grayboard tail` session (ids.viewer, #284 S9). Read
  * once per call.
  */
+// Of `handles`, those whose existence `viewer` (a session ID or handle) may
+// see: a team's aliases only inside the team (#348), as peer_list lists them.
+// For results that echo a board's recipients (board_post's notified/deferred).
+export function seenHandles(db: Database, viewer: string, handles: string[]): string[] {
+  const acc = access(db);
+  if (!acc.seesAlias) return handles;
+  const scopeOf = db.prepare(`SELECT scope_kind, scope_ref FROM aliases WHERE address = ?`);
+  return handles.filter((h) => {
+    const r = scopeOf.get(h) as { scope_kind: AliasScope["scope_kind"] | null; scope_ref: string | null } | null;
+    return !r || r.scope_kind === null || acc.seesAlias!(viewer, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+  });
+}
+
 export function viewers(db: Database): (handle: string) => boolean {
   const ids = new Set((db.prepare(`SELECT id FROM ids WHERE viewer = 1`).all() as { id: string }[]).map((r) => r.id));
   return (h) => ids.has(h);
@@ -1010,7 +1102,7 @@ export function viewers(db: Database): (handle: string) => boolean {
 
 // A live session with no name yet (#182), addressed by its session ID
 // (#284), with the status it set as that ID.
-export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true } & SessionFacts;
+export type UnboundPeer = { session_id: string; unbound: true; online: true; where?: string; status?: string; status_age?: string; self?: true; launcher?: true } & SessionFacts;
 
 // `you` is left out only for a viewer, which nothing can address.
 export type WhoResult = { you?: string; peers: Peer[]; unbound_sessions?: UnboundPeer[]; offline_hidden?: number };
@@ -1037,9 +1129,12 @@ function matches(m: PeerMatch, fields: PeerMatch): boolean {
   return Object.entries(m).every(([k, v]) => fields[k as keyof PeerMatch]?.toLowerCase() === v.toLowerCase());
 }
 
+/** The order of a session's holds, oldest first (#284 S1, #370): every list of holds and every primary pick uses it. */
+export const HOLD_ORDER = "ORDER BY bound_at, address";
+
 /** SQL for session `id`'s primary hold (#284 S1): its oldest, or NULL. `id` is an SQL expression. */
 export function primaryHoldSql(id: string): string {
-  return `(SELECT address FROM alias_holds WHERE id = ${id} ORDER BY bound_at, address LIMIT 1)`;
+  return `(SELECT address FROM alias_holds WHERE id = ${id} ${HOLD_ORDER} LIMIT 1)`;
 }
 
 // The session an alias's facts come from (#284 S13): its holder, or once
@@ -1056,8 +1151,10 @@ export const ALIAS_SESSION_SQL = `COALESCE(
 // or a board's subscribers, each with its session's facts (ALIAS_SESSION_SQL).
 // A status is shown only while a session holds the alias: it's the
 // session's, and clears when the session ends (#284 decision 11). An alias's
-// labels are shown only to a caller that may act in its scope (#284 S13),
-// and `match` filters after that cut, so a hidden label can't be probed.
+// labels, and its session's facts, are shown only to a caller that may act
+// in its scope (#284 S13, F-12), and `match` filters after that cut, so a
+// hidden label or fact can't be probed. A team's aliases aren't listed at all
+// outside the team (#348), a cut made first.
 // `online` comes from the mode: a live session that will receive pushes
 // (local: its wakeup socket answers; server: an open connection).
 // `addresses`: the caller's address set, each row of which is its own and
@@ -1116,17 +1213,44 @@ export function who(
   }
   const now = Date.now();
   const all: Peer[] = [];
+  // One scope check per alias scope, not one per row (#373).
+  const viewer = ctx.session ?? handle;
+  const seen = new Map<string, boolean>();
+  const sees = (scope: Omit<AliasScope, "name">): boolean => {
+    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+    let v = seen.get(key);
+    if (v === undefined) seen.set(key, v = acc.seesAliasMeta(viewer, scope));
+    return v;
+  };
+  // Whether the row is listed at all: a team's alias only to the team's
+  // members (#348), before `match` and the offline count, so neither probes
+  // a hidden name. Memoized per scope as the label cut is.
+  const listed = new Map<string, boolean>();
+  const seesName = (scope: Omit<AliasScope, "name">): boolean => {
+    if (!acc.seesAlias) return true;
+    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+    let v = listed.get(key);
+    if (v === undefined) listed.set(key, v = acc.seesAlias(viewer, scope));
+    return v;
+  };
   for (const r of rows) {
     if (isViewer(r.handle)) continue;
-    const where = r.cwd ? describeLocation(r.cwd) : r.place;
-    const seesMeta = r.scope_kind !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
-    const session = sessionFacts(r);
+    if (r.scope_kind !== null && !own.has(r.handle) && !seesName({ scope_kind: r.scope_kind, scope_ref: r.scope_ref })) continue;
+    const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    // The session's facts (where it runs, its status, harness, model, effort,
+    // launcher) follow the labels' cut: an alias's to a caller that may act
+    // in its scope, an ID's to one that may act in its principal's (security
+    // audit F-12). Another user's agent is a handle and its presence, nothing
+    // about their machine or work. Locally every row passes.
+    const seesSession = own.has(r.handle) || (r.scope_kind !== null ? seesMeta : sees({ scope_kind: "person", scope_ref: r.principal }));
+    const where = !seesSession ? null : r.cwd ? describeLocation(r.cwd) : r.place;
+    const session = seesSession ? sessionFacts(r) : {};
     const meta: AliasMeta = {};
     if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
     // An ID row's scope is its principal, which the row doesn't show: it
     // matches only for a caller that may act in that principal's scope (#371).
     if (opts.match) {
-      const idScope = opts.match.scope !== undefined && r.principal !== null && acc.seesAliasMeta(ctx.session ?? handle, { scope_kind: "person", scope_ref: r.principal });
+      const idScope = opts.match.scope !== undefined && r.principal !== null && sees({ scope_kind: "person", scope_ref: r.principal });
       const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
       if (!matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
     }
@@ -1138,12 +1262,12 @@ export function who(
       ...(r.id ? { id: r.id } : {}),
       ...(r.mode ? { mode: r.mode } : {}),
       ...(where ? { where } : {}),
-      ...(r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
+      ...(seesSession && r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
       ...session,
       ...meta,
       ...(r.human ? { human: true as const } : {}),
       ...(r.queue_off ? { queue_off: true as const } : {}),
-      ...(r.launcher ? { launcher: true as const } : {}),
+      ...(seesSession && r.launcher ? { launcher: true as const } : {}),
     });
   }
   // A board's roster lists its unbound subscribers by ID among its peers.
@@ -1168,13 +1292,14 @@ function sessionFacts(r: { harness: string | null; model: string | null; effort:
 // has one user. A change that lists another user's sessions must add the
 // check here, or a scope match probes their principal (#371, #391).
 function unboundRows(db: Database, unbound: UnboundPeer[], match: PeerMatch | undefined): UnboundPeer[] {
-  const q = db.prepare(`SELECT principal, harness, model, effort FROM ids WHERE id = ?`);
+  const q = db.prepare(`SELECT principal, harness, model, effort, launcher FROM ids WHERE id = ?`);
   const out: UnboundPeer[] = [];
   for (const u of unbound) {
-    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null } | null;
+    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null } | null;
     const session = r ? sessionFacts(r) : {};
     if (match && !matches(match, { id: u.session_id, ...session, scope: r?.principal ?? undefined })) continue;
-    out.push({ ...u, ...session });
+    // An unbound launcher is delegable by its ID (#337), so it's marked as a bound one is (#764).
+    out.push({ ...u, ...session, ...(r?.launcher ? { launcher: true as const } : {}) });
   }
   return out;
 }
@@ -1231,7 +1356,7 @@ export function boardCatalog(db: Database, handle: Viewer, after?: string): { bo
   while (boards.length <= 100) {
     const rows = db.prepare(`SELECT * FROM boards WHERE name > ? ORDER BY name LIMIT 100`).all(cursor) as Board[];
     for (const board of rows) {
-      if (sees(db, handle, board)) boards.push(board);
+      if (sees(db, handle, board)) boards.push(showBoard(board));
       if (boards.length > 100) return { boards: boards.slice(0, 100), next_after: boards[99]!.name };
     }
     if (rows.length < 100) break;
@@ -1473,6 +1598,9 @@ export function parseRetentionDays(raw: string | undefined, fallback: number): n
 // the transaction commits.
 export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<string, number>): string[] {
   const counts: Record<string, number> = {};
+  // Immediate: the first statement is a read, and a deferred transaction
+  // whose snapshot another writer advanced fails its first write with
+  // SQLITE_BUSY at once, busy_timeout or not (#340).
   const changed = db.transaction(() => {
     const boards = db.prepare(`SELECT DISTINCT board FROM posts WHERE created_at < ? ORDER BY board`).all(olderThanMs) as { board: string }[];
     const old = `SELECT id FROM posts WHERE created_at < ?`;
@@ -1490,7 +1618,7 @@ export function prunePosts(db: Database, olderThanMs: number, deleted?: Record<s
     ).run(olderThanMs).changes;
     // Expired claims are left to sweepExpired, which announces them.
     return boards.map(b => b.board);
-  })();
+  }).immediate();
   if (deleted) for (const [table, n] of Object.entries(counts)) deleted[table] = (deleted[table] ?? 0) + n;
   return changed;
 }

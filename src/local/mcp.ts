@@ -8,10 +8,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
-import { boardNotification, dmNotification, type Pending } from "../shared/notifications.ts";
-import { delegateOkFields, launcherInstruction, resolveDelegation } from "../core/delegation.ts";
+import { boardNotification, dmNotification, fenceChannel, type Pending } from "../shared/notifications.ts";
+import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
+import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, launcherNote, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -49,7 +50,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, NOTHING_ENDED, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
@@ -143,6 +144,14 @@ const HUMAN = process.env.BUS_HUMAN === "1";
 const LAUNCHER = process.env.BUS_LAUNCHER === "1";
 // BUS_MODEL, BUS_EFFORT: what this session's harness runs on, shown on its
 // peer_list rows (#284 S12). Self-reported, read once, ended with the session.
+// delegate's per-requester bucket (#252): in this process, so per session
+// (a session's children call through it too). A server's is per user; local
+// mode is one user, and a bucket shared across processes would need a table. A streak is audited once, at
+// its first refusal and when the bucket is full again.
+const delegateLimiter = new RateLimiter(DELEGATE_LIMIT, {
+  start: (requester, ctx, retryAfterMs) => writeCoreAudit(db, "delegation.throttled", requester, null, { ...ctx, retry_after_ms: retryAfterMs }),
+  end: (requester, refused) => writeCoreAudit(db, "delegation.throttle_ended", requester, null, { refused }),
+});
 const MODEL = process.env.BUS_MODEL || undefined;
 const EFFORT = process.env.BUS_EFFORT || undefined;
 // BUS_HARNESS_SESSION: the harness's own id for the session this process
@@ -298,6 +307,17 @@ const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...holds(), rootId
 // The first successful write of a session acting as its ID says how to get a
 // readable name, once per session (#470). A root's notice: never a child's (#523).
 let bindHinted = false;
+// A recipient as the server reads one (#272): a session ID, or a handle
+// matched without regard to case. Handles are lowercase since #181; a
+// database from before then may hold a mixed-case one, so the exact input
+// is tried first.
+function localRecipient(to: string): string {
+  const parsed = addressParts(to);
+  if (parsed?.kind === "id") return parsed.address;
+  if (parsed?.kind !== "bare" || rosterHandles(db).includes(to)) return to;
+  return parsed.address;
+}
+
 function bindHint(child: string | undefined): { bind_hint?: string } {
   if (child !== undefined || bindHinted || WRITES_AS || held.length) return {};
   bindHinted = true;
@@ -336,13 +356,17 @@ async function restoreNames(rec: { names: string[]; session_id: string }, siblin
     if (sibling && n.ok) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
     const r = n.ok
       ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id })
-      : { ok: false as const, error: n.error, ended: NOTHING_ENDED };
+      : { ok: false as const, error: n.error, ended: nothingEnded() };
     await deliverEnded(db, r.ended);
     if (!r.ok) { missed.push({ name, why: r.error }); continue; }
     held.push(r.name);
     if (r.restored && !restored) { restored = true; restoredFrom = rec.session_id; }
   }
   for (const m of missed) startNotes.push(restoreNote(m.name, m.why, held.length > 0));
+  // Unverified: the name stays, the status doesn't; say so only when there was one to lose (#260).
+  if (held.length && !restored && (db.prepare(`SELECT status FROM ids WHERE id = ?`).get(rec.session_id) as { status: string | null } | null)?.status) {
+    startNotes.push(unverifiedRestoreNote(held));
+  }
 }
 if (WRITES_AS) {
   ensureAlias(db, WRITES_AS, WRITES_AS);
@@ -371,7 +395,7 @@ if (WRITES_AS) {
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
     if (KEYED && e.endedAt === null) {
-      const r = await attachSession(db, self, HUMAN);
+      const r = await attachSession(db, self, HUMAN, { model: MODEL ?? null, effort: EFFORT ?? null });
       if (!r.ok) {
         console.error(`[grayboard] ${r.error}`);
         process.exit(1);
@@ -514,6 +538,11 @@ let missedBindNotice: string | null = null;
 let instructionsStale = false;
 // What a result the client dropped carried, for the next one.
 const requeued: string[] = [];
+// A write the client cancelled whose result says it landed (#292): the agent
+// never saw that, and might send it again.
+const LANDING_WRITES = new Set(["dm_send", "board_post", "delegate"]);
+const landed = (name: string, r: { isError?: boolean; content: { text: string }[] }): string | null =>
+  !r.isError && LANDING_WRITES.has(name) ? `${name} completed after it was cancelled; it landed, so don't repeat it. ${r.content[0]?.text ?? ""}` : null;
 const notices = (): string[] => {
   const out = requeued.splice(0);
   if (channelsNoticePending && CHANNELS_OFF_NOTICE) out.push(CHANNELS_OFF_NOTICE);
@@ -734,7 +763,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   expiry.arm();
   // A cancelled call's result is dropped: its notices wait for the next one.
   // Notices and fresh instructions are the root's: they never go to a child.
-  if (signal.aborted || agent !== undefined || (ORDINARY && (callSession !== SESSION_ID || callEpoch !== adapterEpoch))) return r;
+  const mine = agent === undefined && !(ORDINARY && (callSession !== SESSION_ID || callEpoch !== adapterEpoch));
+  if (signal.aborted) {
+    const l = mine ? landed(name, r) : null;
+    if (l) requeued.push(l);
+    return r;
+  }
+  if (!mine) return r;
   const extra = notices();
   let out = withNotices(r, extra);
   if (instructionsStale && !out.structuredContent) {
@@ -744,6 +779,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
     if (name === "unbind" && r.structuredContent) requeued.push(unbindMissed(String(args.name), "it was cancelled", r.content[0]!.text));
+    const l = landed(name, r);
+    if (l) requeued.push(l);
     requeued.push(...extra);
     if (out.structuredContent) instructionsStale = true;
   });
@@ -805,16 +842,27 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // this mode's DM, pending: the promise shows in dm_inbox until the
     // requester settles the thread (#184). Same result fields as dm_send, via
     // the shared builder, so the modes can't drift.
-    const live = await liveHandles(ADDRS);
+    // Only the launchers (and an explicit `to`) are probed: a probe is a
+    // wakeup, so probing the whole roster would wake every peer's drain (#253).
+    const live = await liveHandles(ADDRS, [...launchers(db), ...(typeof a.to === "string" ? [localRecipient(a.to.trim())] : [])]);
     // A name just released (an unbind, or a 1.x rebind sharing the file) can
     // still answer on its socket: filter it like dm_send does (a released
     // name's socket isn't the session).
     const online = (h: string) => live(h) && !lastWasRelease(db, h);
     // The audit rows name the child that called, beside the routing `via` (#523).
     const byChild = child === undefined ? {} : { child };
+    // `to` resolved as dm_send resolves a recipient, as the server does (#272).
+    const args = typeof a.to === "string" ? { ...a, to: localRecipient(a.to.trim()) } : a;
+    // The requester's bucket (#252): checked before resolving, spent once the
+    // request is written (a re-pick spends nothing more).
+    const t = delegateLimiter.check(IDENTITY, byChild);
+    if (!t.ok) return { ...text(`error: ${delegateThrottled(DELEGATE_LIMIT, t.retryAfterMs, "this session")}`), isError: true };
+    // A launcher's open requests, over dm_inbox's default window (#252).
+    const since = Date.now() - inboxDays(undefined) * 86_400_000;
+    const open = (h: string) => countOpenDelegations(db, "audit_log", h, since);
     let d;
     try {
-      d = resolveDelegation(db, IDENTITY, a, online);
+      d = resolveDelegation(db, IDENTITY, null, args, online, undefined, (h) => ADDRS.includes(h), open);
     } catch (e) {
       if (e instanceof CoreError) {
         writeCoreAudit(db, "delegation.refused", IDENTITY, null, { reason: e.message, ...byChild });
@@ -831,6 +879,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     // both (review 16).
     let msgId = (await insertMessage(IDENTITY, WRITER, d.to, d.body, null, true, [], undefined, via, rootLive)).id;
     writeCoreAudit(db, "delegation.requested", IDENTITY, d.to, { via: d.humanFallback ? "human_fallback" : a.to !== undefined ? "explicit" : "auto", message_id: msgId, ...byChild });
+    delegateLimiter.spend(IDENTITY);
     const deliver = async (to: string) => (await poke(to)) && !lastWasRelease(db, to);
     let delivered = await deliver(d.to);
     if (!delivered && !d.humanFallback) {
@@ -841,7 +890,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       // proceeds when the retraction wins; otherwise the request stays
       // queued for the first pick, which the catch below treats as fine.
       try {
-        const d2 = resolveDelegation(db, IDENTITY, a, (h) => online(h) && h !== d!.to);
+        const d2 = resolveDelegation(db, IDENTITY, null, args, (h) => online(h) && h !== d!.to, undefined, (h) => ADDRS.includes(h), open);
         if (d2.to !== d.to && !d2.humanFallback && retractMessage(IDENTITY, msgId)) {
           const id2 = (await insertMessage(IDENTITY, WRITER, d2.to, d2.body, null, true, [], undefined, via, rootLive)).id;
           writeCoreAudit(db, "delegation.requested", IDENTITY, d2.to, { via: "auto", message_id: id2, repicked_from: d.to, ...byChild });
@@ -876,14 +925,13 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
       pending?: boolean;
     };
     const parent = parent_id === undefined ? undefined : getMessage(parent_id);
-    // `as` wins; a reply defaults to the held alias its parent reached or was
-    // sent as (#284 S4); else the primary.
+    // `as` wins (a reply's is checked below, #530); a reply defaults to the
+    // held alias its parent reached or was sent as (#284 S4); else the primary.
     const sender = a.as !== undefined ? actingAs(String(a.as), AS_ADDRS, null) : (mine(parent) ? replySender(parent, holds()) : null) ?? IDENTITY;
     checkBody(body);
     // A session ID is checked where the message is written (insertMessage).
-    const parsed = addressParts(to);
-    const recipient = parsed?.kind === "id" ? parsed.address : to;
-    if (parsed?.kind !== "id" && !rosterHandles(db).includes(recipient)) {
+    const recipient = localRecipient(to);
+    if (addressParts(recipient)?.kind !== "id" && !rosterHandles(db).includes(recipient)) {
       return {
         ...text(`error: no agent "${recipient}" has ever connected; peer_list shows exact handles`),
         isError: true,
@@ -899,6 +947,8 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
     if (parent && peer !== recipient) {
       return { ...text(`error: ${replyPeerError(parent.id, peer!)}`), isError: true };
     }
+    const asError = parent ? replySenderError(parent, peer!, sender) : null;
+    if (asError !== null) return { ...text(`error: ${asError}`), isError: true };
     const files = a.attachments === undefined ? [] : await readAttachmentFiles(a.attachments, ROOTS);
     const { id, attachments } = await withUploads(sender, files, (ids) => insertMessage(sender, WRITER, recipient, body, parent_id ?? null, pending === true, ids, { addresses: ADDRS, principal: null }, via, rootLive));
     // The result names the sender whenever it isn't the primary.
@@ -1022,8 +1072,9 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
 
 // Which addresses have a live session, by probing each wakeup socket. A probe
 // is also a wakeup, so each live peer runs a drain; that's harmless (idempotent).
-async function liveHandles(self: string[]): Promise<(h: string) => boolean> {
-  const others = liveAddresses(db).filter((h) => !self.includes(h));
+async function liveHandles(self: string[], among?: string[]): Promise<(h: string) => boolean> {
+  const candidates = liveAddresses(db);
+  const others = (among ? candidates.filter((h) => among.includes(h)) : candidates).filter((h) => !self.includes(h));
   const alive = await Promise.all(others.map((h) => poke(h)));
   const live = new Set(others.filter((_, i) => alive[i]));
   return (h) => live.has(h);
@@ -1136,6 +1187,11 @@ async function drainLoop(): Promise<void> {
 
 async function pushChannel(params: { content: string; meta: Record<string, string> }): Promise<boolean> {
   if (adapterPaused || claudePaused || shuttingDown) return false;
+  // Claude Code renders the content as sent; an adapter's render() fences it again, to no effect.
+  // The human's session feeds the Slack bridge, a person, not a model: the body stays as sent.
+  // The guidance push is ours, not mail: it shows the genuine <channel ...>
+  // form, which fenced would teach the model that the escaped form is genuine.
+  if (!HUMAN && params.meta.kind !== "guidance") params.content = fenceChannel(params.content);
   if (CLAUDE_CURRENT && readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start)?.session !== HARNESS_SESSION) return false;
   if (!ADAPTER_OWNER) {
     await mcp.notification({ method: "notifications/claude/channel", params });
@@ -1397,7 +1453,7 @@ const shutdown = async () => {
   for (const h of [...listeners.keys()]) stopListening(h);
   stopIdListening();
   await Promise.race([Promise.allSettled([...calls, inflight]), Bun.sleep(SHUTDOWN_WAKE_MS)]);
-  let ended: Ended = NOTHING_ENDED;
+  let ended: Ended = nothingEnded();
   try {
     // A keyed session outlives this process while its harness runs.
     if (HARNESS && isAlive(HARNESS.pid, HARNESS.proc_start)) detachSession(db, SESSION_ID);

@@ -2,15 +2,15 @@
 // processes: it gets a board's posts, is never listed, notified or
 // addressable, and a tail killed hard is ended by the next opener.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLI } from "../support/paths.ts";
 import { localEnv } from "../support/env.ts";
 import { GRAYBOARD_AGENT_META } from "../../src/shared/session_meta.ts";
-import { closeSessions, localSession, type Session } from "../support/mcp.ts";
+import { closeSessions, localSession, refusal } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
+import { busRows } from "../support/local_bus.ts";
 
 let dir: string;
 const tails: Bun.Subprocess[] = [];
@@ -25,21 +25,8 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function rows<T>(sql: string, ...args: (string | number)[]): T[] {
-  const db = new Database(join(dir, "bus.db"), { readonly: true });
-  try {
-    return db.prepare(sql).all(...args) as T[];
-  } finally {
-    db.close();
-  }
-}
+const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 
-async function refusal(s: Session, name: string, args: Record<string, unknown> = {}): Promise<string> {
-  const r = await s.c.callTool({ name, arguments: args });
-  const text = (r.content as { text: string }[])[0]!.text;
-  if (!r.isError) throw new Error(`${name} succeeded: ${text}`);
-  return text;
-}
 
 // A running `grayboard tail <board>`, its output read as it arrives, and its
 // session ID once it has registered.

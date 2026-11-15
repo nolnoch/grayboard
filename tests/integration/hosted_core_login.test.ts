@@ -21,6 +21,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { accessAudits } from "../support/audit.ts";
 import { browse as browseConsent } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
 
@@ -35,7 +36,7 @@ let onRefresh: Hook | undefined;
 async function forward(req: IncomingMessage, body: Buffer): Promise<Response> {
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && !["host", "connection", "content-length"].includes(k)) headers.set(k, v);
-  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? body : undefined, redirect: "manual" });
+  return fetch(new URL(req.url!, target), { method: req.method, headers, body: body.length ? new Uint8Array(body) : undefined, redirect: "manual" });
 }
 async function relay(upstream: Response, res: ServerResponse) {
   const headers: Record<string, string | string[]> = {};
@@ -76,8 +77,8 @@ beforeEach(async () => {
   await startProxy();
   app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
-    hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [],
-  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice" }) } });
+    hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, hostedSubscriberLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [],
+  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }) } });
   target = `http://127.0.0.1:${app.server.port}`;
   resource = app.oauth.resource;
 });
@@ -108,7 +109,7 @@ async function seed(options: { scopes?: string[]; access?: string; expiresIn?: n
   await writeJsonAtomic(login({ clientId: store.clientId }).path, store);
   return { ...issued, store };
 }
-const audits = (action: string) => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM access_log WHERE action = ?").get(action)!.n;
+const audits = (action: string) => accessAudits(app.db, action).length;
 const grants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ?").get(CLIENT)!.n;
 const liveGrants = () => app.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_grants WHERE json_extract(data, '$.clientId') = ? AND revoked_at IS NULL").get(CLIENT)!.n;
 // The client's fetch, with the requests `answer` picks answered here: a
@@ -519,7 +520,7 @@ test("while another process refreshes, a token that is still valid serves at onc
   const { store } = await seed({ expiresIn: 30_000 }); // inside the refresh margin, not expired
   const l = login();
   const held = tryAcquire(`${l.path}.refresh.lock`)!;
-  try { expect(await l.token()).toBe(store.access); } finally { held.release(); }
+  try { expect(await l.token()).toBe(store.access!); } finally { held.release(); }
   expect(refreshes).toBe(0);
   expect(await l.read()).toEqual(store);
 }, 10_000);

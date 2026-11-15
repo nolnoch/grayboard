@@ -11,14 +11,15 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
-import { hashToken, verifySessionToken } from "../../src/server/auth.ts";
-import { AppSession } from "../support/app_session.ts";
+import { hashToken } from "../../src/server/auth.ts";
+import { type AppSession, signedIn } from "../support/app_session.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string, dir: string, clock: number;
 const clients: Client[] = [];
+const appSessions: AppSession[] = [];
 const publicUrl = "https://grayboard.example.com:443/hosted";
 beforeEach(() => {
   clock = Date.now();
@@ -27,6 +28,7 @@ beforeEach(() => {
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {
+  for (const s of appSessions.splice(0)) s.close();
   await Promise.all(clients.splice(0).map(c => c.close()));
   await app.stop();
   expect(app.mcp.activeGetStreams).toBe(0);
@@ -263,6 +265,8 @@ test("wire board receipts bind the issued snapshot and reject removed private-bo
   expect(state.cursor).toBe(0);
   expect(state.notified_id).toBe(issued.event.item.latest.id);
   expect(state.notified_id).toBeLessThan(latest.post_id);
+  // Alice's mention wakes bob's agent only under a grant (#806).
+  app.repo.teams.setPolicy(team.id, "collaborative");
   value(await call(sender.client, "board_post", { board: "private", body: "@bob@example.com/be private" }));
   const privateItem = (await read(sub.client, "grayboard://inbox")).items.find((i: { event: { kind: string; item?: { kind: string; post?: { board: string } } } }) => i.event.kind === "board" && i.event.item?.kind === "push" && i.event.item.post?.board === "private");
   expect(privateItem).toMatchObject({ actionable: true, event: { kind: "board", item: { kind: "push" } } });
@@ -311,10 +315,9 @@ test("explicit open conflicts with an existing live push owner; native and subsc
   const grant = issue();
   const login = await fetch(base + "/api/auth/dev-login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const { session_token } = await login.json() as { session_token: string };
-  const authed = verifySessionToken(session_token, app.repo, app.touches);
-  if (!authed) throw new Error("the dev-login token doesn't authenticate");
   // The session registers first; the name comes by bind.
-  const owner = new AppSession(app.application, authed, "be");
+  const owner = signedIn(app, session_token, "be");
+  appSessions.push(owner);
   await owner.connect();
   const native = await connect(grant.token);
   const sub = await connect(grant.token, "2026-07-28", "subscriber");

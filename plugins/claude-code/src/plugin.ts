@@ -230,7 +230,8 @@ export function createPlugin(o: PluginOptions): Plugin {
   };
 
   const root = client && !("error" in config) ? new RootDelivery(client, {
-    sessionID: config.id, stateDir: config.dataDir, place: () => place, push, ...(configured && "name" in configured ? { configured: configured.name } : {}),
+    // Claude Code has no context-only admission: every channel notification starts a turn (#854).
+    sessionID: config.id, stateDir: config.dataDir, place: () => place, push, context: false, ...(configured && "name" in configured ? { configured: configured.name } : {}),
     // Claude Code drops a notification sent before `initialized`; the
     // Controller receipts only after this resolves, and its admission set
     // keeps a failed receipt from showing an item twice. A stop (the run

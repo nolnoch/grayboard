@@ -16,7 +16,7 @@ import { buildCli } from "../support/build.ts";
 import { runCli, type CliResult } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { sign, signSums, testInstallSh, testKey, testKeys } from "../support/release_keys.ts";
-import { ReleaseServer, type SignedOverride } from "../support/release_server.ts";
+import { ReleaseServer } from "../support/release_server.ts";
 import { previousRelease, releaseBinaries, signedRelease } from "../support/releases.ts";
 import { keep } from "../support/run_dir.ts";
 import { TestServer } from "../support/server.ts";
@@ -199,7 +199,7 @@ test("update verifies the signed SHA256SUMS and the API digest before replacing 
     copyFileSync(v0, join(bin, "grayboard"));
     chmodSync(join(bin, "grayboard"), 0o755);
   };
-  const serve = (asset: string, opts: { digests?: Record<string, Record<string, string>>; signed?: Record<string, SignedOverride> } = {}) => {
+  const serve = (asset: string, opts: ConstructorParameters<typeof ReleaseServer>[3] = {}) => {
     releases?.stop();
     releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: asset } }, opts);
   };
@@ -216,6 +216,10 @@ test("update verifies the signed SHA256SUMS and the API digest before replacing 
     ["a binary that doesn't match SHA256SUMS", () => serve(v0, { signed: { [TAG]: good } }), "but SHA256SUMS lists"],
     ["an API digest that doesn't match", () => serve(built, { digests: { [TAG]: { [ASSET]: `sha256:${"0".repeat(64)}` } } }), `but the release API lists sha256:${"0".repeat(64)}`],
     ["a signed binary that doesn't report the tag", () => serve(v0), `reports '0.0.0', not ${TAG}`],
+    // #316: a broken or hostile origin is refused by name before it fills memory.
+    ["an oversized SHA256SUMS", () => serve(built, { signed: { [TAG]: { sums: "x".repeat(64 * 1024 + 1) } } }), "is larger than 65536 bytes"],
+    ["a binary larger than the API lists", () => serve(built, { sizes: { [TAG]: { [ASSET]: 1024 } } }), "is larger than 1024 bytes"],
+    ["an API size over the binary cap", () => serve(built, { sizes: { [TAG]: { [ASSET]: 512 * 1024 * 1024 + 1 } } }), `the release API lists ${ASSET} at ${512 * 1024 * 1024 + 1} bytes, over ${512 * 1024 * 1024}`],
     // Checked before the tag reaches a URL or the temp file's name.
     ["a latest tag that isn't a release tag", () => {
       releases?.stop();

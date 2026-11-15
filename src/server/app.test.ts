@@ -5,7 +5,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startServer } from "./app.ts";
+import { startLimits, startServer } from "./app.ts";
+import { hashToken, mintToken } from "./auth.ts";
 import { Database } from "bun:sqlite";
 import { until } from "../../tests/support/until.ts";
 
@@ -135,7 +136,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
       }
     }
     expect(released()).toBe(0);
-    expect(app.application.hostedHolder("you@example.com/be")).toBeDefined();
+    expect(app.application.aliasHolderId("you@example.com/be")).not.toBeNull();
     expect(app.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='bound'").get()?.count).toBe(1);
     if (scenario !== "idle") expect((await app.mcp.delivery.open(principal, context)).ownership).toBe(lease.ownership);
   } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
@@ -234,4 +235,70 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
       rmSync(dir, { recursive: true, force: true });
     }
   }
+});
+
+test("a start option overrides the config's limit, and an explicit undefined one doesn't wipe it (#385 item 14)", () => {
+  const config = { helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedSubscriberLimit: { burst: 11, perSec: 5 } };
+  expect(startLimits(config, { helloLimit: undefined, hostedRequestLimit: undefined, hostedSubscriberLimit: undefined })).toMatchObject(config);
+  expect(startLimits(config, { hostedSubscriberLimit: { burst: 13, perSec: 6 } })).toMatchObject({ hostedSubscriberLimit: { burst: 13, perSec: 6 }, hostedRequestLimit: config.hostedRequestLimit });
+  expect(startLimits(config, { helloLimit: { burst: 9, perSec: 9 } })).toMatchObject({ helloLimit: { burst: 9, perSec: 9 }, hostedRequestLimit: config.hostedRequestLimit });
+  // delegate's limits come from the config too (#252).
+  const delegate = { delegateLimit: { burst: 5, perSec: 0.5 }, delegateOpenCap: 4 };
+  expect(startLimits({ ...config, ...delegate }, { delegateLimit: undefined })).toMatchObject(delegate);
+  expect(startLimits({ ...config, ...delegate }, { delegateOpenCap: 9 })).toMatchObject({ ...delegate, delegateOpenCap: 9 });
+});
+
+test("startLimits hands the configured global watch cap to the application's board observers (#805 F-06)", () => {
+  const hostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 5000, perSession: 64 } };
+  expect(startLimits({ helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedCaps }, {})).toMatchObject({ observerCap: 5000 });
+});
+
+test("a started server's hosted MCP surface takes its session caps from the config (#805 F-06)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-caps-"));
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    const hostedCaps = { sessions: { global: 5000, perUser: 300 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
+    app = startServer({ ...restartConfig(dir), hostedCaps }, { hostname, background: false });
+    expect(app.mcp.sessions.limits).toMatchObject({ user: 300, global: 5000 });
+  } finally {
+    await app?.stop();
+    app?.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit observerCap start option overrides the configured watch cap (#805 F-06)", () => {
+  const hostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 5000, perSession: 64 } };
+  expect(startLimits({ helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedCaps }, { observerCap: 5 })).toMatchObject({ observerCap: 5 });
+});
+
+// F-04: a dev sign-in token must not outlive dev auth. A restart without it
+// revokes every dev token, and turning dev auth back on doesn't revive them;
+// a token from the real sign-in survives.
+test("a server started without dev auth revokes dev sign-in tokens for good", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-dev-revoke-"));
+  const config = restartConfig(dir);
+  let app: ReturnType<typeof startServer> | undefined;
+  const whoami = (token: string) => fetch(`http://${hostname}:${app!.server.port}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } }).then(res => res.status);
+  try {
+    app = startServer(config, { hostname, background: false });
+    const login = await fetch(`http://${hostname}:${app.server.port}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "you@example.com" }) });
+    expect(login.status).toBe(200);
+    const dev = (await login.json() as { session_token: string }).session_token;
+    const real = mintToken();
+    app.repo.sessions.create(app.repo.users.upsertByEmail("them@example.com", null).id, hashToken(real), "grayboard/1.0");
+    expect(await whoami(dev)).toBe(200);
+    await app.stop(); app = undefined;
+
+    app = startServer({ ...config, devAuth: false }, { hostname, background: false });
+    expect(await whoami(dev)).toBe(401);
+    expect(await whoami(real)).toBe(200);
+    const revoked = app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'auth.dev_sessions_revoked'").all();
+    expect(revoked.map(row => JSON.parse(row.detail))).toEqual([{ count: 1 }]);
+    await app.stop(); app = undefined;
+
+    app = startServer(config, { hostname, background: false });
+    expect(await whoami(dev)).toBe(401);
+    expect(await whoami(real)).toBe(200);
+  } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

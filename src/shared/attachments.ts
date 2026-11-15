@@ -326,8 +326,7 @@ export function saveAttachment(a: AttachmentInfo, data: Uint8Array, target: stri
   return writeNew(target, `${a.id}-${sanitizeFilename(a.filename)}`, data);
 }
 
-// The routes a session's attachments travel: the server's HTTP API
-// (`/api/attachments?as=`) or a hosted MCP endpoint's
+// The routes a session's attachments travel: a hosted MCP endpoint's
 // (`<resource>/attachments` with X-Grayboard-Session,
 // adapters/hosted-core/src/proxy.ts). Errors are the transport's own.
 export interface AttachmentTransport {
@@ -464,6 +463,14 @@ export const ATTACHMENTS_PARAM = {
   type: "array",
   items: { type: "string" },
   description: `Optional. Paths of files to send: images (PNG, JPEG, GIF, WebP), PDF or UTF-8 text; up to ${MAX_ATTACHMENTS}. Readers get them with attachment_get.`,
+};
+
+// The hosted form (a server's hosted MCP): files uploaded first through the
+// authenticated attachment HTTP API, named by the IDs it returned.
+export const ATTACHMENT_IDS_PARAM = {
+  type: "array",
+  items: { type: "integer", exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  description: "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths.",
 };
 
 // Not alwaysLoad: a channel notification with files names this tool

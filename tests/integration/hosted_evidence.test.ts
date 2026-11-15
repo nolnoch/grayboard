@@ -211,3 +211,23 @@ test("JUnit counts reject partial or inconsistent documents and read the failure
   expect(() => junitCounts(" ".repeat(8 * 1024 * 1024) + document())).toThrow();
   expect(() => junitCounts(document('<testcase><system-out>\u0000</system-out></testcase>'))).toThrow();
 });
+
+test("the provenance script lists tracked files only, so an untracked file passes the allowlist (#378 2)", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "gb-provenance-tracked-"))); roots.push(root);
+  const tracked = ["src/main.ts", "src/moved.ts", "adapters/opencode-v2/package.json", "adapters/opencode-v2/index.js", "adapters/opencode-v2/tui.js", "adapters/opencode-v2/README.md", "adapters/opencode-v2/src/index.ts", "adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts"];
+  for (const path of tracked) { mkdirSync(join(root, path, ".."), { recursive: true }); writeFileSync(join(root, path), path); }
+  const env = fixtureEnv(root), git = (...args: string[]) => fixtureGit(root, env, ...args);
+  git("init", "-q"); git("add", "."); git(...identity, "commit", "-qm", "fixture");
+  // The shape that failed every hosted gate: a new uncommitted source file and editor or OS litter beside tracked ones.
+  rmSync(join(root, "src/moved.ts")); // an unstaged mv: tracked, gone from disk
+  for (const path of ["src/new.ts", "src/.DS_Store", "adapters/opencode-v2/src/scratch.ts", "adapters/opencode-v2/tests/.DS_Store"]) writeFileSync(join(root, path), "untracked");
+  const scratch = join(root, "scratch"), installed = join(root, "installed"), output = join(root, "provenance.json");
+  mkdirSync(scratch); cpSync(join(root, "adapters/opencode-v2"), installed, { recursive: true });
+  rmSync(join(installed, "src/scratch.ts")); writeFileSync(join(scratch, "installed.txt"), installed);
+  const run = Bun.spawnSync([process.execPath, join(checkout, "scripts/hosted-provenance.ts"), root, scratch, output], { env: repositoryGitEnv() });
+  expect(run.exitCode).toBe(0);
+  const value = JSON.parse(readFileSync(output, "utf8"));
+  expect(value.backend.map((e: { path: string }) => e.path)).toEqual(["src/main.ts"]);
+  expect(value.drivers.map((e: { path: string }) => e.path)).toEqual(["adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts"]);
+  expect(provenance(value, root, "git").mismatches).toEqual([]);
+});

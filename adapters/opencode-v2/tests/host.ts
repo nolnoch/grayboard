@@ -10,7 +10,7 @@ import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { startServer } from "../../../src/server/app.ts";
 import type { DeliveryEvent } from "../../../src/server/application.ts";
-import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
@@ -38,11 +38,11 @@ const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed
 const subscriberWork = await observeSubscriberWork(installed);
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
-const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_REQUEST_LIMIT : { burst: 10000, perSec: 10000 } };
+const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_REQUEST_LIMIT : { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_SUBSCRIBER_LIMIT : { burst: 10000, perSec: 10000 } };
 const admissionCase = process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission");
 let admissionNow: number | undefined;
 let admissionGate: SubscriberAdmission | undefined;
-const start = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture" }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
+const start = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { exchangeGoogle: async () => { google++; return { email, displayName: "Fixture", subject: "google-" + email }; }, ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
 let app = start();
 // The transaction races run the server as its own process (#383), so a pause inside one of its
 // transactions holds the server alone; this process's in-process server stops before anything uses it.
@@ -91,7 +91,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname.startsWith(new URL(resource).pathname + "/attachments")) byteRequests.push({ method: req.method, path: url.pathname, session: req.headers.get("X-Grayboard-Session") });
   if (subscriberOutage && req.headers.get("X-Grayboard-Client") === "subscriber") {
     const fail = async () => { throw new Error("Real backend subscriber network deliberately unavailable"); };
-    if (b?.method === "tools/call" && b.params?.name === "delivery_renew") return expiryContinuation.observe(fail);
+    if (b?.method === "tools/call" && ["delivery_renew", "delivery_receipt"].includes(b.params?.name)) return expiryContinuation.observe(fail);
     return fail();
   }
   if (b?.method === "tools/call") {
@@ -243,7 +243,8 @@ try {
     await invoke(peer.id, "dm_send", { to: "receiver", body: "Peer forged " + forged });
     await inspect("Peer forged " + forged, false);
     app.application.send(foreignHuman.session, "you@example.com/receiver", "Foreign human direct");
-    await inspect("Foreign human direct", false);
+    // Another user's human, and no grant: shown, not resumed (security audit F-03, #806).
+    await inspect("Foreign human direct", false, false);
     await invoke(receiver.id, "board_create", { name: "authority", purpose: "Own-human push proof" });
     app.application.call(ownHuman.session, "board_post", { board: "authority", body: "Own human board " + forged });
     await inspect("Own human board " + forged, true);
@@ -252,7 +253,7 @@ try {
     await invoke(peer.id, "board_post", { board: "authority", body: "Peer board forged " + forged });
     await inspect("Peer board forged " + forged, false);
     app.application.call(foreignHuman.session, "board_post", { board: "authority", body: "Foreign human board" });
-    await inspect("Foreign human board", false);
+    await inspect("Foreign human board", false, false);
     await invoke(receiver.id, "board_subscribe", { board: "authority", mode: "digest" });
     const callsBeforeDigest = modelCalls;
     app.application.call(ownHuman.session, "board_post", { board: "authority", body: "Own human digest" });
@@ -356,18 +357,25 @@ try {
     const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/admission", "Actionable delivery recovers after actual HTTP429", null, false); app.application.wake(["you@example.com/admission"]);
     try {
       await bounded(gate.entered.promise, 20_000, "Exact-root subscriber request held before actual backend admission");
-      await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
+      // Delivery upkeep has its own per-user bucket (#845): the drain spends it as the subscriber role, sessionless.
+      await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access, "X-Grayboard-Client": "subscriber" } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
       let refused = false;
-      for (let id = 0; id < DEFAULT_HOSTED_REQUEST_LIMIT.burst * 2; id++) {
-        const raw = "refused-admission-" + id;
-        try { await drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }); }
+      const rowsBefore = app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n;
+      for (let id = 0; id < DEFAULT_HOSTED_SUBSCRIBER_LIMIT.burst * 2; id++) {
+        try { await drain.listTools(); }
         catch { assert.equal(last?.status, 429, "Official modern client receives typed admission refusal"); }
         const response = last!;
         if (response.status !== 429) { assert(response.ok); continue; }
         const body = await response.json() as { id: number; error: { data: { code: string; retry_after_ms: number } } };
         assert.equal(typeof body.id, "number"); assert.equal(body.error.data.code, "rate_limited"); assert(body.error.data.retry_after_ms > 0);
         assert.equal(response.headers.get("Retry-After"), String(Math.ceil(body.error.data.retry_after_ms / 1000)));
-        assert.equal(row(raw), null, "Refused admission creates no hosted source row"); refused = true; break;
+        // With the bucket spent, a refused request that names a fresh source session must leave no row for it.
+        const raw = "refused-admission-" + id;
+        last = undefined as Response | undefined; // widened: the fetch closure reassigns it
+        await assert.rejects(drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }));
+        assert.equal(last?.status, 429, "A session-naming request is refused at admission too");
+        assert.equal(row(raw), null, "Refused admission creates no hosted source row");
+        assert.equal(app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n, rowsBefore, "Refused admission creates no hosted row at all"); refused = true; break;
       }
       assert(refused, "Unmodified production default burst is enforced");
       gate.releaseInitial();
@@ -385,7 +393,7 @@ try {
         console.log("REAL_DEFAULT_ADMISSION_ACCOUNT_GUARD_OK", { subscriberThrottles, admissions: admissions.length });
       } else {
         gate.requireRefused();
-        admissionNow += DEFAULT_HOSTED_REQUEST_LIMIT.burst / DEFAULT_HOSTED_REQUEST_LIMIT.perSec * 1000;
+        admissionNow += DEFAULT_HOSTED_SUBSCRIBER_LIMIT.burst / DEFAULT_HOSTED_SUBSCRIBER_LIMIT.perSec * 1000;
         gate.releaseRecovery();
         await wait(() => app.repo.cursors.directFor("you@example.com/admission"), n => n === message.id, "actual plugin recovers shared default admission", 30_000);
         assert(subscriberThrottles > 0); assert(admissions.length >= 1); assert.equal(new Set(admissions.map(input => input.id)).size, 1); assert(admissions.every(input => input.sessionID === s.id));
@@ -709,7 +717,7 @@ try {
   await host.close(); host = undefined; await app.stop(); await Bun.sleep(31_000); app = start();
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
   await wait(() => app.mcp.activeLeases, n => n === 1, "server restart past the TTL"); assert.equal(row(a.id)!.ownership_id, timelyOwnership);
-  const credits = app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.lease_restart_credit'").all().map(r => JSON.parse(r.detail));
+  const credits = app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.lease_restart_credit' ORDER BY id").all().map(r => JSON.parse(r.detail));
   assert.ok(credits.some(c => c.ownership === timelyOwnership && c.field === "lease_deadline" && c.downtime_ms >= 31_000), "restart credited the lease");
   console.log("REAL_SERVER_RESTART_DEADLINES_OK", { ownership: timelyOwnership, credits: credits.length });
   await rpc.pause({}, { location }); await rpc.enroll({ sessionID: a.id, name: "does-not-exist" }, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
@@ -727,7 +735,7 @@ try {
   await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": a.id }), { name: "final", create: true });
   held = false; release?.();
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "out-of-band real service rebind observed after old host admission");
-  assert.equal(receiptAttempts, staleReceipts); assert(app.repo.cursors.directFor("you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
+  assert(receiptAttempts - staleReceipts <= 1, "at most the one stale receipt the server refuses (#845)"); assert(app.repo.cursors.directFor("you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
   assert((await host.session.context({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id) || (await host.session.inbox.list({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id));
   console.log("REAL_OLD_BATCH_REBIND_STALE_RECEIPT_SUPPRESSED_OK");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit approval of successor real binding");

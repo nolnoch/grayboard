@@ -57,9 +57,13 @@ export type DedupOutcome<W extends Written> =
 // uploads). The lookup, the write, the
 // receipt and the audit row are one IMMEDIATE transaction (a savepoint inside
 // an open one): two calls can't interleave, and a write that throws leaves no
-// receipt. `now` is the hub's clock.
+// receipt. `now` is the hub's clock. `recheck` runs on a hit, in the same
+// transaction, before anything is answered or audited: it throws the refusal a
+// fresh call would get when authority over what the first call wrote has gone
+// since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
 export function dedupWrite<W extends Written>(
   repo: Repo, now: number, call: DedupCall, write: () => Sync<W>, onReplay: () => void = () => {},
+  recheck: (stored: W["payload"]) => void = () => {},
 ): DedupOutcome<W> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
   const since = now - WRITE_DEDUP_WINDOW_MS;
@@ -69,11 +73,17 @@ export function dedupWrite<W extends Written>(
     receipts.pruneSession(call.session, since);
     if (!call.resend) {
       const hit = receipts.find(call.session, call.sender, fp, since);
-      // A receipt whose row is gone (retracted, pruned) is a miss: the upsert below replaces it.
-      if (hit && receipts.refExists(hit.ref_kind, hit.ref_id)) {
+      // A receipt whose row is gone (retracted, pruned) is a miss: the upsert
+      // below replaces it, and the audit says why this repeat wrote fresh (#306).
+      if (hit && !receipts.refExists(hit.ref_kind, hit.ref_id)) {
+        writeAudit(repo, "request.receipt_stale", call.actor, call.sender, {
+          tool: call.tool, fp, ref_kind: hit.ref_kind, ref_id: hit.ref_id, first_at: new Date(hit.at).toISOString(), session: call.session,
+        });
+      } else if (hit) {
         const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
         const first_at = new Date(hit.at).toISOString();
         const stored = JSON.parse(hit.result_json) as W["payload"];
+        recheck(stored);
         writeAudit(repo, "request.replayed", call.actor, call.sender, {
           tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
         });

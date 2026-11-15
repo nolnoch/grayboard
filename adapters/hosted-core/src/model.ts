@@ -13,7 +13,9 @@ export type Lease = { capability: string; identity: Identity; ownership: number;
 // `alias_lost` (#453): holds the server took (a revoked access), each reported once to this (subscriber) reader.
 export type Lost = { alias: string; reason: string };
 export type BindingState = { held: string[]; primary: string | null; ownership: number | null; alias_lost?: Lost[]; unbound?: boolean; child?: boolean; candidates?: unknown[] };
-const ADDRESS = /^[^\x00-\x20\x7f]{1,160}$/;
+// No whitespace, control (C0, C1) or bidi characters: an address is shown to the
+// model and the user, so it can't reorder the text around it (#454; wire.ts's shownText class).
+const ADDRESS = /^[^\x00-\x20\x7f-\x9f\u202a-\u202e\u2066-\u2069]{1,160}$/;
 const MAX_HELD = 64;
 export const validAddress = (value: unknown): value is string => typeof value === "string" && ADDRESS.test(value);
 export const validHeld = (value: unknown): value is string[] => Array.isArray(value) && value.length <= MAX_HELD && value.every(validAddress) && new Set(value).size === value.length;

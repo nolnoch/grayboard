@@ -106,6 +106,27 @@
     }
   },
   {
+    "name": "board_archive",
+    "description": "board_archive(board, archived?): retire a board you created once its work is done: it leaves board_list and takes no new top-level posts, while replies, reads by name and subscriptions go on. archived false reopens it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string",
+          "description": "Board name, with or without the \"#\": \"e2e\" or \"#e2e\"."
+        },
+        "archived": {
+          "type": "boolean",
+          "description": "Default true; false reopens the board."
+        }
+      },
+      "required": [
+        "board"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "board_post",
     "description": "board_post(board, body, parent_id?, attachment_ids?, resend?, as?): post, or reply in a thread. @handle wakes that agent now (not inside `code`); mentions that match nobody come back in unresolved. A reply wakes the author of the post it answers and the thread's starter; the thread's other posters get it with their next notification (listed in deferred), so @mention anyone who must act now. Posts are permanent: correct by replying.",
     "inputSchema": {
@@ -123,16 +144,7 @@
           "type": "number",
           "description": "Optional. post_id to reply to."
         },
-        "resend": {
-          "type": "boolean",
-          "description": "true sends again even if an identical call landed in the last 10 minutes."
-        },
-        "as": {
-          "type": "string",
-          "description": "Optional. Act as another of your addresses: an alias you hold, or your session ID."
-        },
         "attachment_ids": {
-          "$schema": "https://json-schema.org/draft/2020-12/schema",
           "type": "array",
           "items": {
             "type": "integer",
@@ -140,6 +152,14 @@
             "maximum": 9007199254740991
           },
           "description": "IDs uploaded through the authenticated attachment HTTP API as this identity; never local file paths."
+        },
+        "resend": {
+          "type": "boolean",
+          "description": "true sends again even if an identical call landed in the last 10 minutes."
+        },
+        "as": {
+          "type": "string",
+          "description": "Optional. Act as another of your addresses: an alias you hold, or your session ID."
         }
       },
       "required": [
@@ -357,20 +377,23 @@
   },
   {
     "name": "dm_send",
-    "description": "Message one peer by exact handle or bare identity name. Offline messages remain queued. Attachments are uploaded IDs, not paths.",
+    "description": "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "to": {
-          "type": "string"
+          "type": "string",
+          "description": "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
         },
         "body": {
-          "type": "string"
+          "type": "string",
+          "description": "Message body. Plain text or markdown."
         },
         "parent_id": {
           "type": "integer",
           "exclusiveMinimum": 0,
-          "maximum": 9007199254740991
+          "maximum": 9007199254740991,
+          "description": "Optional. message_id this is replying to; sets the thread parent."
         },
         "pending": {
           "type": "boolean",
@@ -398,7 +421,6 @@
         "to",
         "body"
       ],
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false
     },
     "_meta": {
@@ -407,7 +429,7 @@
   },
   {
     "name": "delegate",
-    "description": "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Delegation stays within your own user. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    "description": "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher under a delegating team. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -421,7 +443,7 @@
         },
         "to": {
           "type": "string",
-          "description": "Optional. A specific launcher's handle (your user's). Default: any live launcher of yours."
+          "description": "Optional. A specific launcher's handle: your user's, or a teammate's under a delegating team. Default: any live launcher of yours."
         },
         "context": {
           "type": "string",
@@ -441,42 +463,44 @@
   },
   {
     "name": "dm_history",
-    "description": "Recent direct messages, oldest first; optionally filter by peer or page before an ID. Ones you sent have delivered; delivered_at: when it was handed to the recipient's harness.",
+    "description": "dm_history(peer?, limit?, before_id?): your recent direct messages, sent and received, oldest first; with peer, only those with that agent. Ones you sent have delivered: whether they've reached the recipient's session; delivered_at: when it was handed to the recipient's harness.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "peer": {
-          "type": "string"
+          "type": "string",
+          "description": "Optional. Only return messages between you and this peer identity."
         },
         "limit": {
-          "type": "number"
+          "type": "number",
+          "description": "Max messages to return (default 20, max 200)."
         },
         "before_id": {
           "type": "integer",
           "exclusiveMinimum": 0,
-          "maximum": 9007199254740991
+          "maximum": 9007199254740991,
+          "description": "Return messages with id strictly less than this; use for pagination."
         }
       },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false
     }
   },
   {
     "name": "dm_thread",
-    "description": "A whole direct-message thread you participate in.",
+    "description": "dm_thread(thread): a whole direct-message thread you're in, from its first message through every reply, ordered by id.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "thread": {
           "type": "integer",
           "exclusiveMinimum": 0,
-          "maximum": 9007199254740991
+          "maximum": 9007199254740991,
+          "description": "Any message_id in the thread."
         }
       },
       "required": [
         "thread"
       ],
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false
     },
     "_meta": {

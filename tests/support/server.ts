@@ -7,13 +7,15 @@ import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
-import { verifySessionToken } from "../../src/server/auth.ts";
 import type { Config } from "../../src/server/config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
+import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
+import { attachmentDownload, attachmentRelease, attachmentUpload } from "../../src/server/http.ts";
+import { UploadGate } from "../../src/server/uploads.ts";
 import { cleanEnv } from "./env.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { AppSession, type AppSessionOptions } from "./app_session.ts";
+import { type AppSession, type AppSessionOptions, signedIn } from "./app_session.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession, type HostedOptions } from "./hosted_session.ts";
 
 function serverConfig(dir: string, overrides: Partial<Config>): Config {
@@ -32,6 +34,9 @@ function serverConfig(dir: string, overrides: Partial<Config>): Config {
     helloLimit: DEFAULT_HELLO_LIMIT,
     authFailLimit: DEFAULT_AUTH_FAIL_LIMIT,
     trustedProxies: DEFAULT_TRUSTED_PROXIES,
+    // A raised hostedRequestLimit raises the subscriber bucket too, unless the test sets that one:
+    // HostedSession's inbox polling and receipts are delivery upkeep, charged there (#845).
+    ...(overrides.hostedRequestLimit && !overrides.hostedSubscriberLimit ? { hostedSubscriberLimit: overrides.hostedRequestLimit } : {}),
     ...overrides,
   };
 }
@@ -71,14 +76,39 @@ export class TestServer {
     return { status: r.status, body: await r.json() };
   }
 
-  async upload(token: string, identity: string, filename: string, data: Uint8Array | string): Promise<{ status: number; body: Record<string, any> }> {
-    const q = `as=${encodeURIComponent(identity)}&filename=${encodeURIComponent(filename)}`;
-    const r = await fetch(`${this.base}/api/attachments?${q}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: data,
-    });
+  // The shared attachment handlers (src/server/http.ts) run in-process as
+  // `identity`, as the hosted byte routes run them once they have resolved
+  // the session's bound name. For application sessions, which have no byte
+  // route of their own (#475); a hosted session uses HTTP (HostedSession.upload).
+  async uploadAs(token: string, identity: string, filename: string, data: Uint8Array | string): Promise<{ status: number; body: Record<string, any> }> {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const url = this.handlerUrl(identity, `&filename=${encodeURIComponent(filename)}`);
+    const req = new Request(url, { method: "POST", headers: { "Content-Length": String(bytes.length) }, body: bytes as Uint8Array<ArrayBuffer> });
+    const total = this.app.repo.attachmentLimits.total;
+    const r = await attachmentUpload(req, url, this.authed(token), this.app.repo, this.app.db, new UploadGate(4 * total, total));
     return { status: r.status, body: (await r.json()) as Record<string, any> };
+  }
+
+  async downloadAs(token: string, identity: string, id: number): Promise<{ status: number }> {
+    const r = await attachmentDownload(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo, this.app.db);
+    await r.body?.cancel();
+    return { status: r.status };
+  }
+
+  async releaseAs(token: string, identity: string, id: number): Promise<{ status: number }> {
+    const r = await attachmentRelease(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo, this.app.db);
+    await r.body?.cancel();
+    return { status: r.status };
+  }
+
+  private authed(token: string): AuthedUser {
+    const authed = verifySessionToken(token, this.app.repo, this.app.touches, 0);
+    if (!authed) throw new Error("the token doesn't authenticate");
+    return authed;
+  }
+
+  private handlerUrl(identity: string, extra = ""): URL {
+    return new URL(`${this.base}/attachments?as=${encodeURIComponent(identity)}${extra}`);
   }
 
   // An application-level session (no socket, no hosted store): the
@@ -86,19 +116,24 @@ export class TestServer {
   // an API request resolves it. Identity null stays unbound; connect() it.
   // Closed by stop().
   appSession(token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-    const authed = verifySessionToken(token, this.app.repo, this.app.touches);
-    if (!authed) throw new Error("appSession: the token doesn't authenticate");
-    const s = new AppSession(this.app.application, authed, identity, opts);
+    const s = signedIn(this.app, token, identity, opts);
     this.appSessions.push(s);
+    return s;
+  }
+
+  // appSession, connected (bound unless identity is null or it's tools-only).
+  async connected(token: string, identity: string | null, opts: AppSessionOptions = {}): Promise<AppSession> {
+    const s = this.appSession(token, identity, opts);
+    await s.connect();
     return s;
   }
 
   // A hosted MCP session of `email`'s, through a built-in client's OAuth
   // grant, connected (bound and leased unless identity is null). Closed by
   // stop(). Inbox polling spends hosted requests: give this server a large
-  // hostedRequestLimit.
+  // hostedRequestLimit (serverConfig carries it to the subscriber bucket).
   async hosted(email: string, identity: string | null, opts: HostedOptions = {}): Promise<HostedSession> {
-    const { token } = issueOAuth(this.app.repo, this.app.oauth.resource, email, opts.scopes ?? HOSTED_SCOPES, Date.now(), opts.client ?? HOSTED_CLIENT);
+    const { token } = issueOAuth(this.app.repo, this.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
     const s = new HostedSession(`${this.base}/mcp`, token, identity, opts);
     this.hostedSessions.push(s);
     await s.connect();

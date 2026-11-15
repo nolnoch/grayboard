@@ -4,8 +4,9 @@
 // revalidate() is the backstop for a membership changed behind the server.
 // A team alias is held by application sessions: a hosted session holds one
 // person-scope name (#451). There is no WSS transport to tell a holder (#282):
-// a revocation is the database's (hold released, binding event, audit), and
-// the application session isn't told, so these assert that state.
+// a revocation is the database's (hold released, binding event, audit) and
+// the live session's address set (#475 7c), but the session isn't told, so
+// these assert that state.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { WhoResult } from "../../src/core/boards.ts";
 import type { AppSession } from "../support/app_session.ts";
@@ -36,6 +37,9 @@ const holder = (address: string) => rows(`SELECT id FROM alias_holds WHERE addre
 const lastEvent = (address: string) => rows(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id DESC LIMIT 1`, address)[0];
 const revoked = () => rows(`SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked' ORDER BY id`).map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
 const REASON = `${B} isn't a member of team eng`;
+// One HTTP call made as `identity`: a claim taken under it, a fresh key each time.
+let claimKey = 0;
+const actAs = (token: string, identity: string) => srv.api(token, "POST", "/api/claims/call", { as: identity, tool: "claim_take", args: { key: `ticket:ENG-${++claimKey}` } });
 
 // hosted twin: #451 (team aliases on a session, alias_lost, a tools-only writer)
 test("a removed member's sessions lose the team's aliases: a holder keeps its ID, a tools-only writer ends, a closed session's hold is dropped", async () => {
@@ -81,6 +85,20 @@ test("a removed member's sessions lose the team's aliases: a holder keeps its ID
   expect((await srv.appSession(alice, "eng/build").connect()).bind?.alias).toBe("eng/build");
 });
 
+// #475 7c: the revoked hold leaves the live session too, not only the database: mail to
+// the alias is no longer pushed to it, and it no longer acts as it.
+test("a revoked hold leaves the live session: the alias's mail isn't pushed to it, and it can't write as it", async () => {
+  const build = srv.appSession(bob, "eng/build");
+  await build.connect();
+  expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
+  const sender = srv.appSession(alice, "be");
+  await sender.connect();
+  await sender.send("eng/build", "after the removal");
+  await build.none(direct((m) => m.body === "after the removal"));
+  await build.call("board_create", { name: "e2e", purpose: "fixtures" });
+  await expect(build.call("board_post", { board: "e2e", body: "as the team", as: "eng/build" })).rejects.toThrow();
+});
+
 // hosted twin: #451 (team aliases on a session, alias_lost)
 test("leaving a team releases its aliases from the leaver's sessions; revalidate catches a membership changed behind the server", async () => {
   let build = srv.appSession(bob, "eng/build");
@@ -108,13 +126,35 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   expect(holder("eng/build")).toEqual([kept.id]);
 });
 
-// HTTP's ?as= takes the same check as bind (mayActIn).
+// Acting as an address over HTTP (`/api/claims/call`'s identity, as the
+// `?as=` attachment routes did before #475 removed them) takes the same check
+// as bind (policy.ts scope.act).
 // hosted twin: #451 (the hold: a team alias on a session)
 test("acting as a team alias over HTTP follows membership", async () => {
   await srv.appSession(bob, "eng/build").connect();
-  expect((await srv.upload(bob, "eng/build", "a.txt", "x")).status).toBe(201);
+  expect((await actAs(bob, "eng/build")).status).toBe(200);
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
-  expect(await srv.upload(bob, "eng/build", "a.txt", "x")).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "eng/build": ${REASON}` } });
+  expect(await actAs(bob, "eng/build")).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "eng/build": ${REASON}` } });
+});
+
+// #284 acceptance 4, #356: eng/x is one alias, reached by a DM to its one
+// holder; team:eng is the team, reached only through its board.
+test("a DM to a team alias reaches its holder alone; team:eng isn't a DM recipient, its board reaches every member", async () => {
+  const deploy = await srv.connected(bob, "eng/deploy");
+  const bobFe = await srv.connected(bob, "fe");
+  const aliceQa = await srv.connected(alice, "qa");
+  const be = await srv.connected(alice, "be");
+
+  await be.send("eng/deploy", "ship it");
+  await deploy.next(direct((m) => m.body === "ship it"));
+  expect(rows(`SELECT sender, recipient FROM messages WHERE body = 'ship it'`)).toEqual([{ sender: "alice@example.com/be", recipient: "eng/deploy" }]);
+  await bobFe.none(direct((m) => m.body === "ship it"));
+  await aliceQa.none(direct((m) => m.body === "ship it"));
+
+  await expect(be.send("team:eng", "everyone")).rejects.toMatchObject({ message: "team:eng isn't a person; to reach a team, board_post to its board #eng" });
+  expect(rows(`SELECT 1 FROM messages WHERE body = 'everyone'`)).toEqual([]);
+  await be.call("board_post", { board: "eng", body: "everyone" });
+  for (const s of [deploy, bobFe, aliceQa]) expect((await s.call<{ posts: { body: string }[] }>("board_read", { board: "eng" })).posts.map((p) => p.body)).toEqual(["everyone"]);
 });
 
 // A team's alias follows its own team's board, not its creator's others.
@@ -126,23 +166,38 @@ test("a lazily created team alias follows only its team's board", async () => {
   expect(rows(`SELECT created_by FROM boards WHERE name = 'eng'`)).toEqual([{ created_by: "alice@example.com" }]);
 });
 
-// #284 S8 (decided): an alias in use is exclusive across principals. While
-// bob's session holds eng/build, alice can't write as it (tools-only
-// writes_as, ?as=) or bind it; while alice's tools-only session writes as
-// eng/deploy, bob can't bind it. A principal's own sessions share freely.
-// hosted twin: #451 (team aliases on a session, tools-only writes_as, end)
-test("a team alias in use by one member's session refuses another member's writes_as, ?as= and bind", async () => {
+// #349: an alias_held refusal names the holder's place (its machine and
+// directory) only to the holder's own principal.
+test("an alias_held refusal shows the holder's place to its own principal, not to another member", async () => {
   const build = srv.appSession(bob, "eng/build");
   expect((await build.connect()).bind?.alias).toBe("eng/build");
-  // bob's own tools-only sidecar and ?as= stay allowed (#182).
+  srv.app.db.query(`UPDATE ids SET place = 'bob-box:~/src/secret-project' WHERE id = ?`).run(build.id);
+
+  const other = srv.appSession(alice, "eng/build");
+  const refusal = await other.connect().then(() => { throw new Error("alice's bind was not refused"); }, (e: { code: string; message: string }) => e);
+  expect(refusal.code).toBe("alias_held");
+  expect(refusal.message).toContain(build.id);
+  expect(refusal.message).not.toContain("secret-project");
+
+  await expect(srv.appSession(bob, "eng/build").connect()).rejects.toMatchObject({ code: "alias_held", message: expect.stringContaining(`${build.id}, in bob-box:~/src/secret-project`) });
+});
+
+// #284 S8 (decided): an alias in use is exclusive across principals. While
+// bob's session holds eng/build, alice can't write as it (tools-only
+// writes_as, HTTP's identity) or bind it; while alice's tools-only session writes as
+// eng/deploy, bob can't bind it. A principal's own sessions share freely.
+// hosted twin: #451 (team aliases on a session, tools-only writes_as, end)
+test("a team alias in use by one member's session refuses another member's writes_as, HTTP identity and bind", async () => {
+  const build = srv.appSession(bob, "eng/build");
+  expect((await build.connect()).bind?.alias).toBe("eng/build");
+  // bob's own tools-only sidecar and HTTP identity stay allowed (#182).
   const own = srv.appSession(bob, "eng/build", { push: false });
   await own.connect();
-  expect((await srv.upload(bob, "eng/build", "a.txt", "x")).status).toBe(201);
+  expect((await actAs(bob, "eng/build")).status).toBe(200);
 
   const writer = srv.appSession(alice, "eng/build", { push: false });
   await expect(writer.connect()).rejects.toMatchObject({ code: "alias_held", message: expect.stringContaining(`another user's session ${build.id}`) });
-  const up = await srv.upload(alice, "eng/build", "a.txt", "x");
-  expect(up).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(build.id) } });
+  expect(await actAs(alice, "eng/build")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(build.id) } });
 
   const sidecar = srv.appSession(alice, "eng/deploy", { push: false });
   await sidecar.connect();
@@ -154,15 +209,17 @@ test("a team alias in use by one member's session refuses another member's write
   // leaves a hold alone (#282), so the holder unbinds; the tools-only writer's
   // ID ends, as the hosted store's end does it.
   await build.unbind("eng/build");
-  expect((await srv.upload(alice, "eng/build", "a.txt", "x")).status).toBe(409);
+  expect((await actAs(alice, "eng/build")).status).toBe(409);
   srv.app.db.query(`UPDATE ids SET ended_at = ? WHERE id = ?`).run(Date.now(), own.id);
-  expect((await srv.upload(alice, "eng/build", "a.txt", "x")).status).toBe(201);
+  expect((await actAs(alice, "eng/build")).status).toBe(200);
 });
 
 // #284 PR 4: a revocation takes only the alias it revokes. A session holding
-// two team aliases keeps the other, and the oldest hold left is its primary.
+// two team aliases keeps the other's hold and its mail. The primary switch isn't asserted here: an application
+// session's in-memory holds keep the revoked alias (#475 item 7c; only the Slack bridge is non-hosted), while a hosted
+// root reads its holds from the database (tests/integration/hosted_alias_lost.test.ts).
 // hosted twin: #451 (team aliases on a session, multi-alias holds, alias_lost)
-test("losing one of two team aliases keeps the other, which becomes the primary", async () => {
+test("losing one of two team aliases keeps the other's hold and its mail", async () => {
   expect((await srv.api(alice, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
   expect((await srv.api(alice, "POST", "/api/teams/ops/add", { email: B })).status).toBe(200);
   const s = srv.appSession(bob, "eng/build");
@@ -193,11 +250,12 @@ const peerRow = async (c: AppSession, match?: Record<string, string>) =>
 // #284 S12, S13 on the server: bind's meta labels a team alias; a re-bind of
 // a held alias changes only labels that differ; the labels reach only members.
 // hosted twin: #451 (a team alias on a session, bind's meta)
-test("bind's meta on a session: set, checked, cleared and audited; a held re-bind keeps bound_at; a non-member sees no labels", async () => {
+test("bind's meta on a session: set, checked, cleared and audited; a held re-bind keeps bound_at; a non-member sees no row", async () => {
   const build = srv.appSession(bob, "eng/build", { bind: { create: true, meta: { task: "ENG-142", source_board: "#E2E" } }, harness: "opus" });
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
   expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
-  expect(metaSets("eng/build")).toEqual([{ actor: build.id, detail: { address: "eng/build", fields: { task: "ENG-142", source_board: "e2e" }, session: build.id } }]);
+  // The actor is the signed-in user, as on every user-initiated server row (#373); the session is in the detail.
+  expect(metaSets("eng/build")).toEqual([{ actor: B, detail: { address: "eng/build", fields: { task: "ENG-142", source_board: "e2e" }, session: build.id } }]);
   const boundAt = () => rows(`SELECT bound_at FROM alias_holds WHERE address = 'eng/build'`);
   const at = boundAt();
   const bound = () => rows(`SELECT event FROM binding_events WHERE name = 'eng/build'`).length;
@@ -208,7 +266,7 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   expect(metaSets("eng/build")).toHaveLength(1);
   expect(await build.bind("eng/build", { meta: { task: "" } })).toMatchObject({ alias: "eng/build" });
   expect(labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
-  expect(metaSets("eng/build").at(-1)!.detail).toEqual({ address: "eng/build", fields: { task: null }, session: build.id });
+  expect(metaSets("eng/build").at(-1)).toEqual({ actor: B, detail: { address: "eng/build", fields: { task: null }, session: build.id } });
   expect(boundAt()).toEqual(at);
   expect(bound()).toBe(events);
 
@@ -225,15 +283,13 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   await expect(outsider.bind("eng/build", { meta: { task: "mine" } })).rejects.toMatchObject({ code: "forbidden" });
   expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
 
-  // The labels reach a member; a non-member's row has only the session's facts, and match can't probe them.
+  // The labels and the session's facts reach a member (F-12); a non-member
+  // isn't listed the team's alias at all (#348), so match can't probe them.
   const member = srv.appSession(alice, "fe");
   await member.connect();
   expect(await peerRow(member)).toMatchObject({ task: "ENG-142", source_board: "e2e", harness: "opus" });
   expect(await peerRow(member, { task: "eng-142" })).toBeDefined();
-  const seen = (await peerRow(outsider))!;
-  expect(seen).toMatchObject({ handle: "eng/build", harness: "opus" });
-  expect(seen.task).toBeUndefined();
-  expect(seen.source_board).toBeUndefined();
+  expect(await peerRow(outsider)).toBeUndefined();
   expect(await peerRow(outsider, { task: "ENG-142" })).toBeUndefined();
 });
 
@@ -252,4 +308,16 @@ test("peer_list's match: harness, task, id and scope; an unknown key is refused"
   expect(await handles({ scope: "eng" })).toEqual(["eng/build"]);
   expect(await handles({ scope: "alice@example.com" })).toEqual(["alice@example.com/fe"]);
   await expect(member.call("peer_list", { match: { colour: "red" } })).rejects.toMatchObject({ message: expect.stringContaining(`match has no key "colour"`) });
+});
+
+// #356: the bind-target checks a team's scope shares with a person's, end to end.
+test("a bind of human in a team's scope is refused as reserved, and creates nothing", async () => {
+  await expect(srv.appSession(bob, "eng/human").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining(`"human" is reserved`) });
+  expect(rows(`SELECT address FROM aliases WHERE address = 'eng/human'`)).toEqual([]);
+});
+
+test("a bind in a service principal's scope is refused until #270, and creates nothing", async () => {
+  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining("service principals arrive with #270") });
+  expect(rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
 });

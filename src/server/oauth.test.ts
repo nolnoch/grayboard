@@ -38,7 +38,7 @@ function makeService(cimd?: import("./oauth-cimd.ts").CimdOptions) {
       expect(input.verifier).toMatch(/^[\w-]{43}$/);
       expect(input.redirectUri).toBe(base + "/oauth/google/callback");
       if (input.code !== "fake-google-code") throw new Error("fake rejection");
-      return { email: "you@example.com", displayName: "You" };
+      return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
     } });
 }
 beforeEach(() => {
@@ -429,7 +429,7 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   expect((await fetch(authorization("https://client.example/client.json").url)).status).toBe(503);
   expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.cimd_failed'").get()).toEqual({ action: "oauth.cimd_failed" });
   service.close();
-  service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "other@elsewhere.example", displayName: null }) });
+  service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "other@elsewhere.example", displayName: null, subject: "google-other@elsewhere.example" }) });
   const browser = new Browser();
   const first = await browser.request(authorization().url);
   const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
@@ -445,6 +445,25 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
     expect(trail).toContain("oauth.request_failed");
     expect(trail).not.toContain("PRIVATE"); expect(trail).not.toContain("refresh-token.ts");
   } finally { storage.repo.oauth.createRequest = create; log.mockRestore(); }
+});
+
+// Security audit F-13: an email Google hands to a new account doesn't bring the old account's user with it.
+test("a Google account presenting a linked user's email is refused at the callback and audited", async () => {
+  const signIn = async (subject: string) => {
+    service.close();
+    service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "you@example.com", displayName: "You", subject }) });
+    const browser = new Browser();
+    const first = await browser.request(authorization().url);
+    const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
+    return (await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "code" }))).status;
+  };
+  expect(await signIn("google-first")).toBe(303);
+  expect(await signIn("google-second")).toBe(403);
+  expect(storage.db.query("SELECT action, actor, detail FROM access_log WHERE action LIKE 'auth.subject_%'").all()).toEqual([
+    { action: "auth.subject_refused", actor: "you@example.com", detail: JSON.stringify({ reason: "subject_mismatch", client_id: "native" }) },
+  ]);
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
+  expect(storage.repo.users.findByEmail("you@example.com")!.idp_subject).toBe("google-first");
 });
 
 test("direct config dev auth rejects either Google secret, including an override with an empty primary", () => {
@@ -468,7 +487,8 @@ test("default Google exchange consistently selects the Web override or primary f
         fixtureCalls++;
         expect(input.redirectUri).toBe(cfg.publicUrl + "/oauth/google/callback");
         expect(input.nonce).toBe(nonce);
-        return { email: "you@example.com", displayName: "You" };
+        // The real path's ID token below carries sub "fixture-user"; the modes share one database.
+        return { email: "you@example.com", displayName: "You", subject: "fixture-user" };
       } } : {});
       globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
         const req = new Request(input, init);
@@ -954,7 +974,7 @@ test("official SDK binds one canonical default-port resource while preserving ex
   const publicUrl = "https://grayboard.example.com:443/hosted";
   service.close();
   service = createOAuthServer(storage.repo, { ...config, publicUrl, devAuth: false }, { now: () => clock, exchangeGoogle: async input => {
-    expect(input.redirectUri).toBe(publicUrl + "/oauth/google/callback"); return { email: "you@example.com", displayName: "You" };
+    expect(input.redirectUri).toBe(publicUrl + "/oauth/google/callback"); return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
   } });
   expect(service.resource).toBe("https://grayboard.example.com/hosted/mcp"); expect(service.issuer).toBe(publicUrl);
   const mapURL = (url: string) => { const u = new URL(url); expect(u.origin).toBe("https://grayboard.example.com"); return base + u.pathname + u.search; };
@@ -1005,4 +1025,53 @@ for (const version of ["2026-07-28", "2025-11-25"]) test(`${version} official SD
   expect((await client.listTools()).tools.map(t => t.name)).toEqual(["whoami"]);
   expect((await client.callTool({ name: "whoami", arguments: {} })).content).toEqual([{ type: "text", text: "you@example.com" }]);
   expect((await post("/oauth/revoke", { client_id: "native", token: provider.saved!.refresh_token! })).status).toBe(200);
+});
+
+test("#853: a cached authorization ends with the write that ends it, from this connection or another, and a rolled-back write leaves it standing", async () => {
+  const { Database } = await import("bun:sqlite");
+  const mint = (email: string) => {
+    const { token } = issueOAuth(storage.repo, service.resource, email, ["grayboard:tools"], clock, "native");
+    const p = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+    if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
+    return Object.assign(p, { bearer: new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }) });
+  };
+  const refused = (r: Request) => { const a = service.authenticate(r.clone()); return a instanceof Response && a.status === 401; };
+  // The cache sits under repo.oauth.findActiveAccess, so count the join's SQL rather than the method.
+  const query = spyOn(Database.prototype, "query");
+  try {
+    const joins = () => query.mock.calls.filter(([sql]) => String(sql).includes("FROM oauth_tokens t")).length;
+    const p = mint("cached@example.com");
+    query.mockClear();
+    for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
+    expect(joins()).toBe(0); // warm: no token join while nothing has changed
+    // A write inside a transaction that rolls back: false within it, true again after.
+    expect(() => storage.repo.atomic(() => {
+      storage.repo.sessions.revokeAllForUser(p.authed.user_id);
+      expect(service.isAuthorized(p)).toBe(false);
+      throw new Error("roll back");
+    })).toThrow("roll back");
+    expect(service.isAuthorized(p)).toBe(true);
+    expect(joins()).toBeGreaterThan(0); // the read inside the transaction bypassed the cache, so the spy sees the join
+    // Each committed way the access ends, against a warm entry.
+    const ends: [string, (p: OAuthPrincipal) => void][] = [
+      ["revokeAllForUser", p => storage.repo.sessions.revokeAllForUser(p.authed.user_id)],
+      ["disable", p => storage.repo.users.setDisabled(p.authed.user_id, true)],
+      ["another connection's grant revoke", p => { const other = new Database(config.dbPath); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
+      ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
+    ];
+    for (const [i, [what, end]] of ends.entries()) {
+      const q = mint(`end${i}@example.com`);
+      expect(service.isAuthorized(q)).toBe(true);
+      end(q);
+      expect(service.isAuthorized(q), what).toBe(false);
+      expect(refused(q.bearer), what).toBe(true); // the bearer's own warm entry, not just the principal check
+    }
+    // Expiry needs no write: the entry's own deadline ends it.
+    const e = mint("expiry@example.com");
+    expect(service.isAuthorized(e)).toBe(true);
+    expect(refused(e.bearer)).toBe(false);
+    clock = e.accessExpiry;
+    expect(service.isAuthorized(e)).toBe(false);
+    expect(refused(e.bearer)).toBe(true); // isAuthorized checks the principal's expiry first; authenticate reaches the entry's
+  } finally { query.mockRestore(); }
 });

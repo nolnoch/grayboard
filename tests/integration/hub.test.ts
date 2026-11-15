@@ -51,13 +51,7 @@ afterEach(async () => {
 
 const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
-const upload = (token: string, identity: string, filename: string, data: Uint8Array | string) => srv.upload(token, identity, filename, data);
 
-async function connect(token: string, identity: string | null, opts?: AppSessionOptions): Promise<AppSession> {
-  const s = srv.appSession(token, identity, opts);
-  await s.connect();
-  return s;
-}
 
 const closed = (e: AppEvent): e is Extract<AppEvent, { kind: "closed" }> => e.kind === "closed";
 const postOf = (item: Pending) => {
@@ -67,28 +61,26 @@ const postOf = (item: Pending) => {
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
 
-const download = (token: string, identity: string, id: number) =>
-  fetch(`${srv.base}/api/attachments/${id}?as=${identity}`, { headers: { Authorization: `Bearer ${token}` } });
 
 // hosted twin: #451 (a reconnect on the session's key)
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {
   const alice = await login(A);
   await api(alice, "POST", "/api/teams", { name: "eng" });
   const a = await srv.hosted(A, "be");
-  const s = await connect(alice, "sim");
+  const s = await srv.connected(alice, "sim");
 
   await a.call("board_post", { board: "eng", body: "@sim ping" });
   const first = await s.next(board());
   s.close();
 
   // A reconnect is the same session: its key.
-  const s2 = await connect(alice, "sim", { key: s.key });
+  const s2 = await srv.connected(alice, "sim", { key: s.key });
   const again = await s2.next(board());
   expect(postOf(again.item).id).toBe(postOf(first.item).id);
   await s2.boardAck([{ kind: "push", post_id: postOf(again.item).id }]);
   s2.close();
 
-  const s3 = await connect(alice, "sim", { key: s.key });
+  const s3 = await srv.connected(alice, "sim", { key: s.key });
   await s3.none(board());
 });
 
@@ -98,23 +90,24 @@ test("unacked board pushes are resent after reconnect; acked ones aren't", async
 // hosted twin: #451 (a resume on the session's key)
 test("peer_list shows where the session runs; a reconnect on its key keeps the status, a new session clears it", async () => {
   const alice = await login(A);
-  const watcher = await srv.hosted(B, "fe");
+  // The watcher is alice's own: another user's peer_list shows neither (F-12).
+  const watcher = await srv.hosted(A, "fe");
   const be = async () => (await watcher.call<WhoResult>("peer_list", { include_offline: true })).peers.find((p) => p.handle === `${A}/be`)!;
 
   const key = "c1".repeat(32);
-  const first = await connect(alice, "be", { key });
+  const first = await srv.connected(alice, "be", { key });
   srv.app.application.hostedPlace(first.id, "api worktree stream \n on stream");
   await first.call("peer_status", { text: "soaking" });
   expect(await be()).toMatchObject({ where: "api worktree stream on stream", status: "soaking" });
 
   first.close();
-  const resumed = await connect(alice, "be", { key });
+  const resumed = await srv.connected(alice, "be", { key });
   srv.app.application.hostedPlace(resumed.id, "api worktree stream on main");
   expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
 
   await resumed.unbind("be");
   resumed.close();
-  await connect(alice, "be");
+  await srv.connected(alice, "be");
   const fresh = await be();
   expect(fresh.where).toBeUndefined();
   expect(fresh.status).toBeUndefined();
@@ -127,7 +120,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   await api(alice, "POST", "/api/teams", { name: "eng" });
   await api(alice, "POST", "/api/teams/eng/add", { email: C });
   const a = await srv.hosted(A, "be");
-  const c = await connect(carol, "sim");
+  const c = await srv.connected(carol, "sim");
 
   await expect(a.call("dm_send", { to: "team:eng", body: "standup in 5" })).rejects.toMatchObject({
     message: "team:eng isn't a person; to reach a team, board_post to its board #eng",
@@ -136,7 +129,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
   await a.call("board_post", { board: "eng", body: "standup in 5" });
   await c.none(board());
   c.close();
-  const c2 = await connect(carol, "sim", { key: c.key });
+  const c2 = await srv.connected(carol, "sim", { key: c.key });
   const digest = await c2.next(board());
   expect(digest.item).toMatchObject({ kind: "digest", board: "eng", unread: 1 });
 
@@ -158,7 +151,7 @@ test("team boards: digests coalesce until read; team: is not a DM recipient", as
 test("revoking or disabling a user closes their open connections; a disable the routes missed is caught", async () => {
   await restart({ admins: ["root@example.com"] });
   const [root, alice] = await Promise.all([login("root@example.com"), login(A)]);
-  const a = await connect(alice, "be");
+  const a = await srv.connected(alice, "be");
 
   // A closed session keeps its holds, so each round binds names of its own.
   let round = 0;
@@ -177,7 +170,7 @@ test("revoking or disabling a user closes their open connections; a disable the 
 
   // Disabled behind the server's back (no admin route): the next tick closes it.
   await api(root, "POST", "/api/admin/enable-user", { email: B });
-  const late = await connect(await login(B), "be3");
+  const late = await srv.connected(await login(B), "be3");
   srv.app.repo.users.setDisabled(srv.app.repo.users.findByEmail(B)!.id, true);
   srv.app.revalidate();
   await late.next(closed);
@@ -186,7 +179,7 @@ test("revoking or disabling a user closes their open connections; a disable the 
 
 test("an alias a live session holds refuses another session's bind", async () => {
   const alice = await login(A);
-  const first = await connect(alice, "be");
+  const first = await srv.connected(alice, "be");
   const second = srv.appSession(alice, "be");
   await expect(second.connect()).rejects.toMatchObject({ code: "alias_held", extra: { holder: `the session ${first.id}` } });
   // The first connection still works.
@@ -204,7 +197,7 @@ test("an alias a live session holds refuses another session's bind", async () =>
 test("a bind's notices carry active claims and DMs undelivered after a day", async () => {
   const alice = await login(A);
   const bob = await login(B);
-  const b = await connect(bob, "fe");
+  const b = await srv.connected(bob, "fe");
   b.close();
   const a = srv.appSession(alice, "be");
   expect((await a.connect()).bind!.notices).toBeUndefined();
@@ -229,8 +222,8 @@ test("an identity a session holds or writes as can't be deleted until those sess
   const dbPath = fileDb();
   await restart({ dbPath: dbPath });
   let alice = await login(A);
-  const a = await connect(alice, "be");
-  const sidecar = await connect(alice, "be", { push: false });
+  const a = await srv.connected(alice, "be");
+  const sidecar = await srv.connected(alice, "be", { push: false });
   expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining("is in use by the session") } });
   await a.unbind("be");
   expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(sidecar.id) } });
@@ -242,8 +235,8 @@ test("an identity a session holds or writes as can't be deleted until those sess
 // hosted twin: #451 (tools-only writes_as)
 test("a tools-only connection works beside the live owner without taking its pushes", async () => {
   const alice = await login(A);
-  const owner = await connect(alice, "be");
-  const tools = await connect(alice, "be", { push: false });
+  const owner = await srv.connected(alice, "be");
+  const tools = await srv.connected(alice, "be", { push: false });
   const b = await srv.hosted(B, "fe");
 
   const sent = await b.call<SendResult>("dm_send", { to: `${A}/be`, body: "hi" });
@@ -259,32 +252,32 @@ test("a tools-only connection works beside the live owner without taking its pus
 });
 
 // Audits W1, W4 (#345): after a bind, the session still reads as its ID:
-// it replies in a thread it received as the ID, and downloads a file DM'd to
-// the ID with ?as= its alias. Another user's session's ID never joins the
-// set: bob acting as his own alias can't read alice's ID's file. A session
-// the server ended (here by a restart, the only thing that ends one now) is
-// not acted as, even by its own user (S11). An unbound session no longer acts
-// as its ID at all (#229), so the session is bound from the start.
+// it replies in a thread it received as the ID. Another user's session's ID
+// never joins the set: bob acting as his own alias can't read the file DM'd
+// to alice's ID. A session the server ended (here by a restart, the only
+// thing that ends one now) is not acted as over HTTP, even by its own user
+// (S11): `/api/claims/call` takes the check the `?as=` attachment routes
+// took before they went (#475). An unbound session no longer acts as its ID
+// at all (#229), so the session is bound from the start.
 // hosted twin: #451 (a hosted session that reads as its ID)
-test("a bound session replies to a thread and reads a file it received as its ID; once ended, nothing acts as it", async () => {
+test("a bound session replies to a thread it received as its ID; once ended, nothing acts as it", async () => {
   const dbPath = fileDb();
   await restart({ dbPath: dbPath });
   let alice = await login(A);
-  const bob = await login(B);
-  const a = await connect(alice, "be");
+  const a = await srv.connected(alice, "be");
   const b = await srv.hosted(B, "fe");
-  const up = await upload(bob, "fe", "shot.png", PNG);
-  const sent = await b.call<SendResult>("dm_send", { to: a.id, body: "for your ID", attachment_ids: [up.body.id] });
+  const up = await b.upload("shot.png", PNG);
+  const sent = await b.call<SendResult>("dm_send", { to: a.id, body: "for your ID", attachment_ids: [up] });
 
   await a.send(`${B}/fe`, "got it", { parent_id: sent.message_id });
-  expect((await download(alice, `${A}/be`, up.body.id)).status).toBe(200);
-  expect((await download(alice, a.id, up.body.id)).status).toBe(200);
-  await srv.hosted(B, "ops");
-  expect((await download(bob, `${B}/ops`, up.body.id)).status).toBe(404);
+  const ops = await srv.hosted(B, "ops");
+  expect((await ops.attachmentRaw("GET", `/${up}`)).status).toBe(404);
+  const take = { tool: "claim_take", args: { key: "ticket:ENG-142" } };
+  expect((await api(alice, "POST", "/api/claims/call", { as: a.id, ...take })).status).toBe(200);
 
   // The restart ends the session the WSS transport can no longer reattach.
   await restart({ dbPath: dbPath });
   alice = await login(A);
-  const gone = await download(alice, a.id, up.body.id);
-  expect({ status: gone.status, body: await gone.json() }).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });
+  const gone = await api(alice, "POST", "/api/claims/call", { as: a.id, ...take });
+  expect(gone).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });
 });

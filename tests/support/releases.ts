@@ -9,6 +9,7 @@ import { join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import { newer, REPO, TARGET } from "../../src/cli/update.ts";
 import { ROOT } from "./paths.ts";
+import { sha256Hex } from "../../src/shared/hash.ts";
 
 export const CACHE = join(ROOT, ".e2e-cache");
 
@@ -38,7 +39,7 @@ function listAll(): Promise<Release[]> {
     if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
     const all: Release[] = [];
     for (let url: string | undefined = `https://api.github.com/repos/${REPO}/releases?per_page=100`; url; ) {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
+      const r: Response = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
       if (!r.ok) throw new Error(`listing ${REPO} releases (${url}): HTTP ${r.status} ${await r.text()}`);
       all.push(...((await r.json()) as Release[]));
       url = /<([^>]+)>;\s*rel="next"/.exec(r.headers.get("link") ?? "")?.[1];
@@ -83,7 +84,7 @@ export async function previousRelease(): Promise<string> {
 export type ReleaseBinaries = { tag: string; cli: string; server: string };
 
 const sha256 = async (path: string): Promise<string> =>
-  `sha256:${new Bun.CryptoHasher("sha256").update(await Bun.file(path).arrayBuffer()).digest("hex")}`;
+  `sha256:${sha256Hex(await Bun.file(path).bytes())}`;
 
 // The release's CLI and server for this platform, from the cache or downloaded.
 export async function releaseBinaries(tag: string): Promise<ReleaseBinaries> {

@@ -1,4 +1,4 @@
-// The factory module's isolation (#293, #323; principle 7, docs/boards.md §1):
+// The factory module's isolation (#293, #323; principle 7, docs/vision.md):
 // nothing under src/ imports adapters/factory/, and the module imports nothing
 // in the repo beyond itself and the published hosted client (its tests may
 // also use tests/support/). tests/integration/factory_isolation.test.ts
