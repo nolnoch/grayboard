@@ -1033,41 +1033,45 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     const { token } = issueOAuth(storage.repo, service.resource, email, ["grayboard:tools"], clock, "native");
     const p = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
-    return p;
+    return Object.assign(p, { bearer: new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }) });
   };
+  const refused = (r: Request) => { const a = service.authenticate(r.clone()); return a instanceof Response && a.status === 401; };
   // The cache sits under repo.oauth.findActiveAccess, so count the join's SQL rather than the method.
   const query = spyOn(Database.prototype, "query");
-  const joins = () => query.mock.calls.filter(([sql]) => String(sql).includes("FROM oauth_tokens t")).length;
-  const p = mint("cached@example.com");
-  query.mockClear();
-  for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
-  expect(joins()).toBe(0); // warm: no token join while nothing has changed
-  // A write inside a transaction that rolls back: false within it, true again after.
-  expect(() => storage.repo.atomic(() => {
-    storage.repo.sessions.revokeAllForUser(p.authed.user_id);
-    expect(service.isAuthorized(p)).toBe(false);
-    throw new Error("roll back");
-  })).toThrow("roll back");
-  expect(service.isAuthorized(p)).toBe(true);
-  expect(joins()).toBeGreaterThan(0); // the rolled-back write moved the generation, so the spy sees the join
-  // Each committed way the access ends, against a warm entry.
-  const ends: [string, (p: OAuthPrincipal) => void][] = [
-    ["revokeAllForUser", p => storage.repo.sessions.revokeAllForUser(p.authed.user_id)],
-    ["disable", p => storage.repo.users.setDisabled(p.authed.user_id, true)],
-    ["another connection's grant revoke", p => { const other = new Database(config.dbPath); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
-    ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
-  ];
-  for (const [i, [what, end]] of ends.entries()) {
-    const q = mint(`end${i}@example.com`);
-    expect(service.isAuthorized(q)).toBe(true);
-    end(q);
-    expect(service.isAuthorized(q), what).toBe(false);
-    expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: "Bearer x".padEnd(50, "x") } })) instanceof Response).toBe(true);
-  }
-  // Expiry needs no write: the entry's own deadline ends it.
-  const e = mint("expiry@example.com");
-  expect(service.isAuthorized(e)).toBe(true);
-  clock = e.accessExpiry;
-  expect(service.isAuthorized(e)).toBe(false);
-  query.mockRestore();
+  try {
+    const joins = () => query.mock.calls.filter(([sql]) => String(sql).includes("FROM oauth_tokens t")).length;
+    const p = mint("cached@example.com");
+    query.mockClear();
+    for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
+    expect(joins()).toBe(0); // warm: no token join while nothing has changed
+    // A write inside a transaction that rolls back: false within it, true again after.
+    expect(() => storage.repo.atomic(() => {
+      storage.repo.sessions.revokeAllForUser(p.authed.user_id);
+      expect(service.isAuthorized(p)).toBe(false);
+      throw new Error("roll back");
+    })).toThrow("roll back");
+    expect(service.isAuthorized(p)).toBe(true);
+    expect(joins()).toBeGreaterThan(0); // the read inside the transaction bypassed the cache, so the spy sees the join
+    // Each committed way the access ends, against a warm entry.
+    const ends: [string, (p: OAuthPrincipal) => void][] = [
+      ["revokeAllForUser", p => storage.repo.sessions.revokeAllForUser(p.authed.user_id)],
+      ["disable", p => storage.repo.users.setDisabled(p.authed.user_id, true)],
+      ["another connection's grant revoke", p => { const other = new Database(config.dbPath); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
+      ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
+    ];
+    for (const [i, [what, end]] of ends.entries()) {
+      const q = mint(`end${i}@example.com`);
+      expect(service.isAuthorized(q)).toBe(true);
+      end(q);
+      expect(service.isAuthorized(q), what).toBe(false);
+      expect(refused(q.bearer), what).toBe(true); // the bearer's own warm entry, not just the principal check
+    }
+    // Expiry needs no write: the entry's own deadline ends it.
+    const e = mint("expiry@example.com");
+    expect(service.isAuthorized(e)).toBe(true);
+    expect(refused(e.bearer)).toBe(false);
+    clock = e.accessExpiry;
+    expect(service.isAuthorized(e)).toBe(false);
+    expect(refused(e.bearer)).toBe(true); // isAuthorized checks the principal's expiry first; authenticate reaches the entry's
+  } finally { query.mockRestore(); }
 });

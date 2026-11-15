@@ -92,10 +92,6 @@ export interface Repo {
   now(): number;
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
-  // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this
-  // connection or another; undefined inside a transaction, whose writes may yet roll back. A cache of
-  // what those tables say is valid while this is unchanged (#853).
-  authGeneration(): string | undefined;
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
@@ -333,7 +329,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
 
 // #853: a connection-local counter every write to the authorization tables bumps, by trigger, so no
 // write site can forget to. TEMP objects live and die with this connection, outside the schema, and
-// roll back with their transaction: Repo.authGeneration reads the counter only outside one.
+// roll back with their transaction: authGeneration (makeRepo) reads the counter only outside one.
 function authGenerationTriggers(db: Database): void {
   db.exec(`CREATE TEMP TABLE IF NOT EXISTS auth_generation(n INTEGER NOT NULL);
     INSERT INTO auth_generation(n) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM auth_generation)`);
@@ -720,9 +716,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // on every cached auth read.
   const counter = db.query<{ n: number }, []>("SELECT n FROM temp.auth_generation");
   const dataVersion = db.query<{ data_version: number }, []>("PRAGMA data_version");
+  // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this connection or
+  // another; undefined inside a transaction, whose writes may yet roll back (#853).
   const authGeneration = () => db.inTransaction ? undefined : `${counter.get()!.n}:${dataVersion.get()!.data_version}`;
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
-  // Positives-only caches of what the auth tables say, cleared when authGeneration moves (#853). They sit
+  // Caches of what the auth tables say, cleared when authGeneration moves: a live access token only (an
+  // unknown or dead one is re-read every time); a user row, or its absence, as read (#853). They sit
   // here, under the store's own methods, so a test that replaces one of those methods replaces the cache too.
   let userGeneration: string | undefined;
   const users = new Map<number, User | null>();
@@ -757,7 +756,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
-    authGeneration,
 
     oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
     hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
