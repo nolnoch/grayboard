@@ -11,7 +11,8 @@ const digest = (path: string) => new Bun.CryptoHasher("sha256").update(readFileS
 const files = (directory: string): string[] => {
   const listed = Bun.spawnSync(["git", "ls-files", "-z", "--", relative(checkout, directory)], { cwd: checkout, env: repositoryGitEnv() });
   assert.equal(listed.exitCode, 0, `Cannot enumerate tracked files under ${relative(checkout, directory)}`);
-  return listed.stdout.toString().split("\0").filter(Boolean).map(path => join(checkout, path));
+  // A tracked file deleted from the working tree but not staged (an unstaged rm or mv) has no bytes to digest.
+  return listed.stdout.toString().split("\0").filter(Boolean).map(path => join(checkout, path)).filter(path => existsSync(path));
 };
 const packageRoot = join(checkout, "adapters/opencode-v2");
 const installedFile = join(scratch, "installed.txt");
