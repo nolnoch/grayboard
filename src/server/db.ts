@@ -9,6 +9,7 @@ import { dropHold, logBinding } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
+import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
@@ -125,6 +126,8 @@ export interface Repo {
     create(scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
     find(address: string): Alias | undefined;
     listForScope(kind: ScopeKind, ref: string): Alias[];
+    // The scope's names less the Slack link's human, for the cap (#347).
+    countForScope(kind: ScopeKind, ref: string): number;
     // Every scope's alias of this name.
     findAllByName(name: string): Alias[];
     // Also deletes the alias's read points.
@@ -834,6 +837,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return db.query<Alias, [string, string]>(
           `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
         ).all(ref, kind);
+      },
+      countForScope(kind, ref) {
+        return db.query<{ n: number }, [string, string, string]>(
+          `SELECT COUNT(*) AS n FROM aliases WHERE scope_ref = ? AND scope_kind = ? AND name != ?`,
+        ).get(ref, kind, HUMAN_NAME)!.n;
       },
       findAllByName(name) {
         return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);

@@ -7,6 +7,7 @@ import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
+import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
@@ -47,6 +48,8 @@ export type Config = {
   // GRAYBOARD_DELEGATE_OPEN_CAP; defaults in src/core/delegation.ts.
   delegateLimit?: RateLimit;
   delegateOpenCap?: number;
+  // Names per scope (#347): GRAYBOARD_ALIAS_SCOPE_CAP; default in src/server/alias_cap.ts.
+  aliasScopeCap?: number;
   // Authentication failures per client address (#240), and the proxies
   // whose X-Forwarded-For is believed (CIDRs; default loopback).
   authFailLimit: RateLimit;
@@ -109,6 +112,7 @@ export function loadConfig(): Config {
     oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),
     delegateLimit: parseRateLimit(process.env, "GRAYBOARD_DELEGATE", DELEGATE_LIMIT, "requests"),
     delegateOpenCap: positiveInt(process.env, "GRAYBOARD_DELEGATE_OPEN_CAP", DELEGATE_OPEN_CAP, MAX_BURST, "requests"),
+    aliasScopeCap: positiveInt(process.env, "GRAYBOARD_ALIAS_SCOPE_CAP", ALIAS_SCOPE_CAP, CAP_CEILING, "names"),
     mcpLimits: parseMcpLimits(process.env),
     hostedCaps: parseHostedCaps(process.env),
     ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
