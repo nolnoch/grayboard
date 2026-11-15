@@ -703,12 +703,18 @@ export class Controller<E extends Enrollment = Enrollment> {
           if (!this.restorable(r, epoch)) return true;
           try {
             if (!this.watches.has(r.e.sessionID)) await this.watch(r.e);
-            await this.rotated({ ms: 0 }, () => this.prepare(r, true, true));
+            await this.prepare(r, true, true);
             return true;
           } catch (caught) {
             const error = this.expired(caught);
             if (!this.restorable(r, epoch)) return true;
             if (error instanceof ServerUnreachable) { this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error)); return false; }
+            // As in the run loop's outage: a token that expired while the server
+            // (its issuer) was down couldn't be refreshed; wait for the host's.
+            if (error instanceof AccessExpired && error.reason === "expired") {
+              this.set(r, "retrying", `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "restore", failureCode(error));
+              return false;
+            }
             r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
             return true;
           }

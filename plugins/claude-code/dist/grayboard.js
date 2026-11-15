@@ -37282,7 +37282,7 @@ class Controller {
           try {
             if (!this.watches.has(r.e.sessionID))
               await this.watch(r.e);
-            await this.rotated({ ms: 0 }, () => this.prepare(r, true, true));
+            await this.prepare(r, true, true);
             return true;
           } catch (caught) {
             const error = this.expired(caught);
@@ -37290,6 +37290,10 @@ class Controller {
               return true;
             if (error instanceof ServerUnreachable) {
               this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+              return false;
+            }
+            if (error instanceof AccessExpired && error.reason === "expired") {
+              this.set(r, "retrying", `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "restore", failureCode(error));
               return false;
             }
             r.paused = true;

@@ -643,7 +643,7 @@ test.each([false, true])("a native access expiry pause doesn't survive a restart
   } finally { await restarted?.close(); await r.controller.close(); }
 });
 // The host restarts while the server is down (a release's upgrade): the first `refused` connects are refused.
-async function restoredDuringOutage(refused: number, waited?: (restarted: Controller) => Promise<void>) {
+async function restoredDuringOutage(refused: number, waited?: (restarted: Controller, r: ReturnType<typeof runtime>) => Promise<void>) {
   const r = runtime({}, async () => {});
   r.bind("B", "be");
   await r.controller.enroll("B");
@@ -654,7 +654,7 @@ async function restoredDuringOutage(refused: number, waited?: (restarted: Contro
   const restarted: Controller = r.restart(async ms => {
     waits.push(ms);
     states.push(restarted.status().roots.find(root => root.sessionID === "B")!.state);
-    await waited?.(restarted);
+    await waited?.(restarted, r);
   });
   const start = r.calls.length;
   await restarted.restore();
@@ -670,6 +670,20 @@ test("a restore during a server outage retries on the outage backoff, never paus
     expect(o.states).toEqual(Array(4).fill("retrying"));
     expect(o.calls().filter(c => c.name === "delivery_open").map(c => c.sessionID)).toEqual(["B"]);
     expect(o.calls().some(c => c.name === "bind")).toBe(false);
+  } finally { await o.restarted.close(); await o.r.controller.close(); }
+});
+test("a token that expires during a restore's outage retry waits for the host's refresh, never pausing (#424 6)", async () => {
+  let seen: unknown, waited = 0;
+  const o = await restoredDuringOutage(1, async (restarted, r) => {
+    if (++waited === 1) r.f.expire();
+    else { seen = restarted.status().roots.find(root => root.sessionID === "B"); r.f.rotate("fake-access-two"); }
+  });
+  try {
+    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    expect(seen).toMatchObject({ state: "retrying", operation: "restore", code: "native_access_expired" });
+    expect(o.waits).toEqual([500, 1000]);
+    expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "active", ownership: 1 });
+    expect(o.calls().filter(c => c.name === "delivery_open").map(c => c.sessionID)).toEqual(["B"]);
   } finally { await o.restarted.close(); await o.r.controller.close(); }
 });
 test("a shutdown during a restore's outage retry ends it: nothing opens once the server is back (#424 6)", async () => {
