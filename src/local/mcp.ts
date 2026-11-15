@@ -834,7 +834,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   // checks again in the write's own transaction (#557). The next call then
   // finds the root gone and runs as its own session.
   const rootLive = liveParent === null || child === undefined ? undefined : ((root: string, c: string) => () => {
-    if (!runnerRootLive(db, c, root)) throw new CoreError(`child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`);
+    if (!runnerRootLive(db, c, root)) throw new CoreError(`child_session: this session's root ${root} ended during the call, so nothing was written; call again, as this process's own session`, "child_session");
   })(liveParent, child);
 
   // With no name, the session acts as its ID (#284 S13).
@@ -1330,7 +1330,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     if (!r.ok) {
       if (r.known) return { ...fail(r.error, "identity_unknown"), structuredContent: { code: "identity_unknown", known: r.known } };
       if (r.holder) return { ...fail(r.error, "alias_held"), structuredContent: { code: "alias_held", holder: r.holder } };
-      return fail(r.error);
+      return fail(r.error, r.forbidden ? "forbidden" : "bad_request");
     }
     if (promote) becomeRoot(promote.key, `bound "${n.name}", promoted`);
     // The row holds the new name from here: so does this process, whatever

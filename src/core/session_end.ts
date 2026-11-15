@@ -183,9 +183,9 @@ export class Undeliverable extends CoreError {
   }
 }
 
-/** A refused core call's wire code, both modes: an ID that can't receive names its own (#284 S18); any other CoreError is a bad request. */
+/** A refused core call's wire code, both modes: an ID that can't receive names its own (#284 S18), as does a CoreError built with one; any other is a bad request. */
 export function coreRefusalCode(e: CoreError): ErrorCode {
-  return e instanceof Undeliverable ? e.code : "bad_request";
+  return e instanceof Undeliverable ? e.code : e.refusalCode ?? "bad_request";
 }
 
 /** Why `id` can't receive a send or mention (assertDeliverableId's refusal), or null when it can. */
