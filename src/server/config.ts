@@ -2,6 +2,7 @@ import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 
 import type { HumanReach } from "./policy.ts";
+import { DEFAULT_LAG_GATE, LAG_HISTORY, type LagGate } from "./metrics.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
@@ -44,6 +45,8 @@ export type Config = {
   // Hellos per user: the burst, and the refill per second (#210).
   helloLimit: RateLimit;
   hostedRequestLimit?: RateLimit;
+  // /healthz fails on sustained event-loop lag (#805): p99Ms 0 is off.
+  healthzLag?: LagGate;
   // delegate's limits (#252): GRAYBOARD_DELEGATE_BURST/_PER_SEC (per user) and
   // GRAYBOARD_DELEGATE_OPEN_CAP; defaults in src/core/delegation.ts.
   delegateLimit?: RateLimit;
@@ -117,6 +120,10 @@ export function loadConfig(): Config {
     hostedCaps: parseHostedCaps(process.env),
     ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
+    healthzLag: {
+      p99Ms: process.env.GRAYBOARD_HEALTHZ_LAG_P99_MS === "0" ? 0 : positiveInt(process.env, "GRAYBOARD_HEALTHZ_LAG_P99_MS", DEFAULT_LAG_GATE.p99Ms, 600_000, "milliseconds"),
+      windows: positiveInt(process.env, "GRAYBOARD_HEALTHZ_LAG_WINDOWS", DEFAULT_LAG_GATE.windows, LAG_HISTORY, "windows"),
+    },
     ...(process.env.GRAYBOARD_METRICS_ADDR ? { metricsAddr: parseMetricsAddr(process.env.GRAYBOARD_METRICS_ADDR) } : {}),
     ...slackConfig(),
   };

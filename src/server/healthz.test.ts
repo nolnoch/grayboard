@@ -53,3 +53,28 @@ test("each repo has its own cache", () => {
     } finally { failing.mockRestore(); log.mockRestore(); }
   } finally { other.db.close(); }
 });
+
+// The lag gate (#805) is pure over the finished windows: fed them directly, no timers.
+test("healthz fails only on sustained event-loop lag, keeps the version, and recovers", async () => {
+  const gate = { p99Ms: 1000, windows: 3 };
+  const slow = { p50: 0.5, p99: 1.5, max: 2 }, fast = { p50: 0.001, p99: 0.1, max: 0.2 };
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    // Fewer finished windows than the gate needs, as after a restart: ok, whatever they hold.
+    expect(healthz(store.repo, 20_000, gate, []).status).toBe(200);
+    expect(healthz(store.repo, 20_000, gate, [slow, slow]).status).toBe(200);
+    // One fast window among the last three: ok.
+    expect(healthz(store.repo, 20_000, gate, [slow, fast, slow, slow]).status).toBe(200);
+    const failing = healthz(store.repo, 20_000, gate, [fast, slow, slow, slow]);
+    expect(failing.status).toBe(503);
+    expect(await failing.json()).toMatchObject({ ok: false, code: "lagging", version: expect.any(String), p99_s: [1.5, 1.5, 1.5] });
+    expect(healthz(store.repo, 20_000, gate, [slow, slow, slow, fast]).status).toBe(200);
+    // One journal line per change of state, not per request.
+    expect(errors.mock.calls.filter(c => String(c[0]).includes("healthz:"))).toHaveLength(2);
+    // Still lagging across many probe windows: still only the one line when it starts.
+    for (let i = 1; i <= 5; i++) expect(healthz(store.repo, 20_000 + i * HEALTH_TTL_MS, gate, [slow, slow, slow]).status).toBe(503);
+    expect(errors.mock.calls.filter(c => String(c[0]).includes("healthz:"))).toHaveLength(3);
+    // p99Ms 0 is off.
+    expect(healthz(store.repo, 20_000, { p99Ms: 0, windows: 3 }, [slow, slow, slow]).status).toBe(200);
+  } finally { errors.mockRestore(); }
+});
