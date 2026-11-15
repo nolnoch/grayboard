@@ -91,7 +91,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname.startsWith(new URL(resource).pathname + "/attachments")) byteRequests.push({ method: req.method, path: url.pathname, session: req.headers.get("X-Grayboard-Session") });
   if (subscriberOutage && req.headers.get("X-Grayboard-Client") === "subscriber") {
     const fail = async () => { throw new Error("Real backend subscriber network deliberately unavailable"); };
-    if (b?.method === "tools/call" && b.params?.name === "delivery_renew") return expiryContinuation.observe(fail);
+    if (b?.method === "tools/call" && ["delivery_renew", "delivery_receipt"].includes(b.params?.name)) return expiryContinuation.observe(fail);
     return fail();
   }
   if (b?.method === "tools/call") {

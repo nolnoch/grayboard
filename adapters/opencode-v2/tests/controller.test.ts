@@ -55,7 +55,7 @@ function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: 
         row.capability = (String(row.ownership) + String(row.generation)).padEnd(43, "a");
         return { capability: row.capability, ownership: row.ownership, bind_gen: row.generation, expiresAt: Date.now() + 30_000, identity: { user_email: "you@example.com", identity_full: row.held[0] } };
       }
-      if (name === "delivery_renew") await observation?.("delivery_renew");
+      if (name === "delivery_renew" || name === "delivery_receipt") await observation?.(name);
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
       if (name === "delivery_receipt") {
         if (holdReceipt) { holdReceipt = false; throw new Error("receipt failed"); }
@@ -183,14 +183,14 @@ test.each([false, true])("expiry failed-continuation barrier joins actual subscr
     r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { admission.release(); await releaseAdmission.promise; forwarded = true; gate.returned(); });
     r.observe(async operation => {
-      if (outage && ["delivery_renew", "connect"].includes(operation)) await gate.observe(async () => { throw error; });
+      if (outage && ["delivery_renew", "delivery_receipt", "connect"].includes(operation)) await gate.observe(async () => { throw error; });
     });
     await r.controller.enroll("R"); await bounded(admission.promise, 1000, "Actual subscriber entered held admission");
     const original = work.current("R"); void original.then(() => { retired = true; });
     gate.arm(); outage = true; releaseAdmission.release();
-    await bounded(gate.failed.promise, 1000, "Actual post-admission renewal failed and is held");
+    await bounded(gate.failed.promise, 1000, "Actual post-admission receipt failed and is held");
     expect(forwarded).toBe(true); expect(retired).toBe(false); expect(waits).toEqual([]);
-    expect(r.admissions).toHaveLength(1); expect(r.calls.filter(c => c.name === "delivery_receipt")).toEqual([]);
+    expect(r.admissions).toHaveLength(1); expect(r.batches.get("R")).toHaveLength(1); // the receipt the outage failed committed nothing
     const completion = afterProducers(() => gate.failed.promise, async () => {
       await model.promise; models.push("R"); if (forbidden) models.push("B");
     }, () => assert.deepEqual(models, ["R"]));
@@ -200,7 +200,7 @@ test.each([false, true])("expiry failed-continuation barrier joins actual subscr
     await until(() => waits.length === 5);
     expect(waits).toEqual([500, 1000, 2000, 4000, 8000]); expect(retired).toBe(false);
     expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(true);
-    expect(r.calls.filter(c => c.name === "delivery_receipt")).toEqual([]);
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(1); expect(r.batches.get("R")).toHaveLength(1);
     await r.controller.close(); await original; expect(retired).toBe(true);
   } finally { gate.release(); releaseAdmission.release(); model.release(); await r.controller.close(); work.restore(); }
 });
@@ -913,7 +913,10 @@ test.each(["session.archived", "session.deleted", "credential.switched", "rebind
     if (mode === "expiry") await until(() => r.controller.status().state === "retrying");
     await Bun.sleep(10);
     expect(r.admissions.map(a => a.sessionID)).toEqual(["R"]);
-    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
+    // An expired lease's receipt goes out and the server refuses it (#845: no renew precedes it); a guard
+    // stops every other case before the receipt.
+    expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(mode === "expiry" ? 1 : 0);
+    expect(r.batches.get("R")).toHaveLength(1);
   } finally { await r.controller.close(); }
 });
 test("configuration away-and-back during host admission remains latched and sends no receipt", async () => {

@@ -159,11 +159,11 @@ export function capsEnv(o: Options): Record<string, string> {
 }
 
 // Hosted requests per second per user, at hosted-core's cadence: a renew and a read every 10 s,
-// the agent's op every period, and up to four requests per delivery (a read on its hint, two
-// renews, a receipt). A DM reaches one session; a post reaches its board's other subscribers.
+// the agent's op every period, and up to three requests per delivery (a read on its hint, a
+// renew, a receipt; #845). A DM reaches one session; a post reaches its board's other subscribers.
 export function perUserRate(o: Options): number {
   const subscribers = Math.max(0, o.sessions / o.boards - 1);
-  const perSession = 0.2 + 1 / o.periodS + (1 / o.periodS) * 4 * ((1 - o.postShare) + o.postShare * subscribers);
+  const perSession = 0.2 + 1 / o.periodS + (1 / o.periodS) * 3 * ((1 - o.postShare) + o.postShare * subscribers);
   return perSession * o.sessions / o.users;
 }
 
