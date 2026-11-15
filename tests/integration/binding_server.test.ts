@@ -590,8 +590,15 @@ test("#284 S4: a reply goes as the held alias its parent reached or was sent as;
   await s.next(direct((m) => m.body === "to b"));
   const r1 = await s.send("peer", "r1", { parent_id: toB.message_id });
   expect([senderOf(r1.message_id), r1.sent_as]).toEqual([`${A}/b`, `${A}/b`]);
-  const r2 = await s.send("peer", "r2", { parent_id: toB.message_id, as: "a" });
-  expect(senderOf(r2.message_id)).toBe(`${A}/a`);
+  // #530 1: a reply goes out as the parent's party, so as another alias is
+  // refused, writing nothing; a thread that reached the ID takes any `as`.
+  const before = rows<{ n: number }>(`SELECT count(*) AS n FROM messages`)[0]!.n;
+  await expect(s.send("peer", "r2", { parent_id: toB.message_id, as: "a" })).rejects.toMatchObject({
+    code: "bad_request", message: `parent_id ${toB.message_id} reached you as ${A}/b, so a reply goes out as ${A}/b; to write as ${A}/a, send without parent_id`,
+  });
+  expect(rows<{ n: number }>(`SELECT count(*) AS n FROM messages`)[0]!.n).toBe(before);
+  const r2 = await s.send("peer", "r2", { parent_id: toId.message_id, as: "b" });
+  expect(senderOf(r2.message_id)).toBe(`${A}/b`);
   // Its own thread, as its sender.
   expect(senderOf((await s.send("peer", "r3", { parent_id: r1.message_id })).message_id)).toBe(`${A}/b`);
 

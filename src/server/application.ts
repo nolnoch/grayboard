@@ -12,7 +12,7 @@ import { testPause } from "../shared/testpause.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, delegateOkFields, delegateThrottled, resolveDelegation } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
-  idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
+  idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
@@ -1253,6 +1253,8 @@ function prepareSend(
     if (!participant(parent, session.addresses)) fail("not_found", `parent_id ${parentId} is not a message you sent or received`);
     const peer = replyPeer(parent, session.addresses);
     if (to.address !== peer) fail("bad_request", replyPeerError(parentId, peer));
+    const asError = replySenderError(parent, peer, from);
+    if (asError !== null) fail("bad_request", asError);
   }
   return { from, to: to.address, body, parentId, pending, ids, digests };
 }
