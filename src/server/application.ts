@@ -51,12 +51,11 @@ export class ApplicationError extends Error {
     super(message);
   }
 }
-export type DirectMessage = ReturnType<typeof showMessage<MessageRow>>;
+// other_user, ungranted: the writer marks every read and the pull carry (writerMarks; security audit F-10, F-03).
+export type DirectMessage = ReturnType<typeof showMessage<MessageRow>> & { other_user?: true; ungranted?: true };
 export type HistoryMessage = DirectMessage & { delivered?: boolean };
 export type DeliveryEvent =
-  // other_user, ungranted: set only by pending(), a hosted lease's pull
-  // (security audit F-10, F-03).
-  | { kind: "direct"; message: DirectMessage & { other_user?: true; ungranted?: true } }
+  | { kind: "direct"; message: DirectMessage }
   | { kind: "board"; item: Pending };
 export type DeliverySink = {
   deliver(event: DeliveryEvent): void;
@@ -1009,7 +1008,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
       valid(session, true);
-      return snapshot(db, reader(session, board), board, options);
+      // A resource read is a read like board_read, and carries its marks (#825).
+      const snap = snapshot(db, reader(session, board), board, options);
+      const marks = writerMarks(repo, session, [], snap.posts.map((p) => p.id));
+      return { ...snap, posts: snap.posts.map((p) => ({ ...p, ...marks.post(p.id) })) };
     },
     // O(1), for the metrics scrape (#805).
     get observerCount() { return observers.size; },
@@ -1579,7 +1581,7 @@ function handleBoardPost(hub: Hub, session: ApplicationSession, me: string, args
 // wake (the host shows it without starting a turn), and on every read it's
 // data the instructions say not to act on without the user's approval
 // (vision.md principle 10). Every path marks the same way: the pull and the
-// pull-free reads (dm_inbox, dm_thread, dm_history, board_read), so /clear or
+// pull-free reads (dm_inbox, dm_thread, dm_history, board_read, a board resource), so /clear or
 // a poll session loses no mark. Decided per call, so a revoked grant governs
 // the next one (principle 11); one decision per writer per call. Rows from
 // before the column carry no writer and no mark.

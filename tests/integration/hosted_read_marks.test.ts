@@ -1,8 +1,8 @@
 // #825 (#806 read-time authority, vision.md principle 10): the pull-free
 // reads mark what another signed-in user wrote as the lease's pull does:
 // other_user always, ungranted when no msg.wake grant covers the writer.
-// dm_inbox, dm_thread, dm_history and board_read each carry the marks, so a
-// poll session or one after /clear loses none. Decided per call, so a grant
+// dm_inbox, dm_thread, dm_history, board_read and a board resource read each
+// carry the marks, so a poll session or one after /clear loses none. Decided per call, so a grant
 // set or revoked changes the next read (principle 11). The reader's own
 // user's items are never marked.
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -86,4 +86,12 @@ test("board_read marks another user's post, follows the grant, and leaves the re
 
   expect((await policy("open")).status).toBe(200);
   expect(marks(await read(), "bob's post")).toEqual(OTHER);
+
+  // A board resource read (a native client's snapshot) is a read too.
+  const reader = await srv.connected(alice, "ops");
+  const snap = () => srv.app.application.boardSnapshot(reader.session, "e2e").posts as Marked[];
+  expect(marks(snap(), "bob's post")).toEqual(OTHER);
+  expect(marks(snap(), "alice's post")).toEqual(OWN);
+  expect((await policy("collaborative")).status).toBe(200);
+  expect(marks(snap(), "bob's post")).toEqual(GRANTED);
 });

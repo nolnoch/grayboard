@@ -115,7 +115,7 @@ const POLL_NOTE = "No pushes reach this session; check dm_inbox and board_read y
 export function hostedUnboundInstruction(candidates: Candidate[], notes: string[] = []): string {
   const why = notes.map((n) => ` ${n}`).join("");
   const list = candidates.length ? ` Candidates (free now): ${candidates.map(describeCandidate).join("; ")}.` : "";
-  return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing.`;
+  return `This session has no bus name yet.${why} Bind one with bind(name) once you know your task, or don't bind if the task doesn't need the bus.${list} Until then you can read boards, peers and claims; you send and receive nothing. ${OTHER_USER_NOTE}`;
 }
 // The line a session that is a team member is told, root or child.
 const TEAM_BOARDS_NOTE = "Team boards are private to their members: don't repeat their content where non-members can read it unless your user asks.";

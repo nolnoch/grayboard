@@ -818,6 +818,8 @@ test("#523: a child of a root with no name yet is told it only reads until the r
   const told = child.instructions()!;
   expect(told).toBe(`You are a subagent on grayboard. Your root session has no bus name yet: until it binds one you can read boards, peers and claims, and you send nothing. Binding is your root's, not yours. Mail and board pushes are your root's: dm_thread a thread you wrote to see its replies; board_read reads without marking anything read. ${OTHER_USER_NOTE}`);
   expect(fe.instructions()).toStartWith("This session has no bus name yet.");
+  // An unbound root reads boards, whose posts carry the marks: it is told what they mean (#825).
+  expect(fe.instructions()).toEndWith(OTHER_USER_NOTE);
   const who = await child.call("whoami");
   expect(who).toMatchObject({ id, root, child: true, unbound: true });
   expect(who).not.toHaveProperty("candidates");
