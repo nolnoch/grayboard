@@ -209,7 +209,7 @@ test("only listed metadata documents are clients: no fetch, audit, no redirect; 
   expect(refused.status).toBe(400); expect(refused.headers.get("Location")).toBeNull();
   expect([lookups, reads]).toEqual([0, 0]);
   expect(accessAudits(storage.db, "oauth.cimd_refused").map(a => a.detail)).toEqual([{ reason: "not_allowed" }]);
-  // A listed client signs in; once the operator drops it, refresh is refused for good, not retried.
+  // A listed client signs in; once the operator drops it, refresh is refused while it stays off the list, not retried.
   const issued = await issue(listed, undefined, new Browser(), "https://attacker.example/cb");
   const tokens = await redeem(issued);
   service.close(); config = { ...config, oauthCimdClients: [] }; reads = 0; service = makeService(cimd);
@@ -218,7 +218,10 @@ test("only listed metadata documents are clients: no fetch, audit, no redirect; 
   expect((await (await fetch(base + "/.well-known/oauth-authorization-server")).json()).client_id_metadata_document_supported).toBe(false);
   // Unset lists OpenCode's document only.
   service.close(); const { oauthCimdClients: _, ...unset } = config; config = unset; service = makeService(cimd);
-  expect((await fetch(authorization(listed).url, { redirect: "manual" })).status).toBe(400);
+  lookups = 0; reads = 0;
+  const unsetRefused = await fetch(authorization(listed, undefined, "https://attacker.example/cb").url, { redirect: "manual" });
+  expect(unsetRefused.status).toBe(400); expect([lookups, reads]).toEqual([0, 0]);
+  expect(accessAudits(storage.db, "oauth.cimd_refused").map(a => a.detail)).toEqual(Array(3).fill({ reason: "not_allowed" })); // unlisted authorize, de-listed refresh, unset default
   expect((await (await fetch(base + "/.well-known/oauth-authorization-server")).json()).client_id_metadata_document_supported).toBe(true);
 });
 
