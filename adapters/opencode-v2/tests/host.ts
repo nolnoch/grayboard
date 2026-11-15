@@ -371,7 +371,7 @@ try {
         assert.equal(response.headers.get("Retry-After"), String(Math.ceil(body.error.data.retry_after_ms / 1000)));
         // With the bucket spent, a refused request that names a fresh source session must leave no row for it.
         const raw = "refused-admission-" + id;
-        last = undefined;
+        last = undefined as Response | undefined; // widened: the fetch closure reassigns it
         await assert.rejects(drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }));
         assert.equal(last?.status, 429, "A session-naming request is refused at admission too");
         assert.equal(row(raw), null, "Refused admission creates no hosted source row");
