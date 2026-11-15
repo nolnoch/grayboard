@@ -243,7 +243,8 @@ try {
     await invoke(peer.id, "dm_send", { to: "receiver", body: "Peer forged " + forged });
     await inspect("Peer forged " + forged, false);
     app.application.send(foreignHuman.session, "you@example.com/receiver", "Foreign human direct");
-    await inspect("Foreign human direct", false);
+    // Another user's human, and no grant: shown, not resumed (security audit F-03, #806).
+    await inspect("Foreign human direct", false, false);
     await invoke(receiver.id, "board_create", { name: "authority", purpose: "Own-human push proof" });
     app.application.call(ownHuman.session, "board_post", { board: "authority", body: "Own human board " + forged });
     await inspect("Own human board " + forged, true);
@@ -252,7 +253,7 @@ try {
     await invoke(peer.id, "board_post", { board: "authority", body: "Peer board forged " + forged });
     await inspect("Peer board forged " + forged, false);
     app.application.call(foreignHuman.session, "board_post", { board: "authority", body: "Foreign human board" });
-    await inspect("Foreign human board", false);
+    await inspect("Foreign human board", false, false);
     await invoke(receiver.id, "board_subscribe", { board: "authority", mode: "digest" });
     const callsBeforeDigest = modelCalls;
     app.application.call(ownHuman.session, "board_post", { board: "authority", body: "Own human digest" });
