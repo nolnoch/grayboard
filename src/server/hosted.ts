@@ -688,9 +688,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         rootOnly(row);
         await testPauseAsync("hosted:owning:before-txn");
         const late = refusalRows();
-        let result: T;
-        try { result = await store.write(() => fn(attach(p, row), late.defer)); } catch (error) { late.flush(); throw error; }
-        return committed ? committed(result) : result as unknown as R;
+        // `committed` runs right after the commit, before the queue's next body (the lease maps it fills are
+        // every open's cap check); its own failure isn't a rollback, so it flushes no refusal rows.
+        let done = false;
+        try {
+          return await store.write(() => fn(attach(p, row), late.defer), result => { done = true; return committed ? committed(result) : result as unknown as R; });
+        } catch (error) { if (!done) late.flush(); throw error; }
       });
     },
     async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T): Promise<T> {

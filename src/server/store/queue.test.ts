@@ -65,3 +65,21 @@ test("the Repo and the hosted store share one queue, and a commit's effects flus
   await Promise.all([holder, viaRepo, viaHosted]);
   expect(seen).toEqual(["repo", "repo:committed", "hosted"]);
 });
+
+test("committed runs after its commit and before the queue's next body; a promise it returns doesn't hold the queue", async () => {
+  const { db, repo } = open();
+  const seen: string[] = [];
+  let release!: () => void, finish!: () => void;
+  const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
+  const first = repo.hosted.write(() => { seen.push("body 1"); return 1; }, value => {
+    seen.push(`committed 1 (${db.inTransaction ? "in" : "after"} txn)`);
+    return new Promise<number>(r => { finish = () => r(value + 1); });
+  });
+  const second = repo.write(() => { seen.push("body 2"); return 2; });
+  release();
+  expect(await second).toBe(2);
+  expect(seen).toEqual(["body 1", "committed 1 (after txn)", "body 2"]);
+  finish();
+  expect(await first).toBe(2);
+  await holder;
+});

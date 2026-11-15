@@ -156,15 +156,17 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
       return hosted.control(p, context, false, async row => {
-        const { lease, deadline } = await store.write(() => {
+        const { lease } = await store.write(() => {
           const fresh = store.get(row.session_id);
           const lease = get(p, context, capability, fresh), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
           store.update({ ...fresh, lease_deadline: deadline, last_seen_at: now() });
           return { lease, deadline };
+        }, ({ lease, deadline }) => {
+          lease.expiresAt = deadline;
+          if (hooks) lease.hooks = hooks;
+          return { lease };
         });
-        lease.expiresAt = deadline;
-        if (hooks) lease.hooks = hooks;
         return describe(lease);
       }).catch(error => refused(p, context, error));
     },
@@ -190,7 +192,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
       return hosted.control(p, context, false, async () => {
         await testPauseAsync("hosted:receipt:before-txn");
-        const records = await store.write(() => {
+        await store.write(() => {
           testPause("hosted:receipt:in-txn");
           const row = "id" in context ? store.get(context.id) : undefined;
           const lease = get(p, context, capability, row);
@@ -212,13 +214,14 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           application.receiptDirect(lease.session, direct.map(r => r.item.event.kind === "direct" ? r.item.event.message.id : stale(p, context, capability)));
           application.receiptBoards(lease.session, records.filter(r => r.ref).map(r => r.ref!));
           return { lease, records };
+        }, ({ lease, records }) => {
+          for (const { item } of records) {
+            lease.issued.delete(item.id);
+            lease.acknowledged.set(item.id, { ownership: item.ownership, bind_gen: item.bind_gen, ...(item.address !== undefined ? { address: item.address } : {}), ...(boardOf(item) !== undefined ? { board: boardOf(item) } : {}) });
+          }
+          drained.add(drainKey(lease));
+          while (lease.acknowledged.size > ACKED_HISTORY) lease.acknowledged.delete(lease.acknowledged.keys().next().value!);
         });
-        for (const { item } of records.records) {
-          records.lease.issued.delete(item.id);
-          records.lease.acknowledged.set(item.id, { ownership: item.ownership, bind_gen: item.bind_gen, ...(item.address !== undefined ? { address: item.address } : {}), ...(boardOf(item) !== undefined ? { board: boardOf(item) } : {}) });
-        }
-        drained.add(drainKey(records.lease));
-        while (records.lease.acknowledged.size > ACKED_HISTORY) records.lease.acknowledged.delete(records.lease.acknowledged.keys().next().value!);
       }).catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
@@ -241,9 +244,10 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
         await store.write(() => {
           if (matches(lease, store.get(lease.sessionId))) store.end(lease.sessionId, "closed", now());
+        }, () => {
+          hosted.settle(lease.sessionId);
+          finish(lease);
         });
-        hosted.settle(lease.sessionId);
-        finish(lease);
       });
     },
     revalidate() { hosted.sweep(); },
