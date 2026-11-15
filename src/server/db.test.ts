@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -331,6 +331,20 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
   const detail = plan.map(p => p.detail).join(" ");
   expect(detail).toContain("SEARCH c USING INDEX sqlite_autoindex_mailbox_cursors_1");
   expect(detail).not.toContain("SCAN c");
+});
+
+// #805: without ANALYZE the planner took idx_msg_recipient on `recipient_type = 'user'` alone, a pass over every
+// user DM per call; at 130K messages each churned session's start spent ~100 ms there, stalling the loop for seconds.
+// Both sender-keyed statements must seek by sender.
+test("undeliveredFrom and sentPending search messages by sender, never by recipient_type alone", () => {
+  const { db } = openDatabase(":memory:", { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const detail = (sql: string, ...args: (string | number)[]) =>
+    (db.prepare("EXPLAIN QUERY PLAN " + sql).all(...args) as { detail: string }[]).map((p) => p.detail).join(" ");
+  for (const plan of [detail(UNDELIVERED_FROM_SQL, JSON.stringify(["a@example.com/fe"]), Number.MAX_SAFE_INTEGER),
+                      detail(SENT_PENDING_SQL, JSON.stringify(["a@example.com/fe"]), 0)]) {
+    expect(plan).toContain("SEARCH m USING INDEX idx_msg_sender (sender=?)");
+    expect(plan).not.toContain("idx_msg_recipient");
+  }
 });
 
 // #284 audit: queuedTo and retract read the read point by its key too.
