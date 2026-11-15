@@ -266,7 +266,7 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   expect(metaSets("eng/build")).toHaveLength(1);
   expect(await build.bind("eng/build", { meta: { task: "" } })).toMatchObject({ alias: "eng/build" });
   expect(labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
-  expect(metaSets("eng/build").at(-1)!.detail).toEqual({ address: "eng/build", fields: { task: null }, session: build.id });
+  expect(metaSets("eng/build").at(-1)).toEqual({ actor: B, detail: { address: "eng/build", fields: { task: null }, session: build.id } });
   expect(boundAt()).toEqual(at);
   expect(bound()).toBe(events);
 
