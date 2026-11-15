@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { WhoResult } from "../../src/core/boards.ts";
 import type { AppSession } from "../support/app_session.ts";
-import { direct } from "../support/events.ts";
+import { board, direct } from "../support/events.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -117,8 +117,47 @@ test("a refused bare name suggests only full handles the sender may see; hidden 
   expect(named.message).toContain("bob@example.com/build");
   expect(named.message).not.toContain("eng/build");
 
-  // Mail by exact handle stays open (principle 9): it lands, and msg.wake keeps it unwoken.
+  // Mail by exact handle stays open (principle 9): it lands in the holder's mail.
   const sent = await outsider.send("eng/build", "by name");
   expect(sent.message_id).toBeGreaterThan(0);
   await build.next(direct((m) => m.body === "by name"));
+});
+
+test("a post's bare @name suggests only names the poster may see, and its result names only recipients it may see", async () => {
+  const outsider = srv.appSession(carol, "qa");
+  await outsider.connect();
+  await outsider.call("board_create", { name: "general", purpose: "open" });
+  const build = srv.appSession(bob, "eng/build", { bind: { create: true } });
+  await build.connect();
+  await build.call("board_subscribe", { board: "general", mode: "push" });
+  const member = srv.appSession(alice, "fe");
+  await member.connect();
+
+  // A member is refused with the full handle; to the outsider the team's name is as absent as a missing one.
+  await expect(member.call("board_post", { board: "general", body: "@build hi" })).rejects.toThrow("name it in full: eng/build");
+  const hidden = await outsider.call<{ notified: string[]; unresolved?: string[] }>("board_post", { board: "general", body: "@build hi" });
+  const absent = await outsider.call<{ notified: string[]; unresolved?: string[] }>("board_post", { board: "general", body: "@nosuch hi" });
+  expect(hidden.unresolved).toEqual(["build"]);
+  expect(absent.unresolved).toEqual(["nosuch"]);
+
+  // The subscriber is still woken; only the poster's view of who was is cut.
+  expect(hidden.notified).not.toContain("eng/build");
+  await build.next(board((i) => i.kind === "push" && i.post.body === "@build hi"));
+  const shown = await member.call<{ notified: string[] }>("board_post", { board: "general", body: "for the team" });
+  expect(shown.notified).toContain("eng/build");
+});
+
+test("suggestions follow the session's user, not the team address it acts as", async () => {
+  expect((await srv.api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
+  const run = srv.appSession(bob, "ops/run", { bind: { create: true } });
+  await run.connect();
+  const outsider = srv.appSession(carol, "qa");
+  await outsider.connect();
+  await outsider.call("board_create", { name: "general", purpose: "open" });
+  // Bob's session acting as eng/build sees ops/run in peer_list, so a bare "run" names it too.
+  const build = srv.appSession(bob, "eng/build", { bind: { create: true } });
+  await build.connect();
+  expect(await handles(build)).toContain("ops/run");
+  await expect(build.send("run", "hi")).rejects.toMatchObject({ message: expect.stringContaining("name it in full: ops/run") });
+  await expect(build.call("board_post", { board: "general", body: "@run hi" })).rejects.toThrow("name it in full: ops/run");
 });

@@ -1182,7 +1182,10 @@ function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
 // (alias.see, #348), so with none visible it reads as a name nobody has. Shared with delegate's `to` resolution (#184 review
 // 7): both take bare and mixed-case names through the same path.
 type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
-function resolvePeer(repo: Repo, from: string, input: string): Peer {
+// `viewer` (the session's ID, else `from`) is whose sight the not-found
+// suggestions follow (#348), as peer_list's: the session's user, not the
+// address it acts as.
+function resolvePeer(repo: Repo, from: string, input: string, viewer: string = from): Peer {
   const p = addressParts(input);
   if (!p) fail("bad_request", `invalid address "${input}": expected "id:…", "scope/name" or "team:name"`);
   if (p.kind !== "bare") return p;
@@ -1195,9 +1198,9 @@ function resolvePeer(repo: Repo, from: string, input: string): Peer {
     // full handle, as peer_list shows it.
     fail("not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
   }
-  const viewer = repo.resolver.principalOf(from);
+  const vp = repo.resolver.principalOf(viewer);
   const all = repo.aliases.findAllByName(p.name)
-    .filter((a) => viewer !== null && authorize(repo, {}, { verb: "alias.see", principal: viewer, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow)
+    .filter((a) => vp !== null && authorize(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow)
     .map((i) => i.address).sort();
   const which = all.length ? `"${p.name}" isn't in your scope; name it in full: ${all.join(", ")}` : `no identity is named "${p.name}"`;
   return fail("not_found", `${which}; peer_list shows exact handles`);
@@ -1241,7 +1244,7 @@ function prepareSend(
     throw e;
   }
 
-  const to = resolvePeer(repo, from, recipientStr);
+  const to = resolvePeer(repo, from, recipientStr, session.sessionId || from);
   if (to.kind === "team") fail("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
   if (to.kind === "alias" && !repo.aliases.find(to.address)) fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
@@ -1382,7 +1385,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
-      to = resolvePeer(repo, session.primary, m.to).address;
+      to = resolvePeer(repo, session.primary, m.to, session.sessionId || session.primary).address;
     } catch (e) {
       // An unresolvable `to` is a refusal, and it's audited as one (#184 review 4).
       if (e instanceof ApplicationError) refused({ reason: e.message, to: m.to });
@@ -1578,7 +1581,7 @@ function handleHistory(hub: Hub, session: ApplicationSession, peer: string | und
   } catch (e) {
     return fail("bad_request", (e as Error).message);
   }
-  const peerFull = peer ? resolvePeer(repo, session.primary, peer).address : undefined;
+  const peerFull = peer ? resolvePeer(repo, session.primary, peer, session.sessionId || session.primary).address : undefined;
   const mine = session.addresses;
   const cursors = new Map<string, number>();
   const reached = (to: string) => {

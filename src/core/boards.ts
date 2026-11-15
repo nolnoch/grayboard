@@ -93,8 +93,9 @@ export type Access = {
   checkCreate(handle: string, scope: string | null): string | null;
   // The handle a mention token refers to, or null if unknown or ambiguous.
   // `strict`: a token that names a session that can't receive refuses the
-  // post instead of going unresolved.
-  resolveMention(token: string, author: string, board: Board, strict: boolean): string | null;
+  // post instead of going unresolved. `viewer` (the posting session's ID, else
+  // the author) is whose sight a refusal's name suggestions follow (#348).
+  resolveMention(token: string, author: string, board: Board, strict: boolean, viewer?: string): string | null;
   // Whether a post by `from` may reach `to` as a thread reply. Omitted: always.
   mayReach?(from: string, to: string): boolean;
   // Whether the principal of `handle` (the calling session's ID) may read an alias's labels (task, owner,
@@ -644,12 +645,13 @@ function resolveMentions(
   author: string,
   board: Board,
   strict: boolean,
+  viewer: string,
 ): { handles: string[]; unresolved: string[] } {
   const a = access(db);
   const handles = new Set<string>();
   const unresolved: string[] = [];
   for (const t of mentionTokens(body)) {
-    const h = a.resolveMention(t, author, board, strict);
+    const h = a.resolveMention(t, author, board, strict, viewer);
     if (h && a.canSee(h, board)) handles.add(h);
     else unresolved.push(t);
   }
@@ -907,7 +909,7 @@ export function post(
     const queue = !announcement && parentId === null && !b.archived_at && (b.kind ?? "broadcast") === "queue";
     let unresolved: string[] = [];
     if (queue) {
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
       if (mentioned.length === 0) {
@@ -952,7 +954,7 @@ export function post(
         const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
         for (const m of muted) targets.delete(m.handle);
       }
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true);
+      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
     }
@@ -1080,6 +1082,19 @@ export type Peer = {
  * notified lists: a `grayboard tail` session (ids.viewer, #284 S9). Read
  * once per call.
  */
+// Of `handles`, those whose existence `viewer` (a session ID or handle) may
+// see: a team's aliases only inside the team (#348), as peer_list lists them.
+// For results that echo a board's recipients (board_post's notified/deferred).
+export function seenHandles(db: Database, viewer: string, handles: string[]): string[] {
+  const acc = access(db);
+  if (!acc.seesAlias) return handles;
+  const scopeOf = db.prepare(`SELECT scope_kind, scope_ref FROM aliases WHERE address = ?`);
+  return handles.filter((h) => {
+    const r = scopeOf.get(h) as { scope_kind: AliasScope["scope_kind"] | null; scope_ref: string | null } | null;
+    return !r || r.scope_kind === null || acc.seesAlias!(viewer, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+  });
+}
+
 export function viewers(db: Database): (handle: string) => boolean {
   const ids = new Set((db.prepare(`SELECT id FROM ids WHERE viewer = 1`).all() as { id: string }[]).map((r) => r.id));
   return (h) => ids.has(h);
