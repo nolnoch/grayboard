@@ -1,4 +1,5 @@
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +32,24 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
     if (importPattern.test(text)) offenders.push(file);
   }
   expect(offenders).toEqual([]);
+});
+
+test("#807 P1b-3: the server reads on its read-only connection outside a transaction and on the writer inside one", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-reader-"));
+  const { db, repo } = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
+  const on: Database[] = [];
+  const query = Database.prototype.query;
+  const spy = spyOn(Database.prototype, "query").mockImplementation(function (this: Database, sql: string) {
+    if (sql === "SELECT 7 AS n") on.push(this);
+    return query.call(this, sql);
+  } as typeof query);
+  try {
+    expect(db.prepare<{ n: number }, []>("SELECT 7 AS n").get()?.n).toBe(7);
+    repo.atomic(() => db.prepare<{ n: number }, []>("SELECT 7 AS n").get());
+    expect(on.length).toBe(2);
+    expect(on[0]).not.toBe(db);
+    expect(on[1]).toBe(db);
+  } finally { spy.mockRestore(); db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("an existing pre-OAuth database opens additively without losing old data", () => {

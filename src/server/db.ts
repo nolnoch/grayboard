@@ -16,7 +16,7 @@ import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
 import { endSession, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
-import { afterCommit, guardTopLevel, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
+import { afterCommit, guardTopLevel, openReader, openSqlite, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
@@ -354,6 +354,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     seedSchema(d, first);
   });
   authGenerationTriggers(db);
+  routeReads(db, openReader(path));
   const queue = queueFor(db);
   guardTopLevel(db, () => queue.assertFree());
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, opts.now);
