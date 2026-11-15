@@ -272,9 +272,11 @@ export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachment
 // (mailbox_cursors.last_seen_id); unread = `id > read point` — a message is counted
 // undelivered iff `id > read point`. Exported so the EXPLAIN pin asserts the
 // plan of the exact statement the code executes, not a hand-copied drift.
+// The unary `+` on recipient_type keeps the planner, which has no ANALYZE stats, off
+// idx_msg_recipient: that index on recipient_type alone is a pass over every user DM (#805).
 export const UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
              LEFT JOIN mailbox_cursors c ON c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient
-            WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient_type = 'user' AND m.recipient != m.sender
+            WHERE m.sender IN (SELECT value FROM json_each(?)) AND +m.recipient_type = 'user' AND m.recipient != m.sender
               AND m.id > COALESCE(c.last_seen_id, 0) AND m.delivered_at IS NULL AND m.created_at < ?
             GROUP BY m.recipient ORDER BY m.recipient`;
 
@@ -284,6 +286,12 @@ export const QUEUED_TO_SQL = `SELECT m.recipient, COUNT(*) AS n FROM messages m
             WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
               AND m.id > COALESCE((SELECT c.last_seen_id FROM mailbox_cursors c WHERE c.address = m.recipient AND c.stream_type = 'direct' AND c.stream_ref = m.recipient), 0)
             GROUP BY m.recipient`;
+
+// sentPending: the sender's pending DMs, unacked. Exported for the same EXPLAIN pin; `+` as in undeliveredFrom.
+export const SENT_PENDING_SQL = `SELECT ${M_MSG_COLS} FROM messages m
+            WHERE +m.recipient_type = 'user' AND m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
+              AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
+            ORDER BY m.id ASC`;
 
 // retract: the sender's message, still unread and unanswered. Exported for
 // the same EXPLAIN pin.
@@ -1014,10 +1022,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       sentPending(senders, since) {
         return att(db.query<MessageRow, [string, number]>(
-          `SELECT ${M_MSG_COLS} FROM messages m
-            WHERE m.recipient_type = 'user' AND m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
-              AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
-            ORDER BY m.id ASC`,
+          SENT_PENDING_SQL,
         ).all(JSON.stringify(senders), since));
       },
       openDelegations(launcher, since) {
