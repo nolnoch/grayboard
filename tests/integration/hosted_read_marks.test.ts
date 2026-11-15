@@ -25,14 +25,15 @@ afterEach(() => srv.stop());
 
 type Marked = { id?: number; body: string; other_user?: true; ungranted?: true };
 const policy = (value: string) => srv.api(alice, "POST", "/api/teams/eng/policy", { policy: value });
-const marks = (items: Marked[], body: string) => {
+const marks = (items: Marked[], body: string): Marks => {
   const m = items.find((i) => i.body === body);
   if (!m) throw new Error(`no item "${body}" in ${JSON.stringify(items)}`);
   return { other_user: m.other_user, ungranted: m.ungranted };
 };
-const OTHER = { other_user: true, ungranted: true };
-const GRANTED = { other_user: true, ungranted: undefined };
-const OWN = { other_user: undefined, ungranted: undefined };
+type Marks = { other_user?: true; ungranted?: true };
+const OTHER: Marks = { other_user: true, ungranted: true };
+const GRANTED: Marks = { other_user: true, ungranted: undefined };
+const OWN: Marks = { other_user: undefined, ungranted: undefined };
 
 test("dm_inbox, dm_thread and dm_history mark another user's DM, drop ungranted under a grant and restore it on revoke", async () => {
   const abe = await srv.hosted(A, "be");
