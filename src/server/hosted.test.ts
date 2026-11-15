@@ -1346,7 +1346,7 @@ test("#881: a request reads its row once and skips its own user's disabled read;
     const rowReads = () => count("SELECT * FROM hosted_sessions WHERE session_id = ?"), userReads = () => count("SELECT * FROM users WHERE id = ?");
     query.mockClear();
     await hosted.whoami(principal, root);
-    // settle's read (rowFor reuses it), touchAfter's and whoami's own; before #881, four and one user read.
+    // withGate's before-gate read, settle's (rowFor reuses it) and touchAfter's; before #881, four and one user read.
     expect(rowReads()).toBe(3);
     expect(userReads()).toBe(0);
     // Positive case: settle with no authorized user (the sweep's and mcp authorize's) still reads, and ends.
@@ -1372,4 +1372,17 @@ test("#881: a settle that ends a lapsed root stands when the same request is the
   await expect(hosted.whoami(principal, lapsed)).rejects.toHaveProperty("code", "bad_request");
   expect(database.repo.hosted.get(lapsed.id)).toBeUndefined();
   expect(hostedRowCount(database.db)).toBe(1);
+});
+
+test("#902: a bound native call reads its root's holds once, for the bound check and its session alike", async () => {
+  const { Database } = await import("bun:sqlite");
+  const root = context("one-holds");
+  if (!("id" in root)) throw new Error("fixture context");
+  await hosted.bind(principal, root, { name: "be", create: true });
+  const prepare = spyOn(Database.prototype, "prepare");
+  try {
+    await hosted.run(principal, root, "dm_send", session => application.send(session, "be", "held once"));
+    // Before #902, named() and snapshot() each read them: two.
+    expect(prepare.mock.calls.filter(([s]) => String(s) === "SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").length).toBe(1);
+  } finally { prepare.mockRestore(); }
 });

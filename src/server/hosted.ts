@@ -517,11 +517,12 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (fresh.lease_deadline !== null) audit(row.session_id, "hosted.lease_closed", { reason: "reattached" });
     return { ...fresh, grant_id: p.grantId };
   }
-  function snapshot(p: OAuthPrincipal, row?: HostedSession) {
+  // `held`: the root's holds, when the caller read them for this row with no await since (#902).
+  function snapshot(p: OAuthPrincipal, row?: HostedSession, held?: string[]) {
     const root = row ? rootOf(row) : undefined;
     // A child acts under its root's addresses, and its writes carry its own ID as `via` (#523).
     const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
-    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
+    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
   function fence(p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
     authorized(p);
@@ -586,10 +587,11 @@ export function createHostedSessions(application: Application, options: { now?: 
         const taken = told ? takeLost(p, row, "agent") : [];
         if (taken.length) told!(lostNotice(p, row!, taken));
         const root = row ? rootOf(row) : undefined;
-        if (!(root && named(root)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
+        const held = root ? application.hostedHolds(root.session_id) : undefined;
+        if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
           throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
         }
-        const selected = snapshot(p, row);
+        const selected = snapshot(p, row, held);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
         try {

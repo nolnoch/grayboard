@@ -136,10 +136,17 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return exchange.context;
   }
   // Returns the context's row as it stands after any settle, so a synchronous caller needn't read it again (#853).
-  function authorize(context: Context, signal?: AbortSignal): { row: HostedSession | undefined } {
+  // The grant and user checks share one auth-generation read (#902). `withRow: false` (a native tool, whose hosted
+  // gate reads and settles the row itself) skips the row.
+  function authorize(context: Context, signal?: AbortSignal, withRow?: true): { row: HostedSession | undefined };
+  function authorize(context: Context, signal: AbortSignal | undefined, withRow: false): void;
+  function authorize(context: Context, signal?: AbortSignal, withRow = true): { row: HostedSession | undefined } | void {
     if (closed || context.request.signal.aborted || signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
-    if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
-    application.revalidateSession(context.session, true);
+    application.repo.authRead(() => {
+      if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
+      application.revalidateSession(context.session, true);
+    });
+    if (!withRow) return;
     if (!("id" in context.sessionContext)) return { row: undefined };
     const row = hosted.row(context.sessionContext.id);
     const root = row && hosted.rootOf(row);
@@ -431,7 +438,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       server.server.setRequestHandler("resources/subscribe", (req, ctx) => serialized(req.params.uri, ctx, true));
       server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => serialized(req.params.uri, ctx, false));
     }
-    if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal); return context; }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
+    if (role !== "subscriber") registerNativeTools(server, application, hosted, ctx => { const context = current(ctx); authorize(context, ctx.mcpReq.signal, false); return context; }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
     return server;
   }
   const modernFactory = async () => {

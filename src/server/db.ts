@@ -94,8 +94,8 @@ export interface Repo {
   now(): number;
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
-  // Runs fn, which only reads, with the auth cache's generation read once for its whole body (#881): one
-  // authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
+  // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
+  // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
   authRead<T>(fn: () => Sync<T>): T;
   oauth: OAuthStore;
   hosted: HostedStore;
