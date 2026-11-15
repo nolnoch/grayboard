@@ -51,7 +51,7 @@ case "${1:-}" in
     printf '{"phase":"prepare","state":"started"}\n' > "$GRAYBOARD_MATRIX_OBSERVATIONS"
     PATH="$scratch/matrix-bin:$PATH" bun run test:host-races
     ;;
-  native) bun run test:native-host ;;
+  native) bun run test:native-host && bun run test:native-refresh ;;
   durable) bun run test:durable-host ;;
   config|public)
     public_revision=""

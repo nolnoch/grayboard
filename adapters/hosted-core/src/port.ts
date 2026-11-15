@@ -47,6 +47,10 @@ export interface CredentialPort<E extends Enrollment> {
   watch(e: E, drift: () => void): Promise<{ dispose(): Promise<void> }>;
   token(e: E): Promise<string>;                       // current access token; throws AccessExpired only when a new login is needed
   unauthorized(e: E, token: string): Promise<void>;   // called on 401 for `token`; returns when the next token() may succeed, else throws
+  // Optional, for a host that rotates its own token (OpenCode): asks it to refresh e's expired access token now.
+  // The Controller calls it on each recovery attempt past the rotation grace (#661); acting at most once per
+  // expiry, and only when that can't disturb the host, is the port's. Resolves true when it acted.
+  refresh?(e: E): Promise<boolean>;
 }
 export interface ApprovalPort<E extends Enrollment> {
   key(e: E): string;                                   // OpenCode: enrollmentHash
