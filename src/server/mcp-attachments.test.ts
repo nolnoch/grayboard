@@ -27,6 +27,12 @@ let now: number;
 const origin = "https://grayboard.example.com";
 const resource = `${origin}/hosted/mcp`;
 const bytes = new TextEncoder().encode("attachment bytes\n");
+// A body whose first read signals `entered` and waits for `resume`: highWaterMark 0 keeps the stream from
+// pulling before the handler reads it, so `entered` marks the handler at its body read, not the request's construction.
+function heldBody(entered: { resolve(): void }, resume: { promise: Promise<void> }) {
+  return new ReadableStream({ async pull(controller) { entered.resolve(); await resume.promise; controller.enqueue(bytes); controller.close(); } }, { highWaterMark: 0 });
+}
+
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>(r => { resolve = r; });
@@ -146,7 +152,7 @@ for (const boundary of ["body", "store", "download"] as const) for (const operat
     store.repo.blobs.get = async hash => { const data = await get(hash); entered.resolve(); await resume.promise; return data; };
     req = request("GET", `/mcp/attachments/${id}`);
   } else if (boundary === "body") {
-    req = request("POST", undefined, new ReadableStream({ async start(controller) { entered.resolve(); await resume.promise; controller.enqueue(bytes); controller.close(); } }));
+    req = request("POST", undefined, heldBody(entered, resume));
   } else {
     const put = store.repo.blobs.put.bind(store.repo.blobs);
     store.repo.blobs.put = async (hash, data) => { entered.resolve(); await resume.promise; return put(hash, data); };
@@ -216,13 +222,16 @@ for (const boundary of ["quota", "body", "store"] as const) for (const invalidat
   let req = request();
   if (boundary === "quota") {
     release = await gate.reserve(issued.authed.user_email, 1024, new AbortController().signal);
+    // The request's own reserve marks it waiting on the quota the test holds.
+    const reserve = gate.reserve.bind(gate);
+    gate.reserve = (...args) => { entered.resolve(); return reserve(...args); };
   } else if (boundary === "body") {
-    req = request("POST", undefined, new ReadableStream({ async start(controller) { entered.resolve(); await resume.promise; controller.enqueue(bytes); controller.close(); } }));
+    req = request("POST", undefined, heldBody(entered, resume));
   } else {
     store.repo.blobs.put = async (hash, data) => { entered.resolve(); await resume.promise; return originalPut(hash, data); };
   }
   const operation = send(req);
-  if (boundary === "quota") await Promise.resolve(); else await entered.promise;
+  await entered.promise;
   if (invalidation === "revoke") store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now);
   if (invalidation === "expire") now += 60 * 60 * 1000;
   if (invalidation === "disable") store.repo.users.setDisabled(issued.authed.user_id, true);
