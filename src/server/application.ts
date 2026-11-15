@@ -444,8 +444,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     aliasScopeCap: opts.aliasScopeCap ?? ALIAS_SCOPE_CAP,
     boardChanged(board) {
       afterCommit(db, () => {
-        for (const observer of [...observers]) {
-          if (observer.board === board && observerLive(observer)) notify(() => observer.hooks.changed());
+        // A copy: observerLive removes a dead observer from the set mid-walk.
+        for (const observer of [...observersByBoard.get(board) ?? []]) {
+          if (observerLive(observer)) notify(() => observer.hooks.changed());
         }
       });
     },
@@ -465,9 +466,26 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   const hostedRequestLimiter = hostedLimiter("native", opts.hostedRequestLimit ?? DEFAULT_HOSTED_REQUEST_LIMIT);
   const hostedSubscriberLimiter = hostedLimiter("subscriber", opts.hostedSubscriberLimit ?? DEFAULT_HOSTED_SUBSCRIBER_LIMIT);
   type Observer = { session: ApplicationSession; board: string; hooks: BoardObserver };
+  // Every observer, and the same ones indexed by board and by session, so a post's fan-out walks only its board's
+  // observers and a close only its session's (#831, vision P13): neither grows with the server-wide watch cap.
   const observers = new Set<Observer>();
+  const observersByBoard = new Map<string, Set<Observer>>();
+  const observersBySession = new Map<ApplicationSession, Set<Observer>>();
+  function index<K>(map: Map<K, Set<Observer>>, key: K, observer: Observer, add: boolean) {
+    let set = map.get(key);
+    if (add) { if (!set) map.set(key, set = new Set()); set.add(observer); return; }
+    if (set?.delete(observer) && set.size === 0) map.delete(key);
+  }
+  function addObserver(observer: Observer) {
+    observers.add(observer);
+    index(observersByBoard, observer.board, observer, true);
+    index(observersBySession, observer.session, observer, true);
+  }
   function removeObserver(observer: Observer) {
-    if (observers.delete(observer)) notify(observer.hooks.closed);
+    if (!observers.delete(observer)) return;
+    index(observersByBoard, observer.board, observer, false);
+    index(observersBySession, observer.session, observer, false);
+    notify(observer.hooks.closed);
   }
   function observerLive(observer: Observer): boolean {
     if (!observers.has(observer)) return false;
@@ -494,7 +512,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (!session.active) return;
     session.active = false;
     hub.sessions.delete(session);
-    for (const observer of [...observers]) if (observer.session === session) removeObserver(observer);
+    for (const observer of [...observersBySession.get(session) ?? []]) removeObserver(observer);
     if (session.human) {
       const addr = session.primary;
       if (addr && hub.registry.get(addr) === session) {
@@ -1021,6 +1039,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     // O(1), for the metrics scrape (#805).
     get observerCount() { return observers.size; },
+    // Keys in the observer indexes: a board or session with no observers left has none (#831).
+    get observerIndexKeys() { return { boards: observersByBoard.size, sessions: observersBySession.size }; },
     observeBoard(session: ApplicationSession, boardInput: string, hooks: BoardObserver): () => void {
       valid(session);
       const board = normalizeBoard(boardInput);
@@ -1028,7 +1048,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       snapshot(db, reader(session, board), board, { limit: 1 });
       if (observers.size >= (opts.observerCap ?? DEFAULT_HOSTED_CAPS.watches.global)) { countRefusal("board_observer"); fail("bad_request", "board observer capacity reached"); }
       const observer = { session, board, hooks };
-      observers.add(observer);
+      addObserver(observer);
       return () => removeObserver(observer);
     },
     canReceiveBoard(session: ApplicationSession, board: string) {
