@@ -128,4 +128,34 @@ conformance("dms", [
       expect(await unanswered(ctx, "fe")).toMatchObject([{ id: sent.message_id }]);
     },
   },
+  {
+    name: "dm_thread of an unknown id, or of a thread the caller isn't in, is refused not_found",
+    peers: ["be", "fe", "qa"],
+    async run(ctx) {
+      const { ok, refused, peers } = ctx;
+      const sent = ok(await peers.be!.call("dm_send", { to: "fe", body: "between us" }));
+      ok(await peers.fe!.call("dm_thread", { thread: sent.message_id }));
+      refused(await peers.qa!.call("dm_thread", { thread: sent.message_id }), "not_found");
+      refused(await peers.qa!.call("dm_thread", { thread: sent.message_id + 1000 }), "not_found");
+    },
+  },
+  {
+    name: "a reply whose parent_id is another pair's DM is refused not_found and sends nothing",
+    peers: ["be", "fe", "qa"],
+    async run(ctx) {
+      const { ok, refused, peers } = ctx;
+      const sent = ok(await peers.be!.call("dm_send", { to: "fe", body: "between us" }));
+      refused(await peers.qa!.call("dm_send", { to: "be", body: "butting in", parent_id: sent.message_id }), "not_found");
+      expect(await unanswered(ctx, "be")).toEqual([]);
+    },
+  },
+  {
+    name: "attachment_get of an unknown id is refused not_found",
+    peers: ["be"],
+    modes: ["local"],
+    why: "hosted has no attachment_get tool; it names files by attachment_ids",
+    async run(ctx) {
+      ctx.refused(await ctx.peers.be!.call("attachment_get", { id: 999_999 }), "not_found");
+    },
+  },
 ]);
