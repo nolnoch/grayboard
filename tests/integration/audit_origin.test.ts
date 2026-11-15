@@ -12,14 +12,16 @@ afterEach(async () => { await srv.stop(); });
 const LOOPBACK = /^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/;
 
 // A CLI /api route behind the trusted local proxy: the forwarded client, not the proxy.
+// Dev sign-in itself is loopback-only (security audit F-04), so the row comes from an authenticated route.
 test("a CLI route's row carries the forwarded client address and user agent", async () => {
-  const r = await fetch(`${srv.base}/api/auth/dev-login`, {
+  const token = await srv.login("alice@example.com");
+  const r = await fetch(`${srv.base}/api/teams`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Forwarded-For": "203.0.113.7", "User-Agent": "audit-origin-test/1" },
-    body: JSON.stringify({ email: "alice@example.com" }),
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Forwarded-For": "203.0.113.7", "User-Agent": "audit-origin-test/1" },
+    body: JSON.stringify({ name: "eng" }),
   });
-  expect(r.status).toBe(200);
-  const rows = auditOrigins(srv.app.db, "auth.login");
+  expect(r.status).toBe(201);
+  const rows = auditOrigins(srv.app.db, "team.created");
   expect(rows).toHaveLength(1);
   expect(rows[0]).toMatchObject({ ip: "203.0.113.7", ua: "audit-origin-test/1" });
 });
