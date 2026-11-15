@@ -15,11 +15,11 @@ The server runs on one SQLite file. The target platform runs on Kubernetes again
 
 Facts that set the port's shape, from an inventory of `origin/master` (be48f91):
 
-- **`Repo` is not the whole seam.** `src/server/db.ts` runs about 200 statements, but the raw `Database` also flows from `app.ts` into application, http, slack, teams, retention and the attachment modules, and they call the shared core (`src/core/`: boards, claims, bindings, session_end, delegation, attachments: about 160 statements) on it directly.
+- **`Repo` is not the whole seam.** `src/server/db.ts` runs most of the server's statements, but the raw `Database` also flows from `app.ts` into application, http, slack, teams, retention and the attachment modules, and they call the shared core (`src/core/`: boards, claims, bindings, session_end, delegation, attachments) on it directly. This contradicts `../architecture.md` §4 ("`Repo` is the only server-side store interface"), which holds only for the server's own tables.
 - **The core calls back into the server synchronously.** `src/core/boards.ts` keeps a `WeakMap<Database, Access>`; core statements call the server's `Access`, which reads through `Repo`. An async server core forces an async `Access`.
-- **Correctness leans on a blocking transaction.** `repo.atomic` is `BEGIN IMMEDIATE` with a synchronous callback (`Sync<T>` makes a promise a type error). A hosted tool call is one such transaction (`hosted.ts` run). While it runs, nothing else in the process runs, so a transaction may read in-memory state (registry liveness, busy and inflight maps, delivery leases, BindGate, limiters) and nothing can change it before commit. About a dozen sites (`no await since` comments among them) depend on this.
-- **Read-then-write invariants rely on the single writer.** At least: alias takeover in `holdAlias` and the `bindNow` checks, the alias cap (`alias_cap.ts` says so), `teams.create`, `guardLastOwner`, OAuth `redeemCode` and `rotateRefresh` replay detection, the `createRequest` capacity count, the attachment quota, `dedupWrite`, `claims.take`, and the hosted `full()` capacity check. Postgres's default READ COMMITTED serializes none of them.
-- **`afterCommit` and the auth cache are SQLite mechanisms.** `afterCommit` monkey-patches `db.transaction`; the auth cache is keyed on TEMP triggers plus `PRAGMA data_version`.
+- **Correctness leans on a blocking transaction.** `repo.atomic` is `BEGIN IMMEDIATE` with a synchronous callback (`Sync<T>` makes a promise a type error). A hosted tool call is one such transaction (`hosted.ts` run). While it runs, nothing else in the process runs, so a transaction may read in-memory state (registry liveness, busy and inflight maps, delivery leases, BindGate, limiters, a session's `holds`) and nothing can change it before commit. Several sites (the `no await since` comments among them) depend on this.
+- **Read-then-write invariants rely on the single writer.** At least: alias takeover in `holdAlias`, `bindNow`'s exclusivity check against another user's tools-only `writes_as` (`aliasUser`), the alias cap (`alias_cap.ts` says so), `teams.create`, `guardLastOwner`, OAuth `redeemCode` and `rotateRefresh` replay detection, the `createRequest` capacity count, the attachment quota, `dedupWrite`, `claim()` (`core/claims.ts`), and the hosted `full()` capacity check. Postgres's default READ COMMITTED serializes none of them.
+- **`afterCommit` and the auth cache are SQLite mechanisms.** `afterCommit` monkey-patches `db.transaction`; the auth cache is keyed on TEMP triggers plus `PRAGMA data_version`, which also sees another connection's commits (an operator's `sqlite3`, `scripts/loadtest.ts` seeding users and tokens), and `authRead` pins one generation in a single `pinned` variable that assumes one auth read at a time (#881).
 - **The driver.** `Bun.SQL` (built in; no dependency) speaks Postgres. Probed on Bun 1.4.4 against `postgres:18`: `int8` returns as a string (or `BigInt` with `bigint: true`; no per-type parser, and `BigInt` breaks `JSON.stringify`); SQLSTATE is in the error's `errno` (`40001`, `23505`), not `code`; `sql.begin(...)` gives a transaction handle; `RETURNING` and `ON CONFLICT ... DO NOTHING` behave as in Postgres.
 
 ## Decisions
@@ -32,8 +32,8 @@ The server gets its own async core on Postgres under `src/server/store/`. `src/c
 
 - `type Read` is a statement handle (the pool, or a transaction); `type Tx extends Read` adds `afterCommit(fn)` and `savepoint(fn)`. Every store function that writes takes a `Tx`; one that only reads takes a `Read`. No module holds an ambient pool it can query behind a caller's transaction: a stray pool query inside a transaction runs outside it, and at pool exhaustion it deadlocks against the transaction holding the last connection.
 - `atomic(fn)` opens a transaction and passes the `Tx`. A nested `atomic` inside one is a type error; nesting goes through `tx.savepoint`.
-- `afterCommit` callbacks live on the `Tx` and run in registration order after `COMMIT` resolves, never on rollback. This replaces the `db.transaction` monkey-patch.
-- `Access` (the authorization seam) becomes async and takes the caller's `Read`, so a policy read inside a transaction sees that transaction.
+- `afterCommit` callbacks live on the `Tx` and run in registration order after `COMMIT` resolves, never on rollback, and the synchronous part of each runs before the write queue (D4) is released. So the next queued transaction sees every in-memory effect of the last, as it does today when effects flush before anything else runs. This replaces the `db.transaction` monkey-patch.
+- `Access` (the authorization seam) becomes async and takes the caller's `Read`, so a policy read inside a transaction sees that transaction. This lands with the core's server-side ports (P3): until then the server still calls the synchronous `src/core/`, whose statements call `Access` synchronously.
 
 ### D3. Database invariants move into SQL
 
@@ -41,14 +41,17 @@ Each read-then-write invariant becomes one statement or a lock on a row the inva
 
 | Invariant | Form |
 |---|---|
-| OAuth code single use; refresh-token rotation replay | `UPDATE ... SET spent_at = $now WHERE ... AND spent_at IS NULL RETURNING ...`: zero rows means replay, and the replay path revokes the grant |
-| Alias takeover (`holdAlias`), claim take | `INSERT ... ON CONFLICT ... DO UPDATE ... WHERE <the takeover is allowed> RETURNING ...`: zero rows means held |
-| Write dedup (`dedupWrite`) | insert the receipt first (`ON CONFLICT DO NOTHING RETURNING`); zero rows means a duplicate, which reads the stored result |
-| Principal names unique across users, teams and aliases (`teams.create`) | a unique index on the shared name; `23505` maps to `PrincipalTaken` |
+| OAuth code single use; refresh-token rotation replay | a code is spent when its `grant_id` is set: `UPDATE oauth_codes SET grant_id = $g WHERE hash = $h AND grant_id IS NULL RETURNING ...`, and rotation the same on the refresh token's spent marker; zero rows means replay, and the replay path revokes the grant |
+| Alias takeover (`holdAlias`), `claim()` | `INSERT ... ON CONFLICT ... DO UPDATE ... WHERE <the takeover is allowed> RETURNING ...`: zero rows means held |
+| An alias is held or written as by one user (`bindNow`'s `aliasUser` check; a tools-only root registering `writes_as`) | both paths `SELECT ... FOR UPDATE` the alias row before checking the other |
+| Write dedup (`dedupWrite`) | insert the receipt first (`ON CONFLICT DO NOTHING RETURNING`); zero rows means a duplicate. A duplicate reads the stored result, unless its message was retracted (#306): then a conditional `UPDATE` on that receipt replaces it, the write goes out fresh and `request.receipt_stale` is audited, as today. `resend: true` skips the receipt check, as today |
+| Principal names unique across users, teams and services (`teams.create`) | `principals.name` is already `UNIQUE`; the store relies on it instead of a prior read, and `23505` on that constraint maps to `PrincipalTaken` |
 | Count caps: alias cap per scope, OAuth request capacity, attachment quota per user, hosted `full()` | `SELECT ... FOR UPDATE` on the parent row (the scope, the user, the server's capacity row), then count and insert |
 | A team keeps an owner (`guardLastOwner`) | `FOR UPDATE` on the team row, then count owners |
 
-These forms also run on SQLite except `FOR UPDATE`, which SQLite's single writer makes unnecessary, so D3 lands before Postgres does (P2 below) and is tested against today's suite.
+`MAX_HOLDS` counts a session's in-memory `holds`, so the write queue covers it until Stage 4 moves holds out of process.
+
+These forms also run on SQLite except `FOR UPDATE`, which SQLite's single writer makes unnecessary. The server-only sites (OAuth, `dedupWrite`, `teams.create`, `guardLastOwner`, the alias cap, `createRequest`, `full()`) take them before Postgres does (P2 below). The shared-core sites (`holdAlias`, `claim()`, the attachment quota) take them in the server's ports (P3), so local mode's core is untouched.
 
 Isolation stays READ COMMITTED. SERIALIZABLE everywhere would turn every conflict into a retry of a whole tool call, whose in-memory side effects then need making re-runnable, for no gain at one pod.
 
@@ -64,7 +67,14 @@ Stage 3 is one server pod. Once statements are awaited, other requests run betwe
 
 ### D5. Hot reads stay in process
 
-`authRead` runs per tool call and once a second per open stream: at the Stage 1 load about 1,000 checks a second, which as round trips would dominate. Its generation becomes an in-process counter bumped in `afterCommit` by every write to `oauth_tokens`, `oauth_grants` and `users`. That is sound only while the server process is the database's only writer: today `openDatabase` has one caller (`src/server/app.ts`), and the other openers of a server database (`scripts/inspect.ts`, `scripts/usage.ts`) are read-only. Stage 4 replaces the counter with `LISTEN/NOTIFY` or a generation row.
+`authRead` runs per tool call and once a second per open stream: at the Stage 1 load about 1,000 checks a second, which as round trips would dominate. Principle 11 still binds: no cache outlives a revocation.
+
+- **The generation.** An in-process counter, bumped by the store in `afterCommit` (before the queue is released, D2) on every write to `oauth_tokens`, `oauth_grants` and `users`. Writers outside the process exist (an operator's `psql` disable, `scripts/loadtest.ts` seeding a live server), so a statement trigger on those tables also issues `NOTIFY gb_auth`, and the server's `LISTEN` connection bumps the counter on each notification. An outside write takes effect when its notification arrives, after commit; the process's own writes take effect before the next queued transaction.
+- **A fill can't race a bump.** A cache entry records the generation read before its database read, and is stored only if the counter still has that value after the read resolves. A read that straddles a bump returns its result uncached.
+- **No shared pin.** Each `authRead` carries its generation in its own scope, not in one module variable (`pinned`, #881), because async auth reads overlap.
+- If the `LISTEN` connection drops, the cache is disabled (every check reads the database) until it reconnects, so a lost notification can't leave a revoked token cached.
+
+Stage 4 keeps this shape across pods: every pod listens.
 
 ### D6. Types and SQL
 
@@ -83,28 +93,28 @@ Stage 3 is one server pod. Once statements are awaited, other requests run betwe
 
 Master stays releasable throughout; the released server stays SQLite until the cutover release.
 
-1. **P1, the async seam on SQLite.** `src/server/store/` with D2's types over the existing SQLite code, the write queue (D4), explicit `afterCommit`, async `Access`. Reads use a second SQLite connection, because a read on the writer's connection during a queued transaction would see its uncommitted rows. Behaviour-preserving: today's suite passes unchanged in meaning. This is where in-memory races first become possible, so it lands with D4's queue, not after it.
-2. **P2, invariants into SQL (D3)** on SQLite, each with a test that interleaves two callers at a `testPause` point and fails on the old code.
-3. **P3, the Postgres store** behind the same interface: DDL, migrations, row mappers, the core's server-side ports. The server picks Postgres when `GRAYBOARD_DATABASE_URL` is set; unreleased until P5.
-4. **P4, the vertical slice measured**: hosted tool call → `board_post`, bind, claim take on Postgres under `scripts/loadtest.ts`; tune queue granularity (D4) if the bar fails.
-5. **P5, cutover.** `grayboard-server import-sqlite <path>` copies a live server database into an empty Postgres (one-time, offline, server stopped). The release that ships it deletes the SQLite server store; `GRAYBOARD_DB_PATH` on the server becomes a startup error naming the import. The v1.0.0 upgrade floor retires for the server here (maintainer, 2026-11-14), replaced by "the current release's server database imports" and, for local mode, "the current release's database opens under HEAD".
+1. **P1, the async seam on SQLite.** `src/server/store/` with D2's types over the existing SQLite code, the write queue (D4) and explicit `afterCommit`. Reads use a second SQLite connection, because a read on the writer's connection during a queued transaction would see its uncommitted rows. A second connection to `:memory:` is a separate, empty database, so `TestServer` and the tests that open `":memory:"` move to a file in a scratch directory. Behaviour-preserving: today's suite passes unchanged in meaning. This is where in-memory races first become possible, so it lands with D4's queue, not after it.
+2. **P2, the server-only invariants into SQL (D3)** on SQLite. Today's suite covers behaviour; SQLite serializes these transactions, so no test there can fail on the old read-then-write form.
+3. **P3, the Postgres store** behind the same interface: DDL, migrations, row mappers, the core's server-side ports with their D3 forms, and async `Access`. The server picks Postgres when `GRAYBOARD_DATABASE_URL` is set; unreleased until P5. Each D3 form gets a test on Postgres that runs two callers in separate transactions with the write queue bypassed, interleaved at a `testPause` point, and fails if the form reverts to read-then-write.
+4. **P4, the vertical slice measured**: hosted tool call → `board_post`, bind, `claim()` on Postgres under `scripts/loadtest.ts`, whose seeding of users and tokens moves from `openDatabase` and `bun:sqlite` to the store; tune queue granularity (D4) if the bar fails.
+5. **P5, cutover.** `grayboard-server import-sqlite <path>` copies a live server database into an empty Postgres (one-time, offline, server stopped). The release that ships it deletes the SQLite server store; `GRAYBOARD_DB_PATH` on the server becomes a startup error naming the import. `deploy/backup.sh` (a nightly `sqlite3 .backup`) is replaced in the same release, or it would keep reporting success on a frozen file. P5 does not merge until CI runs a Postgres service container: after it, the server suite has no SQLite store to fall back on. The v1.0.0 upgrade floor retires for the server here (maintainer, 2026-11-14), replaced by "the current release's server database imports" and, for local mode, "the current release's database opens under HEAD".
 
 The two stores coexist only between P3 and P5, inside the repo, never in a release: not a shim (principle 12).
 
 ### D9. Tests
 
-- **Isolation by template database.** A suite-level setup creates `gb_template` once (migrations applied); each test's server gets `CREATE DATABASE ... TEMPLATE gb_template`, dropped after. `TestServer` and `ServerProcess` take the URL; `GRAYBOARD_TEST_PG_URL` names the cluster. Until CI has a Postgres service container (a `.github/workflows/` change, the maintainer's batched push), Postgres-backed tests skip when the variable is unset, and the SQLite store keeps the suite's coverage.
-- **Helpers go through the store.** `hostedRowCount`, `accessAudits`, `busRows`-style readers become async store reads, so tests stop issuing SQL. The 82 test files that run SQL directly are ported with the module they test, not up front.
-- **Conformance suite (D1)**: tool-surface scenarios (DM, board, claim, bind, delegate) run against local mode and the hosted server; it starts small in P3 and grows with each port.
-- **Concurrency tests** force interleavings at `testPause` points (P2), never sleeps.
+- **Isolation by template database.** A suite-level setup creates `gb_template` once (migrations applied); each test's server gets `CREATE DATABASE ... TEMPLATE gb_template`, dropped after. `TestServer` and `ServerProcess` take the URL; `GRAYBOARD_TEST_PG_URL` names the cluster. Until CI has a Postgres service container (a `.github/workflows/` change, the maintainer's batched push), Postgres-backed tests skip when the variable is unset, and the SQLite store keeps the suite's coverage. Once CI has the container, an unset variable under `CI` fails the suite instead of skipping, so a lost service can't turn the server tests silently green.
+- **Helpers go through the store.** `hostedRowCount`, `accessAudits`, `busRows`-style readers become async store reads, so tests stop issuing SQL. Test files that run SQL directly are ported with the module they test, not up front.
+- **Conformance suite (D1)**: tool-surface scenarios (DM, board, claim, bind, delegate, attachments, session end) run against local mode and the hosted server; it starts small in P3 and grows with each port.
+- **Concurrency tests** force interleavings at `testPause` points (P3), never sleeps.
 
 ## Open questions
 
 - **Postgres major.** The RDS major the platform runs; CI and local tests pin the same image. `postgres:18` until the platform answers.
-- **Pool size.** `Bun.SQL` defaults to 10. With D4's single write queue one connection writes at a time, so the pool serves reads. Size it from P4's measurements, against the RDS instance's `max_connections`.
+- **Pool size.** `Bun.SQL` defaults to 10. With D4's single write queue one connection writes at a time, so the pool serves reads; D5's `LISTEN` holds one more connection of its own. Size it from P4's measurements, against the RDS instance's `max_connections`.
 - **Inspector and usage scripts.** `scripts/inspect.ts` (a released binary) and `scripts/usage.ts` read a server's SQLite file. At P5 they either read Postgres or drop their server views; decide before the cutover release.
 - **Import window.** P5's import is offline: the team server is down for the copy. The live database is small, but measure it before choosing offline over dual-write.
 
 ## Not in scope
 
-HA, multiple pods, blobs in object storage, and externalized hub state are Stage 4 (#808). This design keeps them possible: D3's invariants hold across pods, and D4/D5 name exactly what Stage 4 replaces.
+HA, multiple pods, blobs in object storage, and externalized hub state are Stage 4 (#808). This design keeps them possible: D3's invariants hold across pods, D4 names exactly what Stage 4 replaces, and D5's notifications already reach every pod.
