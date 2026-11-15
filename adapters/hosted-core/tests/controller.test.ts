@@ -29,7 +29,7 @@ function runtime(mode: Mode) {
   // Whether the fake server's delivery_open lists `context` (#854); an older server's doesn't.
   let takesContext = true;
   // While set, the credential's token() finds the access token ended for this reason.
-  let accessFault: AccessReason | undefined;
+  let accessFault: AccessReason | undefined, checkSeesAccess = false;
   // The host's refresh requests (#661), and the addresses another session holds (a bind refuses alias_held).
   let refreshes = 0;
   const heldElsewhere = new Set<string>();
@@ -107,7 +107,10 @@ function runtime(mode: Mode) {
   const configuration = () => ({ type: "remote" as const, url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "grayboard-pi", scope: "grayboard:delivery grayboard:tools", configHash: `grant-${grant}` });
   const credential: CredentialPort<Enrollment> = {
     capture: async sessionID => { if (signedOut) throw new AccessExpired("pi", "run /grayboard login"); return { version: 2, sessionID, configuration: configuration() }; },
-    check: async e => { if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed"); },
+    check: async e => {
+      if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed");
+      if (checkSeesAccess && accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault);
+    },
     watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
     token: async () => { if (accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault); return "access"; },
     unauthorized: async () => { throw new Refusal("auth", "unauthorized"); },
@@ -159,6 +162,8 @@ function runtime(mode: Mode) {
     refreshBusy: (n: number) => { refreshBusy = n; },
     // token() refuses with AccessExpired(reason) until called again without one.
     expireAccess: (reason?: AccessReason) => { accessFault = reason; },
+    // check() refuses with the access fault too, as a host whose check reads the token's expiry.
+    checkSeesAccess: () => { checkSeesAccess = true; },
     // The nth delivery_receipt throws `error` once, after running `then`.
     failReceiptAt: (at: number, error: () => Error, then?: () => void) => { receiptFault = { at, error, ...(then ? { then } : {}) }; },
     // The lease lapses after the nth delivery_renew: every later renew and receipt finds no live lease (an
@@ -757,6 +762,47 @@ test.each(modes)("a native unbind that completes during the wait sets the holds:
     expect(o.recovering()).toBe(1);
     expect(o.after().some(c => c.name === "bind")).toBe(false);
     expect(o.r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// A drift clears the wait; a later enroll of another root clears the controller's drift, which must not revive it.
+test.each(modes)("a drift during the wait ends it even after another root enrolls: a refresh then resumes nothing (%s)", async mode => {
+  const o = await expiredPause(mode, async (n, r, c) => { if (n === 1) { r.drift(); r.expireAccess(); await c.enroll("B", ["fe"], true); } });
+  try {
+    await until(() => o.r.root(o.c, "B")?.state === "active");
+    await o.c.close();
+    expect(o.recovering()).toBe(1);
+    expect(o.r.named("delivery_open").filter(c => c.sessionID === "R")).toHaveLength(o.opened);
+    expect(o.r.root(o.c)?.state).toBe("paused");
+    expect(o.r.root(o.c)?.message.startsWith("Grayboard credential changed")).toBe(true);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// The recovery opens delivery, which expires again before it is active: the next wait carries the backoff on.
+test.each(modes)("a recovery whose delivery expires again before it opens keeps its backoff (%s)", async mode => {
+  const o = await expiredPause(mode, (n, r) => {
+    if (n === 2) { r.expireAccess(); r.beforeOpen(() => { r.expireAccess("expired"); throw new AccessExpired("pi", "run /grayboard login", "expired"); }); }
+    if (n === 4) r.expireAccess();
+  });
+  try {
+    await until(() => o.recovering() >= 4 && o.r.root(o.c)?.state === "active");
+    expect(o.waits.filter(ms => ms >= 1000)).toEqual([1000, 2000, 4000, 8000]);
+    expect(o.r.named("delivery_open").length).toBeGreaterThan(o.opened + 1);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// A host whose check() reads the expiry (OpenCode V2) fails restore's own check: that branch waits too.
+test("a reload whose restore check still sees the expiry waits for the refresh and resumes (#661)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    o.r.checkSeesAccess();
+    let polls = 0;
+    const restarted = o.r.make({ wait: async ms => { if (ms >= 1000 && ++polls === 2) o.r.expireAccess(); } });
+    try {
+      await restarted.restore();
+      await until(() => o.r.root(restarted)?.state === "active");
+      expect(polls).toBe(2);
+      expect(o.r.root(restarted)).toMatchObject({ state: "active", held: ["you@example.com/be"] });
+    } finally { await restarted.close(); }
   } finally { await o.c.close(); await o.r.controller.close(); }
 });
 test("a reload during the wait restores the root into the same wait, which a later refresh resumes (#661)", async () => {
