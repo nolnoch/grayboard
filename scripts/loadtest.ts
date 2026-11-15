@@ -411,6 +411,9 @@ async function main() {
     const lost = [...sent].filter(id => !recv.has(id));
     if (!sent.size) failures.push("no DM was sent");
     if (lost.length) failures.push(`${lost.length} of ${sent.size} DMs never reached their recipient (e.g. ${lost.slice(0, 5).join(", ")})`);
+    // Every undelivered id ("sender:seq", the body's `lt|dm|<sender>|<seq>|...`), for classifying against a --keep-db database (#942).
+    // Written even when empty, so a reused --out dir never keeps an earlier run's list.
+    writeFileSync(join(o.out, "lost-dms.json"), JSON.stringify(lost) + "\n");
     const misdelivered = drivers.reduce((a, d) => a + d.final!.misdelivered, 0);
     if (misdelivered) failures.push(`${misdelivered} deliveries reached the wrong session (e.g. ${drivers.flatMap(d => d.final!.misdeliveredFirst).slice(0, 5).join("; ")})`);
     const posts = drivers.reduce((a, d) => a + d.final!.posts, 0), boardRecv = drivers.reduce((a, d) => a + d.final!.boardRecv, 0);
