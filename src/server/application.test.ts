@@ -119,6 +119,54 @@ test("board observers are independent hints with concealed access and explicit l
   expect(() => application.observeBoard(a, "e2e", { changed: () => {} })).toThrow("session is closed");
 });
 
+// #831: observers are indexed by board and by session. A post tells only its board's observers, a close ends only
+// its session's, an observer the walk finds dead leaves both indexes without costing the board's others, and a board
+// or session whose last observer left takes new ones.
+test("#831: board and session observer indexes: a post tells its board's observers, a close ends its session's", async () => {
+  const a = (await connect(alice, "be", { push: false })).session;
+  const b = (await connect(bob, "fe", { push: false })).session;
+  for (const name of ["one", "two"]) application.call(a, "board_create", { name, purpose: "tests" });
+  const seen: string[] = [];
+  const watch = (s: typeof a, board: string, tag: string) =>
+    application.observeBoard(s, board, { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
+  watch(a, "one", "a1"); watch(a, "two", "a2"); watch(b, "one", "b1"); watch(b, "two", "b2");
+  expect(application.observerCount).toBe(4);
+  application.call(a, "board_post", { board: "one", body: "x" });
+  expect(seen.sort()).toEqual(["a1+", "b1+"]);
+
+  seen.length = 0;
+  application.close(a);
+  expect(seen.sort()).toEqual(["a1-", "a2-"]);
+  expect(application.observerCount).toBe(2);
+  expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
+  seen.length = 0;
+  application.call(b, "board_post", { board: "two", body: "y" });
+  expect(seen).toEqual(["b2+"]);
+
+  // b's last observer of "one" leaves; a new one on the emptied board is told.
+  seen.length = 0;
+  const again = watch(b, "one", "b1'");
+  application.call(b, "board_post", { board: "one", body: "z" });
+  expect(seen.sort()).toEqual(["b1'+", "b1+"]);
+  again();
+  seen.length = 0;
+  application.call(b, "board_post", { board: "one", body: "w" });
+  expect(seen).toEqual(["b1+"]);
+
+  // A dead session's observer is dropped by the walk that finds it; the board's live observers are still told.
+  const c = await connect(alice, "be2", { push: false });
+  watch(c.session, "one", "c1");
+  c.session.active = false;
+  seen.length = 0;
+  application.call(b, "board_post", { board: "one", body: "v" });
+  expect(seen.sort()).toEqual(["b1+", "c1-"]);
+  expect(application.observerCount).toBe(2);
+  expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
+  application.close(b);
+  expect(application.observerCount).toBe(0);
+  expect(application.observerIndexKeys).toEqual({ boards: 0, sessions: 0 });
+});
+
 test("tools-only calls neither own nor drain deliveries nor reset the owner's status", async () => {
   const owner = await connect(alice, "be");
   await owner.call("peer_status", { text: "working" });
