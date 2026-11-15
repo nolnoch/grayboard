@@ -723,12 +723,34 @@ export async function declareLocalHuman(db: Database, handle: string, socks?: st
   });
 }
 
-// DMs queued for each of the names in ?1 (a JSON array): one index search per
-// name past its read point, never a pass over the whole table. It lives here,
-// not in db.ts, because this module takes its database (the Slack bridge
-// opens its own). Exported for the plan pin in db.test.ts.
-// db.ts's undeliveredFrom. Here, not there, so the EXPLAIN pin (db.test.ts) can
-// assert the exact statement: importing db.ts opens this process's bus.
+// A message row's columns, as src/local/db.ts reads them.
+export const LOCAL_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind, m.via`;
+// sentPending (src/local/db.ts): the senders' pending DMs, unacked, oldest
+// first. Here beside undeliveredFrom for the same EXPLAIN pin (#859).
+export const LOCAL_SENT_PENDING_SQL = `SELECT ${LOCAL_MSG_COLS} FROM messages m
+        WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
+        ORDER BY m.id ASC`;
+
+// getHistory (src/local/db.ts): a page of the caller's DMs, newest first. With
+// no peer, unary + keeps sender and recipient off their indexes, so SQLite
+// walks messages by rowid from the newest and stops at LIMIT; an index OR
+// would gather and sort every DM the caller has (#859 audit). Args: the
+// caller's names (JSON) per IN, the peer twice if given, beforeId if given,
+// then the limit. Here for the EXPLAIN pin in db.test.ts.
+export function localHistorySql(peer: boolean, before: boolean): string {
+  const me = `(SELECT value FROM json_each(?))`;
+  const who = peer
+    ? `((m.sender IN ${me} AND m.recipient = ?) OR (m.sender = ? AND m.recipient IN ${me}))`
+    : `(+m.sender IN ${me} OR +m.recipient IN ${me})`;
+  return `SELECT ${LOCAL_MSG_COLS} FROM messages m WHERE ${who}${before ? " AND m.id < ?" : ""} ORDER BY m.id DESC LIMIT ?`;
+}
+
+// db.ts's undeliveredFrom: DMs queued from each of the names in ?1 (a JSON
+// array), by an index search per name past each recipient's read point, never
+// a pass over the whole table. Here, not in db.ts, so the EXPLAIN pin
+// (db.test.ts) can assert the exact statement: importing db.ts opens this
+// process's bus.
 export const LOCAL_UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
         LEFT JOIN cursors c ON c.reader = m.recipient
         WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
