@@ -3,7 +3,12 @@
 // Errors a caller can show as-is: a refused tool call, not a fault. Kept out
 // of boards.ts so src/shared/ and core/attachments.ts can throw them without
 // importing the board store.
-export class CoreError extends Error {}
+export class CoreError extends Error {
+  // The wire code a refusal carries when it isn't bad_request (#954): one whose text already names a code.
+  constructor(message: string, readonly refusalCode?: "id_collision" | "id_ended" | "child_session") {
+    super(message);
+  }
+}
 
 /** A file, a message's files, or a user's unsent uploads over a size cap (HTTP 413). */
 export class TooLargeError extends CoreError {}
