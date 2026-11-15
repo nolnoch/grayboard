@@ -46,7 +46,7 @@ export type SessionRow = {
   attached_start: string | null;
 };
 
-/** How a keyed session's harness was found: BUS_HARNESS_PID, or its first non-launcher ancestor. */
+/** How a keyed session's harness was found: BUS_HARNESS_PID, or its first non-wrapper ancestor. */
 export type HarnessRule = "env" | "ancestor";
 
 /** A keyed session's harness: the process whose exit ends it. */
@@ -100,7 +100,7 @@ export function thisSession(sessionId: string, harness: Harness | null = null, c
 /**
  * A keyed session's harness (#284 decision 3): `BUS_HARNESS_PID` when the
  * orchestrator that minted the key set it, else this process's first
- * non-launcher ancestor. An error string when neither names a live process.
+ * non-wrapper ancestor. An error string when neither names a live process.
  */
 export function keyedHarness(env: Record<string, string | undefined> = process.env): Harness | string {
   const raw = env.BUS_HARNESS_PID;

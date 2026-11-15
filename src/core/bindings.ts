@@ -481,11 +481,11 @@ export function unverifiedRestoreNote(names: string[]): string {
 }
 
 /**
- * The parent is a launcher (npx, a shell), not the harness: each restart gets
+ * The parent is a wrapper (npx, a shell), not the harness: each restart gets
  * a new parent, so the name record never matches it.
  */
-export function launcherNote(launcher: string): string {
-  return `Its parent process is a launcher (${launcher}), so if this grayboard process restarts, its name won't come back; register grayboard as a direct command to keep it.`;
+export function wrapperNote(wrapper: string): string {
+  return `Its parent process is a wrapper (${wrapper}), so if this grayboard process restarts, its name won't come back; register grayboard as a direct command to keep it.`;
 }
 
 /**

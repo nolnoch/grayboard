@@ -686,7 +686,7 @@ test("#211: a restore is verified in the transaction that binds: a bind that lan
   expect(next.c.getInstructions()).toContain(`This grayboard process restarted and took back "api", but another session bound it in between, so the earlier peer status wasn't carried over; peer_status sets it again.`);
 }, 30_000);
 
-test("11: a restart under the same harness takes its name back; a fresh harness, or a launcher parent, starts unbound", async () => {
+test("11: a restart under the same harness takes its name back; a fresh harness, or a wrapper parent, starts unbound", async () => {
   // The record outranks an explicit BUS_IDENTITY: the restart is the same session, mid-task.
   let s = await session("be");
   await s.call("bind", { name: "api", create: true });
@@ -718,16 +718,16 @@ test("11: a restart under the same harness takes its name back; a fresh harness,
   expect(fresh.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
   expect(fresh.c.getInstructions()).not.toContain("restarted");
 
-  // A launcher between harness and grayboard is a new parent on each restart,
+  // A wrapper between harness and grayboard is a new parent on each restart,
   // so the name can't come back; the instructions say why.
   const sh = ["sh", "-c", `"$@"; exit $?`, "sh", process.execPath];
   let l = await localSession(dir, undefined, { via: sh });
-  const launcherNote = "Its parent process is a launcher (sh), so if this grayboard process restarts, its name won't come back";
-  expect(l.c.getInstructions()).toContain(launcherNote);
+  const wrapperNote = "Its parent process is a wrapper (sh), so if this grayboard process restarts, its name won't come back";
+  expect(l.c.getInstructions()).toContain(wrapperNote);
   await l.call("bind", { name: "web", create: true });
   l = await l.restart("reconnect");
   expect(l.c.getInstructions()).toContain("This session has no bus name yet, so it acts as its ID");
-  expect(l.c.getInstructions()).toContain(launcherNote);
+  expect(l.c.getInstructions()).toContain(wrapperNote);
 }, 60_000);
 
 test("#284 S10: a restart takes back every name in its record, in order; one held by another is named in a note", async () => {

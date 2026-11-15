@@ -142,7 +142,7 @@ function initLocalSchema(db: Database): void {
   // attached_pid + attached_start are the grayboard mcp child serving it (null
   // while detached, after the child exited and before a restart re-attaches).
   // harness_rule: how the harness pid was found ('env': BUS_HARNESS_PID;
-  // 'ancestor': the first non-launcher ancestor). All null for an unkeyed
+  // 'ancestor': the first non-wrapper ancestor). All null for an unkeyed
   // session, whose own process is pid.
   const bindingCols = new Set((db.prepare(`PRAGMA table_info(bindings)`).all() as { name: string }[]).map((c) => c.name));
   for (const [col, type] of [["attached_pid", "INTEGER"], ["attached_start", "TEXT"], ["detached_at", "INTEGER"], ["harness_rule", "TEXT"]] as const) {
