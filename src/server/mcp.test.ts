@@ -1318,3 +1318,23 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   await untilHosted(() => hosted.activeListens === 0);
   await kept.close();
 });
+
+test("#902: a native tool call authorizes under one auth-generation read and leaves its row to the hosted gate", async () => {
+  const { Database } = await import("bun:sqlite");
+  const client = await connect();
+  await client.callTool({ name: "board_list", arguments: {} });
+  const authRead = store.repo.authRead, validate = application.revalidateSession;
+  let depth = 0, pinned = 0, unpinned = 0;
+  store.repo.authRead = fn => { depth++; try { return authRead(fn); } finally { depth--; } };
+  application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; validate(session, allowUnbound); };
+  const query = spyOn(Database.prototype, "query");
+  try {
+    const listed = await client.callTool({ name: "board_list", arguments: {} });
+    expect(listed.isError).not.toBe(true);
+    const rowReads = query.mock.calls.filter(([s]) => String(s) === "SELECT * FROM hosted_sessions WHERE session_id = ?").length;
+    // Before #902: nine row reads (authorize's own, besides the exchange's and the tool's hosted gates), and the
+    // user check outside the grant check's generation read.
+    expect(rowReads).toBe(8);
+    expect({ pinned, unpinned }).toEqual({ pinned: 1, unpinned: 0 });
+  } finally { query.mockRestore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
+});
