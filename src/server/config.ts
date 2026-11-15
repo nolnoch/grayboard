@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 
-import type { HumanReach } from "./can_send.ts";
+import type { HumanReach } from "./policy.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";

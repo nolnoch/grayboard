@@ -128,7 +128,7 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
 
 // Acting as an address over HTTP (`/api/claims/call`'s identity, as the
 // `?as=` attachment routes did before #475 removed them) takes the same check
-// as bind (mayActIn).
+// as bind (policy.ts scope.act).
 // hosted twin: #451 (the hold: a team alias on a session)
 test("acting as a team alias over HTTP follows membership", async () => {
   await srv.appSession(bob, "eng/build").connect();

@@ -16,7 +16,7 @@ import { endSession, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, openSqlite, reclaimFreePages } from "../core/sqlite.ts";
 import { serverAccess } from "./access.ts";
-import type { HumanReach } from "./can_send.ts";
+import type { HumanReach } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
 import { requestOrigin } from "./request_context.ts";

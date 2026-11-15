@@ -1,6 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
 import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, type Repo, type Team, type TeamRole, type User } from "./db.ts";
-import { mayActIn } from "./access.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
@@ -10,7 +9,7 @@ import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
-import { canAdmin } from "./can_send.ts";
+import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
@@ -206,10 +205,13 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
   if (p.name === HUMAN_NAME) return forbidden(humanReason);
   const owner = repo.resolver.principalOf(address);
-  const no = owner
-    ? mayActIn(repo, { kind: "user", name: authed.user_email }, { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name })
-    : "no principal owns its scope";
-  if (no) return forbidden(`you can't act as "${address}": ${no}`);
+  if (!owner) return forbidden(`you can't act as "${address}": no principal owns its scope`);
+  const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, scope: { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
+  const d = authorize(repo, {}, req);
+  if (!d.allow) {
+    recordDecision(repo, { user: authed.user_email, address }, req, d);
+    return forbidden(`you can't act as "${address}": ${d.reason}`);
+  }
   if (!repo.aliases.find(address)) {
     return jsonErr("unknown_identity", `no session has used "${address}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }
@@ -431,13 +433,16 @@ function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | nu
 }
 
 // Members read their team's roster; admins can read any team's. as_admin
-// marks the audit row when an admin isn't a member.
+// marks the audit row when an admin isn't a member. A denial is recorded
+// (policy.ts), and reads as not found.
 function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
-  const team = memberTeam(teamName, authed, repo);
-  if (team) return { team, audit: {} };
-  if (!canAdmin(authed.user_email, config.admins).allow) return null;
-  const any = repo.teams.findByName(teamName.toLowerCase());
-  return any ? { team: any, audit: { as_admin: true } } : null;
+  const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const d = authorize(repo, { admins: config.admins }, req);
+  if (!d.allow) {
+    recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+    return null;
+  }
+  return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
 }
 
 // Owners change their team's membership; admins can change any team's, e.g.
@@ -445,14 +450,13 @@ function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: C
 // (security audit F-02: a member could remove the creator, then bind the
 // team names the creator lost). as_admin marks an admin acting without
 // owning. A non-member still reads not found; a member who isn't an owner
-// is refused, naming who can.
+// is refused, naming who can. Every decision is recorded (policy.ts).
 function ownedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
-  const managed = managedTeam(teamName, authed, repo, config);
-  if (!managed) return notFound();
-  const { team } = managed;
-  if (!managed.audit.as_admin && repo.teams.isOwner(team.id, authed.user_id)) return managed;
-  if (canAdmin(authed.user_email, config.admins).allow) return { team, audit: { as_admin: true } };
-  return forbidden(`only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`);
+  const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const d = authorize(repo, { admins: config.admins }, req);
+  recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+  if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
+  return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
 }
 
 const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
@@ -655,7 +659,9 @@ export async function handleHttp(
   }
 
   if (path.startsWith("/api/admin/")) {
-    const decision = canAdmin(authed.user_email, config.admins);
+    const req: AuthzRequest = { verb: "admin", email: authed.user_email };
+    const decision = authorize(repo, { admins: config.admins }, req);
+    recordDecision(repo, { user: authed.user_email }, req, decision, { route: path });
     if (!decision.allow) return forbidden(decision.reason);
   }
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);

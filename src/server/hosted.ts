@@ -252,7 +252,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (!row && create) {
       admit(p.authed.user_id, []);
       const t = now();
-      const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)));
+      const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)), later);
       row = { session_id: context.id, ownership_id: store.start(context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
@@ -263,7 +263,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
       // its shape is refused on every request (#451 A4).
-      const declared = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, false, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)));
+      const declared = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, false, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)), later);
       if (declared !== row.writes_as) throw new ApplicationError("id_collision", `session ${row.session_id} ${row.writes_as ? `writes as "${row.writes_as}"` : "holds its own aliases"}, and this request ${declared ? `writes as "${declared}"` : "declares no writes_as"}; a session's shape is fixed.`);
     }
     // The latest model and effort a request reports (#364); a write only on a change.

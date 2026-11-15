@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { idAddress } from "../core/bindings.ts";
 import { endSession } from "../core/session_end.ts";
 import { registerId, type Board, type CoreDb } from "../core/boards.ts";
-import { mayActIn, serverAccess } from "./access.ts";
+import { serverAccess } from "./access.ts";
+import { mayActIn } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
