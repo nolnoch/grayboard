@@ -88,6 +88,45 @@ test("opening a database from before ids.root_id backfills each live hosted chil
   }
 });
 
+// #521 5: a server marks ids.launcher only for a live hosted root's ownership. Opening the file clears every other
+// mark (a pre-upgrade WSS launcher's, an ended hosted root's from before #532, a child's) and audits each cleared ID
+// once; a live root's mark survives, and a second open finds nothing to clear.
+test("opening a database clears launcher marks no live hosted root holds, auditing each once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-launcher-db-"));
+  const path = join(dir, "db.sqlite");
+  const opts = { blobDir: join(dir, "blobs") };
+  const old = openDatabase(path, opts);
+  const user = old.repo.users.upsertByEmail("you@example.com", null);
+  const now = Date.now();
+  const [root, child, wss, ended, plain] = ["id:r000000000000", "id:c000000000000", "id:w000000000000", "id:e000000000000", "id:p000000000000"];
+  for (const id of [root, child, wss, ended, plain]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen, launcher) VALUES (?, ?, ?, ?, ?)`).run(id, user.email, now, now, id === plain ? 0 : 1);
+  const own = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at, ended_at) VALUES (?, ?, ?, ?, ?) RETURNING id`);
+  const live = own.get(root, user.id, "grayboard-pi", now, null) as { id: number };
+  own.get(ended, user.id, "grayboard-pi", now, now);
+  const row = old.db.prepare(`INSERT INTO hosted_sessions (session_id, ownership_id, user_id, client_id, grant_id, source_session_id, root_session_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  row.run(root, live.id, user.id, "grayboard-pi", "G1", "root-run", null, now, now);
+  row.run(child, live.id, user.id, "grayboard-pi", "G1", "child-run", root, now, now);
+  old.db.close();
+  const swept = () => openDatabase(path, opts);
+  const first = swept();
+  const audits = (db: typeof first.db) => db.query(`SELECT actor, target, detail FROM access_log WHERE action = 'handle.launcher_set' ORDER BY target`).all();
+  try {
+    expect(first.db.query(`SELECT id FROM ids WHERE launcher = 1`).all()).toEqual([{ id: root }]);
+    const cleared = [child, ended, wss].map((target) => ({ actor: user.email, target, detail: JSON.stringify({ on: false, reason: "stale" }) }));
+    expect(audits(first.db)).toEqual(cleared);
+    first.db.close();
+    const second = swept();
+    try {
+      expect(audits(second.db)).toEqual(cleared);
+      expect(second.db.query(`SELECT id FROM ids WHERE launcher = 1`).all()).toEqual([{ id: root }]);
+    } finally {
+      second.db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── basic CRUD ────────────────────────────────────────────────────────────────
 
 // auto_vacuum applies only before the file's first page is written (#170).

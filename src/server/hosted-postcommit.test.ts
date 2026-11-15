@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { openDatabase } from "./db.ts";
 import { createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
@@ -82,19 +83,21 @@ test("actual HTTP delegation audit rollback cannot publish a launcher request", 
 });
 
 test("live sink sees committed message and both delegation audits on a separate connection", async () => {
-  const reader = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
+  // A plain read-only connection: a second openDatabase would run the schema step, whose launcher sweep (#521 5)
+  // clears the mark AppSession declares without a hosted row.
+  const reader = new Database(join(dir, "bus.db"), { readonly: true });
   let visible = false;
   recipient.session.sink.deliver = event => {
     expect(database.db.inTransaction).toBe(false);
     expect(event.kind).toBe("direct");
-    expect(reader.repo.messages.history(["you@example.com/launcher"])).toHaveLength(1);
-    expect(reader.db.query("SELECT action FROM access_log WHERE action IN ('hosted.write', 'delegation.requested')").all()).toHaveLength(2);
+    expect(reader.query("SELECT id FROM messages WHERE recipient = 'you@example.com/launcher'").all()).toHaveLength(1);
+    expect(reader.query("SELECT action FROM access_log WHERE action IN ('hosted.write', 'delegation.requested')").all()).toHaveLength(2);
     visible = true; events.push(event);
   };
   try {
     await mcp.sessions.run(principal, context(), "delegate", delegate);
     expect(visible).toBe(true); expect(events).toHaveLength(1);
-  } finally { reader.db.close(); }
+  } finally { reader.close(); }
 });
 
 test("postcommit sink failure cannot fail or roll back a committed native message", async () => {
