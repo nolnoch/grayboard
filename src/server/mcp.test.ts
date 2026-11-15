@@ -1242,9 +1242,11 @@ for (const { label, initMeta } of UNBOUND_GETS) test(`an unbound legacy GET (${l
   } finally { await raw.close(); }
 });
 
-// #939: the attach re-indexes the GET by its new binding rows, so a later commit to those rows still reaches it.
-test("an idle legacy GET attached by a subscribe ends when its new binding does", async () => {
-  const raw = await rawLegacyGet(token);
+// #939: the attach re-indexes the GET by its new binding rows, so a later commit to those rows still reaches it. The
+// `never-bound` variant opens indexed by another row, so it fails if the attach skips the re-index; the no-_meta one
+// opens row-less, which every commit checks.
+for (const { label, initMeta } of UNBOUND_GETS) test(`an idle legacy GET (${label}) attached by a subscribe ends when its new binding does`, async () => {
+  const raw = await rawLegacyGet(token, initMeta);
   const fresh = { "ai.opencode/sessionID": "fresh-root" };
   try {
     expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
