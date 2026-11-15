@@ -10,7 +10,7 @@ export type Context = {
   peers: Record<string, Peer>;
   // A success's value; a refusal fails the scenario with the mode's text.
   ok(o: Outcome): any;
-  // A refusal. `code` is asserted where the mode reports a code; where it reports none, the gap is recorded and
+  // A refusal. `code` is asserted in hosted mode; local refusals carry none yet (#954), so there the gap is recorded and
   // printed. A scenario proves the refusal had no effect with a follow-up read, never by its wording.
   refused(o: Outcome, code?: string): void;
 };
@@ -49,7 +49,8 @@ export function conformance(family: string, scenarios: Scenario[]): void {
               refused(o, code) {
                 if (o.ok) throw new Error(`expected a refusal, got ${JSON.stringify(o.value)}`);
                 if (code === undefined) return;
-                if (o.code === undefined) gaps.add(`${driver.mode}: no refusal code (${family}: ${s.name} expects ${code})`);
+                // Local refusals carry no code yet (#954); hosted ones must.
+                if (o.code === undefined && driver.mode === "local") gaps.add(`${driver.mode}: no refusal code (${family}: ${s.name} expects ${code})`);
                 else expect(o.code).toBe(code);
               },
             });

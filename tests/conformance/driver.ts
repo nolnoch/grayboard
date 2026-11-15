@@ -49,7 +49,10 @@ export function localDriver(): Driver {
       return {
         async peer(name) {
           const s = await localSession(dir, name);
-          return { name, call: async (tool, args = {}) => outcome(await s.c.callTool({ name: tool, arguments: args }) as CallToolResult, s => s) };
+          return { name, call: async (tool, args = {}) => outcome(await s.c.callTool({ name: tool, arguments: args }).catch((e: Error) => {
+            e.message += `\n${s.stderr()}`;
+            throw e;
+          }) as CallToolResult, s => s) };
         },
         async close() {
           await closeSessions();
@@ -75,7 +78,19 @@ export function hostedDriver(): Driver {
       return {
         async peer(name) {
           const s = await server.hosted(email, name);
-          return { name, call: async (tool, args = {}) => outcome(await s.callRaw(tool, args), strip) };
+          return {
+            name,
+            async call(tool, args = {}) {
+              const result = await s.callRaw(tool, args);
+              // A bind or unbind closes the lease (docs/handles.md, Hosted owner); a hosted client reopens it while
+              // holds remain (adapters/hosted-core/src/controller.ts). An unbind of the last hold answers name null.
+              if ((tool === "bind" || tool === "unbind") && !result.isError) {
+                const name = (result.structuredContent as { name?: unknown } | undefined)?.name;
+                if (name !== null) await s.reopen();
+              }
+              return outcome(result, strip);
+            },
+          };
         },
         close: () => server.stop(),
       };

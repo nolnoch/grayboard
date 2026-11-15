@@ -53,8 +53,6 @@ conformance("identity", [
   {
     name: "after a bind, other sessions see both of the binder's names online",
     peers: ["be", "fe"],
-    modes: ["local"],
-    why: "#953: hosted shows both names offline to others after the bind",
     async run(ctx) {
       ctx.ok(await ctx.peers.be!.call("bind", { name: "be-alt", create: true }));
       expect(await handles(ctx, "fe")).toEqual(["be", "be-alt", "fe"]);

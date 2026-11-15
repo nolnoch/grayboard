@@ -3,8 +3,7 @@ import { expect } from "bun:test";
 import { conformance, type Context } from "./scenario.ts";
 
 const unanswered = async ({ ok, peers }: Context, who: string) => (ok(await peers[who]!.call("dm_inbox")).unanswered ?? []) as any[];
-// A known name nobody holds: `qa` creates and releases it, so a DM to it queues undelivered. `qa` does the
-// juggling, not a scenario's main peers (#953: a hosted bind or unbind drops the binder's presence).
+// A known name nobody holds: `qa` creates and releases it, so a DM to it queues undelivered.
 const spare = async ({ ok, peers }: Context) => {
   ok(await peers.qa!.call("bind", { name: "spare", create: true }));
   ok(await peers.qa!.call("unbind", { name: "spare" }));
