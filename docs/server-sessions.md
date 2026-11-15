@@ -1,7 +1,7 @@
 # Application sessions
 
 ```doc-meta
-owns: the server's application sessions: hosted request context, leftover sessions, the bridge's humans, bind, binding events, tools-only and unbound sessions, the address set, revalidation
+owns: the server's application sessions: hosted request context, leftover sessions, the bridge's humans, bind, the server's binding-event sources, tools-only and unbound sessions, the address set, revalidation
 invariants: another session's alias hold is never taken over (a never-leased hosted root idle past its window ends when a contender binds its name); a hosted session holds several names, and its claims stay with their address
 code-pointers: src/server/application.ts, src/server/hosted.ts, src/server/app.ts, src/core/resolver.ts, src/shared/protocol.ts, src/shared/identity.ts
 companions: handles.md (names, both modes), server-operations.md (the operations), server-access.md (rate limits, authorization), slack-bridge.md §8

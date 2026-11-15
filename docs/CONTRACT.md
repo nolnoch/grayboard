@@ -59,7 +59,7 @@ flowchart TD
 | The server's embedded OAuth authorization server, client sources, built-in clients, adapter login | `docs/server-oauth.md` |
 | The server's HTTP MCP endpoint: session binding, streams, legacy sessions, hosted core's server contract, plugin children, attachment transfer | `docs/server-hosted-mcp.md` |
 | Hosted admission, ownership history, grant attachment, the BindGate | `docs/server-hosted-ownership.md` |
-| The server's application sessions: request context, bind, binding events, address set, revalidation | `docs/server-sessions.md` |
+| The server's application sessions: request context, bind, the server's binding-event sources, address set, revalidation | `docs/server-sessions.md` |
 | The server's operations: delegation, DM send, write dedup, `call` | `docs/server-operations.md` |
 | The server's access policy: authorization seam, teams, attachment uploads and reads, retained HTTP routes, rate limits | `docs/server-access.md` |
 | Build, verified install, deploy files, metrics, backups, plugin distribution | `docs/server-deploy.md` |
