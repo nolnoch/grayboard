@@ -7,8 +7,8 @@
 // its tools in every runtime, under the names omp's client would give them
 // (mcp__grayboard_<tool>). A subagent's call names the subagent's session in
 // `_meta`, so grayboard runs it as a child session of the main one: it acts as
-// the main session's names and is shown as the subagent (docs/boards.md,
-// Child sessions). The grayboard process is the session's one process: it
+// the main session's names and is shown as the subagent
+// (docs/child-sessions.md). The grayboard process is the session's one process: it
 // holds the bus name, the wakeup socket and the read cursors. Only the main
 // session's runtime starts and stops it, delivers its channel notifications
 // and gives its instructions to the model, so no push reaches a subagent (#526).

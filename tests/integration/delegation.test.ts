@@ -353,7 +353,7 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
   const before = (await call(sim.c, "peer_list")).peers as { handle: string; launcher?: true }[];
   expect(before.find((p) => p.handle === "be")?.launcher).toBe(true);
 
-  // A sidecar under the launcher's name without BUS_LAUNCHER — the §13
+  // A sidecar under the launcher's name without BUS_LAUNCHER — the delegation.md
   // subagent pattern — must not clear the owner's opt-in.
   await localSession(dir, "be", { extra: { BUS_PUSH: "off" } });
   const after = (await call(sim.c, "peer_list", { include_offline: true })).peers as { handle: string; launcher?: true }[];

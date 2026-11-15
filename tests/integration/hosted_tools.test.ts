@@ -2,7 +2,7 @@
 // (#282): an in-process server with dev auth, and sessions of two or three
 // users through a built-in client's OAuth grant, delivering through the
 // lease's inbox. Covers the distributed board semantics in
-// docs/architecture.md §4–5. Moved from ws.test.ts; hub mechanics are in
+// docs/server-sessions.md and docs/server-access.md. Moved from ws.test.ts; hub mechanics are in
 // hub.test.ts, routes in http_routes.test.ts.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";

@@ -96,7 +96,7 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       if (req.row.client !== req.client) return deny("hosted.other_client", "session not found", "not_found");
       return allow("hosted.own");
     case "attachment.read": {
-      // Anything unreadable reads as missing, not forbidden (docs/boards.md).
+      // Anything unreadable reads as missing, not forbidden (docs/attachments.md).
       const missing = `no attachment ${req.attachment} on a message or post you can read`;
       if (!req.reach) return deny("attachment.unknown", missing, "not_found");
       const rule = { post: "attachment.board_visible", message: "attachment.dm_party", unbound: "attachment.uploader" }[req.reach.carrier];
