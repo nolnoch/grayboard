@@ -73,7 +73,7 @@ test("a limited address is refused everything, a valid token, /healthz and the h
   const { srv } = serve();
   const alice = await srv.login(A);
   const hosted = hostedToken(srv);
-  for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", "bad", X);
+  for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", `bad${i}`, X);
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
   expect((await get(srv, "/healthz", null, X)).status).toBe(429);
   expect((await mcpList(srv, hosted, X)).status).toBe(429);
@@ -129,14 +129,14 @@ test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev
 
 test("behind the trusted loopback each X-Forwarded-For has its own bucket, trusted hops skipped; with none trusted it's ignored", async () => {
   const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
-  expect((await get(srv, "/api/whoami", "bad", `6.6.6.6, ${X}, 127.0.0.1`)).status).toBe(401);
-  expect((await get(srv, "/api/whoami", "bad", X)).status).toBe(429);
-  expect((await get(srv, "/api/whoami", "bad", Y)).status).toBe(401);
+  expect((await get(srv, "/api/whoami", "bad0", `6.6.6.6, ${X}, 127.0.0.1`)).status).toBe(401);
+  expect((await get(srv, "/api/whoami", "bad1", X)).status).toBe(429);
+  expect((await get(srv, "/api/whoami", "bad2", Y)).status).toBe(401);
   expect(audit(srv, "auth.rate_limited").map((r) => r.target)).toEqual([X]);
 
   const none = serve({ authFailLimit: { burst: 1, perSec: 0.1 }, trustedProxies: [] });
-  expect((await get(none.srv, "/api/whoami", "bad", X)).status).toBe(401);
-  expect((await get(none.srv, "/api/whoami", "bad", Y)).status).toBe(429);
+  expect((await get(none.srv, "/api/whoami", "bad0", X)).status).toBe(401);
+  expect((await get(none.srv, "/api/whoami", "bad1", Y)).status).toBe(429);
   // Both keyed by the peer, whichever loopback address it was.
   const targets = audit(none.srv, "auth.rate_limited").map((r) => r.target);
   expect(targets).toHaveLength(1);
@@ -149,7 +149,7 @@ test("a run of refusals writes one row and one log line at its start and one at 
   const err = spyOn(console, "error");
   cleanup.push(() => err.mockRestore());
   const logged = () => err.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("rate-limit"));
-  for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", "bad", X);
+  for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", `bad${i}`, X);
   for (let i = 0; i < 4; i++) expect((await get(srv, "/api/claims", "bad", X)).status).toBe(429);
   expect(logged()).toEqual([`[grayboard] rate-limiting ${X} after repeated authentication failures`]);
   const started = audit(srv, "auth.rate_limited");
@@ -177,6 +177,53 @@ test("a run of refusals writes one row and one log line at its start and one at 
   ]);
   expect(ended[0]!.detail).toEqual({ refused: 4 });
   expect(srv.app.authGate.size).toBe(0);
+});
+
+test("a stale token looping from a shared address is answered from memory: one lookup, one charge, and its neighbours are never limited (#923)", async () => {
+  const { srv, clock, lookups } = serve();
+  const alice = await srv.login(A);
+  for (let i = 0; i < 100; i++) {
+    const r = await get(srv, "/api/whoami", "stale", X);
+    expect(r.status).toBe(401);
+    expect(await r.json()).toEqual({ code: "unauthenticated", message: "invalid or missing token" });
+  }
+  expect(lookups()).toBe(1);
+  expect(srv.app.authGate.refusedSize).toBe(1);
+  expect(audit(srv, "auth.rate_limited")).toEqual([]);
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
+  // Remembered per path: the same token elsewhere is looked up and charged again.
+  expect((await get(srv, "/api/claims", "stale", X)).status).toBe(401);
+  expect(srv.app.authGate.refusedSize).toBe(2);
+  // Once forgotten it's charged again, one token a minute, under any allowed refill.
+  clock.t += 60_000;
+  expect((await get(srv, "/api/whoami", "stale", X)).status).toBe(401);
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
+  // Distinct bad tokens still drain the bucket, as a scan does.
+  for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", `scan${i}`, X);
+  expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
+  // The stale token still gets its 401, not the 429, uncharged.
+  expect((await get(srv, "/api/whoami", "stale", X)).status).toBe(401);
+});
+
+test("a hosted MCP refusal is replayed with its WWW-Authenticate, so an OAuth client still re-authorizes", async () => {
+  const { srv, lookups } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
+  const stale = "s".repeat(43);
+  const first = await mcpList(srv, stale, X);
+  expect(first.status).toBe(401);
+  const challenge = first.headers.get("www-authenticate");
+  expect(challenge).toContain("resource_metadata=");
+  const body = await first.text();
+  const before = lookups();
+  for (let i = 0; i < 5; i++) {
+    const r = await mcpList(srv, stale, X);
+    expect(r.status).toBe(401);
+    expect(r.headers.get("www-authenticate")).toBe(challenge);
+    expect(await r.text()).toBe(body);
+  }
+  expect(lookups()).toBe(before);
+  // The one charge spent a burst of one: a new bad token from X is limited, the stale one isn't.
+  expect((await mcpList(srv, "t".repeat(43), X)).status).toBe(429);
+  expect((await mcpList(srv, stale, X)).status).toBe(401);
 });
 
 test("a CLI command on a limited address prints the server's wait", async () => {
