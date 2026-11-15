@@ -84,6 +84,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   async function route(req: Request, caller: Caller): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+    // A token already refused here gets the same 401 again, uncharged and
+    // without a lookup, even from a limited address (#923).
+    const replayed = authGate.replayRefused(req, url);
+    if (replayed) return replayed;
     const limited = authGate.refuse(caller, path);
     if (limited) return limited;
 

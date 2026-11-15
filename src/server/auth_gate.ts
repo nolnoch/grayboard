@@ -7,8 +7,14 @@
 // costs nothing either: a web page can make a browser send those cross-origin
 // (an <img>, a WebSocket), but not an Authorization header without a CORS
 // preflight, so charging them would let any page lock out an office.
+//
+// A refused token is remembered, with the 401 it got, so a client looping on
+// a stale token is answered from memory, uncharged and without a lookup: it
+// costs its address one token a minute per path, under any refill rate the
+// config allows, instead of draining the bucket for everyone behind the
+// address (#923). Many distinct bad tokens still drain it, as a scan should.
 import type { Repo } from "./db.ts";
-import { extractBearer } from "./auth.ts";
+import { extractBearer, hashToken } from "./auth.ts";
 import { userAgent, writeAudit } from "./audit.ts";
 import { clientAddress, rateKey, TrustedProxies } from "./client_addr.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
@@ -21,11 +27,24 @@ export const AUTH_FAIL_MAX_KEYS = 10_000;
 // shared, so such requests are still limited rather than skipping the gate.
 export const UNKNOWN_PEER_KEY = "unknown";
 
+// How long a refused token is answered from memory. A refused token stays
+// refused, except a disabled user's after an admin re-enables them: this
+// bounds how long that user waits.
+export const REFUSED_TOKEN_TTL_MS = 60_000;
+
+// The most refused tokens remembered; past it the oldest is forgotten, and
+// charged again if it comes back.
+export const REFUSED_TOKEN_MAX = 10_000;
+
+type Refused = { until: number; status: number; headers: [string, string][]; body: Promise<ArrayBuffer> };
+
 export type AuthGateOptions = {
   limit: RateLimit;
   trustedProxies: readonly string[];
   now?: () => number;
   maxKeys?: number;
+  refusedTtlMs?: number;
+  refusedMax?: number;
 };
 
 // A request the gate has placed: the client's address, for the audit trail
@@ -39,9 +58,17 @@ export type FailureReason = "refused token" | "sign-in";
 export class AuthGate {
   private readonly limiter: RateLimiter;
   private readonly trusted: TrustedProxies;
+  private readonly now: () => number;
+  // Insertion-ordered, so the first key is the oldest.
+  private readonly refused = new Map<string, Refused>();
+  private readonly refusedTtlMs: number;
+  private readonly refusedMax: number;
 
   constructor(repo: Repo, opts: AuthGateOptions) {
     this.trusted = new TrustedProxies(opts.trustedProxies);
+    this.now = opts.now ?? Date.now;
+    this.refusedTtlMs = opts.refusedTtlMs ?? REFUSED_TOKEN_TTL_MS;
+    this.refusedMax = opts.refusedMax ?? REFUSED_TOKEN_MAX;
     // Logged and audited once per run of refusals, so a flood floods neither.
     // The start row says what tripped the limit (addr, path) and what drained
     // it (last_failure), so a stale-token fleet reads differently from a scan.
@@ -83,15 +110,57 @@ export class AuthGate {
     this.limiter.spend(c.key, { addr: c.ip, path, reason, ua: userAgent(req) });
   }
 
-  /** Charge the caller if `res` refused a token `req` presented; passes `res` through. */
-  chargeRefusedToken(c: Caller, req: Request, path: string, res: Response): Response {
-    if (res.status === 401 && extractBearer(req)) this.charge(c, req, path, "refused token");
-    return res;
+  /**
+   * The remembered 401 for this request's token on this path and query, or
+   * null to go on. Charges nothing. `url` is the request's, already parsed.
+   */
+  replayRefused(req: Request, url: URL): Promise<Response> | null {
+    if (this.refused.size === 0 || !extractBearer(req)) return null;
+    const key = refusedKey(req, url);
+    const r = this.live(key);
+    return r ? r.body.then((body) => new Response(body, { status: r.status, headers: r.headers })) : null;
   }
 
-  /** Drop refilled buckets, ending their runs: every 30s, with the hello sweep (app.ts). */
+  /**
+   * Charge the caller if `res` refused a token `req` presented, and remember
+   * the refusal; passes `res` through. A token already remembered isn't
+   * charged again, so requests that were in flight together cost one.
+   */
+  chargeRefusedToken(c: Caller, req: Request, path: string, res: Response): Promise<Response> | Response {
+    if (res.status !== 401 || !extractBearer(req)) return res;
+    const key = refusedKey(req, new URL(req.url));
+    const known = this.live(key);
+    if (known) return res;
+    this.charge(c, req, path, "refused token");
+    // Remembered before the body is read, so a concurrent refusal sees it.
+    if (this.refused.size >= this.refusedMax) this.refused.delete(this.refused.keys().next().value!);
+    const headers = [...res.headers];
+    const body = res.arrayBuffer();
+    this.refused.set(key, { until: this.now() + this.refusedTtlMs, status: res.status, headers, body });
+    return body.then((b) => new Response(b, { status: res.status, statusText: res.statusText, headers }));
+  }
+
+  // The live entry under `key`, dropping it if expired.
+  private live(key: string): Refused | undefined {
+    const r = this.refused.get(key);
+    if (r && r.until <= this.now()) { this.refused.delete(key); return undefined; }
+    return r;
+  }
+
+  /** Drop refilled buckets, ending their runs, and expired refusals: every 30s, with the hello sweep (app.ts). */
   sweep(): void {
     this.limiter.sweep();
+    // Entries share one TTL and are inserted in time order, so the expired are a prefix.
+    const t = this.now();
+    for (const [key, r] of this.refused) {
+      if (r.until > t) break;
+      this.refused.delete(key);
+    }
+  }
+
+  /** How many refused tokens are remembered, for tests. */
+  get refusedSize(): number {
+    return this.refused.size;
   }
 
   /** How many addresses have a bucket, for tests. */
@@ -99,3 +168,8 @@ export class AuthGate {
     return this.limiter.size;
   }
 }
+
+// The path, query and Authorization header exactly as sent, hashed: a fixed
+// size whatever the client sends, and a token presented in another shape (or
+// beside an access_token query) is a different entry from the token itself.
+const refusedKey = (req: Request, url: URL) => hashToken(`${url.pathname}${url.search}\n${req.headers.get("authorization")}`);
