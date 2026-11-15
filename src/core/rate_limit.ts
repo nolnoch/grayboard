@@ -75,15 +75,6 @@ export class RateLimiter {
     return { ok: false, retryAfterMs };
   }
 
-  /** Whether `key` has a token now, with no refusal counted, no hook run and
-   *  no allocation: for a caller deciding whether to do optional work. */
-  peek(key: string): boolean {
-    const b = this.buckets.get(key);
-    if (!b) return true;
-    this.refill(b);
-    return b.tokens >= 1;
-  }
-
   /** Spend one token for `key`; never below empty, so requests that passed
    *  the check together don't push the wait past one token's refill. */
   spend(key: string, ctx: StreakContext = {}): void {

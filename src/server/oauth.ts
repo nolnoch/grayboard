@@ -110,12 +110,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
   // redirects that authorize errors follow, and a name the consent page shows.
   const cimdClients = new Set(config.oauthCimdClients ?? [OPENCODE_CLIENT]);
-  // audit false: the token routes write the refusal row only while
-  // refusalRows has room (F-18), so a bogus-post flood can't write one each.
-  const resolveClient = async (id: string, audit = true) => {
+  // unlisted: the token routes are told instead of a row being written, and
+  // write it with their refusal row while refusalRows has room (F-18), so a
+  // bogus-post flood can't write one each.
+  const resolveClient = async (id: string, unlisted?: () => void) => {
     const manual = clients.get(id);
     if (manual) return manual;
-    if (!cimdClients.has(id)) { if (audit) writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
+    if (!cimdClients.has(id)) { if (unlisted) unlisted(); else writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
     let client: OAuthClient | undefined;
     try { client = await cimd.resolve(id); }
     catch (error) { writeAudit(repo, "oauth.cimd_failed", null, null, { category: error instanceof CimdUnavailable ? "unavailable" : "unexpected" }); throw error; }
@@ -213,7 +214,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!r) fail();
     return { h, f: f!, r: r!, c };
   };
-  const clientAuth = async (req: Request, p: URLSearchParams): Promise<OAuthClient> => {
+  const clientAuth = async (req: Request, p: URLSearchParams, unlisted: () => void): Promise<OAuthClient> => {
     if (p.has("client_secret")) fail("invalid_client", 401);
     const auth = req.headers.get("authorization");
     if (auth && auth.length > 8192) fail("invalid_client", 401);
@@ -229,7 +230,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         password = decodeURIComponent(decoded.slice(colon + 1).replace(/\+/g, " "));
       } catch { return fail("invalid_client", 401); }
     } else id = p.get("client_id") ?? "";
-    const c = await resolveClient(id!, refusalRows.peek("global"));
+    const c = await resolveClient(id!, unlisted);
     if (closed) fail("temporarily_unavailable", 503);
     if (!c) fail("invalid_client", 401);
     if (c!.tokenEndpointAuthMethod === "none") {
@@ -404,7 +405,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       // Set once the request presents grant material: before that it is
       // refused uncharged and unaudited, since a cross-site form post can
       // reach that far (#283), and clientAuth's CIMD fetch is never reached.
-      let material = false;
+      let material = false, unlisted = false;
       try {
         sameOrigin(req);
         strictQuery();
@@ -417,7 +418,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (submitted.has("access_token")) fail();
         if (!req.headers.has("authorization") && !(path === "/oauth/token" ? ["code", "refresh_token"] : ["token"]).some(k => submitted.has(k))) fail();
         material = true;
-        const client = await clientAuth(req, submitted);
+        const client = await clientAuth(req, submitted, () => { unlisted = true; });
         if (path === "/oauth/revoke") {
           const p = recognized(submitted, ["token", "token_type_hint"]);
           repo.oauth.revokeToken(hashToken(required(p, "token")), client.clientId, now());
@@ -462,7 +463,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (!material) return refusal(e);
         if (e.status < 500) {
           spend(checks, path);
+          // One decision per refusal, after every await, for both its rows.
           if (!refusalRows.take("global", { path: routeName(path) }).ok) return refusal(e);
+          if (unlisted) writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" });
         }
         throw e;
       }

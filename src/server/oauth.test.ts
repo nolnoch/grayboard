@@ -926,7 +926,18 @@ test("a refused-refresh flood across addresses leaves the global bucket and ever
   // The org-wide bound that's left is on the refusal rows: at most the burst,
   // even past the address limiter's 1000-key cap, where addresses go uncharged.
   for (let a = 0; a < 1100; a++) expect(await refresh(`spread-${a}`, random())).toBe(400);
-  expect(storage.db.query("SELECT 1 FROM access_log WHERE action = 'oauth.request_refused'").all().length).toBe(5);
+  const rows = (action: string) => storage.db.query(`SELECT 1 FROM access_log WHERE action = '${action}'`).all().length;
+  expect(rows("oauth.request_refused")).toBe(5);
+  // Past the cap a new address is neither charged nor refused.
+  for (let i = 0; i < 70; i++) expect(await refresh("spread-1099", random())).toBe(400);
+  // An unlisted client's two rows share one decision, made after every await:
+  // a concurrent batch writes at most the refilled burst of each.
+  clock += 10_000_000;
+  const unlisted = (key: string) => service.fetch(new Request(base + "/oauth/token", { method: "POST",
+    body: new URLSearchParams({ grant_type: "refresh_token", client_id: "https://unlisted.example/client.json", refresh_token: random() }) }), { key }).then(r => r!.status);
+  expect(await Promise.all(Array.from({ length: 20 }, (_, i) => unlisted(`unlisted-${i % 3}`)))).toEqual(Array(20).fill(401));
+  expect(accessAudits(storage.db, "oauth.cimd_refused").map(a => a.detail)).toEqual(Array(5).fill({ reason: "not_allowed" }));
+  expect(rows("oauth.request_refused")).toBe(10);
   expect(await refresh("office", tokens.refresh_token)).toBe(200);
   expect((await service.fetch(new Request(authorization().url), { key: "office" }))!.status).toBe(303);
   // The other direction: browser routes from several addresses drain the
