@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, type Repo, type Team, type TeamRole, type User } from "./db.ts";
+import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type Team, type TeamPolicy, type TeamRole, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
@@ -530,6 +530,21 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
   return json({ ok: true });
 }
 
+// A team's wake policy (#806): whether members' agents may wake each
+// other's across users ('collaborative') or not ('open', the default).
+// Owners and admins set it, like membership; audited with before and after.
+async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
+  const body = await parseBody<{ policy?: unknown }>(req);
+  const managed = ownedTeam(teamName, authed, repo, config);
+  if (managed instanceof Response) return managed;
+  const policy = body?.policy;
+  if (typeof policy !== "string" || !(TEAM_POLICIES as readonly string[]).includes(policy)) return badRequest(`policy must be one of ${TEAM_POLICIES.map(p => `"${p}"`).join(", ")}`);
+  const from = repo.teams.setPolicy(managed.team.id, policy as TeamPolicy);
+  if (from === null) return notFound();
+  if (from !== policy) writeAudit(repo, "team.policy_set", authed.user_email, managed.team.name, { from, to: policy, ...managed.audit });
+  return json({ ok: true, team: managed.team.name, policy, previous: from });
+}
+
 function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Response {
   const managed = managedTeam(teamName, authed, repo, config);
   if (!managed) return notFound();
@@ -656,6 +671,7 @@ export async function handleHttp(
     if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, db, config);
     if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db, config, sessions);
     if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo, config);
+    if (action === "policy"  && method === "POST") return teamPolicy(teamName, req, authed, repo, config);
   }
 
   if (path.startsWith("/api/admin/")) {

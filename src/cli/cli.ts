@@ -1087,6 +1087,14 @@ teamCmd
     catch (e) { handleApiError(e); }
   });
 
+teamCmd
+  .command("policy <name> <policy>")
+  .description("Set whether members' agents may wake each other's across users: collaborative, or open (the default: no cross-user wake). Team owners and admins")
+  .action(async (name: string, policy: string) => {
+    try { output(await makeClient().post(`/api/teams/${name}/policy`, { policy }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
 // ── admin ─────────────────────────────────────────────────────────────────────
 
 const adminCmd = program
