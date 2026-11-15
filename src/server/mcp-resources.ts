@@ -15,6 +15,13 @@ import { isValidIdentityName } from "../shared/addressing.ts";
 // UNBIND_TOOL's fields (src/core/bindings.ts) plus hosted's `where`, the place the session reports.
 export const HOSTED_BIND_INPUT = z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() });
 export const HOSTED_UNBIND_INPUT = z.strictObject({ name: z.string().max(160) });
+// The subscriber role's tool schemas, built once per process: zod schema construction per request was
+// ~6% of server CPU at 1000 sessions (#912), since every hosted request builds its own McpServer.
+const EMPTY_INPUT = z.strictObject({});
+const REGISTER_INPUT = z.strictObject({ child: z.string().min(1).max(1024), via: z.array(z.string().min(1).max(1024)).max(16).optional() });
+const END_INPUT = z.strictObject({ session: z.string().regex(SESSION_ID).optional() });
+const OPEN_INPUT = z.strictObject({ context: z.boolean().optional() });
+const RECEIPT_INPUT = z.strictObject({ ids: z.array(z.string().min(1).max(128)).max(100).refine(ids => new Set(ids).size === ids.length, "IDs must be distinct") });
 
 export type HostedRole = "native" | "subscriber";
 export function hostedRole(request: Request): HostedRole {
@@ -105,7 +112,7 @@ export function registerHostedResources(server: McpServer, context: {
     const { principal, sessionContext, session, request } = context.current();
     const capability = request.headers.get("X-Grayboard-Lease");
     if (!capability || !/^[A-Za-z0-9_-]{43}$/.test(capability) ||
-        delivery.describe(principal, sessionContext, capability, checked).identity.identity_full !== session.identityFull) {
+        delivery.identityFull(principal, sessionContext, capability, checked) !== session.identityFull) {
       throw new ApplicationError("not_found", "delivery lease or item not found");
     }
     return capability;
@@ -160,7 +167,7 @@ export function registerHostedResources(server: McpServer, context: {
       return toolError(error);
     }
   };
-  server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: z.strictObject({}) }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
+  server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: EMPTY_INPUT }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
   server.registerTool("bind", {
     description: "Add a name to this root's holds; never enrolls it for host admission.",
     inputSchema: HOSTED_BIND_INPUT,
@@ -176,15 +183,15 @@ export function registerHostedResources(server: McpServer, context: {
   });
   server.registerTool("session_register", {
     description: "Register a descendant under this top-level root before its native calls.",
-    inputSchema: z.strictObject({ child: z.string().min(1).max(1024), via: z.array(z.string().min(1).max(1024)).max(16).optional() }),
+    inputSchema: REGISTER_INPUT,
   }, (args, ctx) => run(ctx, () => hosted.register(context.current().principal, context.current().sessionContext, args.child, args.via)));
   server.registerTool("session_end", {
     description: "End this ownership, or remove one registered child without ending its root.",
-    inputSchema: z.strictObject({ session: z.string().regex(SESSION_ID).optional() }),
+    inputSchema: END_INPUT,
   }, (args, ctx) => run(ctx, () => hosted.end(context.current().principal, context.current().sessionContext, args.session)));
   server.registerTool("delivery_open", {
     description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items. context: false for a host that starts a turn for every item: non-waking items then wait for a waking one.",
-    inputSchema: z.strictObject({ context: z.boolean().optional() }),
+    inputSchema: OPEN_INPUT,
   }, (args, ctx) => run(ctx, async () => {
     const { principal, sessionContext } = context.current();
     const hooks = context.leaseHooks?.();
@@ -197,13 +204,13 @@ export function registerHostedResources(server: McpServer, context: {
     }
   }));
   server.registerTool("delivery_renew", {
-    description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
+    description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
   }, (_args, ctx) => run(ctx, checked => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked))));
   server.registerTool("delivery_receipt", {
     description: "Receipt issued delivery IDs only after durable host admission; not a DM handling acknowledgment.",
-    inputSchema: z.strictObject({ ids: z.array(z.string().min(1).max(128)).max(100).refine(ids => new Set(ids).size === ids.length, "IDs must be distinct") }),
+    inputSchema: RECEIPT_INPUT,
   }, (args, ctx) => run(ctx, checked => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked), args.ids)));
   server.registerTool("delivery_release", {
-    description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: z.strictObject({}),
+    description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
   }, (_args, ctx) => run(ctx, checked => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked))));
 }

@@ -1379,7 +1379,8 @@ test("#902: a bound native call reads its root's holds once, for the bound check
   const root = context("one-holds");
   if (!("id" in root)) throw new Error("fixture context");
   await hosted.bind(principal, root, { name: "be", create: true });
-  const prepare = spyOn(Database.prototype, "prepare");
+  // `prepare(sql)` hands out the connection's cached statement through `query` (#912).
+  const prepare = spyOn(Database.prototype, "query");
   try {
     await hosted.run(principal, root, "dm_send", session => application.send(session, "be", "held once"));
     // Before #902, named() and snapshot() each read them: two.
