@@ -12,10 +12,11 @@ import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { hashToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import type { Config } from "./config.ts";
-import { BUILTIN_CLIENT_IDS, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, type OAuthClient } from "./oauth-config.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_browser.ts";
+import { accessAudits } from "../../tests/support/audit.ts";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -55,7 +56,8 @@ beforeEach(() => {
   } });
   base = `http://127.0.0.1:${server.port}`;
   config = { dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "fake-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: base,
-    devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, messageRetentionDays: 90, auditRetentionDays: 90, oauthClients: registrations };
+    devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, messageRetentionDays: 90, auditRetentionDays: 90, oauthClients: registrations,
+    oauthCimdClients: [OPENCODE_CLIENT, "https://client.example/metadata.json", "https://client.example/client.json"] };
   service = makeService();
   mcp = createMcpHandler(({ requestInfo }) => {
     const principal = service.authenticate(requestInfo!);
@@ -176,14 +178,16 @@ test("CIMD refuses every issuer-origin redirect before creating a phishing flow"
   }
 });
 
-test("CIMD consent marks the self-declared name unverified, escapes it, and permits only its validated callback origin", async () => {
+test("CIMD consent heads with the client host, quotes the self-declared name escaped, escapes it, and permits only its validated callback origin", async () => {
   service.close();
   const clientId = "https://client.example/metadata.json";
   service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => JSON.stringify({ client_id: clientId, client_name: '<img src=x onerror="alert(1)">', redirect_uris: ["http://127.0.0.1/callback"], token_endpoint_auth_method: "none" }) });
   const a = authorization(clientId);
   const browser = new Browser();
   const consent = await loginConsent(browser, a.url);
-  expect(consent.content).toContain("Unverified client: client.example");
+  // The verified host heads the page; the document's name is only quoted as its claim (F-16).
+  expect(consent.content).toContain("<h1>Authorize client.example</h1>");
+  expect(consent.content).toContain("This client calls itself &lt;img");
   expect(consent.content).toContain("&lt;img");
   expect(consent.content).not.toContain("<img");
   const page = await browser.request(base + "/oauth/consent?request=" + consent.request);
@@ -191,6 +195,34 @@ test("CIMD consent marks the self-declared name unverified, escapes it, and perm
   expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' http://127.0.0.1:34567");
   expect((await decide(browser, consent, "approve", "null")).status).toBe(403);
   expect((await decide(browser, consent)).status).toBe(303);
+});
+
+test("only listed metadata documents are clients: no fetch, audit, no redirect; de-listing ends refresh (F-16)", async () => {
+  const listed = "https://client.example/metadata.json", unlisted = "https://attacker.example/client.json";
+  let lookups = 0, reads = 0;
+  const cimd = { resolve: async () => { lookups++; return [{ address: "8.8.8.8", family: 4 }]; },
+    read: async (url: URL) => { reads++; return JSON.stringify({ client_id: url.href, client_name: "Client", redirect_uris: ["https://attacker.example/cb"], token_endpoint_auth_method: "none" }); } };
+  service.close(); service = makeService(cimd);
+  // An unlisted document is never fetched, and a bad authorize request never redirects to its callback.
+  const u = new URL(authorization(unlisted, undefined, "https://attacker.example/cb").url); u.searchParams.set("response_type", "token");
+  const refused = await fetch(u, { redirect: "manual" });
+  expect(refused.status).toBe(400); expect(refused.headers.get("Location")).toBeNull();
+  expect([lookups, reads]).toEqual([0, 0]);
+  expect(accessAudits(storage.db, "oauth.cimd_refused").map(a => a.detail)).toEqual([{ reason: "not_allowed" }]);
+  // A listed client signs in; once the operator drops it, refresh is refused while it stays off the list, not retried.
+  const issued = await issue(listed, undefined, new Browser(), "https://attacker.example/cb");
+  const tokens = await redeem(issued);
+  service.close(); config = { ...config, oauthCimdClients: [] }; reads = 0; service = makeService(cimd);
+  const refresh = await post("/oauth/token", { grant_type: "refresh_token", client_id: listed, refresh_token: tokens.refresh_token });
+  expect(refresh.status).toBe(401); expect(await refresh.json()).toEqual({ error: "invalid_client" }); expect(reads).toBe(0);
+  expect((await (await fetch(base + "/.well-known/oauth-authorization-server")).json()).client_id_metadata_document_supported).toBe(false);
+  // Unset lists OpenCode's document only.
+  service.close(); const { oauthCimdClients: _, ...unset } = config; config = unset; service = makeService(cimd);
+  lookups = 0; reads = 0;
+  const unsetRefused = await fetch(authorization(listed, undefined, "https://attacker.example/cb").url, { redirect: "manual" });
+  expect(unsetRefused.status).toBe(400); expect([lookups, reads]).toEqual([0, 0]);
+  expect(accessAudits(storage.db, "oauth.cimd_refused").map(a => a.detail)).toEqual(Array(3).fill({ reason: "not_allowed" })); // unlisted authorize, de-listed refresh, unset default
+  expect((await (await fetch(base + "/.well-known/oauth-authorization-server")).json()).client_id_metadata_document_supported).toBe(true);
 });
 
 test("each built-in client completes code and refresh on a random loopback port with no operator registration", async () => {
@@ -201,9 +233,9 @@ test("each built-in client completes code and refresh on a random loopback port 
   for (const [i, clientId] of BUILTIN_CLIENT_IDS.entries()) for (const host of ["127.0.0.1", "[::1]"]) {
     const redirectUri = `http://${host}:${randomInt(1024, 65536)}/callback`;
     const issued = await issue(clientId, "grayboard:delivery grayboard:tools", new Browser(), redirectUri);
-    // Built-ins are in the server's own client map: named, not "Unverified", yet still a local callback.
+    // Built-ins are in the server's own client map: headed by name, not host, yet still a local callback.
     expect(issued.consent.content).toContain(`<h1>Authorize ${names[i]}</h1>`);
-    expect(issued.consent.content).not.toContain("Unverified client");
+    expect(issued.consent.content).not.toContain("calls itself");
     expect(issued.consent.content).toContain(`Redirect: ${redirectUri}`);
     expect(issued.consent.content).toContain("Local callback: only approve if you started this client.");
     const tokens = await redeem(issued);

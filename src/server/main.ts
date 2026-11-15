@@ -36,4 +36,6 @@ console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${met
 const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
 console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);
 console.log(`grayboard server: built-in clients: ${BUILTIN_CLIENT_IDS.join(", ")}`);
+const cimdClients = config.oauthCimdClients ?? [];
+console.log(`grayboard server: metadata-document clients: ${cimdClients.length ? cimdClients.join(", ") : "none"}`);
 
