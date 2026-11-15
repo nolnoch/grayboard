@@ -20,6 +20,11 @@ export function afterCommit(db: Database, effect: CommitEffect): void {
   }
 }
 
+// A check a connection runs before it opens a top-level transaction (the server's write-queue guard, #807). Core
+// stays off the server's queue: the server registers the check on its own connection.
+const topLevelGuards = new WeakMap<Database, () => void>();
+export function guardTopLevel(db: Database, check: () => void): void { topLevelGuards.set(db, check); }
+
 function trackCommits(db: Database): void {
   const frames: CommitEffect[][] = [];
   effects.set(db, frames);
@@ -28,6 +33,7 @@ function trackCommits(db: Database): void {
     const native = transaction(fn);
     const wrap = (invoke: (...args: A) => T) => (...args: A): T => {
       if (!frames.length && db.inTransaction) throw new Error("transaction requires a tracked outer boundary");
+      if (!frames.length) topLevelGuards.get(db)?.();
       const frame: CommitEffect[] = [];
       frames.push(frame);
       let value: T;
