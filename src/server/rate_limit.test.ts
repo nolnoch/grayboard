@@ -158,3 +158,16 @@ test("a sweep whose end hook throws for one key still sweeps the others, and ret
   expect(ends).toEqual(["b 1", "a 1"]);
   expect(l.size).toBe(0);
 });
+
+test("peek reports a token without counting a refusal, running a hook or allocating", () => {
+  const { l, clock, events } = limiter(1, 1);
+  expect(l.peek("a")).toBe(true);
+  expect(l.size).toBe(0);
+  l.spend("a");
+  expect(l.peek("a")).toBe(false);
+  expect(events).toEqual([]);
+  clock.t = 1000;
+  expect(l.peek("a")).toBe(true);
+  l.sweep();
+  expect(events).toEqual([]);
+});

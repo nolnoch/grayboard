@@ -921,7 +921,12 @@ test("a refused-refresh flood across addresses leaves the global bucket and ever
     expect(await refresh(`flood-${a}`, random())).toBe(429);
   }
   const scopes = () => storage.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'oauth.rate_limited'").all().map(r => JSON.parse(r.detail).scope);
-  expect(new Set(scopes())).toEqual(new Set(["token_address"]));
+  expect(scopes()).toContain("token_address");
+  expect(scopes()).not.toContain("global");
+  // The org-wide bound that's left is on the refusal rows: at most the burst,
+  // even past the address limiter's 1000-key cap, where addresses go uncharged.
+  for (let a = 0; a < 1100; a++) expect(await refresh(`spread-${a}`, random())).toBe(400);
+  expect(storage.db.query("SELECT 1 FROM access_log WHERE action = 'oauth.request_refused'").all().length).toBe(5);
   expect(await refresh("office", tokens.refresh_token)).toBe(200);
   expect((await service.fetch(new Request(authorization().url), { key: "office" }))!.status).toBe(303);
   // The other direction: browser routes from several addresses drain the

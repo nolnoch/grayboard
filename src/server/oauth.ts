@@ -110,10 +110,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
   // redirects that authorize errors follow, and a name the consent page shows.
   const cimdClients = new Set(config.oauthCimdClients ?? [OPENCODE_CLIENT]);
-  const resolveClient = async (id: string) => {
+  // audit false: the token routes write the refusal row only while
+  // refusalRows has room (F-18), so a bogus-post flood can't write one each.
+  const resolveClient = async (id: string, audit = true) => {
     const manual = clients.get(id);
     if (manual) return manual;
-    if (!cimdClients.has(id)) { writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
+    if (!cimdClients.has(id)) { if (audit) writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
     let client: OAuthClient | undefined;
     try { client = await cimd.resolve(id); }
     catch (error) { writeAudit(repo, "oauth.cimd_failed", null, null, { category: error instanceof CimdUnavailable ? "unavailable" : "unexpected" }); throw error; }
@@ -156,11 +158,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const globalLimit = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "global", 1);
   const addressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "address", 1000);
   const tokenAddressLimit = limiter(config.oauthLimit ?? { burst: 60, perSec: 1 }, "token_address", 1000);
+  // Thins the audit rows of refused token posts org-wide (F-18, #931). It is
+  // spent at the refusal and never checked before the work, so a flood of
+  // bogus refreshes can't make a valid one wait; while it's empty a refusal
+  // answers as usual but writes no row, and the streak's end row counts them.
+  // Past the address limiter's key cap this is the only bound on those writes.
+  const refusalRows = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "token_refusal", 1);
   let closed = false;
   const sweep = () => {
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
-    globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep();
+    globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep(); refusalRows.sweep();
     repo.oauth.cleanup(t);
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
@@ -173,9 +181,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // token refresh. They never touch the global bucket (F-18, #931): refused
   // refreshes from a handful of addresses would otherwise drain it and block
   // every refresh and sign-in in the org, and a browser-route flood would
-  // block refresh. Their work is database lookups and an allowlisted CIMD
-  // client, so the address bucket alone bounds a refused-grant loop. Every
-  // other route is charged on entry, against its address and the global one.
+  // block refresh. Their work is indexed reads and an allowlisted, cached CIMD
+  // client; their writes, the refusal audit rows, are thinned org-wide by
+  // refusalRows. Every other route is charged on entry, against its address
+  // and the global one.
   type Buckets = readonly (readonly [RateLimiter, string])[];
   const buckets = (context: OAuthNetworkContext | undefined, token: boolean): Buckets => token
     ? [[tokenAddressLimit, context?.key ?? "unknown"]]
@@ -220,7 +229,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         password = decodeURIComponent(decoded.slice(colon + 1).replace(/\+/g, " "));
       } catch { return fail("invalid_client", 401); }
     } else id = p.get("client_id") ?? "";
-    const c = await resolveClient(id!);
+    const c = await resolveClient(id!, refusalRows.peek("global"));
     if (closed) fail("temporarily_unavailable", 503);
     if (!c) fail("invalid_client", 401);
     if (c!.tokenEndpointAuthMethod === "none") {
@@ -451,7 +460,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       } catch (e) {
         if (!(e instanceof OAuthError)) throw e;
         if (!material) return refusal(e);
-        if (e.status < 500) spend(checks, path);
+        if (e.status < 500) {
+          spend(checks, path);
+          if (!refusalRows.take("global", { path: routeName(path) }).ok) return refusal(e);
+        }
         throw e;
       }
     }
