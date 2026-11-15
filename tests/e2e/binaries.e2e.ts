@@ -102,6 +102,8 @@ async function serverFromEnvFile(): Promise<{ server: ServerProcess; dbPath: str
     // Inbox polling spends hosted requests.
     "GRAYBOARD_HOSTED_REQUEST_BURST=10000",
     "GRAYBOARD_HOSTED_REQUEST_PER_SEC=10000",
+    "GRAYBOARD_HOSTED_SUBSCRIBER_BURST=10000",
+    "GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC=10000",
     "",
   ].join("\n"));
   const { GRAYBOARD_DB_PATH: dbPath, ...env } = readEnvFile(envFile);

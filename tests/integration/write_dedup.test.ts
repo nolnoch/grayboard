@@ -142,6 +142,7 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
       BUS_TEST_PAUSE: PAUSE, BUS_TEST_PAUSE_FILE: go(),
       // Inbox polling spends hosted requests.
       GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000",
+      GRAYBOARD_HOSTED_SUBSCRIBER_BURST: "10000", GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC: "10000",
     });
     // Grants written through the server's database beside the running
     // process (WAL), as a finished hosted login leaves them. ServerProcess's

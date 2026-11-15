@@ -10,7 +10,7 @@ import { Plugin, Provider, Model } from "@opencode/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { startServer } from "../../../src/server/app.ts";
 import type { DeliveryEvent } from "../../../src/server/application.ts";
-import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
+import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
@@ -38,7 +38,7 @@ const { default: plugin, Grayboard } = await import(pathToFileURL(join(installed
 const subscriberWork = await observeSubscriberWork(installed);
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp";
 let email = "you@example.com", google = 0, cimd = 0, codes = 0, refreshes = 0, callbackOrigin = "", modelCalls = 0;
-const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_REQUEST_LIMIT : { burst: 10000, perSec: 10000 } };
+const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "blobs"), httpPort: 0, googleClientId: "fake-google", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_REQUEST_LIMIT : { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission") ? DEFAULT_HOSTED_SUBSCRIBER_LIMIT : { burst: 10000, perSec: 10000 } };
 const admissionCase = process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission");
 let admissionNow: number | undefined;
 let admissionGate: SubscriberAdmission | undefined;
@@ -357,18 +357,25 @@ try {
     const message = app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/admission", "Actionable delivery recovers after actual HTTP429", null, false); app.application.wake(["you@example.com/admission"]);
     try {
       await bounded(gate.entered.promise, 20_000, "Exact-root subscriber request held before actual backend admission");
-      await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
+      // Delivery upkeep has its own per-user bucket (#845): the drain spends it as the subscriber role, sessionless.
+      await drain.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: "Bearer " + grant.access, "X-Grayboard-Client": "subscriber" } }, fetch: async (input, init) => { const response = await fetch(input, init); last = response.clone(); return response; } }));
       let refused = false;
-      for (let id = 0; id < DEFAULT_HOSTED_REQUEST_LIMIT.burst * 2; id++) {
-        const raw = "refused-admission-" + id;
-        try { await drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }); }
+      const rowsBefore = app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n;
+      for (let id = 0; id < DEFAULT_HOSTED_SUBSCRIBER_LIMIT.burst * 2; id++) {
+        try { await drain.listTools(); }
         catch { assert.equal(last?.status, 429, "Official modern client receives typed admission refusal"); }
         const response = last!;
         if (response.status !== 429) { assert(response.ok); continue; }
         const body = await response.json() as { id: number; error: { data: { code: string; retry_after_ms: number } } };
         assert.equal(typeof body.id, "number"); assert.equal(body.error.data.code, "rate_limited"); assert(body.error.data.retry_after_ms > 0);
         assert.equal(response.headers.get("Retry-After"), String(Math.ceil(body.error.data.retry_after_ms / 1000)));
-        assert.equal(row(raw), null, "Refused admission creates no hosted source row"); refused = true; break;
+        // With the bucket spent, a refused request that names a fresh source session must leave no row for it.
+        const raw = "refused-admission-" + id;
+        last = undefined as Response | undefined; // widened: the fetch closure reassigns it
+        await assert.rejects(drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }));
+        assert.equal(last?.status, 429, "A session-naming request is refused at admission too");
+        assert.equal(row(raw), null, "Refused admission creates no hosted source row");
+        assert.equal(app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n, rowsBefore, "Refused admission creates no hosted row at all"); refused = true; break;
       }
       assert(refused, "Unmodified production default burst is enforced");
       gate.releaseInitial();
@@ -386,7 +393,7 @@ try {
         console.log("REAL_DEFAULT_ADMISSION_ACCOUNT_GUARD_OK", { subscriberThrottles, admissions: admissions.length });
       } else {
         gate.requireRefused();
-        admissionNow += DEFAULT_HOSTED_REQUEST_LIMIT.burst / DEFAULT_HOSTED_REQUEST_LIMIT.perSec * 1000;
+        admissionNow += DEFAULT_HOSTED_SUBSCRIBER_LIMIT.burst / DEFAULT_HOSTED_SUBSCRIBER_LIMIT.perSec * 1000;
         gate.releaseRecovery();
         await wait(() => app.repo.cursors.directFor("you@example.com/admission"), n => n === message.id, "actual plugin recovers shared default admission", 30_000);
         assert(subscriberThrottles > 0); assert(admissions.length >= 1); assert.equal(new Set(admissions.map(input => input.id)).size, 1); assert(admissions.every(input => input.sessionID === s.id));

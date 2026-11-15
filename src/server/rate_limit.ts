@@ -7,6 +7,11 @@ export { retrySecs, type RateLimit, type StreakContext, type StreakHooks, type T
 
 export const DEFAULT_HELLO_LIMIT: RateLimit = { burst: 60, perSec: 1 };
 export const DEFAULT_HOSTED_REQUEST_LIMIT: RateLimit = { burst: 120, perSec: 20 };
+// Delivery upkeep (role=subscriber: renews, inbox reads, receipts) has its own per-user bucket, so one
+// user's fan-out can't throttle that user's tool calls (#845). Sized for the default 32 leases per user:
+// burst = 32 leases x 5 requests (c + 1: a delivery's 4, a read, two renews and a receipt, plus one) x 1.5; rate = 32 x (0.2 idle +
+// 0.25 deliveries/s x 4 requests), rounded up. docs/guide/server.md §Sizing the caps has the formula.
+export const DEFAULT_HOSTED_SUBSCRIBER_LIMIT: RateLimit = { burst: 240, perSec: 40 };
 export const DEFAULT_AUTH_FAIL_LIMIT: RateLimit = { burst: 60, perSec: 1 };
 
 export class RateLimiter extends CoreRateLimiter {

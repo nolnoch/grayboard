@@ -238,8 +238,9 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
 });
 
 test("a start option overrides the config's limit, and an explicit undefined one doesn't wipe it (#385 item 14)", () => {
-  const config = { helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 } };
-  expect(startLimits(config, { helloLimit: undefined, hostedRequestLimit: undefined })).toMatchObject(config);
+  const config = { helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedSubscriberLimit: { burst: 11, perSec: 5 } };
+  expect(startLimits(config, { helloLimit: undefined, hostedRequestLimit: undefined, hostedSubscriberLimit: undefined })).toMatchObject(config);
+  expect(startLimits(config, { hostedSubscriberLimit: { burst: 13, perSec: 6 } })).toMatchObject({ hostedSubscriberLimit: { burst: 13, perSec: 6 }, hostedRequestLimit: config.hostedRequestLimit });
   expect(startLimits(config, { helloLimit: { burst: 9, perSec: 9 } })).toMatchObject({ helloLimit: { burst: 9, perSec: 9 }, hostedRequestLimit: config.hostedRequestLimit });
   // delegate's limits come from the config too (#252).
   const delegate = { delegateLimit: { burst: 5, perSec: 0.5 }, delegateOpenCap: 4 };
