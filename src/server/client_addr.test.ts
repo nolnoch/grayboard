@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 
-import { clientAddress, DEFAULT_TRUSTED_PROXIES, normalizeIp, parseCidr, rateKey, TrustedProxies } from "./client_addr.ts";
+import { clientAddress, DEFAULT_TRUSTED_PROXIES, normalizeIp, parseCidr, rateKey, siteKey, TrustedProxies } from "./client_addr.ts";
 
 const loopback = new TrustedProxies(DEFAULT_TRUSTED_PROXIES);
 const none = new TrustedProxies([]);
@@ -74,6 +74,13 @@ test("IPv4 keys by address, IPv6 by its /64", () => {
   expect(rateKey("2001:db8::1")).toBe("2001:db8:0:0::/64");
   expect(rateKey("::1")).toBe("0:0:0:0::/64");
   expect(rateKey("64:ff9b::192.0.2.1")).toBe("64:ff9b:0:0::/64");
+});
+
+test("IPv6 has a /48 site key; IPv4 has none (#274)", () => {
+  expect(siteKey("198.51.100.1")).toBeNull();
+  expect(siteKey("2001:db8:1:2:3:4:5:6")).toBe("2001:db8:1::/48");
+  expect(siteKey("2001:db8:1:ffff::9")).toBe("2001:db8:1::/48");
+  expect(siteKey("2001:db8::1")).toBe("2001:db8:0::/48");
 });
 
 test("CIDRs validate and normalise; a bare IP is a host route", () => {
