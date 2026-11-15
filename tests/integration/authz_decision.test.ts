@@ -297,4 +297,30 @@ describe("pre-seam refusals", () => {
     const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "hosted.session");
     expect(got.map((r) => [r.actor, r.target, r.detail.rule, r.detail.session])).toEqual([[B, forged, "hosted.other_user", mine]]);
   });
+
+  test("a download another identity can't read reads as missing, as before, and leaves its download_refused row and one decision row; a readable one leaves none", async () => {
+    const aToken = await srv.login(A);
+    expect((await srv.api(aToken, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const [a, b, c] = await Promise.all([srv.hosted(A, "be"), srv.hosted(B, "fe"), srv.hosted(C, "sim")]);
+    const up = async (name: string) => (await a.uploadRaw(name, "hello")).body.id as number;
+    const [unsent, onDm, onPost] = [await up("u.txt"), await up("d.txt"), await up("p.txt")];
+    await a.call("dm_send", { to: `${B}/fe`, body: "file", attachment_ids: [onDm] });
+    await a.call("board_create", { name: "plans", purpose: "p", team: "eng" });
+    await a.call("board_post", { board: "plans", body: "file", attachment_ids: [onPost] });
+    expect((await b.attachmentRaw("GET", `/${onDm}`)).status).toBe(200);
+    const unknown = 999_999;
+    for (const id of [unsent, onDm, onPost, unknown]) {
+      const r = await c.attachmentRaw("GET", `/${id}`);
+      expect(r.status).toBe(404);
+      expect(await r.json()).toEqual({ code: "not_found", message: `no attachment ${id} on a message or post you can read` });
+    }
+    expect(accessAudits(srv.app.db, "attachment.download_refused").map((r) => [r.actor, r.target])).toEqual([unsent, onDm, onPost, unknown].map((id) => [C, `attachment:${id}`]));
+    const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "attachment.read");
+    expect(got.map((r) => [r.actor, r.target, r.detail.allow, r.detail.rule, r.detail.code, r.detail.identity, r.detail.address])).toEqual([
+      [C, `attachment:${unsent}`, false, "attachment.uploader", "not_found", `${C}/sim`, `${C}/sim`],
+      [C, `attachment:${onDm}`, false, "attachment.dm_party", "not_found", `${C}/sim`, `${C}/sim`],
+      [C, `attachment:${onPost}`, false, "attachment.board_visible", "not_found", `${C}/sim`, `${C}/sim`],
+      [C, `attachment:${unknown}`, false, "attachment.unknown", "not_found", `${C}/sim`, `${C}/sim`],
+    ]);
+  });
 });

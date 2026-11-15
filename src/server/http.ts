@@ -5,7 +5,7 @@ import {
   verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
-import { readableAttachment, releaseStored, storeUpload } from "./attachments.ts";
+import { readableAttachment, releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
@@ -352,11 +352,9 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
   if (handle instanceof Response) return handle;
-  const row = readableAttachment(repo, db, handle, Number(idStr), authed.user_email, authed.user_email);
-  if (!row) {
-    writeAudit(repo, "attachment.download_refused", authed.user_email, `attachment:${idStr.slice(0, 32)}`, { identity: handle });
-    return jsonErr("not_found", `no attachment ${idStr.slice(0, 32)} on a message or post you can read`, 404);
-  }
+  const read = requestAttachment(repo, db, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
+  if ("refused" in read) return jsonErr("not_found", read.refused, 404);
+  const { row } = read;
   // Audited once the bytes are in hand, so a failed read isn't logged as a download.
   let data: Uint8Array<ArrayBuffer>;
   try {

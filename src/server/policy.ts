@@ -5,7 +5,10 @@
 // team management and admin routes); filter checks (board visibility, mention
 // fan-out, a thread reply's reach, the alias sweep) write no rows. The rule
 // helpers below are this module's own: nothing else calls them (policy.test.ts).
+// One rule's body lives in core, shared with local mode: attachment.read names
+// the rule from core's attachmentReach facts (who may read is canReadAttachment's).
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
+import type { AttachmentReach } from "../core/attachments.ts";
 import type { Principal } from "../core/resolver.ts";
 import { HUMAN_NAME, HUMAN_RESERVED } from "../shared/addressing.ts";
 import { writeAudit } from "./audit.ts";
@@ -28,7 +31,9 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // principal owns has a null scope); session.act: an HTTP `as` naming a session
 // ID, with that ID's row as the caller found it; hosted.session: a hosted MCP
 // request reaching a hosted session row (its own, or a session_end target), by
-// the requester's and the row's user ID and OAuth client; team.read / team.manage /
+// the requester's and the row's user ID and OAuth client; attachment.read: an
+// identity downloading an attachment (by its requested ID's text), with core's
+// facts of its carrier (none: no such attachment); team.read / team.manage /
 // team.leave: a user reading, changing or leaving a team's membership; admin: an
 // admin route; msg.wake: whether a delivery written by one signed-in user
 // wakes a session of another (users by email: the writer recorded at write
@@ -40,6 +45,7 @@ export type AuthzRequest =
   | { verb: "act_as"; principal: Principal; address: string; name: string; scope: ActScope | null }
   | { verb: "session.act"; user: string; session: string; row: SessionFacts | undefined }
   | { verb: "hosted.session"; session: string; user: number; client: string; row: { user: number; client: string } }
+  | { verb: "attachment.read"; identity: string; attachment: string; reach: AttachmentReach | undefined }
   | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
   | { verb: "admin"; email: string }
   | { verb: "msg.wake"; from_user: string; to_user: string };
@@ -83,6 +89,13 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       if (req.row.user !== req.user) return deny("hosted.other_user", "session not found", "not_found");
       if (req.row.client !== req.client) return deny("hosted.other_client", "session not found", "not_found");
       return allow("hosted.own");
+    case "attachment.read": {
+      // Anything unreadable reads as missing, not forbidden (docs/boards.md).
+      const missing = `no attachment ${req.attachment} on a message or post you can read`;
+      if (!req.reach) return deny("attachment.unknown", missing, "not_found");
+      const rule = { post: "attachment.board_visible", message: "attachment.dm_party", unbound: "attachment.uploader" }[req.reach.carrier];
+      return req.reach.readable ? allow(rule) : deny(rule, missing, "not_found");
+    }
     case "team.leave":
       return req.team && repo.teams.isMember(req.team.id, req.user.id) ? allow("team.member") : deny("team.member", "not found", "not_found");
     case "team.read": {
@@ -126,6 +139,8 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
       return { target: req.session, detail: { session_requested: req.session } };
     case "hosted.session":
       return { target: req.session, detail: { session_requested: req.session, client: req.client } };
+    case "attachment.read":
+      return { target: `attachment:${req.attachment}`, detail: { identity: req.identity } };
     case "team.read":
     case "team.manage":
     case "team.leave":
