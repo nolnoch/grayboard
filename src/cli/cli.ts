@@ -1095,6 +1095,14 @@ teamCmd
     catch (e) { handleApiError(e); }
   });
 
+teamCmd
+  .command("delete-alias <team> <name>")
+  .description("Delete a team's name no session is using, freeing a slot under the server's per-scope cap. Team owners and admins")
+  .action(async (team: string, name: string) => {
+    try { output(await makeClient().post(`/api/teams/${team}/delete-alias`, { name }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
 // ── admin ─────────────────────────────────────────────────────────────────────
 
 const adminCmd = program
