@@ -501,7 +501,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // authorized(p) just passed, with no await since: settle skips p's own disabled read (#881).
         const settled = settle(context.id, p.authed.user_id);
         const later = refusalRows();
-        const row = (() => { try { return store.atomic(() => { const r = rowFor(p, context, later.defer, true, wake, declare, settled)!; touch(r); return r; }); } catch (e) { later.flush(); throw e; } })();
+        const row = await (async () => { try { return await store.write(() => { const r = rowFor(p, context, later.defer, true, wake, declare, settled)!; touch(r); return r; }); } catch (e) { later.flush(); throw e; } })();
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         const ids = [...new Set([row.session_id, id])];
         for (const s of ids) inflight.set(s, (inflight.get(s) ?? 0) + 1);
@@ -528,7 +528,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     const result = await gate(id).call(async () => {
       authorized(p);
       if (stopped) return MISS;
-      const row = store.atomic(() => {
+      const row = await store.write(() => {
         const fresh = store.get(prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? store.get(fresh.root_session_id) : fresh;
         const t = now();
@@ -653,7 +653,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         selected.session.afterRollback = late.defer;
         try {
           await testPauseAsync("hosted:tool:in-gate");
-          return store.atomic(() => {
+          return await store.write(() => {
             fence(p, row, root);
             const value = fn(selected.session);
             if (value instanceof Promise) throw new Error("hosted native effects must be synchronous");
@@ -693,9 +693,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         rootOnly(row);
         await testPauseAsync("hosted:owning:before-txn");
         const late = refusalRows();
-        let result: T;
-        try { result = store.atomic(() => fn(attach(p, row), late.defer)); } catch (error) { late.flush(); throw error; }
-        return committed ? committed(result) : result as unknown as R;
+        // `committed` runs right after the commit, before the queue's next body (the lease maps it fills are
+        // every open's cap check); its own failure isn't a rollback, so it flushes no refusal rows.
+        let done = false;
+        try {
+          return await store.write(() => fn(attach(p, row), late.defer), result => { done = true; return committed ? committed(result) : result as unknown as R; });
+        } catch (error) { if (!done) late.flush(); throw error; }
       });
     },
     async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T): Promise<T> {
@@ -810,7 +813,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (index < ids.length) return gate(ids[index]!).bind(() => locked(index + 1));
         await testPauseAsync("hosted:register:before-txn");
         const later = refusalRows();
-        try { return store.atomic(() => {
+        try { return await store.write(() => {
           authorized(p);
           testPause("hosted:register:in-txn");
           const root = rowFor(p, context, later.defer)!;
@@ -854,7 +857,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (row.root_session_id && target !== row.session_id) rootOnly(row);
         const root = rootOf(row);
         const later = refusalRows();
-        try { store.atomic(() => {
+        try { await store.write(() => {
           fence(p, row, root);
           const candidate = store.get(target);
           if (candidate) ownRow(p, candidate, later.defer, row.session_id);

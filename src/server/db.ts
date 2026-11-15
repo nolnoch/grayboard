@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
 import { testPause } from "../shared/testpause.ts";
+import { queueFor } from "./store/queue.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -89,11 +90,27 @@ const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 // nothing can await between a transaction's reads and its writes.
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 
+// A top-level write transaction, through db's write queue. `committed` runs after the commit and before the queue's
+// next body (D4: in-memory state a transaction reads changes only inside one or right after its commit, never in
+// the gap before its caller resumes). Its result is boxed, so a promise it returns doesn't hold the queue.
+function queued<T, R>(db: Database, fn: () => T, committed?: (value: T) => R): Promise<Awaited<R>> {
+  if (db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls atomic"));
+  return queueFor(db).run(() => {
+    const value = db.transaction(fn).immediate() as T;
+    return { out: committed ? committed(value) : value as unknown as R };
+  }).then(box => box.out) as Promise<Awaited<R>>;
+}
+
 export interface Repo {
   // The server's clock, for rows written outside the Repo too (writeAudit).
   now(): number;
   // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
   atomic<T>(fn: () => Sync<T>): T;
+  // Runs fn in one IMMEDIATE transaction through the server's write queue (store/queue.ts): the form for a
+  // transaction's outermost caller. Inside an open transaction it refuses, since a nested body can't wait for
+  // the queue its own transaction holds; nested code calls atomic. `committed(value)` runs after the commit, before
+  // the queue's next body: in-memory state the transaction's readers see changes there, not after the await.
+  write<T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
   authRead<T>(fn: () => Sync<T>): T;
@@ -795,6 +812,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
+    write: <T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     authRead<T>(fn: () => Sync<T>): T {
       if (pinned !== null || db.inTransaction) return fn() as T;
       pinned = readGeneration();
@@ -1673,6 +1691,7 @@ function makeHostedStore(db: Database): HostedStore {
   };
   const store: HostedStore = {
     atomic: fn => db.transaction(fn).immediate(),
+    write: (fn, committed) => queued(db, fn, committed),
     subscribe: () => () => {},
     get,
     owned: (id) => db.query<{ n: number }, [string, string]>(
