@@ -1,4 +1,4 @@
-import { LOCAL_UNDELIVERED_FROM_SQL } from "./binding.ts";
+import { LOCAL_MSG_COLS, LOCAL_SENT_PENDING_SQL, LOCAL_UNDELIVERED_FROM_SQL } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 import { SqliteBlobs } from "./blobs.ts";
 import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments, type Uploader } from "../core/attachments.ts";
@@ -51,7 +51,6 @@ export type Message = {
 // session's provenance, kept in the database and left out of reads; via
 // (#523) is shown, since it names a child writer its root's address hides.
 const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, delivered_at, pending, kind, via`;
-const M_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind, m.via`;
 
 // Stores the message from session `senderId` and binds the uploads `ids` of
 // `uploader` (the session's addresses, #284 S5; local mode has one user, so
@@ -146,7 +145,7 @@ function threadRows(id: number): Message[] {
        thread AS (
          SELECT ${MSG_COLS} FROM messages WHERE id = (SELECT id FROM up WHERE parent_id IS NULL)
          UNION ALL
-         SELECT ${M_MSG_COLS} FROM messages m
+         SELECT ${LOCAL_MSG_COLS} FROM messages m
          JOIN thread t ON m.parent_id = t.id
        )
        SELECT * FROM thread ORDER BY id ASC`,
@@ -222,7 +221,7 @@ export function ackMessage(reader: string, id: number): void {
 export function receivedUnacked(readers: string[], since: number): Message[] {
   return withAttachments(db, "message", db
     .prepare(
-      `SELECT ${M_MSG_COLS} FROM messages m
+      `SELECT ${LOCAL_MSG_COLS} FROM messages m
         WHERE m.recipient IN (SELECT value FROM json_each(?)) AND m.sender != m.recipient AND m.created_at >= ?
           AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
         ORDER BY m.id ASC`,
@@ -233,14 +232,7 @@ export function receivedUnacked(readers: string[], since: number): Message[] {
 // Messages the address set `senders` sent pending since `since` that weren't
 // acked, oldest first.
 export function sentPending(senders: string[], since: number): Message[] {
-  return withAttachments(db, "message", db
-    .prepare(
-      `SELECT ${M_MSG_COLS} FROM messages m
-        WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
-          AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
-        ORDER BY m.id ASC`,
-    )
-    .all(JSON.stringify(senders), since) as Message[]);
+  return withAttachments(db, "message", db.prepare(LOCAL_SENT_PENDING_SQL).all(JSON.stringify(senders), since) as Message[]);
 }
 
 // Deletes a message `sender` sent that the recipient's session hasn't received

@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { LOCAL_UNDELIVERED_FROM_SQL, QUEUED_FOR_SQL } from "./binding.ts";
+import { LOCAL_SENT_PENDING_SQL, LOCAL_UNDELIVERED_FROM_SQL, QUEUED_FOR_SQL } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 import { AUDIT_LOG_LAST_SQL } from "../core/audit.ts";
 
@@ -16,6 +16,19 @@ test("undeliveredFrom uses the reader PK, not a cursors scan", () => {
   const detail = plan.map(p => p.detail).join(" ");
   expect(detail).toContain("SEARCH c USING");
   expect(detail).not.toContain("SCAN cursors");
+});
+
+// #859: both sender-keyed statements seek messages by sender; without the
+// index each scanned the whole DM history, at every session start.
+test("undeliveredFrom and sentPending search messages by sender, never scan it", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const detail = (sql: string, ...args: (string | number)[]) =>
+    (db.prepare("EXPLAIN QUERY PLAN " + sql).all(...args) as { detail: string }[]).map((p) => p.detail).join(" ");
+  for (const plan of [detail(LOCAL_UNDELIVERED_FROM_SQL, JSON.stringify(["fe"]), Number.MAX_SAFE_INTEGER),
+                      detail(LOCAL_SENT_PENDING_SQL, JSON.stringify(["fe"]), 0)]) {
+    expect(plan).toContain("SEARCH m USING INDEX idx_messages_sender_id (sender=?)");
+    expect(plan).not.toContain("SCAN m");
+  }
 });
 
 // #182 audit 27: an unbound start counts queued DMs for its candidate names

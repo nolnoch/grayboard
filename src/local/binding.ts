@@ -729,6 +729,15 @@ export async function declareLocalHuman(db: Database, handle: string, socks?: st
 // opens its own). Exported for the plan pin in db.test.ts.
 // db.ts's undeliveredFrom. Here, not there, so the EXPLAIN pin (db.test.ts) can
 // assert the exact statement: importing db.ts opens this process's bus.
+// A message row's columns, as src/local/db.ts reads them.
+export const LOCAL_MSG_COLS = `m.id, m.sender, m.recipient, m.body, m.parent_id, m.created_at, m.delivered_at, m.pending, m.kind, m.via`;
+// sentPending (src/local/db.ts): the senders' pending DMs, unacked, oldest
+// first. Here beside undeliveredFrom for the same EXPLAIN pin (#859).
+export const LOCAL_SENT_PENDING_SQL = `SELECT ${LOCAL_MSG_COLS} FROM messages m
+        WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.pending = 1 AND m.created_at >= ?
+          AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
+        ORDER BY m.id ASC`;
+
 export const LOCAL_UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MIN(m.id) AS oldest_id FROM messages m
         LEFT JOIN cursors c ON c.reader = m.recipient
         WHERE m.sender IN (SELECT value FROM json_each(?)) AND m.recipient != m.sender
