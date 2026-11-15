@@ -162,6 +162,8 @@ OpenCode V2 attachment transforms (`adapters/opencode-v2/src/transfer-tools.ts`)
 
 `Repo` (`src/server/db.ts`) is the only server-side store interface. Porting means reimplementing `Repo` and `src/core/` against Postgres and re-encoding the DDL. Core `endSession` reaches the server's mail only through `Repo.mail` (core's `MailPort`), and access asks `Repo.resolver` (core's `Resolver`) for principals, so a port reimplements those two interfaces rather than their callers. Attachment bytes sit behind `Repo`'s async `BlobStore` (`src/core/attachments.ts`), so moving them to an object store means another `BlobStore`, not a change to callers. `src/server/db.test.ts` enforces that nothing else in the server tree imports `bun:sqlite`. `src/local/` and `src/bridge/` stay on SQLite and are excluded.
 
+The per-request authorization reads (`oauth.ts` live access, `users.isDisabled`) are cached on `Repo.authGeneration()` (#853): TEMP triggers on `oauth_tokens`, `oauth_grants` and `users` bump a connection-local counter, paired with `data_version` so a write through another connection or process also clears the cache; inside a transaction the generation is undefined (the counter rolls back with it) and the cache is bypassed. A port has no `data_version`: it needs the generation in shared storage (a row or `LISTEN/NOTIFY`), or a revocation written by another server instance never clears this one's cache.
+
 ## 7. Build and deploy
 
 - `bun build --compile` produces self-contained binaries (Bun runtime bundled). Every target cross-compiles on Linux runners (only the darwin-arm64 binaries suite runs on macOS); a native dependency that can't cross-compile would break that. Release process: `AGENTS.md` §Releasing.
