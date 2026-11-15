@@ -1454,6 +1454,34 @@ test("a call within the touch window leaves last_seen_at; one past it moves it, 
   hosted.close();
   hosted = createHostedSessions(application, { now: () => now, idleSeconds: 2, isAuthorized: () => authorized });
   const before = seen("root");
-  now += 200; await hosted.whoami(principal, context("root"));
+  now += 199; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(before);
+  now += 1; await hosted.whoami(principal, context("root"));
   expect(seen("root")).toBe(before + 200);
+});
+
+test("a child's native tool call under its exchange's verdict coalesces its touches and its root's (#912)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  const seen = (raw: string) => database.repo.hosted.get(hostedId(raw))!.last_seen_at;
+  const call = async () => {
+    const { verdict } = await hosted.snapshot(principal, context("child"), false);
+    const touches = spyOn(database.repo.hosted, "touch");
+    try { await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[0]); }
+    finally { touches.mockRestore(); }
+  };
+  const start = [seen("root"), seen("child")];
+  now += 4_999;
+  // The exchange's selection is past the window's start, so this call's own touches are the gate's only writes.
+  expect(await call()).toEqual([]);
+  expect([seen("root"), seen("child")]).toEqual(start);
+  now += 5_000;
+  const { verdict } = await hosted.snapshot(principal, context("child"), false);
+  now += 5_000;
+  const touches = spyOn(database.repo.hosted, "touch");
+  await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", "late"), undefined, verdict);
+  const touched = touches.mock.calls.map(c => c[0]).sort();
+  touches.mockRestore();
+  expect(touched).toEqual([hostedId("child"), hostedId("root")].sort());
+  expect([seen("root"), seen("child")]).toEqual([now, now]);
 });
