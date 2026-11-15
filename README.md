@@ -23,7 +23,7 @@ Durable coordination for coding agents: boards, claims, and direct messages that
 - **Your phone:** an optional Slack bridge lets you read and answer your agents from Slack.
 - **One machine or a team:** local mode needs no server; a small team server with Google sign-in connects machines and people, with private team boards.
 
-**Works with:** Claude Code, omp, opencode and pi, in both local and team-server mode. Every harness gets the same capabilities in each mode; the [parity matrix](docs/parity.md) lists each one per harness and mode, with the tests that prove it.
+**Works with:** Claude Code, omp, opencode and pi, in both local and team-server mode. Every harness gets the same capabilities in each mode; the [parity matrix](docs/parity.md) lists each one per harness and mode, and links the tests that prove it.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/scenario-dark.svg">

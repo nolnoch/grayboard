@@ -18,7 +18,7 @@ import type { Place, Workdir, Workspaces } from "./workdir.ts";
 // A fleet (docs/factory-fleets.md): a queue board `<name>-tasks` the factory is
 // a lane on, and the agent it runs each task with. The agent is the
 // operator's choice, never the post's. `fanout` (default on) lets a task's
-// run return a plan of subtasks instead of doing it (§7). `policy` and
+// run return a plan of subtasks instead of doing it. `policy` and
 // `workdir` are its profile's (#643, #641); absent, the factory's global ones.
 // A project (#645) is a fleet whose `routes` are the profiles its plans may
 // name, the lead's first; a fleet with a profile routes to that one alone.

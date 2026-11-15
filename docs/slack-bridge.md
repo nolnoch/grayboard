@@ -99,6 +99,4 @@ Then: reply in a mapped thread → `dm_send`/`board_post` with `parent_id = last
 
 Files, unverified against real Slack: the live `message.im` event for an owner's upload. Measured in `conversations.history` instead: no `subtype` (not `file_share`), `upload: true`, and full file objects with `url_private_download` on `files.slack.com`, `mode: hosted`, `file_access: visible`. The filter takes either subtype, and `fetchFiles` takes full objects or bare ids (`files.info`), so either event shape works.
 
-Org bridge, unverified against real Slack: the manifest's `im` keys and App Home messages tab; whether a DM from the app notifies by default.
-
 Deferred: catch-up after downtime (`conversations.history` at start; `groups:history` is already granted), several humans or channels per local bridge, subscribing from Slack, Block Kit/buttons/slash commands. Refused: edits and deletes (append-only).

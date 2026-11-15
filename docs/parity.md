@@ -2,7 +2,7 @@
 
 ```doc-meta
 owns: capability parity across harnesses and modes: per harness × mode cell, supported, gap (issue) or n/a (reason), and where it is proven
-invariants: parity by addition (a cell becomes supported without taking anything from another cell); a feature or fix PR names the cells it changes; a gap cell links an issue or says unfiled; mechanisms stay in their owner docs, this doc holds status, reasons and proof
+invariants: parity by addition (a cell becomes supported without taking anything from another cell); a feature or fix PR names the cells it changes; a gap cell links an issue or says unfiled; mechanisms stay in their owner docs, this doc holds status; each row's reasons and proof are in parity-delivery.md (rows 1–8) and parity-access.md (rows 9–16)
 code-pointers: adapters/pi/, adapters/omp/, adapters/opencode/, adapters/pi-family/, adapters/opencode-v2/, adapters/hosted-core/src/, plugins/claude-code/src/, src/local/mcp.ts, src/server/hosted.ts
 companions: parity-delivery.md (rows 1–8), parity-access.md (rows 9–16), adapters.md, adapters-hosted.md (adapter and push mechanics), handles.md, child-sessions.md, sessions.md (handles, child sessions, name record), server-hosted-mcp.md, server-oauth.md (hosted wire and login), slack-bridge.md (human handles)
 ```
@@ -61,7 +61,7 @@ Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–19:
 
 ## Maintaining parity
 
-- A feature or fix PR names the cells it changes (row number and column) and updates this doc in the same change.
+- A feature or fix PR names the cells it changes (row number and column) and updates this doc and the row's proof (`parity-delivery.md`, rows 1–8; `parity-access.md`, rows 9–16) in the same change.
 - A new capability lands in every applicable cell, or files a gap issue per cell it leaves and adds the row with those gap cells. An n/a cell states why the capability can't apply. Local mode is the single-user edition (`vision.md` §1): a capability that only means something with more than one principal (roles, grants, service principals, cross-user policy) is n/a in every local cell, not a gap.
 - Parity by addition: moving a cell to supported never removes a capability from another cell.
 

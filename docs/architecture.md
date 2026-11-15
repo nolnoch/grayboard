@@ -4,7 +4,7 @@
 owns: process model and mode selection; the distributed server's data, auth and sessions, and Postgres seam
 invariants: the CLI's commands pick local or server mode from the credentials file's existence, while `grayboard mcp` is local only; a server runs with no mandatory outside service beyond the org's identity provider; HTTP authenticates per request; Google tokens are never stored; a CLI token expires only by idleness; Repo is the Postgres seam and its BlobStore the object-store seam
 code-pointers: src/cli/main.ts (entry; Claude Code hook shim), src/cli/cli.ts (mcp, setup), src/cli/api.ts (busMode, credentials), src/local/launch.ts, src/shared/toolguard.ts (signedInLocalNotice), src/server/db.ts, src/server/auth.ts, src/server/config.ts, src/server/retention.ts, src/shared/http.ts
-companions: boards.md (core semantics both modes share); server-oauth.md, server-hosted-mcp.md, server-hosted-ownership.md, server-sessions.md, server-operations.md, server-access.md, server-deploy.md (the server's other parts); slack-bridge.md (the local bridge, a client of grayboard mcp; the org bridge, in-process in the server); guide/server.md (operator steps)
+companions: boards.md (core semantics both modes share); server-oauth.md, server-hosted-mcp.md, server-hosted-ownership.md, server-sessions.md, server-operations.md, server-access.md, server-deploy.md (the server's other parts); slack-bridge.md (the local bridge, a client of grayboard mcp), slack-org-bridge.md (the org bridge, in-process in the server); guide/server.md (operator steps)
 ```
 
 ## 1. Process model

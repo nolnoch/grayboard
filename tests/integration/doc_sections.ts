@@ -4,7 +4,7 @@ import { basename, dirname, join, normalize } from "node:path";
 // Section references (`docs/x.md` §3, README §Updating the server, a bare §8 after a file on the same line) resolve
 // to a heading, a bold lead or a top-level bullet in their file (#886). A number matches a heading numbered with it; a
 // label (its words up to punctuation) matches a heading, lead or bullet when either's words begin the other's. A § names the file just
-// before it (only spaces, backticks or an opening parenthesis between) or, after a comma or "and", the previous §'s
+// before it (only spaces, backticks, an opening parenthesis or a link's closing one between) or, after a comma or "and", the previous §'s
 // target; else the containing file or the last file named earlier on the line, whichever has it. After an issue (#523 §3a) or an RFC (RFC 8252 §7.3) it names neither.
 
 /** A doc's section keys: heading numbers ("3", "3.2") and lowercased heading, bold-lead and top-level bullet texts. */
@@ -47,7 +47,7 @@ export function sectionRefs(text: string): SectionRef[] {
         continue;
       }
       const gap = last ? line.slice(last.end, m.index) : "";
-      const bound = last && (last.ref ? /^`?(?:,|,? and| or)\s*`?$/.test(gap) : /^[`\s(]*$/.test(gap));
+      const bound = last && (last.ref ? /^`?(?:,|,? and| or)\s*`?$/.test(gap) : /^[`\s(]*\)?[`\s]*$/.test(gap));
       const target = bound ? last!.target : undefined;
       last = { end, target, ref: true };
       if (target !== FOREIGN) out.push({ line: i + 1, file: target, ...(!bound && named ? { also: named } : {}), section: m[4]! });

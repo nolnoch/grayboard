@@ -85,10 +85,10 @@ const tracked = (...patterns: string[]) => {
 };
 
 test("sectionRefs binds a § to the adjacent file, a chained §, else the containing file; skips issues and RFCs", () => {
-  const refs = sectionRefs("`a.md` §3, §4 and §5. README §Install here. Then (§2) and `b.md`), x (§6). #523 §3a, RFC 8252 §7.3, §8.1.");
+  const refs = sectionRefs("`a.md` §3, §4 and §5. README §Install here. Then (§2) and `b.md`), x (§6). #523 §3a, RFC 8252 §7.3, §8.1. See [`c.md`](../c.md) §7.");
   expect(refs.map(r => [r.file, r.also, r.section])).toEqual([
     ["a.md", undefined, "3"], ["a.md", undefined, "4"], ["a.md", undefined, "5"], ["README.md", undefined, "Install here"],
-    [undefined, "README.md", "2"], [undefined, "b.md", "6"],
+    [undefined, "README.md", "2"], [undefined, "b.md", "6"], ["../c.md", undefined, "7"],
   ]);
 });
 
