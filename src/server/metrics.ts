@@ -47,7 +47,7 @@ export async function timeTool<T>(tool: string, fn: () => Promise<T> | T): Promi
 // first start's window holds until the last stop.
 export type LagWindow = { p50: number; p99: number; max: number };
 export const LAG_WINDOW_MS = 10_000;
-let lag: { histogram: ReturnType<typeof monitorEventLoopDelay>; timer: ReturnType<typeof setInterval>; users: number } | undefined;
+let lag: { histogram: ReturnType<typeof monitorEventLoopDelay>; timer: ReturnType<typeof setInterval>; users: number; windowMs: number; rotated: number } | undefined;
 let lastLag: LagWindow | undefined;
 // The newest finished windows, oldest first, for the /healthz lag gate; at most LAG_HISTORY of them.
 export const LAG_HISTORY = 60;
@@ -58,6 +58,7 @@ export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
     const histogram = monitorEventLoopDelay({ resolution: 10 });
     histogram.enable();
     const timer = setInterval(() => {
+      if (lag) lag.rotated = performance.now();
       // Nanoseconds in, seconds out. A window with no tick (count 0) leaves the last one standing.
       if (histogram.count > 0) {
         lastLag = { p50: histogram.percentile(50) / 1e9, p99: histogram.percentile(99) / 1e9, max: histogram.max / 1e9 };
@@ -67,7 +68,7 @@ export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
       histogram.reset();
     }, windowMs);
     timer.unref?.();
-    lag = { histogram, timer, users: 0 };
+    lag = { histogram, timer, users: 0, windowMs, rotated: performance.now() };
   }
   lag.users++;
   let stopped = false;
@@ -81,15 +82,26 @@ export function startLagSampler(windowMs = LAG_WINDOW_MS): () => void {
 // The last finished window, for the scrape.
 export function lagWindow(): LagWindow | undefined { return lastLag; }
 export function lagWindows(): readonly LagWindow[] { return lagHistory; }
+// How long since the sampler last finished a window (its rotation is a timer). Under CPU saturation with more than
+// 1024 ready sockets, Bun's socket loop runs up to 48 full epoll batches per tick before any timer (#941): the
+// windows freeze for tens of seconds while requests, /healthz and the scrape among them, are still answered. This
+// age, read at request time, is what shows that stall; the finished windows can't.
+export type LagSampler = { ageMs: number; windowMs: number };
+export function lagSampler(now = performance.now()): LagSampler | undefined { return lag ? { ageMs: now - lag.rotated, windowMs: lag.windowMs } : undefined; }
 
 // The /healthz lag gate (#805): lagging when each of the last `windows` finished windows has a p99
 // over `p99Ms`. Pure over the window history, which is its clock: a server with fewer finished
 // windows than that is never lagging, so a restart passes install.sh's /healthz check, and one slow
-// window (a GC pause, a churn wave) never fails it. p99Ms 0 turns the gate off.
+// window (a GC pause, a churn wave) never fails it. p99Ms 0 turns the gate off. With `sampler`, a sampler that has
+// missed the window it owed and `windows` more is lagging too (#941): the loop hasn't reached its timers for that
+// long, so every window it would have finished had a delay far over any threshold. The one extra window keeps
+// timer jitter at the moment a window is due from failing a gate of 1.
 export type LagGate = { p99Ms: number; windows: number };
 export const DEFAULT_LAG_GATE: LagGate = { p99Ms: 1000, windows: 3 };
-export function lagVerdict(history: readonly LagWindow[], gate: LagGate): { lagging: false } | { lagging: true; p99s: number[] } {
-  if (gate.p99Ms === 0 || gate.windows < 1 || history.length < gate.windows) return { lagging: false };
+export function lagVerdict(history: readonly LagWindow[], gate: LagGate, sampler?: LagSampler): { lagging: false } | { lagging: true; p99s: number[]; stalledS?: number } {
+  if (gate.p99Ms === 0 || gate.windows < 1) return { lagging: false };
+  if (sampler && sampler.ageMs >= (gate.windows + 1) * sampler.windowMs) return { lagging: true, p99s: history.slice(-gate.windows).map(w => w.p99), stalledS: sampler.ageMs / 1000 };
+  if (history.length < gate.windows) return { lagging: false };
   const recent = history.slice(-gate.windows);
   if (!recent.every(w => w.p99 * 1000 > gate.p99Ms)) return { lagging: false };
   return { lagging: true, p99s: recent.map(w => w.p99) };
@@ -125,6 +137,11 @@ export function render(gauges: Gauges = {}): string {
   if (window) {
     family("grayboard_event_loop_lag_seconds", "gauge", `Event-loop delay over the last ${LAG_WINDOW_MS / 1000} s window, by quantile.`);
     out.push(`grayboard_event_loop_lag_seconds{quantile="0.5"} ${num(window.p50)}`, `grayboard_event_loop_lag_seconds{quantile="0.99"} ${num(window.p99)}`, `grayboard_event_loop_lag_seconds{quantile="1"} ${num(window.max)}`);
+  }
+  const sampler = lagSampler();
+  if (sampler) {
+    family("grayboard_event_loop_lag_window_age_seconds", "gauge", `Seconds since the last lag window finished (one is due every ${sampler.windowMs / 1000} s); more means the event loop hasn't run its timers for that long.`);
+    out.push(`grayboard_event_loop_lag_window_age_seconds ${num(sampler.ageMs / 1000)}`);
   }
 
   family("grayboard_capacity_refusals_total", "counter", "Requests refused at a capacity limit, by limit.");

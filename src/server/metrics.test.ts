@@ -91,11 +91,16 @@ test("the lag sampler records a blocked loop in its window, and stops by referen
   while (performance.now() < end) { /* block the loop */ }
   await until(() => (lagWindow()?.max ?? 0) >= 0.1, 2_000, "a 150 ms block never showed in a lag window");
   expect(render()).toMatch(/^grayboard_event_loop_lag_seconds\{quantile="1"\} /m);
+  // #941: the window age grows while the loop runs no timer, read at scrape time.
+  const blockEnd = performance.now() + 250;
+  while (performance.now() < blockEnd) { /* block the loop */ }
+  expect(sample(render(), "grayboard_event_loop_lag_window_age_seconds")!).toBeGreaterThanOrEqual(0.25);
   stopA();
   expect(lagWindow()).toBeDefined();
   stopB();
   expect(lagWindow()).toBeUndefined();
   expect(render()).not.toContain("grayboard_event_loop_lag_seconds");
+  expect(render()).not.toContain("grayboard_event_loop_lag_window_age_seconds");
 });
 
 test("the listener serves /metrics on its own address, refuses anything else, and stops with the app", async () => {

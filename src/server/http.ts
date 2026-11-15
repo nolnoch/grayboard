@@ -9,7 +9,7 @@ import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts"
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
-import { DEFAULT_LAG_GATE, lagVerdict, lagWindows, type LagGate, type LagWindow } from "./metrics.ts";
+import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
@@ -54,7 +54,7 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 // synchronous read, so no request can arrive while one is in flight and the cache alone is single-flight.
 export const HEALTH_TTL_MS = 1000;
 const health = new WeakMap<Repo, { at: number; ok: boolean; lagging?: boolean }>();
-export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows()): Response {
+export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows(), sampler: LagSampler | undefined = lagSampler()): Response {
   let cached = health.get(repo);
   if (!cached || now - cached.at >= HEALTH_TTL_MS) {
     let ok = true;
@@ -71,10 +71,10 @@ export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEF
   if (!cached.ok) return jsonErr("internal", "db not reachable", 503);
   // Sustained event-loop lag fails the check (#805), with the version kept so a deploy check still
   // tells a restarted server from a stale one. The journal gets one line per change of state.
-  const lag = lagVerdict(windows, gate);
+  const lag = lagVerdict(windows, gate, sampler);
   if (lag.lagging !== !!cached.lagging) {
     cached.lagging = lag.lagging;
-    console.error(lag.lagging ? `[grayboard] healthz: failing on event-loop lag, p99 ${lag.p99s.map(p => p.toFixed(2)).join("/")} s over the last ${gate.windows} windows` : "[grayboard] healthz: event-loop lag recovered");
+    console.error(!lag.lagging ? "[grayboard] healthz: event-loop lag recovered" : lag.stalledS !== undefined ? `[grayboard] healthz: failing on event-loop lag, no lag window finished for ${lag.stalledS.toFixed(1)} s` : `[grayboard] healthz: failing on event-loop lag, p99 ${lag.p99s.map(p => p.toFixed(2)).join("/")} s over the last ${gate.windows} windows`);
   }
   // The per-window p99s and the threshold go to the journal only: this route is public, and the scrape's bind is
   // what guards the server's telemetry.
