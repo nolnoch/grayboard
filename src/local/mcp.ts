@@ -303,6 +303,9 @@ const holds = (): string[] => (liveParent === null ? held : holdsOf(db, livePare
 // mail, claims and uploads as (#284 S1): its holds and its ID. A tools-only
 // process receives nothing, so its ID isn't one of its addresses.
 const primary = (): string => WRITES_AS ?? primaryOf(holds(), rootId());
+// The name structuredContent reports: the primary hold, or null when unbound,
+// as on a server (#375 F10), though an unbound local session sends as its ID.
+const heldName = (): string | null => WRITES_AS ?? holds()[0] ?? null;
 const addresses = (): string[] => (WRITES_AS ? [WRITES_AS] : [...holds(), rootId()]);
 // The first successful write of a session acting as its ID says how to get a
 // readable name, once per session (#470). A root's notice: never a child's (#523).
@@ -531,12 +534,11 @@ const staleNotice = updateNotice();
 // The channels warning also goes in the first tool result, in case the
 // instructions went unread.
 let channelsNoticePending = CHANNELS_OFF;
-// A bind that completed after it was cancelled, for the next tool result; it
-// carries the instructions too, as the bind's result would have, for adapters
-// that keep them in the system prompt.
-let missedBindNotice: string | null = null;
 let instructionsStale = false;
-// What a result the client dropped carried, for the next one.
+// What a result the client dropped carried, for the next one, in order: its
+// notices, and a bind or unbind that completed after it was cancelled (whose
+// result carries the instructions too, for adapters that keep them in the
+// system prompt). A list, so a second cancelled call doesn't overwrite the first's (#375).
 const requeued: string[] = [];
 // A write the client cancelled whose result says it landed (#292): the agent
 // never saw that, and might send it again.
@@ -547,8 +549,6 @@ const notices = (): string[] => {
   const out = requeued.splice(0);
   if (channelsNoticePending && CHANNELS_OFF_NOTICE) out.push(CHANNELS_OFF_NOTICE);
   channelsNoticePending = false;
-  if (missedBindNotice) out.push(missedBindNotice);
-  missedBindNotice = null;
   const stale = staleNotice();
   return stale ? [...out, stale] : out;
 };
@@ -623,7 +623,6 @@ async function rotateRoot(session: string): Promise<void> {
     restoredFrom = null;
     startNotes.length = 0;
     bindHinted = false;
-    missedBindNotice = null;
     requeued.length = 0;
     ROOT_KIND.harnessSession = session;
     registerSession(db, thisSession(SESSION_ID), ROOT_KIND);
@@ -773,11 +772,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
   let out = withNotices(r, extra);
   if (instructionsStale && !out.structuredContent) {
     instructionsStale = false;
-    out = { ...out, structuredContent: { name: primary(), instructions: localInstructions(true) } };
+    out = { ...out, structuredContent: { name: heldName(), instructions: localInstructions(true) } };
   }
   late.answer(requestId, () => {
     if (name === "bind" && r.structuredContent) requeued.push(bindMissed((r.structuredContent as { name: string }).name, "it was cancelled", r.content[0]!.text));
-    if (name === "unbind" && r.structuredContent) requeued.push(unbindMissed(String(args.name), "it was cancelled", r.content[0]!.text));
+    if (name === "unbind" && r.structuredContent) {
+      // The name the unbind resolved (lowercased), not the raw argument (#375).
+      const n = bareName(String(args.name), "unbind");
+      requeued.push(unbindMissed(n.ok ? n.name : String(args.name), "it was cancelled", r.content[0]!.text));
+    }
     const l = landed(name, r);
     if (l) requeued.push(l);
     requeued.push(...extra);
@@ -1338,7 +1341,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     const ok = bindOk(n.name, held, (general) => localInstructions(general));
     // A cancelled call's result is dropped (pi and opencode cancel on abort).
     if (signal.aborted) {
-      missedBindNotice = bindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      requeued.push(bindMissed(n.name, "it was cancelled", ok.content[0]!.text));
       instructionsStale = true;
     }
     return ok;
@@ -1380,9 +1383,9 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
     console.error(`[grayboard] session ${SESSION_ID} released "${n.name}"; ${held.length ? `holds "${held.join('", "')}"` : "unbound"}`);
     if (!held.length) unboundCandidates = await candidateNames(db, SUGGESTED);
     const left = listClaims(db).filter((c) => c.holder === n.name).map((c) => c.key);
-    const ok = unbindOk(n.name, before, primary(), left, (general) => localInstructions(general));
+    const ok = unbindOk(n.name, before, heldName(), left, (general) => localInstructions(general));
     if (signal.aborted) {
-      missedBindNotice = unbindMissed(n.name, "it was cancelled", ok.content[0]!.text);
+      requeued.push(unbindMissed(n.name, "it was cancelled", ok.content[0]!.text));
       instructionsStale = true;
     }
     return ok;

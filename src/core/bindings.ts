@@ -580,9 +580,8 @@ export function bindOk(name: string, held: string[], instructions: (general: boo
  * that stay with the alias, the new primary when it changed, then the
  * instructions for the session as it is now (its new primary's, or its ID's
  * with the unbound line). `structuredContent.name` is the primary now: null
- * where an unbound session sends as nothing (hosted, #542), so an adapter
- * forgets the hold instead of rebinding it on restart; local mode's unbound
- * session sends as its ID and passes that.
+ * for an unbound session in both modes (#542, #375 F10), so an adapter
+ * forgets the hold instead of rebinding it on restart.
  */
 export function unbindOk(alias: string, primaryBefore: string, primaryAfter: string | null, left: string[], instructions: (general: boolean) => string[]) {
   const text = [

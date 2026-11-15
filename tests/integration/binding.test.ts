@@ -290,8 +290,9 @@ test("#284 S1, S2: bind adds a hold; unbind releases one, its claims and mail st
 
   // Unbinding the last hold leaves the session acting as its ID.
   const last = await s.c.callTool({ name: "unbind", arguments: { name: "fe2" } });
-  expect((last.content as { text: string }[])[0]!.text).toContain(`You now send as "${id}".`);
-  expect((last.structuredContent as { name: string; instructions: string[] })).toEqual({ name: id, instructions: expect.arrayContaining([expect.stringContaining("This session has no bus name yet, so it acts as its ID")]) });
+  // F10: unbound, the result says so and names nothing, as hosted's does.
+  expect((last.content as { text: string }[])[0]!.text).toContain("This session is now unbound.");
+  expect((last.structuredContent as { name: string | null; instructions: string[] })).toEqual({ name: null, instructions: expect.arrayContaining([expect.stringContaining("This session has no bus name yet, so it acts as its ID")]) });
   expect((await s.call("peer_list", {})).you).toBe(id);
   expect(rows(`SELECT name FROM bindings WHERE session_id = ?`, id)).toEqual([{ name: null }]);
   expect(JSON.parse(readFileSync(join(dir, `bind.${s.harnessPid}`), "utf8")).names).toEqual([]);
@@ -516,6 +517,24 @@ for (const [tool, point, args, id] of [
     expect((again.content as { text: string }[]).map((c) => c.text).join(" ")).not.toContain("completed after it was cancelled");
   }, 30_000);
 }
+
+// #375 (W11): a cancel that crosses an unbind's result names the alias the
+// unbind resolved, not the raw argument.
+test("a cancelled unbind's notice names the resolved alias", async () => {
+  const s = await session("old", { extra: pauseEnv("unbind:before-txn") });
+  await s.call("bind", { name: "fe", create: true });
+  const abort = new AbortController();
+  const unbinding = s.c.callTool({ name: "unbind", arguments: { name: "FE" } }, undefined, { signal: abort.signal });
+  await until(() => s.stderr().includes("test pause hit: unbind:before-txn"));
+  abort.abort();
+  await expect(unbinding).rejects.toThrow();
+  release("unbind:before-txn");
+  await until(() => holderOf("fe") === undefined);
+  const r = await s.c.callTool({ name: "peer_list", arguments: {} });
+  const texts = (r.content as { text: string }[]).map((c) => c.text).slice(1).join(" ");
+  expect(texts).toContain(`unbind("fe") completed after it was cancelled.`);
+  expect(texts).not.toContain(`unbind("FE")`);
+}, 30_000);
 
 test("audit 7: a cancel that crosses the bind's result on the wire still gets the bind into the next result", async () => {
   const s = await session("old", { extra: pauseEnv("bind:after-acquire") });
