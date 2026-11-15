@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { junitCounts, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
+import { BUN_VERSION, junitCounts, provenance, repositoryGitEnv } from "../../scripts/hosted-evidence.ts";
 import { matrixCases } from "../../scripts/hosted-matrix.ts";
 
 const checkout = resolve(import.meta.dir, "../.."), roots: string[] = [];
@@ -83,6 +83,7 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   if (mode === "cross-filesystem") { roots.push(output); expect(statSync(root).dev === statSync(output).dev).toBe(false); }
   for (const dir of ["scripts", "src", "tests/e2e", "tests/integration", "tests/support", "adapters/opencode-v2/src", "adapters/opencode-v2/tests", "adapters/hosted-core", "bin", "private"]) mkdirSync(join(root, dir), { recursive: true });
   for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts", "hosted-matrix.ts", "hosted-matrix-shell.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
+  cpSync(join(checkout, ".bun-version"), join(root, ".bun-version")); // the Bun pin hosted-evidence.ts and hosted-e2e.sh read (#379)
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
   for (const file of ["tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts"]) writeFileSync(join(root, file), "export {};\n");
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
@@ -179,7 +180,7 @@ test("each hosted suite requires its complete actual installation inventory and 
   });
   const env = fixtureEnv(root), git = (...args: string[]) => fixtureGit(root, env, ...args);
   git("init", "-q"); git("add", "adapters"); git(...identity, "commit", "-qm", "fixture");
-  const base = { bun: "1.4.4", backend: [], drivers: [], installed: false, publicInstalled: false, installedChecks: [] as typeof checks, publicChecks: [] as typeof checks };
+  const base = { bun: BUN_VERSION, backend: [], drivers: [], installed: false, publicInstalled: false, installedChecks: [] as typeof checks, publicChecks: [] as typeof checks };
   expect(provenance(base, root, "strict").installedChecks).toEqual([]);
   expect(() => provenance({ ...base, installed: true, installedChecks: checks }, root, "strict")).toThrow();
   for (const suite of ["git", "config", "public", "host", "live", "matrix", "native", "durable"]) {

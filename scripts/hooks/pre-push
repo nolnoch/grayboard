@@ -49,8 +49,10 @@ for i in "${!shas[@]}"; do
   fi
 done
 
-if [[ "$(bun --version)" != "1.4.4" ]]; then
-  echo "[pre-push] Use Bun 1.4.4, matching CI and the package fixtures; push aborted." >&2
+# .bun-version is the one Bun pin (#379); CI installs it from there.
+want_bun="$(tr -d '[:space:]' 2>/dev/null < "$HOOK_SCRIPTS/../.bun-version")"
+if [[ -z "$want_bun" || "$(bun --version)" != "$want_bun" ]]; then
+  echo "[pre-push] Use Bun ${want_bun:-from .bun-version}, matching CI and the package fixtures; push aborted." >&2
   exit 1
 fi
 

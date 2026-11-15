@@ -24,7 +24,7 @@ Every harness (Claude Code, omp, opencode, pi) gets the same capabilities in eac
 
 ## Build and test
 
-Use Bun 1.4.4 and Node ≥22.19 with npm. Root and OpenCode V2 dependencies have independent frozen lockfiles; a root install does not install the package's dependencies. Run from the checkout root:
+Use the Bun version in `.bun-version` (CI installs the same one) and Node ≥22.19 with npm. Root and OpenCode V2 dependencies have independent frozen lockfiles; a root install does not install the package's dependencies. Run from the checkout root:
 
 ```sh
 bun install --frozen-lockfile
