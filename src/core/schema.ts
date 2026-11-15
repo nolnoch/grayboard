@@ -94,6 +94,8 @@ export function initCoreSchema(db: Database): void {
       notified_id  INTEGER NOT NULL,
       PRIMARY KEY (board, handle)
     );
+    -- A handle's own subscriptions (the digest read on every pending check, #900): the key leads with board.
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_handle ON subscriptions(handle);
 
     -- Per-handle pending pushes (mentions, thread replies, push-mode subs).
     CREATE TABLE IF NOT EXISTS outbox (

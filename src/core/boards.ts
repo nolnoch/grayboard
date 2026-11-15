@@ -1519,6 +1519,8 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   if (!opts.all && !out.some((i) => i.kind === "push" && !i.deferred)) return [];
 
   // Digest: unread exists and nothing has been sent since the last catch-up.
+  // latest_id is read only when unread > 0, so a qualifying post above the cursor exists and the newest
+  // one is the board's newest: the index walks back from the end and stops there (#900).
   // Queue-kind boards are excluded: their posts deliver to exactly one
   // subscriber, so they never count as digest unread for the others.
   const digests = db
@@ -1526,7 +1528,8 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
       `SELECT s.board, s.cursor,
               (SELECT COUNT(*) FROM posts p WHERE p.board = s.board AND p.id > s.cursor
                  AND ${NOT_OWN} AND ${NOT_PUSHED}) AS unread,
-              (SELECT MAX(id) FROM posts p WHERE p.board = s.board AND ${NOT_OWN} AND ${NOT_PUSHED}) AS latest_id
+              (SELECT p.id FROM posts p WHERE p.board = s.board AND p.id > s.cursor AND ${NOT_OWN} AND ${NOT_PUSHED}
+                ORDER BY p.id DESC LIMIT 1) AS latest_id
          FROM subscriptions s
         WHERE s.handle = ? AND s.mode = 'digest' AND s.notified_id <= s.cursor
           AND s.board NOT IN (SELECT name FROM boards WHERE kind = 'queue')`,
