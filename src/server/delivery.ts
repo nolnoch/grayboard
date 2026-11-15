@@ -15,10 +15,15 @@ export type DeliveryLease = { capability: string; identity: IdentityInfo; expire
 export type PendingDelivery = { id: string; actionable: boolean; event: DeliveryEvent; ownership: number; bind_gen: number; address?: string };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
 export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; now?: () => number; caps?: HostedCaps["leases"] };
-type Issued = { item: PendingDelivery; ref?: PendingRef; acked: boolean };
+type Issued = { item: PendingDelivery; ref?: PendingRef };
+// What a retried receipt of an acknowledged id re-checks, without the item's body (#805).
+type Acked = { ownership: number; bind_gen: number; address?: string; board?: string };
+// A lost receipt's retry re-sends one call's ids (at most 100; hosted-core receipts one per call): twice that per lease.
+const ACKED_HISTORY = 200;
+const boardOf = (item: PendingDelivery) => item.event.kind === "board" ? (item.event.item.kind === "push" ? item.event.item.post.board : item.event.item.board) : undefined;
 type Lease = {
   principal: DeliveryPrincipal; capability: string; expiresAt: number; sessionId: string; ownership: number; generation: number;
-  session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Issued>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
+  session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Acked>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
 };
 const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); } };
 class StaleCapability extends ApplicationError {
@@ -150,7 +155,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const items = application.pending(lease.session, limit).map(event => itemOf(event, lease));
         const unseen = items.filter(item => !lease.issued.has(item.id));
         if (lease.issued.size + unseen.length > 1000) { countRefusal("delivery_receipts"); throw new ApplicationError("receipt_capacity", "delivery lease receipt capacity reached; release and reopen"); }
-        for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), acked: false, ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
+        for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
         return items;
       }).catch(error => refused(p, context, error));
     },
@@ -163,27 +168,28 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           const lease = get(p, context, capability, row);
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
-          const records = ids.map(id => lease.issued.get(id) ?? lease.acknowledged.get(id) ?? stale(p, context, capability));
-          for (const r of records) {
-            if (r.item.ownership !== row.ownership_id || r.item.bind_gen !== row.bind_gen || (r.item.address !== undefined && !lease.session.addresses.includes(r.item.address))) stale(p, context, capability);
-            if (r.item.event.kind === "board" && !application.canReceiveBoard(lease.session, r.item.event.item.kind === "push" ? r.item.event.item.post.board : r.item.event.item.board)) stale(p, context, capability);
+          const records: Issued[] = [];
+          for (const id of ids) {
+            const issued = lease.issued.get(id), r: Acked = issued ? { ...issued.item, board: boardOf(issued.item) } : lease.acknowledged.get(id) ?? stale(p, context, capability);
+            if (r.ownership !== row.ownership_id || r.bind_gen !== row.bind_gen || (r.address !== undefined && !lease.session.addresses.includes(r.address))) stale(p, context, capability);
+            if (r.board !== undefined && !application.canReceiveBoard(lease.session, r.board)) stale(p, context, capability);
+            if (issued) records.push(issued);
           }
-          const direct = records.filter(r => !r.acked && r.item.event.kind === "direct");
+          const direct = records.filter(r => r.item.event.kind === "direct");
           if (direct.length) {
             const unread = application.pending(lease.session, 100).filter(e => e.kind === "direct");
             const requested = new Set(direct.map(r => r.item.id));
             if (unread.length < direct.length || unread.slice(0, direct.length).some(e => !requested.has(itemOf(e, lease).id))) stale(p, context, capability);
           }
           application.receiptDirect(lease.session, direct.map(r => r.item.event.kind === "direct" ? r.item.event.message.id : stale(p, context, capability)));
-          application.receiptBoards(lease.session, records.filter(r => !r.acked && r.ref).map(r => r.ref!));
+          application.receiptBoards(lease.session, records.filter(r => r.ref).map(r => r.ref!));
           return { lease, records };
         });
-        for (const r of records.records) {
-          r.acked = true;
-          records.lease.issued.delete(r.item.id);
-          records.lease.acknowledged.set(r.item.id, r);
+        for (const { item } of records.records) {
+          records.lease.issued.delete(item.id);
+          records.lease.acknowledged.set(item.id, { ownership: item.ownership, bind_gen: item.bind_gen, ...(item.address !== undefined ? { address: item.address } : {}), ...(boardOf(item) !== undefined ? { board: boardOf(item) } : {}) });
         }
-        while (records.lease.acknowledged.size > 1000) records.lease.acknowledged.delete(records.lease.acknowledged.keys().next().value!);
+        while (records.lease.acknowledged.size > ACKED_HISTORY) records.lease.acknowledged.delete(records.lease.acknowledged.keys().next().value!);
       }).catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
