@@ -369,7 +369,13 @@ try {
         const body = await response.json() as { id: number; error: { data: { code: string; retry_after_ms: number } } };
         assert.equal(typeof body.id, "number"); assert.equal(body.error.data.code, "rate_limited"); assert(body.error.data.retry_after_ms > 0);
         assert.equal(response.headers.get("Retry-After"), String(Math.ceil(body.error.data.retry_after_ms / 1000)));
-        assert.equal(app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n, rowsBefore, "Refused admission creates no hosted source row"); refused = true; break;
+        // With the bucket spent, a refused request that names a fresh source session must leave no row for it.
+        const raw = "refused-admission-" + id;
+        last = undefined;
+        await assert.rejects(drain.callTool({ name: "whoami", arguments: {}, _meta: { "ai.opencode/sessionID": raw } }));
+        assert.equal(last?.status, 429, "A session-naming request is refused at admission too");
+        assert.equal(row(raw), null, "Refused admission creates no hosted source row");
+        assert.equal(app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_sessions").get()!.n, rowsBefore, "Refused admission creates no hosted row at all"); refused = true; break;
       }
       assert(refused, "Unmodified production default burst is enforced");
       gate.releaseInitial();

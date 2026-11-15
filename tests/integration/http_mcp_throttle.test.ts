@@ -248,6 +248,12 @@ test("subscriber-role requests and tool calls draw on separate per-user buckets 
     expect(await call(tools, 9)).toBe(200);
     expect(await call(delivery, 10, "subscriber")).toBe(200);
     expect(srv.app.application.limiterSizes()).toMatchObject({ hosted: 1, subscriber: 1 });
+    // Refilled buckets are swept, and each run's end is audited with its bucket.
+    now += 10_000;
+    srv.app.application.sweepHellos();
+    expect(srv.app.application.limiterSizes()).toMatchObject({ hosted: 0, subscriber: 0 });
+    const ends = srv.app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.rate_limit_ended' ORDER BY id").all();
+    expect(ends.map(r => JSON.parse(r.detail).bucket).sort()).toEqual(["native", "subscriber"]);
   } finally {
     await srv.stop();
   }
