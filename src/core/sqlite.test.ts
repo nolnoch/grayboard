@@ -2,7 +2,8 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { journalModeWarning, openSqlite, STATEMENT_CACHE_SIZE } from "./sqlite.ts";
+import { Database } from "bun:sqlite";
+import { journalModeWarning, openReader, openSqlite, routeReads, STATEMENT_CACHE_SIZE } from "./sqlite.ts";
 
 let dir = "";
 afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
@@ -84,4 +85,60 @@ test("run with bindings reuses the cached statement and still runs every stateme
     db.run("INSERT INTO t (a) VALUES (?)", [4]);
     expect(db.prepare("SELECT a FROM t ORDER BY a").all()).toEqual([1, 4, 5].map((a) => ({ a })));
   } finally { db.close(); }
+});
+
+// A WAL writer routed through a read-only reader whose statements are counted (#807 P1b-3).
+function routed(): { db: Database; reader: Database; onReader: string[] } {
+  dir = mkdtempSync(join(tmpdir(), "gb-sqlite-"));
+  const path = join(dir, "a.db");
+  const db = openSqlite(path, "PRAGMA journal_mode = WAL;", d => d.exec("CREATE TABLE t (k TEXT PRIMARY KEY, v INTEGER)"));
+  const reader = openReader(path), onReader: string[] = [];
+  const query = reader.query.bind(reader);
+  reader.query = ((sql: string) => { onReader.push(sql); return query(sql); }) as Database["query"];
+  routeReads(db, reader);
+  return { db, reader, onReader };
+}
+
+test("routeReads: a read outside a transaction runs on the reader and sees every commit", () => {
+  const { db, onReader } = routed();
+  const read = db.prepare<{ v: number }, [string]>("SELECT v FROM t WHERE k = ?");
+  db.transaction(() => db.prepare("INSERT INTO t VALUES (?, ?)").run("a", 1)).immediate();
+  expect(read.get("a")?.v).toBe(1);
+  expect(onReader).toEqual(["SELECT v FROM t WHERE k = ?"]);
+  db.close();
+});
+
+test("routeReads: a statement made outside a transaction reads its own uncommitted writes inside one", () => {
+  const { db, onReader } = routed();
+  const read = db.prepare<{ v: number }, [string]>("SELECT v FROM t WHERE k = ?");
+  const inside = db.transaction(() => { db.run("INSERT INTO t VALUES (?, ?)", ["b", 2]); return read.get("b")?.v; }).immediate();
+  expect(inside).toBe(2);
+  expect(onReader).toEqual([]);
+  db.close();
+});
+
+test("routeReads: writes, temp objects, pragmas and transaction control run on the writer", () => {
+  const { db, onReader } = routed();
+  db.run("INSERT INTO t VALUES (?, ?)", ["c", 3]);
+  db.prepare("UPDATE t SET v = ? WHERE k = ?").run(4, "c");
+  db.prepare("WITH x AS (SELECT 'c' AS k) DELETE FROM t WHERE k IN (SELECT k FROM x)").run();
+  db.prepare("INSERT INTO t VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v").run("d", 5);
+  db.exec("CREATE TEMP TABLE n (x INTEGER)");
+  db.prepare("INSERT INTO temp.n VALUES (?)").run(1);
+  expect(db.prepare<{ x: number }, []>("SELECT x FROM temp.n").get()?.x).toBe(1);
+  expect(typeof db.prepare<{ data_version: number }, []>("PRAGMA data_version").get()?.data_version).toBe("number");
+  expect(onReader).toEqual([]);
+  expect(db.prepare<{ k: string; v: number }, []>("SELECT k, v FROM t").all()).toEqual([{ k: "d", v: 5 }]);
+  db.close();
+});
+
+test("openReader: the reader is read-only, so a write misrouted to it fails loudly", () => {
+  const { reader } = routed();
+  expect(() => reader.query("INSERT INTO t VALUES ('e', 6)").run()).toThrow(/readonly/);
+});
+
+test("routeReads: closing the writer closes the reader", () => {
+  const { db, reader } = routed();
+  db.close();
+  expect(() => reader.query("SELECT 1").get()).toThrow();
 });

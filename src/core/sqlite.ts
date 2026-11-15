@@ -75,6 +75,48 @@ function cacheStatements(db: Database): void {
     params.length && !multiStatement.test(sql) ? db.query(sql).run(...(params as never[])) : run(sql, ...(params as never[]))) as Database["run"];
 }
 
+// The server's read-only second connection (#807 P1b-3, docs/future/postgres-server.md). After this, a
+// statement `db.query`/`db.prepare` returns picks its connection on each call, not when it was made: the
+// writer inside a transaction (a body reads its own uncommitted writes), the reader outside one. So a
+// statement hoisted at construction follows the transaction state of each use. Some SQL always runs on
+// the writer: writes (an autocommit write is its own transaction there; a write the pattern misses reaches
+// the read-only reader and throws SQLITE_READONLY, never a silent misroute) and connection-local SQL:
+// `temp.` objects (the auth generation counter), pragmas (data_version is per connection) and transaction
+// control. P1b-4, once bodies await, refuses a write while another body's transaction is open here.
+const writerOnly = /\btemp\.|^\s*(PRAGMA|BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b|\b(INSERT|UPDATE|DELETE|REPLACE)\b/i;
+type Routed = Pick<ReturnType<Database["query"]>, "get" | "all" | "run" | "values">;
+export function routeReads(db: Database, reader: Database): void {
+  // Looked up per call, not bound once: a spy on Database.prototype.query (tests count SQL) sees routed calls.
+  const proto = Object.getPrototypeOf(db) as Database;
+  const onWriter = (sql: string) => proto.query.call(db, sql), onReader = (sql: string) => reader.query(sql);
+  // Routers by SQL, least recently used evicted at the statement cache's cap: dynamic SQL (IN lists) varies.
+  const routers = new Map<string, Routed>();
+  db.query = ((sql: string) => {
+    let r = routers.get(sql);
+    if (r) { routers.delete(sql); routers.set(sql, r); return r; }
+    if (writerOnly.test(sql)) r = onWriter(sql);
+    else {
+      const pick = () => (db.inTransaction ? onWriter : onReader)(sql);
+      r = {
+        get: (...a: never[]) => pick().get(...a), all: (...a: never[]) => pick().all(...a),
+        run: (...a: never[]) => pick().run(...a), values: (...a: never[]) => pick().values(...a),
+      } as Routed;
+    }
+    routers.set(sql, r);
+    if (routers.size > STATEMENT_CACHE_SIZE) routers.delete(routers.keys().next().value!);
+    return r;
+  }) as Database["query"];
+  const close = db.close.bind(db);
+  db.close = ((throwOnError?: boolean) => { try { close(throwOnError); } finally { reader.close(); } }) as Database["close"];
+}
+
+// Opens the read-only second connection on a file a writer already opened (WAL set, schema made).
+export function openReader(path: string): Database {
+  const reader = new Database(path, { readonly: true });
+  reader.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};`);
+  return reader;
+}
+
 // SQLITE_BUSY and its extended codes (_RECOVERY, _SNAPSHOT, _TIMEOUT): Bun's
 // `code` names the extended code, the primary code is errno's low byte.
 const isBusy = (e: unknown) => e instanceof SQLiteError && (e.errno & 0xff) === 5;
