@@ -1078,7 +1078,8 @@ test("children parked in one sweep past the ceiling are evicted by last activity
   hosted.limits.parked = 1;
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   for (const raw of ["c", "a", "b"]) await hosted.register(principal, context("root"), raw);
-  now += 1000; await hosted.whoami(principal, context("c"));
+  // Past the touch window (5 s, #912): activity inside it doesn't move last_seen_at.
+  now += 10_000; await hosted.whoami(principal, context("c"));
   now += 900_001; hosted.sweep();
   expect(database.repo.hosted.children(hostedId("root")).map(r => r.session_id)).toEqual([hostedId("c")]);
   const evicted = childAudits("hosted.child_released").map(a => a.child);
@@ -1437,3 +1438,22 @@ for (const [change, apply] of windows) for (const caller of ["root", "child"] as
     }
   });
 }
+
+test("a call within the touch window leaves last_seen_at; one past it moves it, and the window shrinks to a tenth of a short idle (#912)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const seen = (raw: string) => database.repo.hosted.get(hostedId(raw))!.last_seen_at;
+  const touches = spyOn(database.repo.hosted, "touch");
+  const start = seen("root");
+  now += 4_999; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(start);
+  expect(touches).not.toHaveBeenCalled();
+  now += 1; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(now);
+  touches.mockRestore();
+
+  hosted.close();
+  hosted = createHostedSessions(application, { now: () => now, idleSeconds: 2, isAuthorized: () => authorized });
+  const before = seen("root");
+  now += 200; await hosted.whoami(principal, context("root"));
+  expect(seen("root")).toBe(before + 200);
+});
