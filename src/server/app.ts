@@ -158,7 +158,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     }, 30_000));
     stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
-  // The lag sampler runs with or without a listener: /healthz will read it (#805).
+  // The lag sampler runs with or without a listener: /healthz's lag gate reads it (#805).
   const stopLag = opts.background !== false ? startLagSampler() : undefined;
 
   return {
