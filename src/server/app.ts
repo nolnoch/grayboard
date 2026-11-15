@@ -45,7 +45,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.
   if (!config.devAuth) {
-    const revoked = repo.sessions.revokeDev();
+    const revoked = repo.writeNow(() => repo.sessions.revokeDev());
     if (revoked > 0) writeAudit(repo, "auth.dev_sessions_revoked", null, null, { count: revoked });
   }
   const application = createApplication(repo, db, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
