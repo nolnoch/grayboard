@@ -218,7 +218,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (!over()) return false;
     if (now() - sweptAt < TICK_MS) return true;
     for (const id of own) inflight.set(id, (inflight.get(id) ?? 0) + 1);
-    try { sweep(); } finally { for (const id of own) { const n = inflight.get(id)! - 1; if (n) inflight.set(id, n); else inflight.delete(id); } }
+    try { void sweep(true, "nested"); } finally { for (const id of own) { const n = inflight.get(id)! - 1; if (n) inflight.set(id, n); else inflight.delete(id); } }
     return over();
   };
   function admitChild(root: string, own: string[]) {
@@ -317,9 +317,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   // under the same root ownership: a call that ended its own session or whose root was replaced touches nothing.
   // Never throws (rootOf would), so it can't replace the call's result: a database failure is logged, and the
   // start-of-call touch stands.
-  function touchAfter(row: HostedSession) {
+  async function touchAfter(row: HostedSession) {
     if (stopped) return;
-    try { store.atomic(() => {
+    try { await store.write(() => {
       const current = store.get(row.session_id), root = row.root_session_id ? store.get(row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
       const t = now();
@@ -378,10 +378,12 @@ export function createHostedSessions(application: Application, options: { now?: 
   // disabled passes too, which the timer runs every IDLE_EVERY ticks (the idle window is minutes, and
   // setDisabled ends a disabled user's rows itself, so that pass is a backstop). A test's injected clock calls
   // it directly. The commits tell reconcile which rows changed.
-  function sweep(full = true) {
-    if (stopped) return;
+  // Through the write queue; startup's first sweep runs now (`writeNow`), before anything serves. `nested`: inside
+  // the caller's transaction (a capacity refusal's re-sweep), as its savepoint.
+  function sweep(full = true, mode: "queued" | "startup" | "nested" = "queued"): Promise<void> {
+    if (stopped) return Promise.resolve();
     if (full) sweptAt = now();
-    store.atomic(() => {
+    const body = () => {
       const t = now();
       if (full) for (const row of store.disabled()) store.end(row.session_id, "disabled", t);
       for (const row of store.expired(t)) store.end(row.session_id, "expired", t, row.lease_deadline!);
@@ -392,7 +394,10 @@ export function createHostedSessions(application: Application, options: { now?: 
       const parkedUnder = new Set<string>();
       for (const row of store.idle(t - idle)) if (row.root_session_id && !busy(row.session_id)) park(row, parkedUnder);
       evictParked(parkedUnder);
-    });
+    };
+    if (mode === "queued") return store.write(body);
+    if (mode === "startup") store.writeNow(body); else store.atomic(body);
+    return Promise.resolve();
   }
   function park(row: HostedSession, parkedUnder: Set<string>) {
     store.park(row.session_id, now());
@@ -450,7 +455,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // live server (a concurrent opener). Writing alive_at in the same
   // transaction makes a second start measure ~0, so the credit is applied once.
   function creditDowntime() {
-    store.atomic(() => {
+    store.writeNow(() => {
       const t = now(), alive = store.aliveAt(), downtime = alive === undefined ? null : t - alive;
       let credited = 0;
       if (alive !== undefined && downtime !== null && downtime > LIVE_STALENESS_MS) {
@@ -497,18 +502,26 @@ export function createHostedSessions(application: Application, options: { now?: 
       const before = store.get(context.id);
       const id = before?.root_session_id ?? context.id;
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
-        authorized(p);
-        // authorized(p) just passed, with no await since: settle skips p's own disabled read (#881).
-        const settled = settle(context.id, p.authed.user_id);
         const later = refusalRows();
-        const row = await (async () => { try { return await store.write(() => { const r = rowFor(p, context, later.defer, true, wake, declare, settled)!; touch(r); return r; }); } catch (e) { later.flush(); throw e; } })();
+        // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
+        // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
+        // current when rowFor reads it.
+        const selected = await store.write(() => {
+          authorized(p);
+          // authorized(p) just passed, in this body: settle skips p's own disabled read (#881).
+          const settled = settle(context.id, p.authed.user_id);
+          try { return { row: store.atomic(() => { const r = rowFor(p, context, later.defer, true, wake, declare, settled)!; touch(r); return r; }) }; }
+          catch (error) { later.flush(); return { error }; }
+        });
+        if ("error" in selected) throw selected.error;
+        const row = selected.row;
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         const ids = [...new Set([row.session_id, id])];
         for (const s of ids) inflight.set(s, (inflight.get(s) ?? 0) + 1);
         try { return await fn(row); }
         finally {
           for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
-          if (endTouch) touchAfter(row);
+          if (endTouch) await touchAfter(row);
         }
       });
       if (result !== retry) return result as T;
@@ -545,7 +558,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       try { return await fn(row); }
       finally {
         for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
-        touchAfter(row);
+        await touchAfter(row);
       }
     });
     return result === MISS ? withGate(p, context, false, fn) : result as T;
@@ -584,10 +597,10 @@ export function createHostedSessions(application: Application, options: { now?: 
   // tool result) taken now, audited; the Controller's (its subscriber whoami) reported, taken by its next
   // delivery_open (`seeLost`). A child's call takes none: bind is the root's, and an adapter's own probe from a
   // child (pi's) would swallow the notice.
-  function takeLost(p: OAuthPrincipal, row: HostedSession | undefined, reader: LostReader): HostedLost[] {
-    // The read first, so a call with nothing pending opens no transaction.
-    if (!row || row.root_session_id || !store.lost(row.session_id, reader).length) return [];
-    return store.atomic(() => {
+  // Undefined when nothing is pending: the read first, so such a call opens no transaction and awaits nothing.
+  function takeLost(p: OAuthPrincipal, row: HostedSession | undefined, reader: LostReader): Promise<HostedLost[]> | undefined {
+    if (!row || row.root_session_id || !store.lost(row.session_id, reader).length) return undefined;
+    return store.write(() => {
       if (reader === "controller") return store.reportLost(row.session_id, now());
       const taken = store.tellLost(row.session_id, now());
       if (taken.length) audit(row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
@@ -641,7 +654,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     // verdict (#907).
     async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
       const body = async (row: HostedSession | undefined) => {
-        const taken = told ? takeLost(p, row, "agent") : [];
+        const pending = told ? takeLost(p, row, "agent") : undefined;
+        const taken = pending ? await pending : [];
         if (taken.length) told!(lostNotice(p, row!, taken));
         const root = row ? rootOf(row) : undefined;
         const held = root ? application.hostedHolds(root.session_id) : undefined;
@@ -674,7 +688,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         const selected = snapshot(p, row);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
-        const guard = () => { store.atomic(() => fence(p, row, root)); };
+        // fence only reads, back to back with no await, so no transaction: nothing in this process commits between
+        // its reads, and inside a caller's transaction they read the writer.
+        const guard = () => fence(p, row, root);
         try {
           guard();
           const value = await fn(selected.session, guard);
@@ -716,7 +732,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     async whoami(p: OAuthPrincipal, context: SessionContext, told?: (notice: string) => void) {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(row) : undefined;
-        const taken = takeLost(p, row, told ? "agent" : "controller"), lost = taken.map(({ alias, reason }) => ({ alias, reason }));
+        const pending = takeLost(p, row, told ? "agent" : "controller");
+        const taken = pending ? await pending : [], lost = taken.map(({ alias, reason }) => ({ alias, reason }));
         if (told && taken.length) told(lostNotice(p, row!, taken));
         const held = root ? application.hostedHolds(root.session_id) : [];
         return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
@@ -868,8 +885,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         return { ended: true };
       }, false, false);
     },
-    release(id: string, reason: HostedEnd, deadline?: number) {
-      store.atomic(() => store.end(id, reason, now(), deadline));
+    release(id: string, reason: HostedEnd, deadline?: number): Promise<void> {
+      return store.write(() => store.end(id, reason, now(), deadline));
     },
     close() {
       stopped = true;
@@ -879,7 +896,8 @@ export function createHostedSessions(application: Application, options: { now?: 
       holders.clear(); listeners.clear();
       // A clean stop records its exact time, so the next start credits leases
       // with the real downtime rather than up to a heartbeat interval more.
-      try { store.heartbeat(now()); } catch (e) { hostedFailure("hosted.heartbeat", e); }
+      // Idle at a clean stop, so the queue runs it now, before the caller closes the database.
+      store.write(() => store.heartbeat(now())).catch(e => hostedFailure("hosted.heartbeat", e));
     },
     instructions: hostedUnboundInstruction,
   };
@@ -887,16 +905,20 @@ export function createHostedSessions(application: Application, options: { now?: 
   // holder sessions for roots the sweep then ends (#424 item 7). The full reconcile after the sweep opens the rest.
   creditDowntime();
   const unsubscribe = store.subscribe(reconcile);
-  sweep();
+  void sweep(true, "startup");
   reconcile();
   let beat = now(), tick = 0;
   const timer = setInterval(() => {
     tick++;
-    try { sweep(tick % IDLE_EVERY === 0); } catch (e) { hostedFailure("hosted.sweep", e); }
+    sweep(tick % IDLE_EVERY === 0).catch(e => hostedFailure("hosted.sweep", e));
     // The backstop: holds can change outside the hosted store's commits (#399).
     if (tick % RECONCILE_EVERY === 0) try { reconcile(); } catch (e) { hostedFailure("hosted.reconcile", e); }
     const t = now();
-    if (t - beat >= HEARTBEAT_MS || t < beat) try { store.heartbeat(t); beat = t; } catch (e) { hostedFailure("hosted.heartbeat", e); }
+    if (t - beat >= HEARTBEAT_MS || t < beat) {
+      const last = beat;
+      beat = t; // set now, so a write still queued at the next tick isn't queued again; a failure retries next tick
+      store.write(() => store.heartbeat(t)).catch(e => { beat = last; hostedFailure("hosted.heartbeat", e); });
+    }
   }, TICK_MS);
   timer.unref();
   return service;
