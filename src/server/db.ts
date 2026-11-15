@@ -716,8 +716,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const hosted = makeHostedStore(db);
   const oauth = makeOAuthStore(db, hosted);
   // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
-  const generation = db.query<{ n: number; v: number }, []>("SELECT n, (SELECT data_version FROM pragma_data_version) AS v FROM temp.auth_generation");
-  const authGeneration = () => { if (db.inTransaction) return undefined; const g = generation.get()!; return `${g.n}:${g.v}`; };
+  // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
+  // on every cached auth read.
+  const counter = db.query<{ n: number }, []>("SELECT n FROM temp.auth_generation");
+  const dataVersion = db.query<{ data_version: number }, []>("PRAGMA data_version");
+  const authGeneration = () => db.inTransaction ? undefined : `${counter.get()!.n}:${dataVersion.get()!.data_version}`;
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
   // Positives-only caches of what the auth tables say, cleared when authGeneration moves (#853). They sit
   // here, under the store's own methods, so a test that replaces one of those methods replaces the cache too.
