@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setSystemTime, test } from "bun:test";
 import { fixture } from "./native-fixture.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 
@@ -88,4 +88,78 @@ test("incomplete public OAuth metadata fails closed rather than inventing client
     const f = fixture(); delete (f.metadata as Partial<typeof f.metadata>)[key];
     await expect(f.binding.capture("R")).rejects.toThrow("projection lacks");
   }
+});
+// #661: past expiry the plugin can only make OpenCode reconnect the entry, whose first request then draws the 401
+// that refreshes on 2.1.4. The reconnect flips `timeout.catalog`, outside the endpoint hash.
+test("refresh reconnects once per stored expiry, flipping only timeout.catalog and restoring the user's own value", async () => {
+  const f = fixture();
+  f.config.timeout = { startup: 9_000, catalog: 45_000 };
+  const e = await f.binding.capture("R"), watch = await f.binding.watch(e);
+  try {
+    // A valid token asks nothing.
+    expect(await f.binding.refresh(e)).toBe(false);
+    expect(f.reloads).toBe(0);
+    f.expire();
+    expect(await f.binding.refresh(e)).toBe(true);
+    expect(f.reloads).toBe(1);
+    expect(f.applied.timeout).toEqual({ startup: 9_000, catalog: 45_001 });
+    // The same expiry again: no second reconnect.
+    expect(await f.binding.refresh(e)).toBe(false);
+    expect(f.reloads).toBe(1);
+    // The next expiry flips back to exactly the user's value.
+    f.rotate("fake-access-two", -1);
+    expect(await f.binding.refresh(e)).toBe(true);
+    expect(f.reloads).toBe(2);
+    expect(f.applied.timeout).toEqual({ startup: 9_000, catalog: 45_000 });
+    expect(f.config.timeout).toEqual({ startup: 9_000, catalog: 45_000 });
+    // No hashed field moved: nothing drifted, and the enrollment still checks.
+    expect(f.drifts).toBe(0);
+    f.rotate("fake-access-three");
+    await f.binding.check(e);
+  } finally { await watch.dispose(); }
+});
+test("refresh on an entry with no timeout adds one above OpenCode's default and removes it on the next flip", async () => {
+  const f = fixture(), e = await f.binding.capture("R");
+  f.expire();
+  expect(await f.binding.refresh(e)).toBe(true);
+  expect(f.applied.timeout).toEqual({ catalog: 30_001 });
+  f.rotate("fake-access-two", -1);
+  expect(await f.binding.refresh(e)).toBe(true);
+  expect(f.applied).not.toHaveProperty("timeout");
+  expect(f.config).not.toHaveProperty("timeout");
+});
+test("refresh never reconnects while a native call is in flight; a call whose after hook never came stops counting after 10 minutes", async () => {
+  const f = fixture(), e = await f.binding.capture("R");
+  f.expire();
+  f.binding.calling("call-1"); f.binding.calling("call-2");
+  expect(await f.binding.refresh(e)).toBe(false);
+  f.binding.called("call-1");
+  expect(await f.binding.refresh(e)).toBe(false);
+  expect(f.reloads).toBe(0);
+  f.binding.called("call-2");
+  expect(await f.binding.refresh(e)).toBe(true);
+  expect(f.reloads).toBe(1);
+  // A lost after hook.
+  const g = fixture(), expected = await g.binding.capture("R");
+  g.expire();
+  g.binding.calling("lost");
+  setSystemTime(new Date(Date.now() + 10 * 60_000 + 1));
+  try { expect(await g.binding.refresh(expected)).toBe(true); }
+  finally { setSystemTime(); }
+});
+test("a native call that starts while refresh reads the credential still holds the reconnect", async () => {
+  const f = fixture(), e = await f.binding.capture("R");
+  f.expire();
+  f.afterResolve(() => f.binding.calling("late"));
+  expect(await f.binding.refresh(e)).toBe(false);
+  expect(f.reloads).toBe(0);
+});
+test("refresh's transform is disposed with the binding", async () => {
+  const f = fixture(), e = await f.binding.capture("R");
+  const before = f.transforms;
+  f.expire();
+  await f.binding.refresh(e);
+  expect(f.transforms).toBe(before + 1);
+  await f.binding.dispose();
+  expect(f.transforms).toBe(before);
 });

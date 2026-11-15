@@ -13,11 +13,25 @@ const fingerprint = (token: string) => createHash("sha256").update(token).digest
 // latency (clock skew between the hosts cancels out). A 401 this close to the
 // stored expiry is the hourly rollover, not a rejection (#472).
 const EXPIRY_SKEW_MS = 5_000;
+// A native call whose after hook never came (a host that drops it) stops
+// counting as in flight this long after it began.
+const CALL_STALE_MS = 10 * 60_000;
+// OpenCode's catalog timeout when the entry sets none (`core/dist/mcp/client.js`).
+const CATALOG_TIMEOUT_MS = 30_000;
 // OpenCode's native MCP grant as the Controller's credential: the plugin reads
-// the host's current access token and never refreshes it. `drift` latches every
-// root when the endpoint, account or grant behind an enrollment changed.
+// the host's current access token and never refreshes it itself; past expiry
+// it can only make OpenCode reconnect the entry (`refresh`). `drift` latches
+// every root when the endpoint, account or grant behind an enrollment changed.
 export class Binding implements CredentialPort<OpenCodeEnrollment> {
   constructor(readonly ctx: Context, readonly name: string, readonly drift: () => void, readonly issuer?: string) {}
+  // Native calls in flight in this location (by invocation ID, with their start).
+  private readonly calls = new Map<string, number>();
+  // The connection and stored expiry the last reconnect was for; how many reconnects; their transform.
+  private nudged?: string;
+  private flips = 0;
+  private nudge?: Promise<{ dispose(): Promise<void> }>;
+  calling(id: string) { this.calls.set(id, Date.now()); }
+  called(id: string) { this.calls.delete(id); }
   private endpoint(c: ReturnType<MCPEditor["get"]>) {
     if (!c || c.type !== "remote" || c.oauth === false || c.disabled) return;
     const headers = new Headers(c.headers);
@@ -112,6 +126,38 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     if (await this.ctx.storage.get(this.rejected(e)) === fingerprint(token)) throw new Refusal("auth", "Native access was rejected; restore native authentication before resuming");
     return token;
   }
+  // #661: OpenCode 2.1.4 refreshes a native token only when a request draws a
+  // 401, so with no native call in this location it never does. A reconnect of
+  // the entry makes that request: OpenCode reconnects an entry whose config
+  // changed, and a change to `timeout.catalog`, outside the endpoint hash,
+  // drifts nothing. Each reconnect flips the value between the user's own
+  // (untouched) and one more than it. A reconnect kills a native call in
+  // flight, so it waits until there is none, and comes once per stored expiry.
+  async refresh(e: OpenCodeEnrollment) {
+    if (this.busy()) return false;
+    const selected = await this.selection(e);
+    const credential = await this.ctx.integration.connection.resolve(selected.connection);
+    if (credential?.type !== "oauth" || credential.expires > Date.now()) return false;
+    const key = `${selected.connectionID}:${credential.expires}`;
+    if (this.nudged === key || this.busy()) return false;
+    this.nudged = key;
+    this.flips++;
+    this.nudge ??= this.ctx.mcp.transform(editor => {
+      if (this.flips % 2 === 0) return;
+      editor.update(this.name, c => {
+        if (c.type === "remote") c.timeout = { ...c.timeout, catalog: (c.timeout?.catalog ?? CATALOG_TIMEOUT_MS) + 1 };
+      });
+    });
+    await this.nudge;
+    await this.ctx.mcp.reload();
+    return true;
+  }
+  private busy() {
+    const now = Date.now();
+    for (const [id, at] of this.calls) if (now - at > CALL_STALE_MS) this.calls.delete(id);
+    return this.calls.size > 0;
+  }
+  async dispose() { await (await this.nudge)?.dispose(); }
   // A 401 for `token`: returns when the host already replaced it (the SDK
   // retries with the new one); at its stored expiry it is the rollover
   // (AccessExpired, which the Controller waits out); otherwise the server

@@ -30,6 +30,9 @@ function runtime(mode: Mode) {
   let takesContext = true;
   // While set, the credential's token() finds the access token ended for this reason.
   let accessFault: AccessReason | undefined;
+  // The host's refresh requests (#661), and the addresses another session holds (a bind refuses alias_held).
+  let refreshes = 0;
+  const heldElsewhere = new Set<string>();
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
   // The host's receipt hook (#441), when a test sets one.
@@ -61,7 +64,7 @@ function runtime(mode: Mode) {
         return { held: row?.held ?? [], primary: row?.held[0] ?? null, ownership: row?.ownership ?? null, ...(taken.length ? { alias_lost: taken.map(({ alias, reason }) => ({ alias, reason })) } : {}), ...(!row?.held.length ? { unbound: true } : {}) };
       }
       if (name === "bind") {
-        if (address(args.name as string).endsWith("/gone")) throw new SubscriberError("alias_held");
+        if (address(args.name as string).endsWith("/gone") || heldElsewhere.has(address(args.name as string))) throw new SubscriberError("alias_held");
         if (!args.create && !rows.get(this.sessionID) && !["you@example.com/be", "you@example.com/fe"].includes(address(args.name as string))) throw new Error("identity_unknown");
         bind(this.sessionID, args.name as string); row = rows.get(this.sessionID)!;
         lost.set(this.sessionID, (lost.get(this.sessionID) ?? []).filter(l => l.alias !== address(args.name as string)));
@@ -108,6 +111,7 @@ function runtime(mode: Mode) {
     watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
     token: async () => { if (accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault); return "access"; },
     unauthorized: async () => { throw new Refusal("auth", "unauthorized"); },
+    refresh: async () => { refreshes++; return true; },
   };
   const approval: ApprovalPort<Enrollment> | null = mode === "approval" ? {
     key: e => JSON.stringify([e.sessionID, e.configuration]),
@@ -164,6 +168,9 @@ function runtime(mode: Mode) {
     loseReceipts: () => { receiptsLost = true; },
     // The grant store is logged out: a capture finds no sign-in.
     signOut: () => { signedOut = true; },
+    get refreshes() { return refreshes; },
+    // Another session takes `name`: this root's rebind of it is refused alias_held.
+    holdElsewhere: (name: string) => { heldElsewhere.add(address(name)); },
     olderServer: () => { takesContext = false; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
   };
@@ -629,18 +636,144 @@ test.each(modes)("an `expired` access token at a stream close is polled until th
   } finally { await c.close(); await r.controller.close(); }
 });
 
-test.each(modes)("an `expired` access token the host never rotates pauses once the 10 s grace runs out (%s)", async mode => {
+// #661: past the grace the root stays paused, `native_access_expired`, while it asks the host to refresh and re-reads
+// the stored token on a backoff capped at 30 s, for an hour of waits. Waiting makes no server request.
+const GRACE = Array(21).fill(500), RECOVERY = [1000, 2000, 4000, 8000, 16000, ...Array(119).fill(30_000)];
+test.each(modes)("an `expired` access token the host never rotates pauses after the 10 s grace, then waits for the refresh on a capped backoff without a request (%s)", async mode => {
   const r = runtime(mode), waits: number[] = [];
   const c = r.make({ wait: async ms => { waits.push(ms); } });
   try {
     await c.enroll("R", ["be"], true);
     await until(() => r.root(c)?.state === "active");
+    const before = r.calls.length;
     r.expireAccess("expired"); r.closeStream("R");
-    await until(() => r.root(c)?.state === "paused");
-    expect(waits).toEqual(Array(21).fill(500));
-    expect(r.root(c)?.code).toBe("native_access_expired");
+    await until(() => r.root(c)?.message.startsWith("Access still expired after an hour") === true);
+    expect(waits).toEqual([...GRACE, ...RECOVERY]);
+    expect(RECOVERY.reduce((a, b) => a + b)).toBeGreaterThanOrEqual(3_600_000);
+    // One refresh request per attempt; the port acts at most once per expiry.
+    expect(r.refreshes).toBe(RECOVERY.length);
+    expect(r.root(c)).toMatchObject({ state: "paused", operation: "recover", code: "native_access_expired" });
+    expect(r.calls.slice(before).map(c => c.name)).toEqual([]);
     expect(r.named("delivery_open")).toHaveLength(1);
   } finally { await c.close(); await r.controller.close(); }
+});
+// Pauses R on an expired token past the grace; `during(n)` runs at the nth recovery wait.
+async function expiredPause(mode: Mode, during: (n: number, r: ReturnType<typeof runtime>, c: Controller) => unknown, roots = ["R"]) {
+  const r = runtime(mode), waits: number[] = [], states: { id: string; state: string; operation?: string; code?: string }[] = [];
+  let recovering = 0;
+  const c: Controller = r.make({
+    wait: async ms => { waits.push(ms); if (ms >= 1000) await during(++recovering, r, c); },
+    sink: record => { states.push({ id: record.sessionID ?? "", state: record.state, ...(record.operation ? { operation: record.operation } : {}), ...(record.code ? { code: record.code } : {}) }); },
+  });
+  for (const [index, id] of roots.entries()) { await c.enroll(id, [index ? "fe" : "be"], true); await until(() => r.root(c, id)?.state === "active"); }
+  const opened = r.named("delivery_open").length, calls = r.calls.length;
+  r.expireAccess("expired");
+  for (const id of roots) r.closeStream(id);
+  return { r, c, waits, states, opened, after: () => r.calls.slice(calls), recovering: () => recovering };
+}
+test.each(modes)("a refresh landing after the grace resumes on its own: the remembered holds rebind create:false and a queued message is delivered (%s)", async mode => {
+  const o = await expiredPause(mode, (n, r) => {
+    // The server ended the ownership meanwhile (its lease lapsed); the refresh lands at the third check.
+    if (n === 1) r.rows.delete("R");
+    if (n === 3) { r.expireAccess(); r.batches.set("R", [{ ...r.item("direct:1"), ownership: 2 }]); }
+  });
+  try {
+    await until(() => o.r.admits.length === 1);
+    await until(() => o.r.root(o.c)?.state === "active");
+    expect(o.waits).toEqual([...GRACE, 1000, 2000, 4000]);
+    const seen = o.states.map(s => [s.state, s.operation, s.code].join(":"));
+    expect(seen).toContain("paused:subscriber:native_access_expired");
+    expect(seen).toContain("retrying:recover:");
+    expect(seen.indexOf("paused:subscriber:native_access_expired")).toBeLessThan(seen.indexOf("retrying:recover:"));
+    expect(o.after().filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/work" }]);
+    expect(o.r.root(o.c)).toMatchObject({ state: "active", ownership: 2, held: ["you@example.com/be"] });
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+test.each(modes)("a remembered name another session took meanwhile is recorded alias_held, never taken, and nothing opens (%s)", async mode => {
+  const o = await expiredPause(mode, (n, r) => { if (n === 1) { r.rows.delete("R"); r.holdElsewhere("be"); r.expireAccess(); } });
+  try {
+    await until(() => o.r.root(o.c)?.code === "alias_held");
+    expect(o.r.root(o.c)?.state).not.toBe("active");
+    expect(o.after().filter(c => c.name === "bind").map(c => c.args.create)).toEqual([false]);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened);
+    expect(o.r.rows.get("R")).toBeUndefined();
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+for (const [what, act] of [
+  ["an explicit pause", async (_r: ReturnType<typeof runtime>, c: Controller) => { await c.pause(); }],
+  ["a credential drift", async (r: ReturnType<typeof runtime>) => { r.drift(); }],
+  ["a session end", async (_r: ReturnType<typeof runtime>, c: Controller) => { await c.ended("R"); }],
+  ["a shutdown", async (_r: ReturnType<typeof runtime>, c: Controller) => { await c.shutdown("R", "detach"); }],
+] as const) test.each(modes)(`${what} during the wait ends the recovery: a refresh after it resumes nothing (%s)`, async mode => {
+  const o = await expiredPause(mode, async (n, r, c) => { if (n === 1) { await act(r, c); r.expireAccess(); } });
+  try {
+    await until(() => o.recovering() >= 1);
+    // close waits out the recovery's last check.
+    await o.c.close();
+    expect(o.recovering()).toBe(1);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened);
+    expect(o.after().some(c => c.name === "bind" || c.name === "whoami")).toBe(false);
+    expect(o.r.root(o.c)?.state).toBe("paused");
+    expect(o.r.root(o.c)?.code).toBeUndefined();
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+for (const [what, act, code] of [
+  ["a sign-out", (r: ReturnType<typeof runtime>) => r.expireAccess("login_required"), "login_required"],
+  ["a changed grant", (r: ReturnType<typeof runtime>) => { r.expireAccess(); r.revoke("none"); }, "refused"],
+] as const) test.each(modes)(`${what} during the wait is the pause's cause from then on, never resumed (%s)`, async mode => {
+  const o = await expiredPause(mode, (n, r) => { if (n === 1) act(r); });
+  try {
+    await until(() => o.r.root(o.c)?.operation === "recover" || o.r.root(o.c)?.message.startsWith("Grayboard credential changed") === true);
+    await o.c.close();
+    expect(o.recovering()).toBe(1);
+    expect(o.r.root(o.c)?.state).toBe("paused");
+    expect(o.r.root(o.c)?.code).not.toBe("native_access_expired");
+    if (code === "login_required") expect(o.r.root(o.c)?.code).toBe(code);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+test.each(modes)("two roots awaiting one refresh both resume (%s)", async mode => {
+  let landed = false;
+  const o = await expiredPause(mode, (n, r) => { if (n === 2 && !landed) { landed = true; r.expireAccess(); } }, ["R", "B"]);
+  try {
+    await until(() => landed);
+    await until(() => ["R", "B"].every(id => o.r.root(o.c, id)?.state === "active"));
+    expect(o.r.named("delivery_open").slice(o.opened).map(c => c.sessionID).sort()).toEqual(["B", "R"]);
+    expect(o.states.filter(s => s.code === "native_access_expired" && s.state === "paused").map(s => s.id).sort()).toEqual(["B", "R"]);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+test.each(modes)("a native unbind that completes during the wait sets the holds: the recovery never rebinds the name (%s)", async mode => {
+  const o = await expiredPause(mode, async (n, r, c) => {
+    if (n !== 1) return;
+    // The native call's own 401 refreshed the token.
+    r.expireAccess();
+    await c.beforeCall({ sessionID: "R", tool: "unbind" });
+    r.rows.get("R")!.held = [];
+    await c.afterCall({ sessionID: "R", tool: "unbind", result: { status: "completed", output: { name: null, ownership: 1, instructions: [] } } });
+  });
+  try {
+    await until(() => o.r.root(o.c)?.state === "unbound");
+    await o.c.close();
+    expect(o.recovering()).toBe(1);
+    expect(o.after().some(c => c.name === "bind")).toBe(false);
+    expect(o.r.storage.get("rememberedHeld:R")).toMatchObject({ held: [] });
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+test("a reload during the wait restores the root into the same wait, which a later refresh resumes (#661)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    expect(o.r.root(o.c)).toMatchObject({ state: "paused", code: "native_access_expired" });
+    let polls = 0;
+    const restarted = o.r.make({ wait: async ms => { if (ms >= 1000 && ++polls === 2) o.r.expireAccess(); } });
+    try {
+      await restarted.restore();
+      await until(() => o.r.root(restarted)?.state === "active");
+      expect(polls).toBe(2);
+      expect(o.r.root(restarted)).toMatchObject({ state: "active", held: ["you@example.com/be"] });
+    } finally { await restarted.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
 });
 
 // Own-login adapters (pi, omp, Claude Code) refresh 60 s early and end a grant

@@ -39,7 +39,11 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // never receipts (it spends the item's attempt budget instead). A new lease
 // under another ownership or bind_gen has another key, so it admits the item
 // again.
-type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease };
+// `awaiting` marks a root paused on an expired host-rotated token whose
+// recovery loop is live (#661); anything that takes the root clears it.
+// `recovery` is that wait's backoff, kept until delivery is active again, so a
+// recovery whose delivery expires again before it opens never starts over.
+type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease; awaiting?: object; recovery?: { attempt: number; spent: number } };
 const ADMITTED_LIMIT = 100;
 // Ancestry lookups `childRoot` keeps for sessions not (yet) routed.
 const LOOKUPS = 1024;
@@ -51,6 +55,10 @@ const LOOKUPS = 1024;
 // ownership. Own-login adapters (pi, omp, Claude Code) never hit it: they
 // refresh 60 s early and end a grant as `login_required` or `refresh_outcome_unknown`.
 const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
+// Past the grace a root waits for the refresh (#661): it asks the host once
+// 401), then re-checks the stored credential, a local read, on this backoff,
+// for an hour of waits: after that the pause stands until a reload's restore.
+const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
 // A saved root restore couldn't prepare while the server was down (#424 6).
 const UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
 function sleep(ms: number, signal: AbortSignal) {
@@ -131,7 +139,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   drift(message: string) {
     this.drifted = true;
     for (const r of this.roots.values()) {
-      r.paused = true; r.epoch++; r.abort?.abort(); this.set(r, "paused", message);
+      r.paused = true; r.awaiting = undefined; r.epoch++; r.abort?.abort(); this.set(r, "paused", message);
       void this.port.storage.set(`paused:${r.e.sessionID}`, true).catch(error => this.failure("latch_save", error, r));
     }
   }
@@ -417,7 +425,10 @@ export class Controller<E extends Enrollment = Enrollment> {
     const started = new Promise<void>(resolve => { ready = resolve; });
     r.task = this.run(r, e, epoch, abort.signal, ready).catch(caught => {
       const error = this.expired(caught);
-      if (!abort.signal.aborted) { r.paused = true; this.set(r, "paused", failureMessage(error, this.hint), "subscriber", failureCode(error)); }
+      if (abort.signal.aborted) return;
+      r.paused = true;
+      if (error instanceof AccessExpired && error.reason === "expired") this.awaitRefresh(r, "subscriber");
+      else this.set(r, "paused", failureMessage(error, this.hint), "subscriber", failureCode(error));
     }).finally(ready);
     return started;
   }
@@ -465,7 +476,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         }
         reidentified = false;
         await this.guard(r, epoch, signal);
-        r.lease = lease; wire.capability = lease.capability;
+        r.lease = lease; wire.capability = lease.capability; r.recovery = undefined;
         this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
         let dirty = true, wake: (() => void) | undefined, closed = false;
@@ -572,7 +583,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   async pause(message = `Ownership ended; ${this.hint}`) { return this.serial(async () => {
     for (const r of this.roots.values()) {
-      r.paused = true; await this.stop(r);
+      r.paused = true; r.awaiting = undefined; await this.stop(r);
       await this.release(r).catch(error => this.failure("session_end", error, r));
       await this.save(r, false).catch(error => this.failure("pause_save", error, r));
       this.set(r, "paused", message);
@@ -596,7 +607,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     this.roots.get(sessionID)?.abort?.abort();
     return this.serial(async () => {
       const r = this.roots.get(sessionID);
-      if (r) { r.paused = true; await this.stop(r); }
+      if (r) { r.paused = true; r.awaiting = undefined; await this.stop(r); }
       const carried = o.carry ? await this.carried(sessionID) : undefined;
       if (!r) {
         if (mode === "release") await this.endUnowned(sessionID);
@@ -666,7 +677,9 @@ export class Controller<E extends Enrollment = Enrollment> {
           // refusal now (another account, a revoked grant) is the pause's cause from here on.
           const cause = this.expired(error);
           r.paused = true;
-          this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
+          // Still expired: wait for the refresh here too, so a reload during the wait recovers (#661).
+          if (cause instanceof AccessExpired && cause.reason === "expired") this.awaitRefresh(r, "restore");
+          else this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
           continue;
         }
         if (this.roots.get(id) !== r) continue;
@@ -677,6 +690,9 @@ export class Controller<E extends Enrollment = Enrollment> {
         if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
           this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
           this.retryRestore(r);
+        } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
+          // The token expired between the check and the prepare: the same wait (#661).
+          r.paused = true; this.awaitRefresh(r, "restore");
         } else if (r) { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
         else this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
       }
@@ -722,6 +738,68 @@ export class Controller<E extends Enrollment = Enrollment> {
     })().catch(error => this.failure("restore", error, r)).finally(() => this.retries.delete(retry));
     this.retries.add(retry);
   }
+  // A root whose host-rotated access token stayed expired past the rotation
+  // grace (#661). It stays paused (its record `native_access_expired`, which a
+  // restart also resumes) while this loop asks the host to refresh, once per
+  // expiry where the port can (`credential.refresh`), and re-checks the stored
+  // credential on a capped backoff. A valid credential resumes it the way a
+  // resume does: its remembered holds rebind with create:false, and one held
+  // elsewhere is recorded, never taken. Any other refusal (a changed account or
+  // grant, a sign-out, a rejected token) is the pause's cause from then on. A
+  // pause, drift, shutdown, session end, enroll or resume clears `awaiting` or
+  // replaces the root, which ends the loop; close ends its wait.
+  private awaitingSet(r: Root<E>, operation: Operation) {
+    this.set(r, "paused", `Access expired; delivery resumes once ${this.port.harness} refreshes it, approval retained (or ${this.port.loginAction})`, operation, "native_access_expired");
+  }
+  private awaitRefresh(r: Root<E>, operation: Operation) {
+    const mark = r.awaiting = {}, id = r.e.sessionID;
+    const awaiting = () => this.awaitingSet(r, operation);
+    awaiting();
+    const live = () => r.awaiting === mark && !this.stopped && !this.drifted && !this.ending.has(id) && this.roots.get(id) === r;
+    const recovery = (async () => {
+      const progress = r.recovery ??= { attempt: 0, spent: 0 };
+      while (live()) {
+        if (progress.spent >= RECOVERY_BUDGET_MS) {
+          r.awaiting = undefined;
+          this.set(r, "paused", `Access still expired after an hour; ${this.hint}`, "recover", "native_access_expired");
+          return;
+        }
+        // A failed request is recorded apart from the root, whose record stays the wait's.
+        if (this.port.credential.refresh) await this.port.credential.refresh(r.e).catch(error => this.failure("recover", error));
+        const ms = Math.min(RECOVERY_MAX_MS, RECOVERY_FIRST_MS * 2 ** progress.attempt++);
+        await this.wait(ms, this.closing.signal);
+        progress.spent += ms;
+        const done = await this.serial(async () => {
+          if (!live()) return true;
+          // token(), not check(): only it reads the access token's expiry.
+          try { await this.port.credential.check(r.e); await this.port.credential.token(r.e); }
+          catch (caught) {
+            const error = this.expired(caught);
+            if (!live()) return true;
+            if (error instanceof AccessExpired && error.reason === "expired") return false;
+            r.awaiting = undefined;
+            this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
+            return true;
+          }
+          r.awaiting = undefined;
+          await this.stop(r); r.lease = undefined; r.paused = false;
+          this.set(r, "retrying", "Access refreshed; recovering ownership, approval retained", "recover");
+          try {
+            if (!this.watches.has(id)) await this.watch(r.e);
+            await this.prepare(r, true);
+          } catch (caught) {
+            const error = this.expired(caught);
+            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r) return true;
+            if (error instanceof AccessExpired && error.reason === "expired") { r.paused = true; r.awaiting = mark; awaiting(); return false; }
+            this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
+          }
+          return true;
+        });
+        if (done) return;
+      }
+    })().catch(error => this.failure("recover", error, r)).finally(() => this.retries.delete(recovery));
+    this.retries.add(recovery);
+  }
   // Before a native call: a descendant registers under its root first; a root's
   // own bind stops delivery until afterCall reconciles it.
   async beforeCall(event: { sessionID: string; tool: string }): Promise<void> {
@@ -738,7 +816,16 @@ export class Controller<E extends Enrollment = Enrollment> {
   async afterCall(event: { sessionID: string; tool: string; result: CallOutcome }): Promise<void> {
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
-      if (!r || r.paused || this.drifted || this.stopped) return;
+      if (!r || this.drifted || this.stopped) return;
+      // A native bind or unbind that completed while the root awaited a refresh
+      // (its own 401 refreshed the token) sets the holds: delivery restarts
+      // under them, so the recovery never rebinds a name just unbound (#661).
+      // One that failed leaves the wait as it was.
+      if (r.paused && r.awaiting && (event.tool === "bind" || event.tool === "unbind")) {
+        if (event.result.status !== "completed") { this.awaitingSet(r, "after"); return; }
+        r.awaiting = undefined; r.paused = false;
+      }
+      if (r.paused) return;
       try {
         if (event.tool !== "bind" && event.tool !== "unbind") {
           const output = event.result.status === "completed" ? event.result.output as { unbound?: unknown } | undefined : undefined;
@@ -783,7 +870,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     if (!path) return;
     const r = this.roots.get(path.root);
     if (sessionID === path.root && r) {
-      r.paused = true; r.epoch++; r.abort?.abort();
+      r.paused = true; r.awaiting = undefined; r.epoch++; r.abort?.abort();
       await this.serial(async () => {
         await this.stop(r); await this.release(r).catch(error => this.failure("session_end", error, r));
         await this.port.storage.set(`paused:${sessionID}`, true); this.set(r, "paused", "Root ended; ownership released", "session_end");

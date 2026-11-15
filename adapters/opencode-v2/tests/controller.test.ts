@@ -488,10 +488,10 @@ test("a lease lost outside any item pauses after bounded recoveries despite succ
 // An approved root on an actual controller with an immediate backoff, whose
 // first subscription closes on demand (the server stopping, #423). `waited`
 // sees the backoff waited so far, a virtual clock from that close.
-async function outage(waited?: (elapsed: number) => void) {
+async function outage(waited?: (elapsed: number, ms: number) => void | Promise<void>) {
   const r = runtime(), waits: number[] = [], codes: string[] = [], states: string[] = [];
   let elapsed = 0;
-  const controller = new Controller(r.ctx, { mcpName: "grayboard" }, r.controller.Transport, async ms => { waits.push(ms); waited?.(elapsed += ms); }, record => { states.push(record.state); if (record.code) codes.push(record.code); });
+  const controller = new Controller(r.ctx, { mcpName: "grayboard" }, r.controller.Transport, async ms => { waits.push(ms); await waited?.(elapsed += ms, ms); }, record => { states.push(record.state); if (record.code) codes.push(record.code); });
   const first = Promise.withResolvers<void>();
   let listens = 0;
   r.subscriptions(() => ++listens === 1 ? first.promise : undefined);
@@ -500,6 +500,9 @@ async function outage(waited?: (elapsed: number) => void) {
   await until(() => controller.status().state === "active" && listens === 1);
   return { r, controller, waits, codes, states, stop: () => first.resolve() };
 }
+// #661: past the grace, the wait for the refresh backs off to 30 s for an hour of waits.
+const RECOVERY = [1000, 2000, 4000, 8000, 16000, ...Array(119).fill(30_000)];
+const STILL_EXPIRED = "Access still expired after an hour";
 const item = { id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" };
 test("server outages and subscription closures never spend the failure budget, and recovery reopens", async () => {
   const o = await outage();
@@ -525,7 +528,7 @@ test("server outages and subscription closures never spend the failure budget, a
     expect(o.controller.status().state).toBe("active");
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
-test("a native token that expires during an outage keeps retrying; outside one it waits out the rotation grace, then pauses", async () => {
+test("a native token that expires during an outage keeps retrying; outside one it waits out the rotation grace, then pauses and waits for the refresh", async () => {
   const o = await outage();
   try {
     const failures: Error[] = [new ServerUnreachable(new Error("down")), new NativeAccessExpired(), new NativeAccessExpired()];
@@ -545,10 +548,13 @@ test("a native token that expires during an outage keeps retrying; outside one i
     p.observe(async operation => { if (operation === "connect" && ++connects >= 3) throw new NativeAccessExpired(); });
     p.bind("R", "be");
     await p.controller.enroll("R");
-    await until(() => p.controller.status().state === "paused");
+    await until(() => p.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true);
     // The failure's backoff, then the rotation grace: 20 polls of 500 ms (#472).
-    expect(waits).toEqual([500, ...Array(20).fill(500)]);
-    expect(connects).toBe(23);
+    expect(waits.slice(0, 21)).toEqual([500, ...Array(20).fill(500)]);
+    // The stored token reads valid, so each recovery attempt's prepare connects, finds it expired and keeps the
+    // backoff: one connect per attempt, never a fresh grace (#661).
+    expect(waits.slice(21)).toEqual(RECOVERY);
+    expect(connects).toBe(23 + RECOVERY.length);
     expect(p.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
   } finally { await p.controller.close(); }
 });
@@ -559,9 +565,9 @@ test("a closed subscription is not an outage: native expiry on every reconnect, 
     // The SDK wraps errors thrown during connect (EraNegotiationFailed {cause}).
     o.r.observe(async operation => { if (operation === "connect") { connects++; throw new Error("era negotiation failed", { cause: new NativeAccessExpired() }); } });
     o.stop();
-    await until(() => o.controller.status().state === "paused");
-    expect(connects).toBe(21);
-    expect(o.waits).toEqual(Array(21).fill(500));
+    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true);
+    expect(connects).toBe(21 + RECOVERY.length);
+    expect(o.waits).toEqual([...Array(21).fill(500), ...RECOVERY]);
     expect(o.codes).toContain("subscription_closed");
     expect(o.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
   } finally { await o.controller.close(); await o.r.controller.close(); }
@@ -589,16 +595,47 @@ for (const lands of [600, 1500]) test(`OpenCode's refresh landing ${lands} ms af
     expect(o.r.admissions).toHaveLength(1);
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
-test("a native refresh that never lands within the rotation grace pauses as before, without releasing the lease", async () => {
+test("a native refresh that never lands within the rotation grace pauses, asks OpenCode to reconnect once, and waits an hour without releasing the lease (#661)", async () => {
   const o = await outage();
   try {
     o.r.f.expire();
     o.stop();
-    await until(() => o.controller.status().state === "paused");
-    expect(o.waits).toEqual(Array(21).fill(500));
+    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true);
+    expect(o.waits).toEqual([...Array(21).fill(500), ...RECOVERY]);
+    // Once per stored expiry, though every attempt asks.
+    expect(o.r.f.reloads).toBe(1);
+    expect(o.r.f.config).not.toHaveProperty("timeout");
+    expect(o.r.f.applied).toMatchObject({ timeout: { catalog: 30_001 } });
     expect(o.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
     expect(o.r.calls.filter(c => c.name === "delivery_open")).toHaveLength(1);
     expect(o.r.calls.some(c => ["delivery_release", "session_end"].includes(c.name))).toBe(false);
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
+// #661: OpenCode 2.1.4 refreshes only when a request draws a 401. Past the grace the plugin makes OpenCode
+// reconnect the entry, never while a native call is in flight (a reconnect kills it), and the refresh that
+// reconnect causes resumes delivery under the same ownership.
+test("a native call in flight holds the reconnect until its after hook; the refresh it causes resumes the same ownership", async () => {
+  let recovering = 0, reloadsWhileHeld = -1;
+  const o: Awaited<ReturnType<typeof outage>> = await outage(async (_elapsed, ms) => {
+    if (ms < 1000 || ++recovering !== 3) return;
+    reloadsWhileHeld = o.r.f.reloads;
+    await o.controller.after({ sessionID: "R", tool: "grayboard_dm_send", id: "held", status: "error" });
+  });
+  const controller = o.controller;
+  try {
+    await controller.before({ sessionID: "R", tool: "grayboard_dm_send", id: "held" });
+    // OpenCode's provider refreshes on the reconnect's 401.
+    const reload = o.r.ctx.mcp.reload;
+    (o.r.ctx.mcp as { reload: () => Promise<void> }).reload = async () => { await reload(); o.r.f.rotate("fake-access-two"); };
+    o.r.f.expire();
+    o.stop();
+    await until(() => recovering >= 3 && controller.status().roots.find(root => root.sessionID === "R")?.state === "active");
+    expect(reloadsWhileHeld).toBe(0);
+    expect(o.r.f.reloads).toBe(1);
+    expect(o.waits).toEqual([...Array(21).fill(500), 1000, 2000, 4000, 8000]);
+    expect(controller.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "active", ownership: 1 });
+    expect(o.r.calls.some(c => c.name === "bind")).toBe(false);
+    expect(o.r.f.config).not.toHaveProperty("timeout");
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
 // #472: a restart restores a pause from its diagnostic record. One whose cause
