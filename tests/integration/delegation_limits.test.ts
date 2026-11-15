@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../../src/core/delegation.ts";
 import { refusal, type AppSession } from "../support/app_session.ts";
-import { call, closeSessions, localSession, refusal as localRefusal } from "../support/mcp.ts";
+import { call, closeSessions, localSession, refusal as localRefusal, refusalCoded } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 
 type Delegated = { to: string; message_id: number; replayed?: unknown };
@@ -162,7 +162,9 @@ test("local: the session's bucket refuses past the burst with one throttled row,
     expect(d.to).toBe("be");
     await call(be.c, "dm_ack", { message_id: d.message_id });
   }
-  expect(await localRefusal(sim1, "delegate", { persona: "p", task: "over" })).toContain("too many delegation requests from this session");
+  const over = await refusalCoded(sim1, "delegate", { persona: "p", task: "over" });
+  expect(over.text).toContain("too many delegation requests from this session");
+  expect(over.code).toBe("rate_limited");
   expect(await localRefusal(sim1, "delegate", { persona: "p", task: "over again" })).toContain("too many delegation requests");
   // sim2 has its own bucket: it fills be's cap, and then be is full.
   for (let i = 0; i < DELEGATE_OPEN_CAP; i++) expect((await call(sim2.c, "delegate", { persona: "p", task: `u${i}` })).to).toBe("be");
