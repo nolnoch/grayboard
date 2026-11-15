@@ -1,4 +1,4 @@
-// The run loop (docs/factory.md §4–§7), harness-neutral: take a
+// The run loop (docs/factory.md §4–§5, docs/factory-children.md §1, docs/factory-fleets.md), harness-neutral: take a
 // delegation that passes the authority check, or a task posted on a fleet's
 // queue board, record it before anything else, answer in its thread at
 // once, run it on a free slot, and reply with the outcome. Every reply goes
@@ -15,7 +15,7 @@ import type { ChildTools } from "./relay.ts";
 import type { Admit, Hold, Row, RunOutcome, Store } from "./store.ts";
 import type { Place, Workdir, Workspaces } from "./workdir.ts";
 
-// A fleet (docs/factory.md §7): a queue board `<name>-tasks` the factory is
+// A fleet (docs/factory-fleets.md): a queue board `<name>-tasks` the factory is
 // a lane on, and the agent it runs each task with. The agent is the
 // operator's choice, never the post's. `fanout` (default on) lets a task's
 // run return a plan of subtasks instead of doing it (§7). `policy` and

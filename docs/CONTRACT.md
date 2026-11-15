@@ -73,9 +73,14 @@ flowchart TD
 | Delegation: launchers, `delegate` | `docs/delegation.md` |
 | Local-mode harness adapters and push ownership | `docs/adapters.md` |
 | Server-mode harness adapters (hosted core and its harnesses) | `docs/adapters-hosted.md` |
-| The Slack bridges (local and org) and human handles | `docs/slack-bridge.md` |
+| The local Slack bridge, the routing and threading both bridges share, human handles | `docs/slack-bridge.md` |
+| The org Slack bridge inside the server: `<email>/human`, linking, reach, death notices | `docs/slack-org-bridge.md` |
 | Capability parity across harnesses and modes: the parity matrix, its gap cells, the maintaining-parity rule | `docs/parity.md` |
-| The opt-in factory module (orchestration outside the core) | `docs/factory.md` |
+| Parity proof and reasons, rows 1–8 (tools, delivery, names, child sessions) | `docs/parity-delivery.md` |
+| Parity proof and reasons, rows 9–16 (sign-in, attachments, humans, setup, update) | `docs/parity-access.md` |
+| The opt-in factory module (orchestration outside the core): boundary, authority, store, asking, limits | `docs/factory.md` |
+| Factory children: spawning, working directories, thread commands, relayed bus tools, tree claims | `docs/factory-children.md` |
+| Factory fleets and projects: fan-out, rounds, reload | `docs/factory-fleets.md` |
 | Unbuilt designs, parked until a trigger | `docs/future/<name>.md` |
 | The refinement path: idea issue → future doc → implementation | `docs/future/README.md` |
 | What grayboard is, its features, the quick start (human) | `README.md` |

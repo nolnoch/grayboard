@@ -1,4 +1,4 @@
-// The Claude Code runner (docs/factory.md §5, #264): a headless
+// The Claude Code runner (docs/factory-children.md §1, #264): a headless
 // `claude -p` running the resolved agent. The agent file pins model, tools
 // and prompt; the operator's config pins the working directory and the tool
 // lists (a profile's, #643); permission prompts nothing answers are denied (`--permission-

@@ -1,4 +1,4 @@
-// The factory's entry point (docs/factory.md §5–§6): read the
+// The factory's entry point (docs/factory-children.md §1, docs/factory.md §5): read the
 // operator's config, open the store, start the bus session, run until the
 // bus goes away. Exits non-zero when it does, so a supervisor (systemd,
 // launchd, a tmux loop) restarts it; the store makes a restart safe.

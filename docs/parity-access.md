@@ -1,10 +1,10 @@
 # Parity evidence: sign-in, attachments, humans and setup
 
 ```doc-meta
-owns: TODO
-invariants: TODO
-code-pointers: TODO
-companions: TODO
+owns: proof and reasons for parity.md rows 9–16 (sign-in, sign-in offer, attachments, human reach and marking, presence and whoami, setup, delegation launcher declaration, update)
+invariants: mechanisms stay in their owner docs; a row here holds per-cell proof (a test or measurement) and the reason for each gap or n/a; row numbers match parity.md's matrix
+code-pointers: tests/integration/, tests/e2e/, adapters/, plugins/claude-code/src/, src/cli/
+companions: parity.md (the matrix and the maintaining-parity rule), parity-delivery.md, server-oauth.md, attachments.md, slack-bridge.md, slack-org-bridge.md, delegation.md
 ```
 
 ## 9. Sign-in flow

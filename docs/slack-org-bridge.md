@@ -1,10 +1,10 @@
 # Slack org bridge
 
 ```doc-meta
-owns: TODO
-invariants: TODO
-code-pointers: TODO
-companions: TODO
+owns: the org Slack bridge inside grayboard-server: the `<email>/human` identity, typed in-process delivery, reach, linking and unlinking, its outbox and files, death notices
+invariants: the name `human` is reserved in every scope for the org bridge's in-process connections, so `<email>/human` is provably that user's person; those connections have no session ID, ids row or end; only your own user's human carries authority, and only the adapter-generated `human="true"` marker is authoritative; linking needs the one-time code and a matching Slack email, and a link never moves silently; an item is acked to the hub only once Slack accepts or permanently refuses it; a human's phone never receives a file the human couldn't fetch; one process holds the app tokens; the bot token goes only to Slack's own hosts
+code-pointers: src/server/slack.ts, src/server/application.ts (attachHuman, owedBridgeNotice, helloOkFields), src/server/policy.ts (human.reach, msg.send), src/server/access.ts, src/server/hosted.ts (hostedBoundInstruction), adapters/hosted-core/src/own-human.ts, src/server/config.ts, deploy/slack-org-manifest.yaml, tests/integration/slack_org.test.ts
+companions: slack-bridge.md (routing, threading, text rules, the local bridge), server-access.md (application sessions, policy, audit trail), adapters-hosted.md (human marker formatting), guide/slack.md
 ```
 
 One Slack app per server, inside `grayboard-server`, enabled by `SLACK_APP_TOKEN` + `SLACK_BOT_TOKEN` (`src/server/config.ts`). Each linked user talks to the app in their own DM with it; routing, threading and text rules are `slack-bridge.md` §2's, via the same `Relay`. Manifest: `deploy/slack-org-manifest.yaml`. Human steps: `docs/guide/slack.md` §Slack for a team server (#66).

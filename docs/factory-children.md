@@ -1,10 +1,10 @@
 # Factory children: spawning and bus tools
 
 ```doc-meta
-owns: TODO
-invariants: TODO
-code-pointers: TODO
-companions: TODO
+owns: the factory's children: request keys and spawn, persona resolution, the Claude Code runner, restricted settings, outside effects, working directories and handback, budgets, thread commands, the relayed bus tools, tree and mirrored claims, progress
+invariants: one request key (source, id) spawns at most once, across restarts, and a command key acts at most once; children never share the factory's push channel, inherit no harness session, and read none of the operator's settings, hooks or MCP servers; model and effort come from the agent file, never the payload; a prompt goes on stdin, never argv; a scratch or worktree run's directory is its tree's, removed only after the store prunes the tree's request, and a branch it hands back is never deleted by it; thread commands are read by code, never a model, and cancel/retry obey only the requester or your user; every relayed bus tool is a read any local process of the user's could already make (no posts, DMs, creates, subscribes, bind, delegate or DM reads); relayed results are fenced as data; a mirrored claim is the one bus write a child can cause, on a factory-prefixed path key with a factory-written note
+code-pointers: adapters/factory/runner.ts (resolvePersona, Runner), adapters/factory/claude/runner.ts, adapters/factory/workdir.ts, adapters/factory/relay.ts, adapters/factory/relay_shim.ts, adapters/factory/bus.ts (startReader), adapters/factory/mirror.ts, tests/integration/factory.test.ts, tests/e2e/factory_claude.e2e.ts (e2e `claude-local`)
+companions: factory.md (boundary, authority, store, asking, limits), factory-fleets.md, delegation.md (launcher contract, persona rule), child-sessions.md, claims.md
 ```
 
 ## 1. Spawning

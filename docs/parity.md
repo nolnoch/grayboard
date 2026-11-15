@@ -4,7 +4,7 @@
 owns: capability parity across harnesses and modes: per harness × mode cell, supported, gap (issue) or n/a (reason), and where it is proven
 invariants: parity by addition (a cell becomes supported without taking anything from another cell); a feature or fix PR names the cells it changes; a gap cell links an issue or says unfiled; mechanisms stay in their owner docs, this doc holds status, reasons and proof
 code-pointers: adapters/pi/, adapters/omp/, adapters/opencode/, adapters/pi-family/, adapters/opencode-v2/, adapters/hosted-core/src/, plugins/claude-code/src/, src/local/mcp.ts, src/server/hosted.ts
-companions: adapters.md, adapters-hosted.md (adapter and push mechanics), handles.md, child-sessions.md, sessions.md (handles, child sessions, name record), server-hosted-mcp.md, server-oauth.md (hosted wire and login), slack-bridge.md (human handles)
+companions: parity-delivery.md (rows 1–8), parity-access.md (rows 9–16), adapters.md, adapters-hosted.md (adapter and push mechanics), handles.md, child-sessions.md, sessions.md (handles, child sessions, name record), server-hosted-mcp.md, server-oauth.md (hosted wire and login), slack-bridge.md (human handles)
 ```
 
 The baseline every later change is measured against: as of v2.4.0, every cell is supported or n/a, with no open gap. A cell says what a user of that harness in that mode gets; how it works is in the owner doc the evidence links. "Proof" names a test or e2e suite only where one exercises that cell; `—` means none does.

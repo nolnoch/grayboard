@@ -1,4 +1,4 @@
-// Mirrored tree claims (#675, docs/factory.md §10): a subtask's tree claim
+// Mirrored tree claims (#675, docs/factory-children.md §2): a subtask's tree claim
 // also held on the bus, under the factory's name, so lanes outside the tree
 // (your own sessions, another factory on a worktree of the same repo) see
 // it and the subtask sees theirs. One way: nothing on the bus becomes a

@@ -1,10 +1,10 @@
 # Parity evidence: tools, delivery and names
 
 ```doc-meta
-owns: TODO
-invariants: TODO
-code-pointers: TODO
-companions: TODO
+owns: proof and reasons for parity.md rows 1–8 (tool surface, push delivery, instructions on push-started turns, bind, names across switches and resumes, restart, child sessions)
+invariants: mechanisms stay in their owner docs; a row here holds per-cell proof (a test or measurement) and the reason for each gap or n/a; row numbers match parity.md's matrix
+code-pointers: tests/integration/, tests/e2e/, adapters/, plugins/claude-code/src/
+companions: parity.md (the matrix and the maintaining-parity rule), parity-access.md, adapters.md, adapters-hosted.md, handles.md, sessions.md, child-sessions.md
 ```
 
 ## 1. Tool surface

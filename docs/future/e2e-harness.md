@@ -4,7 +4,7 @@
 owns: the design of the e2e regression harness (#158): real harness hosts, real Slack, upgrades and released binaries
 invariants: `*.e2e.ts` is outside `bun test` discovery, so harness, slow and secret-bearing suites run only through `scripts/e2e.sh`; never the production Slack app; recorded Slack fixtures keep only allowlisted fields (public repo); upgrade checks derive tables from the old DB, not a hand-kept list
 code-pointers: tests/integration/, tests/support/, tests/integration/fake_slack.ts, tests/integration/pi.test.ts, .github/workflows/test.yml, .github/workflows/release.yml, .github/workflows/e2e.yml, scripts/e2e.sh, install.sh, src/cli/update.ts, src/cli/main.ts (setup), src/server/http.ts (healthz)
-companions: adapters.md (delivery owner per harness), slack-bridge.md §9 (what's unverified against Slack), server-deploy.md (build and deploy)
+companions: adapters.md (delivery owner per harness), slack-bridge.md §8 (what's unverified against Slack), server-deploy.md (build and deploy)
 trigger: PRs 0–2 (enablers, shared test support, upgrade tier) are built; PR 3 (harness tier) is buildable now; the real-Slack tier waits on a test workspace (Owner decisions)
 last-verified: 2026-10-31
 ```

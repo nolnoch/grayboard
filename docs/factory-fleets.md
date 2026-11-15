@@ -1,10 +1,10 @@
 # Factory fleets
 
 ```doc-meta
-owns: TODO
-invariants: TODO
-code-pointers: TODO
-companions: TODO
+owns: factory fleets and projects: queue-board lanes, fleet sync, fan-out plans, the work board, synthesis, rounds and the lead's notes, config reload
+invariants: the factory is a queue lane only on its configured fleets' boards, and a fleet task's agent comes from the config, never the post; a fan-out's plan is parsed by the module's code, its work board is broadcast, and a subtask never fans out again; a plan naming a profile outside its project fails before anything is posted; subtasks are admitted and the task marked waiting in one transaction after every post landed; a review sees earlier rounds only through the digest the code builds from the store, never a resumed conversation, and a lead's notes are never posted; a run keeps the config it started with across a reload, and a queued task whose fleet, project or profile is gone fails without a run
+code-pointers: adapters/factory/factory.ts (syncFleets), adapters/factory/fanout.ts (parsePlan), adapters/factory/main.ts (RESTART_ONLY), tests/integration/factory.test.ts
+companions: factory.md (store, limits), factory-children.md (profiles, workdirs, thread commands), boards.md §3 (queue boards)
 ```
 
 A fleet is a queue board, `<name>-tasks`, on which the factory is one lane, with the agent it runs every task with: config `fleets: [{"name": "sim", "agent": "researcher"}]`, or `{"name": "app", "profile": "code"}` to run under a profile's agent and tool lists (`factory-children.md` §1). Anyone who can see the board posts a task with plain `board_post`, and the core's rotation (`boards.md` §3, queue boards) hands each top-level post to exactly one lane. Interactive sessions that subscribe are lanes too.
