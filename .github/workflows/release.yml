@@ -149,7 +149,8 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  # Every v1.x release's databases and installs upgrade to this tree.
+  # Every release at or above the upgrade support floor (v1.0.0): its
+  # databases and installs upgrade to this tree.
   upgrade-matrix:
     name: Upgrade matrix
     permissions:
