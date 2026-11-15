@@ -1035,11 +1035,13 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
     return p;
   };
-  const joins = spyOn(storage.repo.oauth, "findActiveAccess");
+  // The cache sits under repo.oauth.findActiveAccess, so count the join's SQL rather than the method.
+  const query = spyOn(Database.prototype, "query");
+  const joins = () => query.mock.calls.filter(([sql]) => String(sql).includes("FROM oauth_tokens t")).length;
   const p = mint("cached@example.com");
-  joins.mockClear();
+  query.mockClear();
   for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
-  expect(joins).toHaveBeenCalledTimes(0); // warm: no token join while nothing has changed
+  expect(joins()).toBe(0); // warm: no token join while nothing has changed
   // A write inside a transaction that rolls back: false within it, true again after.
   expect(() => storage.repo.atomic(() => {
     storage.repo.sessions.revokeAllForUser(p.authed.user_id);
@@ -1047,6 +1049,7 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     throw new Error("roll back");
   })).toThrow("roll back");
   expect(service.isAuthorized(p)).toBe(true);
+  expect(joins()).toBeGreaterThan(0); // the rolled-back write moved the generation, so the spy sees the join
   // Each committed way the access ends, against a warm entry.
   const ends: [string, (p: OAuthPrincipal) => void][] = [
     ["revokeAllForUser", p => storage.repo.sessions.revokeAllForUser(p.authed.user_id)],
@@ -1066,5 +1069,5 @@ test("#853: a cached authorization ends with the write that ends it, from this c
   expect(service.isAuthorized(e)).toBe(true);
   clock = e.accessExpiry;
   expect(service.isAuthorized(e)).toBe(false);
-  joins.mockRestore();
+  query.mockRestore();
 });

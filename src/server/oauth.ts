@@ -454,27 +454,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const bearerError = (status: 401 | 403, error: string | undefined, requiredScopes: string[]) => json({ error: error ?? "unauthorized" }, status, {
     "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}", scope="${(status === 401 ? OAUTH_SCOPES : requiredScopes).join(" ")}"${error ? `, error="${error}"` : ""}`,
   });
-  // A live access token and its user's email, by hash (#853). Every hosted request and the stream timer's
-  // every live ask this, so a hit skips the token-grant-user join: positives only, held while
-  // repo.authGeneration is unchanged (any write to tokens, grants or users clears the lot) and both the
-  // token and its grant are unexpired, which are the join's own time conditions. Never cached inside a
-  // transaction, whose writes may roll back.
-  let accessGeneration: string | undefined;
-  const accessCache = new Map<string, { access: OAuthAccess; email: string }>();
+  // A live access token and its user's email, by hash. Both reads are cached in the Repo on
+  // authGeneration (#853), so the hot path skips the token-grant-user join.
   function activeAccess(accessHash: string): { access: OAuthAccess; email: string } | undefined {
-    const t = now(), generation = repo.authGeneration();
-    if (generation !== undefined) {
-      if (generation !== accessGeneration) { accessCache.clear(); accessGeneration = generation; }
-      const hit = accessCache.get(accessHash);
-      if (hit && t < hit.access.expiresAt && t < hit.access.grantExpiresAt) return hit;
-    }
-    const access = repo.oauth.findActiveAccess(accessHash, resource, [], t);
+    const access = repo.oauth.findActiveAccess(accessHash, resource, [], now());
     if (!access) return undefined;
-    const user = repo.users.findById(access.userId);
-    if (!user || user.disabled_at !== null) return undefined;
-    const found = { access, email: user.email };
-    if (generation !== undefined) accessCache.set(accessHash, found);
-    return found;
+    const email = repo.users.activeEmail(access.userId);
+    return email === undefined ? undefined : { access, email };
   }
   return {
     issuer, resource, resourceMetadata,

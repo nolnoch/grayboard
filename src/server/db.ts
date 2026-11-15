@@ -108,6 +108,8 @@ export interface Repo {
     findById(userId: number): User | undefined;
     // findById(id)?.disabled_at != null, cached on authGeneration (#853).
     isDisabled(userId: number): boolean;
+    // The user's email while it exists and isn't disabled, cached on authGeneration (#853).
+    activeEmail(userId: number): string | undefined;
     setDisabled(userId: number, disabled: boolean): void;
   };
   sessions: {
@@ -717,8 +719,36 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const generation = db.query<{ n: number; v: number }, []>("SELECT n, (SELECT data_version FROM pragma_data_version) AS v FROM temp.auth_generation");
   const authGeneration = () => { if (db.inTransaction) return undefined; const g = generation.get()!; return `${g.n}:${g.v}`; };
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
-  let disabledGeneration: string | undefined;
-  const disabled = new Map<number, boolean>();
+  // Positives-only caches of what the auth tables say, cleared when authGeneration moves (#853). They sit
+  // here, under the store's own methods, so a test that replaces one of those methods replaces the cache too.
+  let userGeneration: string | undefined;
+  const users = new Map<number, User | null>();
+  const cachedUser = (userId: number): User | undefined => {
+    const g = authGeneration();
+    if (g === undefined) return userById(userId);
+    if (g !== userGeneration) { users.clear(); userGeneration = g; }
+    let u = users.get(userId);
+    if (u === undefined) users.set(userId, u = userById(userId) ?? null);
+    return u ?? undefined;
+  };
+  // A live access token by hash: held while the generation is unchanged and both the token and its grant
+  // are unexpired, the join's own time conditions; required scopes are checked against the held scopes.
+  let accessGeneration: string | undefined;
+  const accesses = new Map<string, OAuthAccess>();
+  const findActiveAccess: OAuthStore["findActiveAccess"] = (h, resource, requiredScopes, now) => {
+    const g = authGeneration();
+    if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(h, resource, requiredScopes, now);
+    if (g !== accessGeneration) { accesses.clear(); accessGeneration = g; }
+    const key = `${resource}\n${h}`;
+    let a = accesses.get(key);
+    if (!a || !(now < a.expiresAt && now < a.grantExpiresAt)) {
+      a = oauth.findActiveAccess(h, resource, [], now);
+      if (!a) { accesses.delete(key); return undefined; }
+      accesses.set(key, a);
+    }
+    const held = a;
+    return requiredScopes.every(s => held.scopes.includes(s)) ? held : undefined;
+  };
   return {
     now: clock,
     atomic<T>(fn: () => Sync<T>): T {
@@ -726,7 +756,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
     authGeneration,
 
-    oauth: { ...oauth, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
+    oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
     hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
       end: marks(hosted.end, session => session), childEnd: marks(hosted.childEnd, session => session),
       park: marks(hosted.park, session => session), unpark: marks(hosted.unpark, session => session),
@@ -771,12 +801,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       findById: userById,
       isDisabled(userId) {
-        const g = authGeneration();
-        if (g === undefined) return userById(userId)?.disabled_at != null;
-        if (g !== disabledGeneration) { disabled.clear(); disabledGeneration = g; }
-        let d = disabled.get(userId);
-        if (d === undefined) disabled.set(userId, d = userById(userId)?.disabled_at != null);
-        return d;
+        return cachedUser(userId)?.disabled_at != null;
+      },
+      activeEmail(userId) {
+        const u = cachedUser(userId);
+        return u && u.disabled_at === null ? u.email : undefined;
       },
       setDisabled(userId, disabled) {
         db.transaction(() => {
