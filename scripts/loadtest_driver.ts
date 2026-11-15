@@ -282,7 +282,9 @@ async function main() {
       await Promise.all([...live.values()].map(l => timed("close", () => close(l))));
       live.clear();
       const f: DriverFinal = { type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst, errors: totalErrors };
-      emit(f);
+      // The final line holds every DM id: tens of KB a pipe takes in several writes. process.exit
+      // drops a write still queued, so exit only once this one has reached the pipe.
+      await new Promise<void>((done, fail) => process.stdout.write(JSON.stringify(f) + "\n", e => e ? fail(e) : done()));
       break;
     }
   }
