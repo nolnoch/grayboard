@@ -11,7 +11,7 @@ test("hosted gates remain independent, mandatory and release-blocking", () => {
   const pkg = JSON.parse(read("package.json"));
   expect(pkg.scripts.test).toBe("bun test --timeout 30000 ./src ./tests");
   const hosted = read(".github/workflows/hosted.yml");
-  expect(hosted).toContain("suite: [strict, git, config, host, matrix, native, durable]");
+  expect(hosted).toContain("suite: [hosted-strict, hosted-git, hosted-config, hosted-host, hosted-matrix, hosted-native, hosted-durable, claude-hosted]");
   expect(hosted).toContain("timeout-minutes: 60");
   expect(hosted).toContain("bun install --frozen-lockfile");
   expect(hosted).not.toContain("GRAYBOARD_PUBLIC_REVISION");
@@ -19,7 +19,9 @@ test("hosted gates remain independent, mandatory and release-blocking", () => {
   expect(hosted).toContain("contents: read");
   expect(hosted).toContain("if: always()");
   expect(hosted).toContain("retention-days: 7");
-  expect(hosted).toContain("path: ${{ runner.temp }}/hosted-run/evidence");
+  const upload = (Bun.YAML.parse(hosted) as any).jobs.hosted.steps.find((s: any) => s.uses?.startsWith("actions/upload-artifact@"));
+  // A hosted suite uploads its evidence only, never its fixture HOME or auth store; claude-hosted its run dir, as e2e.yml does.
+  expect(upload.with.path).toBe("${{ runner.temp }}/hosted-run/evidence\n${{ !startsWith(matrix.suite, 'hosted-') && format('{0}/hosted-run', runner.temp) || '' }}\n");
   expect(read("scripts/e2e.sh")).toContain("bun scripts/hosted-evidence.ts");
   expect(read("scripts/e2e.sh")).not.toContain("tee \"$run/hosted.log\"");
   expect(hosted).not.toContain("continue-on-error");
@@ -41,7 +43,12 @@ test("the stable hosted aggregator runs even when matrix dependencies fail, canc
   expect(job.steps[0].env.SKIP).toBe("${{ inputs.skip }}");
   expect(workflow.jobs.hosted.strategy["fail-fast"]).toBe(false);
   expect(workflow.jobs.hosted["continue-on-error"]).toBeUndefined();
-  expect(workflow.jobs.hosted.strategy.matrix.suite).toEqual(["strict", "git", "config", "host", "matrix", "native", "durable"]);
+  // #501: claude-hosted (the real Claude Code with the hosted plugin) is a required leg too.
+  expect(workflow.jobs.hosted.strategy.matrix.suite).toEqual(["hosted-strict", "hosted-git", "hosted-config", "hosted-host", "hosted-matrix", "hosted-native", "hosted-durable", "claude-hosted"]);
+  const run = workflow.jobs.hosted.steps.find((s: any) => s.name === "Run ${{ matrix.suite }}");
+  expect(run.run).toBe('bash scripts/e2e.sh "$SUITE"');
+  expect(run.env).toEqual({ GRAYBOARD_E2E_RUN_DIR: "${{ runner.temp }}/hosted-run", SUITE: "${{ matrix.suite }}" });
+  expect(workflow.jobs.hosted.steps.find((s: any) => s.name === "Independent frozen package install").if).toBe("startsWith(matrix.suite, 'hosted-')");
   const caller = Bun.YAML.parse(read(".github/workflows/test.yml")) as any;
   expect(caller.jobs.hosted.name).toBeUndefined();
   expect(caller.jobs.hosted.uses).toBe("./.github/workflows/hosted.yml");
