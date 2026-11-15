@@ -4,7 +4,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
 import { accessAudits } from "../support/audit.ts";
-import { HostedToolError } from "../support/hosted_session.ts";
+import { HOSTED_CLIENT, HOSTED_SCOPES, HostedToolError } from "../support/hosted_session.ts";
+import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
+import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
+import { DENY_ROW_LIMIT } from "../../src/server/policy.ts";
+import { GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../../src/shared/session_meta.ts";
+import { issueOAuth } from "../helpers/oauth.ts";
+import { withMeta } from "../helpers/hosted.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -15,7 +21,31 @@ let srv: TestServer;
 beforeEach(() => {
   srv = new TestServer({ admins: [ROOT], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
 });
-afterEach(() => srv.stop());
+const clients: Client[] = [];
+afterEach(async () => {
+  await Promise.allSettled(clients.splice(0).map((c) => c.close()));
+  await srv.stop();
+});
+
+// A hosted tools-only root over real HTTP (#451): every request carries the
+// generic session key and the alias it writes as (`writesAs`, changeable
+// between calls), so the server's own transaction and `later` hook decide.
+async function toolsOnly(email: string, sessionId: string, writesAs: () => string): Promise<(tool: string, args?: Record<string, unknown>) => Promise<CallToolResult>> {
+  const { token } = issueOAuth(srv.app.repo, srv.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
+  const version = MCP_PROTOCOL_VERSIONS[0]!;
+  const client = new Client({ name: "tools-only", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
+    fetch: async (input, init) => {
+      let request = new Request(input, init);
+      request = await withMeta(request, GRAYBOARD_SESSION_META, sessionId);
+      request = await withMeta(request, GRAYBOARD_WRITES_AS_META, writesAs());
+      request.headers.set("Authorization", `Bearer ${token}`);
+      return fetch(request);
+    },
+  }));
+  return async (tool, args = {}) => (await client.callTool({ name: tool, arguments: args })) as CallToolResult;
+}
 
 const rows = () =>
   accessAudits(srv.app.db, "authz.decision").map((r) => ({
@@ -48,6 +78,28 @@ describe("team management", () => {
       { actor: A, target: null, verb: "admin", allow: false, rule: "admin.env", route: "/api/admin/enable-user" },
       { actor: ROOT, target: null, verb: "admin", allow: true, rule: "admin.env", route: "/api/admin/enable-user" },
     ]);
+  });
+});
+
+describe("deny rows", () => {
+  test("a user looping on a refused act writes at most the burst of rows; allows aren't thinned", async () => {
+    const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
+    for (let i = 0; i < DENY_ROW_LIMIT.burst + 10; i++) expect((await srv.api(a, "POST", "/api/admin/enable-user", { email: A })).status).toBe(403);
+    for (let i = 0; i < DENY_ROW_LIMIT.burst + 10; i++) expect((await srv.api(root, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
+    const got = rows();
+    expect(got.filter((r) => r.actor === A).length).toBe(DENY_ROW_LIMIT.burst);
+    expect(got.filter((r) => r.actor === ROOT).length).toBe(DENY_ROW_LIMIT.burst + 10);
+  });
+
+  test("a caller-chosen route or team name is clipped in the row", async () => {
+    const a = await srv.login(A);
+    const long = "x".repeat(4000);
+    expect((await srv.api(a, "POST", `/api/admin/${long}`, {})).status).toBe(403);
+    expect((await srv.api(a, "GET", `/api/teams/${long}/members`)).status).toBe(404);
+    const got = accessAudits(srv.app.db, "authz.decision");
+    expect(got.length).toBe(2);
+    expect(String(got[0].detail.route).length).toBeLessThanOrEqual(129);
+    expect(String(got[1].detail.team_requested).length).toBeLessThanOrEqual(129);
   });
 });
 
@@ -93,5 +145,27 @@ describe("session acts", () => {
     const got = accessAudits(srv.app.db, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule])).toEqual([[B, "team:eng", "alias.bind", false, "scope.team_member"]]);
     expect(got[0].detail).toMatchObject({ address: "eng/build", session: expect.stringMatching(/^id:/) });
+  });
+
+  test("a hosted tools-only root's writes_as into a team one isn't in leaves a row, after the hosted rollback", async () => {
+    const a = await srv.login(A);
+    expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    // The connect's first request is refused (the hosted session is never created).
+    await expect(toolsOnly(B, "tools-new", () => "eng/build")).rejects.toThrow();
+    const got = accessAudits(srv.app.db, "authz.decision");
+    expect(got.map((x) => [x.actor, x.target, x.detail.verb, x.detail.allow, x.detail.rule])).toEqual([[B, "team:eng", "alias.bind", false, "scope.team_member"]]);
+    expect(got[0].detail).toMatchObject({ address: "eng/build", session: expect.stringMatching(/^id:/) });
+  });
+
+  test("an existing tools-only root that later declares a team one isn't in leaves a row", async () => {
+    const a = await srv.login(A);
+    expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    let writesAs = "ci";
+    const call = await toolsOnly(B, "tools-old", () => writesAs);
+    expect((await call("whoami")).isError).not.toBe(true);
+    writesAs = "eng/build";
+    await expect(call("whoami")).rejects.toThrow();
+    const got = accessAudits(srv.app.db, "authz.decision");
+    expect(got.map((x) => [x.actor, x.detail.verb, x.detail.allow, x.detail.address])).toEqual([[B, "alias.bind", false, "eng/build"]]);
   });
 });

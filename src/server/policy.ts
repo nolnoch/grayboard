@@ -10,6 +10,7 @@ import type { Principal } from "../core/resolver.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { writeAudit } from "./audit.ts";
 import type { Repo, Team } from "./db.ts";
+import { RateLimiter, type RateLimit } from "./rate_limit.ts";
 
 // Who besides you can reach your human (your phone, through the Slack
 // bridge): people who share a team with you, or everyone signed in.
@@ -37,8 +38,9 @@ export type Decision =
 
 // Who asked: the signed-in user (null for none), and, when the act came
 // through a session, the address it acted as and the session's ID. The Slack
-// bridge's human connections have no session ID.
-export type Actor = { user: string | null; address?: string; session?: string; client_id?: string };
+// bridge's human connections have no session ID. (The OAuth client joins
+// these rows with #847.)
+export type Actor = { user: string | null; address?: string; session?: string };
 
 const allow = (rule: string): Decision => ({ allow: true, rule });
 const deny = (rule: string, reason: string, code: "forbidden" | "not_found" = "forbidden"): Decision => ({ allow: false, code, reason, rule });
@@ -94,22 +96,47 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
   }
 }
 
+// Deny rows per user (security audit F-19): an authenticated client looping
+// on a refused act, over HTTP routes no request limiter covers, would
+// otherwise write a 90-day row per request. Past the burst a user's denies go
+// unrecorded until the bucket refills; the streak's end writes one
+// `authz.suppressed` row with the count. Allows aren't thinned: only owners
+// and admins reach them. One limiter per Repo (per server).
+export const DENY_ROW_LIMIT: RateLimit = { burst: 30, perSec: 0.5 };
+const denyLimiters = new WeakMap<Repo, RateLimiter>();
+function denyLimiter(repo: Repo): RateLimiter {
+  let l = denyLimiters.get(repo);
+  if (!l) {
+    l = new RateLimiter(DENY_ROW_LIMIT, { start() {}, end: (user, refused) => writeAudit(repo, "authz.suppressed", user, null, { refused }) }, Date.now, 4096);
+    denyLimiters.set(repo, l);
+  }
+  return l;
+}
+
+// A caller-chosen string (a URL path, a requested team name) is clipped
+// before it lands in a row.
+const MAX_DETAIL = 128;
+const clip = (v: unknown): unknown => (typeof v === "string" && v.length > MAX_DETAIL ? `${v.slice(0, MAX_DETAIL)}…` : v);
+
 // An `authz.decision` row: the actor's user in the actor column, both halves
-// of who asked (user, and address/session/client) in the detail. Written
-// through writeAudit, so a request's IP and user agent join it (F-19).
+// of who asked (user, and address/session) in the detail. Written through
+// writeAudit, so a request's IP and user agent join it (F-19).
 export function recordDecision(repo: Repo, actor: Actor, req: AuthzRequest, d: Decision, extra: Record<string, unknown> = {}): void {
+  if (!d.allow) {
+    const limiter = denyLimiter(repo);
+    limiter.sweep();
+    if (!limiter.take(actor.user ?? "").ok) return;
+  }
   const { target, detail } = subject(req);
-  writeAudit(repo, "authz.decision", actor.user, target, {
+  writeAudit(repo, "authz.decision", actor.user, typeof target === "string" ? (clip(target) as string) : target, {
     verb: req.verb,
     allow: d.allow,
     rule: d.rule,
     ...(d.allow ? {} : { code: d.code, reason: d.reason }),
-    ...detail,
+    ...Object.fromEntries(Object.entries({ ...detail, ...extra }).map(([k, v]) => [k, clip(v)])),
     user: actor.user,
     address: actor.address ?? null,
     session: actor.session ?? null,
-    client_id: actor.client_id ?? null,
-    ...extra,
   });
 }
 

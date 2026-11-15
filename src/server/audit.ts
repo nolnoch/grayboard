@@ -106,6 +106,7 @@ export type AuditAction =
   | "team.role_changed"
   | "delegation.requested"
   | "authz.decision"
+  | "authz.suppressed"
   | "delegation.refused"
   | "delegation.throttled"
   | "delegation.throttle_ended"
