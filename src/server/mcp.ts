@@ -1,4 +1,4 @@
-import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
+import { McpServer, createMcpHandler, fromJsonSchema, isLegacyRequest, PROTOCOL_VERSION_META_KEY, WebStandardStreamableHTTPServerTransport, ProtocolError, ProtocolErrorCode, type ServerContext, type McpHttpHandler, type ServerEventBus } from "@modelcontextprotocol/server";
 import { SubscriptionsListenRequestSchema, type CallToolResultSchema } from "@modelcontextprotocol/core";
 import { z } from "zod";
 import { boardTools, DEFAULT_CHANNEL_SOURCE, dmTools, type ToolDef } from "../core/tools.ts";
@@ -26,6 +26,17 @@ import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimit
 import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { countRefusal, timeTool } from "./metrics.ts";
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+// A POST body the SDK's isLegacyRequest can only answer false for, decided without its zod parses (#940): a
+// single message, not initialize, whose params' _meta carries the protocol-version key. The SDK documents that
+// any request carrying that claim is modern (its ladder rejections included); initialize is left out because one
+// with an invalid claim is legacy. isLegacyRequest costs four strict zod parses, and modern.fetch classifies again.
+export function claimsModern(body: unknown): boolean {
+  if (!isPlainObject(body) || typeof body.method !== "string" || body.method === "initialize" || !isPlainObject(body.params)) return false;
+  const meta = body.params._meta;
+  return isPlainObject(meta) && PROTOCOL_VERSION_META_KEY in meta;
+}
 
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
@@ -734,10 +745,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             const modernMethod = req.method !== "POST" && (!req.headers.has("Mcp-Session-Id") || req.headers.get("Mcp-Protocol-Version") === "2026-07-28");
             // The SDK predicate clones unparsed POSTs. Invalid JSON has no envelope;
             // send its bounded rewind directly to the native SDK parser instead.
-            const legacyRequest = !modernMethod && (req.method === "POST" && body.parsedBody === undefined || await isLegacyRequest(req, body.parsedBody));
+            const legacyRequest = !modernMethod && (req.method === "POST" && body.parsedBody === undefined || !(req.method === "POST" && claimsModern(body.parsedBody)) && await isLegacyRequest(req, body.parsedBody));
             if (!legacyRequest) {
-              const listen = SubscriptionsListenRequestSchema.safeParse(body.parsedBody);
-              if (listen.success) {
+              // Only a body naming the method can parse, so the schema's zod parse runs on listens alone (#940).
+              const listen = isPlainObject(body.parsedBody) && body.parsedBody.method === "subscriptions/listen" ? SubscriptionsListenRequestSchema.safeParse(body.parsedBody) : undefined;
+              if (listen?.success) {
                 releaseListen = reserve("listen", principal);
                 if (!releaseListen) { releasePost(); return new Response("MCP listen capacity reached", { status: 429 }); } // counted in reserve()
                 const context = exchange.context = await select(req);
