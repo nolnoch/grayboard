@@ -76,7 +76,10 @@ export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEF
     cached.lagging = lag.lagging;
     console.error(lag.lagging ? `[grayboard] healthz: failing on event-loop lag, p99 ${lag.p99s.map(p => p.toFixed(2)).join("/")} s over the last ${gate.windows} windows` : "[grayboard] healthz: event-loop lag recovered");
   }
-  if (lag.lagging) return json({ ok: false, version: pkg.version, code: "lagging", message: `event-loop p99 over ${gate.p99Ms} ms for ${gate.windows} windows`, p99_s: lag.p99s }, 503);
+  // The per-window p99s and the threshold go to the journal only: this route is public, and the scrape's bind is
+  // what guards the server's telemetry.
+  if (lag.lagging) return json({ ok: false, version: pkg.version, code: "lagging", message: "event loop lagging" }, 503);
+
   // The version lets a deploy check tell a restarted server from a stale one.
   return json({ ok: true, version: pkg.version });
 }

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
 import { HEALTH_TTL_MS, healthz } from "./http.ts";
+import { LAG_HISTORY, lagWindows, startLagSampler } from "./metrics.ts";
+import { until } from "../../tests/support/until.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let dir: string;
@@ -67,7 +69,11 @@ test("healthz fails only on sustained event-loop lag, keeps the version, and rec
     expect(healthz(store.repo, 20_000, gate, [slow, fast, slow, slow]).status).toBe(200);
     const failing = healthz(store.repo, 20_000, gate, [fast, slow, slow, slow]);
     expect(failing.status).toBe(503);
-    expect(await failing.json()).toMatchObject({ ok: false, code: "lagging", version: expect.any(String), p99_s: [1.5, 1.5, 1.5] });
+    const body = await failing.json() as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: false, code: "lagging", version: expect.any(String) });
+    // The public body carries no telemetry: the p99s go to the journal.
+    expect(Object.keys(body).sort()).toEqual(["code", "message", "ok", "version"]);
+    expect(errors.mock.calls.some(c => String(c[0]).includes("p99 1.50/1.50/1.50 s"))).toBe(true);
     expect(healthz(store.repo, 20_000, gate, [slow, slow, slow, fast]).status).toBe(200);
     // One journal line per change of state, not per request.
     expect(errors.mock.calls.filter(c => String(c[0]).includes("healthz:"))).toHaveLength(2);
@@ -77,4 +83,37 @@ test("healthz fails only on sustained event-loop lag, keeps the version, and rec
     // p99Ms 0 is off.
     expect(healthz(store.repo, 20_000, { p99Ms: 0, windows: 3 }, [slow, slow, slow]).status).toBe(200);
   } finally { errors.mockRestore(); }
+});
+
+// The wiring: the real sampler feeds healthz's default window source, its ring is capped, and a stop clears it.
+test("a really blocked loop fails healthz through the sampler's windows; the ring is capped and cleared on stop", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  const stop = startLagSampler(20);
+  try {
+    const gate = { p99Ms: 5, windows: 3 };
+    // Block in 30 ms slices, yielding between them, until three windows in a row saw the delay.
+    await until(() => {
+      const end = performance.now() + 30;
+      while (performance.now() < end) { /* block the loop */ }
+      return healthz(store.repo, 30_000, gate).status === 503;
+    }, 5_000, "three blocked windows never failed healthz");
+    // The same history with the gate off passes.
+    expect(healthz(store.repo, 30_000, { p99Ms: 0, windows: 3 }).status).toBe(200);
+    await until(() => lagWindows().length === LAG_HISTORY, 5_000, `the ring never reached ${LAG_HISTORY} windows`);
+    const before = lagWindows()[0];
+    await until(() => lagWindows()[0] !== before, 2_000, "the full ring never dropped its oldest window");
+    expect(lagWindows().length).toBe(LAG_HISTORY);
+  } finally { stop(); errors.mockRestore(); }
+  expect(lagWindows()).toHaveLength(0);
+});
+
+test("a down database wins over a lagging loop", async () => {
+  const probe = spyOn(store.repo.users, "findByEmail").mockImplementation(() => { throw new Error("gone"); });
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const slow = { p50: 1, p99: 2, max: 3 };
+    const r = healthz(store.repo, 40_000, { p99Ms: 1000, windows: 3 }, [slow, slow, slow]);
+    expect(r.status).toBe(503);
+    expect(await r.json()).toMatchObject({ code: "internal" });
+  } finally { probe.mockRestore(); errors.mockRestore(); }
 });
