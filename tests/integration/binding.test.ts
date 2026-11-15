@@ -321,6 +321,8 @@ test("#284 S2: unbind is refused for a scoped name, a tools-only process and the
 // The alias's labels and its meta audit rows.
 const labels = (name: string) => rows<Record<string, string | null>>(`SELECT task, owner, source_board, spec_hash, description FROM aliases WHERE address = ?`, name)[0]!;
 const metaAudits = (name: string) => rows<{ detail: string }>(`SELECT detail FROM audit_log WHERE action = 'alias.meta_set' AND target = ? ORDER BY rowid`, name).map((r) => JSON.parse(r.detail));
+// Locally no user is signed in: the row's actor is the session (#373).
+const metaActors = (name: string) => rows<{ actor: string | null }>(`SELECT actor FROM audit_log WHERE action = 'alias.meta_set' AND target = ? ORDER BY rowid`, name).map((r) => r.actor);
 
 test("#284 S12: bind's meta labels the alias; a re-bind of a held alias changes only its labels", async () => {
   const s = await session();
@@ -337,6 +339,7 @@ test("#284 S12: bind's meta labels the alias; a re-bind of a held alias changes 
   expect(await s.call("bind", { name: "fe", meta: { task: "", owner: "be" } })).toBe(`already bound to "fe"`);
   expect(labels("fe")).toMatchObject({ task: null, owner: "be", source_board: "e2e" });
   expect(metaAudits("fe").at(-1)).toEqual({ address: "fe", fields: { task: null, owner: "be" }, session: id });
+  expect(metaActors("fe")).toEqual([id, id]);
   expect(events("fe").map((e) => e.event)).toEqual(["bound"]);
   expect(rows<{ bound_at: number }>(`SELECT bound_at FROM alias_holds WHERE address = 'fe'`)[0]!.bound_at).toBe(boundAt);
 
