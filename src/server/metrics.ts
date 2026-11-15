@@ -90,17 +90,17 @@ export type LagSampler = { ageMs: number; windowMs: number };
 export function lagSampler(now = performance.now()): LagSampler | undefined { return lag ? { ageMs: now - lag.rotated, windowMs: lag.windowMs } : undefined; }
 
 // The /healthz lag gate (#805): lagging when each of the last `windows` finished windows has a p99
-// over `p99Ms`. Pure over the window history, which is its clock: a server with fewer finished
-// windows than that is never lagging, so a restart passes install.sh's /healthz check, and one slow
-// window (a GC pause, a churn wave) never fails it. p99Ms 0 turns the gate off. With `sampler`, a sampler that has
-// missed the window it owed and `windows` more is lagging too (#941): the loop hasn't reached its timers for that
-// long, so every window it would have finished had a delay far over any threshold. The one extra window keeps
-// timer jitter at the moment a window is due from failing a gate of 1.
+// over `p99Ms`. On the p99 rule the window history is its clock: a server with fewer finished windows than that
+// never fails it, so a restart passes install.sh's /healthz check, and one slow window (a GC pause, a churn wave)
+// never fails it. p99Ms 0 turns the gate off, both rules. With `sampler`, a sampler that has finished no window for
+// `windows` windows' time, plus a tenth of a window for timer jitter at a due window, is lagging too, however few
+// windows it has (#941): the loop hasn't reached its timers for that long, so every window it would have finished
+// had a delay far over any threshold. At the defaults that's 31 s, under the 35-46 s stalls #941 measured.
 export type LagGate = { p99Ms: number; windows: number };
 export const DEFAULT_LAG_GATE: LagGate = { p99Ms: 1000, windows: 3 };
-export function lagVerdict(history: readonly LagWindow[], gate: LagGate, sampler?: LagSampler): { lagging: false } | { lagging: true; p99s: number[]; stalledS?: number } {
+export function lagVerdict(history: readonly LagWindow[], gate: LagGate, sampler?: LagSampler | null): { lagging: false } | { lagging: true; p99s: number[]; stalledS?: number } {
   if (gate.p99Ms === 0 || gate.windows < 1) return { lagging: false };
-  if (sampler && sampler.ageMs >= (gate.windows + 1) * sampler.windowMs) return { lagging: true, p99s: history.slice(-gate.windows).map(w => w.p99), stalledS: sampler.ageMs / 1000 };
+  if (sampler && sampler.ageMs >= (gate.windows + 0.1) * sampler.windowMs) return { lagging: true, p99s: history.slice(-gate.windows).map(w => w.p99), stalledS: sampler.ageMs / 1000 };
   if (history.length < gate.windows) return { lagging: false };
   const recent = history.slice(-gate.windows);
   if (!recent.every(w => w.p99 * 1000 > gate.p99Ms)) return { lagging: false };

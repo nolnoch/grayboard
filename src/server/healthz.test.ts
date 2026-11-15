@@ -93,8 +93,8 @@ test("a sampler that has finished no window for the gate's span fails healthz, w
   const fast = { p50: 0.001, p99: 0.1, max: 0.2 };
   const errors = spyOn(console, "error").mockImplementation(() => {});
   try {
-    // Just under the owed window and three more: ok, even with no finished window yet.
-    expect(healthz(store.repo, 50_000, gate, [], { ageMs: 39_999, windowMs: 10_000 }).status).toBe(200);
+    // Just under three windows' time plus the jitter allowance: ok, even with no finished window yet.
+    expect(healthz(store.repo, 50_000, gate, [], { ageMs: 30_999, windowMs: 10_000 }).status).toBe(200);
     // Past them with none finished: lagging, though the last windows were fast and too few.
     const stalled = healthz(store.repo, 50_000, gate, [fast], { ageMs: 41_500, windowMs: 10_000 });
     expect(stalled.status).toBe(503);
@@ -130,10 +130,9 @@ test("a really blocked loop fails healthz through the sampler's windows; the rin
     await until(() => {
       const end = performance.now() + 30;
       while (performance.now() < end) { /* block the loop */ }
-      return healthz(store.repo, 30_000, gate).status === 503;
+      // No sampler (null): the windows alone carry this verdict, not the age rule (#941).
+      return healthz(store.repo, 30_000, gate, lagWindows(), null).status === 503;
     }, 5_000, "three blocked windows never failed healthz");
-    // The windows themselves carry the verdict, not only the sampler's age (#941).
-    expect(lagWindows().slice(-3).every(w => w.p99 * 1000 > 5)).toBe(true);
     // The same history with the gate off passes.
     expect(healthz(store.repo, 30_000, { p99Ms: 0, windows: 3 }).status).toBe(200);
     await until(() => lagWindows().length === LAG_HISTORY, 5_000, `the ring never reached ${LAG_HISTORY} windows`);

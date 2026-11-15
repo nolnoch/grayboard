@@ -54,7 +54,7 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 // synchronous read, so no request can arrive while one is in flight and the cache alone is single-flight.
 export const HEALTH_TTL_MS = 1000;
 const health = new WeakMap<Repo, { at: number; ok: boolean; lagging?: boolean }>();
-export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows(), sampler: LagSampler | undefined = lagSampler()): Response {
+export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows(), sampler: LagSampler | null = lagSampler() ?? null): Response {
   let cached = health.get(repo);
   if (!cached || now - cached.at >= HEALTH_TTL_MS) {
     let ok = true;
