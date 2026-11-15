@@ -429,7 +429,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   function makeServer(context: Context, legacy?: Legacy) {
     const { role, info } = context;
-    const server = new McpServer({ name: DEFAULT_CHANNEL_SOURCE, version: pkg.version }, {
+    const server = new HostedMcpServer({ name: DEFAULT_CHANNEL_SOURCE, version: pkg.version }, {
       supportedProtocolVersions: legacy ? MCP_PROTOCOL_VERSIONS.slice(1) : MCP_PROTOCOL_VERSIONS,
       capabilities: { tools: { listChanged: false }, experimental: { [ATTACHMENT_LIMITS_CAPABILITY]: { ...application.repo.attachmentLimits } } },
       cacheHints: { "resources/list": { ttlMs: 0, cacheScope: "private" }, "resources/read": { ttlMs: 0, cacheScope: "private" } },
@@ -888,6 +888,26 @@ const DM_INBOX_INPUT = z.strictObject({ days: z.number().positive().max(MAX_INBO
 const DM_ACK_INPUT = z.strictObject({ message_id: z.union([id, ids.min(1)]) });
 const DM_RETRACT_INPUT = z.strictObject({ message_id: id });
 const WHOAMI_INPUT = z.strictObject({});
+
+// The SDK converts a tool's inputSchema to JSON Schema on every modern tools/call (its Mcp-Param header scan) and
+// caches the result on the McpServer, which the modern entry builds per request, so the cache never hits (#950).
+// Every inputSchema above is built once per process, so one conversion per schema object serves every server.
+// `_registeredTools` is the SDK's private registry (pinned by mcp_schema_cache.test.ts); without it, or for a
+// disabled tool, this defers to the SDK unchanged.
+const INPUT_SCHEMA_JSON = new WeakMap<object, Record<string, unknown>>();
+type RegisteredTools = Record<string, { enabled: boolean; inputSchema?: object } | undefined>;
+export class HostedMcpServer extends McpServer {
+  override toolInputSchemaJson(name: string): Record<string, unknown> | undefined {
+    const tool = (this as unknown as { _registeredTools?: RegisteredTools })._registeredTools?.[name];
+    if (!tool?.enabled || tool.inputSchema === undefined) return super.toolInputSchemaJson(name);
+    let json = INPUT_SCHEMA_JSON.get(tool.inputSchema);
+    if (json === undefined) {
+      json = super.toolInputSchemaJson(name);
+      if (json !== undefined) INPUT_SCHEMA_JSON.set(tool.inputSchema, json);
+    }
+    return json;
+  }
+}
 
 function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Context, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
   // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do; `_meta`
