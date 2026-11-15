@@ -47,9 +47,11 @@ export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; 
 export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
 // A team's wake policy (#806): 'open' (the default) isolates members' agents
 // from each other's wakes, as from anyone's; 'collaborative' grants members'
-// agents a wake across users (vision.md principle 9).
-export type TeamPolicy = "open" | "collaborative";
-export const TEAM_POLICIES: readonly TeamPolicy[] = ["open", "collaborative"];
+// agents a wake across users (vision.md principle 9); 'delegating' (#256)
+// is collaborative and also lets a member's session name another member's
+// launcher in `delegate`'s `to`.
+export type TeamPolicy = "open" | "collaborative" | "delegating";
+export const TEAM_POLICIES: readonly TeamPolicy[] = ["open", "collaborative", "delegating"];
 // attachments: present on reads when the message carries files.
 // delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
 // via: the child session (a harness subagent, #523) that wrote it under its root's addresses; null for a root's own write.
@@ -154,9 +156,12 @@ export interface Repo {
     isMember(teamId: number, userId: number): boolean;
     // The previous policy, or null when the team is gone.
     setPolicy(teamId: number, policy: TeamPolicy): TeamPolicy | null;
-    // Whether two users share a team whose policy is 'collaborative': the
-    // grant under which one's agents may wake the other's (#806).
+    // Whether two users share a team whose policy is 'collaborative' or
+    // 'delegating': the grant under which one's agents may wake the other's (#806).
     shareCollaborative(userA: number, userB: number): boolean;
+    // Whether two users share a team whose policy is 'delegating': the grant
+    // under which one's session may delegate to the other's launcher (#256).
+    shareDelegating(userA: number, userB: number): boolean;
   };
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
@@ -174,6 +179,8 @@ export interface Repo {
     // The writer's signed-in user of each message and post that has one
     // recorded (rows from before F-10, bounces and system posts have none).
     writerUsers(messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
+    // Which of these messages `delegate` wrote: each has a delegation.requested row targeting its recipient (#256).
+    delegationIds(messageIds: number[]): Set<number>;
     // The row alone, without its attachments: an access or ack check.
     getById(id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
@@ -676,6 +683,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       throw new LastOwner(db.query<{ name: string }, [number]>("SELECT name FROM teams WHERE id = ?").get(teamId)!.name);
     }
   };
+  // Whether two users share a team whose policy is one of `policies`: one indexed lookup (principle 11).
+  const sharePolicy = (userA: number, userB: number, policies: readonly TeamPolicy[]): boolean =>
+    !!db.query<{ x: number }, (number | string)[]>(
+      `SELECT 1 AS x FROM team_members a
+       JOIN team_members b ON b.team_id = a.team_id AND b.user_id = ?
+       JOIN teams t ON t.id = a.team_id AND t.policy IN (${policies.map(() => "?").join(", ")})
+       WHERE a.user_id = ? LIMIT 1`,
+    ).get(userB, ...policies, userA);
   const principalByName = (name: string): PrincipalRow | undefined =>
     db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
   // Each changed row tells the observers after its transaction commits (#399); a rollback drops the notice with
@@ -923,16 +938,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           const row = db.query<{ policy: string }, [number]>("SELECT policy FROM teams WHERE id = ?").get(teamId);
           if (!row) return null;
           db.run("UPDATE teams SET policy = ? WHERE id = ?", [policy, teamId]);
-          return row.policy === "collaborative" ? "collaborative" : "open";
+          return (TEAM_POLICIES as readonly string[]).includes(row.policy) ? row.policy as TeamPolicy : "open";
         })();
       },
       shareCollaborative(userA, userB) {
-        return !!db.query<{ x: number }, [number, number]>(
-          `SELECT 1 AS x FROM team_members a
-           JOIN team_members b ON b.team_id = a.team_id AND b.user_id = ?
-           JOIN teams t ON t.id = a.team_id AND t.policy = 'collaborative'
-           WHERE a.user_id = ? LIMIT 1`,
-        ).get(userB, userA);
+        return sharePolicy(userA, userB, ["collaborative", "delegating"]);
+      },
+      shareDelegating(userA, userB) {
+        return sharePolicy(userA, userB, ["delegating"]);
       },
     },
 
@@ -955,6 +968,23 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
             .all(JSON.stringify(ids)).map((r) => [r.id, r.user] as const));
         return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds) };
+      },
+      // The delegation.requested row is written in the message's own
+      // transaction on the same clock, so a window around created_at bounds
+      // the (action, target, at) index scan: access_log isn't pruned, and an
+      // unbounded join would read every request a launcher ever got per
+      // message (principle 11, #878 audit). The window's width only absorbs
+      // a slow transaction or a clock step. CROSS JOIN fixes the order
+      // (messages first), so the planner can't drive from access_log by
+      // action alone.
+      delegationIds(messageIds) {
+        return new Set(db.query<{ id: number }, [string]>(
+          `SELECT m.id FROM messages m
+           CROSS JOIN access_log a ON a.action = 'delegation.requested' AND a.target = m.recipient
+             AND a.at BETWEEN m.created_at - 60000 AND m.created_at + 60000
+             AND json_extract(a.detail, '$.message_id') = m.id
+           WHERE m.id IN (SELECT value FROM json_each(?))`,
+        ).all(JSON.stringify(messageIds)).map((r) => r.id));
       },
       bouncesFrom(id, since = 0) {
         return db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);

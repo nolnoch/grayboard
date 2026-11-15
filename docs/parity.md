@@ -44,6 +44,7 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 16 | Update | yes | yes | yes | yes | yes | n/a | yes | yes |
 | 17 | Repo-name suggestion while unbound | yes | yes | yes | yes | yes | yes | yes | yes |
 | 18 | Another user's item wakes only under a grant (`msg.wake`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
+| 19 | Delegation to another user's launcher under a grant (`delegate.to`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 
 ## Evidence by row
 
@@ -185,3 +186,10 @@ Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only
 - pi H, omp H: hosted-core's `wakes()` refuses an `ungranted` item whatever the actionable flag (boards.md §9 Hosted core). Proof: `adapters/hosted-core/tests/channel.test.ts` ("an ungranted item never wakes…").
 - OC V2: admits the item with `resume: item.actionable` (`adapters/opencode-v2/src/lifecycle.ts`), so it lands as context. Proof: the server half above; no host test sends a cross-user item.
 - CC H: Claude Code wakes on any channel notification, so the plugin opens its lease with `context: false` and the server withholds a lone non-waking item, ungranted among them, until a waking one carries it (#854; boards.md §9 Hosted Claude Code). Not a wake bound: a full page of 100 non-waking items still goes out, each item its own channel notification, so a sender who fills a page can still start turns. Proof: `tests/integration/hosted_context_off.test.ts`, `adapters/hosted-core/tests/controller.test.ts` ("context: false opens the lease…"); no Claude Code test sends a cross-user item.
+
+### 19. Delegation to another user's launcher under a grant (`delegate.to`)
+
+- Local (all four): n/a. Local mode is single-user (`vision.md` §1).
+- Server side, every hosted cell: an explicit `to` naming another user's launcher is refused unless the two share a `delegating` team (boards.md §13, #256); the launcher's reads and pull mark such a request `delegated` per call, and the launcher instruction acts on another user's request only with that mark. Proof: `tests/integration/delegation_grant.test.ts`.
+- pi H, omp H, CC H: hosted-core's `channelParams` carries `delegated="true"` (`dmNotification`, `src/shared/notifications.ts`). Proof: `adapters/hosted-core/tests/channel.test.ts` ("channelParams carries the server's delegated mark…").
+- OC V2: the item's JSON carries the field as the server sent it; no host test sends a cross-user delegation.

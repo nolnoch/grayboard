@@ -34,6 +34,9 @@ function serverConfig(dir: string, overrides: Partial<Config>): Config {
     helloLimit: DEFAULT_HELLO_LIMIT,
     authFailLimit: DEFAULT_AUTH_FAIL_LIMIT,
     trustedProxies: DEFAULT_TRUSTED_PROXIES,
+    // A raised hostedRequestLimit raises the subscriber bucket too, unless the test sets that one:
+    // HostedSession's inbox polling and receipts are delivery upkeep, charged there (#845).
+    ...(overrides.hostedRequestLimit && !overrides.hostedSubscriberLimit ? { hostedSubscriberLimit: overrides.hostedRequestLimit } : {}),
     ...overrides,
   };
 }
@@ -128,7 +131,7 @@ export class TestServer {
   // A hosted MCP session of `email`'s, through a built-in client's OAuth
   // grant, connected (bound and leased unless identity is null). Closed by
   // stop(). Inbox polling spends hosted requests: give this server a large
-  // hostedRequestLimit.
+  // hostedRequestLimit (serverConfig carries it to the subscriber bucket).
   async hosted(email: string, identity: string | null, opts: HostedOptions = {}): Promise<HostedSession> {
     const { token } = issueOAuth(this.app.repo, this.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
     const s = new HostedSession(`${this.base}/mcp`, token, identity, opts);

@@ -38,6 +38,9 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // admin route; msg.wake: whether a delivery written by one signed-in user
 // wakes a session of another (users by email: the writer recorded at write
 // time and the receiving session's user, never an address's spelling, F-01);
+// delegate.to: whether a user's session may name another user's launcher in
+// `delegate`'s `to` (#256; users by email, the target's from the session
+// that holds the address).
 // alias.see: whether principal p may see that an alias of a scope exists (a
 // filter for listings and name suggestions, #348).
 export type AuthzRequest =
@@ -50,7 +53,7 @@ export type AuthzRequest =
   | { verb: "attachment.read"; identity: string; attachment: string; reach: AttachmentReach | undefined }
   | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
   | { verb: "admin"; email: string }
-  | { verb: "msg.wake"; from_user: string; to_user: string }
+  | { verb: "msg.wake" | "delegate.to"; from_user: string; to_user: string }
   | { verb: "alias.see"; principal: Principal; scope: ActScope };
 
 // What session.act judges of an ID's row: whose it is, and whether it's a
@@ -117,6 +120,8 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
     }
     case "msg.wake":
       return wakeRule(repo, req.from_user, req.to_user);
+    case "delegate.to":
+      return delegateRule(repo, req.from_user, req.to_user);
     case "alias.see":
       // The directory of people's names is open in the org (vision.md
       // principle 9); a team's names are its members' (and the team's own),
@@ -160,6 +165,7 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
     case "admin":
       return { target: null, detail: {} };
     case "msg.wake":
+    case "delegate.to":
       return { target: req.to_user, detail: { from_user: req.from_user, to_user: req.to_user } };
     case "alias.see":
       return { target: `${req.scope.scope_kind}:${req.scope.scope_ref}`, detail: { principal: req.principal.name, scope_kind: req.scope.scope_kind, scope_ref: req.scope.scope_ref } };
@@ -246,13 +252,24 @@ function sessionRule(user: string, session: string, row: SessionFacts | undefine
 // (security audit F-03, #103; vision.md principle 9). Sending stays open
 // (msg.send); without this grant the item is delivered as mail that doesn't
 // wake. A user's own agents wake each other; across users, only members of a
-// shared 'collaborative' team do. No admin exemption: admin is a server role,
+// shared 'collaborative' or 'delegating' team do (delegating implies it, #256). No admin exemption: admin is a server role,
 // not a messaging grant. One indexed lookup per decision (principle 11).
 function wakeRule(repo: Repo, fromUser: string, toUser: string): Decision {
   if (fromUser === toUser) return allow("wake.same_user");
   const a = repo.users.findByEmail(fromUser), b = repo.users.findByEmail(toUser);
   if (a && b && repo.teams.shareCollaborative(a.id, b.id)) return allow("wake.team_policy");
   return deny("wake.cross_user", `${fromUser} shares no collaborative team with ${toUser}; delivered as mail that doesn't wake their agent`);
+}
+
+// Whether a user's session may hand a task to another user's launcher by
+// name (#256). A user's own launchers take it; across users, only members of
+// a shared 'delegating' team. The grant is the team's, set by its owner; an
+// owner-approved grant per launcher is #874. No admin exemption, as for wakes.
+function delegateRule(repo: Repo, fromUser: string, toUser: string): Decision {
+  if (fromUser === toUser) return allow("delegate.same_user");
+  const a = repo.users.findByEmail(fromUser), b = repo.users.findByEmail(toUser);
+  if (a && b && repo.teams.shareDelegating(a.id, b.id)) return allow("delegate.team_policy");
+  return deny("delegate.cross_user", `${fromUser} shares no team whose policy is delegating with ${toUser}`);
 }
 
 // Whether the address `from` may wake `to` when `to` is a human

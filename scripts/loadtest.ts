@@ -26,6 +26,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { Database } from "bun:sqlite";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../src/server/config.ts";
+import { DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, type RateLimit } from "../src/server/rate_limit.ts";
 import { openDatabase } from "../src/server/db.ts";
 import { OAUTH_TTL } from "../src/server/oauth-types.ts";
 import { issueOAuth } from "../tests/helpers/oauth.ts";
@@ -153,18 +154,26 @@ export function capsEnv(o: Options): Record<string, string> {
     ...pair("GRAYBOARD_MCP_LISTEN", DEFAULT_MCP_LIMITS.listen), ...pair("GRAYBOARD_MCP_POST", DEFAULT_MCP_LIMITS.post, perUser * 4),
     // Board watches: one per session at most here; the per-session default stands.
     GRAYBOARD_RESOURCE_WATCHES_GLOBAL: String(Math.max(n, DEFAULT_HOSTED_CAPS.watches.global)),
-    // The per-user request bucket, raised only when the estimate needs it, at twice the estimate.
-    ...(perUserRate(o) * 2 > 20 ? { GRAYBOARD_HOSTED_REQUEST_PER_SEC: String(Math.ceil(perUserRate(o) * 2)), GRAYBOARD_HOSTED_REQUEST_BURST: String(Math.max(120, Math.ceil(perUserRate(o) * 12))) } : {}),
+    // Each per-user request bucket (#845), raised only when its estimate needs it, at twice the estimate.
+    ...bucket("GRAYBOARD_HOSTED_REQUEST", DEFAULT_HOSTED_REQUEST_LIMIT, perUserRate(o).tools),
+    ...bucket("GRAYBOARD_HOSTED_SUBSCRIBER", DEFAULT_HOSTED_SUBSCRIBER_LIMIT, perUserRate(o).subscriber),
   };
 }
+function bucket(prefix: string, d: RateLimit, rate: number): Record<string, string> {
+  if (rate * 2 <= d.perSec) return {};
+  return { [`${prefix}_PER_SEC`]: String(Math.ceil(rate * 2)), [`${prefix}_BURST`]: String(Math.max(d.burst, Math.ceil(rate * 12))) };
+}
 
-// Hosted requests per second per user, at hosted-core's cadence: a renew and a read every 10 s,
-// the agent's op every period, and up to three requests per delivery (a read on its hint, a
-// renew, a receipt; #845). A DM reaches one session; a post reaches its board's other subscribers.
-export function perUserRate(o: Options): number {
+// Hosted requests per second per user, per bucket, at hosted-core's cadence. Tool calls: the agent's
+// op every period. Delivery upkeep (role=subscriber): a renew and a read every 10 s, and up to three
+// requests per delivery (a read on its hint, a renew, a receipt; #845). A DM reaches one session; a
+// post reaches its board's other subscribers.
+export function perUserRate(o: Options): { tools: number; subscriber: number; total: number } {
   const subscribers = Math.max(0, o.sessions / o.boards - 1);
-  const perSession = 0.2 + 1 / o.periodS + (1 / o.periodS) * 3 * ((1 - o.postShare) + o.postShare * subscribers);
-  return perSession * o.sessions / o.users;
+  const perUser = o.sessions / o.users;
+  const tools = perUser / o.periodS;
+  const subscriber = perUser * (0.2 + (1 / o.periodS) * 3 * ((1 - o.postShare) + o.postShare * subscribers));
+  return { tools, subscriber, total: tools + subscriber };
 }
 
 type Window = {
@@ -186,7 +195,7 @@ async function main() {
   const caps = capsEnv(o);
   const env = { ...caps, ...o.env, GRAYBOARD_METRICS_ADDR: "127.0.0.1:0", HOME: join(scratch, "home") };
   mkdirSync(env.HOME, { recursive: true });
-  log(`server env: ${Object.entries(env).filter(([k]) => k !== "HOME").map(([k, v]) => `${k}=${v}`).join(" ")} (about ${perUserRate(o).toFixed(1)} hosted requests/s per user)`);
+  log(`server env: ${Object.entries(env).filter(([k]) => k !== "HOME").map(([k, v]) => `${k}=${v}`).join(" ")} (about ${perUserRate(o).tools.toFixed(1)} tool and ${perUserRate(o).subscriber.toFixed(1)} delivery requests/s per user)`);
   type Driver = { proc: ReturnType<typeof Bun.spawn>; windows: DriverWindow[]; ready?: { live: number; want: number }; final?: DriverFinal; churned: number; quiesced: boolean; read: Promise<void> };
   const drivers: Driver[] = [];
   const failures: string[] = [];

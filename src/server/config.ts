@@ -3,7 +3,7 @@ import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.
 
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_LAG_GATE, LAG_HISTORY, type LagGate } from "./metrics.ts";
-import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, type RateLimit } from "./rate_limit.ts";
+import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
@@ -45,6 +45,7 @@ export type Config = {
   // Hellos per user: the burst, and the refill per second (#210).
   helloLimit: RateLimit;
   hostedRequestLimit?: RateLimit;
+  hostedSubscriberLimit?: RateLimit;
   // /healthz fails on sustained event-loop lag (#805): p99Ms 0 is off.
   healthzLag?: LagGate;
   // delegate's limits (#252): GRAYBOARD_DELEGATE_BURST/_PER_SEC (per user) and
@@ -110,6 +111,7 @@ export function loadConfig(): Config {
     ...parseAttachmentLimits(process.env),
     helloLimit: parseRateLimit(process.env, "GRAYBOARD_HELLO", DEFAULT_HELLO_LIMIT, "hellos"),
     hostedRequestLimit: parseRateLimit(process.env, "GRAYBOARD_HOSTED_REQUEST", DEFAULT_HOSTED_REQUEST_LIMIT, "requests"),
+    hostedSubscriberLimit: parseRateLimit(process.env, "GRAYBOARD_HOSTED_SUBSCRIBER", DEFAULT_HOSTED_SUBSCRIBER_LIMIT, "requests"),
     authFailLimit: parseRateLimit(process.env, "GRAYBOARD_AUTH_FAIL", DEFAULT_AUTH_FAIL_LIMIT, "failures"),
     oauthLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH", { burst: 60, perSec: 1 }, "requests"),
     oauthGlobalLimit: parseRateLimit(process.env, "GRAYBOARD_OAUTH_GLOBAL", { burst: 600, perSec: 10 }, "requests"),

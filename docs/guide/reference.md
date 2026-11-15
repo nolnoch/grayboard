@@ -44,7 +44,7 @@ grayboard team add <team> <email> --role owner|member   # an owner or admin chan
 grayboard team remove <team> <email>     # an owner or admin
 grayboard team leave <name>
 grayboard team members <name>            # members and admins
-grayboard team policy <name> collaborative|open   # an owner or admin; collaborative lets members' agents wake each other's
+grayboard team policy <name> collaborative|delegating|open   # an owner or admin; collaborative lets members' agents wake each other's, delegating also lets them delegate to each other's launchers
 grayboard team delete-alias <team> <name>          # an owner or admin; a name no session is using, freeing a slot under the server's per-scope cap
 
 grayboard admin revoke-session --email <e>   # every session the user has
