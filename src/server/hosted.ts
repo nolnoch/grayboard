@@ -920,10 +920,17 @@ export function createHostedSessions(application: Application, options: { now?: 
   const unsubscribe = store.subscribe(reconcile);
   void sweep(true, "startup");
   reconcile();
-  let beat = now(), tick = 0;
+  let beat = now(), tick = 0, sweeping = false, fullDue = false;
   const timer = setInterval(() => {
     tick++;
-    sweep(tick % IDLE_EVERY === 0).catch(e => hostedFailure("hosted.sweep", e));
+    // One queued sweep at a time: behind a backlog longer than a tick, the next tick skips rather than queueing
+    // another (the one waiting reads the clock when it runs). A full pass due on a skipped tick runs on the next.
+    if (tick % IDLE_EVERY === 0) fullDue = true;
+    if (!sweeping) {
+      const full = fullDue;
+      sweeping = true; fullDue = false;
+      sweep(full).catch(e => hostedFailure("hosted.sweep", e)).finally(() => { sweeping = false; });
+    }
     // The backstop: holds can change outside the hosted store's commits (#399).
     if (tick % RECONCILE_EVERY === 0) try { reconcile(); } catch (e) { hostedFailure("hosted.reconcile", e); }
     const t = now();

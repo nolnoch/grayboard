@@ -21,6 +21,7 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { createDelivery } from "./delivery.ts";
 import { claim, listClaims } from "../core/claims.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { queueFor } from "./store/queue.ts";
 
 let database: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -42,6 +43,21 @@ beforeEach(() => {
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
+
+test("#807: behind a write backlog longer than a tick, the timer keeps one sweep queued, not one per tick", async () => {
+  const expired = spyOn(database.repo.hosted, "expired");
+  let release!: () => void;
+  const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
+  const before = expired.mock.calls.length;
+  await Bun.sleep(1_100); // four or more 250 ms ticks while the queue is held
+  expect(expired.mock.calls.length).toBe(before);
+  release();
+  await holder;
+  await until(() => expired.mock.calls.length > before);
+  // The one queued sweep ran; at most one more tick's has started since.
+  expect(expired.mock.calls.length - before).toBeLessThanOrEqual(2);
+  expired.mockRestore();
+});
 
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
