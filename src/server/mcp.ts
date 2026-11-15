@@ -13,7 +13,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Ident
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions } from "./hosted.ts";
+import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions, type Verdict } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
 import { domainData, HOSTED_BIND_INPUT, HOSTED_UNBIND_INPUT, hostedRole, roleScopes, registerHostedResources, type HostedRole } from "./mcp-resources.ts";
 import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.ts";
@@ -34,7 +34,7 @@ const ids = z.array(id);
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
-type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
+type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; verdict?: Verdict; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
 // A legacy session whose access token expired with its grant still active sleeps
 // (#476): its admission is released, its sid stays, and the binding's next
@@ -111,7 +111,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: principal => oauth.isAuthorized(principal) });
   const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now, caps: caps.leases });
-  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; refusal?: Response; context?: Context; legacy?: Legacy };
+  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
@@ -186,7 +186,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
     try {
       if (admit) application.admitHosted(principal.authed, "id" in routing ? routing.id : null, role);
-      selected = await hosted.snapshot(principal, routing);
+      // A native tool call's end is touched by its tool's gate, which also reuses this selection's verdict (#907).
+      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchanges.getStore()?.method === "tools/call"));
     } catch (error) {
       const exchange = exchanges.getStore();
       if (exchange && error instanceof ApplicationError && error.code === "rate_limited" && typeof error.extra.retry_after_ms === "number" && Number.isFinite(error.extra.retry_after_ms) && error.extra.retry_after_ms > 0) {
@@ -391,8 +392,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // The bound text follows the ownership: its launcher flag, and (with no declaration) its lease (#531).
   function boundInstruction(context: Context): string {
     if (!("id" in context.sessionContext)) return hostedBoundInstruction(context.info, context.declared);
-    const row = hosted.row(context.sessionContext.id);
-    const root = row && hosted.rootOf(row);
+    // The exchange's selection read the root moments ago (#907).
+    const row = context.verdict ? undefined : hosted.row(context.sessionContext.id);
+    const root = context.verdict?.root ?? (row && hosted.rootOf(row));
     return hostedBoundInstruction(context.info, context.declared, application.hostedLauncher(context.sessionContext.id), root?.lease_deadline != null);
   }
   function makeServer(context: Context, legacy?: Legacy) {
@@ -701,8 +703,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         const body = post ? await readBody(original) : { request: original, parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
         const req = body.request;
-        const parsed = body.parsedBody as { id?: string | number | null; params?: { _meta?: unknown } } | undefined;
-        return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id }, async () => {
+        const parsed = body.parsedBody as { id?: string | number | null; method?: unknown; params?: { _meta?: unknown } } | undefined;
+        return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id, method: parsed?.method }, async () => {
           const exchange = exchanges.getStore()!;
           let live: Live | undefined;
           let ownHandler: McpHttpHandler | undefined;
@@ -870,7 +872,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
-      return said(text(await timeTool(tool, () => { const context = current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }); }) ?? "ok"), notice);
+      return said(text(await timeTool(tool, () => { const context = current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict); }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
