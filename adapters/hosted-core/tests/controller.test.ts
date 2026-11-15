@@ -26,6 +26,8 @@ function runtime(mode: Mode) {
   const lost = new Map<string, { alias: string; reason: string; reported: boolean }[]>();
   let ownership = 0, grant = 1, failReceipt = 0, renews = 0, refreshBusy = 0, renewsLostFrom = Infinity, signedOut = false;
   let renewFault: { at: number; error: () => Error; then?: () => void } | undefined;
+  // Whether the fake server's delivery_open lists `context` (#854); an older server's doesn't.
+  let takesContext = true;
   // While set, the credential's token() finds the access token ended for this reason.
   let accessFault: AccessReason | undefined;
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
@@ -90,6 +92,7 @@ function runtime(mode: Mode) {
       return { ok: true };
     }
     async read() { return { items: batches.get(this.sessionID) ?? [] }; }
+    async takes(tool: string, arg: string) { calls.push({ sessionID: this.sessionID, name: "tools/list", args: {} }); return takesContext && tool === "delivery_open" && arg === "context"; }
     // The server closes the stream on its own: a revoked grant closes it at once.
     async listen() {
       const { promise: closed, resolve } = Promise.withResolvers<void>();
@@ -157,6 +160,7 @@ function runtime(mode: Mode) {
     loseRenewsFrom: (at: number) => { renewsLostFrom = at; },
     // The grant store is logged out: a capture finds no sign-in.
     signOut: () => { signedOut = true; },
+    olderServer: () => { takesContext = false; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
   };
 }
@@ -175,6 +179,26 @@ test.each(modes)("enroll binds, opens delivery with the port's session key and d
     expect(r.wires.every(w => w.sessionKey === SESSION_KEY && same(w.delivery, DELIVERY) && w.client.name === "grayboard-test")).toBe(true);
     if (mode === "approval") expect(r.approvals.get("R")?.enabled).toBe(true);
     else expect(r.approvals.size).toBe(0);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("context: false opens the lease with context:false where the server lists it, plainly where it doesn't; by default it never asks (%s)", async mode => {
+  for (const older of [false, true]) {
+    const r = runtime(mode);
+    if (older) r.olderServer();
+    const c = r.make({ context: false });
+    try {
+      await c.enroll("R", ["be"], true);
+      await until(() => r.root(c)?.state === "active");
+      expect(r.named("delivery_open").map(o => o.args)).toEqual([older ? {} : { context: false }]);
+    } finally { await c.close(); await r.controller.close(); }
+  }
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    expect(r.named("delivery_open").map(o => o.args)).toEqual([{}]);
+    expect(r.named("tools/list")).toEqual([]);
   } finally { await r.controller.close(); }
 });
 

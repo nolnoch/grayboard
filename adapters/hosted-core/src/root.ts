@@ -34,6 +34,8 @@ export type RootOptions = {
   // refuses it; unreachable or signed out, a later start (tools-only: a later
   // call) tries again.
   configured?: string;
+  // false: the host starts a turn for every item it admits (Claude Code), so the lease withholds non-waking ones (#854).
+  context?: false;
   // The host renders and delivers; `signal` is the Controller run loop's, which
   // a host whose admit waits (Claude Code's `initialized`) races.
   admit(item: Item, stableID: string, identity: Identity, signal: AbortSignal): Promise<void>;
@@ -225,7 +227,7 @@ export class RootDelivery {
       // makes (an unreadable state file) is weighed against this epoch.
       this.begun = await this.epoch();
       if (this.closed) return;
-      const controller = this.controller = new Controller(this.port(), { sink: this.sink });
+      const controller = this.controller = new Controller(this.port(), { sink: this.sink, ...(this.o.context === false ? { context: false as const } : {}) });
       await controller.restore();
       if (this.closed) return;
       // The tools-only proxy's calls in flight finish on it.

@@ -182,11 +182,12 @@ export function registerHostedResources(server: McpServer, context: {
     inputSchema: z.strictObject({ session: z.string().regex(SESSION_ID).optional() }),
   }, (args, ctx) => run(ctx, () => hosted.end(context.current().principal, context.current().sessionContext, args.session)));
   server.registerTool("delivery_open", {
-    description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items.", inputSchema: z.strictObject({}),
-  }, (_args, ctx) => run(ctx, async () => {
+    description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items. context: false for a host that starts a turn for every item: non-waking items then wait for a waking one.",
+    inputSchema: z.strictObject({ context: z.boolean().optional() }),
+  }, (args, ctx) => run(ctx, async () => {
     const { principal, sessionContext } = context.current();
     const hooks = context.leaseHooks?.();
-    const lease = await delivery.open(principal, sessionContext, hooks);
+    const lease = await delivery.open(principal, sessionContext, hooks, args.context === undefined ? {} : { context: args.context });
     hooks?.bind(lease.capability);
     try { authorize(ctx.mcpReq.signal); delivery.accept(lease); return lease; }
     catch (error) {
