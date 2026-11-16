@@ -222,7 +222,7 @@ for (const operation of ["revoke", "bind"] as const) {
     const issued = await issue(), { principal } = issued;
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
     const lease = await delivery.open(principal, context(principal));
-    await seed(database.repo, () => database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "must remain", null, false));
+    await seed(database.repo, tx => database.repo.messages.insert(tx, "sender@example.com/be", "user", "you@example.com/fe", "must remain", null, false));
     const batch = await delivery.pending(principal, context(principal), lease.capability);
     const receipt = hostedPause("hosted:receipt:before-txn", () => delivery.receipt(principal, context(principal), lease.capability, batch.map(item => item.id)), async () => {
       expect(external({ operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }).ok).toBe(true);
@@ -234,7 +234,7 @@ for (const operation of ["revoke", "bind"] as const) {
   test(`receipt lock precedes external ${operation}, consumes only the authorized batch`, async () => {
     const issued = await issue(), { principal } = issued;
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
-    const message = await seed(database.repo, () => database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
+    const message = await seed(database.repo, tx => database.repo.messages.insert(tx, "sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
     const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
     expect(results.every(result => result.ok)).toBe(true);
     expect(database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(message.id);
@@ -328,7 +328,7 @@ test("opening a pre-hosted SQLite schema adds tables without changing users, mes
   const first = await issue();
   const message = await seed(database.repo, tx => {
     database.repo.aliases.create(tx, { scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
-    return database.repo.messages.insert("you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
+    return database.repo.messages.insert(tx, "you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
   });
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
   close(); open();
