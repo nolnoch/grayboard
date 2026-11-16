@@ -1,3 +1,4 @@
+import "./zod_config.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { loadConfig } from "./config.ts";
 import { startServer } from "./app.ts";
