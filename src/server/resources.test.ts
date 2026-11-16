@@ -32,7 +32,7 @@ const hooks = () => {
 const quotaOf = (user: AuthedUser) => ({ principal: user.user_email, unsent: 1 << 20, stored: 1 << 20 });
 // push: false is a tools-only session (it writes as the alias and holds nothing), push: true a holder that is delivered to.
 async function open(user: AuthedUser, name = "be", push = false) {
-  const s = new AppSession(application, user, name, { push });
+  const s = new AppSession(application, store.repo, user, name, { push });
   await s.connect();
   return s;
 }

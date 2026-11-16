@@ -20,8 +20,8 @@ function delivery(): DeliverySink {
   return { deliver: () => {}, closed: () => {} };
 }
 // A connected AppSession: it registers like a hosted session and binds `alias`.
-async function connect(user: AuthedUser, alias: string | null, opts: ConstructorParameters<typeof AppSession>[3] = {}): Promise<AppSession> {
-  const s = new AppSession(application, user, alias, opts);
+async function connect(user: AuthedUser, alias: string | null, opts: ConstructorParameters<typeof AppSession>[4] = {}): Promise<AppSession> {
+  const s = new AppSession(application, store.repo, user, alias, opts);
   await s.connect();
   return s;
 }

@@ -263,7 +263,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
     if (stop !== "close") {
-      const replacement = new AppSession(application, grant.authed, "be");
+      const replacement = new AppSession(application, store.repo, grant.authed, "be");
       await replacement.connect();
       replacement.close();
     }

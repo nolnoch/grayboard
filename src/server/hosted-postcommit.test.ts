@@ -44,7 +44,7 @@ beforeEach(async () => {
   if (authenticated instanceof Response) throw new Error("fixture authentication");
   principal = authenticated;
   await mcp.sessions.bind(principal, context(), { name: "fe", create: true });
-  recipient = new AppSession(application, principal.authed, "launcher", { launcher: true });
+  recipient = new AppSession(application, database.repo, principal.authed, "launcher", { launcher: true });
   await recipient.connect();
   events = recipient.events;
 });

@@ -508,7 +508,7 @@ async function paused<T>(point: string, start: () => Promise<T>, overlap: () => 
 test("pending holds the reader gate while rebind waits; stale receipt cannot move the old cursor", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   const lease = await delivery.open(principal, context("root"));
-  const sender = new AppSession(application, principal.authed, "sender", { push: false });
+  const sender = new AppSession(application, database.repo, principal.authed, "sender", { push: false });
   await sender.connect();
   await sender.send("you@example.com/fe", "old mailbox");
   let binding!: ReturnType<typeof hosted.bind>, finished = false;
@@ -536,7 +536,7 @@ test("tool reader gate excludes rebind and revoke during its pause prevents the 
 
 test("bind publishes its new hold before the after-commit pause and the first hold's mail still reaches the root", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
-  const sender = new AppSession(application, principal.authed, "sender", { push: false });
+  const sender = new AppSession(application, database.repo, principal.authed, "sender", { push: false });
   await sender.connect();
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     await sender.send("you@example.com/fe", "not for be");

@@ -36,7 +36,7 @@ beforeEach(async () => {
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
-  sender = new AppSession(application, alice.authed, "be", { push: false });
+  sender = new AppSession(application, store.repo, alice.authed, "be", { push: false });
   await sender.connect();
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
@@ -219,8 +219,8 @@ test("explicit release ends ownership and closes all children", async () => {
 });
 
 test("cross application-level/hosted holders share one exclusion path", async () => {
-  await expect(new AppSession(application, bob.authed, "fe").connect()).rejects.toHaveProperty("code", "alias_held");
-  const holder = new AppSession(application, bob.authed, "be");
+  await expect(new AppSession(application, store.repo, bob.authed, "fe").connect()).rejects.toHaveProperty("code", "alias_held");
+  const holder = new AppSession(application, store.repo, bob.authed, "be");
   await holder.connect();
   await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "alias_held");
   // Since #282 close() leaves an application-level hold (there is no grace to sweep it) and a hosted bind never probes it; an unbind frees it.
