@@ -17,7 +17,8 @@ export type PendingDelivery = { id: string; actionable: boolean; event: Delivery
 // `context: false`: the host can't show an item without starting a turn (Claude Code), so non-waking items wait (#854).
 export type DeliveryOpenOptions = { context?: boolean };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
-export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal): boolean; now?: () => number; caps?: HostedCaps["leases"] };
+// `r`: the body's Tx when the check runs inside one, so it sees that body's own revokes; else the pool.
+export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal, r?: Read): boolean; now?: () => number; caps?: HostedCaps["leases"] };
 type Issued = { item: PendingDelivery; ref?: PendingRef };
 // What a retried receipt of an acknowledged id re-checks, without the item's body (#805).
 type Acked = { ownership: number; bind_gen: number; address?: string; board?: string };
@@ -95,12 +96,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     throw error;
   }
   // `authorized`: the caller checked p's token this turn, with no await since (#853).
-  // `r`: the body's Tx when this runs inside one, so the fallback row read stays in that transaction; else the pool.
+  // `r`: the body's Tx when this runs inside one, so the fallback row read and the access check stay in that transaction; else the pool.
   function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, authorized = false, r: Read = pool) {
     const lease = leases.get(capability);
     if (stopped || !lease || !("id" in context) || context.id !== lease.sessionId ||
       p.authed.user_id !== lease.principal.authed.user_id || p.clientId !== lease.principal.clientId || p.grantId !== lease.principal.grantId ||
-      !matches(lease, row ?? store.get(r, lease.sessionId)) || (!authorized && !options.isAuthorized(p))) return stale(p, context, capability);
+      !matches(lease, row ?? store.get(r, lease.sessionId)) || (!authorized && !options.isAuthorized(p, r))) return stale(p, context, capability);
     return lease;
   }
   const describe = (l: Lease): DeliveryLease => ({ capability: l.capability, identity: structuredClone(l.identity), expiresAt: l.expiresAt, ownership: l.ownership, bind_gen: l.generation });

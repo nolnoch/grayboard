@@ -188,7 +188,7 @@ const RECONCILE_EVERY = 120;
 // Activity writes coalesce (#912): a touch skips a row whose last_seen_at is within this of now, at most a tenth
 // of the idle window, so the idle sweep sees a row at most that much older than its last call.
 const TOUCH_EVERY_MS = 5_000;
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal): boolean }) {
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   // GRAYBOARD_HOSTED_IDLE_SECONDS is parsed strictly in config.ts and arrives here as options.idleSeconds.
@@ -196,7 +196,12 @@ export function createHostedSessions(application: Application, options: { now?: 
   if (!Number.isSafeInteger(rawIdle) || rawIdle < 1) throw new Error("hosted idle seconds must be a positive integer");
   const idle = rawIdle * 1000;
   const touchEvery = Math.min(TOUCH_EVERY_MS, Math.floor(idle / 10));
-  const touchRow = (tx: Tx, r: HostedSession, t: number) => { if (t - r.last_seen_at >= touchEvery) store.touch(tx, r.session_id, t); };
+  // Returns the row's last_seen_at after the touch.
+  const touchRow = (tx: Tx, r: HostedSession, t: number): number => {
+    if (t - r.last_seen_at < touchEvery) return r.last_seen_at;
+    store.touch(tx, r.session_id, t);
+    return t;
+  };
   // A delivery lease's TTL (createDelivery reads it from the service); the
   // restart credit caps a deadline at one TTL past startup (#423).
   const leaseTtl = DELIVERY_TTL_MS;
@@ -252,8 +257,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     const actor = principal?.authed.user_email ?? (row && repo.users.findById(row.user_id)?.email) ?? null;
     writeAudit(repo, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
   };
-  function authorized(p: OAuthPrincipal) {
-    if (stopped || !options.isAuthorized(p)) throw new ApplicationError("unauthenticated", "unauthenticated");
+  // `r`: the body's Tx when the check runs inside one, so it sees the body's own revokes (#998); else the pool.
+  function authorized(p: OAuthPrincipal, r?: Read) {
+    if (stopped || !options.isAuthorized(p, r)) throw new ApplicationError("unauthenticated", "unauthenticated");
   }
   // `later`: a refusal's row, handed to the caller's `refusalRows` (the throw rolls back a row written inside, #452).
   // `wake`: a parked child's request makes it active again; an exchange's selection (`snapshot`) and session_end
@@ -310,17 +316,20 @@ export function createHostedSessions(application: Application, options: { now?: 
   function rootOnly(row: HostedSession) {
     if (row.root_session_id) throw new ApplicationError("child_session", `this session acts under its root ${row.root_session_id}; bind and delivery are the root's. Call them from the root session.`);
   }
-  function touch(tx: Tx, row: HostedSession) {
+  // Returns the older last_seen_at of the row and its root after the touch, for `touchAfter`.
+  function touch(tx: Tx, row: HostedSession): number {
     const root = rootOf(tx, row), t = now();
-    touchRow(tx, root, t);
-    if (row.session_id !== root.session_id) touchRow(tx, row, t);
+    const seen = touchRow(tx, root, t);
+    return row.session_id === root.session_id ? seen : Math.min(seen, touchRow(tx, row, t));
   }
   // A call's end is activity too (#584), so the idle window runs from it. Only a row still as the call found it,
   // under the same root ownership: a call that ended its own session or whose root was replaced touches nothing.
   // Never throws (rootOf would), so it can't replace the call's result: a database failure is logged, and the
-  // start-of-call touch stands.
-  async function touchAfter(row: HostedSession) {
-    if (stopped) return;
+  // start-of-call touch stands. `seen`: the older last_seen_at the start-of-call touch left on the row and its root.
+  // While both are within the touch window, the touch below would write nothing (no write moves last_seen_at back
+  // but a full-row update), so the call ends without a transaction (#998).
+  async function touchAfter(row: HostedSession, seen: number) {
+    if (stopped || now() - seen < touchEvery) return;
     try { await store.write(tx => {
       const current = store.get(tx, row.session_id), root = row.root_session_id ? store.get(tx, row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
@@ -534,23 +543,23 @@ export function createHostedSessions(application: Application, options: { now?: 
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.
         const pending = store.write(tx => {
-          if (waited) authorized(p);
+          if (waited) authorized(p, tx);
           // authorized(p) passed with no await since: settle skips p's own disabled read (#881).
           const settled = settle(tx, context.id, p.authed.user_id);
-          try { return { row: store.atomic(() => { const r = rowFor(tx, p, context, later.defer, true, wake, declare, settled)!; touch(tx, r); return r; }) }; }
+          try { return { row: store.atomic(() => { const r = rowFor(tx, p, context, later.defer, true, wake, declare, settled)!; return { r, seen: touch(tx, r) }; }) }; }
           catch (error) { later.flush(); return { error }; }
         });
         waited = true;
         const selected = await pending;
         if ("error" in selected) throw selected.error;
-        const row = selected.row;
+        const { r: row, seen } = selected.row;
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         const ids = [...new Set([row.session_id, id])];
         for (const s of ids) inflight.set(s, (inflight.get(s) ?? 0) + 1);
         try { return await fn(row); }
         finally {
           for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
-          if (endTouch) await touchAfter(row);
+          if (endTouch) await touchAfter(row, seen);
         }
       });
       if (result !== retry) return result as T;
@@ -570,37 +579,37 @@ export function createHostedSessions(application: Application, options: { now?: 
     const result = await gate(id).call(async () => {
       authorized(p);
       if (stopped) return MISS;
-      const row = await store.write(tx => {
+      const touched = await store.write(tx => {
         const fresh = store.get(tx, prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? store.get(tx, fresh.root_session_id) : fresh;
         const t = now();
         if (!fresh || !root || fresh.ownership_id !== prior.row.ownership_id || fresh.root_session_id !== prior.row.root_session_id || fresh.parked_at !== null
           || root.session_id !== id || root.ownership_id !== prior.root.ownership_id || root.bind_gen !== prior.root.bind_gen || root.root_session_id
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
-        touchRow(tx, root, t);
-        if (fresh !== root) touchRow(tx, fresh, t);
-        return fresh;
+        const seen = touchRow(tx, root, t);
+        return { row: fresh, seen: fresh === root ? seen : Math.min(seen, touchRow(tx, fresh, t)) };
       });
-      if (!row) return MISS;
+      if (!touched) return MISS;
+      const { row, seen } = touched;
       const ids = [...new Set([row.session_id, id])];
       for (const s of ids) inflight.set(s, (inflight.get(s) ?? 0) + 1);
       try { return await fn(row); }
       finally {
         for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
-        await touchAfter(row);
+        await touchAfter(row, seen);
       }
     });
     return result === MISS ? withGate(p, context, false, fn) : result as T;
   }
   function attach(tx: Tx, p: OAuthPrincipal, row: HostedSession): HostedSession {
-    authorized(p);
+    authorized(p, tx);
     const fresh = store.get(tx, row.session_id);
     if (!fresh) throw new ApplicationError("unbound", "unbound; bind again");
     rootOnly(fresh);
     fence(tx, p, row, row);
     if (fresh.grant_id === p.grantId) return fresh;
     testPause("hosted:attach:in-txn");
-    authorized(p);
+    authorized(p, tx);
     for (const child of store.ofOwnership(tx, fresh.ownership_id)) store.update(tx, { ...child, grant_id: p.grantId });
     audit(row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
     // The lease is tied to the grant (delivery.ts), so a reattach closes one only if it was open.
@@ -616,7 +625,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
   function fence(r: Read, p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
-    authorized(p);
+    authorized(p, r);
     if (!row || !root) return;
     const fresh = store.get(r, row.session_id);
     const current = fresh ? rootOf(r, fresh) : undefined;
@@ -859,7 +868,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:register:before-txn");
         const later = refusalRows();
         try { return await store.write(tx => {
-          authorized(p);
+          authorized(p, tx);
           testPause("hosted:register:in-txn");
           const root = rowFor(tx, p, context, later.defer)!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);

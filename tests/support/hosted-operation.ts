@@ -10,9 +10,9 @@ const input = JSON.parse(raw!) as { principal: OAuthPrincipal; operation: "bind"
 const { db, repo } = openDatabase(path!, { blobDir: blobs! });
 const application = createApplication(repo, db);
 let now = input.now;
-const hosted = createHostedSessions(application, { now: () => now, isAuthorized: p => repo.oauth.isGrantActive(repo.read, p.grantId, now) });
+const hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r = repo.read) => repo.oauth.isGrantActive(r, p.grantId, now) });
 const context = sessionContext(input.principal, { [OPENCODE_SESSION_META]: input.rawSession ?? "root" });
-const delivery = createDelivery(hosted, { isAuthorized: p => repo.oauth.isGrantActive(repo.read, p.grantId, now) });
+const delivery = createDelivery(hosted, { isAuthorized: (p, r = repo.read) => repo.oauth.isGrantActive(r, p.grantId, now) });
 const lease = input.operation === "receipt" ? await delivery.open(input.principal, context) : undefined;
 const pending = lease ? await delivery.pending(input.principal, context, lease.capability) : [];
 console.log("READY");

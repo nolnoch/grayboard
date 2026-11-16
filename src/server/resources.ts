@@ -22,7 +22,8 @@ export type ResourceHooks = {
 };
 export type ResourceOptions = {
   // Trusted boundary rechecks the session's grant/scopes; never derive a principal here.
-  isAuthorized(session: ApplicationSession): boolean;
+  // `r`: the body's Tx when the check runs inside one (`list`, `read` inside hosted `run`); else the pool.
+  isAuthorized(session: ApplicationSession, r?: Read): boolean;
   caps?: HostedCaps["watches"];
 };
 type Watch = {
@@ -56,9 +57,9 @@ export function createResources(application: Application, options: ResourceOptio
   function finishQuietly(watch: Watch) {
     try { finish(watch); } catch (e) { hostedFailure("resources.finish", e); }
   }
-  function authorized(session: ApplicationSession, allowUnbound = false): boolean {
+  function authorized(session: ApplicationSession, allowUnbound = false, r?: Read): boolean {
     try {
-      if (stopped || !options.isAuthorized(session)) return false;
+      if (stopped || !options.isAuthorized(session, r)) return false;
       application.revalidateSession(session, allowUnbound);
       return true;
     } catch (error) {
@@ -66,8 +67,8 @@ export function createResources(application: Application, options: ResourceOptio
       throw error;
     }
   }
-  function requireSession(session: ApplicationSession, allowUnbound = false) {
-    if (authorized(session, allowUnbound)) return;
+  function requireSession(session: ApplicationSession, allowUnbound = false, r?: Read) {
+    if (authorized(session, allowUnbound, r)) return;
     for (const watch of [...bySession.get(session) ?? []]) finishQuietly(watch);
     throw new ApplicationError("unauthenticated", "resource session is closed or unauthorized");
   }
@@ -83,12 +84,12 @@ export function createResources(application: Application, options: ResourceOptio
   const service = {
     get activeWatchCount() { return watches.size; },
     async list(r: Read, session: ApplicationSession, after?: string) {
-      requireSession(session, true);
+      requireSession(session, true, r);
       const page = await application.boardCatalog(r, session, after);
       return { resources: page.boards.map(board => ({ uri: boardResourceUri(board.name), board })), next_after: page.next_after };
     },
     async read(r: Read, session: ApplicationSession, uri: string, options: SnapshotOptions = {}) {
-      requireSession(session, true);
+      requireSession(session, true, r);
       const board = parseBoardResourceUri(uri);
       return { uri: boardResourceUri(board), ...await application.boardSnapshot(r, session, board, options) };
     },
