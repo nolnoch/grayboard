@@ -395,7 +395,7 @@ describe("OAuth domain store", () => {
   test("pre-correction OAuth tables migrate additively and legacy access retains full grant scopes", async () => {
     const input = await issue();
     second.db.close();
-    first.db.exec("DELETE FROM oauth_codes");
+    await seed(first.repo, () => { first.db.exec("DELETE FROM oauth_codes"); });
     first.db.exec("DROP INDEX idx_oauth_codes_grant");
     first.db.exec("ALTER TABLE oauth_codes DROP COLUMN grant_id");
     first.db.exec("ALTER TABLE oauth_tokens DROP COLUMN access_scopes");

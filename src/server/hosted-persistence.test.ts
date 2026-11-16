@@ -344,7 +344,7 @@ test("a database a v2.x release wrote, with a hosted root bound under its single
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
   const id = (context(first.principal) as { id: string }).id;
   // The v2.x shape: the name on the row under its partial unique index, no writes_as, and the hold row its bind also wrote.
-  database.db.exec(`ALTER TABLE hosted_sessions DROP COLUMN writes_as; UPDATE hosted_sessions SET name = 'fe'; CREATE UNIQUE INDEX idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;`);
+  await seed(database.repo, () => { database.db.exec(`ALTER TABLE hosted_sessions DROP COLUMN writes_as; UPDATE hosted_sessions SET name = 'fe'; CREATE UNIQUE INDEX idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;`); });
   close(); open();
   expect(database.db.query("SELECT name FROM hosted_sessions").get()).toEqual({ name: null });
   expect(database.db.query("SELECT 1 AS x FROM sqlite_master WHERE name = 'idx_hosted_name'").get()).toBeNull();

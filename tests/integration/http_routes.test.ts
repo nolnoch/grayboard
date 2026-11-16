@@ -168,7 +168,7 @@ test("a team from before roles: its creator owns it, per row", async () => {
     await api(alice, "POST", "/api/teams", { name });
     await api(alice, "POST", `/api/teams/${name}/add`, { email: "bob@example.com" });
   }
-  srv.app.db.run("UPDATE team_members SET role = NULL");
+  await seed(srv.app.repo, () => { srv.app.db.run("UPDATE team_members SET role = NULL"); });
 
   expect((await api(bob, "POST", "/api/teams/eng/add", { email: "carol@example.com" })).status).toBe(403);
   expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" })).status).toBe(200);
@@ -177,7 +177,7 @@ test("a team from before roles: its creator owns it, per row", async () => {
 
   // ops: the creator left before roles; nobody owns it, so bob can't manage
   // it, and leaving isn't guarded; an admin can.
-  srv.app.db.run("DELETE FROM team_members WHERE team_id = (SELECT id FROM teams WHERE name = 'ops') AND user_id = (SELECT id FROM users WHERE email = 'alice@example.com')");
+  await seed(srv.app.repo, () => { srv.app.db.run("DELETE FROM team_members WHERE team_id = (SELECT id FROM teams WHERE name = 'ops') AND user_id = (SELECT id FROM users WHERE email = 'alice@example.com')"); });
   expect((await api(bob, "POST", "/api/teams/ops/add", { email: "carol@example.com" })).status).toBe(403);
   expect((await api(root, "POST", "/api/teams/ops/add", { email: "carol@example.com", role: "owner" })).status).toBe(200);
   expect((await api(carol, "POST", "/api/teams/ops/remove", { email: "bob@example.com" })).status).toBe(200);
