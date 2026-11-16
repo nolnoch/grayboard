@@ -1,6 +1,6 @@
 // The tools a hosted adapter registers before login come from a committed
 // snapshot of the server's native tools/list (#430), and the Rust SDK's
-// request types are checked against stripped copies of both roles' lists
+// request types will be checked against stripped copies of both roles' lists
 // (#929). This fails when the server's list changed without the snapshots:
 // run `bun scripts/snapshot_native_tools.ts` and commit the result.
 import { expect, test } from "bun:test";

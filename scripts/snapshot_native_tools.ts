@@ -53,8 +53,6 @@ export async function liveToolLists(): Promise<ToolLists> {
   }
 }
 
-export async function liveNativeTools(): Promise<NativeTool[]> { return (await liveToolLists()).native; }
-
 // Drops every string-valued `description`. A property named `description`
 // survives: its value in a `properties` map is a schema object, not a string.
 function stripDescriptions(value: unknown): unknown {
