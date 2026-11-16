@@ -18,6 +18,7 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_browser.ts";
 import { accessAudits } from "../../tests/support/audit.ts";
 import { stubProvider } from "../../tests/support/stub_provider.ts";
+import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -498,11 +499,39 @@ test("a Google account presenting a linked user's email is refused at the callba
   expect(await signIn("google-first")).toBe(303);
   expect(await signIn("google-second")).toBe(403);
   expect(storage.db.query("SELECT action, actor, detail FROM access_log WHERE action LIKE 'auth.subject_%'").all()).toEqual([
-    { action: "auth.subject_refused", actor: "you@example.com", detail: JSON.stringify({ reason: "subject_mismatch", client_id: "native" }) },
+    { action: "auth.subject_refused", actor: "you@example.com", detail: JSON.stringify({ reason: "subject_mismatch", provider: "google", issuer: GOOGLE_ISSUER, client_id: "native" }) },
   ]);
   expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
   expect(storage.repo.users.findByEmail("you@example.com")!.idp_subject).toBe("google-first");
 });
+
+// #928 D4: an email one IdP's account holds never signs in from another IdP, either way round, until an admin
+// unlinks it; the AS keys the user by the provider's issuer.
+for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const) {
+  test(`an email a ${first} account holds is refused from ${second} at the callback, audited, and taken after unlink-idp`, async () => {
+    const okta = { id: "okta", issuer: "https://example.okta.com", label: "Okta" };
+    const signIn = async (idp: "google" | "okta") => {
+      service.close();
+      service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "you@example.com", displayName: "You", subject: idp + "-you" }), undefined, idp === "okta" ? okta : {})] });
+      const browser = new Browser();
+      const first = await browser.request(authorization().url);
+      const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
+      return (await browser.request(base + `/oauth/${idp}/callback?` + new URLSearchParams({ state, code: "code" }))).status;
+    };
+    const issuer = (idp: "google" | "okta") => idp === "okta" ? okta.issuer : GOOGLE_ISSUER;
+    expect(await signIn(first)).toBe(303);
+    expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(first), idp_subject: first + "-you" });
+    expect(await signIn(second)).toBe(403);
+    expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
+    expect(accessAudits(storage.db, "auth.subject_refused").map(r => [r.actor, r.detail])).toEqual([
+      ["you@example.com", { reason: "issuer_mismatch", holding_issuer: issuer(first), provider: second, issuer: issuer(second), client_id: "native" }],
+    ]);
+    await storage.repo.write(() => storage.repo.users.clearSubject(storage.repo.users.findByEmail("you@example.com")!.id));
+    expect(await signIn(second)).toBe(303);
+    expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(second), idp_subject: second + "-you" });
+    expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 2 });
+  });
+}
 
 test("direct config dev auth rejects either Google secret, including an override with an empty primary", () => {
   for (const credentials of [{ googleClientSecret: "primary-private" }, { mcpGoogle: { clientId: "web-client", clientSecret: "web-private" } }]) {

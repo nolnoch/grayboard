@@ -7,6 +7,7 @@ import pkg from "../../package.json" with { type: "json" };
 import type { Config } from "../../src/server/config.ts";
 import { ROOT } from "../support/paths.ts";
 import { TestServer } from "../support/server.ts";
+import { GOOGLE_ISSUER } from "../../src/server/idp_google.ts";
 
 const SERVER = join(ROOT, "src/server/main.ts");
 
@@ -198,18 +199,21 @@ test("admin routes: refused for non-admins and when no admins are configured", a
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
 });
 
-// Security audit F-13: an admin frees an email from its Google account, so the next account to present it signs in.
-test("admin unlink-idp clears a user's IdP subject and audits it", async () => {
+// Security audit F-13, #928: an admin frees an email from its IdP account, issuer and subject, so the next account to
+// present it, from any provider, signs in.
+test("admin unlink-idp clears a user's IdP issuer and subject and audits them", async () => {
   await restart({ admins: ["root@example.com"] });
   const root = await login("root@example.com");
-  expect(srv.app.repo.users.signIn("bob@example.com", "google-bob", null).status).toBe("ok");
-  expect(srv.app.repo.users.signIn("bob@example.com", "google-new", null).status).toBe("subject_mismatch");
+  const okta = "https://example.okta.com";
+  expect(srv.app.repo.users.signIn(GOOGLE_ISSUER, "google-bob", "bob@example.com", null).status).toBe("ok");
+  expect(srv.app.repo.users.signIn(GOOGLE_ISSUER, "google-new", "bob@example.com", null).status).toBe("subject_mismatch");
+  expect(srv.app.repo.users.signIn(okta, "okta-bob", "bob@example.com", null).status).toBe("issuer_mismatch");
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "Bob@Example.com" })).status).toBe(200);
-  expect(srv.app.repo.users.findByEmail("bob@example.com")!.idp_subject).toBeNull();
-  expect(srv.app.repo.users.signIn("bob@example.com", "google-new", null)).toMatchObject({ status: "ok", linked: true });
+  expect(srv.app.repo.users.findByEmail("bob@example.com")).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect(srv.app.repo.users.signIn(okta, "okta-bob", "bob@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { idp_issuer: okta } });
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "nobody@example.com" })).status).toBe(404);
   expect(srv.app.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'auth.subject_cleared'").all())
-    .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: '{"had_subject":true}' }]);
+    .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: JSON.stringify({ had_subject: true, provider: "google", issuer: GOOGLE_ISSUER }) }]);
 });
 
 // Security audit F-14: the server's GRAYBOARD_CLI_TOKEN_IDLE_DAYS reaches the token check.
