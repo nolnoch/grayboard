@@ -1433,16 +1433,16 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
 test("a login code, spent or not, never becomes a grant, and a grant code never a session", async () => {
   const a = await cliCode();
   const binding = { clientId: CLI_CLIENT_ID, resource: service.resource, scopes: [LOGIN_SCOPE], redirectUri: a.redirectUri, codeChallenge: s256(a.verifier), codeHash: hashToken(a.code) };
-  const asGrant = () => storage.repo.oauth.redeemCode({ ...binding, grantId: random(), grantExpiresAt: clock + OAUTH_TTL.grant,
-    tokens: { clientId: CLI_CLIENT_ID, resource: service.resource, scopes: [LOGIN_SCOPE], accessHash: hashToken(random()), refreshHash: hashToken(random()), accessExpiresAt: clock + OAUTH_TTL.access, refreshExpiresAt: clock + OAUTH_TTL.refresh } }, clock);
-  expect(asGrant().status).toBe("invalid");
+  const asGrant = () => seed(storage.repo, () => storage.repo.oauth.redeemCode({ ...binding, grantId: random(), grantExpiresAt: clock + OAUTH_TTL.grant,
+    tokens: { clientId: CLI_CLIENT_ID, resource: service.resource, scopes: [LOGIN_SCOPE], accessHash: hashToken(random()), refreshHash: hashToken(random()), accessExpiresAt: clock + OAUTH_TTL.access, refreshExpiresAt: clock + OAUTH_TTL.refresh } }, clock));
+  expect((await asGrant()).status).toBe("invalid");
   expect((await post("/oauth/token", cliTokenParams(a))).status).toBe(200);
-  expect(asGrant().status).toBe("invalid");
+  expect((await asGrant()).status).toBe("invalid");
   expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
   // The reverse: a grant code presented to the login redeemer.
   const g = await issue("native", "grayboard:tools");
   const grantBinding = { clientId: "native", resource: service.resource, scopes: ["grayboard:tools"], redirectUri: g.redirectUri, codeChallenge: s256(g.verifier), codeHash: hashToken(g.code) };
-  expect(storage.repo.oauth.redeemLoginCode({ ...grantBinding, tokenHash: hashToken(random()), label: null }, clock).status).toBe("invalid");
+  expect((await seed(storage.repo, () => storage.repo.oauth.redeemLoginCode({ ...grantBinding, tokenHash: hashToken(random()), label: null }, clock))).status).toBe("invalid");
   expect((await post("/oauth/token", tokenParams(g))).status).toBe(200);
 });
 
