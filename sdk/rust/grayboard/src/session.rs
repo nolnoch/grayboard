@@ -4,6 +4,7 @@ use crate::credential::Credential;
 use crate::delivery::{Control, DeliveryStream, Holds, alias_lost_meta, held_of, unbound_output};
 use crate::envelope::{CallToolResult, ClientInfo, DeliveryMode};
 use crate::error::Error;
+use crate::tools::{Args, SessionEndArgs, WhoamiArgs, to_arguments};
 use crate::transport::{
     CONNECT_TIMEOUT, Connection, Discovery, Role, Shared, Subscription, Timeouts,
 };
@@ -117,46 +118,6 @@ impl Drop for Paused {
     }
 }
 
-/// `bind`'s result.
-#[derive(Debug, Clone)]
-pub struct Bound {
-    /// The name as the session's user writes it (their own names unscoped).
-    pub name: String,
-    pub ownership: u64,
-    /// The instruction lines the bind returned.
-    pub instructions: Vec<String>,
-}
-
-/// `board_post`'s result.
-#[derive(Debug, Clone)]
-pub struct Posted {
-    pub post_id: u64,
-    /// The whole result value, for fields this crate doesn't type yet.
-    pub value: Value,
-    /// Text blocks after the result: server notices.
-    pub notices: Vec<String>,
-}
-
-/// A `board_subscribe` mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubscribeMode {
-    Push,
-    Digest,
-    Quiet,
-    Off,
-}
-
-impl SubscribeMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Push => "push",
-            Self::Digest => "digest",
-            Self::Quiet => "quiet",
-            Self::Off => "off",
-        }
-    }
-}
-
 impl Session {
     pub fn id(&self) -> &str {
         &self.id
@@ -186,7 +147,7 @@ impl Session {
             let paused = self.pause().await;
             let result = self.native_call(tool, arguments).await;
             // After every bind and unbind, stream or not: a later `deliveries()` rebinds these, so they must be what the session holds now, not what a stopped or dropped stream last saw. A failed read keeps them as they were: the next open's whoami then stops on a change it can't explain.
-            if let Ok(value) = call_subscriber(&self.subscriber, "whoami", json!({})).await
+            if let Ok(value) = subscriber_call(&self.subscriber, &WhoamiArgs {}).await
                 && let Ok(held) = held_of(&value)
             {
                 *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = held;
@@ -236,81 +197,6 @@ impl Session {
             }
         }
         paused
-    }
-
-    /// `bind` a name (`create: true` creates it when nobody has it yet). A refusal is `Error::Refusal` with the server's code (`alias_held`, `identity_unknown`, `forbidden`, `bad_request`).
-    pub async fn bind(&self, name: &str, create: bool) -> Result<Bound, Error> {
-        let result = self
-            .call_raw("bind", json!({"name": name, "create": create}))
-            .await?;
-        let (value, _) = read_result(&result)?;
-        let value =
-            value.ok_or_else(|| Error::InvalidResponse("bind result has no value".into()))?;
-        let name = value
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::InvalidResponse("bind result has no name".into()))?
-            .to_owned();
-        let ownership = value
-            .get("ownership")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| Error::InvalidResponse("bind result has no ownership".into()))?;
-        let instructions = value
-            .get("instructions")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Bound {
-            name,
-            ownership,
-            instructions,
-        })
-    }
-
-    /// `board_subscribe` the session's primary to `board`. A queue board routes work only to `Push` subscribers. Returns the server's notices.
-    pub async fn board_subscribe(
-        &self,
-        board: &str,
-        mode: SubscribeMode,
-    ) -> Result<Vec<String>, Error> {
-        let result = self
-            .call_raw(
-                "board_subscribe",
-                json!({"board": board, "mode": mode.as_str()}),
-            )
-            .await?;
-        read_result(&result).map(|(_, notices)| notices)
-    }
-
-    /// `board_post` to `board`, as a reply in `parent`'s thread when given (a reply to a queue board's work item completes it).
-    pub async fn board_post(
-        &self,
-        board: &str,
-        body: &str,
-        parent: Option<u64>,
-    ) -> Result<Posted, Error> {
-        let mut arguments = json!({"board": board, "body": body});
-        if let Some(parent) = parent {
-            arguments["parent_id"] = json!(parent);
-        }
-        let result = self.call_raw("board_post", arguments).await?;
-        let (value, notices) = read_result(&result)?;
-        let value =
-            value.ok_or_else(|| Error::InvalidResponse("board_post result has no value".into()))?;
-        let post_id = value
-            .get("post_id")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| Error::InvalidResponse("board_post result has no post_id".into()))?;
-        Ok(Posted {
-            post_id,
-            value,
-            notices,
-        })
     }
 
     /// The session's deliveries, one at a time (`docs/sdk-rust.md` §2): a background task opens and renews the lease, listens for inbox hints and hands over each item; the next comes only after this one's `receipt()`. Delivery is at-least-once: dedupe on `Delivery::stable_id`. A terminal stop is one `Err`, then the stream ends. A session has one stream at a time; dropping it releases the lease, which ends the session on the server.
@@ -371,8 +257,7 @@ impl Session {
                 let _ = done.await;
             }
         }
-        let result = self
-            .call_subscriber("session_end", json!({}))
+        let result = subscriber_call(&self.subscriber, &SessionEndArgs::default())
             .await
             .map(|_| ());
         self.cancel.cancel();
@@ -411,6 +296,11 @@ async fn list_tools(conn: &Connection) -> Result<Vec<Value>, Error> {
             return Ok(tools);
         }
     }
+}
+
+/// `call_subscriber` with an argument struct, so the request is what the schema test checked.
+pub(crate) async fn subscriber_call<A: Args>(conn: &Connection, args: &A) -> Result<Value, Error> {
+    call_subscriber(conn, A::TOOL, to_arguments(args)).await
 }
 
 /// A subscriber tool call: a refusal is `Error::Refusal`; the value is `structuredContent` or the one text block parsed as JSON.
