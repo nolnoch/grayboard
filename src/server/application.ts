@@ -1509,8 +1509,11 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   // request's grant can't be judged against a holder that isn't there
   // (security audit of #878).
   const reach = (to: string, recheck = false): DelegateReach => {
-    // A team's alias this session may not see reads as one nobody has (#1014), before any grant is judged.
-    if (teamAliasHidden(repo, session.sessionId || session.primary, to)) return { refused: neverConnected(to) };
+    // A team's alias this session may not see reads as one nobody has (#1014), before any grant is judged. A replay
+    // named it while it could: it says why it can't be replayed, not that the name never connected.
+    if (teamAliasHidden(repo, session.sessionId || session.primary, to)) {
+      return { refused: recheck ? `"${to}" is a team's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) };
+    }
     const owner = addressUser(db, to);
     if (owner === undefined && recheck) return { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` };
     if (owner === undefined || owner === authed.user_email) return { ok: "own" };
