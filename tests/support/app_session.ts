@@ -180,13 +180,13 @@ export class AppSession {
     // A refusal's rows, written after its rollback, as hosted registration hands them to `later` (#807 P1b-4f).
     const rows: Array<() => void> = [], later = (w: () => void) => { rows.push(w); };
     try {
-      ({ session: this.session, info } = await seed(this.repo, () => {
+      ({ session: this.session, info } = await seed(this.repo, tx => {
         const writesAs = toolsOnly && this.identity !== null
-          ? this.application.hostedWritesAs(this.authed, id, this.identity, true, (address, detail) => later(() => this.application.hostedRefused(id, address, detail)), later)
+          ? this.application.hostedWritesAs(tx, this.authed, id, this.identity, true, (address, detail) => later(() => this.application.hostedRefused(id, address, detail)), later)
           : null;
         this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs, why => later(() => this.application.hostedCollided(this.authed, id, why)));
         if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
-        return this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
+        return this.application.hostedSession(tx, this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
       }));
     } catch (e) {
       await this.flushRefusal(rows);
@@ -203,7 +203,7 @@ export class AppSession {
   // session a writer, as a rebuilt hosted session is.
   async bind(alias: string, extra: { create?: boolean; meta?: unknown } = {}): Promise<BindResult> {
     const session = this.live();
-    const ok = await this.write(session, () => this.application.bindNow(session, { alias, ...extra } as Parameters<Application["bindNow"]>[1]));
+    const ok = await this.write(session, tx => this.application.bindNow(tx, session, { alias, ...extra } as Parameters<Application["bindNow"]>[2]));
     if (session.readOnly) {
       session.readOnly = false;
       session.writerId = this.id;

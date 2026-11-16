@@ -460,7 +460,7 @@ test("#807: a rolled-back unlink leaves the link and its human online", async ()
     expect((await api(alice, "POST", "/api/slack/unlink")).status).not.toBe(200);
   } finally { spy.mockRestore(); }
   expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeDefined();
-  expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeDefined();
+  expect(srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeDefined();
   const sent = await be.call<SendResult>("dm_send", { to: "human", body: "still linked?" });
   expect(sent.delivered_now).toBe(true);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("still linked?")));
@@ -477,8 +477,27 @@ test("#807: a rolled-back link leaves no link, no human identity and nothing att
     await until(() => spy.mock.calls.some((c) => c.map(String).join(" ").includes("audit refused")), 5000, "the link's failure was logged");
   } finally { spy.mockRestore(); }
   expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeUndefined();
-  expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  expect(srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeUndefined();
   expect((await api(alice, "GET", "/api/whoami")).body.identities).not.toContain("human");
+});
+
+// #807 P1c-13: the link's human create and the unlink's remove run on their body's Tx.
+test("#807 P1c-13: link and unlink read and write the human alias on their body's Tx", async () => {
+  const repo = srv.app.repo;
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const spies = (["find", "create", "remove"] as const).map((name) => {
+    const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
+    return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await login("alice@example.com");
+    await link(alice);
+    expect((await api(alice, "POST", "/api/slack/unlink")).status).toBe(200);
+  } finally { for (const spy of spies) spy.mockRestore(); }
+  expect(checks).toEqual([{ op: "find", inTxn: true, handle: "tx" }, { op: "create", inTxn: true, handle: "tx" }, { op: "remove", inTxn: true, handle: "tx" }]);
 });
 
 test("thread replies while unlinked don't flood in at relink", async () => {

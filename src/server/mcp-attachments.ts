@@ -66,7 +66,8 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
           const current = oauth.authenticate(req, ["grayboard:tools"]);
           if (current instanceof Response) throw new Refusal(current);
           bindingGuard();
-          if (!repo.aliases.find(session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
+          // On the pool, inside the attachment routes' bodies too, until the attachment slice (D8).
+          if (!repo.aliases.find(repo.read, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
         guard();
         const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, db, uploads, guard, signal)

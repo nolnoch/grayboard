@@ -65,7 +65,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   const { user, session } = await seed(old.repo, tx => {
     const user = old.repo.users.upsertByEmail(tx, "you@example.com", "You");
     const session = old.repo.sessions.create(tx, user.id, "old-session-hash", "old client");
-    old.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
+    old.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
     old.repo.messages.insert("you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
     for (const table of ["oauth_tokens", "oauth_grants", "oauth_codes", "oauth_browsers", "oauth_requests"]) old.db.exec(`DROP TABLE ${table}`);
     return { user, session };
@@ -75,7 +75,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   try {
     expect(reopened.repo.users.findById(user.id)?.display_name).toBe("You");
     expect(reopened.repo.sessions.findByTokenHash(reopened.repo.read, "old-session-hash")?.id).toBe(session.id);
-    expect(reopened.repo.aliases.listForScope("person", user.email).map(i => i.name)).toEqual(["fe"]);
+    expect(reopened.repo.aliases.listForScope(reopened.repo.read, "person", user.email).map(i => i.name)).toEqual(["fe"]);
     expect(reopened.repo.messages.history(["you@example.com/fe"])[0]?.body).toBe("preserved");
     expect(reopened.repo.oauth.isGrantActive(reopened.repo.read, "missing", Date.now())).toBe(false);
     expect(reopened.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'oauth_%'").all()).toHaveLength(5);
@@ -209,17 +209,17 @@ describe("Repo", () => {
   test("aliases: create, list, remove", async () => {
     const fe = await seed(repo, tx => {
       repo.users.upsertByEmail(tx, "you@example.com", null);
-      const fe = repo.aliases.create(person("you@example.com", "fe"), "you@example.com");
-      repo.aliases.create(person("you@example.com", "be"), "you@example.com");
+      const fe = repo.aliases.create(tx, person("you@example.com", "fe"), "you@example.com");
+      repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
       return fe;
     });
     expect(fe.address).toBe("you@example.com/fe");
-    expect(repo.aliases.listForScope("person", "you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
+    expect(repo.aliases.listForScope(repo.read, "person", "you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
     await seed(repo, tx => {
       repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 7);
-      repo.aliases.remove("you@example.com/fe");
+      repo.aliases.remove(tx, "you@example.com/fe");
     });
-    expect(repo.aliases.listForScope("person", "you@example.com")).toHaveLength(1);
+    expect(repo.aliases.listForScope(repo.read, "person", "you@example.com")).toHaveLength(1);
     // Its read point goes with it: a new alias of the name starts from scratch.
     expect(repo.cursors.directFor(repo.read, "you@example.com/fe")).toBe(0);
   });
@@ -229,16 +229,16 @@ describe("Repo", () => {
     const team = await seed(repo, tx => {
       const u = repo.users.upsertByEmail(tx, "you@example.com", null);
       repo.teams.create(tx, "eng", u.id);
-      repo.aliases.create(person("you@example.com", "be"), "you@example.com");
-      return repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
+      repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
+      return repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
     });
     expect(team).toMatchObject({ address: "eng/be", scope_kind: "team", scope_ref: "eng", name: "be" });
-    expect(repo.aliases.find("eng/be")?.id).toBe(team.id);
-    expect(repo.aliases.find("eng/fe")).toBeUndefined();
-    expect(repo.aliases.listForScope("team", "eng").map((a) => a.address)).toEqual(["eng/be"]);
-    expect(repo.aliases.listForScope("person", "you@example.com").map((a) => a.address)).toEqual(["you@example.com/be"]);
-    expect(repo.aliases.listForScope("person", "eng")).toEqual([]);
-    expect(repo.aliases.findAllByName("be").map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
+    expect(repo.aliases.find(repo.read, "eng/be")?.id).toBe(team.id);
+    expect(repo.aliases.find(repo.read, "eng/fe")).toBeUndefined();
+    expect(repo.aliases.listForScope(repo.read, "team", "eng").map((a) => a.address)).toEqual(["eng/be"]);
+    expect(repo.aliases.listForScope(repo.read, "person", "you@example.com").map((a) => a.address)).toEqual(["you@example.com/be"]);
+    expect(repo.aliases.listForScope(repo.read, "person", "eng")).toEqual([]);
+    expect(repo.aliases.findAllByName(repo.read, "be").map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
   });
 
   test("principals: findByName reads users and teams", async () => {
@@ -569,9 +569,9 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, tx => {
     repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
+    repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     repo.users.upsertByEmail(tx, "b@example.com", null);
-    repo.aliases.create(person("b@example.com", "be"), "b@example.com");
+    repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
     repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
@@ -601,9 +601,9 @@ test("queuedTo and retract look the read point up by its key, never a mailbox_cu
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, tx => {
     repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
+    repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     repo.users.upsertByEmail(tx, "b@example.com", null);
-    repo.aliases.create(person("b@example.com", "be"), "b@example.com");
+    repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
     repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
@@ -862,4 +862,37 @@ test("#807 P1c-12: hosted reads run on the handle they're given", async () => {
   expect(h.counts(repo.read, u.id)).toEqual({ total: 1, user: 1 });
   expect(h.roots(repo.read, u.id).map(r => r.session_id)).toEqual(["root-1"]);
   expect(h.expired(repo.read, 9).map(r => r.session_id)).toEqual(["root-1"]);
+});
+
+// #807 P1c-13: the aliases store runs on the handle it's given, as P1c-6's sessions do.
+test("#807 P1c-13: the aliases store runs on the handle it's given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { kept } = await seed(repo, tx => {
+    repo.users.upsertByEmail(tx, "a@example.com", null);
+    repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
+    // Read inside the body that wrote it, on its Tx.
+    expect(repo.aliases.find(tx, "a@example.com/fe")?.name).toBe("fe");
+    return { kept: tx };
+  });
+  const settled = /used after its transaction settled/;
+  const a = repo.aliases;
+  expect(() => a.create(kept, person("a@example.com", "be"), "a@example.com")).toThrow(settled);
+  expect(() => a.remove(kept, "a@example.com/fe")).toThrow(settled);
+  expect(() => a.find(kept, "a@example.com/fe")).toThrow(settled);
+  expect(() => a.listForScope(kept, "person", "a@example.com")).toThrow(settled);
+  expect(() => a.countForScope(kept, "person", "a@example.com")).toThrow(settled);
+  expect(() => a.findAllByName(kept, "fe")).toThrow(settled);
+  expect(() => a.find({} as Tx, "a@example.com/fe")).toThrow("not a SQLite store handle");
+  expect(a.find(repo.read, "a@example.com/be")).toBeUndefined();
+  expect(a.listForScope(repo.read, "person", "a@example.com").map(x => x.name)).toEqual(["fe"]);
+  expect(a.countForScope(repo.read, "person", "a@example.com")).toBe(1);
+  expect(a.findAllByName(repo.read, "fe").map(x => x.address)).toEqual(["a@example.com/fe"]);
+  // A create rolls back with its body, and a remove's read points with it.
+  await expect(seed(repo, tx => {
+    a.create(tx, person("a@example.com", "qa"), "a@example.com");
+    a.remove(tx, "a@example.com/fe");
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(a.find(repo.read, "a@example.com/qa")).toBeUndefined();
+  expect(a.find(repo.read, "a@example.com/fe")?.name).toBe("fe");
 });

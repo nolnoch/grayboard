@@ -80,7 +80,7 @@ test("legacy identity headers cannot select or create names; explicit bind retai
   const refused = await client.callTool({ name: "bind", arguments: { name: "bee" } });
   expect(refused.isError).toBe(true);
   expect(refused.content).toEqual([expect.objectContaining({ text: expect.stringMatching(/"known":\s*\[\s*"be"\s*\]/) })]);
-  expect(store.repo.aliases.find(`${user.user_email}/bee`)).toBeUndefined();
+  expect(store.repo.aliases.find(store.repo.read, `${user.user_email}/bee`)).toBeUndefined();
   expect(hosted.activeContexts).toBe(0);
 });
 
@@ -215,7 +215,7 @@ test("Origin policy precedes authentication and context creation on every HTTP m
     }
   }
   expect(selections).toBe(0);
-  expect(store.repo.aliases.find(`${user.user_email}/refused`)).toBeUndefined();
+  expect(store.repo.aliases.find(store.repo.read, `${user.user_email}/refused`)).toBeUndefined();
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
@@ -1161,7 +1161,7 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
     const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
-    expect(store.repo.aliases.find(`${user.user_email}/unselected`)).toBeUndefined();
+    expect(store.repo.aliases.find(store.repo.read, `${user.user_email}/unselected`)).toBeUndefined();
   } finally { store.repo.oauth.findActiveAccess = original; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });

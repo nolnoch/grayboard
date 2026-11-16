@@ -110,7 +110,7 @@ describe("deny rows", () => {
 describe("session acts", () => {
   test("a refused DM to another user's human leaves one row, after the hosted rollback", async () => {
     await srv.login(A);
-    await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: A, name: "human" }, A));
+    await seed(srv.app.repo, tx => srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: A, name: "human" }, A));
     const fe = await srv.hosted(B, "fe");
     const err = (await fe.call("dm_send", { to: `${A}/human`, body: "hi" }).catch((e: unknown) => e)) as Error;
     expect(err).toBeInstanceOf(HostedToolError);

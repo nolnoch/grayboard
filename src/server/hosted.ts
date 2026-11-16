@@ -286,7 +286,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (!row && create) {
       admit(tx, p.authed.user_id, []);
       const t = now();
-      const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, true, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)), later);
+      const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, true, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)), later);
       row = { session_id: context.id, ownership_id: store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
@@ -297,7 +297,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
       // its shape is refused on every request (#451 A4).
-      const declared = context.writesAs === undefined ? null : application.hostedWritesAs(p.authed, context.id, context.writesAs, false, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)), later);
+      const declared = context.writesAs === undefined ? null : application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, false, (address, detail) => later(() => application.hostedRefused(context.id, address, detail)), later);
       if (declared !== row.writes_as) throw new ApplicationError("id_collision", `session ${row.session_id} ${row.writes_as ? `writes as "${row.writes_as}"` : "holds its own aliases"}, and this request ${declared ? `writes as "${declared}"` : "declares no writes_as"}; a session's shape is fixed.`);
     }
     // The latest model and effort a request reports (#364); a write only on a change.
@@ -365,7 +365,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         holders.delete(changed);
       }
       const user = row && held.length && !holders.has(changed) ? repo.users.findById(row.user_id) : undefined;
-      if (row && user) holders.set(changed, { row, session: application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, changed, held, null, row, quietSink).session });
+      if (row && user) holders.set(changed, { row, session: application.hostedSession(repo.read, { user_id: user.id, user_email: user.email, session_id: 0 }, changed, held, null, row, quietSink).session });
       return;
     }
     const held = application.holdsByOwner();
@@ -381,7 +381,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     for (const row of rows) if (!holders.has(row.session_id)) {
       const user = repo.users.findById(row.user_id);
       if (!user) continue;
-      const { session } = application.hostedSession({ user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row, quietSink);
+      const { session } = application.hostedSession(repo.read, { user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row, quietSink);
       holders.set(row.session_id, { row, session });
     }
   }
@@ -622,7 +622,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     const root = row ? known ?? rootOf(repo.read, row) : undefined;
     // A child acts under its root's addresses, and its writes carry its own ID as `via` (#523).
     const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
-    return { ...application.hostedSession(p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
+    return { ...application.hostedSession(repo.read, p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
   function fence(r: Read, p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
     authorized(p, r);
@@ -777,7 +777,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           // A child binds nothing, so it isn't offered names to bind (#523).
-          ...(!(root && named(root, held)) ? { unbound: true, ...(row?.root_session_id ? {} : { candidates: application.hostedCandidates(p.authed, root?.suggested ?? null) }) } : {}) };
+          ...(!(root && named(root, held)) ? { unbound: true, ...(row?.root_session_id ? {} : { candidates: application.hostedCandidates(repo.read, p.authed, root?.suggested ?? null) }) } : {}) };
       });
     },
     // `declared`: the native request's declaration (deliveryDeclaration); text only.
@@ -795,10 +795,10 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (other && !other.root_session_id && ((other.lease_deadline !== null && other.lease_deadline <= now()) || (other.lease_deadline === null && idleAt(other)))) {
           store.end(tx, other.session_id, other.lease_deadline === null ? "idle" : "expired", now());
         }
-        const selected = application.hostedSession(p.authed, row.session_id, before, row.writes_as, row, quietSink);
+        const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
-          const ok = application.bindNow(selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) });
+          const ok = application.bindNow(tx, selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) });
           const added = ok.held.length !== before.length;
           // `where` restates the place even when the name was already held (a re-bind), as on the other surfaces.
           if (added || args.where !== undefined) store.update(tx, { ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
@@ -830,7 +830,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async unbind(p: OAuthPrincipal, context: SessionContext, args: { name: string }, declared?: DeclaredDelivery) {
       const result = await service.owning(p, context, (row, defer, tx) => {
         const before = application.hostedHolds(row.session_id);
-        const selected = application.hostedSession(p.authed, row.session_id, before, row.writes_as, row, quietSink);
+        const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
           const ok = application.unbind(selected.session, args.name);
@@ -851,7 +851,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
       const instructions = held.length
         ? (general: boolean) => boundInstructions(held[0]!, source, general, () => hostedGeneral(source !== null && "id" in context && application.hostedLauncher(context.id)), [], held.slice(1))
-        : () => [hostedUnboundInstruction(application.hostedCandidates(p.authed, result.suggested))];
+        : () => [hostedUnboundInstruction(application.hostedCandidates(repo.read, p.authed, result.suggested))];
       const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? null, result.ok.left ?? [], instructions);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },

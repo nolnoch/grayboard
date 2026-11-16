@@ -130,6 +130,47 @@ test("#998 audit: delivery's access check inside the renew, receipt and release 
   } finally { service.close(); }
 });
 
+// #807 P1c-13: the alias reads and writes a hosted body makes (bind's lazy create and cap, alias_held's holder,
+// a tools-only root's writes_as, a send's peer, unbind's candidates) run on that body's Tx. Two pool reads in a body
+// remain, named in docs/future/postgres-server.md D8: access.ts's mention resolver (the Access seam, P3) and the
+// attachment guard (the attachment slice).
+test("#807 P1c-13: alias reads inside hosted bodies run on that body's Tx", async () => {
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx"; site: string }[] = [];
+  const pooled = ["/access.ts:", "/mcp-attachments.ts:"];
+  const spies = (["find", "countForScope", "listForScope", "findAllByName", "create", "remove"] as const).map(name => {
+    const original = database.repo.aliases[name].bind(database.repo.aliases) as (...a: unknown[]) => unknown;
+    return spyOn(database.repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      const site = new Error().stack?.split("\n").find(l => l.includes("/src/") && !l.includes("hosted.test.ts")) ?? "";
+      checks.push({ op: name, inTxn: database.db.inTransaction, handle: r === database.repo.read ? "pool" : "tx", site });
+      return original(r, ...rest);
+    }) as never);
+  });
+  const described: ("pool" | "tx")[] = [];
+  const get = database.repo.hosted.get.bind(database.repo.hosted);
+  const holder = spyOn(database.repo.hosted, "get").mockImplementation((r, id) => {
+    if (new Error().stack?.includes("describeHolder")) described.push(r === database.repo.read ? "pool" : "tx");
+    return get(r, id);
+  });
+  try {
+    await hosted.bind(principal, context("p13-root"), { name: "p13", create: true });
+    expect(checks.filter(c => c.op === "create" && c.inTxn)).toHaveLength(1);
+    expect(checks.some(c => c.op === "countForScope" && c.inTxn)).toBe(true);
+    await expect(hosted.bind(principal, context("p13-other"), { name: "p13" })).rejects.toHaveProperty("code", "alias_held");
+    expect(described).toEqual(["tx"]);
+    const { generic, meta } = toolsOnly();
+    const before = checks.length;
+    await hosted.whoami(generic, meta("p13-tools", "p13-scribe"));
+    expect(checks.slice(before).some(c => c.inTxn && c.handle === "tx")).toBe(true);
+    await hosted.run(principal, context("p13-root"), "dm_send", (session, tx) => application.send(tx, session, "p13-scribe", "hi"));
+    await hosted.unbind(principal, context("p13-other"), { name: "p13" });
+    expect(checks.filter(c => c.inTxn).length).toBeGreaterThan(4);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx") && !pooled.some(p => c.site.includes(p)))).toEqual([]);
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+    holder.mockRestore();
+  }
+});
+
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
   const invalidations: (string | null)[] = [];
@@ -370,7 +411,7 @@ test("unbound context cannot write or implicitly create names", async () => {
   await expect(hosted.run(principal, context("one"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
   await expect(hosted.bind(principal, context("one"), { name: "fe" })).rejects.toHaveProperty("code", "identity_unknown");
   await expect(hosted.bind(principal, { missing: "metadata missing" }, { name: "fe", create: true })).rejects.toHaveProperty("code", "unbound");
-  expect(database.repo.aliases.listForScope("person", principal.authed.user_email)).toEqual([]);
+  expect(database.repo.aliases.listForScope(database.repo.read, "person", principal.authed.user_email)).toEqual([]);
 });
 
 test("two contexts execute tools under distinct bound identities", async () => {
@@ -628,7 +669,7 @@ test("a hosted root holds several names: bind adds, unbind releases one and prom
   expect(unbound).toMatchObject({ held: [], ownership: first.ownership });
   await expect(hosted.run(principal, context("root"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
   // The released names' mail still queues for their next holder.
-  expect(database.repo.aliases.find(at("fe"))).toBeDefined();
+  expect(database.repo.aliases.find(database.repo.read, at("fe"))).toBeDefined();
 });
 
 const at = (name: string) => `you@example.com/${name}`;
@@ -648,7 +689,7 @@ test("ending a hosted root releases every hold in one transaction and audits eac
 test("a generic-key poll root's writes_as is recorded, makes it tools-only, and a different later declaration is refused (#451)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = (as: string) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: as });
-  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "fe", true));
+  await seed(database.repo, tx => application.hostedWritesAs(tx, generic.authed, "id:probe", "fe", true));
   const first = await hosted.whoami(generic, meta("fe"));
   expect(first).toMatchObject({ held: [], writes_as: "you@example.com/fe" });
   expect(database.repo.hosted.all(database.repo.read).map(r => r.writes_as)).toEqual(["you@example.com/fe"]);
@@ -789,7 +830,7 @@ test("a revoked tools-only hosted root's ownership ends, audited once: a later r
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "ops/lead" });
   const id = (meta as { id: string }).id;
-  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "ops/lead", true));
+  await seed(database.repo, tx => application.hostedWritesAs(tx, generic.authed, "id:probe", "ops/lead", true));
   expect(await hosted.whoami(generic, meta)).toMatchObject({ held: [], writes_as: "ops/lead" });
   const before = database.repo.hosted.get(database.repo.read, id)!;
   const audits = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked'").all().map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
@@ -1257,7 +1298,7 @@ const rowOf = (c: ReturnType<typeof context>) => { if (!("id" in c)) throw new E
 
 test("a child's call past the idle window neither parks it nor ends its unheld root; the window restarts at the call's end (#584)", async () => {
   const { generic, meta } = toolsOnly();
-  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "fe", true));
+  await seed(database.repo, tx => application.hostedWritesAs(tx, generic.authed, "id:probe", "fe", true));
   await hosted.whoami(generic, meta("root", "fe"));
   await hosted.register(generic, meta("root", "fe"), "kid");
   const during = await hosted.transfer(generic, meta("kid"), async () => {
@@ -1275,7 +1316,7 @@ test("a child's call past the idle window neither parks it nor ends its unheld r
 
 test("an unheld root's own call past the idle window doesn't end it (#584)", async () => {
   const { generic, meta } = toolsOnly();
-  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "fe", true));
+  await seed(database.repo, tx => application.hostedWritesAs(tx, generic.authed, "id:probe", "fe", true));
   await hosted.whoami(generic, meta("root", "fe"));
   const alive = await hosted.transfer(generic, meta("root", "fe"), async () => { now += 900_001; hosted.sweep(); return rowOf(meta("root", "fe")) !== undefined; });
   expect(alive).toBe(true);

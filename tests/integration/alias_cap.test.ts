@@ -2,7 +2,7 @@
 // every create path a client reaches (bind, a tools-only writes_as, HTTP's
 // identity add); an existing name binds at any count; a team owner or an
 // admin deletes a team's unused name to free a slot.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { endSession } from "../../src/core/session_end.ts";
@@ -57,7 +57,7 @@ test("a team at its cap refuses a new name by bind and by writes_as; an existing
 test("a user at the cap is refused a new identity over HTTP; the Slack human is not counted", async () => {
   expect((await srv.api(bob, "POST", "/api/identities", { name: "one" })).status).toBe(201);
   // A human row (as a Slack link makes) neither counts nor is capped.
-  await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: B, name: "human" }, B));
+  await seed(srv.app.repo, tx => srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: B, name: "human" }, B));
   expect((await srv.api(bob, "POST", "/api/identities", { name: "two" })).status).toBe(201);
   const r = await srv.api(bob, "POST", "/api/identities", { name: "three" });
   expect(r).toMatchObject({ status: 400, body: { message: expect.stringMatching(/your scope already has 2 names.*grayboard identity rm <name>/) } });
@@ -136,3 +136,42 @@ test("grayboard team delete-alias deletes an unused team name; a member is refus
   expect(JSON.parse(ok.out)).toEqual({ ok: true, deleted: "eng/b" });
   expect(names("eng")).toEqual([]);
 }, 20_000);
+
+// #807 P1c-13: the HTTP routes that read or write aliases inside a write body (identity add and delete, a team's
+// delete-alias, a claim call's address check, a team join's follows) do so on that body's Tx; the GET routes on the pool.
+test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx", async () => {
+  const repo = srv.app.repo;
+  const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  let route = "";
+  const spies = (["find", "countForScope", "listForScope", "create", "remove"] as const).map(name => {
+    const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
+    return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push({ route, op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  const step = async (name: string, f: () => Promise<{ status: number }>, status: number) => { route = name; expect((await f()).status).toBe(status); };
+  try {
+    const b = srv.appSession(bob, "eng/gone");
+    await b.connect();
+    await b.unbind("eng/gone");
+    await step("identity.create", () => srv.api(bob, "POST", "/api/identities", { name: "one" }), 201);
+    await step("claim.call", () => srv.api(bob, "POST", "/api/claims/call", { as: "one", tool: "claim_take", args: { key: "k" } }), 200);
+    await step("identity.delete", () => srv.api(bob, "DELETE", "/api/identities/one"), 200);
+    await step("team.delete_alias", () => srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "gone" }), 200);
+    await step("team.add", () => srv.api(alice, "POST", "/api/teams/eng/add", { email: ROOT }), 200);
+    await step("team.leave", () => srv.api(root, "POST", "/api/teams/eng/leave"), 200);
+    await step("identity.list", () => srv.api(bob, "GET", "/api/identities"), 200);
+    await step("whoami", () => srv.api(bob, "GET", "/api/whoami"), 200);
+    const ops = (r: string) => checks.filter(c => c.route === r).map(c => `${c.op}:${c.handle}`);
+    expect(ops("identity.create")).toEqual(["find:tx", "countForScope:tx", "create:tx"]);
+    expect(ops("claim.call")).toContain("find:tx");
+    expect(ops("identity.delete")).toEqual(["find:tx", "remove:tx"]);
+    expect(ops("team.delete_alias")).toEqual(["find:tx", "remove:tx"]);
+    expect(ops("team.add")).toContain("listForScope:tx");
+    expect(ops("team.leave")).toContain("listForScope:tx");
+    expect(ops("identity.list")).toEqual(["listForScope:pool"]);
+    expect(ops("whoami")).toEqual(["listForScope:pool"]);
+    expect(checks.filter(c => c.route && c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { for (const spy of spies) spy.mockRestore(); }
+});
