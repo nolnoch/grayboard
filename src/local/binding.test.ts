@@ -1,9 +1,10 @@
 import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
+import { Database } from "bun:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
+import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, TOUCH_EVERY_MS, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
 import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
 import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
@@ -343,15 +344,59 @@ test("ChildSessions keeps only the children seen inside the idle window, refusin
   for (let i = 1; i < MAX_CHILDREN; i++) children.resolve(`sub-${i}`, t0);
   expect(children.size).toBe(MAX_CHILDREN);
   expect(() => children.resolve("sub-overflow", t0 + 1)).toThrow(childCapacity(root));
-  // A known child resolves again, keeping its place, and is touched.
+  // A known child resolves again, keeping its place; it is touched at most
+  // once per TOUCH_EVERY_MS (#894).
   expect(children.resolve("sub-0", t0 + 2)).toBe(first);
-  expect(db.prepare(`SELECT last_seen FROM ids WHERE id = ?`).get(first)).toEqual({ last_seen: t0 + 2 });
+  expect(db.prepare(`SELECT last_seen FROM ids WHERE id = ?`).get(first)).toEqual({ last_seen: t0 });
+  children.resolve("sub-0", t0 + TOUCH_EVERY_MS);
+  expect(db.prepare(`SELECT last_seen FROM ids WHERE id = ?`).get(first)).toEqual({ last_seen: t0 + TOUCH_EVERY_MS });
   // Past the window every child but sub-0 is forgotten; the newcomer takes a place.
   children.resolve("sub-overflow", t0 + window + 1);
   expect(children.size).toBe(2);
   // sub-1, forgotten, comes back as the same child: no second id.child_seen.
   expect(children.resolve("sub-1", t0 + window + 2)).toBe(childSessionId(key, "sub-1"));
   expect(db.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'id.child_seen'`).get()).toEqual({ n: MAX_CHILDREN + 1 });
+});
+
+// #894: a subagent's call soon after its last, and peer_list's read of the
+// live sessions with a dead one among them, don't wait on another process's
+// write lock: the child's touch isn't due, and the reap is skipped at once
+// while the lock is held, then ends the dead session once it's free.
+test("a known child's call and a no-wait liveSessions read don't wait on another process's lock", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db");
+  const db = openLocalDb(path).db;
+  const key = "cd".repeat(32);
+  const root = idAddress(key);
+  registerSession(db, { ...thisSession(root), pid: process.pid, proc_start: procStart(process.pid) ?? null });
+  const dead = "id:0123456789dea";
+  registerSession(db, { ...thisSession(dead), pid: 999999, proc_start: null });
+  const children = new ChildSessions(db, root, key);
+  const t0 = Date.now();
+  const kid = children.resolve("sub-0", t0);
+  const lock = new Database(path);
+  lock.exec("BEGIN IMMEDIATE");
+  // An end that fails on the lock is logged here, so a waiting attempt shows.
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    db.exec("PRAGMA busy_timeout = 3000");
+    const started = performance.now();
+    expect(children.resolve("sub-0", t0 + 1)).toBe(kid);
+    expect(liveSessions(db, { wait: false })).toEqual({ alive: [expect.objectContaining({ session_id: root })], ended: [], wake: [] });
+    expect(performance.now() - started).toBeLessThan(1500);
+    expect(logged).not.toHaveBeenCalled();
+    expect(db.prepare(`PRAGMA busy_timeout`).get()).toEqual({ timeout: 3000 });
+    db.exec("PRAGMA busy_timeout = 200");
+    // The touch that comes due, and an ending read, still write: they wait on the lock.
+    expect(() => children.resolve("sub-0", t0 + TOUCH_EVERY_MS)).toThrow(/locked/);
+    expect(liveSessions(db).ended).toEqual([]);
+    expect(logged).toHaveBeenCalledWith(`grayboard: ending dead session ${dead} failed:`, expect.anything());
+  } finally {
+    logged.mockRestore();
+    lock.exec("ROLLBACK");
+    lock.close();
+  }
+  expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(dead)).toEqual({ ended_at: null });
+  expect(liveSessions(db, { wait: false }).ended).toEqual([dead]);
 });
 
 // #523: a live root's children stay live; a child whose root is gone, ended
