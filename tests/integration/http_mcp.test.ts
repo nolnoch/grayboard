@@ -385,12 +385,13 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
 // #521 item 6: the launcher declaration rides a real HTTP request's `_meta` and is stored for that session; the
 // next initialize carries the launcher sentence only once delivery is live (#521 4).
 test("HTTP: a launcher declared in _meta is stored for its session; initialize carries the launcher sentence once a delivery lease opens", async () => {
-  const token = await login();
-  const open = async (raw: string, launcher: boolean, subscriber?: string) => {
+  // One grant with both scopes, as a harness installation holds (docs/server-hosted-mcp.md): the subscriber role adds only its header.
+  const token = await login("alice@example.com", ["grayboard:tools", "grayboard:delivery"]);
+  const open = async (raw: string, launcher: boolean, subscriber = false) => {
     const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
     clients.push(client);
     await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
-      requestInit: { headers: subscriber ? { Authorization: `Bearer ${subscriber}`, "X-Grayboard-Client": "subscriber" } : { Authorization: `Bearer ${token}` } },
+      requestInit: { headers: { Authorization: `Bearer ${token}`, ...(subscriber ? { "X-Grayboard-Client": "subscriber" } : {}) } },
       fetch: async (input, init) => {
         const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, raw);
         return fetch(launcher ? await withMeta(req, GRAYBOARD_LAUNCHER_META, true) : req);
@@ -410,9 +411,8 @@ test("HTTP: a launcher declared in _meta is stored for its session; initialize c
   expect((await open("lead-root", false)).getInstructions()).not.toContain(sentence);
   expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
   // #883: a delivery lease opened over HTTP by each session's subscriber role: the next initialize follows the stored flag.
-  const delivery = await login("alice@example.com", ["grayboard:delivery"]);
   for (const raw of ["lead-root", "plain-root"]) {
-    const opened = await (await open(raw, false, delivery)).callTool({ name: "delivery_open", arguments: {} });
+    const opened = await (await open(raw, false, true)).callTool({ name: "delivery_open", arguments: {} });
     expect(opened.isError).not.toBe(true);
   }
   expect((await open("lead-root", false)).getInstructions()).toContain(sentence);
