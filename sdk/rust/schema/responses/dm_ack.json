@@ -1,0 +1,19 @@
+{
+  "arguments": {
+    "message_id": 1
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "ok"
+      }
+    ]
+  }
+}

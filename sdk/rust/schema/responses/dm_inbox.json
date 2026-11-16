@@ -1,0 +1,17 @@
+{
+  "arguments": {},
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"unanswered\": [\n    {\n      \"id\": 1,\n      \"from\": \"you@example.com/rec-a\",\n      \"age\": \"0m\",\n      \"body\": \"a message\"\n    }\n  ]\n}"
+      }
+    ]
+  }
+}

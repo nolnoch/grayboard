@@ -1,0 +1,17 @@
+{
+  "arguments": {},
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "[\n  {\n    \"key\": \"ticket:ENG-142\",\n    \"holder\": \"you@example.com/rec-a\",\n    \"note\": \"recording\",\n    \"board\": \"rec\",\n    \"acquired_at\": 1700000000000,\n    \"expires_at\": 1700000000000\n  }\n]"
+      }
+    ]
+  }
+}

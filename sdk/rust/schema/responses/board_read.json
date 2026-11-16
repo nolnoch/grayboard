@@ -1,0 +1,19 @@
+{
+  "arguments": {
+    "board": "rec"
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"board\": \"rec\",\n  \"posts\": [\n    {\n      \"id\": 1,\n      \"board\": \"rec\",\n      \"author\": \"you@example.com/rec-a\",\n      \"body\": \"a post\",\n      \"parent_id\": null,\n      \"created_at\": 1700000000000,\n      \"expires_at\": null\n    }\n  ],\n  \"unread_remaining\": 0\n}"
+      }
+    ]
+  }
+}

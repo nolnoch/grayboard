@@ -173,7 +173,7 @@ impl Fake {
     pub(crate) fn requests(&self) -> Vec<Req> {
         self.requests.lock().unwrap().clone()
     }
-    fn calls(&self, method: &str) -> Vec<Req> {
+    pub(crate) fn calls(&self, method: &str) -> Vec<Req> {
         self.requests()
             .into_iter()
             .filter(|r| r.method() == method)
@@ -228,7 +228,7 @@ pub(crate) fn fast() -> Timeouts {
     }
 }
 
-fn client(fake: &Fake) -> Client {
+pub(crate) fn client(fake: &Fake) -> Client {
     Client::new(
         &fake.url,
         StaticBearer::new("tok-1"),
@@ -238,7 +238,7 @@ fn client(fake: &Fake) -> Client {
     .with_timeouts(fast())
 }
 
-fn session(fake: &Fake) -> crate::Session {
+pub(crate) fn session(fake: &Fake) -> crate::Session {
     client(fake).session("s-1", DeliveryMode::push("rust-sdk-test").unwrap())
 }
 

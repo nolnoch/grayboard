@@ -3,7 +3,11 @@
 //! Deliberate differences from the controller, each a consequence of handing items to a caller instead of admitting them inline: one item is out at a time (the server receipts direct items only as an in-order prefix of unread), so the in-process dedup state is that one item rather than a 100-key set; the lease is renewed in the background while an item is out (the controller has no renew between admission and receipt, #845, because its admission is inline and fast); a `Delivery` dropped without `receipt()` is a failed admission.
 
 use crate::error::Error;
-use crate::session::{call_subscriber, read_resource};
+use crate::session::{read_resource, subscriber_call};
+use crate::tools::{
+    BindArgs, DeliveryOpenArgs, DeliveryReceiptArgs, DeliveryReleaseArgs, DeliveryRenewArgs,
+    WhoamiArgs,
+};
 use crate::transport::{Connection, Subscription, Timeouts};
 use futures_util::Stream;
 use serde_json::{Value, json};
@@ -541,7 +545,7 @@ impl Task {
     async fn release(&mut self) {
         if let Some(lease) = self.lease.take() {
             self.sub.set_lease(Some(lease.capability));
-            let _ = call_subscriber(&self.sub, "delivery_release", json!({})).await;
+            let _ = subscriber_call(&self.sub, &DeliveryReleaseArgs {}).await;
         }
         self.lose_lease();
     }
@@ -586,7 +590,7 @@ impl Task {
         sub.set_lease(None);
         let current = call!(
             &mut self.ctl,
-            call_subscriber(&sub, "whoami", json!({})),
+            subscriber_call(&sub, &WhoamiArgs {}),
             Fail::Err
         );
         // An invalid whoami (a child session, a malformed hold) stops at once, as `model.ts` `bindingOf` does: retrying can't fix the server's answer.
@@ -630,7 +634,13 @@ impl Task {
             for address in &holds {
                 call!(
                     &mut self.ctl,
-                    call_subscriber(&sub, "bind", json!({"name": address, "create": false})),
+                    subscriber_call(
+                        &sub,
+                        &BindArgs {
+                            create: Some(false),
+                            ..BindArgs::new(address.clone())
+                        }
+                    ),
                     Fail::Err
                 );
             }
@@ -649,7 +659,7 @@ impl Task {
         }
         let opened = call!(
             &mut self.ctl,
-            call_subscriber(&sub, "delivery_open", json!({})),
+            subscriber_call(&sub, &DeliveryOpenArgs::default()),
             lease_fail
         );
         let lease = match Lease::of(&opened, &holds[0]) {
@@ -701,7 +711,12 @@ impl Task {
                 let id = o.id.clone();
                 call!(
                     &mut self.ctl,
-                    call_subscriber(sub, "delivery_receipt", json!({"ids": [id]})),
+                    subscriber_call(
+                        sub,
+                        &DeliveryReceiptArgs {
+                            ids: vec![id.clone()]
+                        }
+                    ),
                     lease_fail
                 );
                 if let Some(Outstanding {
@@ -763,7 +778,7 @@ impl Task {
                     Wake::Renew => {
                         call!(
                             &mut self.ctl,
-                            call_subscriber(sub, "delivery_renew", json!({})),
+                            subscriber_call(sub, &DeliveryRenewArgs {}),
                             lease_fail
                         );
                         renew_at = Instant::now() + self.t.renew;
@@ -879,7 +894,7 @@ impl Task {
                     // A renew re-reads the inbox: a hint lost with a dropped stream costs at most one interval.
                     call!(
                         &mut self.ctl,
-                        call_subscriber(sub, "delivery_renew", json!({})),
+                        subscriber_call(sub, &DeliveryRenewArgs {}),
                         lease_fail
                     );
                     renew_at = Instant::now() + self.t.renew;
@@ -914,12 +929,7 @@ impl Task {
                 message: "an issued item does not match the lease".into(),
             }));
         }
-        match watch(
-            &mut self.ctl,
-            call_subscriber(sub, "delivery_renew", json!({})),
-        )
-        .await
-        {
+        match watch(&mut self.ctl, subscriber_call(sub, &DeliveryRenewArgs {})).await {
             Err(f) => Err(f),
             Ok(Err(e)) => Err(lease_fail(e)),
             Ok(Ok(_)) => {

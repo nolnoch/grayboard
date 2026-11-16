@@ -6,8 +6,8 @@
 //! ```
 
 use futures_util::StreamExt;
-use grayboard::{Client, ClientInfo, DeliveryMode, Error, StaticBearer, SubscribeMode};
-use serde_json::json;
+use grayboard::tools::{BindArgs, BoardPostArgs, BoardSubscribeArgs, DmAckArgs, SubscribeMode};
+use grayboard::{Client, ClientInfo, DeliveryMode, Error, StaticBearer};
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
@@ -32,9 +32,16 @@ async fn main() -> Result<(), Error> {
         DeliveryMode::push("grayboard-rust-roundtrip")?,
     );
 
-    let bound = session.bind(&name, true).await?;
+    let bound = session
+        .bind(BindArgs {
+            create: Some(true),
+            ..BindArgs::new(&name)
+        })
+        .await?;
     println!("bound {}", bound.name);
-    session.board_subscribe(&board, SubscribeMode::Push).await?;
+    session
+        .board_subscribe(BoardSubscribeArgs::new(&board, SubscribeMode::Push))
+        .await?;
     println!("subscribed #{board}");
 
     let mut deliveries = session.deliveries();
@@ -56,19 +63,19 @@ async fn main() -> Result<(), Error> {
             let post = event["item"]["post"]["id"]
                 .as_u64()
                 .ok_or_else(|| Error::InvalidResponse("a push item without a post id".into()))?;
-            let reply = session.board_post(&board, "done", Some(post)).await?;
+            let reply = session
+                .board_post(BoardPostArgs {
+                    parent_id: Some(post),
+                    ..BoardPostArgs::new(&board, "done")
+                })
+                .await?;
             println!("replied {} to {post}", reply.post_id);
             replied = true;
         } else if event["kind"] == "direct" {
             let id = event["message"]["id"].as_u64().ok_or_else(|| {
                 Error::InvalidResponse("a direct item without a message id".into())
             })?;
-            let ack = session
-                .call_raw("dm_ack", json!({ "message_id": id }))
-                .await?;
-            if let Some(refusal) = ack.refusal() {
-                return Err(refusal);
-            }
+            session.dm_ack(DmAckArgs::new(id)).await?;
             println!("acked {id}");
             acked = true;
         }

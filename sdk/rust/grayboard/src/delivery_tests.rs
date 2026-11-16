@@ -1046,7 +1046,14 @@ async fn bind_while_an_item_is_out_loses_its_handle_and_shows_it_again() {
     let w = World::start(bus).await;
     let mut stream = w.s().deliveries();
     let first = next(&mut stream).await.unwrap();
-    let bound = w.s().bind("b", true).await.unwrap();
+    let bound = w
+        .s()
+        .bind(crate::tools::BindArgs {
+            create: Some(true),
+            ..crate::tools::BindArgs::new("b")
+        })
+        .await
+        .unwrap();
     assert_eq!(bound.name, "b");
     let again = next(&mut stream).await.unwrap();
     assert_eq!(again.id, "direct:1");
@@ -1117,7 +1124,13 @@ async fn a_bind_between_streams_is_what_the_next_stream_holds() {
         b.held.clear();
         b.ownership += 1;
     }
-    w.s().bind("b", true).await.unwrap();
+    w.s()
+        .bind(crate::tools::BindArgs {
+            create: Some(true),
+            ..crate::tools::BindArgs::new("b")
+        })
+        .await
+        .unwrap();
     let _again = w.s().deliveries();
     w.until("the second stream listens", |b| ops_count(b, "listen") == 1)
         .await;
@@ -1152,7 +1165,13 @@ async fn an_unbind_between_streams_is_not_undone_and_the_next_stream_idles_until
     .await;
     // Room for a wrong rebind of a to show up before the bind of c pauses the stream; nothing observable marks the task idle.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    w.s().bind("c", true).await.unwrap();
+    w.s()
+        .bind(crate::tools::BindArgs {
+            create: Some(true),
+            ..crate::tools::BindArgs::new("c")
+        })
+        .await
+        .unwrap();
     w.until("the stream opens after the bind", |b| {
         ops_count(b, "listen") == 1
     })
@@ -1178,7 +1197,13 @@ async fn unbinding_the_last_hold_with_an_item_out_loses_its_handle() {
         .await
         .expect("receipt() resolves while idle");
     assert!(lost_reason(why).contains("unbound"));
-    w.s().bind("a", false).await.unwrap();
+    w.s()
+        .bind(crate::tools::BindArgs {
+            create: Some(false),
+            ..crate::tools::BindArgs::new("a")
+        })
+        .await
+        .unwrap();
     assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
 }
 
@@ -1225,7 +1250,13 @@ async fn a_restart_during_a_bind_waits_for_the_resume() {
         )
         .unwrap();
     };
-    let (bound, ()) = tokio::join!(w.s().bind("b", true), poke);
+    let (bound, ()) = tokio::join!(
+        w.s().bind(crate::tools::BindArgs {
+            create: Some(true),
+            ..crate::tools::BindArgs::new("b")
+        }),
+        poke
+    );
     bound.unwrap();
     w.until("the stream reopens under a and b", |b| {
         ops_count(b, "listen") == 2

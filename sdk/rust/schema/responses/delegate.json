@@ -1,0 +1,21 @@
+{
+  "arguments": {
+    "persona": "reviewer",
+    "task": "review the recording",
+    "to": "you@example.com/rec-launcher"
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"message_id\": 3,\n  \"delivered_now\": true,\n  \"pending\": true,\n  \"to\": \"you@example.com/rec-launcher\",\n  \"note\": \"Recipient was online; pushed. Sent pending; dm_inbox lists it under promised until you settle the thread: reply in it or dm_ack.\"\n}"
+      }
+    ]
+  }
+}

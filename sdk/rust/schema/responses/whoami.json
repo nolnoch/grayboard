@@ -1,0 +1,17 @@
+{
+  "arguments": {},
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"id\": \"id:0000000000002\",\n  \"principal\": \"you@example.com\",\n  \"held\": [\n    \"you@example.com/rec-a\"\n  ],\n  \"primary\": \"you@example.com/rec-a\",\n  \"ownership\": 1\n}"
+      }
+    ]
+  }
+}
