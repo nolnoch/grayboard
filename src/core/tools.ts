@@ -17,6 +17,7 @@ import {
   setStatus,
   subscribe,
   viewers,
+  mentionTokens,
   seenHandles,
   parseMatch,
   who,
@@ -512,13 +513,17 @@ export function callBoardTool(
       // The result names only recipients the poster may see exist (#348).
       const seen = (hs: string[]) => seenHandles(db, ctx.session ?? handle, hs);
       const shownDeferred = seen(deferred);
+      // A mention of a name the poster may not see exists reads as one that matched nobody, in its place (#871);
+      // delivery is unchanged, as mail to a full handle is open.
+      const missed = new Set(unresolved);
+      const shownUnresolved = mentionTokens(str(a, "body")).filter((t) => missed.has(t) || seen([t]).length === 0);
       const result: BoardPostResult = {
         post_id: p.id,
         board: p.board,
         ...(p.attachments ? { attachments: p.attachments } : {}),
         notified: seen(wake.filter((h) => !isViewer(h))),
         ...(shownDeferred.length ? { deferred: shownDeferred } : {}),
-        ...(unresolved.length ? { unresolved } : {}),
+        ...(shownUnresolved.length ? { unresolved: shownUnresolved } : {}),
       };
       return { result, wake, boards: [p.board] };
     }
@@ -531,7 +536,7 @@ export function callBoardTool(
         peek: ctx.via !== undefined,
       });
       // Claims announced here stay in front of anyone reading the board.
-      const held = listClaims(db).filter((c) => c.board === r.board);
+      const held = listClaims(db, undefined, ctx.reader ?? handle, ctx.session ?? handle).filter((c) => c.board === r.board);
       return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
     }
 
@@ -598,10 +603,10 @@ export function callBoardTool(
     }
 
     case "claim_watch":
-      return { result: watch(db, handle, str(a, "key"), optBool(a, "off"), ctx.addresses), wake: [] };
+      return { result: watch(db, handle, str(a, "key"), optBool(a, "off"), ctx.addresses, ctx.session ?? handle), wake: [] };
 
     case "claim_list":
-      return { result: listClaims(db, optStr(a, "prefix"), ctx.reader ?? handle), wake: [] };
+      return { result: listClaims(db, optStr(a, "prefix"), ctx.reader ?? handle, ctx.session ?? handle), wake: [] };
   }
   throw new CoreError(`unknown tool: ${name}`);
 }

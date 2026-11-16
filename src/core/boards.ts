@@ -921,7 +921,9 @@ export function post(
       const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
       unresolved = u;
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
-      if (mentioned.length === 0) {
+      // A mention the poster may not see exists routes as one that matched nobody (#871): a lane still gets
+      // the post, so whether a team's name exists shows neither in who was notified nor in a queue claim.
+      if (seenHandles(db, opts.author_id ?? handle, mentioned).length === 0) {
         // Eligible lanes, least-recently-woken first, live lanes preferred: a
         // post claimed by an offline lane would sit for the full TTL while
         // live lanes idle (#192 review).
@@ -1098,7 +1100,10 @@ export function seenHandles(db: Database, viewer: string, handles: string[]): st
   const scopeOf = db.prepare(`SELECT scope_kind, scope_ref FROM aliases WHERE address = ?`);
   return handles.filter((h) => {
     const r = scopeOf.get(h) as { scope_kind: AliasScope["scope_kind"] | null; scope_ref: string | null } | null;
-    return !r || r.scope_kind === null || acc.seesAlias!(viewer, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    if (r) return r.scope_kind === null || acc.seesAlias!(viewer, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    // A deleted team name (#347) keeps its claims; it stays inside the team that had it (#871).
+    const p = addressParts(h);
+    return p?.kind !== "alias" || p.scopeKind !== "principal" || acc.seesAlias!(viewer, { scope_kind: "team", scope_ref: p.scope });
   });
 }
 
