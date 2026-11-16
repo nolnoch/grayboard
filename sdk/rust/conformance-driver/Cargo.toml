@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "Drives the Rust SDK under the conformance suite (tests/conformance, #929 D7)"
+description = "Drives the Rust SDK under the conformance suite (tests/conformance; docs/sdk-rust.md §4)"
 publish = false
 
 [dependencies]

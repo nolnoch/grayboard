@@ -1,4 +1,4 @@
-//! The conformance suite's Rust driver (#929 D7; `docs/sdk-rust.md` §4): `tests/conformance/driver.ts` `rustDriver()` runs one of these per bus and speaks JSON lines with it on stdio.
+//! The conformance suite's Rust driver (#929; `docs/sdk-rust.md` §4): `tests/conformance/driver.ts` `rustDriver()` runs one of these per bus and speaks JSON lines with it on stdio.
 //!
 //! - `{"id","op":"peer","peer","url","token","session"}` opens a session in push mode, binds `peer` with `create: true` and opens its delivery lease; it answers `{"id","result":<the bind's CallToolResult>}`.
 //! - `{"id","op":"call","peer","tool","args"}` makes a native tool call through `Session::call_raw` and answers `{"id","result":<raw CallToolResult>}`, refusals included.
@@ -185,14 +185,20 @@ async fn main() {
         let (peers, out) = (Arc::clone(&peers), out.clone());
         calls.spawn(async move {
             let id = req.get("id").cloned().unwrap_or(Value::Null);
-            let answer = match handle(peers, req).await {
-                Ok(result) => json!({"id": id, "result": result}),
-                Err(error) => json!({"id": id, "error": error}),
+            // An inner task, so a panic still answers its id instead of leaving the TS side waiting.
+            let answer = match tokio::spawn(handle(peers, req)).await {
+                Ok(Ok(result)) => json!({"id": id, "result": result}),
+                Ok(Err(error)) => json!({"id": id, "error": error}),
+                Err(e) => json!({"id": id, "error": format!("driver task panicked: {e}")}),
             };
             let _ = out.send(answer.to_string());
         });
     }
-    while calls.join_next().await.is_some() {}
+    while let Some(joined) = calls.join_next().await {
+        if let Err(e) = joined {
+            eprintln!("conformance-driver: a call task failed: {e}");
+        }
+    }
     let ended = end_all(&peers).await;
     drop(out);
     let _ = writer.await;

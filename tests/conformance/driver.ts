@@ -107,7 +107,7 @@ export function hostedDriver(): Driver {
   };
 }
 
-// The Rust SDK (#929 D7; docs/sdk-rust.md §4): each bus is a compiled server process with the operator client the
+// The Rust SDK (#929; docs/sdk-rust.md §4): each bus is a compiled server process with the operator client the
 // SDK's tests use, and one conformance-driver process (sdk/rust/conformance-driver) speaking JSON lines on stdio,
 // whose peers are Rust sessions of one user. It answers each call's raw CallToolResult, so outcome() reads it as it
 // reads hostedDriver's; the lease rule matches hostedDriver's, in the binary. Joins DRIVERS only when
@@ -115,6 +115,10 @@ export function hostedDriver(): Driver {
 const RUST_CLIENT = "rust-sdk-test";
 const RUST_SCOPES = ["grayboard:delivery", "grayboard:tools"];
 const SERVER_BIN = join(import.meta.dir, "../../dist/grayboard-server");
+
+function spawnDriver(bin: string) {
+  return Bun.spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, RUST_BACKTRACE: "1" } });
+}
 
 export function rustDriver(bin: string): Driver {
   return {
@@ -132,15 +136,24 @@ export function rustDriver(bin: string): Driver {
       const prefix = `${email}/`;
       const strip = (s: string) => s.split(prefix).join("");
       // Seeded before the server opens the database, so the two never write it at once.
-      const { token } = issueOAuthIn(dbPath, url, email, RUST_SCOPES, Date.now(), RUST_CLIENT);
-      const server = await ServerProcess.start(SERVER_BIN, dbPath, {
-        GRAYBOARD_PUBLIC_URL: issuer,
-        GRAYBOARD_HTTP_PORT: String(port),
-        GRAYBOARD_OAUTH_CLIENTS: JSON.stringify([{ clientId: RUST_CLIENT, name: "Rust SDK test", redirectUris: ["http://127.0.0.1/callback"], scopes: RUST_SCOPES, tokenEndpointAuthMethod: "none", sessionSource: true }]),
-        GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000",
-        GRAYBOARD_HOSTED_SUBSCRIBER_BURST: "10000", GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC: "10000",
-      });
-      const proc = Bun.spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, RUST_BACKTRACE: "1" } });
+      // scenario.ts opens a bus outside its try: a failed start stops what it started and removes the dir itself.
+      let token: string, server: ServerProcess | undefined, proc: ReturnType<typeof spawnDriver>;
+      try {
+        token = issueOAuthIn(dbPath, url, email, RUST_SCOPES, Date.now(), RUST_CLIENT).token;
+        server = await ServerProcess.start(SERVER_BIN, dbPath, {
+          GRAYBOARD_PUBLIC_URL: issuer,
+          GRAYBOARD_HTTP_PORT: String(port),
+          GRAYBOARD_OAUTH_CLIENTS: JSON.stringify([{ clientId: RUST_CLIENT, name: "Rust SDK test", redirectUris: ["http://127.0.0.1/callback"], scopes: RUST_SCOPES, tokenEndpointAuthMethod: "none", sessionSource: true }]),
+          GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000",
+          GRAYBOARD_HOSTED_SUBSCRIBER_BURST: "10000", GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC: "10000",
+        });
+        proc = spawnDriver(bin);
+      } catch (e) {
+        await server?.stop();
+        rmSync(dir, { recursive: true, force: true });
+        throw e;
+      }
+      const running = server;
       let stderr = "";
       const drainErr = (async () => {
         const decoder = new TextDecoder();
@@ -150,7 +163,7 @@ export function rustDriver(bin: string): Driver {
       const pending = new Map<number, { resolve(v: any): void; reject(e: Error): void }>();
       let next = 0;
       const failAll = (why: string) => {
-        for (const p of pending.values()) p.reject(new Error(`${why}\n${stderr}\n${server.log()}`));
+        for (const p of pending.values()) p.reject(new Error(`${why}\n${stderr}\n${running.log()}`));
         pending.clear();
       };
       const reader = (async () => {
@@ -197,7 +210,7 @@ export function rustDriver(bin: string): Driver {
             await Promise.all([reader, drainErr]);
             if (code !== 0) throw new Error(`conformance-driver exited ${code}\n${stderr}`);
           } finally {
-            await server.stop();
+            await running.stop();
             rmSync(dir, { recursive: true, force: true });
           }
         },
@@ -208,4 +221,5 @@ export function rustDriver(bin: string): Driver {
 }
 
 const rustBin = process.env.GRAYBOARD_RUST_DRIVER;
+if (!rustBin) console.log("conformance: hosted/rust skipped (set GRAYBOARD_RUST_DRIVER to the built conformance-driver, or run scripts/e2e.sh rust-sdk)");
 export const DRIVERS: (() => Driver)[] = [localDriver, hostedDriver, ...(rustBin ? [() => rustDriver(rustBin)] : [])];
