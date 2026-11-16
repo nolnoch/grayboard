@@ -663,16 +663,16 @@ test("ending a tools-only hosted root frees its alias for other users and restor
 });
 
 test("revoking one hosted hold releases only it, bumps the generation and closes the lease; the next whoami shows what is left (#451)", async () => {
-  const team = await seed(database.repo, () => {
-    const t = database.repo.teams.create("ops", principal.authed.user_id);
-    database.repo.teams.addMember(t.id, principal.authed.user_id);
+  const team = await seed(database.repo, (tx) => {
+    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
   const lease = await delivery.open(principal, context("root"));
   const before = database.repo.hosted.get((context("root") as { id: string }).id)!;
-  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
+  await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
   const after = database.repo.hosted.get(before.session_id)!;
   expect(after.bind_gen).toBeGreaterThan(before.bind_gen);
@@ -684,15 +684,15 @@ test("revoking one hosted hold releases only it, bumps the generation and closes
 });
 
 test("an alias revoke issued while another body holds the write queue waits behind it, then revokes and closes the lease (#807 P1b-4b)", async () => {
-  const team = await seed(database.repo, () => {
-    const t = database.repo.teams.create("ops", principal.authed.user_id);
-    database.repo.teams.addMember(t.id, principal.authed.user_id);
+  const team = await seed(database.repo, (tx) => {
+    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
   await delivery.open(principal, context("root"));
   const before = database.repo.hosted.get((context("root") as { id: string }).id)!;
-  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
+  await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
   let release!: () => void;
   const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
@@ -707,16 +707,16 @@ test("an alias revoke issued while another body holds the write queue waits behi
 });
 
 test("one alias revoke that throws rolls back alone, audited alias.revoke_failed; the recheck's other revokes land (#807 P1b-4b)", async () => {
-  const team = await seed(database.repo, () => {
-    const t = database.repo.teams.create("ops", principal.authed.user_id);
-    database.repo.teams.addMember(t.id, principal.authed.user_id);
+  const team = await seed(database.repo, (tx) => {
+    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
   await hosted.bind(principal, context("other"), { name: "ops/dev", create: true });
   const ids = ["root", "other"].map(r => (context(r) as { id: string }).id);
   const before = ids.map(id => database.repo.hosted.get(id)!.bind_gen);
-  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
+  await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
   const lose = database.repo.hosted.lose.bind(database.repo.hosted);
   let calls = 0;
   const spy = spyOn(database.repo.hosted, "lose").mockImplementation((...args) => { if (calls++ === 0) throw new Error("bad row"); return lose(...args); });
@@ -734,9 +734,9 @@ test("one alias revoke that throws rolls back alone, audited alias.revoke_failed
 });
 
 test("a revoked tools-only hosted root's ownership ends, audited once: a later recheck finds nothing to revoke again (#454)", async () => {
-  const team = await seed(database.repo, () => {
-    const t = database.repo.teams.create("ops", principal.authed.user_id);
-    database.repo.teams.addMember(t.id, principal.authed.user_id);
+  const team = await seed(database.repo, (tx) => {
+    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
@@ -746,7 +746,7 @@ test("a revoked tools-only hosted root's ownership ends, audited once: a later r
   expect(await hosted.whoami(generic, meta)).toMatchObject({ held: [], writes_as: "ops/lead" });
   const before = database.repo.hosted.get(id)!;
   const audits = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked'").all().map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
-  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
+  await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
   const revoked = [{ actor: "admin@example.com", target: "ops/lead", detail: { session: id, principal: "you@example.com", writes_as: true, reason: expect.any(String) } }];
   expect(audits()).toEqual(revoked);
@@ -784,9 +784,9 @@ test("a hosted root holding two names sends as either with as:, its ID too, and 
 });
 
 test("a root whose last hold is revoked or unbound has no lease, so the sweep leaves it owning instead of expiring it (#451)", async () => {
-  const team = await seed(database.repo, () => {
-    const t = database.repo.teams.create("ops", principal.authed.user_id);
-    database.repo.teams.addMember(t.id, principal.authed.user_id);
+  const team = await seed(database.repo, (tx) => {
+    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   const id = (raw: string) => (context(raw) as { id: string }).id;
@@ -795,7 +795,7 @@ test("a root whose last hold is revoked or unbound has no lease, so the sweep le
   await hosted.bind(principal, context("unbound"), { name: "fe", create: true });
   await delivery.open(principal, context("unbound"));
   await hosted.unbind(principal, context("unbound"), { name: "fe" });
-  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
+  await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
   expect(delivery.activeLeaseCount).toBe(0);
   for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(id(raw))).toMatchObject({ lease_deadline: null });

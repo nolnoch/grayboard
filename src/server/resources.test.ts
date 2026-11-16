@@ -116,10 +116,10 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
 });
 
 test("only authorized same-board watchers receive hints; lost membership closes without private data", async () => {
-  const team = await seed(store.repo, () => {
-    const t = store.repo.teams.create("private", alice.user_id);
-    store.repo.teams.addMember(t.id, alice.user_id);
-    store.repo.teams.addMember(t.id, bob.user_id);
+  const team = await seed(store.repo, (tx) => {
+    const t = store.repo.teams.create(tx, "private", alice.user_id);
+    store.repo.teams.addMember(tx, t.id, alice.user_id);
+    store.repo.teams.addMember(tx, t.id, bob.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);
@@ -131,7 +131,7 @@ test("only authorized same-board watchers receive hints; lost membership closes 
   resources.watch(b, boardResourceUri("open"), other);
   await call(a, "board_post", { board: "private", body: "secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([1, 1, 0]);
-  await seed(store.repo, () => store.repo.teams.removeMember(team.id, bob.user_id));
+  await seed(store.repo, (tx) => store.repo.teams.removeMember(tx, team.id, bob.user_id));
   await call(a, "board_post", { board: "private", body: "after removal" });
   expect(hb.counts).toEqual({ changed: 1, closed: 1 });
   resources.revalidate();
@@ -144,9 +144,9 @@ test("only authorized same-board watchers receive hints; lost membership closes 
 });
 
 test("attachments are metadata only and cannot escape the selected board/page", async () => {
-  const team = await seed(store.repo, () => {
-    const t = store.repo.teams.create("private", alice.user_id);
-    store.repo.teams.addMember(t.id, alice.user_id);
+  const team = await seed(store.repo, (tx) => {
+    const t = store.repo.teams.create(tx, "private", alice.user_id);
+    store.repo.teams.addMember(tx, t.id, alice.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);
@@ -219,9 +219,9 @@ test("claim create/update/release and refused acquisition's opportunistic lapse 
 });
 
 test("rolled back claims and unauthorized board mutations emit no hint or transient lapse", async () => {
-  const team = await seed(store.repo, () => {
-    const t = store.repo.teams.create("private", alice.user_id);
-    store.repo.teams.addMember(t.id, alice.user_id);
+  const team = await seed(store.repo, (tx) => {
+    const t = store.repo.teams.create(tx, "private", alice.user_id);
+    store.repo.teams.addMember(tx, t.id, alice.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);
@@ -244,10 +244,10 @@ test("rolled back claims and unauthorized board mutations emit no hint or transi
 });
 
 test("real bearer CLI claim route hints committed posts without attention subscribers or private leaks", async () => {
-  const team = await seed(store.repo, () => {
-    const t = store.repo.teams.create("private", alice.user_id);
-    store.repo.teams.addMember(t.id, alice.user_id);
-    store.repo.teams.addMember(t.id, bob.user_id);
+  const team = await seed(store.repo, (tx) => {
+    const t = store.repo.teams.create(tx, "private", alice.user_id);
+    store.repo.teams.addMember(tx, t.id, alice.user_id);
+    store.repo.teams.addMember(tx, t.id, bob.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);
@@ -307,7 +307,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     const bodies = (await resources.read(store.repo.read, b, boardResourceUri("e2e"))).posts.map(p => p.body);
     expect(bodies.slice(2, 5)).toEqual(["[claim] ticket:ENG-142", "[release] ticket:ENG-142", "[claim] lapsed"]);
     expect(bodies.at(-1)).toStartWith("[expired] lapsed:");
-    await seed(store.repo, () => store.repo.teams.removeMember(team.id, bob.user_id));
+    await seed(store.repo, (tx) => store.repo.teams.removeMember(tx, team.id, bob.user_id));
     expect((await call(at, "claim_take", { key: "secret", board: "private" })).status).toBe(200);
     expect(privateHint.counts.changed).toBe(1);
     expect(removedHint.counts).toEqual({ changed: 0, closed: 1 });

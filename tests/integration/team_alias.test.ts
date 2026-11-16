@@ -115,7 +115,7 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   build = srv.appSession(bob, "eng/build");
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
   const team = srv.app.repo.teams.findByName("eng")!;
-  await seed(srv.app.repo, () => srv.app.repo.teams.removeMember(team.id, srv.app.repo.users.findByEmail(B)!.id));
+  await seed(srv.app.repo, (tx) => srv.app.repo.teams.removeMember(tx, team.id, srv.app.repo.users.findByEmail(B)!.id));
   expect(holder("eng/build")).toEqual([build.id]);
   srv.app.revalidate();
   expect(holder("eng/build")).toEqual([]);

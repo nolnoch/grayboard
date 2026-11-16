@@ -204,9 +204,9 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   const grant = await issue();
   const alice = grant.authed.user_id;
   const bob = await issue("bob@example.com");
-  const team = await seed(app.repo, () => {
-    const t = app.repo.teams.create("private", alice);
-    app.repo.teams.addMember(t.id, alice);
+  const team = await seed(app.repo, (tx) => {
+    const t = app.repo.teams.create(tx, "private", alice);
+    app.repo.teams.addMember(tx, t.id, alice);
     return t;
   });
   const native = await connect(grant.token);
@@ -226,7 +226,7 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   expect(peers.peers.find((p: { handle: string }) => p.handle === "alice@example.com/be")).toMatchObject({ online: false });
   expect(await read(native.client, "grayboard://boards/private")).toHaveProperty("posts");
   expect(app.db.query("SELECT * FROM subscriptions WHERE handle=?").all("alice@example.com/be")).toEqual(before);
-  await seed(app.repo, () => app.repo.teams.removeMember(team.id, alice));
+  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, alice));
   await expect(read(native.client, "grayboard://boards/private")).rejects.toThrow("resource not found");
   expect((await native.client.listResources({ cursor: "page101" })).resources).toEqual([]);
   expect(app.mcp.activeLeases).toBe(0);
@@ -251,10 +251,10 @@ test("issued contiguous DM prefix receipts survive lost responses, but not out-o
 test("wire board receipts bind the issued snapshot and reject removed private-board membership", async () => {
   const alice = await issue();
   const bob = await issue("bob@example.com");
-  const team = await seed(app.repo, () => {
-    const t = app.repo.teams.create("private", alice.authed.user_id);
-    app.repo.teams.addMember(t.id, alice.authed.user_id);
-    app.repo.teams.addMember(t.id, bob.authed.user_id);
+  const team = await seed(app.repo, (tx) => {
+    const t = app.repo.teams.create(tx, "private", alice.authed.user_id);
+    app.repo.teams.addMember(tx, t.id, alice.authed.user_id);
+    app.repo.teams.addMember(tx, t.id, bob.authed.user_id);
     return t;
   });
   const sender = await connect(alice.token);
@@ -274,11 +274,11 @@ test("wire board receipts bind the issued snapshot and reject removed private-bo
   expect(state.notified_id).toBe(issued.event.item.latest.id);
   expect(state.notified_id).toBeLessThan(latest.post_id);
   // Alice's mention wakes bob's agent only under a grant (#806).
-  await seed(app.repo, () => app.repo.teams.setPolicy(team.id, "collaborative"));
+  await seed(app.repo, (tx) => app.repo.teams.setPolicy(tx, team.id, "collaborative"));
   value(await call(sender.client, "board_post", { board: "private", body: "@bob@example.com/be private" }));
   const privateItem = (await read(sub.client, "grayboard://inbox")).items.find((i: { event: { kind: string; item?: { kind: string; post?: { board: string } } } }) => i.event.kind === "board" && i.event.item?.kind === "push" && i.event.item.post?.board === "private");
   expect(privateItem).toMatchObject({ actionable: true, event: { kind: "board", item: { kind: "push" } } });
-  await seed(app.repo, () => app.repo.teams.removeMember(team.id, bob.authed.user_id));
+  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, bob.authed.user_id));
   expect((await call(sub.client, "delivery_receipt", { ids: [privateItem.id] })).isError).toBe(true);
   expect((await read(sub.client, "grayboard://inbox")).items.map((i: { id: string }) => i.id)).not.toContain(privateItem.id);
 });

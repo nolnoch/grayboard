@@ -228,7 +228,7 @@ describe("Repo", () => {
   test("aliases: a team scope's alias is its own address, listed under its scope", async () => {
     const team = await seed(repo, tx => {
       const u = repo.users.upsertByEmail(tx, "you@example.com", null);
-      repo.teams.create("eng", u.id);
+      repo.teams.create(tx, "eng", u.id);
       repo.aliases.create(person("you@example.com", "be"), "you@example.com");
       return repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
     });
@@ -244,7 +244,7 @@ describe("Repo", () => {
   test("principals: findByName reads users and teams", async () => {
     const { u, eng } = await seed(repo, tx => {
       const u = repo.users.upsertByEmail(tx, "you@example.com", null);
-      return { u, eng: repo.teams.create("eng", u.id) };
+      return { u, eng: repo.teams.create(tx, "eng", u.id) };
     });
     expect(repo.principals.findByName("you@example.com")).toMatchObject({ kind: "user", user_id: u.id, team_id: null });
     expect(repo.principals.findByName("eng")).toMatchObject({ kind: "team", user_id: null, team_id: eng.id });
@@ -255,13 +255,13 @@ describe("Repo", () => {
     const { u2, t } = await seed(repo, tx => {
       const u1 = repo.users.upsertByEmail(tx, "a@example.com", null);
       const u2 = repo.users.upsertByEmail(tx, "b@example.com", null);
-      const t  = repo.teams.create("eng", u1.id);
-      repo.teams.addMember(t.id, u1.id);
-      repo.teams.addMember(t.id, u2.id);
+      const t  = repo.teams.create(tx, "eng", u1.id);
+      repo.teams.addMember(tx, t.id, u1.id);
+      repo.teams.addMember(tx, t.id, u2.id);
       return { u2, t };
     });
     expect(repo.teams.listMembers(t.id)).toHaveLength(2);
-    await seed(repo, () => repo.teams.removeMember(t.id, u2.id));
+    await seed(repo, (tx) => repo.teams.removeMember(tx, t.id, u2.id));
     expect(repo.teams.listMembers(t.id)).toHaveLength(1);
   });
 
@@ -374,12 +374,12 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
   const { u, eng } = await seed(repo, tx => {
     const u = repo.users.upsertByEmail(tx, "a@example.com", null);
     repo.users.upsertByEmail(tx, "a@example.com", "A");
-    const eng = repo.teams.create("eng", u.id);
+    const eng = repo.teams.create(tx, "eng", u.id);
     // Service principals arrive with #270; the namespace guard is here now.
     db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
     return { u, eng };
   });
-  await expect(seed(repo, () => repo.teams.create("ingest", u.id))).rejects.toThrow(PrincipalTaken);
+  await expect(seed(repo, (tx) => repo.teams.create(tx, "ingest", u.id))).rejects.toThrow(PrincipalTaken);
   expect(repo.teams.findByName("ingest")).toBeUndefined();
   expect(db.prepare(`SELECT kind, name, user_id, team_id FROM principals ORDER BY id`).all()).toEqual([
     { kind: "user", name: "a@example.com", user_id: u.id, team_id: null },
@@ -770,4 +770,25 @@ test("#807 P1c-9: the Slack store runs on the handle it's given", async () => {
   expect(s.thread(repo.read, u.id, "dm", null, 1)?.thread_ts).toBe("1.1");
   expect(s.threadByTs(repo.read, u.id, "2.2")).toBeUndefined();
   expect(s.progress(repo.read, u.id, "dm:1")).toEqual({ posted: true });
+});
+
+// #807 P1c-10: the teams store's writes run on the handle they're given, as P1c-7's users writes do.
+test("#807 P1c-10: team writes run on the handle they're given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { kept, t, a, b } = await seed(repo, tx => {
+    const a = repo.users.upsertByEmail(tx, "a@example.com", null), b = repo.users.upsertByEmail(tx, "b@example.com", null);
+    const t = repo.teams.create(tx, "ops", a.id);
+    repo.teams.addMember(tx, t.id, a.id, "owner");
+    return { kept: tx, t, a, b };
+  });
+  const settled = /used after its transaction settled/;
+  expect(() => repo.teams.create(kept, "dev", a.id)).toThrow(settled);
+  expect(() => repo.teams.addMember(kept, t.id, b.id)).toThrow(settled);
+  expect(() => repo.teams.removeMember(kept, t.id, a.id)).toThrow(settled);
+  expect(() => repo.teams.setRole(kept, t.id, a.id, "member")).toThrow(settled);
+  expect(() => repo.teams.setPolicy(kept, t.id, "collaborative")).toThrow(settled);
+  expect(() => repo.teams.addMember({} as Tx, t.id, b.id)).toThrow("not a SQLite store handle");
+  expect(repo.teams.findByName("dev")).toBeUndefined();
+  expect(repo.teams.listMembers(t.id)).toEqual([{ user_id: a.id, email: "a@example.com", role: "owner" }]);
+  expect(repo.teams.findByName("ops")?.policy).toBe("open");
 });

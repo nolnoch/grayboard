@@ -409,18 +409,18 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: Core
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid team name");
-  return repo.write(() => {
+  return repo.write((tx) => {
     if (repo.teams.findByName(name)) return conflict(`team "${name}" already exists`);
     // The team's board shares its name, so the name must be free as a board too.
     if (getBoard(db, name)) return conflict(`a board named "#${name}" already exists`);
     let team: Team;
     try {
-      team = repo.teams.create(name, authed.user_id);
+      team = repo.teams.create(tx, name, authed.user_id);
     } catch (e) {
       if (e instanceof PrincipalTaken) return conflict(e.message);
       throw e;
     }
-    repo.teams.addMember(team.id, authed.user_id, "owner");
+    repo.teams.addMember(tx, team.id, authed.user_id, "owner");
     ensureTeamBoard(db, team, authed.user_email);
     onTeamJoined(db, repo, team, authed.user_email);
     writeAudit(repo, "team.created", authed.user_email, name);
@@ -476,11 +476,11 @@ function ownedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Con
 const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
 
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb, sessions: SessionHooks): Promise<Response> {
-  return repo.write(() => {
+  return repo.write((tx) => {
     const team = memberTeam(teamName, authed, repo);
     if (!team) return notFound();
     try {
-      repo.teams.removeMember(team.id, authed.user_id);
+      repo.teams.removeMember(tx, team.id, authed.user_id);
     } catch (e) {
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
@@ -496,7 +496,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
   // Read the body before the ownership check (security audit F-02): an owner
   // demoted while a slow body trickles in must not act on a stale check.
   const body = await parseBody<{ email: string; role?: unknown }>(req);
-  return repo.write(() => {
+  return repo.write((tx) => {
     const managed = ownedTeam(teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const { team } = managed;
@@ -506,7 +506,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     const email = body.email.toLowerCase();
     const user  = repo.users.findByEmail(email);
     if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
-    if (repo.teams.addMember(team.id, user.id, role ?? "member")) {
+    if (repo.teams.addMember(tx, team.id, user.id, role ?? "member")) {
       onTeamJoined(db, repo, team, email);
       writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
       return json({ ok: true });
@@ -515,7 +515,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     if (role === undefined) return json({ ok: true });
     let from: TeamRole | null;
     try {
-      from = repo.teams.setRole(team.id, user.id, role);
+      from = repo.teams.setRole(tx, team.id, user.id, role);
     } catch (e) {
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
@@ -527,7 +527,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
 
 async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config, sessions: SessionHooks): Promise<Response> {
   const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
-  return repo.write(() => {
+  return repo.write((tx) => {
     const managed = ownedTeam(teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const { team } = managed;
@@ -538,7 +538,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
     }
     try {
-      repo.teams.removeMember(team.id, user.id);
+      repo.teams.removeMember(tx, team.id, user.id);
     } catch (e) {
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
@@ -556,12 +556,12 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
 // Owners and admins set it, like membership; audited with before and after.
 async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ policy?: unknown }>(req);
-  return repo.write(() => {
+  return repo.write((tx) => {
     const managed = ownedTeam(teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const policy = body?.policy;
     if (typeof policy !== "string" || !(TEAM_POLICIES as readonly string[]).includes(policy)) return badRequest(`policy must be one of ${TEAM_POLICIES.map(p => `"${p}"`).join(", ")}`);
-    const from = repo.teams.setPolicy(managed.team.id, policy as TeamPolicy);
+    const from = repo.teams.setPolicy(tx, managed.team.id, policy as TeamPolicy);
     if (from === null) return notFound();
     if (from !== policy) writeAudit(repo, "team.policy_set", authed.user_email, managed.team.name, { from, to: policy, ...managed.audit });
     return json({ ok: true, team: managed.team.name, policy, previous: from });
