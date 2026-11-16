@@ -1,4 +1,4 @@
-//! An incremental `text/event-stream` parser: data, event and id fields, comments ignored. The server sends nothing else (#929 D1).
+//! An incremental `text/event-stream` parser: data, event and id fields, comments ignored. The server sends nothing else (#929; `docs/sdk-rust.md` §1).
 
 use crate::error::Error;
 

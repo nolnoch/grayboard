@@ -1,4 +1,4 @@
-//! Where a request's bearer token comes from (#929 D3).
+//! Where a request's bearer token comes from (#929; the service credential still to come: `docs/future/rust-sdk.md` D3).
 
 use crate::error::AuthError;
 use futures_util::future::BoxFuture;
