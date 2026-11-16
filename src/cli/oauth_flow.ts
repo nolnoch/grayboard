@@ -19,7 +19,7 @@ const printable = (text: string, max = 300) => {
   return clean.length > max ? clean.slice(0, max) + "..." : clean;
 };
 
-type Metadata = { issuer: string; authorization_endpoint: string; token_endpoint: string; code_challenge_methods_supported?: string[] };
+type Metadata = { issuer: string; authorization_endpoint: string; token_endpoint: string; code_challenge_methods_supported?: string[]; grayboard_cli_client?: unknown };
 
 const page = (title: string) => new Response(`<!doctype html><meta charset="utf-8"><title>Grayboard</title><h1>${title}</h1><p>You may close this tab and return to your terminal.</p>`,
   { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
@@ -31,12 +31,15 @@ async function metadata(serverUrl: string): Promise<Metadata> {
   let res: Response;
   try { res = await fetch(`${u.origin}/.well-known/oauth-authorization-server${path}`, { signal: AbortSignal.timeout(10_000), redirect: "error" }); }
   catch (e) { throw new Error(`couldn't reach ${serverUrl} (${(e as Error).message})`); }
-  if (!res.ok) throw new Error(`${serverUrl} has no OAuth authorization server (HTTP ${res.status}); is it a grayboard server?`);
+  if (!res.ok) throw new Error(`${serverUrl} has no OAuth authorization server (HTTP ${res.status}): it isn't a grayboard server, or one older than v2.0.0, too old for this CLI's sign-in (upgrade it, or sign in with grayboard CLI v2.4.2)`);
   const m = await res.json().catch(() => ({})) as Partial<Metadata>;
   if (typeof m.issuer !== "string" || typeof m.authorization_endpoint !== "string" || typeof m.token_endpoint !== "string") throw new Error(`${serverUrl} sent malformed OAuth metadata`);
   // The endpoints must be this server's: the browser and the code go nowhere else.
   for (const e of [m.issuer, m.authorization_endpoint, m.token_endpoint]) if (new URL(e).origin !== u.origin) throw new Error(`${serverUrl}'s OAuth metadata names another origin (${new URL(e).origin})`);
   if (!m.code_challenge_methods_supported?.includes("S256")) throw new Error(`${serverUrl}'s OAuth server doesn't offer PKCE S256`);
+  // A server older than #928 doesn't know grayboard-cli: its authorize page refuses the client with no redirect, and
+  // the flow would wait out FLOW_MS (#991). v2.4.2 is the last CLI that signs in the old way.
+  if (m.grayboard_cli_client !== CLI_CLIENT_ID) throw new Error(`${serverUrl} is too old for this CLI's sign-in: upgrade the server, or sign in with grayboard CLI v2.4.2`);
   return m as Metadata;
 }
 

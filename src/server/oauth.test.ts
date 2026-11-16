@@ -1406,6 +1406,8 @@ test("R3: no client but grayboard-cli obtains grayboard:login, and it never trav
   const metadata = await (await fetch(base + "/.well-known/oauth-authorization-server")).json();
   expect(metadata.scopes_supported).not.toContain(LOGIN_SCOPE);
   expect(metadata.grayboard_builtin_clients).not.toContain(CLI_CLIENT_ID);
+  // The client ID alone is advertised, so the CLI tells a pre-#928 server apart before opening a browser (#991).
+  expect(metadata.grayboard_cli_client).toBe(CLI_CLIENT_ID);
   expect(storage.db.query("SELECT COUNT(*) AS n FROM sessions").get()).toEqual({ n: 0 });
 });
 
