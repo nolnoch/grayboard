@@ -1006,7 +1006,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Everything owed to a push session, after its hello's answer: direct
     // messages and board items for `addresses` (every address by default; a
     // bind's alias after its answer).
-    replay(session: ApplicationSession, addresses?: string[]) {
+    async replay(session: ApplicationSession, addresses?: string[]) {
       valid(session, true);
       if (session.readOnly || !session.push) return;
       afterCommit(db, () => {
@@ -1015,7 +1015,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         drainBoards(session, hub, true);
       });
     },
-    send(
+    async send(
       session: ApplicationSession,
       recipient: string,
       body: string,
@@ -1024,25 +1024,25 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session);
       return handleSend(hub, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
-    delegate(session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
+    async delegate(session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       valid(session);
       return handleDelegate(hub, session, request);
     },
-    history(session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
+    async history(session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
       valid(session);
       return handleHistory(hub, session, options.peer, options.limit, options.before_id);
     },
-    thread(session: ApplicationSession, id: number) {
+    async thread(session: ApplicationSession, id: number) {
       valid(session);
       return handleThread(session, id, repo);
     },
-    inbox(session: ApplicationSession, days?: number) {
+    async inbox(session: ApplicationSession, days?: number) {
       valid(session);
       childState(session, "dm_inbox");
       return handleInbox(hub, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
-    pending(session: ApplicationSession, limit = 100): DeliveryEvent[] {
+    async pending(session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
       valid(session);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(a, "direct", a) }));
@@ -1065,11 +1065,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
           : { ...item, latest: { ...item.latest, ...marks.post(item.latest.id, false) } } })),
       ];
     },
-    boardCatalog(session: ApplicationSession, after?: string) {
+    async boardCatalog(session: ApplicationSession, after?: string) {
       valid(session, true);
       return boardCatalog(db, session.readOnly ? seer(repo, session) : session.primary, after);
     },
-    boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
+    async boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
       valid(session, true);
       // A resource read is a read like board_read, and carries its marks (#825).
       const snap = snapshot(db, reader(session, board), board, options);
@@ -1112,7 +1112,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     // Acked as the address the row names (S8): receivedUnacked and
     // sentPending match a.reader = m.recipient, or m.sender.
-    acknowledgeDm(session: ApplicationSession, id: number) {
+    async acknowledgeDm(session: ApplicationSession, id: number) {
       valid(session);
       childState(session, "dm_ack");
       const m = repo.messages.getById(id), mine = session.addresses;
@@ -1123,11 +1123,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (!m || reader === null) fail("not_found", `no message ${id} to you or pending from you; dm_inbox lists them`);
       repo.messages.ack(reader, m.id);
     },
-    retract(session: ApplicationSession, id: number) {
+    async retract(session: ApplicationSession, id: number) {
       valid(session);
       return handleRetract(hub, session, id);
     },
-    call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
+    async call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool));
       // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
       try { return handleCall(hub, session, tool, args, publish); }

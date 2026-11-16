@@ -102,9 +102,9 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
   await call(b, "board_post", { board: "e2e", body: "hello" });
   expect([h1.counts.changed, h2.counts.changed, h3.counts.changed]).toEqual([1, 1, 1]);
-  expect(resources.read(a, boardResourceUri("e2e")).posts[0]!.body).toBe("hello");
+  expect((await resources.read(a, boardResourceUri("e2e"))).posts[0]!.body).toBe("hello");
   expect(ownerEvents).toEqual([]);
-  const peers = application.call(a, "peer_list", {}) as { peers: { handle: string; status?: string; online: boolean }[] };
+  const peers = (await application.call(a, "peer_list", {})) as { peers: { handle: string; status?: string; online: boolean }[] };
   expect(peers.peers.find(p => p.handle === a.identityFull)).toMatchObject({ status: "working", online: true });
   // #284: a held alias refuses another session's bind as alias_held (was identity_in_use).
   await expect(select(alice, "be", true)).rejects.toMatchObject({ code: "alias_held" });
@@ -136,8 +136,8 @@ test("only authorized same-board watchers receive hints; lost membership closes 
   expect(hb.counts).toEqual({ changed: 1, closed: 1 });
   resources.revalidate();
   expect(hb.counts.closed).toBe(1);
-  expect(resources.list(b).resources.map(r => r.uri)).not.toContain(privateUri);
-  expect(() => resources.read(b, privateUri)).toThrow("no such board #private; see board_list");
+  expect((await resources.list(b)).resources.map(r => r.uri)).not.toContain(privateUri);
+  await expect(resources.read(b, privateUri)).rejects.toThrow("no such board #private; see board_list");
   expect(() => resources.watch(b, privateUri, hooks())).toThrow("no such board #private; see board_list");
   await call(a, "board_post", { board: "private", body: "new secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([3, 1, 0]);
@@ -155,13 +155,13 @@ test("attachments are metadata only and cannot escape the selected board/page", 
   await call(a, "board_post", { board: "open", body: "file", attachment_ids: [file.id] });
   const hidden = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "hidden.txt", type: "text/plain", data: new TextEncoder().encode("hidden") }, { quota: quotaOf(alice), tx: queuedTx(store.repo) });
   await call(a, "board_post", { board: "private", body: "hidden", attachment_ids: [hidden.id] });
-  const result = resources.read(b, boardResourceUri("open"));
+  const result = await resources.read(b, boardResourceUri("open"));
   expect(result.posts[0]!.attachments).toEqual([{ id: file.id, filename: file.filename, type: file.type, size: file.size, sha256: file.sha256 }]);
   expect(JSON.stringify(result)).not.toContain("hidden");
   expect(JSON.stringify(result)).not.toContain(dir);
-  expect(() => resources.read(b, boardResourceUri("private"))).toThrow("no such board");
+  await expect(resources.read(b, boardResourceUri("private"))).rejects.toThrow("no such board");
   await call(a, "board_post", { board: "open", body: "no file" });
-  expect(resources.read(b, boardResourceUri("open"), { limit: 1 }).posts[0]!.attachments).toBeUndefined();
+  expect((await resources.read(b, boardResourceUri("open"), { limit: 1 })).posts[0]!.attachments).toBeUndefined();
 });
 
 test("failed/missed callbacks do not acknowledge; reconcile reads recover and callback exceptions are isolated", async () => {
@@ -176,11 +176,11 @@ test("failed/missed callbacks do not acknowledge; reconcile reads recover and ca
   await call(a, "board_post", { board: "e2e", body: "second" });
   await Promise.resolve();
   expect(good.counts.changed).toBe(2);
-  const pending = application.pending(b);
+  const pending = await application.pending(b);
   expect(pending).toHaveLength(2);
-  expect(resources.read(b, boardResourceUri("e2e")).posts.map(p => p.body)).toEqual(["first", "second"]);
-  expect(resources.read(b, boardResourceUri("e2e")).posts.map(p => p.body)).toEqual(["first", "second"]);
-  expect(application.pending(b)).toEqual(pending);
+  expect((await resources.read(b, boardResourceUri("e2e"))).posts.map(p => p.body)).toEqual(["first", "second"]);
+  expect((await resources.read(b, boardResourceUri("e2e"))).posts.map(p => p.body)).toEqual(["first", "second"]);
+  expect(await application.pending(b)).toEqual(pending);
 });
 
 test("claim create/update/release and refused acquisition's opportunistic lapse signal without attention watchers", async () => {
@@ -209,13 +209,13 @@ test("claim create/update/release and refused acquisition's opportunistic lapse 
   const refused = await call<{ ok: boolean }>(b, "claim_take", { key: "occupied" });
   expect(refused.ok).toBe(false);
   expect(h.counts.changed).toBe(5);
-  expect(resources.read(b, uri).posts.map(p => p.body)).toEqual([
+  expect((await resources.read(b, uri)).posts.map(p => p.body)).toEqual([
     "[claim] ticket:ENG-142", "[update] ticket:ENG-142 — progress", "[release] ticket:ENG-142",
     "[claim] lapsed", `[expired] lapsed: not released by ${a.identityFull}; check with them before relying on it`,
   ]);
   expect(isSubscribed(store.db, a.identityFull, "e2e")).toBe(false);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
-  expect(application.pending(b)).toEqual([]);
+  expect(await application.pending(b)).toEqual([]);
 });
 
 test("rolled back claims and unauthorized board mutations emit no hint or transient lapse", async () => {
@@ -236,7 +236,7 @@ test("rolled back claims and unauthorized board mutations emit no hint or transi
     BEGIN SELECT RAISE(ABORT, 'rollback'); END`);
   await expect(call(a, "claim_take", { key: "rollback", board: "e2e" })).rejects.toThrow("claim_take failed");
   expect(h.counts.changed).toBe(0);
-  expect(resources.read(b, uri).posts.map(p => p.body)).toEqual(["[claim] lapsed"]);
+  expect((await resources.read(b, uri)).posts.map(p => p.body)).toEqual(["[claim] lapsed"]);
   expect(store.db.query("SELECT key FROM claims WHERE key = 'lapsed'").get()).toEqual({ key: "lapsed" });
   await expect(call(b, "board_post", { board: "private", body: "no" })).rejects.toThrow("no such board");
   await expect(call(b, "claim_take", { key: "private", board: "private" })).rejects.toThrow("no such board");
@@ -291,7 +291,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     while (publicHint.counts.changed < 2 && Date.now() < deadline) await Bun.sleep(10);
     expect(publicHint.counts.changed).toBe(2);
     expect(store.db.query("SELECT key FROM claims").all()).toEqual([]);
-    expect(resources.read(b, boardResourceUri("e2e")).posts.at(-1)!.body).toStartWith("[expired] short:");
+    expect((await resources.read(b, boardResourceUri("e2e"))).posts.at(-1)!.body).toStartWith("[expired] short:");
     expect((await call(at, "claim_take", { key: "ticket:ENG-142", board: "e2e" })).body.ok).toBe(true);
     expect(publicHint.counts.changed).toBe(3);
     expect((await call(at, "claim_release", { key: "ticket:ENG-142" })).status).toBe(200);
@@ -304,7 +304,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     expect(refused.body.ok).toBe(false);
     expect(refused.body.boards).toBeUndefined();
     expect(publicHint.counts.changed).toBe(6);
-    const bodies = resources.read(b, boardResourceUri("e2e")).posts.map(p => p.body);
+    const bodies = (await resources.read(b, boardResourceUri("e2e"))).posts.map(p => p.body);
     expect(bodies.slice(2, 5)).toEqual(["[claim] ticket:ENG-142", "[release] ticket:ENG-142", "[claim] lapsed"]);
     expect(bodies.at(-1)).toStartWith("[expired] lapsed:");
     await seed(store.repo, () => store.repo.teams.removeMember(team.id, bob.user_id));
@@ -314,18 +314,18 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     expect((await call(bt, "claim_take", { key: "denied", board: "private" })).status).toBe(400);
     expect(publicHint.counts.changed).toBe(6);
     expect(privateHint.counts.changed).toBe(1);
-    expect(() => resources.read(b, boardResourceUri("private"))).toThrow("no such board");
+    await expect(resources.read(b, boardResourceUri("private"))).rejects.toThrow("no such board");
     const state = () => ({
       subscriptions: store.db.query("SELECT * FROM subscriptions ORDER BY board, handle").all(),
       outbox: store.db.query("SELECT * FROM outbox ORDER BY handle, post_id").all(),
     });
     const before = state();
-    resources.read(b, boardResourceUri("e2e"));
-    resources.read(a, boardResourceUri("private"));
+    await resources.read(b, boardResourceUri("e2e"));
+    await expect(resources.read(a, boardResourceUri("private"))).resolves.toBeDefined();
     expect(state()).toEqual(before);
     for (const session of [a, b]) {
       expect(isSubscribed(store.db, session.identityFull, "e2e")).toBe(false);
-      expect(application.pending(session)).toEqual([]);
+      expect(await application.pending(session)).toEqual([]);
       expect(store.repo.cursors.directFor(session.identityFull)).toBe(0);
     }
   } finally { touches.cancelAll(); server.stop(true); }
@@ -343,10 +343,10 @@ test("timer expiry independently hints with no attention subscribers", async () 
   const deadline = Date.now() + 2_000;
   while (h.counts.changed < 2 && Date.now() < deadline) await Bun.sleep(10);
   expect(h.counts.changed).toBe(2);
-  expect(resources.read(b, uri).posts.at(-1)!.body).toStartWith("[expired] short:");
+  expect((await resources.read(b, uri)).posts.at(-1)!.body).toStartWith("[expired] short:");
   expect(isSubscribed(store.db, a.identityFull, "e2e")).toBe(false);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
-  expect(application.pending(b)).toEqual([]);
+  expect(await application.pending(b)).toEqual([]);
 });
 
 test("retention hints only actual committed post deletions and snapshot reads leave attention state intact", async () => {
@@ -367,7 +367,7 @@ test("retention hints only actual committed post deletions and snapshot reads le
   const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
   await runRetention(store.repo, store.db, config, Date.now(), application.boardsChanged);
   expect(h.counts.changed).toBe(1);
-  expect(resources.read(b, uri).posts.map(p => p.body)).toEqual(["kept"]);
+  expect((await resources.read(b, uri)).posts.map(p => p.body)).toEqual(["kept"]);
   expect(state()).toEqual(before);
   await runRetention(store.repo, store.db, config, Date.now(), application.boardsChanged);
   expect(h.counts.changed).toBe(1);
@@ -386,7 +386,7 @@ test("unwatch is session-bound and bounded capacity is reclaimed by cancellation
   expect(h.counts.closed).toBe(1);
   application.close(a);
   expect(h.counts.closed).toBe(33);
-  expect(() => resources.read(a, boardResourceUri("e2e"))).toThrow("unauthorized");
+  await expect(resources.read(a, boardResourceUri("e2e"))).rejects.toThrow("unauthorized");
 });
 
 test("revocation, disabled users, application disconnect and stop close watchers", async () => {
@@ -398,7 +398,7 @@ test("revocation, disabled users, application disconnect and stop close watchers
   // Notification must recheck authorization even without explicit revalidation.
   await call(b, "board_post", { board: "e2e", body: "after revoke" });
   expect(revokedHook.counts).toEqual({ changed: 0, closed: 1 });
-  expect(() => resources.list(a)).toThrow("unauthorized");
+  await expect(resources.list(a)).rejects.toThrow("unauthorized");
   const disabledHook = hooks();
   resources.watch(b, boardResourceUri("e2e"), disabledHook);
   await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
@@ -438,14 +438,14 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
   failed = true;
   try {
     for (const call of [() => resources.list(b), () => resources.read(b, uri), () => resources.watch(b, uri, hooks()), () => resources.unwatch(b, watch)]) {
-      try { call(); throw new Error("request unexpectedly succeeded"); } catch (error) { expect(error).toBe(failure); }
+      try { await call(); throw new Error("request unexpectedly succeeded"); } catch (error) { expect(error).toBe(failure); }
     }
     expect(h.counts).toEqual({ changed: 0, closed: 0 });
     expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
   } finally { failed = false; application.revalidateSession = validate; }
   await call(a, "board_post", { board: "e2e", body: "healthy" });
   expect(h.counts).toEqual({ changed: 1, closed: 0 });
-  expect(resources.read(b, uri).posts.map(p => p.body)).toEqual(["healthy"]);
+  expect((await resources.read(b, uri)).posts.map(p => p.body)).toEqual(["healthy"]);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
   resources.unwatch(b, watch);
   expect(h.counts.closed).toBe(1);
@@ -480,7 +480,7 @@ for (const background of ["revalidate", "hint", "closed", "timer"] as const) tes
     }
     expect({ changed, closed }).toEqual({ changed: 0, closed: 1 });
     failed = false;
-    if (background === "hint") expect(resources.read(a, boardResourceUri("e2e")).posts[0]!.body).toBe("committed");
+    if (background === "hint") expect((await resources.read(a, boardResourceUri("e2e"))).posts[0]!.body).toBe("committed");
     expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
     expect(() => resources.close()).not.toThrow();
     expect(closed).toBe(1);
@@ -500,7 +500,7 @@ test("resource background session storage faults fail closed, but authoritative 
   } finally { application.revalidateSession = validate; }
   for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
   application.revalidateSession = () => { throw new ApplicationError("unauthenticated", "closed session"); };
-  try { expect(() => resources.list(a)).toThrow("unauthorized"); }
+  try { await expect(resources.list(a)).rejects.toThrow("unauthorized"); }
   finally { application.revalidateSession = validate; }
   for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
 });
@@ -520,7 +520,7 @@ test("per-session watch capacity counts only that session's watches and frees on
   ids[0] = resources.watch(a, "grayboard://boards/cap", hooks());
   expect(resources.activeWatchCount).toBe(33);
   revoked.add(a);
-  expect(() => resources.list(a)).toThrow("resource session is closed or unauthorized");
+  await expect(resources.list(a)).rejects.toThrow("resource session is closed or unauthorized");
   expect(resources.activeWatchCount).toBe(1);
   resources.unwatch(b, theirs);
   expect(resources.activeWatchCount).toBe(0);

@@ -13,6 +13,7 @@ import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.
 import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META, validSourceId } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
+import type { Sync } from "./db.ts";
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
@@ -675,7 +676,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     },
     // `told` (a native tool call): gets the alias_lost notice, if any, for the result. `prior`: its exchange's
     // verdict (#907).
-    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
+    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
       const body = async (row: HostedSession | undefined) => {
         const pending = told ? takeLost(p, row, "agent") : undefined;
         const taken = pending ? await pending : [];
@@ -690,10 +691,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         selected.session.afterRollback = late.defer;
         try {
           await testPauseAsync("hosted:tool:in-gate");
-          return await store.write(() => {
+          return await store.write<T>(async () => {
             fence(p, row, root);
-            const value = fn(selected.session);
-            if (value instanceof Promise) throw new Error("hosted native effects must be synchronous");
+            const value = await fn(selected.session);
             if (!writeReads.has(tool)) audit(row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
             return value;
           });
@@ -736,7 +736,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // every open's cap check); its own failure isn't a rollback, so it flushes no refusal rows.
         let done = false;
         try {
-          return await store.write(() => fn(attach(p, row), late.defer), result => { done = true; return committed ? committed(result) : result as unknown as R; });
+          return await store.write(() => fn(attach(p, row), late.defer) as Sync<T>, (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
       });
     },
