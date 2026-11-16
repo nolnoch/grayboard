@@ -8,6 +8,7 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { GRAYBOARD_LAUNCHER_META } from "../../src/shared/session_meta.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
+import { seed } from "../support/seed.ts";
 
 let srv: TestServer;
 let app: TestServer["app"];
@@ -35,9 +36,11 @@ async function legacyLogin(email = "alice@example.com") {
   const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
   const token = (await res.json() as { session_token: string }).session_token;
   const user = app.repo.users.findByEmail(email)!;
-  for (const name of ["be", "allowed"]) {
-    if (!app.repo.aliases.find(`${user.email}/${name}`)) app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: name }, user.email);
-  }
+  await seed(app.repo, () => {
+    for (const name of ["be", "allowed"]) {
+      if (!app.repo.aliases.find(`${user.email}/${name}`)) app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: name }, user.email);
+    }
+  });
   return token;
 }
 // An application session (#282) signed in with a session token: the launcher
@@ -241,7 +244,7 @@ test("revocation is checked on subsequent calls, including legacy", async () => 
   for (const version of ["2026-07-28", "2025-11-25"]) {
     const token = await login("bob@example.com");
     const c = await connect(token, "be", version);
-    app.repo.sessions.revokeAllForUser(app.repo.users.findByEmail("bob@example.com")!.id);
+    await seed(app.repo, () => app.repo.sessions.revokeAllForUser(app.repo.users.findByEmail("bob@example.com")!.id));
     await expect(c.listTools()).rejects.toThrow();
   }
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
@@ -275,10 +278,14 @@ test("live access, family, disable and admin revocation never reuse a cached pri
     const issued = await issueOAuth(app.repo, app.oauth.resource, `${action}@example.com`, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
     const client = await connect(issued.token);
     switch (action) {
-      case "access": app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now()); break;
-      case "family": app.repo.oauth.revokeToken(issued.tokens.refreshHash, issued.binding.clientId, Date.now()); break;
-      case "disable": app.repo.users.setDisabled(issued.authed.user_id, true); app.repo.users.setDisabled(issued.authed.user_id, false); break;
-      case "admin": app.repo.sessions.revokeAllForUser(issued.authed.user_id); break;
+      case "access": await seed(app.repo, () => app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now())); break;
+      case "family": await seed(app.repo, () => app.repo.oauth.revokeToken(issued.tokens.refreshHash, issued.binding.clientId, Date.now())); break;
+      // Two bodies, as the two autocommit writes were: the disable commits before the re-enable.
+      case "disable":
+        await seed(app.repo, () => app.repo.users.setDisabled(issued.authed.user_id, true));
+        await seed(app.repo, () => app.repo.users.setDisabled(issued.authed.user_id, false));
+        break;
+      case "admin": await seed(app.repo, () => app.repo.sessions.revokeAllForUser(issued.authed.user_id)); break;
     }
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "revoked" } })).rejects.toThrow();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
@@ -341,7 +348,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
     const pending = fetch(base + "/mcp", { method: "POST", headers: { Authorization: `Bearer ${issued.token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body });
     await authenticated;
     if (failure === "expiry") clock = Date.now() + 3_600_001;
-    if (failure === "revoke") app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now());
+    if (failure === "revoke") await seed(app.repo, () => app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now()));
     const valid = failure === "revoke" ? await connect(await login("bob@example.com")) : undefined;
     controller.enqueue(encoder.encode(json.slice(1))); controller.close();
     const [response, validResult] = await Promise.all([pending, valid?.callTool({ name: "board_list", arguments: {} })]);

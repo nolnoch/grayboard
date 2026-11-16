@@ -6,6 +6,7 @@ import { until } from "../support/until.ts";
 import { hostedRowCount } from "../support/hosted_rows.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
+import { seed } from "../support/seed.ts";
 
 // The per-user bind bucket (helloLimit: the hello that shared it is gone, #282)
 // is the application's, separate from the hosted request bucket; the binds are
@@ -19,8 +20,10 @@ test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion i
     const other = await srv.login("bob@example.com");
     const hostedToken = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT)).token;
     const otherHostedToken = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "bob@example.com")).token;
-    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
-    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "bob@example.com", name: "be" }, "bob@example.com");
+    await seed(srv.app.repo, () => {
+      srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
+      srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "bob@example.com", name: "be" }, "bob@example.com");
+    });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
       requestInit: { headers: { Authorization: `Bearer ${hostedToken}` } },
       fetch: async (input, init) => {
@@ -64,7 +67,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
   try {
     const { token, authed } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
     const user = srv.app.repo.users.findByEmail("alice@example.com")!;
-    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "be" }, user.email);
+    await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "be" }, user.email));
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
       requestInit: { headers: { Authorization: `Bearer ${token}` } },
       fetch: async (input, init) => {
@@ -117,7 +120,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
   const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, now: () => now });
   try {
     const { token } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
-    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
+    await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com"));
     const aliases = srv.app.repo.aliases;
     const find = aliases.find.bind(aliases), listFor = aliases.listForScope.bind(aliases);
     let finds = 0, lists = 0;

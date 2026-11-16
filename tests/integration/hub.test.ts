@@ -17,6 +17,7 @@ import type { AppEvent, AppSession, AppSessionOptions } from "../support/app_ses
 import { board, direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { seed } from "../support/seed.ts";
 import { queueFor } from "../../src/server/store/queue.ts";
 
 const A = "alice@example.com";
@@ -123,13 +124,13 @@ test("peer_list shows where the session runs; a reconnect on its key keeps the s
 
   const key = "c1".repeat(32);
   const first = await srv.connected(alice, "be", { key });
-  srv.app.application.hostedPlace(first.id, "api worktree stream \n on stream");
+  await seed(srv.app.repo, () => srv.app.application.hostedPlace(first.id, "api worktree stream \n on stream"));
   await first.call("peer_status", { text: "soaking" });
   expect(await be()).toMatchObject({ where: "api worktree stream on stream", status: "soaking" });
 
   first.close();
   const resumed = await srv.connected(alice, "be", { key });
-  srv.app.application.hostedPlace(resumed.id, "api worktree stream on main");
+  await seed(srv.app.repo, () => srv.app.application.hostedPlace(resumed.id, "api worktree stream on main"));
   expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
 
   await resumed.unbind("be");
@@ -198,7 +199,7 @@ test("revoking or disabling a user closes their open connections; a disable the 
   // Disabled behind the server's back (no admin route): the next tick closes it.
   await api(root, "POST", "/api/admin/enable-user", { email: B });
   const late = await srv.connected(await login(B), "be3");
-  srv.app.repo.users.setDisabled(srv.app.repo.users.findByEmail(B)!.id, true);
+  await seed(srv.app.repo, () => srv.app.repo.users.setDisabled(srv.app.repo.users.findByEmail(B)!.id, true));
   srv.app.revalidate();
   await late.next(closed);
   await a.call("board_list");
@@ -231,7 +232,7 @@ test("a bind's notices carry active claims and DMs undelivered after a day", asy
   await a.call("claim_take", { key: "ticket:ENG-2", note: "on it" });
   const old = await a.send(`${B}/fe`, "stale");
   await a.send(`${B}/fe`, "fresh");
-  srv.app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id);
+  await seed(srv.app.repo, () => srv.app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id));
   await a.unbind("be");
   a.close();
 
