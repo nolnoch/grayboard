@@ -11,7 +11,7 @@ test("hosted gates remain independent, mandatory and release-blocking", () => {
   const pkg = JSON.parse(read("package.json"));
   expect(pkg.scripts.test).toBe("bun test --timeout 30000 ./src ./tests");
   const hosted = read(".github/workflows/hosted.yml");
-  expect(hosted).toContain("suite: [hosted-strict, hosted-git, hosted-config, hosted-host, hosted-matrix, hosted-native, hosted-durable, claude-hosted]");
+  expect(hosted).toContain("suite: [hosted-strict, hosted-git, hosted-config, hosted-host, hosted-matrix, hosted-native, hosted-durable, claude-hosted, rust-sdk]");
   expect(hosted).toContain("timeout-minutes: 60");
   expect(hosted).toContain("bun install --frozen-lockfile");
   expect(hosted).not.toContain("GRAYBOARD_PUBLIC_REVISION");
@@ -43,8 +43,8 @@ test("the stable hosted aggregator runs even when matrix dependencies fail, canc
   expect(job.steps[0].env.SKIP).toBe("${{ inputs.skip }}");
   expect(workflow.jobs.hosted.strategy["fail-fast"]).toBe(false);
   expect(workflow.jobs.hosted["continue-on-error"]).toBeUndefined();
-  // #501: claude-hosted (the real Claude Code with the hosted plugin) is a required leg too.
-  expect(workflow.jobs.hosted.strategy.matrix.suite).toEqual(["hosted-strict", "hosted-git", "hosted-config", "hosted-host", "hosted-matrix", "hosted-native", "hosted-durable", "claude-hosted"]);
+  // #501: claude-hosted (the real Claude Code with the hosted plugin) is a required leg too; #929: so is rust-sdk.
+  expect(workflow.jobs.hosted.strategy.matrix.suite).toEqual(["hosted-strict", "hosted-git", "hosted-config", "hosted-host", "hosted-matrix", "hosted-native", "hosted-durable", "claude-hosted", "rust-sdk"]);
   const run = workflow.jobs.hosted.steps.find((s: any) => s.name === "Run ${{ matrix.suite }}");
   expect(run.run).toBe('bash scripts/e2e.sh "$SUITE"');
   expect(run.env).toEqual({ GRAYBOARD_E2E_RUN_DIR: "${{ runner.temp }}/hosted-run", SUITE: "${{ matrix.suite }}" });
