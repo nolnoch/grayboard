@@ -114,9 +114,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
-      return hosted.owning(p, context, row => {
+      return hosted.owning(p, context, (row, _defer, tx) => {
         if (!application.hostedHolds(row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
-        hosted.seeLost(p, row);
+        hosted.seeLost(tx, p, row);
         previous = bySession.get(row.session_id);
         if (previous && matches(previous, row)) { previous.context = openOptions.context ?? true; return previous; }
         // A lease this open replaces (another grant's) frees its slot here, not after the check; a
@@ -124,7 +124,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const replaced = previous ? 1 : 0;
         if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
         const expiresAt = now() + ttl;
-        store.update({ ...row, lease_deadline: expiresAt, last_seen_at: now() });
+        store.update(tx, { ...row, lease_deadline: expiresAt, last_seen_at: now() });
         hosted.audit(row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null, ...(openOptions.context === false ? { context: false } : {}) });
         return { row, expiresAt };
       }, result => {
@@ -156,11 +156,11 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
       return hosted.control(p, context, false, async row => {
-        const { lease } = await store.write(() => {
+        const { lease } = await store.write(tx => {
           const fresh = store.get(row.session_id);
           const lease = get(p, context, capability, fresh), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
-          store.update({ ...fresh, lease_deadline: deadline, last_seen_at: now() });
+          store.update(tx, { ...fresh, lease_deadline: deadline, last_seen_at: now() });
           return { lease, deadline };
         }, ({ lease, deadline }) => {
           lease.expiresAt = deadline;
@@ -226,9 +226,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
-        await store.write(() => {
+        await store.write(tx => {
           get(p, context, capability, store.get(row.session_id));
-          store.end(row.session_id, "closed", now());
+          store.end(tx, row.session_id, "closed", now());
         });
       }).catch(error => refused(p, context, error));
     },
@@ -242,10 +242,10 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       const capability = result.capability;
       await hosted.gate(lease.sessionId).bind(async () => {
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
-        await store.write(() => {
-          if (matches(lease, store.get(lease.sessionId))) store.end(lease.sessionId, "closed", now());
+        await store.write(tx => {
+          if (matches(lease, store.get(lease.sessionId))) store.end(tx, lease.sessionId, "closed", now());
+          hosted.settle(tx, lease.sessionId);
         }, () => {
-          hosted.settle(lease.sessionId);
           finish(lease);
         });
       });

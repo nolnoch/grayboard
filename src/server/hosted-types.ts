@@ -46,22 +46,22 @@ export interface HostedStore {
   // A user's live roots, oldest first (#475): peer_list's unbound sessions are those holding nothing.
   roots(user: number): HostedSession[];
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
-  park(session: string, now: number): void;
-  unpark(session: string, grant: string, now: number): void;
-  insert(row: HostedSession): void;
-  update(row: HostedSession): void;
+  park(tx: Tx, session: string, now: number): void;
+  unpark(tx: Tx, session: string, grant: string, now: number): void;
+  insert(tx: Tx, row: HostedSession): void;
+  update(tx: Tx, row: HostedSession): void;
   // Activity only: `last_seen_at`, observed by no one (#399).
-  touch(session: string, now: number): void;
+  touch(tx: Tx, session: string, now: number): void;
   // The sweep's candidates by query, not by scanning every row (#399): roots whose lease lapsed by `now`; idle
   // unparked rows (children, and roots with no lease and no hold) last seen before `cutoff`; disabled users' roots.
   expired(now: number): HostedSession[];
   idle(cutoff: number): HostedSession[];
   disabled(): HostedSession[];
   // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
-  start(session: string, user: number, client: string, now: number, suggested?: string | null): number;
-  end(session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
+  start(tx: Tx, session: string, user: number, client: string, now: number, suggested?: string | null): number;
+  end(tx: Tx, session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
   // A child's release, or a root's end (each of its children), ends the child's ID in the same transaction.
-  childEnd(session: string, now: number, reason: ChildEnd): void;
+  childEnd(tx: Tx, session: string, now: number, reason: ChildEnd): void;
   // The child IDs ended since the last take: the application's post-commit wakes and bounce deliveries.
   takeEnded(): EndedChild[];
   // A root's lost holds `reader` hasn't taken, oldest first (#453). `lose` records one in the revocation's
@@ -69,14 +69,14 @@ export interface HostedStore {
   // agent's; `reportLost` returns the Controller's, marking them reported; `seeLost` takes the reported ones (its
   // delivery_open: the Controller applied them before opening); `forgetLost` drops an alias the root bound again.
   // A hold both readers took is deleted.
-  lose(session: string, lost: HostedLost, now: number): void;
+  lose(tx: Tx, session: string, lost: HostedLost, now: number): void;
   lost(session: string, reader: LostReader): HostedLost[];
-  tellLost(session: string, now: number): HostedLost[];
-  reportLost(session: string, now: number): HostedLost[];
-  seeLost(session: string, now: number): HostedLost[];
-  forgetLost(session: string, alias: string): void;
+  tellLost(tx: Tx, session: string, now: number): HostedLost[];
+  reportLost(tx: Tx, session: string, now: number): HostedLost[];
+  seeLost(tx: Tx, session: string, now: number): HostedLost[];
+  forgetLost(tx: Tx, session: string, alias: string): void;
   // The server's last recorded liveness (epoch ms), absent before the first
   // heartbeat on this schema. A restart credits leases with the downtime (#423).
   aliveAt(): number | undefined;
-  heartbeat(now: number): void;
+  heartbeat(tx: Tx, now: number): void;
 }

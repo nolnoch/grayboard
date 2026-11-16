@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader } from "./hosted-types.ts";
+import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader, HostedLost } from "./hosted-types.ts";
 import { testPause } from "../shared/testpause.ts";
 import { queueFor } from "./store/queue.ts";
 import { mkdirSync } from "node:fs";
@@ -872,6 +872,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     return value;
   };
   const hosted = makeHostedStore(db);
+  const { writesOn: _writesOn, ...hostedStore } = hosted;
   const oauth = makeOAuthStore(hosted);
   // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
   // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
@@ -952,9 +953,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     authGeneration,
 
     oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
-    hosted: { ...hosted, insert: marks(hosted.insert, row => row.session_id), update: marks(hosted.update, row => row.session_id),
-      end: marks(hosted.end, session => session), childEnd: marks(hosted.childEnd, session => session),
-      park: marks(hosted.park, session => session), unpark: marks(hosted.unpark, session => session),
+    hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, row) => row.session_id),
+      end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
+      park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
       subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
     users: {
       upsertByEmail(tx, email, displayName) {
@@ -1030,7 +1031,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           if (disabled) {
             // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
             db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
-            endHostedWhere(hosted, "disabled", now, row => row.user_id === userId);
+            endHostedWhere(hosted, db, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
             db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
@@ -1063,7 +1064,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         db.transaction(() => {
           const now = clock();
           db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
-          endHostedWhere(hosted, "revoked", now, row => row.user_id === userId);
+          endHostedWhere(hosted, db, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         }).immediate();
@@ -1548,9 +1549,9 @@ function insertSession(db: Database, userId: number, tokenHash: string, label: s
 }
 
 // The OAuth store over its handle (#807 P1c-8): each method runs its statements on the connection its `Tx` or `Read`
-// names (sqliteOf refuses a settled Tx). The hosted sessions a revoked grant ends go through the hosted store,
-// which keeps the ambient writer until its slice (#998).
-function makeOAuthStore(hosted: HostedStore): OAuthStore {
+// names (sqliteOf refuses a settled Tx). The hosted sessions a revoked grant or disabled user ends go through the
+// hosted store bound to that same connection (P1c-11).
+function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
   const ops = new WeakMap<Database, OAuthOps>();
   const on = (h: Read): OAuthOps => {
     const db = sqliteOf(h);
@@ -1581,7 +1582,7 @@ function makeOAuthStore(hosted: HostedStore): OAuthStore {
 
 // The store's methods without their handle, bound to one connection.
 type OAuthOps = { [K in keyof OAuthStore]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => R : never };
-function oauthOps(db: Database, hosted: HostedStore): OAuthOps {
+function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   const createSession = (userId: number, tokenHash: string, label: string | null, now: number) => insertSession(db, userId, tokenHash, label, now);
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
@@ -1632,7 +1633,7 @@ function oauthOps(db: Database, hosted: HostedStore): OAuthOps {
   const revokeGrant = (id: string, now: number) => {
     testPause("hosted:revoke:in-txn");
     db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, id]);
-    endHostedWhere(hosted, "revoked", now, row => row.grant_id === id);
+    endHostedWhere(hosted, db, "revoked", now, row => row.grant_id === id);
   };
   type Token = { hash: string; grant_id: string; kind: string; expires_at: number; spent_at: number | null; revoked_at: number | null; created_at: number };
   const token = (h: string) => db.query<Token, [string]>("SELECT * FROM oauth_tokens WHERE hash = ?").get(h);
@@ -1908,39 +1909,24 @@ function mailPort(db: Database): MailPort {
   };
 }
 
-function makeHostedStore(db: Database): HostedStore {
-  const get = (id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
-  const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
-    const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
-      WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
-    insertAudit(db, now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null }));
+// The writes take the body's `Tx` (#807 P1c-11), resolved to its connection before any argument is read, so a
+// kept `Tx` is refused whatever the call; the reads stay on the store's connection until their slice.
+// `writesOn`: the writes bound to a connection a store already resolved from its caller's handle (the OAuth store's ops).
+type HostedStoreOf = HostedStore & { writesOn(c: Database): HostedWrites };
+function makeHostedStore(db: Database): HostedStoreOf {
+  // The child IDs ended since the last take, queued at commit by whichever connection ended them (#475 item 1).
+  const ended: { list: EndedChild[] } = { list: [] };
+  const ops = new WeakMap<Database, HostedWrites>();
+  const writesOn = (c: Database): HostedWrites => {
+    let o = ops.get(c);
+    if (!o) ops.set(c, o = hostedWrites(c, ended));
+    return o;
   };
-  // A released child's ID ends in the release's transaction, with its reason (#475 item 1): left unended,
-  // nothing owns it, and the next start would end it as a WSS leftover. The ends' wakes wait in `ended`,
-  // queued at commit, for the application to run (`takeEnded`).
-  const mail = mailPort(db);
-  const coreAudit = (now: number): AuditSink => (action, actor, target, detail) =>
-    insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
-  let ended: EndedChild[] = [];
-  const endChild = (child: string, why: string, now: number) => {
-    const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
-    // Queued at commit, so a rolled-back release wakes nobody and bounces nothing.
-    if (end.ended) afterCommit(db, () => { ended.push({ id: child, at: now, wake: end.wake }); });
-  };
-  // The hosted_alias_lost column each reader's take marks (#453).
-  const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
-  const lostOf = (session: string, where: string) => db.query<{ alias: string; reason: string; was_primary: number }, [string]>(
-    `SELECT alias, reason, was_primary FROM hosted_alias_lost WHERE session_id = ? AND ${where} ORDER BY at, rowid`,
-  ).all(session).map(r => ({ alias: r.alias, reason: r.reason, primary: r.was_primary === 1 }));
-  // Marks `where`'s rows' `column` and deletes the rows both readers took.
-  const takeLost = (session: string, where: string, column: string, now: number) => {
-    const lost = lostOf(session, where);
-    if (!lost.length) return lost;
-    db.run(`UPDATE hosted_alias_lost SET ${column} = ? WHERE session_id = ? AND ${where}`, [now, session]);
-    db.run("DELETE FROM hosted_alias_lost WHERE session_id = ? AND told_at IS NOT NULL AND seen_at IS NOT NULL", [session]);
-    return lost;
-  };
-  const store: HostedStore = {
+  const on = (tx: Tx): HostedWrites => writesOn(sqliteOf(tx));
+  const get = (id: string) => hostedRow(db, id);
+  const lostOf = hostedLostOf(db);
+  const store: HostedStoreOf = {
+    writesOn,
     atomic: fn => db.transaction(fn).immediate(),
     write: (fn, committed) => queued(db, fn, committed),
     writeNow: fn => queuedNow(db, fn),
@@ -1956,6 +1942,77 @@ function makeHostedStore(db: Database): HostedStore {
     children: (root) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
     roots: (user) => db.query<HostedSession, [number]>(
       "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
+    park: (tx, ...a) => on(tx).park(...a),
+    unpark: (tx, ...a) => on(tx).unpark(...a),
+    start: (tx, ...a) => on(tx).start(...a),
+    insert: (tx, ...a) => on(tx).insert(...a),
+    update: (tx, ...a) => on(tx).update(...a),
+    touch: (tx, ...a) => on(tx).touch(...a),
+    // The unary `+` keeps the planner off idx_hosted_root, which every root matches, so these two read
+    // idx_hosted_deadline and idx_hosted_user (#399).
+    expired: (now) => db.query<HostedSession, [number]>(
+      "SELECT * FROM hosted_sessions WHERE lease_deadline <= ? AND +root_session_id IS NULL").all(now),
+    idle: (cutoff) => db.query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
+      AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
+    disabled: () => db.query<HostedSession, []>(
+      "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
+    childEnd: (tx, ...a) => on(tx).childEnd(...a),
+    takeEnded() {
+      const taken = ended.list;
+      ended.list = [];
+      return taken;
+    },
+    end: (tx, ...a) => on(tx).end(...a),
+    lose: (tx, ...a) => on(tx).lose(...a),
+    lost: (session, reader) => lostOf(session, `${LOST_READ[reader]} IS NULL`),
+    tellLost: (tx, ...a) => on(tx).tellLost(...a),
+    reportLost: (tx, ...a) => on(tx).reportLost(...a),
+    seeLost: (tx, ...a) => on(tx).seeLost(...a),
+    forgetLost: (tx, ...a) => on(tx).forgetLost(...a),
+    aliveAt: () => db.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
+    heartbeat: (tx, ...a) => on(tx).heartbeat(...a),
+  };
+  return store;
+}
+
+const hostedRow = (db: Database, id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
+// The hosted_alias_lost column each reader's take marks (#453).
+const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
+const hostedLostOf = (db: Database) => (session: string, where: string): HostedLost[] => db.query<{ alias: string; reason: string; was_primary: number }, [string]>(
+  `SELECT alias, reason, was_primary FROM hosted_alias_lost WHERE session_id = ? AND ${where} ORDER BY at, rowid`,
+).all(session).map(r => ({ alias: r.alias, reason: r.reason, primary: r.was_primary === 1 }));
+
+type HostedWriteName = "park" | "unpark" | "start" | "insert" | "update" | "touch" | "childEnd" | "end" | "lose" | "tellLost" | "reportLost" | "seeLost" | "forgetLost" | "heartbeat";
+// The hosted store's writes without their handle, bound to one connection.
+type HostedWrites = { [K in HostedWriteName]: HostedStore[K] extends (tx: Tx, ...a: infer A) => infer R ? (...a: A) => R : never };
+function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites {
+  const get = (id: string) => hostedRow(db, id);
+  const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
+    const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
+      WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
+    insertAudit(db, now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null }));
+  };
+  // A released child's ID ends in the release's transaction, with its reason (#475 item 1): left unended,
+  // nothing owns it, and the next start would end it as a WSS leftover. The ends' wakes wait in `ended`,
+  // queued at commit, for the application to run (`takeEnded`).
+  const mail = mailPort(db);
+  const coreAudit = (now: number): AuditSink => (action, actor, target, detail) =>
+    insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
+  const endChild = (child: string, why: string, now: number) => {
+    const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
+    // Queued at commit, so a rolled-back release wakes nobody and bounces nothing.
+    if (end.ended) afterCommit(db, () => { ended.list.push({ id: child, at: now, wake: end.wake }); });
+  };
+  const lostOf = hostedLostOf(db);
+  // Marks `where`'s rows' `column` and deletes the rows both readers took.
+  const takeLost = (session: string, where: string, column: string, now: number) => {
+    const lost = lostOf(session, where);
+    if (!lost.length) return lost;
+    db.run(`UPDATE hosted_alias_lost SET ${column} = ? WHERE session_id = ? AND ${where}`, [now, session]);
+    db.run("DELETE FROM hosted_alias_lost WHERE session_id = ? AND told_at IS NOT NULL AND seen_at IS NOT NULL", [session]);
+    return lost;
+  };
+  return {
     park(session, now) {
       db.run("UPDATE hosted_sessions SET parked_at = ? WHERE session_id = ? AND root_session_id IS NOT NULL AND parked_at IS NULL", [now, session]);
     },
@@ -1979,25 +2036,12 @@ function makeHostedStore(db: Database): HostedStore {
     touch(session, now) {
       db.run("UPDATE hosted_sessions SET last_seen_at = ? WHERE session_id = ?", [now, session]);
     },
-    // The unary `+` keeps the planner off idx_hosted_root, which every root matches, so these two read
-    // idx_hosted_deadline and idx_hosted_user (#399).
-    expired: (now) => db.query<HostedSession, [number]>(
-      "SELECT * FROM hosted_sessions WHERE lease_deadline <= ? AND +root_session_id IS NULL").all(now),
-    idle: (cutoff) => db.query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
-      AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
-    disabled: () => db.query<HostedSession, []>(
-      "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
     childEnd(session, now, reason) {
       const row = get(session);
       if (!row?.root_session_id) return;
       db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
       audit(row.root_session_id, "hosted.child_released", { child: session, reason }, now);
       endChild(session, reason, now);
-    },
-    takeEnded() {
-      const taken = ended;
-      ended = [];
-      return taken;
     },
     end(session, reason, now, deadline) {
       const row = get(session);
@@ -2029,7 +2073,6 @@ function makeHostedStore(db: Database): HostedStore {
         ON CONFLICT(session_id, alias) DO UPDATE SET reason = excluded.reason, was_primary = excluded.was_primary, at = excluded.at, told_at = NULL, reported_at = NULL, seen_at = NULL`,
         [session, lost.alias, lost.reason, lost.primary ? 1 : 0, now]);
     },
-    lost: (session, reader) => lostOf(session, `${LOST_READ[reader]} IS NULL`),
     tellLost: (session, now) => takeLost(session, "told_at IS NULL", "told_at", now),
     reportLost(session, now) {
       db.run("UPDATE hosted_alias_lost SET reported_at = ? WHERE session_id = ? AND seen_at IS NULL AND reported_at IS NULL", [now, session]);
@@ -2039,16 +2082,17 @@ function makeHostedStore(db: Database): HostedStore {
     forgetLost(session, alias) {
       db.run("DELETE FROM hosted_alias_lost WHERE session_id = ? AND alias = ?", [session, alias]);
     },
-    aliveAt: () => db.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
     heartbeat(now) {
       db.run("INSERT INTO server_state(key, value) VALUES ('alive_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [now]);
     },
   };
-  return store;
 }
 
 // The repo's own hosted store, never a fresh one: a child's end queues its wakes in that store's `ended`,
 // which the application drains (#475 item 1).
-function endHostedWhere(hosted: HostedStore, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
-  for (const row of hosted.all()) if (!row.root_session_id && predicate(row)) hosted.end(row.session_id, reason, now);
+// `db`: the connection of the caller's transaction, already resolved from its handle. The candidates are read on the
+// store's own connection, as its reads are until their slice.
+function endHostedWhere(hosted: HostedStoreOf, db: Database, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
+  const w = hosted.writesOn(db);
+  for (const row of hosted.all()) if (!row.root_session_id && predicate(row)) w.end(row.session_id, reason, now);
 }

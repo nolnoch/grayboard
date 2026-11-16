@@ -127,7 +127,7 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
       let sent: Promise<unknown> | undefined;
       database.repo.hosted.atomic(() => {
         sent = application.send(tx, recipient.session, "launcher", "rolled back nested");
-        database.repo.hosted.end(context().id!, "closed", Date.now());
+        database.repo.hosted.end(tx, context().id!, "closed", Date.now());
       });
       await sent;
       expect(closed).not.toHaveBeenCalled();
@@ -141,13 +141,13 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
     // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
     await seed(database.repo, async tx => {
       let sent: Promise<unknown> | undefined;
-      database.repo.hosted.atomic(() => { sent = application.send(tx, recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(id, Date.now()); });
+      database.repo.hosted.atomic(() => { sent = application.send(tx, recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(tx, id, Date.now()); });
       await sent;
       expect(events).toEqual([]); expect(invalidations).toBe(0);
     });
     expect(events).toHaveLength(1); expect(invalidations).toBe(0);
     await seed(database.repo, tx => {
-      database.repo.hosted.atomic(() => database.repo.hosted.end(id, "closed", Date.now()));
+      database.repo.hosted.atomic(() => database.repo.hosted.end(tx, id, "closed", Date.now()));
       expect(invalidations).toBe(0);
     });
     expect(invalidations).toBe(1);
