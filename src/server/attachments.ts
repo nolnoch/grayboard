@@ -27,7 +27,8 @@ function readRequest(repo: Repo, r: Read, db: CoreDb, handle: string, idText: st
 
 // A requested read (the download route's and its recheck, the Slack bridge's): the row if readable, with a refusal recorded as both
 // its `attachment.download_refused` row and an `authz.decision` row (security audit F-01, #851). `detail` joins the
-// first. Outside any transaction, so neither row needs deferring.
+// first. `r` is the caller's handle: `repo.read` for the download's first read and the Slack bridge's, the recheck body's `Tx`
+// inside it. `writeAudit` joins an open transaction and queues otherwise, so neither row needs deferring.
 export function requestAttachment(repo: Repo, r: Read, db: CoreDb, handle: string, idText: string, principal: string | null, actor: Actor & { user: string }, detail: Record<string, unknown> = {}): { row: AttachmentRow } | { refused: string } {
   const { row, req } = readRequest(repo, r, db, handle, idText, principal, actor.user);
   const d = authorize(repo, {}, req);
