@@ -577,17 +577,17 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // retried at the next start, and its holds stay until then (#475 item 2).
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
-    repo.post(() => endIdsIn(ids, why), ends => afterEnds(ends.woken, ends.bounced), "session ends");
+    repo.post(tx => endIdsIn(tx, ids, why), ends => afterEnds(ends.woken, ends.bounced), "session ends");
   }
   type Ends = { woken: Set<string>; bounced: { id: string; at: number }[] };
-  // endIds's body, inside a write body.
-  function endIdsIn(ids: string[], why: string): Ends {
+  // endIds's body, inside a write body: `tx` is that body's.
+  function endIdsIn(tx: Tx, ids: string[], why: string): Ends {
     const woken = new Set<string>(), bounced: { id: string; at: number }[] = [];
     for (const id of ids) {
       let ended;
       const at = now();
       try {
-        ended = repo.atomic(() => endSession(db, repo.mail, id, { why, now: at, audit: serverAuditSink(repo) }));
+        ended = repo.atomic(() => endSession(db, repo.mailOn(tx), id, { why, now: at, audit: serverAuditSink(repo) }));
       } catch (e) {
         console.error(`[grayboard] ending session ${id} (${why}) failed:`, e);
         writeAudit(repo, "id.end_failed", null, id, { why, error: String(e) });
@@ -667,7 +667,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         writeAudit(repo, "alias.revoke_failed", by, u.address, { session: u.id, principal: u.principal, error: String(e) });
       }
     }
-    return { resync, ends: endIdsIn(ended, "revoked") };
+    return { resync, ends: endIdsIn(tx, ended, "revoked") };
   }
   function revokeUse(tx: Tx, u: AliasUse & { reason: string }, by: string | null, ended: string[], resync: string[]): void {
     const { reason } = u;
@@ -1131,7 +1131,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         : m.pending && mine.includes(m.sender) ? m.sender
         : null;
       if (!m || reader === null) fail("not_found", `no message ${id} to you or pending from you; dm_inbox lists them`);
-      repo.messages.ack(reader, m.id);
+      repo.messages.ack(tx, reader, m.id);
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
       valid(session);
@@ -1370,7 +1370,7 @@ function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSen
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
+    msg = repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1612,7 +1612,7 @@ function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(tx, m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  if (!repo.messages.retract(m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
+  if (!repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
   afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
   return {};
 }
@@ -1805,7 +1805,7 @@ function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], re
   for (const msgId of messageIds) {
     const msg = repo.messages.getById(msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
-    if (at !== null) repo.messages.markDelivered(msgId, at);
+    if (at !== null) repo.messages.markDelivered(tx, msgId, at);
     repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
   }
 }

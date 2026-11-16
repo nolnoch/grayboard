@@ -90,7 +90,7 @@ test("a receipt stamps delivered_at once; a cursor-only delivery shows delivered
   expect((await a.thread(sent.message_id))[0]!.delivered_at).toBe(stamp);
   expect((await b.inbox()).unanswered[0]).toMatchObject({ id: sent.message_id, delivered_at: stamp });
   // A repeated receipt keeps the first stamp.
-  await seed(store.repo, () => store.repo.messages.markDelivered(sent.message_id, stamp + 60_000));
+  await seed(store.repo, tx => store.repo.messages.markDelivered(tx, sent.message_id, stamp + 60_000));
   await b.ack([sent.message_id]);
   expect((await a.history())[0]!.delivered_at).toBe(stamp);
 
