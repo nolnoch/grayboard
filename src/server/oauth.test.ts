@@ -429,7 +429,9 @@ test("OAuth event trail records decisions, grant, strict replay warnings and rev
     expect((await post("/oauth/revoke", { client_id: "native", token: third.refresh_token })).status).toBe(200);
     const rows = storage.db.query<{ action: string; actor: string | null; detail: string }, []>("SELECT action,actor,detail FROM access_log WHERE action LIKE 'oauth.%'").all();
     const actions = rows.map(r => r.action);
-    for (const action of ["request_refused", "authorize", "google_authenticated", "consent_denied", "consent_approved", "grant_issued", "code_replay_revoked", "refreshed", "refresh_replay_revoked", "revoked", "revoke_requested"]) expect(actions).toContain("oauth." + action);
+    for (const action of ["request_refused", "authorize", "upstream_authenticated", "consent_denied", "consent_approved", "grant_issued", "code_replay_revoked", "refreshed", "refresh_replay_revoked", "revoked", "revoke_requested"]) expect(actions).toContain("oauth." + action);
+    // #928 D9: the upstream rows name their provider.
+    expect(rows.filter(r => r.action === "oauth.upstream_authenticated").map(r => [r.actor, JSON.parse(r.detail)])).toContainEqual(["you@example.com", { client_id: "native", provider: "google" }]);
     for (const row of rows.filter(r => /grant_issued|replay_revoked|refreshed|^oauth.revoked$/.test(r.action))) {
       expect(row.actor).toBe("you@example.com");
       expect(JSON.parse(row.detail).client_id).toBe("native");
@@ -471,7 +473,7 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
       '[grayboard] {"operation":"oauth.exchange","category":"failure","level":"error","class":"Error"}',
     ]);
     const trail = JSON.stringify(storage.db.query("SELECT * FROM access_log WHERE action LIKE 'oauth.%'").all());
-    expect(trail).toContain("oauth.google_failed");
+    expect(accessAudits(storage.db, "oauth.upstream_failed").map(r => r.detail)).toEqual([{ client_id: "native", provider: "google" }]);
     for (const secret of ["PRIVATE", "refresh-token.ts", "AUTHORIZATION-CODE"]) expect(trail + JSON.stringify(log.mock.calls)).not.toContain(secret);
   } finally { log.mockRestore(); }
 });
@@ -889,7 +891,7 @@ test("the default Google provider refuses an ID token whose nonce isn't the flow
     };
     tokenNonce = () => random();
     expect(await signIn()).toBe(REFUSED.provider);
-    expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.google_failed'").all()).toEqual([{ action: "oauth.google_failed" }]);
+    expect(accessAudits(storage.db, "oauth.upstream_failed").map(r => r.detail)).toEqual([{ client_id: "native", provider: "google" }]);
     tokenNonce = n => n;
     expect(await signIn()).toBe("consent");
   } finally { globalThis.fetch = originalFetch; }

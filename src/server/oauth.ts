@@ -421,14 +421,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       // From here the request is bound: a refusal goes back to the client (RFC 6749 §4.1.2.1), so `grayboard login` and
       // any other client can report it, with a fixed description per reason. The audit rows are as before.
       const refuse = (description?: string) => { flows.delete(r.requestHash); return returnToClient(r, f, description ? { error: "access_denied", error_description: errorDescription(description) } : { error: "access_denied" }); };
-      if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); return refuse(); }
+      if (p.has("error")) { writeAudit(repo, "oauth.upstream_denied", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(); }
       let identity: UpstreamIdentity;
       try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(callbackPath(provider)) }); }
       catch (e) {
         // The provider checked the email's domain (D1, D5); its refusal is audited as such.
         if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.domain); }
         // The log keeps the error's class, which names the failed stage for the OIDC provider (OidcDiscoveryError…).
-        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider);
+        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.upstream_failed", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider);
       }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider); }
@@ -443,7 +443,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (created.status !== "ok") fail("temporarily_unavailable", 503);
       const response = redirect(endpoint("/oauth/consent") + "?request=" + id);
       response.headers.append("Set-Cookie", cookie("session", session, OAUTH_TTL.browser / 1000));
-      writeAudit(repo, "oauth.google_authenticated", user.email, null, { client_id: r.clientId });
+      writeAudit(repo, "oauth.upstream_authenticated", user.email, null, { client_id: r.clientId, provider: provider.id });
       return response;
     }
     if (path === "/oauth/consent" && req.method === "GET") {
