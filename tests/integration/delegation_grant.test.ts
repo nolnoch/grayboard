@@ -8,7 +8,9 @@
 import { expect, test } from "bun:test";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
+import { seed } from "../support/seed.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 
 const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) =>
   new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 100, perSec: 100 }, ...o });
@@ -212,6 +214,43 @@ test("server: a granted delegation reads as delegated; a forged one and a revoke
     expect(r.inbox(real.message_id)).toMatchObject({ other_user: true });
     expect(r.inbox(real.message_id).delegated).toBeUndefined();
     expect(r.thread.delegated).toBeUndefined();
+  } finally {
+    await srv.stop();
+  }
+}, 30_000);
+
+// #879: delegate's two msg.send sites keep their deny's decision row past the
+// rolled-back write on a connected session, as delegate.to's does (#867): the
+// fresh call's prepareSend and the replay's recheck. A team alias reaches its
+// user's human only while that user is in the team (policy.ts human.team_alias);
+// the membership row is dropped directly, so the session keeps its hold.
+test("server: delegate's msg.send deny leaves a decision row on a fresh call and on a replay's recheck", async () => {
+  const { FakeSlack } = await import("./fake_slack.ts");
+  const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
+  const srv = serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
+  try {
+    await srv.app.slackReady;
+    const alice = await srv.login("alice@example.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    // Linked, so the human fallback is reachable: no launcher is live, so delegate picks alice's human.
+    const r = await srv.api(alice, "POST", "/api/slack/link");
+    slack.emails.set("U0ALICE", "alice@example.com");
+    slack.say(`link ${r.body.code}`);
+    await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Linked to `alice@example.com`")));
+    const sim = await srv.connected(alice, "eng/sim");
+    const replayed = { persona: "p", task: "replayed" };
+    expect((await sim.delegate(replayed)).to).toBe("alice@example.com/human");
+    const denied = [expect.objectContaining({ verb: "msg.send", allow: false, from: "eng/sim", to: "alice@example.com/human" })];
+
+    // A replay with nothing revoked answers the first call (#1030): the human has no session, yet it is alice's.
+    expect((await sim.delegate(replayed)).replayed).toBeDefined();
+    await seed(srv.app.repo, () => { srv.app.db.exec(`DELETE FROM team_members`); });
+    // A replay of the first call rechecks msg.send against the launcher it picked.
+    await refusal(sim.delegate(replayed));
+    expect(decisions(srv, "human.team_alias")).toEqual(denied);
+    // A fresh call's prepareSend decides it too.
+    await refusal(sim.delegate({ persona: "p", task: "fresh" }));
+    expect(decisions(srv, "human.team_alias")).toEqual([...denied, ...denied]);
   } finally {
     await srv.stop();
   }
