@@ -1,0 +1,490 @@
+[
+  {
+    "name": "bind",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "create": {
+          "type": "boolean"
+        },
+        "meta": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {}
+        },
+        "where": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_archive",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string"
+        },
+        "archived": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "board"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_create",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "broadcast",
+            "queue"
+          ]
+        },
+        "team": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "purpose"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_list",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_post",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "parent_id": {
+          "type": "number"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "resend": {
+          "type": "boolean"
+        },
+        "as": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "board",
+        "body"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_read",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "number"
+        },
+        "before_id": {
+          "type": "number"
+        },
+        "thread": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "board"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "board_subscribe",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "push",
+            "digest",
+            "quiet",
+            "off"
+          ]
+        },
+        "thread": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "board",
+        "mode"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "claim_list",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prefix": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "claim_release",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "claim_take",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "ttl_minutes": {
+          "type": "number"
+        },
+        "until": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "board": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "claim_watch",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "off": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "delegate",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "persona": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "context": {
+          "type": "string"
+        },
+        "resend": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "persona",
+        "task"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_ack",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "message_id"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_history",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "peer": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "number"
+        },
+        "before_id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_inbox",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 30
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_retract",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "message_id"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_send",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "parent_id": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pending": {
+          "type": "boolean"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "resend": {
+          "type": "boolean"
+        },
+        "as": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "to",
+        "body"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dm_thread",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "thread": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "thread"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "peer_list",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "board": {
+          "type": "string"
+        },
+        "include_offline": {
+          "type": "boolean"
+        },
+        "match": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "peer_status",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "queue": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "unbind",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 160
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "whoami",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false
+    }
+  }
+]
