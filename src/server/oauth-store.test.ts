@@ -287,7 +287,7 @@ describe("OAuth domain store", () => {
       const script = `import { openDatabase } from ${JSON.stringify(modulePath)};
         const {db,repo}=openDatabase(process.argv[1], {blobDir:process.argv[2]});
         while(Date.now()<Number(process.argv[3])) {}
-        const result=repo.oauth[process.argv[4]](JSON.parse(process.argv[5]), ${start + 1});
+        const result=await repo.write(() => repo.oauth[process.argv[4]](JSON.parse(process.argv[5]), ${start + 1}));
         console.log(JSON.stringify(result)); db.close();`;
       return await Promise.all(inputs.map(async value => {
         const child = Bun.spawn([process.execPath, "-e", script, join(dir, "db.sqlite"), join(dir, "blobs"), String(due), action, JSON.stringify(value)], { stdout: "pipe", stderr: "pipe" });

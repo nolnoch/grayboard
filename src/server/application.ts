@@ -1472,13 +1472,10 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
   const open = (h: string) => repo.messages.openDelegations(h, since);
   // The limiter's streak rows and the policy denies' decision rows from this
   // call: written inside the dedup transaction they'd roll back with it, so
-  // they're written after it. A session with no afterRollback of its own (WSS)
-  // collects its refusal rows here for the call, so they reach the catch path
-  // below rather than being written into the transaction (#867).
+  // they're written after it. A refusal's decision rows go to the session's
+  // afterRollback, which every queued caller sets (hosted run, Slack inWrite).
   const rows: (() => void)[] = [];
   hub.delegateRows = rows;
-  const ownAfterRollback = session.afterRollback;
-  if (!ownAfterRollback) session.afterRollback = (w) => rows.push(w);
   // Whether this user may name `to`'s launcher (#256): its own user's, or
   // another's under a shared 'delegating' team (policy.ts delegate.to). The
   // target's user is the session behind the address now, so a team alias
@@ -1542,7 +1539,6 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     });
   } catch (e) {
     hub.delegateRows = undefined;
-    if (!ownAfterRollback) session.afterRollback = undefined;
     for (const row of rows) rowAfterRollback(session, row);
     // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
@@ -1557,7 +1553,6 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     throw e;
   }
   hub.delegateRows = undefined;
-  if (!ownAfterRollback) session.afterRollback = undefined;
   // Committed with the write: kept, and written again should hosted's outer transaction roll back.
   for (const row of rows) { row(); session.afterRollback?.(row); }
   if ("replay" in out) return out.replay;

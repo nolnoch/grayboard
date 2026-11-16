@@ -10,20 +10,35 @@ function flush(effect: CommitEffect): void {
   catch (error) { console.error("postcommit effect failed", error); }
 }
 
-export function afterCommit(db: Database, effect: CommitEffect): void {
-  const frame = effects.get(db)?.at(-1);
-  if (frame) frame.push(effect);
-  else {
-    // Raw BEGIN/COMMIT is not a supported effect-bearing transaction boundary.
-    if (db.inTransaction) throw new Error("postcommit effect requires db.transaction");
-    flush(effect);
-  }
+// A connection's writer (the server's write queue, #807 D4). Core stays off the server's queue: the server registers
+// it on its own connection; local mode registers none. `holds`: whether the calling task is the writer, so the open
+// transaction, if any, is its own (an async body's stays open across its awaits while other tasks run). `check`:
+// throws unless it is, before a top-level transaction or a write opens.
+export type Writer = { holds(): boolean; check(): void };
+const writers = new WeakMap<Database, Writer>();
+export function ownWriter(db: Database, writer: Writer): void { writers.set(db, writer); }
+
+// Whether the caller is inside the connection's open transaction: one is open and, on a connection with a writer,
+// the caller holds it. Another task, while the holder awaits, is outside it: it reads committed state on the reader
+// and its post-commit effects run now.
+function ownsTx(db: Database): boolean {
+  return db.inTransaction && (writers.get(db)?.holds() ?? true);
 }
 
-// A check a connection runs before it opens a top-level transaction (the server's write-queue guard, #807). Core
-// stays off the server's queue: the server registers the check on its own connection.
-const topLevelGuards = new WeakMap<Database, () => void>();
-export function guardTopLevel(db: Database, check: () => void): void { topLevelGuards.set(db, check); }
+export function afterCommit(db: Database, effect: CommitEffect): void {
+  if (!ownsTx(db)) { flush(effect); return; }
+  const frame = effects.get(db)?.at(-1);
+  // Raw BEGIN/COMMIT is not a supported effect-bearing transaction boundary.
+  if (!frame) throw new Error("postcommit effect requires db.transaction");
+  frame.push(effect);
+}
+
+// A top-level boundary's checks: the writer's, then that no transaction is open (one opened by raw BEGIN, or by a
+// task the writer check passed for: a holder's suspended body).
+function topLevel(db: Database): void {
+  writers.get(db)?.check();
+  if (db.inTransaction) throw new Error("transaction requires a tracked outer boundary");
+}
 
 function trackCommits(db: Database): void {
   const frames: CommitEffect[][] = [];
@@ -32,8 +47,7 @@ function trackCommits(db: Database): void {
   db.transaction = <A extends any[], T>(fn: (...args: A) => T) => {
     const native = transaction(fn);
     const wrap = (invoke: (...args: A) => T) => (...args: A): T => {
-      if (!frames.length && db.inTransaction) throw new Error("transaction requires a tracked outer boundary");
-      if (!frames.length) topLevelGuards.get(db)?.();
+      if (!(frames.length && ownsTx(db))) topLevel(db);
       const frame: CommitEffect[] = [];
       frames.push(frame);
       let value: T;
@@ -49,6 +63,38 @@ function trackCommits(db: Database): void {
     return Object.assign(wrap(native), {
       deferred: wrap(native.deferred), immediate: wrap(native.immediate), exclusive: wrap(native.exclusive),
     });
+  };
+}
+
+// A top-level IMMEDIATE transaction whose body awaits (#807 P1b-4e): db.transaction can't hold one open across an
+// await, so the boundary is explicit. Its post-commit effects collect as db.transaction's do (nested atomic bodies
+// are savepoints inside it) and run after commit() succeeds; rollback() drops them. Each settles it once.
+export type Boundary = { commit(): void; rollback(): void };
+export function openBoundary(db: Database): Boundary {
+  const frames = effects.get(db);
+  if (!frames) throw new Error("openBoundary: the connection doesn't track commits (openSqlite)");
+  topLevel(db);
+  db.run("BEGIN IMMEDIATE");
+  const frame: CommitEffect[] = [];
+  frames.push(frame);
+  let open = true;
+  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i, 1); };
+  return {
+    commit() {
+      if (!open) throw new Error("boundary already settled");
+      try { db.run("COMMIT"); } catch (error) {
+        pop();
+        if (db.inTransaction) db.run("ROLLBACK");
+        throw error;
+      }
+      pop();
+      for (const effect of frame) flush(effect);
+    },
+    rollback() {
+      if (!open) return;
+      pop();
+      if (db.inTransaction) db.run("ROLLBACK");
+    },
   };
 }
 
@@ -82,8 +128,11 @@ function cacheStatements(db: Database): void {
 // the writer: writes (an autocommit write is its own transaction there; a write the pattern misses reaches
 // the read-only reader and throws SQLITE_READONLY, never a silent misroute) and connection-local SQL:
 // `temp.` objects (the auth generation counter), pragmas (data_version is per connection) and transaction
-// control. P1b-4, once bodies await, refuses a write while another body's transaction is open here.
-const writerOnly = /\btemp\.|^\s*(PRAGMA|BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b|\b(INSERT|UPDATE|DELETE|REPLACE)\b/i;
+// control. A connection with a writer (ownWriter) refuses a write from any other task, and routes reads by whether the
+// caller is inside the open transaction, not whether one is open: another task, while an async body awaits, reads
+// committed state.
+const writes = /\b(INSERT|UPDATE|DELETE|REPLACE)\b/i, ddl = /^\s*(CREATE|DROP|ALTER)\b/i;
+const writerOnly = /\btemp\.|^\s*(PRAGMA|BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
 type Routed = Pick<ReturnType<Database["query"]>, "get" | "all" | "run" | "values">;
 export function routeReads(db: Database, reader: Database): void {
   // Looked up per call, not bound once: a spy on Database.prototype.query (tests count SQL) sees routed calls.
@@ -94,9 +143,16 @@ export function routeReads(db: Database, reader: Database): void {
   db.query = ((sql: string) => {
     let r = routers.get(sql);
     if (r) { routers.delete(sql); routers.set(sql, r); return r; }
-    if (writerOnly.test(sql)) r = onWriter(sql);
+    if (writes.test(sql) && !ddl.test(sql)) {
+      // A write runs only as the writer (D4): the check precedes each use, not the statement's making.
+      const w = onWriter(sql), check = () => writers.get(db)?.check();
+      r = {
+        get: (...a: never[]) => { check(); return w.get(...a); }, all: (...a: never[]) => { check(); return w.all(...a); },
+        run: (...a: never[]) => { check(); return w.run(...a); }, values: (...a: never[]) => { check(); return w.values(...a); },
+      } as Routed;
+    } else if (writerOnly.test(sql) || writes.test(sql)) r = onWriter(sql);
     else {
-      const pick = () => (db.inTransaction ? onWriter : onReader)(sql);
+      const pick = () => (ownsTx(db) ? onWriter : onReader)(sql);
       r = {
         get: (...a: never[]) => pick().get(...a), all: (...a: never[]) => pick().all(...a),
         run: (...a: never[]) => pick().run(...a), values: (...a: never[]) => pick().values(...a),
@@ -106,6 +162,13 @@ export function routeReads(db: Database, reader: Database): void {
     if (routers.size > STATEMENT_CACHE_SIZE) routers.delete(routers.keys().next().value!);
     return r;
   }) as Database["query"];
+  // db.run without bindings is exec and never reaches db.query: its writes are checked here. Schema SQL is exempt
+  // (startup's, and a test's DDL).
+  const run = db.run.bind(db);
+  db.run = ((sql: string, ...params: unknown[]) => {
+    if (writes.test(sql) && !ddl.test(sql)) writers.get(db)?.check();
+    return run(sql, ...(params as never[]));
+  }) as Database["run"];
   const close = db.close.bind(db);
   // Reader first: only the last connection to close checkpoints the WAL into the file, and a read-only one can't.
   db.close = ((throwOnError?: boolean) => { try { reader.close(); } finally { close(throwOnError); } }) as Database["close"];

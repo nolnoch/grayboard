@@ -39,10 +39,13 @@ export class WriteQueue {
   // committed callback, a timer or un-awaited promise it began).
   get mine(): boolean { return this.busy && holder.getStore() === this.current; }
 
-  // Throws when another task holds the queue: a transaction opened now would interleave with the holder's (D4).
-  // The server's connection runs it before every top-level transaction (guardTopLevel in core/sqlite.ts).
-  assertFree(): void {
-    if (this.busy && !this.mine) throw new Error("top-level transaction while another body holds the write queue: route it through write() (docs/future/postgres-server.md D4)");
+  // Throws unless the caller holds the queue (#807 P1b-4e): a write or top-level transaction from any other task
+  // would interleave with the holder's (D4), and one on an idle queue would let the next body's interleave with it.
+  // The server's connection runs it before every top-level transaction and every write (ownWriter in core/sqlite.ts).
+  assertMine(): void {
+    if (this.mine) return;
+    if (this.busy) throw new Error("top-level transaction while another body holds the write queue: route it through write() (docs/future/postgres-server.md D4)");
+    throw new Error("write outside the write queue: route it through write() (docs/future/postgres-server.md D4)");
   }
 
   // Runs one body. True when it returned a thenable (any callable `then`, not only a Promise): it holds the queue until
