@@ -212,7 +212,7 @@ export function resolveDelegation(
     const to = args.to.trim();
     const r = reach(to);
     if ("refused" in r) throw new CoreError(r.refused);
-    if (!everConnected(db, to)) throw new CoreError(`no agent "${to}" has ever connected; peer_list shows exact handles`);
+    if (!everConnected(db, to)) throw new CoreError(neverConnected(to));
     if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
     if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
@@ -231,6 +231,11 @@ export function resolveDelegation(
   const human = humanFallbackHandle(db, requester, principal, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };
   throw new CoreError("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human to fall back to; start one or pass to");
+}
+
+// An explicit `to` no agent has stood behind; the server says the same of a team's alias the caller may not see (#1014).
+export function neverConnected(to: string): string {
+  return `no agent "${to}" has ever connected; peer_list shows exact handles`;
 }
 
 function full(to: string, cap: number): string {
