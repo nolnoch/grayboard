@@ -290,6 +290,28 @@ test("a receipt that fails inside answers an internal error and keeps the sessio
   await fe.call("board_list");
 });
 
+// #843: a fault in whoami, dm_ack and bind answers one code, in structuredContent and in the text a client reads.
+test("#843: a whoami, dm_ack or bind fault answers internal_error in structuredContent and the text alike", async () => {
+  const be = await srv.hosted(A, "be");
+  const fe = await srv.hosted(A, "fe");
+  const unbound = await srv.hosted(A, null);
+  const sent = await be.call<SendResult>("dm_send", { to: "fe", body: "hi" });
+  const textOf = (r: Awaited<ReturnType<HostedSession["callRaw"]>>) => r.content?.[0]?.type === "text" ? r.content[0].text : "";
+  // An unbound session's whoami lists its candidates, which admission doesn't: their listing throwing faults whoami alone.
+  srv.app.application.hostedCandidates = () => { throw new Error("candidates fail"); };
+  const who = await unbound.callRaw("whoami", {});
+  expect([who.isError, who.structuredContent, textOf(who)]).toEqual([true, { code: "internal_error" }, "error: internal error"]);
+  // A hold's insert that aborts makes bind fail inside, after admission.
+  await seed(srv.app.repo, () => { srv.app.db.exec(`CREATE TRIGGER holds_fail BEFORE INSERT ON alias_holds BEGIN SELECT RAISE(ABORT, 'holds_fail'); END`); });
+  const bind = await unbound.callRaw("bind", { name: "sim", create: true });
+  expect([bind.isError, bind.structuredContent, JSON.parse(textOf(bind))]).toEqual([true, { code: "internal_error" }, { code: "internal_error", message: "internal error" }]);
+  // A message table gone from under the live server makes the ack's write fail. The first ID is missing, the
+  // second faults: the fault keeps its own code rather than becoming the missing ID's not_found.
+  await seed(srv.app.repo, () => { srv.app.db.exec(`ALTER TABLE dm_acks RENAME TO dm_acks_gone`); });
+  const ack = await fe.callRaw("dm_ack", { message_id: [99999, sent.message_id] });
+  expect([ack.isError, ack.structuredContent, textOf(ack)]).toEqual([true, { code: "internal_error" }, "error: internal error"]);
+});
+
 test("a bare DM recipient is only ever your own identity of that name (F-08)", async () => {
   const a = await srv.hosted(A, "be");
   const a2 = await srv.hosted(A, "be-stream");
