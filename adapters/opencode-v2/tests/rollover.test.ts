@@ -34,7 +34,7 @@ test("a real access-expiry stream close with OpenCode's refresh landing after it
   try {
     // The access token expires 3 s from now; OpenCode stamped its stored expiry
     // 300 ms later, when the token response arrived.
-    const issued = issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now() - OAUTH_TTL.access + 3_000, OPENCODE_CLIENT);
+    const issued = await issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now() - OAUTH_TTL.access + 3_000, OPENCODE_CLIENT);
     const f = fixture();
     f.rotate(issued.token, issued.tokens.accessExpiresAt + 300 - Date.now());
     let expiredPolls = 0, rotation: string | undefined;
