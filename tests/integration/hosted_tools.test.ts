@@ -21,6 +21,7 @@ import { accessAudits } from "../support/audit.ts";
 import { HostedToolError, type HostedSession } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { seed } from "../support/seed.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -130,9 +131,11 @@ test("peer_list shows a session's facts only inside a scope the caller may act i
   const facts = (address: string, model: string) =>
     srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = ?, effort = 'high', launcher = 1, status = 'on ENG-142', status_at = ?
       WHERE id = (SELECT id FROM alias_holds WHERE address = ?)`).run(model, Date.now(), address);
-  facts(`${A}/be`, "model-a");
-  facts(`${B}/fe`, "model-b");
-  facts("eng/deploy", "model-d");
+  await seed(srv.app.repo, () => {
+    facts(`${A}/be`, "model-a");
+    facts(`${B}/fe`, "model-b");
+    facts("eng/deploy", "model-d");
+  });
   const FACTS = ["where", "status", "status_age", "harness", "model", "effort", "launcher"];
   const row = (r: WhoResult, h: string) => r.peers.find((p) => p.handle === h)! as unknown as Record<string, unknown>;
   const shown = (r: WhoResult, h: string) => FACTS.filter((k) => row(r, h)[k] !== undefined);
@@ -170,9 +173,11 @@ test("peer_list(board) shows another user's ID subscription without its facts (F
   // A hosted session can't subscribe unbound; a row as its ID is what a
   // released alias's subscription leaves, so write it directly.
   const { id: bobId } = srv.app.db.query(`SELECT id FROM ids WHERE principal = ?`).get(B) as { id: string };
-  srv.app.db.prepare(`INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('eng', ?, 'push', 0, 0)`).run(bobId);
-  srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = 'model-b', effort = 'high', status = 'on ENG-142', status_at = ? WHERE id = ?`)
-    .run(Date.now(), bobId);
+  await seed(srv.app.repo, () => {
+    srv.app.db.prepare(`INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('eng', ?, 'push', 0, 0)`).run(bobId);
+    srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = 'model-b', effort = 'high', status = 'on ENG-142', status_at = ? WHERE id = ?`)
+      .run(Date.now(), bobId);
+  });
   const FACTS = ["where", "status", "harness", "model", "effort"];
   const shown = (r: WhoResult) => {
     const row = r.peers.find((p) => p.handle === bobId) as unknown as Record<string, unknown> | undefined;
@@ -280,7 +285,7 @@ test("a receipt that fails inside answers an internal error and keeps the sessio
   await be.call("dm_send", { to: "fe", body: "hi" });
   const item = await fe.next(direct());
   // A read-point table gone from under the live server makes the receipt's cursor write fail.
-  srv.app.db.exec(`ALTER TABLE mailbox_cursors RENAME TO mailbox_cursors_gone`);
+  await seed(srv.app.repo, () => { srv.app.db.exec(`ALTER TABLE mailbox_cursors RENAME TO mailbox_cursors_gone`); });
   await expect(fe.receipt([item.id])).rejects.toMatchObject({ code: "internal_error" });
   await fe.call("board_list");
 });
@@ -357,7 +362,7 @@ test("dm_retract withdraws a queued message; one the recipient is holding or has
   const a = await srv.hosted(A, "be");
   const fresh = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "fresh" });
   expect(fresh.note).toMatch(/^Recipient offline/);
-  srv.app.db.prepare("UPDATE aliases SET last_seen = ? WHERE address = ?").run(Date.now() - 22 * 3_600_000, `${B}/fe`);
+  await seed(srv.app.repo, () => srv.app.db.prepare("UPDATE aliases SET last_seen = ? WHERE address = ?").run(Date.now() - 22 * 3_600_000, `${B}/fe`));
   const wrong = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "wrong" });
   expect(wrong.note).toMatch(/^Queued: bob@example.com\/fe last seen 22h ago\. .*dm_retract/);
 
@@ -692,8 +697,8 @@ test("disable-user ends a hosted child and pushes its bounce to a live sender (#
   // Their clients drop first (no release), so the disable's 401s reach no client; the rows stay.
   await Promise.all([be.drop(), child.drop()]);
   expect(srv.app.repo.hosted.get(id)?.root_session_id).toBeTruthy();
-  srv.app.db.prepare(`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
-    VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, 0)`).run(`${B}/fe`, id, Date.now());
+  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
+    VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, 0)`).run(`${B}/fe`, id, Date.now()));
   expect((await api(admin, "POST", "/api/admin/disable-user", { email: A })).status).toBe(200);
   expect((await fe.next(direct())).message).toMatchObject({ sender: id, kind: "bounce" });
   expect(srv.app.repo.hosted.get(id)).toBeUndefined();

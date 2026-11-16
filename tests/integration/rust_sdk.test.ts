@@ -30,7 +30,7 @@ test.skipIf(!example)("the Rust roundtrip example works a queue item and a DM fr
   const rows = <T>(sql: string, ...args: (string | number)[]) => db.query(sql).all(...args) as T[];
   const peer = await srv.hosted(EMAIL, "ts-peer");
   await peer.call("board_create", { name: "work", purpose: "rust sdk queue", kind: "queue" });
-  const { token } = issueOAuth(srv.app.repo, srv.resource, EMAIL, ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  const { token } = await issueOAuth(srv.app.repo, srv.resource, EMAIL, ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
 
   const run = Bun.spawn([example!, "rust-w1", "work"], {
     env: { ...process.env, GRAYBOARD_URL: `${srv.issuer}/mcp`, GRAYBOARD_TOKEN: token, GRAYBOARD_SESSION: SESSION },

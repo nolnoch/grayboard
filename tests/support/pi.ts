@@ -18,6 +18,7 @@ import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { attachRoots } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { seed } from "./seed.ts";
 import { cleanEnv, localEnv } from "./env.ts";
 import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
@@ -1048,7 +1049,7 @@ export type Peer = { dir: string; reports: string[]; call(tool: string, args?: R
 export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> {
   const home = join(dir, "peer");
   mkdirSync(home, { recursive: true });
-  const { token } = issueOAuth(srv.app.repo, srv.resource, "bob@example.com", ["grayboard:delivery", "grayboard:tools"], Date.now(), "grayboard-omp");
+  const { token } = await issueOAuth(srv.app.repo, srv.resource, "bob@example.com", ["grayboard:delivery", "grayboard:tools"], Date.now(), "grayboard-omp");
   const reports: string[] = [];
   const proxy = new ToolProxy({
     wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-omp", version: "1.0.0" }, delivery: { mode: "poll", source: "grayboard" } },
@@ -1066,11 +1067,13 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
   // The peer is another user, and its DMs must wake alice's agent: they
   // share a collaborative team, the cross-user wake grant (#806).
   const repo = srv.app.repo;
-  const alice = repo.users.upsertByEmail("alice@example.com", null), bob = repo.users.findByEmail("bob@example.com")!;
-  const team = repo.teams.findByName("peers") ?? repo.teams.create("peers", alice.id);
-  repo.teams.addMember(team.id, alice.id, "owner");
-  repo.teams.addMember(team.id, bob.id);
-  repo.teams.setPolicy(team.id, "collaborative");
+  await seed(repo, () => {
+    const alice = repo.users.upsertByEmail("alice@example.com", null), bob = repo.users.findByEmail("bob@example.com")!;
+    const team = repo.teams.findByName("peers") ?? repo.teams.create("peers", alice.id);
+    repo.teams.addMember(team.id, alice.id, "owner");
+    repo.teams.addMember(team.id, bob.id);
+    repo.teams.setPolicy(team.id, "collaborative");
+  });
   return { dir: home, reports, call, close: () => proxy.close() };
 }
 

@@ -16,6 +16,7 @@ import type { AppSession, AppSessionOptions } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { seed } from "../support/seed.ts";
 
 let srv: TestServer;
 let alice: string;
@@ -59,9 +60,9 @@ const connect = (identity: string | null, { token, ...opts }: AppSessionOptions 
 // The session ends as a hosted ID's expiry ends it (core endSession): holds and
 // claims released, unread mail bounced. A close alone no longer ends one
 // (#282: no grace, no clean-exit frame), so tests that need an ended session end it.
-function endIt(s: AppSession): void {
+async function endIt(s: AppSession): Promise<void> {
   s.close();
-  srv.app.repo.atomic(() => endSession(srv.app.db, srv.app.repo.mail, s.id, { why: "exit", now: Date.now() }));
+  await seed(srv.app.repo, () => srv.app.repo.atomic(() => endSession(srv.app.db, srv.app.repo.mail, s.id, { why: "exit", now: Date.now() })));
 }
 // The server restarts on the same database, a new in-process TestServer.
 async function restarted(): Promise<void> {
@@ -129,7 +130,7 @@ test("#475 3: peer_list reads the user's unbound hosted roots from the durable s
   // A tools-only root writes as its writes_as: it isn't an unbound session. (The bound root, be, isn't either.)
   const row = srv.app.repo.hosted.get(id)!;
   const tools = "id:toolsonly0001";
-  srv.app.repo.hosted.insert({ ...row, session_id: tools, source_session_id: tools, ownership_id: srv.app.repo.hosted.start(tools, row.user_id, row.client_id, Date.now()), writes_as: `${A}/ci` });
+  await seed(srv.app.repo, () => srv.app.repo.hosted.insert({ ...row, session_id: tools, source_session_id: tools, ownership_id: srv.app.repo.hosted.start(tools, row.user_id, row.client_id, Date.now()), writes_as: `${A}/ci` }));
   expect(await unbound()).toEqual([id]);
   // Another user's unbound root is never listed.
   const bob = await srv.hosted("bob@example.com", null);
@@ -137,7 +138,7 @@ test("#475 3: peer_list reads the user's unbound hosted roots from the durable s
   await bob.close();
   expect(await unbound()).toEqual([id]);
   // Ended, its row is gone and so is its entry.
-  expect(srv.app.repo.hosted.end(id, "closed", Date.now())).toBe(true);
+  expect(await seed(srv.app.repo, () => srv.app.repo.hosted.end(id, "closed", Date.now()))).toBe(true);
   expect(await unbound()).toEqual([]);
 }, 20_000);
 
@@ -181,7 +182,7 @@ test("#284 S1, S2, S6: bind adds a hold; unbind releases one, its claims and mai
   const be = await connect("be");
   await s.call("claim_take", { key: "ticket:ENG-142", ttl_minutes: 60 });
   // fe2 exists (it was used once), with a DM queued before the bind.
-  endIt(await connect("fe2"));
+  await endIt(await connect("fe2"));
   await be.send("fe2", "queued for fe2");
 
   const result = await s.bind("fe2");
@@ -361,7 +362,7 @@ test("a tools-only session that ended comes back on a new ID still writing as it
   const s = await connect("be", { push: false });
   await s.send(`${A}/be`, "before");
   const old = rows<{ id: string }>(`SELECT id FROM ids WHERE writes_as = ?`, `${A}/be`)[0]!.id;
-  endIt(s);
+  await endIt(s);
   const back = await connect("be", { push: false });
   const now = back.id;
   expect(now).not.toBe(old);
@@ -410,7 +411,7 @@ test("11 (server): a rebind refused by the bind limit binds after the wait", asy
   srv = new TestServer({ helloLimit: { burst: 3, perSec: 1 } }, { now: () => clock });
   alice = await srv.login(A);
   const first = await connect("api");
-  endIt(first);
+  await endIt(first);
   // Only a bind spends a token now (the hello is gone, #282): api's, then two
   // more empty the bucket (3), so the rebind is refused.
   const restored = await connect(null);
@@ -436,7 +437,7 @@ test("#284 #367: a team alias's unsent upload doesn't pass to the next member wh
   const mine = await connect("eng/api");
   const up = await srv.uploadAs(alice, "eng/api", "plan.md", "# plan");
   expect(up.status).toBe(201);
-  endIt(mine);
+  await endIt(mine);
 
   const theirs = await connect("eng/api", { token: bob });
   const refused = `attachment ${up.body.id} isn't an unsent upload of yours`;
@@ -448,7 +449,7 @@ test("#284 #367: a team alias's unsent upload doesn't pass to the next member wh
   expect(rows(`SELECT message_id, post_id FROM attachments WHERE id = ?`, up.body.id)).toEqual([{ message_id: null, post_id: null }]);
 
   // #391: the uploader takes the alias back and still sends her own upload.
-  endIt(theirs);
+  await endIt(theirs);
   await connect("be");
   const again = await connect("eng/api");
   const sent = await again.send(`${A}/be`, "the plan", { attachment_ids: [up.body.id] });
@@ -490,13 +491,13 @@ test("#284: a key whose ID is another principal's session is refused with id_col
   expect(await mine.bind("web")).toMatchObject({ alias: `${A}/web` });
   expect(rows(`SELECT id FROM ids`)).toEqual([{ id: idAddress(key) }]);
   expect(rows(`SELECT address, id FROM alias_holds ORDER BY address`)).toEqual([{ address: `${A}/api`, id: idAddress(key) }, { address: `${A}/web`, id: idAddress(key) }]);
-  endIt(mine);
+  await endIt(mine);
   expect(rows(`SELECT 1 FROM alias_holds`)).toEqual([]);
 });
 
 // #284 decision 5: teams and service principals share one namespace.
 test("#284: creating a team refuses a name another principal holds", async () => {
-  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run());
   const r = await srv.api(alice, "POST", "/api/teams", { name: "ingest" });
   expect(r.status).toBe(409);
   expect(r.body.message).toContain(`"ingest" belongs to another team or service principal`);
@@ -683,7 +684,7 @@ test("#284 S10 (server): a restore takes back its names but one held by another"
   await s.unbind("api");
   const t = await connect(null);
   await t.bind("api");
-  endIt(s);
+  await endIt(s);
   // The restore re-binds its names: "api" is refused, naming its holder; "be" binds.
   const r = await connect("be");
   expect(r.session.holds).toEqual([`${A}/be`]);
@@ -790,7 +791,7 @@ test("#259: a stray refused a while its holder lives takes it after the end, kee
   await x.send(`${A}/a`, "from b");
   await p.next(direct((m) => m.body === "from b" && m.sender === `${A}/b`));
 
-  endIt(p);
+  await endIt(p);
   const peer = await connect("fe", { token: bob });
   expect(await peer.send(`${A}/a`, "for a")).toMatchObject({ delivered_now: false });
 
@@ -830,7 +831,7 @@ test("#284 S1 (server): with the server's clock frozen, the first alias bound st
   expect(order()).toEqual([`${A}/zed`, `${A}/alpha`, `${A}/mid`]);
   expect(s.session.holds[0]).toBe(`${A}/zed`);
   // A restore (the old session ended, the record re-binds in order) keeps it.
-  endIt(s);
+  await endIt(s);
   const r = await connect("zed");
   await r.bind("alpha");
   await r.bind("mid");
@@ -847,7 +848,7 @@ test("#366: a board call without as acts as a subscribed address first, one with
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const prev = await connect("eng/x");
   await prev.call("board_subscribe", { board: "eng", mode: "digest" });
-  endIt(prev);
+  await endIt(prev);
   const s = await connect("a");
   // alice made the team, so a is subscribed to its board: unsubscribe it, as in the issue.
   await s.call("board_subscribe", { board: "eng", mode: "off" });

@@ -222,10 +222,10 @@ async function main() {
     const issuedAt = Date.now() + Math.max(0, runMs - OAUTH_TTL.access);
     const { db, repo } = openDatabase(dbPath, { blobDir: join(scratch, "blobs") });
     const resource = "http://localhost/mcp";
-    const users = Array.from({ length: o.users }, (_, u) => {
+    const users = await Promise.all(Array.from({ length: o.users }, async (_, u) => {
       const email = `load${u}@example.com`;
-      return { email, token: issueOAuth(repo, resource, email, HOSTED_SCOPES, issuedAt, HOSTED_CLIENT).token };
-    });
+      return { email, token: (await issueOAuth(repo, resource, email, HOSTED_SCOPES, issuedAt, HOSTED_CLIENT)).token };
+    }));
     db.close();
 
     const scrape = async () => parseMetrics(await (await fetch(metricsUrl!)).text());

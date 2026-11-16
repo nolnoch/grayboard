@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { pruneMessages, pruneAudit, reclaimFreePages, runRetention } from "./retention.ts";
-import { openDatabase, type Repo } from "./db.ts";
+import { openDatabase, queuedTx, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { storeAttachment } from "../core/attachments.ts";
 import { createBoard, post, snapshot } from "../core/boards.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 let blobDir: string;
 beforeEach(() => {
@@ -24,30 +25,32 @@ describe("retention pruning", () => {
     ({ repo } = open());
   });
 
-  test("pruneMessages deletes messages older than cutoff", () => {
+  test("pruneMessages deletes messages older than cutoff", async () => {
     // Insert a message with a far-past timestamp by manipulating via direct insert
     // We use a trick: insert, then advance time via the prune cutoff
-    const m = repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
+    const m = await seed(repo, () => repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null));
     // Prune everything up to and including now — should remove the message
-    pruneMessages(repo, Date.now() + 1);
+    await seed(repo, () => pruneMessages(repo, Date.now() + 1));
     const gone = repo.messages.getById(m.id);
     expect(gone).toBeUndefined();
   });
 
-  test("pruneMessages keeps messages newer than cutoff", () => {
-    const m = repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null);
+  test("pruneMessages keeps messages newer than cutoff", async () => {
+    const m = await seed(repo, () => repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null));
     // Prune only things older than 1 hour ago — should keep the fresh message
-    pruneMessages(repo, Date.now() - 3_600_000);
+    await seed(repo, () => pruneMessages(repo, Date.now() - 3_600_000));
     const still = repo.messages.getById(m.id);
     expect(still).not.toBeUndefined();
   });
 
-  test("pruneMessages keeps replies whose parent aged out", () => {
+  test("pruneMessages keeps replies whose parent aged out", async () => {
     const { db, repo: r } = open();
-    const root = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
-    db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [root.id]);
-    const reply = r.messages.insert("b@example.com/be", "user", "a@example.com/fe", "reply", root.id);
-    expect(() => pruneMessages(r, 1)).not.toThrow(); // used to fail the parent_id foreign key
+    const { root, reply } = await seed(r, () => {
+      const root = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
+      db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [root.id]);
+      return { root, reply: r.messages.insert("b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
+    });
+    await expect(seed(r, () => pruneMessages(r, 1))).resolves.toBeUndefined(); // used to fail the parent_id foreign key
     expect(r.messages.getById(root.id)).toBeUndefined();
     expect(r.messages.getById(reply.id)?.parent_id).toBeNull();
   });
@@ -57,11 +60,16 @@ describe("retention pruning", () => {
     const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
     const file = { filename: "a.txt", type: "text/plain", data: new TextEncoder().encode("same bytes") };
     const quota = { principal: "a@example.com", unsent: 1_000_000, stored: 1_000_000 };
-    const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file, { quota })).id;
+    const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file, { quota, tx: queuedTx(r) })).id;
     const from = { addresses: ["a@example.com/fe"], principal: "a@example.com" };
-    const old = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, { ids: [await up("a@example.com/fe")], uploader: from }, null);
-    const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [await up("a@example.com/fe")], uploader: from }, null);
-    db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
+    const oldFile = await up("a@example.com/fe");
+    const old = await seed(r, () => r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, { ids: [oldFile], uploader: from }, null));
+    const keptFile = await up("a@example.com/fe");
+    const kept = await seed(r, () => {
+      const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [keptFile], uploader: from }, null);
+      db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
+      return kept;
+    });
     await runRetention(r, db, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);
     expect(r.messages.thread(kept.id)[0].attachments).toHaveLength(1);
@@ -76,11 +84,13 @@ describe("retention pruning", () => {
     const { db, repo: r } = open();
     const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
     // A board reads as missing to an address no principal owns (#284).
-    r.users.upsertByEmail("a@example.com", null);
-    r.aliases.create({ scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
-    createBoard(db, "a@example.com/be", "e2e", "test");
-    post(db, "a@example.com/be", "e2e", "old");
-    db.run("UPDATE posts SET created_at = 0");
+    await seed(r, () => {
+      r.users.upsertByEmail("a@example.com", null);
+      r.aliases.create({ scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
+      createBoard(db, "a@example.com/be", "e2e", "test");
+      post(db, "a@example.com/be", "e2e", "old");
+      db.run("UPDATE posts SET created_at = 0");
+    });
     const seen: string[][] = [], snapshots: unknown[] = [];
     const callback = (boards: string[]) => {
       seen.push(boards);
@@ -91,51 +101,57 @@ describe("retention pruning", () => {
     await runRetention(r, db, config, Date.now(), callback);
     await runRetention(r, db, config, Date.now(), callback);
     expect(seen).toEqual([["e2e"]]);
-    post(db, "a@example.com/be", "e2e", "old again");
-    db.run("UPDATE posts SET created_at = 0");
+    await seed(r, () => {
+      post(db, "a@example.com/be", "e2e", "old again");
+      db.run("UPDATE posts SET created_at = 0");
+    });
     await runRetention(r, db, config, Date.now(), callback);
     expect(seen).toEqual([["e2e"], ["e2e"]]);
     expect(snapshots).toEqual([[], []]);
   });
 
-  test("pruneAudit does not throw", () => {
-    repo.audit.write({ at: Date.now() - 1000, actor: "system", action: "auth.login", target: null, detail: null });
-    expect(() => pruneAudit(repo, Date.now())).not.toThrow();
+  test("pruneAudit does not throw", async () => {
+    await seed(repo, () => repo.audit.write({ at: Date.now() - 1000, actor: "system", action: "auth.login", target: null, detail: null }));
+    await expect(seed(repo, () => pruneAudit(repo, Date.now()))).resolves.toBeUndefined();
   });
 });
 
 // #137: the nightly run returns freed pages to the filesystem, bounded per run.
 describe("reclaiming free pages", () => {
-  // A file database with `rows` 4 KB rows written and then deleted: that many free pages, or more.
-  const freed = (db: import("bun:sqlite").Database, rows: number) => {
-    db.run("CREATE TABLE IF NOT EXISTS filler (x BLOB)");
-    db.transaction(() => { for (let i = 0; i < rows; i++) db.run("INSERT INTO filler VALUES (randomblob(4000))"); })();
-    db.run("DELETE FROM filler");
+  // A file database with `rows` 4 KB rows written and then deleted: that many free pages, or more. Through db's write
+  // queue, as two transactions (the fill, then the delete).
+  const freed = async (db: import("bun:sqlite").Database, rows: number) => {
+    await seed(db, () => {
+      db.run("CREATE TABLE IF NOT EXISTS filler (x BLOB)");
+      for (let i = 0; i < rows; i++) db.run("INSERT INTO filler VALUES (randomblob(4000))");
+    });
+    await seed(db, () => { db.run("DELETE FROM filler"); });
   };
   const freeCount = (db: import("bun:sqlite").Database) => db.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count;
-  const quiet = <T>(f: () => T): { value: T; lines: string[] } => {
+  const quiet = async <T>(f: () => Promise<T>): Promise<{ value: T; lines: string[] }> => {
     const lines: string[] = [];
     const real = console.error;
     console.error = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
-    try { return { value: f(), lines }; } finally { console.error = real; }
+    try { return { value: await f(), lines }; } finally { console.error = real; }
   };
 
-  test("reclaimFreePages returns at most maxPages, and refuses a non-positive count", () => {
+  test("reclaimFreePages returns at most maxPages, and refuses a non-positive count", async () => {
     const { db, repo } = openDatabase(join(blobDir, "bus.db"), { blobDir: join(blobDir, "blobs") });
-    freed(db, 300);
+    await freed(db, 300);
     const before = freeCount(db);
     expect(before).toBeGreaterThanOrEqual(300);
-    expect(repo.storage.reclaimFreePages(100)).toEqual({ reclaimed: 100, remaining: before - 100, incremental: true });
+    // As the queue's holder, as retention runs it.
+    expect(await seed(repo, () => repo.storage.reclaimFreePages(100))).toEqual({ reclaimed: 100, remaining: before - 100, incremental: true });
     expect(freeCount(db)).toBe(before - 100);
     // incremental_vacuum(0) means every page: never passed through.
-    expect(() => repo.storage.reclaimFreePages(0)).toThrow(RangeError);
+    await expect(seed(repo, () => repo.storage.reclaimFreePages(0))).rejects.toThrow(RangeError);
     expect(freeCount(db)).toBe(before - 100);
     db.close();
   });
 
   test("runRetention reclaims the free pages and says how many", async () => {
     const { db, repo } = openDatabase(join(blobDir, "bus.db"), { blobDir: join(blobDir, "blobs") });
-    freed(db, 300);
+    await freed(db, 300);
     const before = freeCount(db);
     const lines: string[] = [];
     const real = console.error;
@@ -146,17 +162,17 @@ describe("reclaiming free pages", () => {
     db.close();
   });
 
-  test("a database from before #170 (auto_vacuum=NONE) reclaims nothing and says how to convert it", () => {
+  test("a database from before #170 (auto_vacuum=NONE) reclaims nothing and says how to convert it", async () => {
     const path = join(blobDir, "old.db");
     const old = new Database(path);
     old.exec("PRAGMA journal_mode = WAL;");
-    freed(old, 500);
+    await freed(old, 500);
     old.close();
     // Opening adds the schema, which reuses some of those pages.
     const { db, repo } = openDatabase(path, { blobDir: join(blobDir, "blobs") });
     const before = freeCount(db);
     expect(before).toBeGreaterThan(0);
-    const { value, lines } = quiet(() => reclaimFreePages(repo));
+    const { value, lines } = await quiet(() => seed(repo, () => reclaimFreePages(repo)));
     expect(value).toBeUndefined();
     expect(freeCount(db)).toBe(before);
     expect(lines).toEqual([`[grayboard] retention: the database has ${before} free pages it can't reclaim (auto_vacuum is not INCREMENTAL); a one-time VACUUM converts it (docs/guide/server.md §Reclaiming disk space)`]);

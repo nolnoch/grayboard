@@ -22,6 +22,7 @@ import { createDelivery } from "./delivery.ts";
 import { claim, listClaims } from "../core/claims.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 let database: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -32,11 +33,11 @@ let now: number;
 let authorized: boolean;
 let blobDir: string;
 const context = (raw: string) => sessionContext(principal, { [OPENCODE_SESSION_META]: raw });
-beforeEach(() => {
+beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-hosted-"));
   database = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(database.repo, database.db);
-  const user = database.repo.users.upsertByEmail("you@example.com", null);
+  const user = await seed(database.repo, () => database.repo.users.upsertByEmail("you@example.com", null));
   principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
@@ -100,10 +101,10 @@ test("a commit invalidates only the rows it changed; a touch or an empty commit 
   const invalidations: (string | null)[] = [];
   const unlisten = hosted.listen(changed => { invalidations.push(changed); });
   try {
-    database.repo.hosted.atomic(() => {});
-    database.repo.hosted.atomic(() => database.repo.hosted.touch(target.id, now));
+    await seed(database.repo, () => database.repo.hosted.atomic(() => {}));
+    await seed(database.repo, () => database.repo.hosted.atomic(() => database.repo.hosted.touch(target.id, now)));
     expect(invalidations).toEqual([]);
-    database.repo.hosted.atomic(() => database.repo.hosted.end(target.id, "closed", now));
+    await seed(database.repo, () => database.repo.hosted.atomic(() => database.repo.hosted.end(target.id, "closed", now)));
     expect(invalidations).toEqual([target.id]);
     expect(application.holdsByOwner().size).toBe(3);
   } finally { unlisten(); }
@@ -116,7 +117,7 @@ test("startup opens no holder session for a root its first sweep ends (#424 item
   await delivery.open(principal, root);
   hosted.close();
   // The lease lapsed while the server was still up: no credit, and the startup sweep ends the root.
-  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, root.id]);
+  await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, root.id]));
   now += 5 * 60_000;
   const opened = spyOn(application, "hostedSession");
   try {
@@ -181,7 +182,7 @@ test("global quota applies across users transactionally without creating an over
   await hosted.whoami(principal, context("template"));
   const template = database.repo.hosted.all()[0]!;
   await hosted.end(principal, context("template"));
-  database.repo.hosted.atomic(() => {
+  await seed(database.repo, () => {
     for (let userIndex = 0; userIndex < hosted.limits.global / hosted.limits.user; userIndex++) {
       const user = database.repo.users.upsertByEmail(`user${userIndex}@example.com`, null);
       for (let i = 0; i < hosted.limits.user; i++) {
@@ -226,13 +227,13 @@ test("the authenticated client selects the source key and harness; nothing else 
     { clientId: "plain", name: "Plain", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none" },
   ] });
   try {
-    const authenticate = (clientId: string) => {
-      const issued = issueOAuth(database.repo, oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], now, clientId);
+    const authenticate = async (clientId: string) => {
+      const issued = await issueOAuth(database.repo, oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], now, clientId);
       const p = oauth.authenticate(new Request(oauth.resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
       if (p instanceof Response) throw new Error("fixture authorization failed");
       return p;
     };
-    const [broker, opencode, plain, cimd, ...builtins] = ["broker", OPENCODE_CLIENT, "plain", "https://client.example/client.json", ...BUILTIN_CLIENT_IDS].map(authenticate);
+    const [broker, opencode, plain, cimd, ...builtins] = await Promise.all(["broker", OPENCODE_CLIENT, "plain", "https://client.example/client.json", ...BUILTIN_CLIENT_IDS].map(authenticate));
     expect([broker!.sourceKey, opencode!.sourceKey, plain!.sourceKey, cimd!.sourceKey]).toEqual([GRAYBOARD_SESSION_META, OPENCODE_SESSION_META, null, null]);
     expect(builtins.map(p => [p.clientId, p.sourceKey])).toEqual(BUILTIN_CLIENT_IDS.map(id => [id, GRAYBOARD_SESSION_META]));
     const both = { [GRAYBOARD_SESSION_META]: "generic", [OPENCODE_SESSION_META]: "opencode" };
@@ -346,11 +347,13 @@ test("a second bind adds a hold, keeps ownership, children and the first hold's 
   await hosted.register(principal, context("root"), "child");
   const before = await hosted.whoami(principal, context("root"));
   const lease = await delivery.open(principal, context("root"));
-  claim(database.db, "you@example.com/fe", "ticket:ENG-142");
+  await seed(database.repo, () => claim(database.db, "you@example.com/fe", "ticket:ENG-142"));
   const root = context("root");
   if (!("id" in root)) throw new Error("fixture has no mapped source");
-  database.db.prepare("UPDATE ids SET status = ?, status_at = ? WHERE id = ?").run("reviewing", now, root.id);
-  database.db.prepare("UPDATE aliases SET queue_off = 1 WHERE address = ?").run("you@example.com/fe");
+  await seed(database.repo, () => {
+    database.db.prepare("UPDATE ids SET status = ?, status_at = ? WHERE id = ?").run("reviewing", now, root.id);
+    database.db.prepare("UPDATE aliases SET queue_off = 1 WHERE address = ?").run("you@example.com/fe");
+  });
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   expect(database.db.prepare("SELECT status, status_at FROM ids WHERE id = ?").get(root.id)).toEqual({ status: "reviewing", status_at: now });
   expect(database.db.prepare("SELECT queue_off FROM aliases WHERE address = ?").get("you@example.com/fe")).toEqual({ queue_off: 1 });
@@ -448,7 +451,7 @@ test("registration rejects invalid ownership graphs without moving an existing c
   if (!("id" in rootContext)) throw new Error("fixture context missing");
   await expect(hosted.end(principal, context("child"), rootContext.id)).rejects.toHaveProperty("code", "child_session");
   expect(await hosted.whoami(principal, context("child"))).toMatchObject({ primary: "you@example.com/fe", child: true });
-  const foreign = database.repo.users.upsertByEmail("peer@example.com", null);
+  const foreign = await seed(database.repo, () => database.repo.users.upsertByEmail("peer@example.com", null));
   const outsider = { ...principal, authed: { user_id: foreign.id, user_email: foreign.email, session_id: 0 } };
   const outsiderContext = sessionContext(outsider, { [OPENCODE_SESSION_META]: "root" });
   expect(await hosted.whoami(outsider, outsiderContext)).toHaveProperty("unbound", true);
@@ -508,7 +511,7 @@ async function paused<T>(point: string, start: () => Promise<T>, overlap: () => 
 test("pending holds the reader gate while rebind waits; stale receipt cannot move the old cursor", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   const lease = await delivery.open(principal, context("root"));
-  const sender = new AppSession(application, principal.authed, "sender", { push: false });
+  const sender = new AppSession(application, database.repo, principal.authed, "sender", { push: false });
   await sender.connect();
   await sender.send("you@example.com/fe", "old mailbox");
   let binding!: ReturnType<typeof hosted.bind>, finished = false;
@@ -536,7 +539,7 @@ test("tool reader gate excludes rebind and revoke during its pause prevents the 
 
 test("bind publishes its new hold before the after-commit pause and the first hold's mail still reaches the root", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
-  const sender = new AppSession(application, principal.authed, "sender", { push: false });
+  const sender = new AppSession(application, database.repo, principal.authed, "sender", { push: false });
   await sender.connect();
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     await sender.send("you@example.com/fe", "not for be");
@@ -598,7 +601,7 @@ test("ending a hosted root releases every hold in one transaction and audits eac
 test("a generic-key poll root's writes_as is recorded, makes it tools-only, and a different later declaration is refused (#451)", async () => {
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = (as: string) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: as });
-  await application.hostedWritesAs(generic.authed, "id:probe", "fe", true);
+  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "fe", true));
   const first = await hosted.whoami(generic, meta("fe"));
   expect(first).toMatchObject({ held: [], writes_as: "you@example.com/fe" });
   expect(database.repo.hosted.all().map(r => r.writes_as)).toEqual(["you@example.com/fe"]);
@@ -660,13 +663,16 @@ test("ending a tools-only hosted root frees its alias for other users and restor
 });
 
 test("revoking one hosted hold releases only it, bumps the generation and closes the lease; the next whoami shows what is left (#451)", async () => {
-  const team = database.repo.teams.create("ops", principal.authed.user_id);
-  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const team = await seed(database.repo, () => {
+    const t = database.repo.teams.create("ops", principal.authed.user_id);
+    database.repo.teams.addMember(t.id, principal.authed.user_id);
+    return t;
+  });
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
   const lease = await delivery.open(principal, context("root"));
   const before = database.repo.hosted.get((context("root") as { id: string }).id)!;
-  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
   const after = database.repo.hosted.get(before.session_id)!;
   expect(after.bind_gen).toBeGreaterThan(before.bind_gen);
@@ -678,12 +684,15 @@ test("revoking one hosted hold releases only it, bumps the generation and closes
 });
 
 test("an alias revoke issued while another body holds the write queue waits behind it, then revokes and closes the lease (#807 P1b-4b)", async () => {
-  const team = database.repo.teams.create("ops", principal.authed.user_id);
-  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const team = await seed(database.repo, () => {
+    const t = database.repo.teams.create("ops", principal.authed.user_id);
+    database.repo.teams.addMember(t.id, principal.authed.user_id);
+    return t;
+  });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
   await delivery.open(principal, context("root"));
   const before = database.repo.hosted.get((context("root") as { id: string }).id)!;
-  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
   let release!: () => void;
   const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
@@ -698,13 +707,16 @@ test("an alias revoke issued while another body holds the write queue waits behi
 });
 
 test("one alias revoke that throws rolls back alone, audited alias.revoke_failed; the recheck's other revokes land (#807 P1b-4b)", async () => {
-  const team = database.repo.teams.create("ops", principal.authed.user_id);
-  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const team = await seed(database.repo, () => {
+    const t = database.repo.teams.create("ops", principal.authed.user_id);
+    database.repo.teams.addMember(t.id, principal.authed.user_id);
+    return t;
+  });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
   await hosted.bind(principal, context("other"), { name: "ops/dev", create: true });
   const ids = ["root", "other"].map(r => (context(r) as { id: string }).id);
   const before = ids.map(id => database.repo.hosted.get(id)!.bind_gen);
-  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
   const lose = database.repo.hosted.lose.bind(database.repo.hosted);
   let calls = 0;
   const spy = spyOn(database.repo.hosted, "lose").mockImplementation((...args) => { if (calls++ === 0) throw new Error("bad row"); return lose(...args); });
@@ -722,16 +734,19 @@ test("one alias revoke that throws rolls back alone, audited alias.revoke_failed
 });
 
 test("a revoked tools-only hosted root's ownership ends, audited once: a later recheck finds nothing to revoke again (#454)", async () => {
-  const team = database.repo.teams.create("ops", principal.authed.user_id);
-  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const team = await seed(database.repo, () => {
+    const t = database.repo.teams.create("ops", principal.authed.user_id);
+    database.repo.teams.addMember(t.id, principal.authed.user_id);
+    return t;
+  });
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
   const meta = sessionContext(generic, { [GRAYBOARD_SESSION_META]: "poll-root", [GRAYBOARD_WRITES_AS_META]: "ops/lead" });
   const id = (meta as { id: string }).id;
-  await application.hostedWritesAs(generic.authed, "id:probe", "ops/lead", true);
+  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "ops/lead", true));
   expect(await hosted.whoami(generic, meta)).toMatchObject({ held: [], writes_as: "ops/lead" });
   const before = database.repo.hosted.get(id)!;
   const audits = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked'").all().map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
-  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
   const revoked = [{ actor: "admin@example.com", target: "ops/lead", detail: { session: id, principal: "you@example.com", writes_as: true, reason: expect.any(String) } }];
   expect(audits()).toEqual(revoked);
@@ -769,15 +784,18 @@ test("a hosted root holding two names sends as either with as:, its ID too, and 
 });
 
 test("a root whose last hold is revoked or unbound has no lease, so the sweep leaves it owning instead of expiring it (#451)", async () => {
-  const team = database.repo.teams.create("ops", principal.authed.user_id);
-  database.repo.teams.addMember(team.id, principal.authed.user_id);
+  const team = await seed(database.repo, () => {
+    const t = database.repo.teams.create("ops", principal.authed.user_id);
+    database.repo.teams.addMember(t.id, principal.authed.user_id);
+    return t;
+  });
   const id = (raw: string) => (context(raw) as { id: string }).id;
   await hosted.bind(principal, context("revoked"), { name: "ops/lead", create: true });
   await delivery.open(principal, context("revoked"));
   await hosted.bind(principal, context("unbound"), { name: "fe", create: true });
   await delivery.open(principal, context("unbound"));
   await hosted.unbind(principal, context("unbound"), { name: "fe" });
-  database.repo.teams.removeMember(team.id, principal.authed.user_id);
+  await seed(database.repo, () => database.repo.teams.removeMember(team.id, principal.authed.user_id));
   application.accessChanged(principal.authed.user_email, "admin@example.com");
   expect(delivery.activeLeaseCount).toBe(0);
   for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(id(raw))).toMatchObject({ lease_deadline: null });
@@ -1192,7 +1210,7 @@ const rowOf = (c: ReturnType<typeof context>) => { if (!("id" in c)) throw new E
 
 test("a child's call past the idle window neither parks it nor ends its unheld root; the window restarts at the call's end (#584)", async () => {
   const { generic, meta } = toolsOnly();
-  await application.hostedWritesAs(generic.authed, "id:probe", "fe", true);
+  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "fe", true));
   await hosted.whoami(generic, meta("root", "fe"));
   await hosted.register(generic, meta("root", "fe"), "kid");
   const during = await hosted.transfer(generic, meta("kid"), async () => {
@@ -1210,7 +1228,7 @@ test("a child's call past the idle window neither parks it nor ends its unheld r
 
 test("an unheld root's own call past the idle window doesn't end it (#584)", async () => {
   const { generic, meta } = toolsOnly();
-  await application.hostedWritesAs(generic.authed, "id:probe", "fe", true);
+  await seed(database.repo, () => application.hostedWritesAs(generic.authed, "id:probe", "fe", true));
   await hosted.whoami(generic, meta("root", "fe"));
   const alive = await hosted.transfer(generic, meta("root", "fe"), async () => { now += 900_001; hosted.sweep(); return rowOf(meta("root", "fe")) !== undefined; });
   expect(alive).toBe(true);
@@ -1232,9 +1250,9 @@ test("a call whose root's ownership ended and restarted before it returns keeps 
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   const before = rowOf(context("root"))!.ownership_id;
   const value = await hosted.control(principal, context("root"), false, async () => {
-    database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+    await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]));
     hosted.sweep();
-    database.db.run("UPDATE users SET disabled_at = NULL WHERE id = ?", [principal.authed.user_id]);
+    await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = NULL WHERE id = ?", [principal.authed.user_id]));
     now += 1000;
     await hosted.whoami(principal, context("root"));
     return "done";
@@ -1271,7 +1289,7 @@ test("a disabled user's root earns no restart credit", async () => {
   await delivery.open(principal, root);
   expect(database.repo.hosted.get(root.id)?.lease_deadline).not.toBeNull();
   hosted.close();
-  database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+  await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]));
   now += 5 * 60_000;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   expect(creditRows()).toEqual([]);
@@ -1333,7 +1351,7 @@ test("an ended ID that comes back as a root reopens its row, audited, and its al
   await hosted.end(principal, context("child"));
   // A row an earlier release ended at a restart (`wss_removed`) reopens the same way.
   const endedAt = now - 60_000;
-  database.db.run("UPDATE ids SET ended_at = ? WHERE id = ?", [endedAt, hostedId("child")]);
+  await seed(database.repo, () => database.db.run("UPDATE ids SET ended_at = ? WHERE id = ?", [endedAt, hostedId("child")]));
   now += 1000;
   await hosted.bind(principal, context("child"), { name: "fe", create: true });
   expect(idEnd(hostedId("child"))).toBeNull();
@@ -1435,9 +1453,9 @@ test("#881: a request reads its row once and skips its own user's disabled read;
     expect(rowReads()).toBe(3);
     expect(userReads()).toBe(0);
     // Positive case: settle with no authorized user (the sweep's and mcp authorize's) still reads, and ends.
-    database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]);
+    await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]));
     query.mockClear();
-    hosted.settle(root.id);
+    await seed(database.repo, () => hosted.settle(root.id));
     expect(userReads()).toBe(1);
     expect(database.repo.hosted.get(root.id)).toBeUndefined();
   } finally { query.mockRestore(); }
@@ -1452,7 +1470,7 @@ test("#881: a settle that ends a lapsed root stands when the same request is the
   delivery.close(); hosted.close();
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 1 } });
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
-  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, lapsed.id]);
+  await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, lapsed.id]));
   // settle ends the lapsed root; rowFor then starts a new row there, which the one-row cap refuses.
   await expect(hosted.whoami(principal, lapsed)).rejects.toHaveProperty("code", "bad_request");
   expect(database.repo.hosted.get(lapsed.id)).toBeUndefined();
@@ -1479,16 +1497,18 @@ test("#902: a bound native call reads its root's holds once, for the bound check
 const windows: [string, (m: { root: string; child: string; other: string; name: string }) => Promise<void> | void][] = [
   ["nothing", () => {}],
   // The child alone goes idle: the root stays live (touched, its lease renewed), so a miss here is the child's.
-  ["the child parked", ({ root, child }) => { now += 900_001; keepLive(root); hosted.sweep(); const row = database.repo.hosted.get(hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
-  ["the root's lease lapsed", ({ root }) => { database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, hostedId(root)]); }],
-  ["the root's generation moved", ({ root }) => database.repo.hosted.atomic(() => { const r = database.repo.hosted.get(hostedId(root))!; database.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); })],
+  ["the child parked", async ({ root, child }) => { now += 900_001; await keepLive(root); hosted.sweep(); const row = database.repo.hosted.get(hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
+  ["the root's lease lapsed", async ({ root }) => { await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, hostedId(root)])); }],
+  ["the root's generation moved", async ({ root }) => { await seed(database.repo, () => { const r = database.repo.hosted.get(hostedId(root))!; database.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); }); }],
   ["the root ended and started again", async ({ root }) => { await hosted.end(principal, context(root)); await hosted.whoami(principal, context(root)); }],
   ["the child moved to another root", async ({ root, other, child }) => { await hosted.end(principal, context(root), hostedId(child)); await hosted.register(principal, context(other), child); }],
-  ["the child's idle window passed", ({ root, child }) => { now += 900_001; keepLive(root); expect(database.repo.hosted.get(hostedId(child))).toBeDefined(); }],
+  ["the child's idle window passed", async ({ root, child }) => { now += 900_001; await keepLive(root); expect(database.repo.hosted.get(hostedId(child))).toBeDefined(); }],
 ];
 function keepLive(root: string) {
-  database.repo.hosted.touch(hostedId(root), now);
-  database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ? AND lease_deadline IS NOT NULL", [now + 30_000, hostedId(root)]);
+  return seed(database.repo, () => {
+    database.repo.hosted.touch(hostedId(root), now);
+    database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ? AND lease_deadline IS NOT NULL", [now + 30_000, hostedId(root)]);
+  });
 }
 for (const [change, apply] of windows) for (const caller of ["root", "child"] as const) {
   test(`#907: a ${caller}'s call with its exchange's verdict ends as one without it when, between the gates, ${change}`, async () => {

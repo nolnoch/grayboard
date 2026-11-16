@@ -3,7 +3,10 @@
 // `to`. Auto-pick and the human fallback stay within the requester's user;
 // a replay re-checks the grant against the session holding the name now; a
 // granted requester fills at most half a launcher's open cap; and a policy
-// deny on a connected (non-hosted) session keeps its decision row (#867).
+// deny keeps its decision row past the call's rollback (#867), through the
+// session's afterRollback as hosted `run` sets it. handleDelegate's own
+// collector for a session with none is unreachable once every write is
+// queued (#807 P1b-4f); 4e removes it.
 import { expect, test } from "bun:test";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
@@ -39,7 +42,7 @@ test("server: a delegating team lets a member name another member's launcher; co
     const no = await refusal(aliceSim.delegate({ persona: "p", task: "t", to: "eng/launcher" }));
     expect(no.message).toMatch(/"eng\/launcher" belongs to another user.*delegating/);
     await bobLauncher.none(direct());
-    // The row survives the delegate's rolled-back write on a connected session (#867).
+    // The row survives the delegate's rolled-back write (#867).
     expect(decisions(srv, "delegate.cross_user")).toEqual([expect.objectContaining({ verb: "delegate.to", allow: false, from_user: "alice@example.com", to_user: "bob@b.com", launcher: "eng/launcher" })]);
 
     expect((await srv.api(alice, "POST", "/api/teams/eng/policy", { policy: "delegating" })).status).toBe(200);

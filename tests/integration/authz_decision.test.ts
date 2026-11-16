@@ -14,6 +14,7 @@ import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { withMeta } from "../helpers/hosted.ts";
+import { seed } from "../support/seed.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -34,7 +35,7 @@ afterEach(async () => {
 // generic session key and the alias it writes as (`writesAs`, changeable
 // between calls), so the server's own transaction and `later` hook decide.
 async function toolsOnly(email: string, sessionId: string, writesAs: () => string): Promise<(tool: string, args?: Record<string, unknown>) => Promise<CallToolResult>> {
-  const { token } = issueOAuth(srv.app.repo, srv.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
+  const { token } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
   const version = MCP_PROTOCOL_VERSIONS[0]!;
   const client = new Client({ name: "tools-only", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
@@ -109,7 +110,7 @@ describe("deny rows", () => {
 describe("session acts", () => {
   test("a refused DM to another user's human leaves one row, after the hosted rollback", async () => {
     await srv.login(A);
-    srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: A, name: "human" }, A);
+    await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: A, name: "human" }, A));
     const fe = await srv.hosted(B, "fe");
     const err = (await fe.call("dm_send", { to: `${A}/human`, body: "hi" }).catch((e: unknown) => e)) as Error;
     expect(err).toBeInstanceOf(HostedToolError);
@@ -185,10 +186,10 @@ describe("pre-seam refusals", () => {
     const theirs = idOf(A);
     await srv.connected(b, "be");
     const mine = idOf(B);
-    srv.app.db.run("UPDATE ids SET ended_at = 1000 WHERE id = ?", [mine]);
+    await seed(srv.app.repo, () => srv.app.db.run("UPDATE ids SET ended_at = 1000 WHERE id = ?", [mine]));
     await srv.connected(b, "viewer");
     const viewer = idOf(B);
-    srv.app.db.run("UPDATE ids SET viewer = 1 WHERE id = ?", [viewer]);
+    await seed(srv.app.repo, () => srv.app.db.run("UPDATE ids SET viewer = 1 WHERE id = ?", [viewer]));
     const unknown = "id:0000000000000";
     const texts: string[] = [];
     for (const id of [theirs, unknown, viewer, mine]) {
@@ -252,7 +253,7 @@ describe("pre-seam refusals", () => {
     const cols = srv.app.db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('hosted_sessions')").all().map((c) => c.name);
     const picked = cols.map((c) => (c === "session_id" || c in set ? "?" : c)).join(", ");
     const values = cols.filter((c) => c === "session_id" || c in set).map((c) => (c === "session_id" ? id : set[c]!));
-    srv.app.db.run(`INSERT INTO hosted_sessions (${cols.join(", ")}) SELECT ${picked} FROM hosted_sessions WHERE session_id = ?`, [...values, from]);
+    return seed(srv.app.repo, () => srv.app.db.run(`INSERT INTO hosted_sessions (${cols.join(", ")}) SELECT ${picked} FROM hosted_sessions WHERE session_id = ?`, [...values, from]));
   };
 
   test("session_end naming another user's or another client's hosted session reads as not found and leaves one row each, after the hosted rollback", async () => {
@@ -260,7 +261,7 @@ describe("pre-seam refusals", () => {
     const [theirs, mine] = [hostedId(A, a.sessionId), hostedId(B, b.sessionId)];
     // B's session through another OAuth client: a copy of B's row under that client's ID.
     const otherClient = hostedSessionId(srv.app.repo.users.findByEmail(B)!.id, "another-client", b.sessionId);
-    forgeRow(otherClient, mine, { client_id: "another-client" });
+    await forgeRow(otherClient, mine, { client_id: "another-client" });
     const unknown = hostedSessionId(1, HOSTED_CLIENT, "nobody");
     for (const id of [theirs, otherClient, unknown]) {
       await expect(b.subscriber.call("session_end", { session: id })).rejects.toMatchObject({ code: "not_found" });
@@ -280,7 +281,7 @@ describe("pre-seam refusals", () => {
     const b = await srv.hosted(B, "be");
     // Forged under the ID B's next session will send, owned by A.
     const forged = hostedId(B, "forged");
-    forgeRow(forged, hostedId(B, b.sessionId), { user_id: srv.app.repo.users.findByEmail(A)!.id });
+    await forgeRow(forged, hostedId(B, b.sessionId), { user_id: srv.app.repo.users.findByEmail(A)!.id });
     // Refused while the exchange selects its row, before any tool runs: the HTTP 404 it always was.
     const e = await srv.hosted(B, null, { sessionId: "forged" }).then(() => null, (x: Error) => x);
     expect(e?.message).toContain(`{"code":"not_found","message":"resource not found"}`);
@@ -295,7 +296,7 @@ describe("pre-seam refusals", () => {
     await srv.login(A);
     const b = await srv.hosted(B, "be");
     const mine = hostedId(B, b.sessionId), forged = hostedId(B, "child");
-    forgeRow(forged, mine, { user_id: srv.app.repo.users.findByEmail(A)!.id });
+    await forgeRow(forged, mine, { user_id: srv.app.repo.users.findByEmail(A)!.id });
     await expect(b.subscriber.call("session_register", { child: "child" })).rejects.toMatchObject({ code: "not_found" });
     const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "hosted.session");
     expect(got.map((r) => [r.actor, r.target, r.detail.rule, r.detail.session])).toEqual([[B, forged, "hosted.other_user", mine]]);

@@ -32,12 +32,12 @@ afterEach(async () => {
   rmSync(blobDir, { recursive: true, force: true });
 });
 
-const token = () => issueOAuth(app.repo, app.oauth.resource, A, ["grayboard:tools", "grayboard:delivery"], Date.now(), "grayboard-pi").token;
+const token = async () => (await issueOAuth(app.repo, app.oauth.resource, A, ["grayboard:tools", "grayboard:delivery"], Date.now(), "grayboard-pi")).token;
 
 // A client whose every POST carries the session key and the current facts, as hosted-core's wire sends them.
 // `get: false`: the client opens no standalone GET (a 405 tells the SDK the server offers none), so a test's own GET is the session's only one.
 async function connect(version: string, raw: string, facts: { model?: unknown; effort?: unknown; suggested?: unknown }, get = true) {
-  const tok = token();
+  const tok = await token();
   const inject = async (request: Request): Promise<Request | Response> => {
     if (request.method === "GET" && !get) return new Response(null, { status: 405 });
     if (request.method !== "POST") return request;
@@ -84,7 +84,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.filter(v => v !== "2026-07-28")) tes
 });
 
 test("a model that isn't a string is refused with a message naming the key (#364)", async () => {
-  const res = await fetch(`${base}/mcp`, { method: "POST", headers: { Authorization: `Bearer ${token()}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2026-07-28" },
+  const res = await fetch(`${base}/mcp`, { method: "POST", headers: { Authorization: `Bearer ${await token()}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2026-07-28" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "whoami", arguments: {}, _meta: { [GRAYBOARD_SESSION_META]: "facts-bad", [GRAYBOARD_MODEL_META]: 5 } } }) });
   expect(res.status).toBe(400);
   expect(await res.json()).toEqual({ code: "bad_request", message: `_meta["${GRAYBOARD_MODEL_META}"] must be a string` });

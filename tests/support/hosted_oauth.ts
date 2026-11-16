@@ -56,7 +56,7 @@ export async function browse(issuer: string, authorizeUrl: string, harness: stri
 // issued to `email`, as a finished login would. `expiresIn` < 0 makes the
 // next token() refresh.
 export async function seedGrant(srv: HostedServer, stateDir: string, clientId: string, email = "alice@example.com", expiresIn = 3_600_000) {
-  const issued = issueOAuth(srv.app.repo, srv.resource, email, SCOPES, Date.now(), clientId);
+  const issued = await issueOAuth(srv.app.repo, srv.resource, email, SCOPES, Date.now(), clientId);
   const login = new Login({ resource: srv.resource, clientId, stateDir, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} });
   await writeJsonAtomic(login.path, { version: 1, resource: srv.resource, clientId, epoch: "seeded", issuer: srv.issuer, scope: SCOPES.join(" "),
     access: issued.token, accessExpiresAt: Date.now() + expiresIn, refresh: issued.refreshToken });

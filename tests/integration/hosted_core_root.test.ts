@@ -96,7 +96,7 @@ const row = (raw: string): Row | null => {
 // Another pi process on this state dir: a sign-in writes a new epoch and
 // grant to the shared store; a sign-out revokes and logs the store out.
 async function loginElsewhere(epoch: string) {
-  const issued = issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
+  const issued = await issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
   await writeJsonAtomic(storeLogin().path, { version: 1, resource: srv.resource, clientId: CLIENT, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
     access: issued.token, accessExpiresAt: Date.now() + 3_600_000, refresh: issued.refreshToken });
 }

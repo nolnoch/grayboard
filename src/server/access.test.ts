@@ -11,6 +11,7 @@ import { serverAccess } from "./access.ts";
 import { mayActIn } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 const team = (ref: string, name: string) => ({ scope_kind: "team" as const, scope_ref: ref, name });
@@ -25,22 +26,24 @@ let repo: Repo;
 let db: CoreDb;
 let access: ReturnType<typeof serverAccess>;
 
-beforeEach(() => {
+beforeEach(async () => {
   ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
-  const wade = repo.users.upsertByEmail("wade@example.com", null);
-  const bob = repo.users.upsertByEmail("bob@example.com", null);
-  const eve = repo.users.upsertByEmail("eve@example.com", null);
-  const eng = repo.teams.create("eng", wade.id);
-  repo.teams.addMember(eng.id, wade.id);
-  repo.teams.addMember(eng.id, bob.id);
-  const ops = repo.teams.create("ops", eve.id);
-  repo.teams.addMember(ops.id, eve.id);
-  repo.teams.addMember(ops.id, wade.id);
-  for (const [email, name] of [["wade@example.com", "be"], ["bob@example.com", "be"], ["bob@example.com", "qa"], ["eve@example.com", "be"]] as const) {
-    repo.aliases.create(person(email, name), email);
-  }
-  repo.aliases.create(team("eng", "deploy"), "wade@example.com");
-  registerId(db, { id: WADE_ID, principal: "wade@example.com", launcher: false });
+  await seed(repo, () => {
+    const wade = repo.users.upsertByEmail("wade@example.com", null);
+    const bob = repo.users.upsertByEmail("bob@example.com", null);
+    const eve = repo.users.upsertByEmail("eve@example.com", null);
+    const eng = repo.teams.create("eng", wade.id);
+    repo.teams.addMember(eng.id, wade.id);
+    repo.teams.addMember(eng.id, bob.id);
+    const ops = repo.teams.create("ops", eve.id);
+    repo.teams.addMember(ops.id, eve.id);
+    repo.teams.addMember(ops.id, wade.id);
+    for (const [email, name] of [["wade@example.com", "be"], ["bob@example.com", "be"], ["bob@example.com", "qa"], ["eve@example.com", "be"]] as const) {
+      repo.aliases.create(person(email, name), email);
+    }
+    repo.aliases.create(team("eng", "deploy"), "wade@example.com");
+    registerId(db, { id: WADE_ID, principal: "wade@example.com", launcher: false });
+  });
   access = serverAccess(repo, db);
 });
 
@@ -129,22 +132,22 @@ describe("resolveMention", () => {
     expect(access.resolveMention("qa", "eve@example.com/be", OPS, true)).toBeNull();
   });
 
-  test("a bare @human is only ever your own", () => {
-    repo.aliases.create(person("bob@example.com", "human"), "bob@example.com");
+  test("a bare @human is only ever your own", async () => {
+    await seed(repo, () => repo.aliases.create(person("bob@example.com", "human"), "bob@example.com"));
     expect(access.resolveMention("human", AUTHOR, OPEN, true)).toBeNull();
     expect(access.resolveMention("human", "bob@example.com/qa", OPEN, true)).toBe("bob@example.com/human");
   });
 
-  test("an exact human mention follows DM reach", () => {
-    repo.aliases.create(person("bob@example.com", "human"), "bob@example.com");
+  test("an exact human mention follows DM reach", async () => {
+    await seed(repo, () => repo.aliases.create(person("bob@example.com", "human"), "bob@example.com"));
     expect(access.resolveMention("bob@example.com/human", AUTHOR, OPEN, true)).toBe("bob@example.com/human");
     expect(access.resolveMention("bob@example.com/human", "eve@example.com/be", OPEN, true)).toBeNull();
     expect(access.resolveMention("bob@example.com/human", "eng/deploy", OPEN, true)).toBe("bob@example.com/human");
   });
 
-  test("@id: resolves a live ID; an ended one refuses a strict post and is unresolved otherwise", () => {
+  test("@id: resolves a live ID; an ended one refuses a strict post and is unresolved otherwise", async () => {
     expect(access.resolveMention(WADE_ID, AUTHOR, OPEN, true)).toBe(WADE_ID);
-    repo.atomic(() => endSession(db, repo.mail, WADE_ID, { why: "test", now: 5 }));
+    await seed(repo, () => endSession(db, repo.mail, WADE_ID, { why: "test", now: 5 }));
     expect(() => access.resolveMention(WADE_ID, AUTHOR, OPEN, true)).toThrow(/^id_ended:/);
     expect(access.resolveMention(WADE_ID, AUTHOR, OPEN, false)).toBeNull();
     expect(access.resolveMention(idAddress("f".repeat(64)), AUTHOR, OPEN, false)).toBeNull();
@@ -158,9 +161,9 @@ describe("resolveMention", () => {
 // Who may bind or write as an alias (#284 S9), keyed by principal.
 // #284 S13: peer_list's alias labels are judged for the calling session's
 // ID, whose principal is its user even when its primary is a team alias.
-test("seesAliasMeta: only a principal that may act in the alias's scope", () => {
+test("seesAliasMeta: only a principal that may act in the alias's scope", async () => {
   const eveId = idAddress("e".repeat(64));
-  registerId(db, { id: eveId, principal: "eve@example.com", launcher: false });
+  await seed(repo, () => registerId(db, { id: eveId, principal: "eve@example.com", launcher: false }));
   expect(access.seesAliasMeta(WADE_ID, { scope_kind: "team", scope_ref: "eng" })).toBe(true);
   expect(access.seesAliasMeta(WADE_ID, { scope_kind: "person", scope_ref: "wade@example.com" })).toBe(true);
   expect(access.seesAliasMeta(eveId, { scope_kind: "team", scope_ref: "eng" })).toBe(false);
@@ -171,11 +174,13 @@ test("seesAliasMeta: only a principal that may act in the alias's scope", () => 
 
 // #348: a team's alias names reach the team and its members; people's names
 // are the open directory. No admin exemption, and an unknown address sees none.
-test("seesAlias: a person scope to anyone signed in, a team's to its members and its own aliases", () => {
+test("seesAlias: a person scope to anyone signed in, a team's to its members and its own aliases", async () => {
   const eveId = idAddress("e".repeat(64));
-  registerId(db, { id: eveId, principal: "eve@example.com", launcher: false });
-  repo.aliases.create(team("eng", "build"), "wade@example.com");
-  repo.aliases.create(team("ops", "run"), "eve@example.com");
+  await seed(repo, () => {
+    registerId(db, { id: eveId, principal: "eve@example.com", launcher: false });
+    repo.aliases.create(team("eng", "build"), "wade@example.com");
+    repo.aliases.create(team("ops", "run"), "eve@example.com");
+  });
   const eng = { scope_kind: "team" as const, scope_ref: "eng" };
   expect(access.seesAlias!(WADE_ID, eng)).toBe(true);
   expect(access.seesAlias!(eveId, eng)).toBe(false);
@@ -188,7 +193,7 @@ test("seesAlias: a person scope to anyone signed in, a team's to its members and
   expect(access.seesAlias!(WADE_ID, { scope_kind: "team", scope_ref: null })).toBe(false);
 });
 
-test("mayActIn: a user acts in its own person scope and its teams' scopes; service scopes wait for #270", () => {
+test("mayActIn: a user acts in its own person scope and its teams' scopes; service scopes wait for #270", async () => {
   const bob = { kind: "user" as const, name: "bob@example.com" };
   const may = (p: Parameters<typeof mayActIn>[1], kind: "person" | "team" | "service", ref: string) => mayActIn(repo, p, { scope_kind: kind, scope_ref: ref });
   expect(may(bob, "person", "bob@example.com")).toBeNull();
@@ -199,6 +204,6 @@ test("mayActIn: a user acts in its own person scope and its teams' scopes; servi
   expect(may(bob, "service", "ci")).toBe("service principals arrive with #270");
   expect(may({ kind: "service", name: "ci" }, "team", "eng")).toBe("service principals arrive with #270");
   expect(may({ kind: "team", name: "eng" }, "team", "eng")).toBe("eng is a team, not a user");
-  repo.teams.removeMember(repo.teams.findByName("eng")!.id, repo.users.findByEmail("bob@example.com")!.id);
+  await seed(repo, () => repo.teams.removeMember(repo.teams.findByName("eng")!.id, repo.users.findByEmail("bob@example.com")!.id));
   expect(may(bob, "team", "eng")).toBe("bob@example.com isn't a member of team eng");
 });

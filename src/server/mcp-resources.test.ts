@@ -10,17 +10,18 @@ import { ApplicationError, createApplication } from "./application.ts";
 import { createHostedMcp, MCP_PROTOCOL_VERSIONS } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
-import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import { createBoard, post, subscribe } from "../core/boards.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 const meta = { "ai.opencode/sessionID": "resource-root" };
 
 let store: ReturnType<typeof openDatabase>, application: ReturnType<typeof createApplication>;
 let oauth: ReturnType<typeof createOAuthServer>, hosted: ReturnType<typeof createHostedMcp>;
-let dir: string, grant: ReturnType<typeof issueOAuth>;
+let dir: string, grant: IssuedOAuth;
 const clients: Client[] = [];
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-resource-unit-"));
@@ -28,7 +29,7 @@ beforeEach(async () => {
   application = createApplication(store.repo, store.db);
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer });
-  grant = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true });
@@ -90,13 +91,15 @@ test("receipt capacity is structured and release then bind false reopens under a
   headers.set("X-Grayboard-Lease", first.capability);
   const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
-  createBoard(store.db, "alice@example.com/be", "capacity", "digest receipt bound");
-  subscribe(store.db, "alice@example.com/be", "capacity", "digest");
+  await seed(store.repo, () => {
+    createBoard(store.db, "alice@example.com/be", "capacity", "digest receipt bound");
+    subscribe(store.db, "alice@example.com/be", "capacity", "digest");
+  });
   for (let i = 0; i < 1000; i++) {
-    post(store.db, "alice@example.com/sender", "capacity", `version ${i}`);
+    await seed(store.repo, () => post(store.db, "alice@example.com/sender", "capacity", `version ${i}`));
     await hosted.delivery.pending(principal, sessionContext(principal, meta), first.capability);
   }
-  post(store.db, "alice@example.com/sender", "capacity", "overflow");
+  await seed(store.repo, () => post(store.db, "alice@example.com/sender", "capacity", "overflow"));
   await expect(client.readResource({ uri: "grayboard://inbox" })).rejects.toMatchObject({ data: { code: "receipt_capacity" } });
   const renew = hosted.delivery.renew;
   hosted.delivery.renew = async () => { throw new ApplicationError("receipt_capacity", "receipt capacity reached"); };
@@ -115,7 +118,7 @@ test("receipt capacity is structured and release then bind false reopens under a
 });
 
 test("subscriber known suggestions stay account scoped and reject malformed extra fields without getters", async () => {
-  const bob = issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
+  const bob = await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
   const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${bob.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "private-name", create: true });
@@ -176,7 +179,7 @@ test("hosted audit actors and clients survive grant deletion and ownership clean
   if (p instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.register(p, sessionContext(p, meta), "audit-child");
   await hosted.sessions.end(p, sessionContext(p, meta));
-  store.repo.oauth.cleanup(Date.now() + OAUTH_TTL.grant + 1);
+  await seed(store.repo, () => store.repo.oauth.cleanup(Date.now() + OAUTH_TTL.grant + 1));
   const rows = store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action LIKE 'hosted.%'").all();
   expect(rows.length).toBeGreaterThanOrEqual(5);
   for (const row of rows) {
@@ -250,7 +253,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     const pending = client.callTool({ name: "delivery_open", arguments: {} }, { signal: abort.signal }).catch(e => e);
     await ready;
     expect(hosted.activeLeases).toBe(1);
-    if (stop === "access") store.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
+    if (stop === "access") await seed(store.repo, () => store.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now()));
     if (stop === "abort") abort.abort();
     const closing = stop === "close" ? hosted.close() : undefined;
     resume();
@@ -263,7 +266,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
     if (stop !== "close") {
-      const replacement = new AppSession(application, grant.authed, "be");
+      const replacement = new AppSession(application, store.repo, grant.authed, "be");
       await replacement.connect();
       replacement.close();
     }

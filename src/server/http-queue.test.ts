@@ -13,6 +13,7 @@ import type { Config } from "./config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { until } from "../../tests/support/until.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
@@ -29,11 +30,12 @@ test("#807: a session touch that fires while another body holds the write queue 
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }), () => db.close());
   const touches = createTouchQueue();
   cleanups.push(() => touches.cancelAll());
-  const session = repo.writeNow(() => {
+  const session = await seed(repo, () => {
     const user = repo.users.upsertByEmail("you@example.com", null);
-    return repo.sessions.create(user.id, hashToken("raw-token"), "test");
+    const created = repo.sessions.create(user.id, hashToken("raw-token"), "test");
+    db.run("UPDATE sessions SET last_used_at = 0 WHERE id = ?", [created.id]);
+    return created;
   });
-  db.run("UPDATE sessions SET last_used_at = 0 WHERE id = ?", [session.id]);
   const lastUsed = () => repo.sessions.findById(session.id)!.last_used_at;
   const touched = spyOn(repo.sessions, "touch");
   const holder = hold(db);

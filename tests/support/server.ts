@@ -133,7 +133,7 @@ export class TestServer {
   // stop(). Inbox polling spends hosted requests: give this server a large
   // hostedRequestLimit (serverConfig carries it to the subscriber bucket).
   async hosted(email: string, identity: string | null, opts: HostedOptions = {}): Promise<HostedSession> {
-    const { token } = issueOAuth(this.app.repo, this.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
+    const { token } = await issueOAuth(this.app.repo, this.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
     const s = new HostedSession(`${this.base}/mcp`, token, identity, opts);
     this.hostedSessions.push(s);
     await s.connect();

@@ -30,7 +30,7 @@ export async function liveToolLists(): Promise<ToolLists> {
   const server = new TestServer();
   const signal = new AbortController();
   try {
-    const { token } = issueOAuth(server.app.repo, server.app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), "grayboard-pi");
+    const { token } = await issueOAuth(server.app.repo, server.app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), "grayboard-pi");
     const options: WireOptions = { url: `${server.base}/mcp`, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-snapshot", version: "1" } };
     const auth = { token: async () => token };
     const native = new NativeWire(options, auth, signal.signal);

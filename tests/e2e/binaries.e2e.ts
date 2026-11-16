@@ -118,9 +118,9 @@ test("server: the compiled server, started from an env file, relays a DM and its
   // through the server's own database beside the running process (WAL), since
   // the compiled server's upstream Google sign-in can't be stubbed.
   const store = openDatabase(started.dbPath, { blobDir: join(dir, "blobs") });
-  const token = (email: string) => issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT).token;
+  const token = async (email: string) => (await issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT)).token;
   const session = async (email: string, identity: string) => {
-    const h = new HostedSession(`${server!.base}/mcp`, token(email), identity);
+    const h = new HostedSession(`${server!.base}/mcp`, await token(email), identity);
     hosted.push(h);
     await h.connect();
     return h;

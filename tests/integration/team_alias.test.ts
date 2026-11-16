@@ -13,6 +13,7 @@ import type { AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 
 const B = "bob@example.com";
 let srv: TestServer;
@@ -114,7 +115,7 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   build = srv.appSession(bob, "eng/build");
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
   const team = srv.app.repo.teams.findByName("eng")!;
-  srv.app.repo.teams.removeMember(team.id, srv.app.repo.users.findByEmail(B)!.id);
+  await seed(srv.app.repo, () => srv.app.repo.teams.removeMember(team.id, srv.app.repo.users.findByEmail(B)!.id));
   expect(holder("eng/build")).toEqual([build.id]);
   srv.app.revalidate();
   expect(holder("eng/build")).toEqual([]);
@@ -171,7 +172,7 @@ test("a lazily created team alias follows only its team's board", async () => {
 test("an alias_held refusal shows the holder's place to its own principal, not to another member", async () => {
   const build = srv.appSession(bob, "eng/build");
   expect((await build.connect()).bind?.alias).toBe("eng/build");
-  srv.app.db.query(`UPDATE ids SET place = 'bob-box:~/src/secret-project' WHERE id = ?`).run(build.id);
+  await seed(srv.app.repo, () => srv.app.db.query(`UPDATE ids SET place = 'bob-box:~/src/secret-project' WHERE id = ?`).run(build.id));
 
   const other = srv.appSession(alice, "eng/build");
   const refusal = await other.connect().then(() => { throw new Error("alice's bind was not refused"); }, (e: { code: string; message: string }) => e);
@@ -210,7 +211,7 @@ test("a team alias in use by one member's session refuses another member's write
   // ID ends, as the hosted store's end does it.
   await build.unbind("eng/build");
   expect((await actAs(alice, "eng/build")).status).toBe(409);
-  srv.app.db.query(`UPDATE ids SET ended_at = ? WHERE id = ?`).run(Date.now(), own.id);
+  await seed(srv.app.repo, () => srv.app.db.query(`UPDATE ids SET ended_at = ? WHERE id = ?`).run(Date.now(), own.id));
   expect((await actAs(alice, "eng/build")).status).toBe(200);
 });
 
@@ -317,7 +318,7 @@ test("a bind of human in a team's scope is refused as reserved, and creates noth
 });
 
 test("a bind in a service principal's scope is refused until #270, and creates nothing", async () => {
-  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run());
   await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining("service principals arrive with #270") });
   expect(rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
 });
