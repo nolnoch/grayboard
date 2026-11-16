@@ -36,6 +36,14 @@ class OAuthError extends Error {
   constructor(readonly error: string, readonly status = 400) { super(error); }
 }
 function fail(error = "invalid_request", status = 400): never { throw new OAuthError(error, status); }
+// error_description texts for a refusal after the request is bound (#928): fixed, since they reach any client.
+export const REFUSED = {
+  domain: "this account's domain isn't allowed on this server",
+  provider: "sign-in with the provider failed",
+  disabled: "this account is disabled on this server",
+} as const;
+// RFC 6749 §4.1.2.1: error_description is %x20-21 / %x23-5B / %x5D-7E.
+const errorDescription = (text: string) => text.replace(/[^\x20-\x21\x23-\x5b\x5d-\x7e]/g, "?").slice(0, 300);
 const headers = { "Cache-Control": "no-store", Pragma: "no-cache", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" };
 const json = (data: unknown, status = 200, extra: Record<string, string> = {}) => Response.json(data, { status, headers: { ...headers, ...extra } });
 const html = (body: string, status = 200, callbackOrigin?: string) => new Response(`<!doctype html><html><meta charset="utf-8"><title>Grayboard authorization</title><body>${body}</body></html>`, {
@@ -383,20 +391,24 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const upstreamFlow = f.upstream!;
       upstream.delete(stateHash);
       delete f.upstream;
-      if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); flows.delete(r.requestHash); return returnToClient(r, f, { error: "access_denied" }); }
+      // From here the request is bound: a refusal goes back to the client (RFC 6749 §4.1.2.1), so `grayboard login` and
+      // any other client can report it, with a fixed description per reason. The audit rows are as before.
+      const refuse = (description?: string) => { flows.delete(r.requestHash); return returnToClient(r, f, description ? { error: "access_denied", error_description: errorDescription(description) } : { error: "access_denied" }); };
+      if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); return refuse(); }
       let identity: UpstreamIdentity;
       try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(providerCallback) }); }
       catch (e) {
         // The provider checked the email's domain (D1, D5); its refusal is audited as such.
-        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
-        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403);
+        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.domain); }
+        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider);
       }
       if (f.expiresAt <= now() || closed) fail();
-      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
+      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider); }
       const signedIn = await repo.write(() => idpSignIn(repo, provider, identity!, { client_id: r.clientId }, providers));
-      if ("refused" in signedIn) fail("access_denied", 403);
+      // idpSignIn's text names only the person's email(s), the provider labels and the admin's unlink-idp remedy.
+      if ("refused" in signedIn) return refuse(signedIn.refused);
       const { user } = signedIn;
-      if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); fail("access_denied", 403); }
+      if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); return refuse(REFUSED.disabled); }
       const session = random(), t = now();
       const created = await repo.write(() => repo.oauth.createBrowserSession({ sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
         c.session && hashToken(c.session)));

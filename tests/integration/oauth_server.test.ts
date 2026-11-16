@@ -87,9 +87,10 @@ test("AS metadata is mounted on the single production listener with canonical re
   }
   const metadata = await fetch(base + "/.well-known/oauth-authorization-server/hosted");
   expect(await metadata.json()).toMatchObject({ issuer, authorization_endpoint: issuer + "/oauth/authorize", token_endpoint: issuer + "/oauth/token" });
-  // The CLI's own Google routes are gone (#928 D8): it signs in through the AS above.
-  expect((await fetch(base + "/api/auth/config")).status).not.toBe(200);
-  expect((await fetch(base + "/api/auth/exchange", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).not.toBe(200);
+  // The CLI's own Google routes are gone (#928 D8): it signs in through the AS above, and an unauthenticated
+  // request to either old path now meets the API's token check (401) instead of a sign-in route.
+  expect((await fetch(base + "/api/auth/config")).status).toBe(401);
+  expect((await fetch(base + "/api/auth/exchange", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(401);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: real SDK OAuth code/S256/state/iss and tools through production app`, async () => {

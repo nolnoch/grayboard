@@ -20,6 +20,7 @@ import { accessAudits } from "../../tests/support/audit.ts";
 import { stubProvider } from "../../tests/support/stub_provider.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { DomainRefused } from "./idp.ts";
+import { REFUSED } from "./oauth.ts";
 import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -355,6 +356,17 @@ function authorization(clientId = "native", verifier = random(), redirectUri = "
     scope, state, code_challenge: s256(verifier), code_challenge_method: "S256" });
   return { url, verifier, state, clientId, redirectUri, scope };
 }
+// The provider callback's answer: "consent" when the sign-in goes on to consent, else the refusal's error_description
+// ("" for none). A refusal after the callback binds the request returns to the client (RFC 6749 §4.1.2.1, #928) with
+// access_denied, the client's state and the issuer.
+function callbackOutcome(res: Response, a: { state: string; redirectUri: string }): string {
+  expect(res.status).toBe(303);
+  const to = new URL(res.headers.get("location")!);
+  if (to.href.startsWith(base + "/oauth/consent?")) return "consent";
+  expect(to.origin + to.pathname).toBe(a.redirectUri);
+  expect([to.searchParams.get("error"), to.searchParams.get("state"), to.searchParams.get("iss"), to.searchParams.has("code")]).toEqual(["access_denied", a.state, base, false]);
+  return to.searchParams.get("error_description") ?? "";
+}
 async function loginConsent(browser: Browser, url: string) {
   const begin = await browser.request(url);
   expect(begin.status).toBe(303);
@@ -449,10 +461,10 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
   try {
     service.close();
     service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => { throw forged; })] });
-    const browser = new Browser();
-    const begin = await browser.request(authorization().url);
+    const browser = new Browser(), a = authorization();
+    const begin = await browser.request(a.url);
     const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
-    expect((await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" }))).status).toBe(403);
+    expect(callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" })), a)).toBe(REFUSED.provider);
     expect(log.mock.calls.flat()).toEqual([
       '[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error","class":"Error"}',
       '[grayboard] {"operation":"oauth.exchange","category":"failure","level":"error","class":"Error"}',
@@ -471,10 +483,10 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   service.close();
   // The provider checks the domain inside its exchange (#928 D1; idp_google.test.ts); its refusal is audited as one.
   service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => { throw new DomainRefused("account must be from @example.com"); })] });
-  const browser = new Browser();
-  const first = await browser.request(authorization().url);
+  const browser = new Browser(), a = authorization();
+  const first = await browser.request(a.url);
   const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
-  expect((await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" }))).status).toBe(403);
+  expect(callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" })), a)).toBe(REFUSED.domain);
   expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.domain_refused'").get()).toEqual({ action: "oauth.domain_refused" });
   const log = spyOn(console, "error").mockImplementation(() => {});
   const create = storage.repo.oauth.createRequest;
@@ -488,18 +500,35 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   } finally { storage.repo.oauth.createRequest = create; log.mockRestore(); }
 });
 
+// #928: a disabled user's refusal at the callback reaches the client with its reason, is audited, and opens no
+// browser session.
+test("a disabled user is refused at the callback back to the client, and audited", async () => {
+  const signIn = async () => {
+    const browser = new Browser(), a = authorization();
+    const begin = await browser.request(a.url);
+    const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
+    return callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "fake-google-code" })), a);
+  };
+  expect(await signIn()).toBe("consent");
+  const user = storage.repo.users.findByEmail("you@example.com")!;
+  storage.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [clock, user.id]);
+  expect(await signIn()).toBe(REFUSED.disabled);
+  expect(accessAudits(storage.db, "oauth.user_refused")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: "native" } })]);
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
+});
+
 // Security audit F-13: an email Google hands to a new account doesn't bring the old account's user with it.
 test("a Google account presenting a linked user's email is refused at the callback and audited", async () => {
   const signIn = async (subject: string) => {
     service.close();
     service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "you@example.com", displayName: "You", subject }))] });
-    const browser = new Browser();
-    const first = await browser.request(authorization().url);
+    const browser = new Browser(), a = authorization();
+    const first = await browser.request(a.url);
     const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
-    return (await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "code" }))).status;
+    return callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "code" })), a);
   };
-  expect(await signIn("google-first")).toBe(303);
-  expect(await signIn("google-second")).toBe(403);
+  expect(await signIn("google-first")).toBe("consent");
+  expect(await signIn("google-second")).toBe("you@example.com is linked to a different Google account. If this account should have it, an admin runs grayboard admin unlink-idp --email you@example.com");
   expect(storage.db.query("SELECT action, actor, detail FROM access_log WHERE action LIKE 'auth.subject_%'").all()).toEqual([
     { action: "auth.subject_refused", actor: "you@example.com", detail: JSON.stringify({ reason: "subject_mismatch", provider: "google", issuer: GOOGLE_ISSUER, client_id: "native" }) },
   ]);
@@ -515,21 +544,24 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
     const signIn = async (idp: "google" | "okta") => {
       service.close();
       service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "you@example.com", displayName: "You", subject: idp + "-you" }), undefined, idp === "okta" ? okta : {})] });
-      const browser = new Browser();
-      const first = await browser.request(authorization().url);
+      const browser = new Browser(), a = authorization();
+      const first = await browser.request(a.url);
       const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
-      return (await browser.request(base + `/oauth/${idp}/callback?` + new URLSearchParams({ state, code: "code" }))).status;
+      return callbackOutcome(await browser.request(base + `/oauth/${idp}/callback?` + new URLSearchParams({ state, code: "code" })), a);
     };
     const issuer = (idp: "google" | "okta") => idp === "okta" ? okta.issuer : GOOGLE_ISSUER;
-    expect(await signIn(first)).toBe(303);
+    expect(await signIn(first)).toBe("consent");
     expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(first), idp_subject: first + "-you" });
-    expect(await signIn(second)).toBe(403);
+    // The CLI prints this. This server lists only the second provider, so the holder goes unnamed (its issuer may be an
+    // org's own host); the text names the person's email, the provider and the admin's remedy, nothing else.
+    const label = second === "okta" ? "Okta" : "Google";
+    expect(await signIn(second)).toBe(`you@example.com is linked to another provider's account, not ${label}. If this ${label} account should have it, an admin runs grayboard admin unlink-idp --email you@example.com`);
     expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
     expect(accessAudits(storage.db, "auth.subject_refused").map(r => [r.actor, r.detail])).toEqual([
       ["you@example.com", { reason: "issuer_mismatch", holding_issuer: issuer(first), provider: second, issuer: issuer(second), client_id: "native" }],
     ]);
     await storage.repo.write(() => storage.repo.users.clearSubject(storage.repo.users.findByEmail("you@example.com")!.id));
-    expect(await signIn(second)).toBe(303);
+    expect(await signIn(second)).toBe("consent");
     expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(second), idp_subject: second + "-you" });
     expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 2 });
   });
@@ -591,14 +623,18 @@ test("default Google exchange consistently selects the Web override or primary f
       nonce = upstream.searchParams.get("nonce")!;
       expect(nonce).toMatch(/^[\w-]{43}$/);
       const callback = await direct(cfg.publicUrl + "/oauth/google/callback?" + new URLSearchParams({ state: upstream.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" }));
-      expect(callback.status).toBe(mode === "wrong-audience" ? 403 : 303);
+      expect(callback.status).toBe(303);
       expect(tokenCalls).toBe(mode === "trusted-fixture" ? 0 : 1);
       expect(fixtureCalls).toBe(mode === "trusted-fixture" ? 1 : 0);
       if (mode !== "wrong-audience") {
         const consent = await direct(callback.headers.get("Location")!);
         expect(consent.status).toBe(200);
         expect(await consent.text()).toContain("you@example.com");
-      } else expect(await callback.text()).not.toContain("private");
+      } else {
+        const refused = new URL(callback.headers.get("Location")!);
+        expect([refused.origin + refused.pathname, refused.searchParams.get("error"), refused.searchParams.get("error_description")]).toEqual([a.redirectUri, "access_denied", REFUSED.provider]);
+        expect(refused.href + await callback.text()).not.toContain("private");
+      }
       const metadata = await direct("https://grayboard.example.com/.well-known/oauth-authorization-server/hosted");
       const text = await metadata.text();
       expect(text).not.toContain("web-private"); expect(text).not.toContain("desktop-private");
@@ -845,15 +881,15 @@ test("the default Google provider refuses an ID token whose nonce isn't the flow
     service.close();
     service = createOAuthServer(storage.repo, config, { now: () => clock });
     const signIn = async () => {
-      const browser = new Browser(), begin = await browser.request(authorization().url), google = new URL(begin.headers.get("Location")!);
+      const browser = new Browser(), a = authorization(), begin = await browser.request(a.url), google = new URL(begin.headers.get("Location")!);
       flowNonce = google.searchParams.get("nonce")!;
-      return (await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state: google.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" }))).status;
+      return callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state: google.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" })), a);
     };
     tokenNonce = () => random();
-    expect(await signIn()).toBe(403);
+    expect(await signIn()).toBe(REFUSED.provider);
     expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.google_failed'").all()).toEqual([{ action: "oauth.google_failed" }]);
     tokenNonce = n => n;
-    expect(await signIn()).toBe(303);
+    expect(await signIn()).toBe("consent");
   } finally { globalThis.fetch = originalFetch; }
 });
 

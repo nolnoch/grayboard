@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { accessAudits } from "../support/audit.ts";
 import { runCli } from "../support/cli.ts";
 import { browse, hostedServer, type HostedServer } from "../support/hosted_oauth.ts";
+import { Browser } from "../support/oauth_browser.ts";
 import { until } from "../support/until.ts";
 
 const EMAIL = "alice@example.com";
@@ -21,9 +22,11 @@ beforeEach(() => {
   const bin = join(dir, "bin");
   mkdirSync(bin);
   opened = join(dir, "opened");
-  // The CLI's browser: records the URL it was asked to open.
-  writeFileSync(join(bin, "xdg-open"), `#!/bin/sh\nprintf '%s' "$1" > '${opened}.tmp' && mv '${opened}.tmp' '${opened}'\n`);
-  chmodSync(join(bin, "xdg-open"), 0o755);
+  // The CLI's browser (`open` on macOS, `xdg-open` elsewhere): records the URL it was asked to open.
+  for (const name of ["open", "xdg-open"]) {
+    writeFileSync(join(bin, name), `#!/bin/sh\nprintf '%s' "$1" > '${opened}.tmp' && mv '${opened}.tmp' '${opened}'\n`);
+    chmodSync(join(bin, name), 0o755);
+  }
   env = { PATH: `${bin}:${process.env.PATH}`, HOME: join(dir, "home"), GRAYBOARD_CREDENTIALS: join(dir, "credentials"), NO_COLOR: "1" };
 });
 afterEach(async () => {
@@ -69,4 +72,28 @@ test("a denied consent fails the login and writes no credentials", async () => {
   expect(result.err).toContain("sign-in was denied");
   expect(existsSync(env.GRAYBOARD_CREDENTIALS!)).toBe(false);
   expect(srv.app.db.query("SELECT COUNT(*) AS n FROM sessions").get()).toEqual({ n: 0 });
+});
+
+// A refusal after the upstream sign-in returns to the CLI's loopback (#928): the CLI exits at once, printing the
+// server's reason, rather than waiting out its five minutes; the browser tab only says the sign-in didn't complete.
+test("a refusal at the provider callback reaches the CLI, which exits promptly with the reason", async () => {
+  await srv.app.repo.write(() => srv.app.repo.users.upsertByEmail(EMAIL, null));
+  srv.app.db.run("UPDATE users SET disabled_at = ? WHERE email = ?", [Date.now(), EMAIL]);
+  const started = Date.now();
+  const login = runCli(["login", "--server", srv.issuer], { env, timeoutMs: 30_000 });
+  await until(() => existsSync(opened), 20_000, "the CLI to open the authorize URL");
+  const browser = new Browser();
+  const begin = await browser.request(readFileSync(opened, "utf8"));
+  const google = new URL(begin.headers.get("Location")!);
+  const callback = await browser.request(`${srv.issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: google.searchParams.get("state")!, iss: "https://accounts.google.com" }));
+  expect(callback.status).toBe(303);
+  const loopback = new URL(callback.headers.get("Location")!);
+  expect([loopback.hostname, loopback.searchParams.get("error")]).toEqual(["127.0.0.1", "access_denied"]);
+  expect(await (await fetch(loopback)).text()).toContain("did not complete");
+  const result = await login;
+  expect(result.code).toBe(1);
+  expect(result.err).toContain("sign-in was refused: this account is disabled on this server");
+  expect(Date.now() - started).toBeLessThan(25_000);
+  expect(accessAudits(srv.app.db, "oauth.user_refused")).toEqual([expect.objectContaining({ actor: EMAIL, detail: { client_id: "grayboard-cli" } })]);
+  expect(existsSync(env.GRAYBOARD_CREDENTIALS!)).toBe(false);
 });

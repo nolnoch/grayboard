@@ -100,7 +100,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
     if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
 
-    // A sign-in costs a token up front: the exchange awaits Google. Only a
+    // A sign-in costs a token up front, before its body is read. Only a
     // JSON body is accepted, uncharged otherwise: a cross-origin page can
     // post a form without a preflight, but not application/json.
     if (signInRoute(req.method, path, config)?.charged) {

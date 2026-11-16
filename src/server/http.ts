@@ -8,7 +8,7 @@ import {
 import { defaultProviders } from "./idp.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
-import { userAgent, writeAudit } from "./audit.ts";
+import { writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";

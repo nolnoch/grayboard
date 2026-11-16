@@ -8,9 +8,16 @@ import { createHash, randomBytes } from "node:crypto";
 import { openBrowser } from "../shared/browser.ts";
 
 // The server's constants (src/server/oauth-config.ts); the CLI doesn't import server code.
-export const CLI_CLIENT_ID = "grayboard-cli";
-export const LOGIN_SCOPE = "grayboard:login";
+const CLI_CLIENT_ID = "grayboard-cli";
+const LOGIN_SCOPE = "grayboard:login";
 const FLOW_MS = 5 * 60_000;
+
+// The server's words reach the terminal only as printable text: control characters (escape sequences
+// among them) become spaces, and the length is capped.
+const printable = (text: string, max = 300) => {
+  const clean = text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ").replace(/\s+/g, " ").trim();
+  return clean.length > max ? clean.slice(0, max) + "..." : clean;
+};
 
 type Metadata = { issuer: string; authorization_endpoint: string; token_endpoint: string; code_challenge_methods_supported?: string[] };
 
@@ -83,7 +90,11 @@ export async function loginThroughServer(serverUrl: string, open: (url: string) 
   // RFC 9207: the response names its issuer, so another server's code can't land here.
   if (params.get("iss") !== meta.issuer) throw new Error("sign-in response came from an unexpected issuer");
   const error = params.get("error");
-  if (error !== null) throw new Error(error === "access_denied" ? "sign-in was denied" : `sign-in failed (${error.slice(0, 100)})`);
+  if (error !== null) {
+    if (error !== "access_denied") throw new Error(`sign-in failed (${printable(error)})`);
+    const description = printable(params.get("error_description") ?? "");
+    throw new Error(description ? `sign-in was refused: ${description}` : "sign-in was denied");
+  }
   const code = params.get("code");
   if (!code) throw new Error("sign-in response carried no code");
   let res: Response;
@@ -92,7 +103,7 @@ export async function loginThroughServer(serverUrl: string, open: (url: string) 
       body: new URLSearchParams({ grant_type: "authorization_code", client_id: CLI_CLIENT_ID, code, code_verifier: verifier, redirect_uri: callback.redirectUri }) });
   } catch (e) { throw new Error(`couldn't reach ${serverUrl}'s token endpoint (${(e as Error).message})`); }
   const body = await res.json().catch(() => ({})) as { access_token?: unknown; error?: unknown };
-  if (res.status !== 200) throw new Error(`the server refused the sign-in code (HTTP ${res.status}${typeof body.error === "string" ? `: ${body.error.slice(0, 100)}` : ""})`);
+  if (res.status !== 200) throw new Error(`the server refused the sign-in code (HTTP ${res.status}${typeof body.error === "string" ? `: ${printable(body.error)}` : ""})`);
   if (typeof body.access_token !== "string" || !body.access_token.startsWith("gbrd_v1_")) throw new Error("the server's token response carried no grayboard token");
   return body.access_token;
 }

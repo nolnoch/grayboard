@@ -120,7 +120,8 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
       !["none", "client_secret_basic"].includes(String(v.tokenEndpointAuthMethod)) ||
       (v.allowRefresh !== undefined && typeof v.allowRefresh !== "boolean") ||
       (v.sessionSource !== undefined && typeof v.sessionSource !== "boolean")) throw new Error("invalid OAuth client configuration");
-    if (builtinHarness.has(v.clientId) || v.clientId === CLI_CLIENT_ID) throw new Error(`OAuth client ID ${v.clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
+    if (builtinHarness.has(v.clientId)) throw new Error(`OAuth client ID ${v.clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
+    if (v.clientId === CLI_CLIENT_ID) throw new Error(`OAuth client ID ${v.clientId} is reserved for the CLI's client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     // CIMD resolves only https: identifiers and grants keep only the client ID string, so an
     // https: ID never maps the generic key: a grant consented under a metadata document can't
     // turn write-capable because the operator later registers the same ID.
