@@ -138,7 +138,8 @@ test("grayboard team delete-alias deletes an unused team name; a member is refus
 }, 20_000);
 
 // #807 P1c-13: the HTTP routes that read or write aliases inside a write body (identity add and delete, a team's
-// delete-alias, a claim call's address check, a team join's follows) do so on that body's Tx; the GET routes on the pool.
+// delete-alias, a claim call's address check, a team create's or join's follows, a member removal's unfollows) do so
+// on that body's Tx; the GET routes on the pool.
 test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx", async () => {
   const repo = srv.app.repo;
   const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
@@ -163,6 +164,8 @@ test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx
     await step("team.leave", () => srv.api(root, "POST", "/api/teams/eng/leave"), 200);
     await step("identity.list", () => srv.api(bob, "GET", "/api/identities"), 200);
     await step("whoami", () => srv.api(bob, "GET", "/api/whoami"), 200);
+    await step("team.create", () => srv.api(alice, "POST", "/api/teams", { name: "ops" }), 201);
+    await step("team.remove", () => srv.api(alice, "POST", "/api/teams/eng/remove", { email: B }), 200);
     const ops = (r: string) => checks.filter(c => c.route === r).map(c => `${c.op}:${c.handle}`);
     expect(ops("identity.create")).toEqual(["find:tx", "countForScope:tx", "create:tx"]);
     expect(ops("claim.call")).toContain("find:tx");
@@ -172,6 +175,8 @@ test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx
     expect(ops("team.leave")).toContain("listForScope:tx");
     expect(ops("identity.list")).toEqual(["listForScope:pool"]);
     expect(ops("whoami")).toEqual(["listForScope:pool"]);
+    expect(ops("team.create")).toContain("listForScope:tx");
+    expect(ops("team.remove")).toContain("listForScope:tx");
     expect(checks.filter(c => c.route && c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { for (const spy of spies) spy.mockRestore(); }
 });

@@ -131,9 +131,10 @@ test("#998 audit: delivery's access check inside the renew, receipt and release 
 });
 
 // #807 P1c-13: the alias reads and writes a hosted body makes (bind's lazy create and cap, alias_held's holder,
-// a tools-only root's writes_as, a send's peer, unbind's candidates) run on that body's Tx. Two pool reads in a body
-// remain, named in docs/future/postgres-server.md D8: access.ts's mention resolver (the Access seam, P3) and the
-// attachment guard (the attachment slice).
+// a tools-only root's writes_as, a send's peer, a create:false bind's unknown name, a bare name outside the sender's
+// scope, unbind's candidates) run on that body's Tx. Two pool reads in a body remain, named in
+// docs/future/postgres-server.md D8: access.ts's mention resolver (the Access seam, P3) and the attachment guard
+// (the attachment slice).
 test("#807 P1c-13: alias reads inside hosted bodies run on that body's Tx", async () => {
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx"; site: string }[] = [];
   const pooled = ["/access.ts:", "/mcp-attachments.ts:"];
@@ -162,6 +163,12 @@ test("#807 P1c-13: alias reads inside hosted bodies run on that body's Tx", asyn
     await hosted.whoami(generic, meta("p13-tools", "p13-scribe"));
     expect(checks.slice(before).some(c => c.inTxn && c.handle === "tx")).toBe(true);
     await hosted.run(principal, context("p13-root"), "dm_send", (session, tx) => application.send(tx, session, "p13-scribe", "hi"));
+    const typo = checks.length;
+    await expect(hosted.bind(principal, context("p13-other"), { name: "p13-typo", create: false })).rejects.toHaveProperty("code", "identity_unknown");
+    expect(checks.slice(typo).filter(c => c.inTxn).map(c => `${c.op}:${c.handle}`)).toEqual(expect.arrayContaining(["find:tx", "listForScope:tx"]));
+    const stranger = checks.length;
+    await expect(hosted.run(principal, context("p13-root"), "dm_send", (session, tx) => application.send(tx, session, "p13-nobody", "hi"))).rejects.toHaveProperty("code", "not_found");
+    expect(checks.slice(stranger).filter(c => c.op === "findAllByName").map(c => c.handle)).toEqual(["tx"]);
     await hosted.unbind(principal, context("p13-other"), { name: "p13" });
     expect(checks.filter(c => c.inTxn).length).toBeGreaterThan(4);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx") && !pooled.some(p => c.site.includes(p)))).toEqual([]);

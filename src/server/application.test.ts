@@ -208,6 +208,23 @@ test("bind budget is per user and spent before an alias is created or a hold tak
   expect((await connect(bob, "fe")).session.holds).toEqual(["bob@example.com/fe"]);
 });
 
+// #807 P1c-13: attachHuman's lazy human alias (the find, then the create) runs on its write's Tx.
+test("#807 P1c-13: attachHuman reads and creates the human alias on its write's Tx", async () => {
+  const repo = store.repo;
+  const checks: string[] = [];
+  const spies = (["find", "create"] as const).map(name => {
+    const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
+    return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push(`${name}:${store.db.inTransaction && r !== repo.read ? "tx" : "pool"}`);
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    await application.attachHuman(alice, delivery());
+  } finally { for (const spy of spies) spy.mockRestore(); }
+  expect(checks).toEqual(["find:tx", "create:tx"]);
+});
+
 test("reserved human authority is a separate trusted method, never a selected client field", async () => {
   await expect(connect(alice, "human")).rejects.toMatchObject({ code: "forbidden" });
   const human = (await application.attachHuman(alice, delivery())).session;
