@@ -393,7 +393,7 @@ function describeHolder(hub: Hub, id: string, asker: string): string {
   const row = idRow(hub.db, id);
   const place = row?.principal === asker ? row.place : null;
   // A hosted root has no connection to disconnect: it is last seen when its client last called (#402).
-  const hosted = hub.repo.hosted.get(id);
+  const hosted = hub.repo.hosted.get(hub.repo.read, id);
   if (hosted) return `the hosted session ${id}${place ? `, in ${place}` : ""}, last seen ${Math.floor((hub.now() - hosted.last_seen_at) / 1000)}s ago`;
   return `the session ${id}${place ? `, in ${place}` : ""}`;
 }
@@ -617,7 +617,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // session a previous run left unended, because only a hello re-attached one.
   // End each at start, as the grace sweep would have: holds and claims
   // released, mail bounced. A hosted ID is the hosted store's to end.
-  endIds(unendedIds(db).filter((id) => !repo.hosted.owned(id)), "wss_removed");
+  endIds(unendedIds(db).filter((id) => !repo.hosted.owned(repo.read, id)), "wss_removed");
   // Re-checks the aliases that sessions act as (S9) against policy.ts (scope.act), for
   // one principal's sessions or (null) every session's, and revokes the ones
   // it now refuses. by: the user whose act changed the access (an admin's
@@ -667,7 +667,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   }
   function revokeUse(tx: Tx, u: AliasUse & { reason: string }, by: string | null, ended: string[], resync: string[]): void {
     const { reason } = u;
-    const hosted = repo.hosted.owned(u.id);
+    const hosted = repo.hosted.owned(tx, u.id);
     if (!u.held) {
       // A hosted tools-only root ends its ownership, not an ID (hosted IDs are the store's).
       repo.atomic(() => {
@@ -685,7 +685,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       logBinding(db, u.id, u.address, "released", `access revoked: ${reason}`);
       writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
       if (hosted) {
-        const row = repo.hosted.get(u.id);
+        const row = repo.hosted.get(tx, u.id);
         if (row) {
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
           repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(db, u.id).length ? row.lease_deadline : null });
@@ -1234,7 +1234,7 @@ function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
     if (c.transport !== "hosted" || c.authed.user_id !== user) continue;
     live.set(c.sessionId, (live.get(c.sessionId) ?? false) || c.listed);
   }
-  const roots = hub.repo.hosted.roots(user).filter((r) =>
+  const roots = hub.repo.hosted.roots(hub.repo.read, user).filter((r) =>
     r.writes_as === null && live.get(r.session_id) !== false && holdsOf(hub.db, r.session_id).length === 0);
   const statuses = idStatuses(hub.db, roots.map((r) => r.session_id));
   const now = hub.now();

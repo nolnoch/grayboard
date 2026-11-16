@@ -805,7 +805,7 @@ test("#807 P1c-11: hosted writes run on the handle they're given", async () => {
     repo.hosted.insert(tx, row);
     return { kept: tx, row };
   });
-  expect(repo.hosted.get("root-1")?.last_seen_at).toBe(1);
+  expect(repo.hosted.get(repo.read, "root-1")?.last_seen_at).toBe(1);
   const settled = /used after its transaction settled/;
   const h = repo.hosted, x = {} as never;
   expect(() => h.park(kept, "root-1", 2)).toThrow(settled);
@@ -823,9 +823,43 @@ test("#807 P1c-11: hosted writes run on the handle they're given", async () => {
   expect(() => h.forgetLost(kept, "root-1", "a@example.com/fe")).toThrow(settled);
   expect(() => h.heartbeat(kept, 9)).toThrow(settled);
   expect(() => h.touch({} as Tx, "root-1", 9)).toThrow("not a SQLite store handle");
-  expect(h.get("root-1")).toMatchObject({ last_seen_at: 1, parked_at: null });
-  expect(h.get("root-2")).toBeUndefined();
-  expect(h.owned("root-2")).toBe(false);
-  expect(h.lost("root-1", "agent")).toEqual([]);
-  expect(h.aliveAt()).toBeUndefined();
+  expect(h.get(repo.read, "root-1")).toMatchObject({ last_seen_at: 1, parked_at: null });
+  expect(h.get(repo.read, "root-2")).toBeUndefined();
+  expect(h.owned(repo.read, "root-2")).toBe(false);
+  expect(h.lost(repo.read, "root-1", "agent")).toEqual([]);
+  expect(h.aliveAt(repo.read)).toBeUndefined();
+});
+
+// #807 P1c-12: the hosted store's reads run on the handle they're given, as P1c-6's sessions reads do.
+test("#807 P1c-12: hosted reads run on the handle they're given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { kept, u } = await seed(repo, tx => {
+    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
+    const ownership = repo.hosted.start(tx, "root-1", u.id, "test", 1);
+    repo.hosted.insert(tx, { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
+      writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: 5, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null });
+    // Read inside the body that wrote it, on its Tx.
+    expect(repo.hosted.get(tx, "root-1")?.ownership_id).toBe(ownership);
+    return { kept: tx, u };
+  });
+  const settled = /used after its transaction settled/;
+  const h = repo.hosted;
+  expect(() => h.get(kept, "root-1")).toThrow(settled);
+  expect(() => h.owned(kept, "root-1")).toThrow(settled);
+  expect(() => h.all(kept)).toThrow(settled);
+  expect(() => h.counts(kept, u.id)).toThrow(settled);
+  expect(() => h.ofOwnership(kept, 1)).toThrow(settled);
+  expect(() => h.children(kept, "root-1")).toThrow(settled);
+  expect(() => h.roots(kept, u.id)).toThrow(settled);
+  expect(() => h.expired(kept, 9)).toThrow(settled);
+  expect(() => h.idle(kept, 9)).toThrow(settled);
+  expect(() => h.disabled(kept)).toThrow(settled);
+  expect(() => h.lost(kept, "root-1", "agent")).toThrow(settled);
+  expect(() => h.aliveAt(kept)).toThrow(settled);
+  expect(() => h.get({} as Tx, "root-1")).toThrow("not a SQLite store handle");
+  expect(h.get(repo.read, "root-1")?.user_id).toBe(u.id);
+  expect(h.owned(repo.read, "root-1")).toBe(true);
+  expect(h.counts(repo.read, u.id)).toEqual({ total: 1, user: 1 });
+  expect(h.roots(repo.read, u.id).map(r => r.session_id)).toEqual(["root-1"]);
+  expect(h.expired(repo.read, 9).map(r => r.session_id)).toEqual(["root-1"]);
 });

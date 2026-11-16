@@ -1923,24 +1923,22 @@ function makeHostedStore(db: Database): HostedStoreOf {
     return o;
   };
   const on = (tx: Tx): HostedWrites => writesOn(sqliteOf(tx));
-  const get = (id: string) => hostedRow(db, id);
-  const lostOf = hostedLostOf(db);
   const store: HostedStoreOf = {
     writesOn,
     atomic: fn => db.transaction(fn).immediate(),
     write: (fn, committed) => queued(db, fn, committed),
     writeNow: fn => queuedNow(db, fn),
     subscribe: () => () => {},
-    get,
-    owned: (id) => db.query<{ n: number }, [string, string]>(
+    get: (r, id) => hostedRow(sqliteOf(r), id),
+    owned: (r, id) => sqliteOf(r).query<{ n: number }, [string, string]>(
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
     ).get(id, id) !== null,
-    all: () => db.query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all(),
-    counts: (user) => db.query<{ total: number; user: number }, [number]>(
+    all: (r) => sqliteOf(r).query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all(),
+    counts: (r, user) => sqliteOf(r).query<{ total: number; user: number }, [number]>(
       "SELECT (SELECT count(*) FROM hosted_sessions WHERE parked_at IS NULL) AS total, (SELECT count(*) FROM hosted_sessions WHERE user_id = ?1 AND parked_at IS NULL) AS user").get(user)!,
-    ofOwnership: (ownership) => db.query<HostedSession, [number]>("SELECT * FROM hosted_sessions WHERE ownership_id = ? AND parked_at IS NULL").all(ownership),
-    children: (root) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
-    roots: (user) => db.query<HostedSession, [number]>(
+    ofOwnership: (r, ownership) => sqliteOf(r).query<HostedSession, [number]>("SELECT * FROM hosted_sessions WHERE ownership_id = ? AND parked_at IS NULL").all(ownership),
+    children: (r, root) => sqliteOf(r).query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
+    roots: (r, user) => sqliteOf(r).query<HostedSession, [number]>(
       "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
     park: (tx, ...a) => on(tx).park(...a),
     unpark: (tx, ...a) => on(tx).unpark(...a),
@@ -1950,11 +1948,11 @@ function makeHostedStore(db: Database): HostedStoreOf {
     touch: (tx, ...a) => on(tx).touch(...a),
     // The unary `+` keeps the planner off idx_hosted_root, which every root matches, so these two read
     // idx_hosted_deadline and idx_hosted_user (#399).
-    expired: (now) => db.query<HostedSession, [number]>(
+    expired: (r, now) => sqliteOf(r).query<HostedSession, [number]>(
       "SELECT * FROM hosted_sessions WHERE lease_deadline <= ? AND +root_session_id IS NULL").all(now),
-    idle: (cutoff) => db.query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
+    idle: (r, cutoff) => sqliteOf(r).query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
       AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
-    disabled: () => db.query<HostedSession, []>(
+    disabled: (r) => sqliteOf(r).query<HostedSession, []>(
       "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
     childEnd: (tx, ...a) => on(tx).childEnd(...a),
     takeEnded() {
@@ -1964,12 +1962,12 @@ function makeHostedStore(db: Database): HostedStoreOf {
     },
     end: (tx, ...a) => on(tx).end(...a),
     lose: (tx, ...a) => on(tx).lose(...a),
-    lost: (session, reader) => lostOf(session, `${LOST_READ[reader]} IS NULL`),
+    lost: (r, session, reader) => hostedLostOf(sqliteOf(r))(session, `${LOST_READ[reader]} IS NULL`),
     tellLost: (tx, ...a) => on(tx).tellLost(...a),
     reportLost: (tx, ...a) => on(tx).reportLost(...a),
     seeLost: (tx, ...a) => on(tx).seeLost(...a),
     forgetLost: (tx, ...a) => on(tx).forgetLost(...a),
-    aliveAt: () => db.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
+    aliveAt: (r) => sqliteOf(r).query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
     heartbeat: (tx, ...a) => on(tx).heartbeat(...a),
   };
   return store;
@@ -2094,5 +2092,5 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
 // store's own connection, as its reads are until their slice.
 function endHostedWhere(hosted: HostedStoreOf, db: Database, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
   const w = hosted.writesOn(db);
-  for (const row of hosted.all()) if (!row.root_session_id && predicate(row)) w.end(row.session_id, reason, now);
+  for (const row of db.query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all()) if (!row.root_session_id && predicate(row)) w.end(row.session_id, reason, now);
 }

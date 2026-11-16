@@ -125,10 +125,10 @@ test("#475 3: peer_list reads the user's unbound hosted roots from the durable s
   const quiet = await srv.hosted(A, null);
   const id = ((await quiet.call<{ unbound_sessions: { session_id: string; self?: true }[] }>("peer_list", {})).unbound_sessions).find((u) => u.self)!.session_id;
   await quiet.close();
-  expect(srv.app.repo.hosted.get(id)).toMatchObject({ root_session_id: null });
+  expect(srv.app.repo.hosted.get(srv.app.repo.read, id)).toMatchObject({ root_session_id: null });
   expect(await unbound()).toEqual([id]);
   // A tools-only root writes as its writes_as: it isn't an unbound session. (The bound root, be, isn't either.)
-  const row = srv.app.repo.hosted.get(id)!;
+  const row = srv.app.repo.hosted.get(srv.app.repo.read, id)!;
   const tools = "id:toolsonly0001";
   await seed(srv.app.repo, tx => srv.app.repo.hosted.insert(tx, { ...row, session_id: tools, source_session_id: tools, ownership_id: srv.app.repo.hosted.start(tx, tools, row.user_id, row.client_id, Date.now()), writes_as: `${A}/ci` }));
   expect(await unbound()).toEqual([id]);

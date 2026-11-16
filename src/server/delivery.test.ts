@@ -63,7 +63,7 @@ test("shutdown detaches each accepted lease with one hosted.lease_detached row n
   const lease = await delivery.open(bob, context(bob)); delivery.accept(lease);
   delivery.close();
   const rows = store.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'hosted.lease_detached'").all();
-  expect(rows.map(r => [r.actor, r.target, JSON.parse(r.detail)])).toEqual([[bob.authed.user_email, store.repo.hosted.all()[0]!.session_id, { reason: "shutdown", client_id: OPENCODE_CLIENT }]]);
+  expect(rows.map(r => [r.actor, r.target, JSON.parse(r.detail)])).toEqual([[bob.authed.user_email, store.repo.hosted.all(store.repo.read)[0]!.session_id, { reason: "shutdown", client_id: OPENCODE_CLIENT }]]);
 });
 
 test("a DM to the session's own ID is pushed unstamped, an alias DM carries its alias (#451: the client checks held addresses only)", async () => {
@@ -102,7 +102,7 @@ test("canceling duplicate open preserves accepted lease, children, receipts and 
   const duplicate = await delivery.open(bob, context(bob), { changed: () => { duplicateHints++; } });
   await delivery.cancel(duplicate);
   expect(delivery.activeLeaseCount).toBe(1);
-  expect(store.repo.hosted.all()).toHaveLength(2);
+  expect(store.repo.hosted.all(store.repo.read)).toHaveLength(2);
   expect(originalHints).toBe(1);
   await send("next message");
   expect(originalHints).toBe(2); expect(duplicateHints).toBe(0);

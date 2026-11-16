@@ -136,7 +136,7 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
     })).rejects.toThrow("outer rollback");
     expect(events).toEqual([]); expect(invalidations).toBe(0);
     expect(closed).not.toHaveBeenCalled();
-    expect(database.repo.hosted.get(context().id!)).toBeDefined();
+    expect(database.repo.hosted.get(database.repo.read, context().id!)).toBeDefined();
     expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
     // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
     await seed(database.repo, async tx => {

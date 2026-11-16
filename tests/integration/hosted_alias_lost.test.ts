@@ -66,7 +66,7 @@ test("the Controller's whoami reports alias_lost until its delivery_open; the na
   expect(await b.subscriber.call("whoami")).not.toHaveProperty("alias_lost");
   expect(pending()).toBe(0);
 
-  const row = srv.app.repo.hosted.get(rootId(b))!;
+  const row = srv.app.repo.hosted.get(srv.app.repo.read, rootId(b))!;
   const detail = { aliases: ["eng/build"], ownership: row.ownership_id, client_id: HOSTED_CLIENT };
   expect(notified()).toMatchObject([{ actor: B, target: row.session_id, detail }]);
   expect(audits("hosted.alias_lost_seen")).toMatchObject([{ actor: B, target: row.session_id, detail }]);
