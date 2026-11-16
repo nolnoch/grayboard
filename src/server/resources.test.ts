@@ -539,3 +539,17 @@ test("configured watch caps admit past the defaults and refuse at the configured
   expect(resources.activeWatchCount).toBe(1100);
   expect(() => resources.watch(a, "grayboard://boards/wide", hooks())).toThrow("resource watch capacity reached");
 });
+
+test("#998 audit: list and read check access on the handle they read on, a body's Tx inside one", async () => {
+  const handles: ("pool" | "tx")[] = [];
+  const checked = createResources(application, { isAuthorized: (_s, r) => { handles.push(r === undefined || r === store.repo.read ? "pool" : "tx"); return true; } });
+  const a = await select(alice);
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await seed(store.repo, async tx => { await checked.list(tx, a); await checked.read(tx, a, boardResourceUri("e2e")); });
+  expect(handles).toEqual(["tx", "tx"]);
+  handles.length = 0;
+  await checked.list(store.repo.read, a);
+  await checked.read(store.repo.read, a, boardResourceUri("e2e"));
+  expect(handles).toEqual(["pool", "pool"]);
+  checked.close();
+});

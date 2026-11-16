@@ -100,9 +100,32 @@ test("#998: an access check inside a hosted body reads on that body's Tx, one ou
     const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
     const call = service.whoami(principal, context("check-root"));
     await Bun.sleep(0);
+    const queuedAt = checks.length;
     release();
     await holder; await call;
+    expect(checks[queuedAt]).toEqual({ inTxn: true, handle: "tx" });
     expect(checks.filter(c => c.inTxn).length).toBeGreaterThan(2);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { service.close(); }
+});
+
+test("#998 audit: delivery's access check inside the renew, receipt and release bodies reads on that body's Tx", async () => {
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  let op = "open";
+  const service = createDelivery(hosted, { isAuthorized: (_p, r) => {
+    checks.push({ op, inTxn: database.db.inTransaction, handle: r === undefined || r === database.repo.read ? "pool" : "tx" });
+    return true;
+  } });
+  try {
+    await hosted.bind(principal, context("lease-root"), { name: "lease-peer", create: true });
+    const lease = await service.open(principal, context("lease-root"));
+    for (const [name, step] of [["renew", () => service.renew(principal, context("lease-root"), lease.capability)],
+      ["receipt", () => service.receipt(principal, context("lease-root"), lease.capability, [])],
+      ["release", () => service.release(principal, context("lease-root"), lease.capability)]] as const) {
+      op = name;
+      await step();
+    }
+    for (const name of ["renew", "receipt", "release"]) expect(checks.filter(c => c.op === name && c.inTxn)).toEqual([{ op: name, inTxn: true, handle: "tx" }]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { service.close(); }
 });
