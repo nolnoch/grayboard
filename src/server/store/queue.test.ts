@@ -331,7 +331,7 @@ test("an async write body keeps its transaction across awaits: others read commi
     // Resumed: still its own transaction. It reads its uncommitted row, a nested atomic is a savepoint in it, and
     // an effect waits for the commit.
     expect(repo.users.findByEmail("async@example.com")).toBeDefined();
-    repo.atomic(() => addUser(db, "nested@example.com"));
+    repo.atomic(() => repo.users.upsertByEmail(tx, "nested@example.com", null));
     afterCommit(db, () => { seen.push("holder committed"); });
     expect(seen).toEqual(["other's effect"]);
     return "done";
@@ -365,7 +365,7 @@ test("an async write body that rejects after an await rolls back, drops its effe
     repo.users.upsertByEmail(tx, "gone@example.com", null);
     afterCommit(db, () => { seen.push("effect"); });
     await Promise.resolve();
-    repo.atomic(() => addUser(db, "gone-too@example.com"));
+    repo.atomic(() => repo.users.upsertByEmail(tx, "gone-too@example.com", null));
     throw new Error("late");
   })).rejects.toThrow("late");
   expect(repo.users.findByEmail("gone@example.com")).toBeUndefined();
