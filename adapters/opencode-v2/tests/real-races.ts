@@ -96,7 +96,7 @@ export async function realRace(f: {
       case "revocation": {
         const row = app.db.prepare("SELECT grant_id FROM hosted_sessions WHERE source_session_id = ?").get(root) as { grant_id: string };
         const token = app.db.prepare("SELECT hash FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' LIMIT 1").get(row.grant_id) as { hash: string };
-        await app.repo.write(() => app.repo.oauth.revokeToken(token.hash, OPENCODE_CLIENT, Date.now()));
+        await app.repo.write(tx => app.repo.oauth.revokeToken(tx, token.hash, OPENCODE_CLIENT, Date.now()));
         break;
       }
       default: throw new Error("Unknown real race " + scenario);

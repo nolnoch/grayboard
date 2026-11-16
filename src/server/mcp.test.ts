@@ -555,7 +555,7 @@ test("actual access revocation between factory and dispatch prevents mutation", 
   let checks = 0;
   oauth.isAuthorized = principal => {
     const valid = original(principal);
-    if (++checks === 1) seedSync(store.repo, () => store.repo.oauth.revokeToken(principal.accessHash, principal.clientId, Date.now()));
+    if (++checks === 1) seedSync(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
     return valid;
   };
   try {
@@ -602,7 +602,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
     return access;
   }
   const firstAccess = await rotate(), secondAccess = await rotate();
-  await seed(store.repo, () => store.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now()));
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, Date.now()));
   const select = hosted.sessions.snapshot;
   const releases: Array<() => void> = [];
   async function selected(count: number) {
@@ -622,7 +622,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
     headers.set("Authorization", `Bearer ${secondAccess}`);
     const second = client.callTool({ name: "peer_list", arguments: { include_offline: true } });
     await selected(2);
-    await seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(firstAccess), grant.binding.clientId, Date.now()));
+    await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(firstAccess), grant.binding.clientId, Date.now()));
     releases[1]!();
     expect(JSON.stringify(await second)).toContain("alice@example.com/be");
     releases[0]!();
@@ -645,8 +645,8 @@ for (const failure of ["storage", "revoke"] as const) test(`legacy timer contain
   const find = store.repo.oauth.findActiveAccess;
   let reads = 0;
   const hostile = new Proxy({}, { get() { reads++; throw new Error("Bearer PRIVATE"); } });
-  if (failure === "revoke") await seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, Date.now()));
-  store.repo.oauth.findActiveAccess = (...args) => { if (failure === "storage" && args[0] === hashToken(token)) throw hostile; return find(...args); };
+  if (failure === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, Date.now()));
+  store.repo.oauth.findActiveAccess = (...args) => { if (failure === "storage" && args[1] === hashToken(token)) throw hostile; return find(...args); };
   const log = spyOn(console, "error").mockImplementation(() => {});
   const serverFault = spyOn(McpServer.prototype, "close").mockImplementation(() => { throw hostile; });
   const transportFault = spyOn(WebStandardStreamableHTTPServerTransport.prototype, "close").mockImplementation(async () => { throw hostile; });
@@ -788,7 +788,7 @@ for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases mod
   const modern = await connect(), legacy = await connect("2025-11-25");
   await modern.callTool({ name: "board_create", arguments: { name: "expiry", purpose: "admission lifecycle" } });
   await modern.listen({ resourceSubscriptions: ["grayboard://boards/expiry"] });
-  if (ending === "revoke") await seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, time.now));
+  if (ending === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, time.now));
   else time.now += OAUTH_TTL.access + 1;
   tick();
   await untilHosted(() => hosted.activeListens === 0 && hosted.activeLegacySessions === 0 && hosted.activePosts === 0);
@@ -900,7 +900,7 @@ for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) te
     expect(hosted.dormantLegacySessions).toBe(1);
     f.time.now += 1; f.tick();
   } else if (ending === "grant_ended") {
-    await seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(f.grant.refreshToken), OPENCODE_CLIENT, f.time.now));
+    await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(f.grant.refreshToken), OPENCODE_CLIENT, f.time.now));
     f.tick();
   } else if (ending === "shutdown") {
     await hosted.close();
@@ -1090,7 +1090,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
   const fault = kind === "internal" ? new ApplicationError("internal", "SELECT secret FROM private_storage") : new Error("SELECT secret FROM private_storage");
   let oldChecks = 0;
   store.repo.oauth.findActiveAccess = (...args) => {
-    if (args[0] === grant.tokens.accessHash) { oldChecks++; throw fault; }
+    if (args[1] === grant.tokens.accessHash) { oldChecks++; throw fault; }
     return original(...args);
   };
   try {
@@ -1383,8 +1383,8 @@ async function stampedListen(recheckMs = 3_600_000) {
 }
 const aliceRoot = () => store.repo.hosted.all().find(r => !r.root_session_id && r.user_id === user.user_id)!;
 const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][] = [
-  ["access revoke", ({ time }) => seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, time.now))],
-  ["grant revoke", ({ time, grant }) => seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(grant.refreshToken), OPENCODE_CLIENT, time.now))],
+  ["access revoke", ({ time }) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, time.now))],
+  ["grant revoke", ({ time, grant }) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(grant.refreshToken), OPENCODE_CLIENT, time.now))],
   ["sign-out everywhere", () => seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id))],
   ["disable", () => seed(store.repo, tx => store.repo.users.setDisabled(tx, user.user_id, true))],
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
@@ -1402,7 +1402,7 @@ for (const [what, end] of ends) test(`#899: a stamped listen ends within a strea
 
 test("#899: a failed generation read leaves every stream to phase B's full check, which closes a revoked one", async () => {
   const f = await stampedListen();
-  await seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, f.time.now));
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, f.time.now));
   const authGeneration = store.repo.authGeneration;
   store.repo.authGeneration = () => { throw new Error("generation read failed"); };
   try { f.tickStream(); } finally { store.repo.authGeneration = authGeneration; }

@@ -234,7 +234,7 @@ for (const boundary of ["quota", "body", "store"] as const) for (const invalidat
   }
   const operation = send(req);
   await entered.promise;
-  if (invalidation === "revoke") await seed(store.repo, () => store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now));
+  if (invalidation === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   if (invalidation === "expire") now += 60 * 60 * 1000;
   if (invalidation === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
   if (invalidation === "identity") await seed(store.repo, () => store.repo.aliases.remove(`${issued.authed.user_email}/be`));
@@ -257,7 +257,7 @@ test("a concurrently bound upload survives fail-closed cleanup", async () => {
     bindAttachments(store.db, [row.id], { addresses: ["alice@example.com/be"], principal: "alice@example.com" }, { message_id: inserted.id }, store.repo.attachmentLimits);
     return inserted;
   });
-  await seed(store.repo, () => store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now));
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   resume.resolve();
   expect((await operation).status).toBe(401);
   expect(getAttachment(store.db, row.id)?.message_id).toBe(message.id);
@@ -270,7 +270,7 @@ for (const change of ["revoke", "expire", "disable", "identity", "retention", "f
   store.repo.blobs.get = async hash => { const data = await original(hash); entered.resolve(); await resume.promise; if (change === "fault") throw new Error("secret SQL /blob/path"); return data; };
   const operation = send(request("GET", `/mcp/attachments/${id}?identity=be`));
   await entered.promise;
-  if (change === "revoke") await seed(store.repo, () => store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now));
+  if (change === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   if (change === "expire") now += 60 * 60 * 1000;
   if (change === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
   if (change === "identity") await seed(store.repo, () => store.repo.aliases.remove(`${issued.authed.user_email}/be`));
@@ -291,7 +291,7 @@ test("release rechecks authorization after the async sweep without resurrecting 
   store.repo.blobs.delete = async hash => { entered.resolve(); await resume.promise; await original(hash); };
   const releasing = send(request("DELETE", `/mcp/attachments/${id}?identity=be`));
   await entered.promise;
-  await seed(store.repo, () => store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now));
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   resume.resolve();
   expect((await releasing).status).toBe(401);
   expect(getAttachment(store.db, id)).toBeUndefined();
@@ -301,7 +301,7 @@ test("revocation does not disguise a simultaneous failed blob put as authenticat
   const entered = deferred(), resume = deferred();
   store.repo.blobs.put = async () => { entered.resolve(); await resume.promise; throw new Error("secret disk failure"); };
   const storing = send(); await entered.promise;
-  await seed(store.repo, () => store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now));
+  await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   resume.resolve();
   const response = await storing;
   expect(response.status).toBe(500);

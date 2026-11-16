@@ -872,7 +872,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     return value;
   };
   const hosted = makeHostedStore(db);
-  const oauth = makeOAuthStore(db, hosted, (userId, tokenHash, label, now) => insertSession(db, userId, tokenHash, label, now));
+  const oauth = makeOAuthStore(hosted);
   // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
   // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
   // on every cached auth read.
@@ -916,14 +916,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // are unexpired, the join's own time conditions; required scopes are checked against the held scopes.
   let accessGeneration: string | undefined;
   const accesses = new Map<string, OAuthAccess>();
-  const findActiveAccess: OAuthStore["findActiveAccess"] = (h, resource, requiredScopes, now) => {
+  // Inside a transaction (authGeneration undefined) it reads on the caller's handle, uncached.
+  const findActiveAccess: OAuthStore["findActiveAccess"] = (r, h, resource, requiredScopes, now) => {
     const g = authGeneration();
-    if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(h, resource, requiredScopes, now);
+    if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(r, h, resource, requiredScopes, now);
     if (g !== accessGeneration) { accesses.clear(); accessGeneration = g; }
     const key = `${resource}\n${h}`;
     let a = accesses.get(key);
     if (!a || !(now < a.expiresAt && now < a.grantExpiresAt)) {
-      a = oauth.findActiveAccess(h, resource, [], now);
+      a = oauth.findActiveAccess(r, h, resource, [], now);
       if (!a) { accesses.delete(key); return undefined; }
       accesses.set(key, a);
     }
@@ -1527,7 +1528,42 @@ function insertSession(db: Database, userId: number, tokenHash: string, label: s
   return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(Number(r.lastInsertRowid))!;
 }
 
-function makeOAuthStore(db: Database, hosted: HostedStore, createSession: (userId: number, tokenHash: string, label: string | null, now: number) => Session): OAuthStore {
+// The OAuth store over its handle (#807 P1c-8): each method runs its statements on the connection its `Tx` or `Read`
+// names (sqliteOf refuses a settled Tx). The hosted sessions a revoked grant or disabled user ends go through the
+// hosted store, which keeps the ambient writer until its slice (#998).
+function makeOAuthStore(hosted: HostedStore): OAuthStore {
+  const ops = new WeakMap<Database, OAuthOps>();
+  const on = (h: Read): OAuthOps => {
+    const db = sqliteOf(h);
+    let o = ops.get(db);
+    if (!o) ops.set(db, o = oauthOps(db, hosted));
+    return o;
+  };
+  return {
+    createRequest: (tx, ...a) => on(tx).createRequest(...a),
+    findRequest: (r, ...a) => on(r).findRequest(...a),
+    bindRequestSession: (tx, ...a) => on(tx).bindRequestSession(...a),
+    createBrowserSession: (tx, ...a) => on(tx).createBrowserSession(...a),
+    findBrowserSession: (r, ...a) => on(r).findBrowserSession(...a),
+    revokeBrowserSession: (tx, ...a) => on(tx).revokeBrowserSession(...a),
+    decideRequest: (tx, ...a) => on(tx).decideRequest(...a),
+    findCodeScopes: (r, ...a) => on(r).findCodeScopes(...a),
+    redeemCode: (tx, ...a) => on(tx).redeemCode(...a),
+    redeemLoginCode: (tx, ...a) => on(tx).redeemLoginCode(...a),
+    findRefreshGrant: (r, ...a) => on(r).findRefreshGrant(...a),
+    rotateRefresh: (tx, ...a) => on(tx).rotateRefresh(...a),
+    revokeToken: (tx, ...a) => on(tx).revokeToken(...a),
+    findActiveAccess: (r, ...a) => on(r).findActiveAccess(...a),
+    isGrantActive: (r, ...a) => on(r).isGrantActive(...a),
+    revokePreBuiltinGrants: (tx, ...a) => on(tx).revokePreBuiltinGrants(...a),
+    cleanup: (tx, ...a) => on(tx).cleanup(...a),
+  };
+}
+
+// The store's methods without their handle, bound to one connection.
+type OAuthOps = { [K in keyof OAuthStore]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => R : never };
+function oauthOps(db: Database, hosted: HostedStore): OAuthOps {
+  const createSession = (userId: number, tokenHash: string, label: string | null, now: number) => insertSession(db, userId, tokenHash, label, now);
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
     insertAudit(db, now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail }));

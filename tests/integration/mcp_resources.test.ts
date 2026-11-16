@@ -288,11 +288,11 @@ test("fresh access of the same grant continues a lease; revoked access and repla
   const sub = await connect(grant.token, "2026-07-28", "subscriber");
   const lease = await open(sub.client, sub.headers);
   const token = randomBytes(32).toString("base64url");
-  const rotated = await seed(app.repo, () => app.repo.oauth.rotateRefresh({ clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(grant.refreshToken), tokens: {
+  const rotated = await seed(app.repo, tx => app.repo.oauth.rotateRefresh(tx, { clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(grant.refreshToken), tokens: {
     ...grant.tokens, accessHash: hashToken(token), refreshHash: hashToken(randomBytes(32).toString("base64url")), accessExpiresAt: clock + OAUTH_TTL.access, refreshExpiresAt: clock + OAUTH_TTL.refresh,
   } }, clock));
   expect(rotated.status).toBe("ok");
-  await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
+  await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
   sub.headers.set("Authorization", `Bearer ${token}`);
   expect(value(await call(sub.client, "delivery_renew")).capability).toBe(lease.capability);
@@ -307,9 +307,9 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
   const grant = await issue();
   const sub = await connect(grant.token, "2026-07-28", "subscriber");
   await open(sub.client, sub.headers);
-  if (action === "access") await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
+  if (action === "access") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
   if (action === "expiry") clock += OAUTH_TTL.access;
-  if (action === "grant") await seed(app.repo, () => app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock));
+  if (action === "grant") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, hashToken(grant.refreshToken), grant.binding.clientId, clock));
   if (action === "disable") await seed(app.repo, tx => app.repo.users.setDisabled(tx, grant.authed.user_id, true));
   if (action === "admin") await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, grant.authed.user_id));
   await expect(sub.client.listResources()).rejects.toThrow();

@@ -152,7 +152,7 @@ test("internal grant liveness survives individual access revocation but never au
   const principal = service.authenticate(request);
   if (principal instanceof Response) throw new Error("expected fixture principal");
   expect(service.isGrantActive(grant.grantId)).toBe(true);
-  await seed(storage.repo, () => storage.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
+  await seed(storage.repo, tx => storage.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
   expect(service.isGrantActive(grant.grantId)).toBe(true);
   expect(service.isAuthorized(principal)).toBe(false);
   expect(service.authenticate(request)).toBeInstanceOf(Response);
@@ -306,7 +306,7 @@ test("the first start with built-in clients revokes the grants and codes an oper
     service.close();
     // A refused config changes nothing: the cutover runs only once the clients parse.
     expect(() => createOAuthServer(storage.repo, { ...config, oauthClients: [{ ...registrations[0]!, clientId: "grayboard-pi" }] })).toThrow("reserved for a built-in client");
-    expect([storage.repo.oauth.isGrantActive(oldPrincipal.grantId, clock), audit().length]).toEqual([true, 0]);
+    expect([storage.repo.oauth.isGrantActive(storage.repo.read, oldPrincipal.grantId, clock), audit().length]).toEqual([true, 0]);
     service = makeService();
     expect(revokedLines().map(([line]) => line)).toEqual([expect.stringContaining("revoked 1 OAuth grant(s)")]);
     expect(audit()).toEqual([{ actor: "you@example.com", target: oldPrincipal.grantId, detail: JSON.stringify({ client_id: "grayboard-pi" }) }]);
@@ -449,7 +449,7 @@ test("OAuth event trail records decisions, grant, strict replay warnings and rev
     const serialized = JSON.stringify(rows) + JSON.stringify(warning.mock.calls);
     for (const value of ["PRIVATE-QUERY", code.code, code.verifier, first.access_token, first.refresh_token, tokens.refresh_token]) expect(serialized).not.toContain(value);
     clock += OAUTH_TTL.grant + 1;
-    await seed(storage.repo, () => storage.repo.oauth.cleanup(clock));
+    await seed(storage.repo, tx => storage.repo.oauth.cleanup(tx, clock));
     expect(storage.db.query("SELECT count(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
     expect(storage.db.query("SELECT actor FROM access_log WHERE action = 'oauth.grant_issued' LIMIT 1").get()).toEqual({ actor: "you@example.com" });
   } finally { warning.mockRestore(); }
@@ -1428,7 +1428,7 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
     expect(authed).not.toBeNull();
     // Kept past its expiry while the session lives, so a late replay is still caught.
     clock += OAUTH_TTL.code + 1;
-    await seed(storage.repo, () => storage.repo.oauth.cleanup(clock));
+    await seed(storage.repo, tx => storage.repo.oauth.cleanup(tx, clock));
     const again = await post("/oauth/token", cliTokenParams(a));
     expect(again.status).toBe(400);
     expect(await again.json()).toEqual({ error: "invalid_grant" });
@@ -1436,7 +1436,7 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
     expect(storage.repo.sessions.findById(storage.repo.read, authed.session_id)!.revoked_at).not.toBeNull();
     expect(accessAudits(storage.db, "oauth.code_replay_revoked")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: CLI_CLIENT_ID, token_session: authed.session_id, level: "warning" } })]);
     // With its session revoked the spent code goes at the next sweep.
-    await seed(storage.repo, () => storage.repo.oauth.cleanup(clock));
+    await seed(storage.repo, tx => storage.repo.oauth.cleanup(tx, clock));
     expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_codes").get()).toEqual({ n: 0 });
   } finally { warning.mockRestore(); }
 });
@@ -1444,7 +1444,7 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
 test("a login code, spent or not, never becomes a grant, and a grant code never a session", async () => {
   const a = await cliCode();
   const binding = { clientId: CLI_CLIENT_ID, resource: service.resource, scopes: [LOGIN_SCOPE], redirectUri: a.redirectUri, codeChallenge: s256(a.verifier), codeHash: hashToken(a.code) };
-  const asGrant = () => seed(storage.repo, () => storage.repo.oauth.redeemCode({ ...binding, grantId: random(), grantExpiresAt: clock + OAUTH_TTL.grant,
+  const asGrant = () => seed(storage.repo, tx => storage.repo.oauth.redeemCode(tx, { ...binding, grantId: random(), grantExpiresAt: clock + OAUTH_TTL.grant,
     tokens: { clientId: CLI_CLIENT_ID, resource: service.resource, scopes: [LOGIN_SCOPE], accessHash: hashToken(random()), refreshHash: hashToken(random()), accessExpiresAt: clock + OAUTH_TTL.access, refreshExpiresAt: clock + OAUTH_TTL.refresh } }, clock));
   expect((await asGrant()).status).toBe("invalid");
   expect((await post("/oauth/token", cliTokenParams(a))).status).toBe(200);
@@ -1453,7 +1453,7 @@ test("a login code, spent or not, never becomes a grant, and a grant code never 
   // The reverse: a grant code presented to the login redeemer.
   const g = await issue("native", "grayboard:tools");
   const grantBinding = { clientId: "native", resource: service.resource, scopes: ["grayboard:tools"], redirectUri: g.redirectUri, codeChallenge: s256(g.verifier), codeHash: hashToken(g.code) };
-  expect((await seed(storage.repo, () => storage.repo.oauth.redeemLoginCode({ ...grantBinding, tokenHash: hashToken(random()), label: null }, clock))).status).toBe("invalid");
+  expect((await seed(storage.repo, tx => storage.repo.oauth.redeemLoginCode(tx, { ...grantBinding, tokenHash: hashToken(random()), label: null }, clock))).status).toBe("invalid");
   expect((await post("/oauth/token", tokenParams(g))).status).toBe(200);
 });
 

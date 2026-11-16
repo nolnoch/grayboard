@@ -25,7 +25,7 @@ const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCO
 function open() {
   database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
   application = createApplication(database.repo, database.db);
-  const isAuthorized = (p: OAuthPrincipal) => database.repo.oauth.isGrantActive(p.grantId, now);
+  const isAuthorized = (p: OAuthPrincipal) => database.repo.oauth.isGrantActive(database.repo.read, p.grantId, now);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized });
   delivery = createDelivery(hosted, { isAuthorized });
 }
@@ -286,7 +286,7 @@ test("G2 ordinary writes do not attach, G1 revoke releases atomically including 
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
   await hosted.register(first.principal, context(first.principal), "child");
   await hosted.run(second.principal, context(second.principal), "peer_status", () => true);
-  await seed(database.repo, () => database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now));
+  await seed(database.repo, tx => database.repo.oauth.revokeToken(tx, hashToken(first.refreshToken), OPENCODE_CLIENT, now));
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "revoked" }]);
   expect(application.aliasHolderId("you@example.com/fe")).toBeNull();
@@ -314,7 +314,7 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.child_registered'").get()?.count).toBe(1);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.grant_attached'").get()?.count).toBe(1);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.lease_closed'").get()?.count).toBe(1);
-  await seed(database.repo, () => database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now));
+  await seed(database.repo, tx => database.repo.oauth.revokeToken(tx, hashToken(first.refreshToken), OPENCODE_CLIENT, now));
   expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("primary", "you@example.com/fe");
   expect(releases()).toEqual([]);
   await seed(database.repo, tx => database.repo.users.setDisabled(tx, second.authed.user_id, true));
@@ -332,7 +332,7 @@ test("opening a pre-hosted SQLite schema adds tables without changing users, mes
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
   close(); open();
   expect(database.repo.aliases.listForScope("person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
-  expect(database.repo.oauth.isGrantActive(first.grantId, now)).toBe(true);
+  expect(database.repo.oauth.isGrantActive(database.repo.read, first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
   expect(hostedRowCount(database.db)).toBe(0);
   await hosted.bind(first.principal, context(first.principal), { name: "fe" });

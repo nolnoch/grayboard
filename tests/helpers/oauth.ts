@@ -23,14 +23,14 @@ function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: s
   const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
   const request = { ...binding, requestHash: hashToken(random()), browserHash: hashToken(random()), csrfHash: hashToken(random()), stateHash: hashToken(random()), consentSessionHash: null, createdAt: now, expiresAt: now + OAUTH_TTL.request };
   const sessionHash = hashToken(random());
-  checked(repo.oauth.createBrowserSession({ sessionHash, userId: user.id, createdAt: now, expiresAt: now + OAUTH_TTL.browser }, now));
-  checked(repo.oauth.createRequest(request, now));
-  checked(repo.oauth.bindRequestSession(request.requestHash, request.browserHash, sessionHash, now));
+  checked(repo.oauth.createBrowserSession(tx, { sessionHash, userId: user.id, createdAt: now, expiresAt: now + OAUTH_TTL.browser }, now));
+  checked(repo.oauth.createRequest(tx, request, now));
+  checked(repo.oauth.bindRequestSession(tx, request.requestHash, request.browserHash, sessionHash, now));
   const code = { ...binding, codeHash: hashToken(random()), userId: user.id, createdAt: now, expiresAt: now + OAUTH_TTL.code };
-  checked(repo.oauth.decideRequest({ requestHash: request.requestHash, browserHash: request.browserHash, csrfHash: request.csrfHash, sessionHash, approve: true, code }, now));
+  checked(repo.oauth.decideRequest(tx, { requestHash: request.requestHash, browserHash: request.browserHash, csrfHash: request.csrfHash, sessionHash, approve: true, code }, now));
   const token = random(), refreshToken = random(), grantId = random();
   const tokens = { ...binding, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh };
-  checked(repo.oauth.redeemCode({ ...binding, codeHash: code.codeHash, grantId, grantExpiresAt: now + OAUTH_TTL.grant, tokens }, now));
+  checked(repo.oauth.redeemCode(tx, { ...binding, codeHash: code.codeHash, grantId, grantExpiresAt: now + OAUTH_TTL.grant, tokens }, now));
   const authed: AuthedUser = { user_id: user.id, user_email: user.email, session_id: 0 };
   return { token, refreshToken, grantId, authed, tokens, binding, now };
 }
@@ -38,7 +38,7 @@ function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: s
 /** Rotates `refreshToken` on the issued grant, as a client's refresh does; the new tokens' lifetimes start at `now`. */
 export async function rotateOAuth(repo: Repo, grant: Pick<IssuedOAuth, "binding" | "tokens">, refreshToken: string, now = Date.now()) {
   const access = random(), refresh = random();
-  const status = await seed(repo, () => repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
+  const status = await seed(repo, tx => repo.oauth.rotateRefresh(tx, { ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
     ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
   } }, now).status);
   return { access, refresh, status };
