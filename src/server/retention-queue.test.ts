@@ -11,6 +11,7 @@ import { claim, claimExpiryTimer } from "../core/claims.ts";
 import { queueFor } from "./store/queue.ts";
 import { createBoard } from "../core/boards.ts";
 import { until } from "../../tests/support/until.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
@@ -32,8 +33,11 @@ const rows = (db: { query: (s: string) => { all: () => unknown[] } }) => (db.que
 
 test("#807: retention while another body holds the write queue waits, then prunes", async () => {
   const { db, repo } = setup();
-  const m = repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
-  db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [m.id]);
+  const m = await seed(repo, () => {
+    const inserted = repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
+    db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [inserted.id]);
+    return inserted;
+  });
   const holder = hold(db);
   const ran = runRetention(repo, db, { messageRetentionDays: 1, auditRetentionDays: 1 } as Config);
   await ticks();
@@ -49,10 +53,12 @@ test("#807: a server claim expiry timer's sweep waits behind another body holdin
   const woken: string[][] = [];
   const timer = claimExpiryTimer(db, h => { woken.push(h); }, undefined, queuedTx(repo));
   cleanups.push(() => timer.stop());
-  repo.users.upsertByEmail("a@example.com", null);
-  repo.aliases.create({ scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
-  createBoard(db, "a@example.com/be", "e2e", "test");
-  claim(db, "a@example.com/be", "soon", { board: "e2e", ttl_minutes: 0.001 });
+  await seed(repo, () => {
+    repo.users.upsertByEmail("a@example.com", null);
+    repo.aliases.create({ scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
+    createBoard(db, "a@example.com/be", "e2e", "test");
+    claim(db, "a@example.com/be", "soon", { board: "e2e", ttl_minutes: 0.001 });
+  });
   // The old sync sweep would hit the queue's top-level guard and retry 5s later: a failure is a test failure.
   const errors = spyOn(console, "error").mockImplementation(() => {});
   cleanups.push(() => errors.mockRestore());

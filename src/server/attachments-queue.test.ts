@@ -2,6 +2,7 @@
 // starts while another body holds the queue waits behind it, instead of opening a transaction beside it.
 import { afterEach, expect, test } from "bun:test";
 import { until } from "../../tests/support/until.ts";
+import { seed } from "../../tests/support/seed.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,7 +61,7 @@ test("#807: an upload released while another body holds the write queue waits, t
 test("#807: a server blob sweep's catalog delete waits behind another body holding the write queue", async () => {
   const { db, repo } = setup();
   const sha = sha256Hex(new TextEncoder().encode("orphan"));
-  db.prepare(`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (?, 6, 0)`).run(sha);
+  await seed(repo, () => { db.prepare(`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (?, 6, 0)`).run(sha); });
   let deleted = false;
   const del = repo.blobs.delete.bind(repo.blobs);
   repo.blobs.delete = async (s: string) => { await del(s); deleted = true; };

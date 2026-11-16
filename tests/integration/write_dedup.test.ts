@@ -26,6 +26,7 @@ import { board, direct } from "../support/events.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
 import { ROOT } from "../support/paths.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 import { until } from "../support/until.ts";
 
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
@@ -471,15 +472,17 @@ describe("dedup and state answers (in process)", () => {
       { user_id: user.id, user_email: user.email, session_id: 0 },
       { deliver() {}, closed() {} },
     );
-    const a = srv.app.application.send(session, "you@example.com/be", "yes");
-    const b = srv.app.application.send(session, "you@example.com/be", "yes") as SendResult & Replayed;
+    // Each line in its own queued body, as the bridge's inWrite runs it.
+    const repo = srv.app.repo;
+    const a = await seed(repo, () => srv.app.application.send(session, "you@example.com/be", "yes"));
+    const b = await seed(repo, () => srv.app.application.send(session, "you@example.com/be", "yes")) as SendResult & Replayed;
     expect(a.message_id).toBeGreaterThan(0);
     expect(b.replayed).toBeUndefined();
     expect(b.message_id).not.toBe(a.message_id);
     expect(n("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);
     const args = { name: "slack-made", purpose: "fixtures" };
-    expect(srv.app.application.call(session, "board_create", args)).toHaveProperty("name", "slack-made");
-    expect(() => srv.app.application.call(session, "board_create", args)).toThrow("already exists");
+    expect(await seed(repo, () => srv.app.application.call(session, "board_create", args))).toHaveProperty("name", "slack-made");
+    await expect(seed(repo, () => srv.app.application.call(session, "board_create", args))).rejects.toThrow("already exists");
     srv.app.application.close(session);
   });
 });
