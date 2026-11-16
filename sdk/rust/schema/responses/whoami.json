@@ -10,7 +10,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"id\": \"id:0000000000002\",\n  \"principal\": \"you@example.com\",\n  \"held\": [\n    \"you@example.com/rec-a\"\n  ],\n  \"primary\": \"you@example.com/rec-a\",\n  \"ownership\": 1\n}"
+        "text": "{\n  \"id\": \"id:#1\",\n  \"principal\": \"you@example.com\",\n  \"held\": [\n    \"you@example.com/rec-a\"\n  ],\n  \"primary\": \"you@example.com/rec-a\",\n  \"ownership\": 1\n}"
       }
     ]
   }

@@ -755,3 +755,83 @@ async fn confirmations_and_results_that_are_not_refusals() {
         (&[1][..], &[2][..])
     );
 }
+
+/// Fields the server adds only on some branch, which the recording doesn't reach: whoami after a revocation (`alias_lost`, objects), an unbound root (`unbound`, `candidates`), a child (`root`, `child`).
+#[tokio::test]
+async fn whoami_reads_the_conditional_fields() {
+    let fake = Fake::start(false, |req, _| {
+        let whoami = json!({
+            "id": "id:abc", "principal": "you@example.com", "held": [], "primary": null, "ownership": 3,
+            "alias_lost": [{"alias": "you@example.com/be", "reason": "removed from team core"}, {"alias": "you@example.com/fe"}],
+            "writes_as": "you@example.com/be", "root": "id:root", "child": true, "unbound": true,
+            "candidates": [{"name": "be", "queued": 2, "claims": 1, "where": null, "suggested": true}]
+        });
+        HttpReply::result(
+            req,
+            json!({"content": [{"type": "text", "text": whoami.to_string()}]}),
+        )
+    })
+    .await;
+    let me = session(&fake).whoami().await.unwrap();
+    let lost: Vec<_> = me
+        .alias_lost
+        .iter()
+        .map(|l| (l.alias.as_str(), l.reason.as_deref()))
+        .collect();
+    assert_eq!(
+        lost,
+        [
+            ("you@example.com/be", Some("removed from team core")),
+            ("you@example.com/fe", None)
+        ]
+    );
+    assert_eq!(
+        (
+            me.writes_as.as_deref(),
+            me.root.as_deref(),
+            me.child,
+            me.unbound
+        ),
+        (Some("you@example.com/be"), Some("id:root"), true, true)
+    );
+    let c = &me.candidates[0];
+    assert_eq!(
+        (
+            c.name.as_str(),
+            c.queued,
+            c.claims,
+            c.where_.as_deref(),
+            c.suggested
+        ),
+        ("be", Some(2), Some(1), None, true)
+    );
+}
+
+/// `dm_ack`'s bare confirmation is a full ack only as `"ok"` or `"ok: …"`; no value and no such text is invalid, not success.
+#[tokio::test]
+async fn dm_ack_defaults_only_on_ok() {
+    let fake = Fake::start(false, |req, _| {
+        let content = match req.body["params"]["arguments"]["message_id"]
+            .as_u64()
+            .unwrap()
+        {
+            1 => json!([{"type": "text", "text": "ok"}]),
+            2 => json!([{"type": "text", "text": "ok: already acked"}]),
+            3 => json!([]),
+            _ => json!([{"type": "text", "text": "done"}]),
+        };
+        HttpReply::result(req, json!({"content": content}))
+    })
+    .await;
+    let s = session(&fake);
+    for id in [1, 2] {
+        let acked = s.dm_ack(DmAckArgs::new(id)).await.unwrap();
+        assert!(acked.acked.is_empty() && acked.not_found.is_empty(), "{id}");
+    }
+    for id in [3, 4] {
+        match s.dm_ack(DmAckArgs::new(id)).await {
+            Err(Error::InvalidResponse(_)) => {}
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+}

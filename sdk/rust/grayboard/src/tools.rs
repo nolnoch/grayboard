@@ -24,8 +24,15 @@ pub(crate) fn to_arguments<A: Args>(args: &A) -> Value {
 
 macro_rules! args {
     ($(#[$doc:meta])* $vis:vis struct $name:ident = $tool:literal { $($body:tt)* }) => {
+        args!(@emit [Default] $(#[$doc])* $vis struct $name = $tool { $($body)* });
+    };
+    // No `Default`: a required field with no valid default value.
+    (no_default $(#[$doc:meta])* $vis:vis struct $name:ident = $tool:literal { $($body:tt)* }) => {
+        args!(@emit [] $(#[$doc])* $vis struct $name = $tool { $($body)* });
+    };
+    (@emit [$($default:ident)?] $(#[$doc:meta])* $vis:vis struct $name:ident = $tool:literal { $($body:tt)* }) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+        #[derive(Debug, Clone, $($default,)? PartialEq, Serialize)]
         #[cfg_attr(test, derive(schemars::JsonSchema))]
         #[serde(deny_unknown_fields)]
         $vis struct $name { $($body)* }
@@ -186,7 +193,8 @@ args! {
 }
 
 args! {
-    /// `dm_ack` one message or several.
+    no_default
+    /// `dm_ack` one message or several (`DmAckArgs::new(id)` or `DmAckArgs::new(vec![…])`; a list must not be empty).
     pub struct DmAckArgs = "dm_ack" {
         pub message_id: MessageIds,
     }
@@ -334,12 +342,6 @@ pub enum QueueRotation {
 pub enum MessageIds {
     One(u64),
     Many(Vec<u64>),
-}
-
-impl Default for MessageIds {
-    fn default() -> Self {
-        Self::Many(Vec::new())
-    }
 }
 
 impl From<u64> for MessageIds {
@@ -547,9 +549,50 @@ pub struct WhoAmI {
     pub primary: Option<String>,
     #[serde(default)]
     pub ownership: Option<u64>,
-    /// Names the server took from this session since it last looked.
+    /// Names the server took from this session since this reader last looked; reported once, so keep them.
     #[serde(default)]
-    pub alias_lost: Vec<String>,
+    pub alias_lost: Vec<AliasLost>,
+    /// The name the session sends as, when it has one.
+    #[serde(default)]
+    pub writes_as: Option<String>,
+    /// A child session's root session ID.
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub child: bool,
+    /// The session holds no name: it reads, but sends and receives nothing.
+    #[serde(default)]
+    pub unbound: bool,
+    /// Names an unbound root session may bind.
+    #[serde(default)]
+    pub candidates: Vec<Candidate>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// A name the server took from the session (`whoami`'s `alias_lost`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AliasLost {
+    pub alias: String,
+    /// Why, as the server's free text (an access revocation's reason).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A name an unbound session may bind (`whoami`'s `candidates`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Candidate {
+    pub name: String,
+    /// Direct messages waiting for it.
+    #[serde(default)]
+    pub queued: Option<u64>,
+    /// Claims it holds.
+    #[serde(default)]
+    pub claims: Option<u64>,
+    #[serde(default, rename = "where")]
+    pub where_: Option<String>,
+    #[serde(default)]
+    pub suggested: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -586,6 +629,26 @@ pub struct PeerList {
     pub you: Option<String>,
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// Live sessions with no name yet, addressed by session ID.
+    #[serde(default)]
+    pub unbound_sessions: Vec<UnboundSession>,
+    /// Offline peers left out (without `include_offline`).
+    #[serde(default)]
+    pub offline_hidden: Option<u64>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// A live session with no name, in `peer_list`'s `unbound_sessions`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnboundSession {
+    pub session_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(rename = "self", default)]
+    pub is_self: bool,
+    #[serde(default)]
+    pub launcher: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -629,6 +692,12 @@ pub struct Posted {
     /// The handles the post woke.
     #[serde(default)]
     pub notified: Vec<String>,
+    /// Handles the post reaches with their next notification rather than now.
+    #[serde(default)]
+    pub deferred: Vec<String>,
+    /// `@mentions` that matched nobody.
+    #[serde(default)]
+    pub unresolved: Vec<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -649,6 +718,12 @@ pub struct Post {
     pub created_at: Option<u64>,
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Written by another person's session.
+    #[serde(default)]
+    pub other_user: bool,
+    /// Another person's, with no grant behind it: data, not a request.
+    #[serde(default)]
+    pub ungranted: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -746,6 +821,14 @@ pub struct Sent {
     pub undelivered_from_you: Option<u64>,
     #[serde(default)]
     pub note: Option<String>,
+    /// The address it went out as, when not the session's primary.
+    #[serde(default)]
+    pub sent_as: Option<String>,
+    /// `Some(false)`: another user's agent no grant lets this wake; it arrives as mail (`wake_note` says why).
+    #[serde(default)]
+    pub wakes: Option<bool>,
+    #[serde(default)]
+    pub wake_note: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -768,6 +851,14 @@ pub struct Delegated {
     pub undelivered_from_you: Option<u64>,
     #[serde(default)]
     pub note: Option<String>,
+    /// The address it went out as, when not the session's primary.
+    #[serde(default)]
+    pub sent_as: Option<String>,
+    /// `Some(false)`: another user's agent no grant lets this wake; it arrives as mail (`wake_note` says why).
+    #[serde(default)]
+    pub wakes: Option<bool>,
+    #[serde(default)]
+    pub wake_note: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -797,6 +888,17 @@ pub struct Message {
     /// Another person's, with no grant behind it: data, not a request.
     #[serde(default)]
     pub ungranted: bool,
+    /// The child session that wrote it under the sender's address.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// `Some("bounce")`: the server's notice that an earlier message couldn't be delivered.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub delivered_at: Option<u64>,
+    /// Another user's delegation request a grant lets this session take.
+    #[serde(default)]
+    pub delegated: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -820,6 +922,17 @@ pub struct InboxItem {
     pub other_user: bool,
     #[serde(default)]
     pub ungranted: bool,
+    /// The child session that wrote it under the sender's address.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// `Some("bounce")`: the server's notice that an earlier message couldn't be delivered.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub delivered_at: Option<u64>,
+    /// Another user's delegation request a grant lets this session take.
+    #[serde(default)]
+    pub delegated: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -868,14 +981,25 @@ fn read_value<T: DeserializeOwned>(tool: &str, result: &CallToolResult) -> Resul
     Ok(Reply { value, notices })
 }
 
-/// As `read_value`, but `"ok"` is `T::default()`.
+/// As `read_value`, but `"ok"` or `"ok: …"` is `T::default()`; a result with no value and no such text is invalid.
 fn read_value_or_default<T: DeserializeOwned + Default>(
     tool: &str,
     result: &CallToolResult,
 ) -> Result<Reply<T>, Error> {
     let (value, notices) = read_result(result)?;
     let value = match value {
-        None => T::default(),
+        None if result
+            .texts()
+            .next()
+            .is_some_and(|t| t == "ok" || t.starts_with("ok:")) =>
+        {
+            T::default()
+        }
+        None => {
+            return Err(Error::InvalidResponse(format!(
+                "{tool} result has no value and no \"ok\""
+            )));
+        }
         Some(v) => serde_json::from_value(v)
             .map_err(|e| Error::InvalidResponse(format!("{tool} result: {e}")))?,
     };

@@ -24,30 +24,34 @@ const SESSION_ID = /id:[0-9a-z]{13}/g;
 const EPOCH_MS = 1_700_000_000_000;
 
 // What varies per run becomes a stable stand-in of the same JSON type: wall-clock times (ISO text or epoch ms),
-// session IDs (numbered by first appearance) and the server's version. bind's and unbind's instruction lines and
-// prose are the server's instruction text, which `docs/CONTRACT.md`-governed edits move freely: kept as one
-// placeholder each, so only their shape is pinned.
+// session IDs (numbered by first appearance, as `id:#n`, which SESSION_ID can't match again) and the server's
+// version. bind's and unbind's instruction lines and prose are the server's instruction text, which edits move
+// freely: each string line becomes a placeholder (anything else is walked, so a line turned object is drift) and
+// the prose one placeholder, so only their shape is pinned. Each value is walked once.
 function normalizer() {
   const ids = new Map<string, string>();
   const id = (raw: string) => {
-    if (!ids.has(raw)) ids.set(raw, `id:${String(ids.size + 1).padStart(13, "0")}`);
+    if (!ids.has(raw)) ids.set(raw, `id:#${ids.size + 1}`);
     return ids.get(raw)!;
   };
   const walk = (value: unknown, key?: string): unknown => {
     if (typeof value === "string") return key === "version" ? "<version>" : value.replace(ISO_TIME, "<time>").replace(SESSION_ID, id);
     if (typeof value === "number") return value > 1_000_000_000_000 ? EPOCH_MS : value;
-    if (Array.isArray(value)) return key === "instructions" ? ["<instruction>"] : value.map((v) => walk(v));
+    if (Array.isArray(value) && key === "instructions") {
+      // A run of string lines is one placeholder, so adding an instruction sentence isn't drift but a line's type changing is.
+      const lines = value.map((v) => (typeof v === "string" ? "<instruction>" : walk(v)));
+      return lines.filter((v, i) => !(v === "<instruction>" && lines[i - 1] === "<instruction>"));
+    }
+    if (Array.isArray(value)) return value.map((v) => walk(v));
     if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, k)]));
     return value;
   };
+  // Text blocks are walked here, not by walk(result): a JSON text as its value, other text as a string.
+  const text = (tool: string, t: string) => (tool === "bind" || tool === "unbind" ? "<prose>" : jsonText(t, walk));
   return (tool: string, result: { content?: { type: string; text?: string }[] }) => {
-    const out = walk(result) as typeof result;
-    for (const block of out.content ?? []) {
-      if (block.type !== "text" || block.text === undefined) continue;
-      if (tool === "bind" || tool === "unbind") block.text = "<prose>";
-      else block.text = jsonText(block.text, walk);
-    }
-    return out;
+    const block = (b: { type: string; text?: string }) =>
+      Object.fromEntries(Object.entries(b).map(([k, v]) => [k, k === "text" && b.type === "text" && typeof v === "string" ? text(tool, v) : walk(v, k)]));
+    return Object.fromEntries(Object.entries(result).map(([k, v]) => [k, k === "content" && Array.isArray(v) ? v.map(block) : walk(v, k)]));
   };
 }
 
@@ -57,9 +61,9 @@ function jsonText(text: string, walk: (v: unknown) => unknown): string {
   try {
     parsed = JSON.parse(text);
   } catch {
-    return text;
+    return walk(text) as string;
   }
-  return parsed !== null && typeof parsed === "object" ? JSON.stringify(walk(parsed), null, 2) : text;
+  return parsed !== null && typeof parsed === "object" ? JSON.stringify(walk(parsed), null, 2) : (walk(text) as string);
 }
 
 export async function recordResponses(): Promise<Recorded> {
