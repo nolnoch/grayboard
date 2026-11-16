@@ -245,9 +245,9 @@ for (const child of [false, true]) test(`external rebind during native dispatch 
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   if (child) await hosted.register(principal, context(principal), "child");
   let dispatched = false;
-  const call = hostedPause("hosted:tool:in-gate", () => hosted.run(principal, context(principal, child ? "child" : "root"), "peer_status", session => {
+  const call = hostedPause("hosted:tool:in-gate", () => hosted.run(principal, context(principal, child ? "child" : "root"), "peer_status", (session, tx) => {
     dispatched = true;
-    return application.call(session, "peer_status", { text: "stale write" });
+    return application.call(tx, session, "peer_status", { text: "stale write" });
   }), async () => { expect(external({ operation: "bind", principal, name: "be" }).ok).toBe(true); });
   await expect(call).rejects.toHaveProperty("code", "unbound");
   expect(dispatched).toBe(false);

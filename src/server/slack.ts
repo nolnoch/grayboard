@@ -24,6 +24,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Deliv
 import { CoreError } from "../core/errors.ts";
 import { failureDiagnostic } from "./diagnostics.ts";
 import { detached } from "./request_context.ts";
+import type { Tx } from "./store/tx.ts";
 
 /** users.info errors that mean Slack won't give this account's email, as opposed to Slack being unreachable. */
 const NO_EMAIL = new Set(["missing_scope", "user_not_found", "user_not_visible"]);
@@ -359,13 +360,13 @@ export class SlackBridge implements SlackLinker {
     // (hosted.run): its refusal rows, which the rollback would drop, are written after it in a body of their own.
     // Bodies hold the write queue one at a time, so the shared session's afterRollback is set only inside one, and
     // cleared once fn (an application operation, async since #807 P1c-3) settles.
-    const inWrite = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const inWrite = async <T>(fn: (tx: Tx) => Promise<T>): Promise<T> => {
       const rows: Array<() => void> = [];
       try {
-        return await repo.write(async () => {
+        return await repo.write(async tx => {
           rows.length = 0;
           session.afterRollback = write => { rows.push(write); };
-          try { return await fn(); } finally { session.afterRollback = undefined; }
+          try { return await fn(tx); } finally { session.afterRollback = undefined; }
         }) as T;
       } catch (error) {
         if (rows.length) {
@@ -382,15 +383,15 @@ export class SlackBridge implements SlackLinker {
       async call(name, args) {
         try {
           if (name === "dm_send") {
-            return { ok: true, value: await inWrite(() => application.send(session, String(args.to), String(args.body), {
+            return { ok: true, value: await inWrite(tx => application.send(tx, session, String(args.to), String(args.body), {
               ...(args.parent_id !== undefined ? { parent_id: Number(args.parent_id) } : {}),
               ...(args.attachment_ids !== undefined ? { attachment_ids: args.attachment_ids as number[] } : {}),
             })) };
           }
           if (name === "dm_thread") {
-            return { ok: true, value: await inWrite(() => application.thread(session, Number(args.thread))) };
+            return { ok: true, value: await inWrite(tx => application.thread(tx, session, Number(args.thread))) };
           }
-          return { ok: true, value: await inWrite(() => application.call(session, name, args)) };
+          return { ok: true, value: await inWrite(tx => application.call(tx, session, name, args)) };
         } catch (e) {
           if (e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError) return { ok: false, error: e.message, ...(typeof (e as { code?: unknown }).code === "string" ? { code: (e as { code: string }).code } : {}) };
           console.error(`[grayboard slack] bus call failed: ${JSON.stringify({ principal: link.user_id, identity: handle, session: session.sessionId, tool: name, protocol: "slack", ...failureDiagnostic("slack-bus", e) })}`);

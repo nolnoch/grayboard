@@ -17,6 +17,7 @@ import {
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, queuedTx, type MessageRow, type Repo, type Sync } from "./db.ts";
+import type { Read, Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
@@ -1016,6 +1017,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       });
     },
     async send(
+      tx: Tx,
       session: ApplicationSession,
       recipient: string,
       body: string,
@@ -1024,25 +1026,25 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session);
       return handleSend(hub, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
-    async delegate(session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
+    async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       valid(session);
       return handleDelegate(hub, session, request);
     },
-    async history(session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
+    async history(r: Read, session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
       valid(session);
       return handleHistory(hub, session, options.peer, options.limit, options.before_id);
     },
-    async thread(session: ApplicationSession, id: number) {
+    async thread(r: Read, session: ApplicationSession, id: number) {
       valid(session);
       return handleThread(session, id, repo);
     },
-    async inbox(session: ApplicationSession, days?: number) {
+    async inbox(r: Read, session: ApplicationSession, days?: number) {
       valid(session);
       childState(session, "dm_inbox");
       return handleInbox(hub, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
-    async pending(session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
+    async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
       valid(session);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(a, "direct", a) }));
@@ -1065,11 +1067,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
           : { ...item, latest: { ...item.latest, ...marks.post(item.latest.id, false) } } })),
       ];
     },
-    async boardCatalog(session: ApplicationSession, after?: string) {
+    async boardCatalog(r: Read, session: ApplicationSession, after?: string) {
       valid(session, true);
       return boardCatalog(db, session.readOnly ? seer(repo, session) : session.primary, after);
     },
-    async boardSnapshot(session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
+    async boardSnapshot(r: Read, session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
       valid(session, true);
       // A resource read is a read like board_read, and carries its marks (#825).
       const snap = snapshot(db, reader(session, board), board, options);
@@ -1112,7 +1114,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     // Acked as the address the row names (S8): receivedUnacked and
     // sentPending match a.reader = m.recipient, or m.sender.
-    async acknowledgeDm(session: ApplicationSession, id: number) {
+    async acknowledgeDm(tx: Tx, session: ApplicationSession, id: number) {
       valid(session);
       childState(session, "dm_ack");
       const m = repo.messages.getById(id), mine = session.addresses;
@@ -1123,11 +1125,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (!m || reader === null) fail("not_found", `no message ${id} to you or pending from you; dm_inbox lists them`);
       repo.messages.ack(reader, m.id);
     },
-    async retract(session: ApplicationSession, id: number) {
+    async retract(tx: Tx, session: ApplicationSession, id: number) {
       valid(session);
       return handleRetract(hub, session, id);
     },
-    async call(session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
+    async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool));
       // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
       try { return handleCall(hub, session, tool, args, publish); }

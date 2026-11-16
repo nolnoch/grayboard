@@ -104,18 +104,18 @@ test("a receipt stamps delivered_at once; a cursor-only delivery shows delivered
 
 test("board observers are independent hints with concealed access and explicit lifecycle cleanup", async () => {
   const a = (await connect(alice, "be", { push: false })).session;
-  await seed(store.repo, () => application.call(a, "board_create", { name: "e2e", purpose: "tests" }));
+  await seed(store.repo, tx => application.call(tx, a, "board_create", { name: "e2e", purpose: "tests" }));
   let changed = 0, closed = 0;
   const unsubscribe = application.observeBoard(a, "#E2E", { changed: () => { changed++; }, closed: () => { closed++; } });
   application.observeBoard(a, "e2e", { changed: () => { throw new Error("ignored hint"); } });
-  await seed(store.repo, () => application.call(a, "board_post", { board: "e2e", body: "hello" }));
+  await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "e2e", body: "hello" }));
   expect(changed).toBe(1);
-  expect((await application.boardSnapshot(a, "e2e")).posts[0]!.body).toBe("hello");
-  expect((await application.boardCatalog(a)).boards.map(b => b.name)).toContain("e2e");
+  expect((await application.boardSnapshot(store.repo.read, a, "e2e")).posts[0]!.body).toBe("hello");
+  expect((await application.boardCatalog(store.repo.read, a)).boards.map(b => b.name)).toContain("e2e");
   unsubscribe();
   unsubscribe();
   expect(closed).toBe(1);
-  await seed(store.repo, () => application.call(a, "board_post", { board: "e2e", body: "later" }));
+  await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "e2e", body: "later" }));
   expect(changed).toBe(1);
   application.close(a);
   expect(() => application.observeBoard(a, "e2e", { changed: () => {} })).toThrow("session is closed");
@@ -127,14 +127,14 @@ test("board observers are independent hints with concealed access and explicit l
 test("#831: board and session observer indexes: a post tells its board's observers, a close ends its session's", async () => {
   const a = (await connect(alice, "be", { push: false })).session;
   const b = (await connect(bob, "fe", { push: false })).session;
-  await seed(store.repo, async () => { for (const name of ["one", "two"]) await application.call(a, "board_create", { name, purpose: "tests" }); });
+  await seed(store.repo, async tx => { for (const name of ["one", "two"]) await application.call(tx, a, "board_create", { name, purpose: "tests" }); });
   const seen: string[] = [];
   const watch = (s: typeof a, board: string, tag: string) =>
     application.observeBoard(s, board, { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
   watch(a, "one", "a1"); watch(a, "two", "a2"); watch(b, "one", "b1");
   const b2off = watch(b, "two", "b2");
   expect(application.observerCount).toBe(4);
-  await seed(store.repo, () => application.call(a, "board_post", { board: "one", body: "x" }));
+  await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "one", body: "x" }));
   expect(seen.sort()).toEqual(["a1+", "b1+"]);
 
   seen.length = 0;
@@ -143,7 +143,7 @@ test("#831: board and session observer indexes: a post tells its board's observe
   expect(application.observerCount).toBe(2);
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
   seen.length = 0;
-  await seed(store.repo, () => application.call(b, "board_post", { board: "two", body: "y" }));
+  await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "two", body: "y" }));
   expect(seen).toEqual(["b2+"]);
 
   // "two"'s last observer leaves, emptying its index entry; a new one on the emptied board is told.
@@ -152,17 +152,17 @@ test("#831: board and session observer indexes: a post tells its board's observe
   watch(b, "two", "b2'");
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
   seen.length = 0;
-  await seed(store.repo, () => application.call(b, "board_post", { board: "two", body: "u" }));
+  await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "two", body: "u" }));
   expect(seen).toEqual(["b2'+"]);
 
   // A second observer of "one" joins and leaves; the board's first is still told.
   seen.length = 0;
   const again = watch(b, "one", "b1'");
-  await seed(store.repo, () => application.call(b, "board_post", { board: "one", body: "z" }));
+  await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "one", body: "z" }));
   expect(seen.sort()).toEqual(["b1'+", "b1+"]);
   again();
   seen.length = 0;
-  await seed(store.repo, () => application.call(b, "board_post", { board: "one", body: "w" }));
+  await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "one", body: "w" }));
   expect(seen).toEqual(["b1+"]);
 
   // A dead session's observer is dropped by the walk that finds it; the board's live observers are still told.
@@ -170,7 +170,7 @@ test("#831: board and session observer indexes: a post tells its board's observe
   watch(c.session, "one", "c1");
   c.session.active = false;
   seen.length = 0;
-  await seed(store.repo, () => application.call(b, "board_post", { board: "one", body: "v" }));
+  await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "one", body: "v" }));
   expect(seen.sort()).toEqual(["b1+", "c1-"]);
   expect(application.observerCount).toBe(2);
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
@@ -213,7 +213,7 @@ test("reserved human authority is a separate trusted method, never a selected cl
   application.disconnectUser(alice.user_id);
   expect(human.active).toBe(true);
   await seed(store.repo, () => store.repo.users.setDisabled(alice.user_id, true));
-  await expect(application.inbox(human)).rejects.toThrow("an admin signed this user out");
+  await expect(application.inbox(store.repo.read, human)).rejects.toThrow("an admin signed this user out");
 });
 
 test("board delivery is typed, replayable and acknowledged separately", async () => {
@@ -237,14 +237,14 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
   const b = (await connect(bob, "fe", { push: false })).session;
   const id = (await a.send("bob@example.com/fe", "pending", { pending: true })).message_id;
   await a.send("bob@example.com/fe", "second");
-  const pending = await application.pending(b, 1);
+  const pending = await application.pending(store.repo.read, b, 1);
   expect(pending).toMatchObject([{ kind: "direct", message: { id, body: "pending", pending: true } }]);
-  expect(await application.pending(b, 1)).toEqual(pending);
+  expect(await application.pending(store.repo.read, b, 1)).toEqual(pending);
   expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
-  await expect(application.pending(b, 101)).rejects.toThrow();
-  await expect(application.pending(b, 0)).rejects.toThrow();
+  await expect(application.pending(store.repo.read, b, 101)).rejects.toThrow();
+  await expect(application.pending(store.repo.read, b, 0)).rejects.toThrow();
   await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
-  await expect(application.pending(b)).rejects.toThrow("an admin signed this user out");
+  await expect(application.pending(store.repo.read, b)).rejects.toThrow("an admin signed this user out");
 });
 
 // Judged by the bundler's import scan, not the source text (#385 item 21): comments, strings and erased
@@ -261,14 +261,14 @@ test("hosted Slack has no dependency on the transitional wire adapter", async ()
 // identity that #announce authority rests on.
 test("unbound hosted reads never use the human address and still list and read boards", async () => {
   const owner = (await connect(alice, "be", { key: "owner-secret" })).session;
-  await seed(store.repo, async () => {
-    await application.call(owner, "board_create", { name: "e2e", purpose: "fixture" });
-    await application.call(owner, "board_post", { board: "e2e", body: "hello" });
+  await seed(store.repo, async tx => {
+    await application.call(tx, owner, "board_create", { name: "e2e", purpose: "fixture" });
+    await application.call(tx, owner, "board_post", { board: "e2e", body: "hello" });
     const team = store.repo.teams.create("private", bob.user_id);
     store.repo.teams.addMember(team.id, bob.user_id);
   });
   const bobBe = (await connect(bob, "be", { key: "bob-secret" })).session;
-  await seed(store.repo, () => application.call(bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" }));
+  await seed(store.repo, tx => application.call(tx, bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" }));
   const asked: string[] = [];
   const principalOf = store.repo.resolver.principalOf.bind(store.repo.resolver);
   store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
@@ -277,13 +277,13 @@ test("unbound hosted reads never use the human address and still list and read b
   await seed(store.repo, () => application.hostedRegister(alice, "id:1111111111111", "opencode"));
   const registered = application.hostedSession(alice, "id:1111111111111", [], null, null, delivery()).session;
   for (const session of [unregistered, registered]) {
-    expect((await application.boardCatalog(session)).boards.map(b => b.name)).toContain("e2e");
-    expect((await application.boardCatalog(session)).boards.map(b => b.name)).not.toContain("secret");
-    expect((await application.boardSnapshot(session, "e2e")).posts.map(p => p.body)).toEqual(["hello"]);
-    await expect(application.boardSnapshot(session, "secret")).rejects.toThrow();
+    expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).toContain("e2e");
+    expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).not.toContain("secret");
+    expect((await application.boardSnapshot(store.repo.read, session, "e2e")).posts.map(p => p.body)).toEqual(["hello"]);
+    await expect(application.boardSnapshot(store.repo.read, session, "secret")).rejects.toThrow();
   }
-  expect(((await application.call(registered, "board_list", {})) as { name: string }[]).map(b => b.name)).toContain("e2e");
-  expect(((await application.call(registered, "board_read", { board: "e2e" })) as { posts: { body: string }[] }).posts.map(p => p.body)).toEqual(["hello"]);
+  expect(((await seed(store.repo, tx => application.call(tx, registered, "board_list", {}))) as { name: string }[]).map(b => b.name)).toContain("e2e");
+  expect(((await seed(store.repo, tx => application.call(tx, registered, "board_read", { board: "e2e" }))) as { posts: { body: string }[] }).posts.map(p => p.body)).toEqual(["hello"]);
   expect(asked.filter(a => a.endsWith("/human"))).toEqual([]);
   expect(store.repo.aliases.find("alice@example.com/human")).toBeUndefined();
   expect(store.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE handle LIKE '%/human'").get()).toEqual({ n: 0 });
@@ -321,28 +321,28 @@ test("unbound hosted sessions cannot use named operations or persist synthetic h
   expect(store.repo.aliases.listForScope("person", alice.user_email)).toEqual([]);
   expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
   const operations = [
-    () => application.send(session, "be", "no"),
-    () => application.delegate(session, { persona: "a researcher", task: "no" }),
-    () => application.history(session),
-    () => application.thread(session, 1),
-    () => application.inbox(session),
+    () => seed(store.repo, tx => application.send(tx, session, "be", "no")),
+    () => seed(store.repo, tx => application.delegate(tx, session, { persona: "a researcher", task: "no" })),
+    () => application.history(store.repo.read, session),
+    () => application.thread(store.repo.read, session, 1),
+    () => application.inbox(store.repo.read, session),
     () => application.receiptDirect(session, [1]),
     () => application.receiptBoards(session, []),
-    () => application.acknowledgeDm(session, 1),
-    () => application.retract(session, 1),
-    () => application.call(session, "board_create", { name: "e2e", purpose: "no" }),
+    () => seed(store.repo, tx => application.acknowledgeDm(tx, session, 1)),
+    () => seed(store.repo, tx => application.retract(tx, session, 1)),
+    () => seed(store.repo, tx => application.call(tx, session, "board_create", { name: "e2e", purpose: "no" })),
   ];
   for (const operation of operations) {
     try { await operation(); throw new Error("operation admitted"); } catch (e) { expect(e).toMatchObject({ code: "unbound" }); }
   }
-  for (const tool of ["board_list", "peer_list", "claim_list"]) await expect(application.call(session, tool, {})).resolves.toBeDefined();
+  for (const tool of ["board_list", "peer_list", "claim_list"]) await expect(seed(store.repo, tx => application.call(tx, session, tool, {}))).resolves.toBeDefined();
   await application.replay(session);
   expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
-  const peers = (await application.call(session, "peer_list", {})) as Record<string, unknown>;
+  const peers = (await seed(store.repo, tx => application.call(tx, session, "peer_list", {}))) as Record<string, unknown>;
   expect(peers).not.toHaveProperty("you");
   expect(peers.unbound_sessions).toMatchObject([{ self: true }]);
   application.disconnectUser(alice.user_id);
-  await expect(application.call(session, "board_list", {})).rejects.toThrow("session is closed");
+  await expect(seed(store.repo, tx => application.call(tx, session, "board_list", {}))).rejects.toThrow("session is closed");
 });
 
 test("hold sessions block binding and candidates without push or online presence; a close leaves the hold", async () => {
@@ -350,7 +350,7 @@ test("hold sessions block binding and candidates without push or online presence
   await owner.call("peer_status", { text: "working" });
   const tools = await connect(alice, "held", { push: false });
   const observer = application.hostedSession(alice, "hosted-observer", [], null, null, delivery()).session;
-  expect(((await application.call(observer, "peer_list", { include_offline: true })) as { peers: unknown[] }).peers).toMatchObject([{ online: false }]);
+  expect(((await seed(store.repo, tx => application.call(tx, observer, "peer_list", { include_offline: true }))) as { peers: unknown[] }).peers).toMatchObject([{ online: false }]);
   expect(tools.session.toolsOnly).toBe(true);
   expect(tools.session.holds).toEqual([]);
   await expect(connect(alice, "held")).rejects.toMatchObject({ code: "alias_held", extra: { holder: expect.stringContaining(owner.id) } });
@@ -467,7 +467,7 @@ test("#807: a rolled-back attachHuman leaves the earlier bridge connection in pl
   store.db.run(`CREATE TRIGGER fail_bind BEFORE INSERT ON binding_events BEGIN SELECT RAISE(ABORT, 'binding refused'); END`);
   await expect(application.attachHuman(alice, delivery())).rejects.toThrow("binding refused");
   expect(first.active).toBe(true);
-  expect(await application.inbox(first)).toBeDefined();
+  expect(await application.inbox(store.repo.read, first)).toBeDefined();
 });
 
 test("#807: attachHuman refuses inside its write when the bridge's check went stale, and registers nothing", async () => {

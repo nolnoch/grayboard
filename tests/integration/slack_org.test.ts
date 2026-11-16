@@ -381,8 +381,8 @@ test("#807: a Slack user's dm_send and board_post run inside a write-queue trans
   const { call, send } = app;
   const seen: Record<string, boolean> = {};
   const queued = () => srv.app.db.inTransaction && queueFor(srv.app.db).mine;
-  app.call = (s, n, a, p) => { seen[n] = queued(); return call.call(app, s, n, a, p); };
-  app.send = (s, to, body, o) => { seen.dm_send = queued(); return send.call(app, s, to, body, o); };
+  app.call = (tx, s, n, a, p) => { seen[n] = queued(); return call.call(app, tx, s, n, a, p); };
+  app.send = (tx, s, to, body, o) => { seen.dm_send = queued(); return send.call(app, tx, s, to, body, o); };
   try {
     slack.say("#e2e queued post");
     slack.say("@be queued dm");
@@ -399,7 +399,7 @@ test("#807: a Slack user's refused call keeps its refusal row", async () => {
   await hosted("alice@example.com", "be");
   const app = srv.app.application;
   const { send } = app;
-  app.send = (s) => {
+  app.send = (_tx, s) => {
     const row = () => writeAudit(srv.app.repo, "delegation.refused", "alice@example.com", "be", {});
     if (s.afterRollback) s.afterRollback(row); else row();
     throw new ApplicationError("forbidden", "stub refusal");

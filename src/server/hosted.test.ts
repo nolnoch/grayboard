@@ -137,7 +137,7 @@ test("hosted source IDs attribute child writes and release only the root alias h
     expect(database.db.query("SELECT principal, keyed, launcher FROM ids WHERE id=?").get(id)).toEqual({ principal: "you@example.com", keyed: 0, launcher: 0 });
   }
   expect(database.db.query("SELECT address, id FROM alias_holds").all()).toEqual([{ address: "you@example.com/be", id: root.id }]);
-  await hosted.run(principal, child, "dm_send", session => application.send(session, "be", "child attribution"));
+  await hosted.run(principal, child, "dm_send", (session, tx) => application.send(tx, session, "be", "child attribution"));
   expect(database.db.query("SELECT sender_id FROM messages WHERE body='child attribution'").get()).toEqual({ sender_id: child.id });
   await hosted.end(principal, root);
   expect(database.db.query("SELECT * FROM alias_holds").all()).toEqual([]);
@@ -380,21 +380,21 @@ test("a child's dm_inbox, dm_ack and board_subscribe are refused child_session; 
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   await hosted.bind(principal, context("peer"), { name: "be", create: true });
   const { child } = await hosted.register(principal, context("root"), "child") as { child: string };
-  const sent = await hosted.run(principal, context("peer"), "dm_send", (s) => application.send(s, "you@example.com/fe", "owed by the root"));
+  const sent = await hosted.run(principal, context("peer"), "dm_send", (s, tx) => application.send(tx, s, "you@example.com/fe", "owed by the root"));
   const message = `${child} is a subagent of you@example.com/fe; its root owns this inbox. dm_thread a thread you wrote to see its replies.`;
-  await expect(hosted.run(principal, context("child"), "dm_inbox", (s) => application.inbox(s))).rejects.toMatchObject({ code: "child_session", message });
-  await expect(hosted.run(principal, context("child"), "dm_ack", (s) => application.acknowledgeDm(s, sent.message_id))).rejects.toMatchObject({ code: "child_session", message });
-  await hosted.run(principal, context("peer"), "board_create", (s) => application.call(s, "board_create", { name: "e2e", purpose: "test" }));
+  await expect(hosted.run(principal, context("child"), "dm_inbox", (s, tx) => application.inbox(tx, s))).rejects.toMatchObject({ code: "child_session", message });
+  await expect(hosted.run(principal, context("child"), "dm_ack", (s, tx) => application.acknowledgeDm(tx, s, sent.message_id))).rejects.toMatchObject({ code: "child_session", message });
+  await hosted.run(principal, context("peer"), "board_create", (s, tx) => application.call(tx, s, "board_create", { name: "e2e", purpose: "test" }));
   const subs = { code: "child_session", message: `${child} is a subagent of you@example.com/fe; its root owns its board subscriptions and thread mutes. board_read reads a board without marking anything read.` };
-  await expect(hosted.run(principal, context("child"), "board_subscribe", (s) => application.call(s, "board_subscribe", { board: "e2e", mode: "push" }))).rejects.toMatchObject(subs);
-  await expect(hosted.run(principal, context("child"), "board_subscribe", (s) => application.call(s, "board_subscribe", { board: "e2e", mode: "off", thread: 1 }))).rejects.toMatchObject(subs);
+  await expect(hosted.run(principal, context("child"), "board_subscribe", (s, tx) => application.call(tx, s, "board_subscribe", { board: "e2e", mode: "push" }))).rejects.toMatchObject(subs);
+  await expect(hosted.run(principal, context("child"), "board_subscribe", (s, tx) => application.call(tx, s, "board_subscribe", { board: "e2e", mode: "off", thread: 1 }))).rejects.toMatchObject(subs);
   expect(database.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE board = 'e2e' AND handle = 'you@example.com/fe'").get()).toEqual({ n: 0 });
-  expect((await hosted.run(principal, context("child"), "dm_history", (s) => application.history(s))).map((m) => m.id)).toEqual([sent.message_id]);
-  expect((await hosted.run(principal, context("child"), "dm_thread", (s) => application.thread(s, sent.message_id))).map((m) => m.id)).toEqual([sent.message_id]);
+  expect((await hosted.run(principal, context("child"), "dm_history", (s, tx) => application.history(tx, s))).map((m) => m.id)).toEqual([sent.message_id]);
+  expect((await hosted.run(principal, context("child"), "dm_thread", (s, tx) => application.thread(tx, s, sent.message_id))).map((m) => m.id)).toEqual([sent.message_id]);
   // The root's inbox still owes it, and the root's own ack settles it.
-  expect((await hosted.run(principal, context("root"), "dm_inbox", (s) => application.inbox(s))).unanswered.map((m) => m.id)).toEqual([sent.message_id]);
-  await hosted.run(principal, context("root"), "dm_ack", (s) => application.acknowledgeDm(s, sent.message_id));
-  expect((await hosted.run(principal, context("root"), "dm_inbox", (s) => application.inbox(s))).unanswered).toEqual([]);
+  expect((await hosted.run(principal, context("root"), "dm_inbox", (s, tx) => application.inbox(tx, s))).unanswered.map((m) => m.id)).toEqual([sent.message_id]);
+  await hosted.run(principal, context("root"), "dm_ack", (s, tx) => application.acknowledgeDm(tx, s, sent.message_id));
+  expect((await hosted.run(principal, context("root"), "dm_inbox", (s, tx) => application.inbox(tx, s))).unanswered).toEqual([]);
 });
 
 // #523 audit 2: under a root with no name yet, a child is offered no names to
@@ -405,9 +405,9 @@ test("a child of an unbound root gets no bind candidates, and its write is refus
   expect(who).toMatchObject({ id: child, root, child: true, unbound: true });
   expect(who).not.toHaveProperty("candidates");
   expect(await hosted.whoami(principal, context("root"))).toHaveProperty("candidates");
-  await expect(hosted.run(principal, context("child"), "dm_send", (s) => application.send(s, "you@example.com/be", "x")))
+  await expect(hosted.run(principal, context("child"), "dm_send", (s, tx) => application.send(tx, s, "you@example.com/be", "x")))
     .rejects.toMatchObject({ code: "unbound", message: `unbound; this session is a subagent of ${root}, which has no bus name yet. Its writes work once ${root} binds one; binding is the root's.` });
-  await expect(hosted.run(principal, context("other"), "dm_send", (s) => application.send(s, "you@example.com/be", "x")))
+  await expect(hosted.run(principal, context("other"), "dm_send", (s, tx) => application.send(tx, s, "you@example.com/be", "x")))
     .rejects.toMatchObject({ code: "unbound", message: "unbound; bind a name first, or have this session's root register it as a child (session_register)" });
 });
 
@@ -417,8 +417,8 @@ test("a child's delegate request and refusal are audited naming the child; the r
   await hosted.bind(principal, context("peer"), { name: "be", create: true });
   const { child } = await hosted.register(principal, context("root"), "child") as { child: string };
   const ask = { persona: "a reviewer", task: "review", to: "be" };
-  await expect(hosted.run(principal, context("child"), "delegate", (s) => application.delegate(s, ask))).rejects.toThrow("isn't a launcher session");
-  await expect(hosted.run(principal, context("root"), "delegate", (s) => application.delegate(s, { ...ask, task: "the root's own" }))).rejects.toThrow("isn't a launcher session");
+  await expect(hosted.run(principal, context("child"), "delegate", (s, tx) => application.delegate(tx, s, ask))).rejects.toThrow("isn't a launcher session");
+  await expect(hosted.run(principal, context("root"), "delegate", (s, tx) => application.delegate(tx, s, { ...ask, task: "the root's own" }))).rejects.toThrow("isn't a launcher session");
   const rows = (database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid").all() as { actor: string; target: string; detail: string }[])
     .map((r) => ({ ...r, detail: JSON.parse(r.detail) as Record<string, unknown> }));
   expect(rows.map((r) => [r.actor, r.target, r.detail.to, r.detail.child])).toEqual([
@@ -428,7 +428,7 @@ test("a child's delegate request and refusal are audited naming the child; the r
   // be declares itself a launcher and goes live: the child's request lands, audited naming it.
   await hosted.whoami(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "peer", [GRAYBOARD_LAUNCHER_META]: true }));
   await delivery.open(principal, context("peer"));
-  const sent = await hosted.run(principal, context("child"), "delegate", (s) => application.delegate(s, { ...ask, task: "now a launcher" }));
+  const sent = await hosted.run(principal, context("child"), "delegate", (s, tx) => application.delegate(tx, s, { ...ask, task: "now a launcher" }));
   const requested = database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.requested'").all() as { actor: string; target: string; detail: string }[];
   expect(requested.map((r) => ({ ...r, detail: JSON.parse(r.detail) }))).toEqual([
     { actor: "you@example.com", target: "you@example.com/be", detail: { requester: "you@example.com/fe", via: "explicit", message_id: sent.message_id, child } },
@@ -765,7 +765,7 @@ test("a hosted root holding two names sends as either with as:, its ID too, and 
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   await hosted.bind(principal, context("peer"), { name: "peer", create: true });
   const id = (context("root") as { id: string }).id;
-  const send = (as: string | undefined, body: string) => hosted.run(principal, context("root"), "dm_send", s => application.send(s, "peer", body, as === undefined ? {} : { as }));
+  const send = (as: string | undefined, body: string) => hosted.run(principal, context("root"), "dm_send", (s, tx) => application.send(tx, s, "peer", body, as === undefined ? {} : { as }));
   await send(undefined, "primary");
   await send("be", "second");
   await send("you@example.com/fe", "full");
@@ -998,9 +998,9 @@ test("a declared launcher is a delegation target, and only its own session's ini
   expect(hostedBoundInstruction(info)).not.toContain("You're a launcher session");
   // The requester is a third session of the same user: the declared launcher takes the request, the other is not a target.
   await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
-  const result = await hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it" }));
+  const result = await hosted.run(generic, ctx("req-root"), "delegate", (session, tx) => application.delegate(tx, session, { persona: "researcher", task: "inspect it" }));
   expect(result).toMatchObject({ to: "you@example.com/lead" });
-  await expect(hosted.run(generic, ctx("req-root"), "delegate", session => application.delegate(session, { persona: "researcher", task: "inspect it", to: "plain" }))).rejects.toThrow("isn't a launcher session");
+  await expect(hosted.run(generic, ctx("req-root"), "delegate", (session, tx) => application.delegate(tx, session, { persona: "researcher", task: "inspect it", to: "plain" }))).rejects.toThrow("isn't a launcher session");
   // The text follows the stored flag, not the later request: a restart without the declaration still gets the rule.
   const later = await hosted.bind(generic, ctx("lead-root"), { name: "lead2", create: true });
   expect(instructions(later)).toContain("You're a launcher session");
@@ -1020,7 +1020,7 @@ test("a declared launcher with no live delivery is no delegation target until it
   const lead = ctx("idle-lead", { [GRAYBOARD_LAUNCHER_META]: true });
   await hosted.bind(generic, lead, { name: "idle-lead", create: true });
   await hosted.bind(generic, ctx("idle-req"), { name: "idle-req", create: true });
-  const delegate = (to?: string) => hosted.run(generic, ctx("idle-req"), "delegate", session => application.delegate(session, { persona: "researcher", task: `t ${to ?? "auto"}`, ...(to ? { to } : {}) }));
+  const delegate = (to?: string) => hosted.run(generic, ctx("idle-req"), "delegate", (session, tx) => application.delegate(tx, session, { persona: "researcher", task: `t ${to ?? "auto"}`, ...(to ? { to } : {}) }));
   await expect(delegate("idle-lead")).rejects.toThrow('"you@example.com/idle-lead" is a launcher but offline');
   await expect(delegate()).rejects.toThrow("no live launcher session");
   await delivery.open(generic, lead);
@@ -1086,7 +1086,7 @@ test("a parked child's next call runs as its root's child under the same ownersh
   const before = ownerships();
   now += 900_001; hosted.sweep();
   expect(database.repo.hosted.get(hostedId("child"))?.parked_at).not.toBeNull();
-  await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", "after parking"));
+  await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", "after parking"));
   expect(database.db.query("SELECT sender_id FROM messages WHERE body='after parking'").get()).toEqual({ sender_id: hostedId("child") });
   const row = database.repo.hosted.get(hostedId("child"))!;
   expect(row).toMatchObject({ parked_at: null, root_session_id: hostedId("root"), last_seen_at: now });
@@ -1485,7 +1485,7 @@ test("#902: a bound native call reads its root's holds once, for the bound check
   // `prepare(sql)` hands out the connection's cached statement through `query` (#912).
   const prepare = spyOn(Database.prototype, "query");
   try {
-    await hosted.run(principal, root, "dm_send", session => application.send(session, "be", "held once"));
+    await hosted.run(principal, root, "dm_send", (session, tx) => application.send(tx, session, "be", "held once"));
     // Before #902, named() and snapshot() each read them: two.
     expect(prepare.mock.calls.filter(([s]) => String(s) === "SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").length).toBe(1);
   } finally { prepare.mockRestore(); }
@@ -1526,7 +1526,7 @@ for (const [change, apply] of windows) for (const caller of ["root", "child"] as
       await apply(m);
       const body = `${mode} ${change} ${caller} ${parkedFirst}`;
       const get = spyOn(database.repo.hosted, "get");
-      const result = await hosted.run(principal, context(self), "dm_send", session => application.send(session, m.name, body), undefined, mode === "prior" ? verdict : undefined)
+      const result = await hosted.run(principal, context(self), "dm_send", (session, tx) => application.send(tx, session, m.name, body), undefined, mode === "prior" ? verdict : undefined)
         .then(() => "ok", (e: { code?: string }) => e.code ?? "error").finally(() => { reads.push(get.mock.calls.length); get.mockRestore(); });
       const sent = database.db.query<{ sender_id: string }, [string]>("SELECT sender_id FROM messages WHERE body = ?").get(body)?.sender_id;
       const row = database.repo.hosted.get(hostedId(self));
@@ -1571,7 +1571,7 @@ test("a child's native tool call under its exchange's verdict coalesces its touc
   const call = async () => {
     const { verdict } = await hosted.snapshot(principal, context("child"), false);
     const touches = spyOn(database.repo.hosted, "touch");
-    try { await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[0]); }
+    try { await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[0]); }
     finally { touches.mockRestore(); }
   };
   const start = [seen("root"), seen("child")];
@@ -1583,7 +1583,7 @@ test("a child's native tool call under its exchange's verdict coalesces its touc
   const { verdict } = await hosted.snapshot(principal, context("child"), false);
   now += 5_000;
   const touches = spyOn(database.repo.hosted, "touch");
-  await hosted.run(principal, context("child"), "dm_send", session => application.send(session, "be", "late"), undefined, verdict);
+  await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", "late"), undefined, verdict);
   const touched = touches.mock.calls.map(c => c[0]).sort();
   touches.mockRestore();
   expect(touched).toEqual([hostedId("child"), hostedId("root")].sort());

@@ -42,7 +42,7 @@ async function select(user: AuthedUser, name = "be", push = false) {
 }
 // A board or claim tool on a raw session, in a queued body, as hosted run holds the write queue around a tool.
 async function call<T = unknown>(session: ApplicationSession, tool: string, args: Record<string, unknown>): Promise<T> {
-  return await seed(store.repo, () => application.call(session, tool, args)) as T;
+  return await seed(store.repo, tx => application.call(tx, session, tool, args)) as T;
 }
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
@@ -104,13 +104,13 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
   expect([h1.counts.changed, h2.counts.changed, h3.counts.changed]).toEqual([1, 1, 1]);
   expect((await resources.read(a, boardResourceUri("e2e"))).posts[0]!.body).toBe("hello");
   expect(ownerEvents).toEqual([]);
-  const peers = (await application.call(a, "peer_list", {})) as { peers: { handle: string; status?: string; online: boolean }[] };
+  const peers = (await call(a, "peer_list", {})) as { peers: { handle: string; status?: string; online: boolean }[] };
   expect(peers.peers.find(p => p.handle === a.identityFull)).toMatchObject({ status: "working", online: true });
   // #284: a held alias refuses another session's bind as alias_held (was identity_in_use).
   await expect(select(alice, "be", true)).rejects.toMatchObject({ code: "alias_held" });
   resources.close();
   expect([h1.counts.closed, h2.counts.closed, h3.counts.closed]).toEqual([1, 1, 1]);
-  await seed(store.repo, () => application.send(b, a.identityFull, "direct"));
+  await seed(store.repo, tx => application.send(tx, b, a.identityFull, "direct"));
   expect(ownerEvents).toHaveLength(1);
   expect(store.repo.cursors.directFor(a.identityFull)).toBe(0);
 });
@@ -176,11 +176,11 @@ test("failed/missed callbacks do not acknowledge; reconcile reads recover and ca
   await call(a, "board_post", { board: "e2e", body: "second" });
   await Promise.resolve();
   expect(good.counts.changed).toBe(2);
-  const pending = await application.pending(b);
+  const pending = await application.pending(store.repo.read, b);
   expect(pending).toHaveLength(2);
   expect((await resources.read(b, boardResourceUri("e2e"))).posts.map(p => p.body)).toEqual(["first", "second"]);
   expect((await resources.read(b, boardResourceUri("e2e"))).posts.map(p => p.body)).toEqual(["first", "second"]);
-  expect(await application.pending(b)).toEqual(pending);
+  expect(await application.pending(store.repo.read, b)).toEqual(pending);
 });
 
 test("claim create/update/release and refused acquisition's opportunistic lapse signal without attention watchers", async () => {
@@ -215,7 +215,7 @@ test("claim create/update/release and refused acquisition's opportunistic lapse 
   ]);
   expect(isSubscribed(store.db, a.identityFull, "e2e")).toBe(false);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
-  expect(await application.pending(b)).toEqual([]);
+  expect(await application.pending(store.repo.read, b)).toEqual([]);
 });
 
 test("rolled back claims and unauthorized board mutations emit no hint or transient lapse", async () => {
@@ -325,7 +325,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     expect(state()).toEqual(before);
     for (const session of [a, b]) {
       expect(isSubscribed(store.db, session.identityFull, "e2e")).toBe(false);
-      expect(await application.pending(session)).toEqual([]);
+      expect(await application.pending(store.repo.read, session)).toEqual([]);
       expect(store.repo.cursors.directFor(session.identityFull)).toBe(0);
     }
   } finally { touches.cancelAll(); server.stop(true); }
@@ -346,7 +346,7 @@ test("timer expiry independently hints with no attention subscribers", async () 
   expect((await resources.read(b, uri)).posts.at(-1)!.body).toStartWith("[expired] short:");
   expect(isSubscribed(store.db, a.identityFull, "e2e")).toBe(false);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
-  expect(await application.pending(b)).toEqual([]);
+  expect(await application.pending(store.repo.read, b)).toEqual([]);
 });
 
 test("retention hints only actual committed post deletions and snapshot reads leave attention state intact", async () => {

@@ -15,6 +15,7 @@ import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { afterCommit } from "../core/sqlite.ts";
 import { seed } from "../../tests/support/seed.ts";
+import type { Tx } from "./store/tx.ts";
 
 const origin = "https://grayboard.example.com";
 let dir: string;
@@ -57,12 +58,12 @@ afterEach(async () => {
 function failAudit(action: string) {
   database.db.exec(`CREATE TRIGGER fail_late_audit BEFORE INSERT ON access_log WHEN NEW.action = '${action}' BEGIN SELECT RAISE(ABORT, 'forced late audit failure'); END`);
 }
-const delegate = (session: Parameters<typeof application.delegate>[0]) => application.delegate(session, { persona: "researcher", task: "inspect commit boundary", to: "launcher" });
+const delegate = (session: Parameters<typeof application.delegate>[1], tx: Tx) => application.delegate(tx, session, { persona: "researcher", task: "inspect commit boundary", to: "launcher" });
 
 for (const tool of ["dm_send", "delegate"]) test(`${tool}: late hosted audit rollback discards live payload`, async () => {
   failAudit("hosted.write");
-  await expect(mcp.sessions.run(principal, context(), tool, session => tool === "delegate" ? delegate(session) : application.send(session, "launcher", "no ghost"))).rejects.toThrow("forced late audit failure");
-  expect(await application.history(recipient.session)).toEqual([]);
+  await expect(mcp.sessions.run(principal, context(), tool, (session, tx) => tool === "delegate" ? delegate(session, tx) : application.send(tx, session, "launcher", "no ghost"))).rejects.toThrow("forced late audit failure");
+  expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
   expect(events).toEqual([]);
   expect(database.db.query("SELECT * FROM write_receipts").all()).toEqual([]);
   expect(database.db.query("SELECT action FROM access_log WHERE action IN ('request.replayed', 'request.resent', 'delegation.requested')").all()).toEqual([]);
@@ -80,7 +81,7 @@ test("actual HTTP delegation audit rollback cannot publish a launcher request", 
   expect(response.status).toBe(200);
   expect(JSON.parse(body)).toMatchObject({ id: "rollback", result: { isError: true, content: [{ type: "text", text: "error: internal error" }] } });
   expect(body).not.toContain("forced late audit");
-  expect(await application.history(recipient.session)).toEqual([]); expect(events).toEqual([]);
+  expect(await application.history(database.repo.read, recipient.session)).toEqual([]); expect(events).toEqual([]);
 });
 
 test("live sink sees committed message and both delegation audits on a separate connection", async () => {
@@ -105,9 +106,9 @@ test("postcommit sink failure cannot fail or roll back a committed native messag
   const log = spyOn(console, "error").mockImplementation(() => {});
   recipient.session.sink.deliver = () => { throw new Error("closed transport"); };
   try {
-    const sent = await mcp.sessions.run(principal, context(), "dm_send", session => application.send(session, "launcher", "durable despite sink"));
+    const sent = await mcp.sessions.run(principal, context(), "dm_send", (session, tx) => application.send(tx, session, "launcher", "durable despite sink"));
     expect(sent.message_id).toBeGreaterThan(0);
-    expect(await application.history(recipient.session)).toHaveLength(1);
+    expect(await application.history(database.repo.read, recipient.session)).toHaveLength(1);
     expect(database.db.query("SELECT action FROM access_log WHERE action='hosted.write'").all()).toHaveLength(1);
     expect(log).toHaveBeenCalled();
   } finally { log.mockRestore(); }
@@ -122,10 +123,10 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
   try {
     // Each send's promise is awaited after the synchronous savepoint that started it: its writes ran inside it,
     // and a refusal fails the test here rather than as an unhandled rejection.
-    await expect(seed(database.repo, async () => {
+    await expect(seed(database.repo, async tx => {
       let sent: Promise<unknown> | undefined;
       database.repo.hosted.atomic(() => {
-        sent = application.send(recipient.session, "launcher", "rolled back nested");
+        sent = application.send(tx, recipient.session, "launcher", "rolled back nested");
         database.repo.hosted.end(context().id!, "closed", Date.now());
       });
       await sent;
@@ -136,16 +137,16 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
     expect(events).toEqual([]); expect(invalidations).toBe(0);
     expect(closed).not.toHaveBeenCalled();
     expect(database.repo.hosted.get(context().id!)).toBeDefined();
-    expect(await application.history(recipient.session)).toEqual([]);
+    expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
     // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
-    await seed(database.repo, async () => {
+    await seed(database.repo, async tx => {
       let sent: Promise<unknown> | undefined;
-      database.repo.hosted.atomic(() => { sent = application.send(recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(id, Date.now()); });
+      database.repo.hosted.atomic(() => { sent = application.send(tx, recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(id, Date.now()); });
       await sent;
       expect(events).toEqual([]); expect(invalidations).toBe(0);
     });
     expect(events).toHaveLength(1); expect(invalidations).toBe(0);
-    await seed(database.repo, () => {
+    await seed(database.repo, tx => {
       database.repo.hosted.atomic(() => database.repo.hosted.end(id, "closed", Date.now()));
       expect(invalidations).toBe(0);
     });
@@ -156,46 +157,46 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
 
 test("caught inner rollback discards only inner effects and preserves outer effect ordering", async () => {
   const observed: string[] = [];
-  await seed(database.repo, async () => {
+  await seed(database.repo, async tx => {
     afterCommit(database.db, () => { observed.push("outer-first"); });
     let ghost: Promise<unknown> | undefined;
     expect(() => database.db.transaction(() => {
-      ghost = application.send(recipient.session, "launcher", "inner ghost");
+      ghost = application.send(tx, recipient.session, "launcher", "inner ghost");
       throw new Error("inner rollback");
     }).deferred()).toThrow("inner rollback");
     await ghost;
-    await database.repo.hosted.atomic(() => application.send(recipient.session, "launcher", "outer durable"));
+    await database.repo.hosted.atomic(() => application.send(tx, recipient.session, "launcher", "outer durable"));
     afterCommit(database.db, () => { observed.push("outer-last"); });
     expect(events).toEqual([]);
   });
   expect(observed).toEqual(["outer-first", "outer-last"]);
-  expect(events).toHaveLength(1); expect((await application.history(recipient.session)).map(message => message.body)).toEqual(["outer durable"]);
+  expect(events).toHaveLength(1); expect((await application.history(database.repo.read, recipient.session)).map(message => message.body)).toEqual(["outer durable"]);
 });
 
 test("rolled-back board post neither publishes payload nor invalidates observers or inflight state", async () => {
-  await seed(database.repo, async () => {
-    await application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-    await application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+  await seed(database.repo, async tx => {
+    await application.call(tx, recipient.session, "board_create", { name: "updates", purpose: "test" });
+    await application.call(tx, recipient.session, "board_subscribe", { board: "updates", mode: "push" });
   });
   const observer = mock(() => {});
   application.observeBoard(recipient.session, "updates", { changed: observer });
   events.length = 0;
   failAudit("hosted.write");
-  await expect(mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "no ghost post" }))).rejects.toThrow();
+  await expect(mcp.sessions.run(principal, context(), "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "updates", body: "no ghost post" }))).rejects.toThrow();
   expect(events).toEqual([]); expect(observer).not.toHaveBeenCalled(); expect(recipient.session.inflight.size).toBe(0);
   database.db.exec("DROP TRIGGER fail_late_audit");
-  await mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "committed post" }));
+  await mcp.sessions.run(principal, context(), "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "updates", body: "committed post" }));
   expect(events.some(event => event.kind === "board")).toBe(true); expect(observer).toHaveBeenCalled();
 });
 
 test("failed SQLite COMMIT discards queued payload and leaves the connection reusable", async () => {
   database.db.exec("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_child(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)");
-  await expect(seed(database.repo, async () => {
-    await application.send(recipient.session, "launcher", "commit must fail");
+  await expect(seed(database.repo, async tx => {
+    await application.send(tx, recipient.session, "launcher", "commit must fail");
     database.db.run("INSERT INTO commit_child(parent) VALUES (1)");
   })).rejects.toThrow();
-  expect(events).toEqual([]); expect(await application.history(recipient.session)).toEqual([]);
-  await seed(database.repo, () => application.send(recipient.session, "launcher", "next commit succeeds"));
+  expect(events).toEqual([]); expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
+  await seed(database.repo, tx => application.send(tx, recipient.session, "launcher", "next commit succeeds"));
   expect(events).toHaveLength(1);
 });
 
@@ -203,18 +204,18 @@ test("a failing postcommit effect does not suppress later effects or retain boar
   const log = spyOn(console, "error").mockImplementation(() => {});
   const observed: string[] = [];
   try {
-    await seed(database.repo, () => {
+    await seed(database.repo, tx => {
       afterCommit(database.db, () => { throw new Error("first failed"); });
       afterCommit(database.db, async () => { throw new Error("async failed"); });
       afterCommit(database.db, () => { observed.push("last delivered"); });
     });
     expect(observed).toEqual(["last delivered"]);
-    await seed(database.repo, async () => {
-      await application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-      await application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+    await seed(database.repo, async tx => {
+      await application.call(tx, recipient.session, "board_create", { name: "updates", purpose: "test" });
+      await application.call(tx, recipient.session, "board_subscribe", { board: "updates", mode: "push" });
     });
     recipient.session.sink.deliver = () => { throw new Error("board sink failed"); };
-    await mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "durable post" }));
+    await mcp.sessions.run(principal, context(), "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "updates", body: "durable post" }));
     expect(recipient.session.inflight.size).toBe(0);
     recipient.session.sink.deliver = event => { events.push(event); };
     application.wake([recipient.session.identityFull]);
@@ -225,7 +226,7 @@ test("a failing postcommit effect does not suppress later effects or retain boar
 
 // #452: a refusal thrown inside `hosted.run`'s transaction rolls its audit row back with the call, so the row is written after the unwind.
 const refusals = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'delegation.refused'").all() as { actor: string; target: string; detail: string }[];
-const refused = (request: Parameters<typeof application.delegate>[1]) => mcp.sessions.run(principal, context(), "delegate", session => application.delegate(session, request));
+const refused = (request: Parameters<typeof application.delegate>[2]) => mcp.sessions.run(principal, context(), "delegate", (session, tx) => application.delegate(tx, session, request));
 
 test("hosted delegate: an unresolvable `to` leaves its refusal audit row", async () => {
   await expect(refused({ persona: "researcher", task: "x", to: "nobody-here" })).rejects.toThrow();

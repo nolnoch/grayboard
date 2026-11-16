@@ -18,6 +18,7 @@ import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
 import { countRefusal } from "./metrics.ts";
+import type { Tx } from "./store/tx.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
 // an empty string clears it (#558).
@@ -676,7 +677,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     },
     // `told` (a native tool call): gets the alias_lost notice, if any, for the result. `prior`: its exchange's
     // verdict (#907).
-    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
+    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
       const body = async (row: HostedSession | undefined) => {
         const pending = told ? takeLost(p, row, "agent") : undefined;
         const taken = pending ? await pending : [];
@@ -691,9 +692,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         selected.session.afterRollback = late.defer;
         try {
           await testPauseAsync("hosted:tool:in-gate");
-          return await store.write<T>(async () => {
+          return await store.write<T>(async tx => {
             fence(p, row, root);
-            const value = await fn(selected.session);
+            const value = await fn(selected.session, tx);
             if (!writeReads.has(tool)) audit(row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
             return value;
           });

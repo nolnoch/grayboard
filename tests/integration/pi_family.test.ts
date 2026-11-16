@@ -210,7 +210,7 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
 
   // The Slack bridge's in-process human for this user.
   const human = await srv.app.application.attachHuman({ user_id: user, user_email: EMAIL, session_id: 0 }, { deliver() {}, closed() {} });
-  await seed(srv.app.repo, () => srv.app.application.send(human.session, `${EMAIL}/alpha`, "hello from slack"));
+  await seed(srv.app.repo, tx => srv.app.application.send(tx, human.session, `${EMAIL}/alpha`, "hello from slack"));
   await until(() => alpha.deliveries.length > 1);
   // The first was receipted: the next read admitted only the new item.
   expect(alpha.deliveries).toHaveLength(2);

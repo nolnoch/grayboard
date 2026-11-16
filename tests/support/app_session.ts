@@ -30,6 +30,7 @@ import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
 import type { DelegateRequest, DelegateResult, ErrorCode } from "../../src/shared/protocol.ts";
 import { seed } from "./seed.ts";
 import { until } from "./until.ts";
+import type { Tx } from "../../src/server/store/tx.ts";
 
 type StartedServer = ReturnType<typeof startServer>;
 
@@ -86,7 +87,7 @@ export class AppSession {
   constructor(
     private readonly application: Application,
     // A handler that writes runs in a queued body, as hosted `run` holds the write queue around it (#807 P1b-4f).
-    private readonly repo: Pick<Repo, "write" | "atomic">,
+    private readonly repo: Pick<Repo, "write" | "atomic" | "read">,
     private readonly authed: AuthedUser,
     // The alias to bind after connecting; null stays an unbound session.
     private readonly identity: string | null,
@@ -103,13 +104,13 @@ export class AppSession {
   // session's `afterRollback`) are written after the rollback, in a body of their own. As Slack's inWrite does, the
   // collector is set and cleared inside the body, which holds the write queue, so overlapping calls on one session
   // can't leave it pointing at another call's. fn may be async (an application operation, #807 P1c-3).
-  private async write<T>(session: ApplicationSession, fn: () => T | Promise<T>): Promise<Awaited<T>> {
+  private async write<T>(session: ApplicationSession, fn: (tx: Tx) => T | Promise<T>): Promise<Awaited<T>> {
     const rows: Array<() => void> = [];
     try {
-      return await this.repo.write(async () => {
+      return await this.repo.write(async tx => {
         rows.length = 0;
         session.afterRollback = (w) => { rows.push(w); };
-        try { return await fn(); } finally { session.afterRollback = undefined; }
+        try { return await fn(tx); } finally { session.afterRollback = undefined; }
       }) as Awaited<T>;
     } catch (e) {
       await this.flushRefusal(rows);
@@ -222,29 +223,29 @@ export class AppSession {
     opts: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
   ): Promise<SendResult> {
     const session = this.live();
-    return this.write(session, () => this.application.send(session, recipient, body, opts));
+    return this.write(session, tx => this.application.send(tx, session, recipient, body, opts));
   }
 
   async delegate(req: Omit<DelegateRequest, "type" | "req_id">): Promise<DelegateResult> {
     const session = this.live();
-    return this.write(session, () => this.application.delegate(session, req));
+    return this.write(session, tx => this.application.delegate(tx, session, req));
   }
 
   async history(opts: { peer?: string; limit?: number; before_id?: number } = {}): Promise<HistoryMessage[]> {
-    return this.application.history(this.live(), opts);
+    return this.application.history(this.repo.read, this.live(), opts);
   }
 
   async thread(id: number): Promise<DirectMessage[]> {
-    return this.application.thread(this.live(), id);
+    return this.application.thread(this.repo.read, this.live(), id);
   }
 
   async inbox(days?: number): Promise<InboxResult> {
-    return this.application.inbox(this.live(), days);
+    return this.application.inbox(this.repo.read, this.live(), days);
   }
 
   // The hosted pull (application.pending()): what a lease's next pull carries, writer marks included.
   async pending(limit?: number): Promise<DeliveryEvent[]> {
-    return this.application.pending(this.live(), limit);
+    return this.application.pending(this.repo.read, this.live(), limit);
   }
 
   // A board or claim tool; resolves with the result the call publishes, after
@@ -253,7 +254,7 @@ export class AppSession {
   async call<T = unknown>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
     const session = this.live();
     const { promise, resolve } = Promise.withResolvers<T>();
-    await this.write(session, () => this.application.call(session, tool, args, (result) => resolve(result as T)));
+    await this.write(session, tx => this.application.call(tx, session, tool, args, (result) => resolve(result as T)));
     return promise;
   }
 
@@ -269,12 +270,12 @@ export class AppSession {
 
   async dmAck(id: number): Promise<void> {
     const session = this.live();
-    await this.write(session, () => this.application.acknowledgeDm(session, id));
+    await this.write(session, tx => this.application.acknowledgeDm(tx, session, id));
   }
 
   async retract(id: number): Promise<{ note?: string }> {
     const session = this.live();
-    return this.write(session, () => this.application.retract(session, id));
+    return this.write(session, tx => this.application.retract(tx, session, id));
   }
 
   // The first event matching pred, taken from those already here or the
