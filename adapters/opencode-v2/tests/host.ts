@@ -204,7 +204,7 @@ try {
     await wait(() => app.mcp.activeLeases, n => n === 1, "human-authority lease");
     await invoke(peer.id, "bind", { name: "peer", create: true });
     const ownUser = app.repo.users.findByEmail(email)!;
-    const foreignUser = await app.repo.write(() => app.repo.users.upsertByEmail("other@example.com", "Other fixture"));
+    const foreignUser = await app.repo.write(tx => app.repo.users.upsertByEmail(tx, "other@example.com", "Other fixture"));
     const sink = { deliver() {}, probe: async () => true, closed() {} };
     const ownHuman = await app.application.attachHuman({ user_id: ownUser.id, user_email: ownUser.email, session_id: 0 }, sink);
     const foreignHuman = await app.application.attachHuman({ user_id: foreignUser.id, user_email: foreignUser.email, session_id: 0 }, sink);
@@ -765,7 +765,7 @@ try {
   const oldPending = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/final", "Old account must not retarget", null, false));
   await rpc.enroll({ sessionID: a.id, name: "final", create: true }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit new account approval");
   const lastOpen = await host.session.get({ sessionID: a.id }); assert(lastOpen.metadata);
-  const pendingBeforeDisable = admissions.length; await app.repo.write(() => app.repo.users.setDisabled(app.repo.users.findByEmail(email)!.id, true));
+  const pendingBeforeDisable = admissions.length; await app.repo.write(tx => app.repo.users.setDisabled(tx, app.repo.users.findByEmail(email)!.id, true));
   await wait(() => app.mcp.activeLeases, n => n === 0, "actual user disable ends ownership"); assert.equal(row(a.id), null);
   assert(app.repo.cursors.directFor(app.repo.read, "you@example.com/final") < oldPending.id); assert.equal(admissions.length, pendingBeforeDisable);
   console.log("REAL_ACCOUNT_DRIFT_AND_DISABLE_OK");

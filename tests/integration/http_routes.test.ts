@@ -206,7 +206,7 @@ test("admin unlink-idp clears a user's IdP issuer and subject and audits them", 
   await restart({ admins: ["root@example.com"] });
   const root = await login("root@example.com");
   const okta = "https://example.okta.com";
-  const signIn = (issuer: string, subject: string) => seed(srv.app.repo, () => srv.app.repo.users.signIn(issuer, subject, "bob@example.com", null));
+  const signIn = (issuer: string, subject: string) => seed(srv.app.repo, tx => srv.app.repo.users.signIn(tx, issuer, subject, "bob@example.com", null));
   expect((await signIn(GOOGLE_ISSUER, "google-bob")).status).toBe("ok");
   expect((await signIn(GOOGLE_ISSUER, "google-new")).status).toBe("subject_mismatch");
   expect((await signIn(okta, "okta-bob")).status).toBe("issuer_mismatch");

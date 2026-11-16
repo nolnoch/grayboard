@@ -33,8 +33,8 @@ describe("OAuth domain store", () => {
     const opts = { blobDir: join(dir, "blobs") };
     first = openDatabase(join(dir, "db.sqlite"), opts);
     second = openDatabase(join(dir, "db.sqlite"), opts);
-    await w1(() => {
-      userId = first.repo.users.upsertByEmail("you@example.com", null).id;
+    await w1(tx => {
+      userId = first.repo.users.upsertByEmail(tx, "you@example.com", null).id;
       expect(first.repo.oauth.createBrowserSession({ sessionHash, userId, createdAt: start, expiresAt: start + OAUTH_TTL.browser }, start).status).toBe("ok");
     });
     request = { ...binding, requestHash: h("request"), browserHash: h("browser"), csrfHash: h("csrf"), stateHash: h("state"), consentSessionHash: null, createdAt: start, expiresAt: start + OAUTH_TTL.request };
@@ -123,7 +123,7 @@ describe("OAuth domain store", () => {
     const reopened = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
     expect(reopened.repo.oauth.findCodeScopes(code.codeHash, binding.clientId, binding.resource, binding.redirectUri, start + OAUTH_TTL.code)).toEqual(binding.scopes);
     reopened.db.close();
-    await w1(() => first.repo.users.setDisabled(userId, true));
+    await w1(tx => first.repo.users.setDisabled(tx, userId, true));
     expect(get()).toBeUndefined();
   });
   test("failed insertion rolls back code consumption and half-grant", async () => {
@@ -197,10 +197,10 @@ describe("OAuth domain store", () => {
     expect(o.findActiveAccess(input.tokens.accessHash, "wrong", [], start)).toBeUndefined();
     expect(o.findActiveAccess(input.tokens.accessHash, binding.resource, ["grayboard:delivery"], start)).toBeUndefined();
     expect(o.findActiveAccess(input.tokens.accessHash, binding.resource, [], input.tokens.accessExpiresAt)).toBeUndefined();
-    await w1(() => first.repo.users.setDisabled(userId, true));
+    await w1(tx => first.repo.users.setDisabled(tx, userId, true));
     expect(o.findBrowserSession(sessionHash, start)).toBeUndefined();
     expect(o.isGrantActive(input.grantId, start)).toBe(false);
-    await w1(() => first.repo.users.setDisabled(userId, false));
+    await w1(tx => first.repo.users.setDisabled(tx, userId, false));
     expect(o.isGrantActive(input.grantId, start)).toBe(false);
   });
   test("admin revoke-all includes OAuth; single old-session logout and browser logout do not", async () => {
@@ -386,7 +386,7 @@ describe("OAuth domain store", () => {
     second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
     expect((await w2(() => second.repo.oauth.redeemCode(input, later))).status).toBe("replay");
     await w1(tx => first.repo.sessions.revokeAllForUser(tx, userId));
-    await w1(() => first.repo.users.setDisabled(userId, true));
+    await w1(tx => first.repo.users.setDisabled(tx, userId, true));
     expect(first.db.query("SELECT grant_id FROM oauth_codes WHERE hash = ?").get(code.codeHash)).toEqual({ grant_id: input.grantId });
     expect((await w2(() => second.repo.oauth.redeemCode(input, input.grantExpiresAt))).status).toBe("not_found");
     await w1(() => first.repo.oauth.cleanup(input.grantExpiresAt));
@@ -461,7 +461,7 @@ describe("OAuth domain store", () => {
     await expect(w1(() => first.repo.oauth.revokeToken(input.tokens.refreshHash, binding.clientId, start))).rejects.toThrow("storage failure");
     expect(first.repo.oauth.isGrantActive(input.grantId, start)).toBe(true);
     await expect(w1(tx => first.repo.sessions.revokeAllForUser(tx, userId))).rejects.toThrow("storage failure");
-    await expect(w1(() => first.repo.users.setDisabled(userId, true))).rejects.toThrow("storage failure");
+    await expect(w1(tx => first.repo.users.setDisabled(tx, userId, true))).rejects.toThrow("storage failure");
     expect(first.repo.users.findById(userId)?.disabled_at).toBeNull();
   });
 });

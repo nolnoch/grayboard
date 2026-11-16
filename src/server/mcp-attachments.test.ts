@@ -236,7 +236,7 @@ for (const boundary of ["quota", "body", "store"] as const) for (const invalidat
   await entered.promise;
   if (invalidation === "revoke") await seed(store.repo, () => store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now));
   if (invalidation === "expire") now += 60 * 60 * 1000;
-  if (invalidation === "disable") await seed(store.repo, () => store.repo.users.setDisabled(issued.authed.user_id, true));
+  if (invalidation === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
   if (invalidation === "identity") await seed(store.repo, () => store.repo.aliases.remove(`${issued.authed.user_email}/be`));
   resume.resolve(); release();
   const response = await operation;
@@ -272,7 +272,7 @@ for (const change of ["revoke", "expire", "disable", "identity", "retention", "f
   await entered.promise;
   if (change === "revoke") await seed(store.repo, () => store.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, now));
   if (change === "expire") now += 60 * 60 * 1000;
-  if (change === "disable") await seed(store.repo, () => store.repo.users.setDisabled(issued.authed.user_id, true));
+  if (change === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
   if (change === "identity") await seed(store.repo, () => store.repo.aliases.remove(`${issued.authed.user_email}/be`));
   if (change === "retention") await seed(store.repo, () => store.db.query("DELETE FROM attachments WHERE id = ?").run(id));
   resume.resolve();

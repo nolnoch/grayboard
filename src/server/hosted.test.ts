@@ -37,7 +37,7 @@ beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-hosted-"));
   database = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(database.repo, database.db);
-  const user = await seed(database.repo, () => database.repo.users.upsertByEmail("you@example.com", null));
+  const user = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "you@example.com", null));
   principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
@@ -182,9 +182,9 @@ test("global quota applies across users transactionally without creating an over
   await hosted.whoami(principal, context("template"));
   const template = database.repo.hosted.all()[0]!;
   await hosted.end(principal, context("template"));
-  await seed(database.repo, () => {
+  await seed(database.repo, tx => {
     for (let userIndex = 0; userIndex < hosted.limits.global / hosted.limits.user; userIndex++) {
-      const user = database.repo.users.upsertByEmail(`user${userIndex}@example.com`, null);
+      const user = database.repo.users.upsertByEmail(tx, `user${userIndex}@example.com`, null);
       for (let i = 0; i < hosted.limits.user; i++) {
         const id = `seed-${userIndex}-${i}`;
         const ownership = database.repo.hosted.start(id, user.id, OPENCODE_CLIENT, now);
@@ -451,7 +451,7 @@ test("registration rejects invalid ownership graphs without moving an existing c
   if (!("id" in rootContext)) throw new Error("fixture context missing");
   await expect(hosted.end(principal, context("child"), rootContext.id)).rejects.toHaveProperty("code", "child_session");
   expect(await hosted.whoami(principal, context("child"))).toMatchObject({ primary: "you@example.com/fe", child: true });
-  const foreign = await seed(database.repo, () => database.repo.users.upsertByEmail("peer@example.com", null));
+  const foreign = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "peer@example.com", null));
   const outsider = { ...principal, authed: { user_id: foreign.id, user_email: foreign.email, session_id: 0 } };
   const outsiderContext = sessionContext(outsider, { [OPENCODE_SESSION_META]: "root" });
   expect(await hosted.whoami(outsider, outsiderContext)).toHaveProperty("unbound", true);

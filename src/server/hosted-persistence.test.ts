@@ -317,7 +317,7 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   await seed(database.repo, () => database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now));
   expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("primary", "you@example.com/fe");
   expect(releases()).toEqual([]);
-  await seed(database.repo, () => database.repo.users.setDisabled(second.authed.user_id, true));
+  await seed(database.repo, tx => database.repo.users.setDisabled(tx, second.authed.user_id, true));
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "disabled" }]);
   expect(application.aliasHolderId("you@example.com/fe")).toBeNull();

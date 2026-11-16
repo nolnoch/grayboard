@@ -6,6 +6,7 @@
 import { writeAudit } from "./audit.ts";
 import type { Config } from "./config.ts";
 import type { Repo, User } from "./db.ts";
+import type { Tx } from "./store/tx.ts";
 import { googleProvider } from "./idp_google.ts";
 import { oidcProvider } from "./idp_oidc.ts";
 
@@ -55,12 +56,12 @@ export type SignInProvider = Pick<IdentityProvider, "id" | "label" | "issuer">;
 // provider's constant, never the token's. A refusal's text tells the person
 // signing in what an admin can do and reaches the OAuth client as its error_description; `detail` joins each audit row, and `known`
 // names the provider holding an email another issuer holds. Callers run it
-// inside repo.write.
+// inside repo.write, passing its Tx.
 export function idpSignIn(
-  repo: Repo, provider: SignInProvider, identity: Omit<UpstreamIdentity, "issuer">,
+  repo: Repo, tx: Tx, provider: SignInProvider, identity: Omit<UpstreamIdentity, "issuer">,
   detail: Record<string, unknown> = {}, known: readonly SignInProvider[] = [provider],
 ): { user: User } | { refused: string } {
-  const r = repo.users.signIn(provider.issuer, identity.subject, identity.email, identity.displayName);
+  const r = repo.users.signIn(tx, provider.issuer, identity.subject, identity.email, identity.displayName);
   const audited = { provider: provider.id, issuer: provider.issuer, ...detail };
   const fix = (email: string) => `an admin runs grayboard admin unlink-idp --email ${email}`;
   if (r.status === "issuer_mismatch") {

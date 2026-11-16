@@ -9,6 +9,10 @@ import { queueFor, WriteQueue } from "./queue.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 
 const open = () => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+// A user row written on the ambient connection, not a Tx (#807 P1c-7): the queue's own guards, which atomic and a
+// bare statement go through, are what these tests exercise.
+const addUser = (db: ReturnType<typeof open>["db"], email: string) => { db.run("INSERT INTO users (email, created_at) VALUES (?, 0)", [email]); };
+import type { Tx } from "./tx.ts";
 
 test("an idle queue runs a synchronous body before run() returns", async () => {
   const q = new WriteQueue();
@@ -114,9 +118,9 @@ test("#925: a synchronous body that throws in a backlog rejects only its caller;
 
 test("Repo.write commits a transaction, rolls it back on a throw, and refuses inside an open one", async () => {
   const { repo } = open();
-  await repo.write(() => repo.users.upsertByEmail("a@example.com", null));
+  await repo.write(tx => repo.users.upsertByEmail(tx, "a@example.com", null));
   expect(repo.users.findByEmail("a@example.com")).toBeDefined();
-  await expect(repo.write(() => { repo.users.upsertByEmail("b@example.com", null); throw new Error("boom"); })).rejects.toThrow("boom");
+  await expect(repo.write(tx => { repo.users.upsertByEmail(tx, "b@example.com", null); throw new Error("boom"); })).rejects.toThrow("boom");
   expect(repo.users.findByEmail("b@example.com")).toBeUndefined();
   let nested: Promise<unknown> | undefined;
   await repo.write(() => { nested = repo.write(() => 1); });
@@ -126,15 +130,15 @@ test("Repo.write commits a transaction, rolls it back on a throw, and refuses in
 test("#807: writeNow runs its transaction now through an idle queue, and refuses while the queue is held or a transaction is open", async () => {
   const { db, repo } = open();
   const seen: string[] = [];
-  expect(repo.writeNow(() => { repo.users.upsertByEmail("now@example.com", null); afterCommit(db, () => { seen.push("committed"); }); return 7; })).toBe(7);
+  expect(repo.writeNow(tx => { repo.users.upsertByEmail(tx, "now@example.com", null); afterCommit(db, () => { seen.push("committed"); }); return 7; })).toBe(7);
   expect(seen).toEqual(["committed"]);
   expect(repo.users.findByEmail("now@example.com")).toBeDefined();
-  expect(() => repo.writeNow(() => { repo.users.upsertByEmail("rolled@example.com", null); throw new Error("boom"); })).toThrow("boom");
+  expect(() => repo.writeNow(tx => { repo.users.upsertByEmail(tx, "rolled@example.com", null); throw new Error("boom"); })).toThrow("boom");
   expect(repo.users.findByEmail("rolled@example.com")).toBeUndefined();
   expect(queueFor(db).held).toBe(false);
   let release!: () => void;
   const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
-  expect(() => repo.writeNow(() => repo.users.upsertByEmail("held@example.com", null))).toThrow("writeNow while the write queue is held");
+  expect(() => repo.writeNow(tx => repo.users.upsertByEmail(tx, "held@example.com", null))).toThrow("writeNow while the write queue is held");
   expect(() => repo.hosted.writeNow(() => 1)).toThrow("writeNow while the write queue is held");
   release();
   await holder;
@@ -181,18 +185,18 @@ test("a top-level transaction refuses unless its caller holds the queue; the hol
   const holder = queueFor(db).run(async () => {
     await new Promise<void>(r => { release = r; });
     // The holder, resumed after its await: its own transaction opens.
-    inside = repo.atomic(() => { repo.users.upsertByEmail("holder@example.com", null); return "opened"; });
+    inside = repo.atomic(() => { addUser(db, "holder@example.com"); return "opened"; });
   });
   expect(queueFor(db).mine).toBe(false);
-  expect(() => repo.atomic(() => repo.users.upsertByEmail("other@example.com", null))).toThrow("another body holds the write queue");
+  expect(() => repo.atomic(() => addUser(db, "other@example.com"))).toThrow("another body holds the write queue");
   expect(() => repo.hosted.atomic(() => 1)).toThrow("another body holds the write queue");
   expect(repo.users.findByEmail("other@example.com")).toBeUndefined();
   release();
   await holder;
   expect(inside).toBe("opened");
   // Idle again: a direct transaction, or an autocommit write, is still outside the queue (#807 P1b-4e).
-  expect(() => repo.atomic(() => repo.users.upsertByEmail("after@example.com", null))).toThrow("write outside the write queue");
-  expect(() => repo.users.upsertByEmail("after@example.com", null)).toThrow("write outside the write queue");
+  expect(() => repo.atomic(() => addUser(db, "after@example.com"))).toThrow("write outside the write queue");
+  expect(() => addUser(db, "after@example.com")).toThrow("write outside the write queue");
   // A bare autocommit write, by a statement or by exec (db.run with no bindings); DDL stays open to tests.
   expect(() => db.prepare("DELETE FROM users WHERE email = ?").run("holder@example.com")).toThrow("write outside the write queue");
   expect(() => db.run("DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
@@ -201,7 +205,7 @@ test("a top-level transaction refuses unless its caller holds the queue; the hol
   db.run("CREATE TEMP TRIGGER IF NOT EXISTS t_queue_test AFTER INSERT ON users BEGIN SELECT 1; END");
   expect(repo.users.findByEmail("after@example.com")).toBeUndefined();
   // committed runs inside its body, so a write there (cancel's settle) opens.
-  expect(await repo.write(() => 1, v => repo.atomic(() => { repo.users.upsertByEmail("committed@example.com", null); return v + 1; }))).toBe(2);
+  expect(await repo.write(() => 1, v => repo.atomic(() => { addUser(db, "committed@example.com"); return v + 1; }))).toBe(2);
   expect(repo.users.findByEmail("committed@example.com")).toBeDefined();
 });
 
@@ -232,7 +236,7 @@ test("an async afterCommit effect a body started doesn't pass for a later holder
 test("post runs now on an idle queue, through it, and throws its error there", () => {
   const { db, repo } = open();
   let mine = false;
-  expect(repo.post(() => { mine = queueFor(db).mine; repo.users.upsertByEmail("idle@example.com", null); })).toBe(true);
+  expect(repo.post(tx => { mine = queueFor(db).mine; repo.users.upsertByEmail(tx, "idle@example.com", null); })).toBe(true);
   expect(mine).toBe(true);
   expect(repo.users.findByEmail("idle@example.com")).toBeDefined();
   expect(() => repo.post(() => { throw new Error("now"); })).toThrow("now");
@@ -244,10 +248,10 @@ test("post waits behind another body's hold, lands after it, and outlives the ho
   let release!: () => void;
   const holder = queueFor(db).run(async () => {
     await new Promise<void>(r => { release = r; });
-    try { repo.atomic(() => { repo.users.upsertByEmail("holder@example.com", null); throw new Error("holder rolls back"); }); } catch {}
+    try { repo.atomic(() => { addUser(db, "holder@example.com"); throw new Error("holder rolls back"); }); } catch {}
   });
   const seen: string[] = [];
-  expect(repo.post(() => { repo.users.upsertByEmail("posted@example.com", null); }, () => seen.push("committed"))).toBe(false);
+  expect(repo.post(tx => { repo.users.upsertByEmail(tx, "posted@example.com", null); }, () => seen.push("committed"))).toBe(false);
   expect(repo.users.findByEmail("posted@example.com")).toBeUndefined();
   release();
   await holder;
@@ -261,12 +265,12 @@ test("post inside a write body is part of its transaction; committed runs after 
   const { repo } = open();
   const seen: string[] = [];
   await expect(repo.write(() => {
-    expect(repo.post(() => { repo.users.upsertByEmail("rolled@example.com", null); }, () => seen.push("never"))).toBe(true);
+    expect(repo.post(tx => { repo.users.upsertByEmail(tx, "rolled@example.com", null); }, () => seen.push("never"))).toBe(true);
     throw new Error("body rolls back");
   })).rejects.toThrow("body rolls back");
   expect(repo.users.findByEmail("rolled@example.com")).toBeUndefined();
   await repo.write(() => {
-    repo.post(() => { repo.users.upsertByEmail("kept@example.com", null); }, () => seen.push("committed"));
+    repo.post(tx => { repo.users.upsertByEmail(tx, "kept@example.com", null); }, () => seen.push("committed"));
     seen.push("body");
   });
   expect(repo.users.findByEmail("kept@example.com")).toBeDefined();
@@ -278,7 +282,7 @@ test("post from the holder outside a transaction (its committed callback) opens 
   let inTxn: boolean | undefined;
   await repo.write(() => 1, () => {
     expect(db.inTransaction).toBe(false);
-    expect(repo.post(() => { inTxn = db.inTransaction; repo.users.upsertByEmail("committed-post@example.com", null); })).toBe(true);
+    expect(repo.post(tx => { inTxn = db.inTransaction; repo.users.upsertByEmail(tx, "committed-post@example.com", null); })).toBe(true);
   });
   expect(inTxn).toBe(true);
   expect(repo.users.findByEmail("committed-post@example.com")).toBeDefined();
@@ -320,14 +324,14 @@ test("an async write body keeps its transaction across awaits: others read commi
   const seen: string[] = [];
   let resume!: () => void, entered!: () => void;
   const paused = new Promise<void>(r => { resume = r; }), inside = new Promise<void>(r => { entered = r; });
-  const body = repo.write(async () => {
-    repo.users.upsertByEmail("async@example.com", null);
+  const body = repo.write(async tx => {
+    repo.users.upsertByEmail(tx, "async@example.com", null);
     entered();
     await paused;
     // Resumed: still its own transaction. It reads its uncommitted row, a nested atomic is a savepoint in it, and
     // an effect waits for the commit.
     expect(repo.users.findByEmail("async@example.com")).toBeDefined();
-    repo.atomic(() => repo.users.upsertByEmail("nested@example.com", null));
+    repo.atomic(() => repo.users.upsertByEmail(tx, "nested@example.com", null));
     afterCommit(db, () => { seen.push("holder committed"); });
     expect(seen).toEqual(["other's effect"]);
     return "done";
@@ -337,12 +341,12 @@ test("an async write body keeps its transaction across awaits: others read commi
   // Another task reads committed state (the reader), not the holder's uncommitted row.
   expect(repo.users.findByEmail("async@example.com")).toBeUndefined();
   // Its autocommit write and its top-level transaction are refused; its effect runs now.
-  expect(() => repo.users.upsertByEmail("other@example.com", null)).toThrow("another body holds the write queue");
+  expect(() => addUser(db, "other@example.com")).toThrow("another body holds the write queue");
   expect(() => repo.atomic(() => 1)).toThrow("another body holds the write queue");
   afterCommit(db, () => { seen.push("other's effect"); });
   expect(seen).toEqual(["other's effect"]);
   // A queued write waits its turn and commits after the holder.
-  const waiting = repo.write(() => { seen.push("queued body"); return repo.users.upsertByEmail("queued@example.com", null); });
+  const waiting = repo.write(tx => { seen.push("queued body"); return repo.users.upsertByEmail(tx, "queued@example.com", null); });
   expect(seen).toEqual(["other's effect"]);
   resume();
   expect(await body).toBe("done");
@@ -357,11 +361,11 @@ test("an async write body keeps its transaction across awaits: others read commi
 test("an async write body that rejects after an await rolls back, drops its effects and releases the queue", async () => {
   const { db, repo } = open();
   const seen: string[] = [];
-  await expect(repo.write(async () => {
-    repo.users.upsertByEmail("gone@example.com", null);
+  await expect(repo.write(async tx => {
+    repo.users.upsertByEmail(tx, "gone@example.com", null);
     afterCommit(db, () => { seen.push("effect"); });
     await Promise.resolve();
-    repo.atomic(() => repo.users.upsertByEmail("gone-too@example.com", null));
+    repo.atomic(() => repo.users.upsertByEmail(tx, "gone-too@example.com", null));
     throw new Error("late");
   })).rejects.toThrow("late");
   expect(repo.users.findByEmail("gone@example.com")).toBeUndefined();
@@ -370,7 +374,7 @@ test("an async write body that rejects after an await rolls back, drops its effe
   expect(db.inTransaction).toBe(false);
   expect(queueFor(db).held).toBe(false);
   // The queue goes on: the next body commits.
-  await repo.write(() => repo.users.upsertByEmail("next@example.com", null));
+  await repo.write(tx => repo.users.upsertByEmail(tx, "next@example.com", null));
   expect(repo.users.findByEmail("next@example.com")).toBeDefined();
 });
 
@@ -381,17 +385,17 @@ test("a COMMIT that fails rolls the body back, drops its effects and releases th
   db.run("CREATE TABLE fk_child (p INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED)");
   const seen: string[] = [];
   for (const body of [() => 1, async () => { await Promise.resolve(); return 1; }]) {
-    await expect(repo.write((() => {
-      repo.users.upsertByEmail("orphaned@example.com", null);
+    await expect(repo.write(((tx: Tx) => {
+      repo.users.upsertByEmail(tx, "orphaned@example.com", null);
       db.query("INSERT INTO fk_child (p) VALUES (?)").run(99);
       afterCommit(db, () => { seen.push("effect"); });
       return body();
-    }) as () => Promise<number>)).rejects.toThrow(/FOREIGN KEY/);
+    }) as (tx: Tx) => Promise<number>)).rejects.toThrow(/FOREIGN KEY/);
     expect(repo.users.findByEmail("orphaned@example.com")).toBeUndefined();
     expect(seen).toEqual([]);
     expect(db.inTransaction).toBe(false);
     expect(queueFor(db).held).toBe(false);
   }
-  await repo.write(() => repo.users.upsertByEmail("next@example.com", null));
+  await repo.write(tx => repo.users.upsertByEmail(tx, "next@example.com", null));
   expect(repo.users.findByEmail("next@example.com")).toBeDefined();
 });

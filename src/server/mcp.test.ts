@@ -460,7 +460,7 @@ for (const revoked of [false, true]) test(`authentication lost between HTTP pref
     original(...args);
     seedSync(store.repo, tx => {
       if (revoked) store.repo.sessions.revokeAllForUser(tx, user.user_id);
-      else store.repo.users.setDisabled(user.user_id, true);
+      else store.repo.users.setDisabled(tx, user.user_id, true);
     });
   };
   try {
@@ -1386,7 +1386,7 @@ const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][
   ["access revoke", ({ time }) => seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, time.now))],
   ["grant revoke", ({ time, grant }) => seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(grant.refreshToken), OPENCODE_CLIENT, time.now))],
   ["sign-out everywhere", () => seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id))],
-  ["disable", () => seed(store.repo, () => store.repo.users.setDisabled(user.user_id, true))],
+  ["disable", () => seed(store.repo, tx => store.repo.users.setDisabled(tx, user.user_id, true))],
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
   ["binding change", () => seed(store.repo, () => store.repo.hosted.atomic(() => { const r = aliceRoot(); store.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); }))],
 ];

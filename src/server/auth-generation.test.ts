@@ -5,17 +5,17 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, type Repo } from "./db.ts";
-import { sqliteOf } from "./store/tx.ts";
+import { sqliteOf, type Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 const open = (): Repo => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
 const gate = () => { let open!: () => void; const p = new Promise<void>(r => { open = r; }); return { p, open }; };
 
 // Holds a write body open after `fn`'s writes until the returned release() is called; settles with the body.
-function hold(repo: Repo, fn: () => void, fail = false) {
+function hold(repo: Repo, fn: (tx: Tx) => void, fail = false) {
   const g = gate(), wrote = gate();
-  const done = repo.write(async () => {
-    fn();
+  const done = repo.write(async tx => {
+    fn(tx);
     wrote.open();
     await g.p;
     if (fail) throw new Error("rolled back");
@@ -25,12 +25,12 @@ function hold(repo: Repo, fn: () => void, fail = false) {
 
 test("another task's generation stays the committed one while a holder's uncommitted write is open", async () => {
   const repo = open();
-  const user = repo.writeNow(() => repo.users.upsertByEmail("a@example.com", null));
+  const user = repo.writeNow(tx => repo.users.upsertByEmail(tx, "a@example.com", null));
   const before = repo.authGeneration();
   expect(before).toBeDefined();
   expect(repo.users.activeEmail(user.id)).toBe("a@example.com");
   let inside: string | undefined = "unset";
-  const h = hold(repo, () => { repo.users.setDisabled(user.id, true); inside = repo.authGeneration(); });
+  const h = hold(repo, tx => { repo.users.setDisabled(tx, user.id, true); inside = repo.authGeneration(); });
   await h.wrote;
   expect(inside).toBeUndefined();
   // Outside the holder's transaction: the committed generation, and the committed (enabled) user.
@@ -45,9 +45,9 @@ test("another task's generation stays the committed one while a holder's uncommi
 
 test("a rolled-back holder leaves the generation and the cached user as committed", async () => {
   const repo = open();
-  const user = repo.writeNow(() => repo.users.upsertByEmail("b@example.com", null));
+  const user = repo.writeNow(tx => repo.users.upsertByEmail(tx, "b@example.com", null));
   const before = repo.authGeneration();
-  const h = hold(repo, () => { repo.users.setDisabled(user.id, true); }, true);
+  const h = hold(repo, tx => { repo.users.setDisabled(tx, user.id, true); }, true);
   await h.wrote;
   expect(repo.users.activeEmail(user.id)).toBe("b@example.com");
   h.release();
@@ -59,16 +59,16 @@ test("a rolled-back holder leaves the generation and the cached user as committe
 test("a synchronous transaction's commit moves the generation too", () => {
   const repo = open();
   const before = repo.authGeneration();
-  repo.writeNow(() => repo.users.upsertByEmail("c@example.com", null));
+  repo.writeNow(tx => repo.users.upsertByEmail(tx, "c@example.com", null));
   const mid = repo.authGeneration();
   expect(mid).not.toBe(before);
-  expect(repo.post(() => { repo.users.upsertByEmail("d@example.com", null); })).toBe(true);
+  expect(repo.post(tx => { repo.users.upsertByEmail(tx, "d@example.com", null); })).toBe(true);
   expect(repo.authGeneration()).not.toBe(mid);
 });
 
 test("a failed counter read leaves the generation undefined, never stale, until a commit reads it again", async () => {
   const repo = open();
-  repo.writeNow(() => repo.users.upsertByEmail("g@example.com", null));
+  repo.writeNow(tx => repo.users.upsertByEmail(tx, "g@example.com", null));
   // Drops the counter table: the commit's hook can't read it.
   repo.writeNow(tx => { sqliteOf(tx).run("DROP TABLE temp.auth_generation"); });
   const h = hold(repo, () => {});
@@ -87,9 +87,9 @@ test("a failed counter read leaves the generation undefined, never stale, until 
 
 test("an auth-table write that commits without a tracked boundary still moves the generation", async () => {
   const repo = open();
-  const user = repo.writeNow(() => repo.users.upsertByEmail("h@example.com", null));
+  const user = repo.writeNow(tx => repo.users.upsertByEmail(tx, "h@example.com", null));
   const before = repo.authGeneration();
-  // A holder's committed callback, outside any transaction: clearSubject is a bare autocommit UPDATE.
-  await repo.write(() => {}, () => { repo.users.clearSubject(user.id); });
+  // A holder's committed callback, outside any transaction: a bare autocommit UPDATE (clearSubject's statement).
+  await repo.write(() => {}, () => { sqliteOf(repo.read).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [user.id]); });
   expect(repo.authGeneration()).not.toBe(before);
 });

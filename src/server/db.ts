@@ -213,18 +213,18 @@ export interface Repo {
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
-    upsertByEmail(email: string, displayName: string | null): User;
+    upsertByEmail(tx: Tx, email: string, displayName: string | null): User;
     // An IdP sign-in: matches (issuer, subject) first, then the email (F-13, #928 D4).
-    signIn(issuer: string, subject: string, email: string, displayName: string | null): IdpSignIn;
+    signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): IdpSignIn;
     // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
-    clearSubject(userId: number): void;
+    clearSubject(tx: Tx, userId: number): void;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
     // findById(id)?.disabled_at != null, cached on authGeneration (#853).
     isDisabled(userId: number): boolean;
     // The user's email while it exists and isn't disabled, cached on authGeneration (#853).
     activeEmail(userId: number): string | undefined;
-    setDisabled(userId: number, disabled: boolean): void;
+    setDisabled(tx: Tx, userId: number, disabled: boolean): void;
   };
   sessions: {
     create(tx: Tx, userId: number, tokenHash: string, label: string | null): Session;
@@ -954,7 +954,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       park: marks(hosted.park, session => session), unpark: marks(hosted.unpark, session => session),
       subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
     users: {
-      upsertByEmail(email, displayName) {
+      upsertByEmail(tx, email, displayName) {
+        const db = sqliteOf(tx);
         const now = clock();
         return db.transaction(() => {
           db.run(
@@ -967,7 +968,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return user;
         })();
       },
-      signIn(issuer, subject, email, displayName) {
+      signIn(tx, issuer, subject, email, displayName) {
+        const db = sqliteOf(tx);
         return db.transaction((): IdpSignIn => {
           // A link is conditional on the row still being unlinked (D3): on Postgres another sign-in may link it
           // between the read and the write. Zero rows: re-read and decide again, now a refusal.
@@ -997,14 +999,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
               continue;
             }
             // 6. A new user, created with both.
-            const user = this.upsertByEmail(email, displayName);
+            const user = this.upsertByEmail(tx, email, displayName);
             if (link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject }, linked: false };
           }
           throw new Error(`sign-in for ${email} kept losing its link to concurrent sign-ins`);
         }).immediate();
       },
-      clearSubject(userId) {
-        db.run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
+      clearSubject(tx, userId) {
+        sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
       },
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
@@ -1017,7 +1019,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         const u = cachedUser(userId);
         return u && u.disabled_at === null ? u.email : undefined;
       },
-      setDisabled(userId, disabled) {
+      setDisabled(tx, userId, disabled) {
+        const db = sqliteOf(tx);
         db.transaction(() => {
           const now = clock();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);

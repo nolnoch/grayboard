@@ -161,9 +161,9 @@ test("internal grant liveness survives individual access revocation but never au
   storage.repo.oauth.isGrantActive = () => { throw new Error("storage unavailable"); };
   try { expect(() => service.isGrantActive(grant.grantId)).toThrow("storage unavailable"); }
   finally { storage.repo.oauth.isGrantActive = active; }
-  await seed(storage.repo, () => storage.repo.users.setDisabled(grant.authed.user_id, true));
+  await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, grant.authed.user_id, true));
   expect(service.isGrantActive(grant.grantId)).toBe(false);
-  await seed(storage.repo, () => storage.repo.users.setDisabled(grant.authed.user_id, false));
+  await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, grant.authed.user_id, false));
   expect(service.isGrantActive(grant.grantId)).toBe(false);
   const next = await issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery"], clock);
   clock += OAUTH_TTL.grant;
@@ -571,7 +571,7 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
     expect(accessAudits(storage.db, "auth.subject_refused").map(r => [r.actor, r.detail])).toEqual([
       ["you@example.com", { reason: "issuer_mismatch", holding_issuer: issuer(first), provider: second, issuer: issuer(second), client_id: "native" }],
     ]);
-    await storage.repo.write(() => storage.repo.users.clearSubject(storage.repo.users.findByEmail("you@example.com")!.id));
+    await storage.repo.write(tx => storage.repo.users.clearSubject(tx, storage.repo.users.findByEmail("you@example.com")!.id));
     expect(await signIn(second)).toBe("consent");
     expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(second), idp_subject: second + "-you" });
     expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 2 });
@@ -920,8 +920,8 @@ test("live disable/admin revoke, expiry, and database failures are not credentia
   expect(service.isAuthorized(p)).toBe(false);
   const refreshed = await post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: tokens.refresh_token, resource: service.resource });
   const next = await refreshed.json() as Tokens; const np = principal(next);
-  await seed(storage.repo, () => storage.repo.users.setDisabled(np.authed.user_id, true));
-  await seed(storage.repo, () => storage.repo.users.setDisabled(np.authed.user_id, false));
+  await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, np.authed.user_id, true));
+  await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, np.authed.user_id, false));
   expect(service.isAuthorized(np)).toBe(false);
   const b = await issue(), t2 = await redeem(b), p2 = principal(t2);
   await seed(storage.repo, tx => storage.repo.sessions.revokeAllForUser(tx, p2.authed.user_id)); expect(service.isAuthorized(p2)).toBe(false);
@@ -1287,7 +1287,7 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     // Each committed way the access ends, against a warm entry.
     const ends: [string, (p: OAuthPrincipal) => unknown][] = [
       ["revokeAllForUser", p => seed(storage.repo, tx => storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id))],
-      ["disable", p => seed(storage.repo, () => storage.repo.users.setDisabled(p.authed.user_id, true))],
+      ["disable", p => seed(storage.repo, tx => storage.repo.users.setDisabled(tx, p.authed.user_id, true))],
       ["another connection's grant revoke", p => { const other = new Database(config.dbPath); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
       ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
     ];
@@ -1331,7 +1331,7 @@ test("#881: one authorization reads the auth generation once, and a write betwee
     reads = 0;
     expect(counting.isAuthorized(p)).toBe(true);
     expect(reads).toBe(1); // the token read and the user read share it; before #881, two
-    await seed(counted.repo, () => counted.repo.users.setDisabled(p.authed.user_id, true));
+    await seed(counted.repo, tx => counted.repo.users.setDisabled(tx, p.authed.user_id, true));
     expect(counting.isAuthorized(p)).toBe(false);
   } finally { counting.close(); counted.db.close(); }
 });
