@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
 import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
-import type { Config } from "./config.ts";
+import { checkIdpConfig, type Config } from "./config.ts";
 import type { Repo } from "./db.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, LOGIN_SCOPE, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
@@ -106,7 +106,7 @@ async function form(req: Request): Promise<URLSearchParams> {
 }
 
 export function createOAuthServer(repo: Repo, config: Config, options: OAuthOptions = {}) {
-  if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret)) throw new Error("dev auth must not coexist with a Google client secret");
+  checkIdpConfig(config);
   const providers = options.providers ?? defaultProviders(config);
   if (providers.length !== 1) throw new Error("exactly one identity provider is supported");
   const provider = providers[0]!, providerCallback = callbackPath(provider);

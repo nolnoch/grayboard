@@ -11,7 +11,7 @@ import { openDatabase } from "./db.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { hashToken, verifySessionToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
-import type { Config } from "./config.ts";
+import type { Config, IdpId } from "./config.ts";
 import { BUILTIN_CLIENT_IDS, CLI_CLIENT_ID, LOGIN_SCOPE, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
@@ -568,9 +568,10 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
   });
 }
 
-test("direct config dev auth rejects either Google secret, including an override with an empty primary", () => {
-  for (const credentials of [{ googleClientSecret: "primary-private" }, { mcpGoogle: { clientId: "web-client", clientSecret: "web-private" } }]) {
-    expect(() => createOAuthServer(storage.repo, { ...config, ...credentials })).toThrow("dev auth must not coexist with a Google client secret");
+test("direct config dev auth rejects any provider secret (either Google pair, Okta), including an override with an empty primary", () => {
+  const okta = { idps: ["google", "okta"] as IdpId[], okta: { issuer: "https://example.okta.com", clientId: "okta-client", clientSecret: "okta-private", allowedDomains: ["example.com"] } };
+  for (const credentials of [{ googleClientSecret: "primary-private" }, { mcpGoogle: { clientId: "web-client", clientSecret: "web-private" } }, okta]) {
+    expect(() => createOAuthServer(storage.repo, { ...config, ...credentials })).toThrow("dev auth must not coexist with an identity provider's client secret");
   }
 });
 

@@ -10,6 +10,7 @@ import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type Attachme
 import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
+import { GOOGLE_ISSUER } from "./idp_google.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
@@ -18,6 +19,12 @@ export type HostedCaps = { sessions: { global: number; perUser: number }; leases
 export const DEFAULT_HOSTED_CAPS: HostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
 // Every cap may be raised to this: a guard against a typo, not a tested size.
 const CAP_CEILING = 1_000_000;
+
+// The upstream identity providers a server can list (#928 D6), in GRAYBOARD_IDPS.
+export const IDP_IDS = ["google", "okta"] as const;
+export type IdpId = (typeof IDP_IDS)[number];
+// The Okta org behind the generic OIDC provider (src/server/idp_oidc.ts): one per server.
+export type OktaConfig = { issuer: string; clientId: string; clientSecret: string; allowedDomains: string[] };
 
 export type Config = {
   dbPath: string;
@@ -28,6 +35,9 @@ export type Config = {
   googleClientSecret: string;
   mcpGoogle?: { clientId: string; clientSecret: string };
   orgDomain: string;
+  // GRAYBOARD_IDPS: the providers sign-in offers, in the chooser's order; absent means Google alone.
+  idps?: IdpId[];
+  okta?: OktaConfig;
   publicUrl: string;
   messageRetentionDays: number;
   auditRetentionDays: number;
@@ -76,9 +86,9 @@ export type Config = {
 export function loadConfig(): Config {
   const devAuth = process.env.GRAYBOARD_DEV_AUTH === "1";
 
-  if (devAuth && (process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET)) {
+  if (devAuth && (process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET || process.env.GRAYBOARD_OKTA_CLIENT_SECRET)) {
     throw new Error(
-      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET or GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET (prevents prod misconfig)",
+      "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET, GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET or GRAYBOARD_OKTA_CLIENT_SECRET (prevents prod misconfig)",
     );
   }
 
@@ -91,13 +101,20 @@ export function loadConfig(): Config {
     throw new Error(`GRAYBOARD_DEV_AUTH=1 needs a loopback GRAYBOARD_PUBLIC_URL (localhost, 127.0.0.1 or [::1]), not ${publicUrl}: dev sign-in lets anyone who reaches the server act as anyone`);
   }
 
+  const idps = parseIdps(process.env.GRAYBOARD_IDPS);
+  const google = idps.includes("google");
+  const okta = oktaConfig(idps.includes("okta"));
+
   // One Google client pair (#928 D6, D8): the MCP pair when set, else the primary, which is then required. A
   // deployment with a Desktop primary pair and a Web MCP pair runs on the Web pair; its Desktop pair goes unused.
-  const mcpGoogle          = mcpGoogleConfig();
-  const primaryRequired    = !devAuth && !mcpGoogle.mcpGoogle;
-  const googleClientId     = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_ID") : (process.env.GOOGLE_OAUTH_CLIENT_ID ?? (devAuth ? "dev" : ""));
-  const googleClientSecret = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_SECRET") : devAuth ? "" : (process.env.GOOGLE_OAUTH_CLIENT_SECRET ?? "");
-  const orgDomain          = devAuth ? (process.env.GRAYBOARD_ORG_DOMAIN ?? "example.com") : requireEnv("GRAYBOARD_ORG_DOMAIN");
+  // Google's variables and GRAYBOARD_ORG_DOMAIN are read only when google is listed.
+  const mcpGoogle          = google ? mcpGoogleConfig() : {};
+  const primaryRequired    = google && !devAuth && !mcpGoogle.mcpGoogle;
+  const googleClientId     = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_ID") : !google ? "" : (process.env.GOOGLE_OAUTH_CLIENT_ID ?? (devAuth ? "dev" : ""));
+  const googleClientSecret = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_SECRET") : devAuth || !google ? "" : (process.env.GOOGLE_OAUTH_CLIENT_SECRET ?? "");
+  const orgDomain          = !google ? "" : devAuth ? (process.env.GRAYBOARD_ORG_DOMAIN ?? "example.com") : requireEnv("GRAYBOARD_ORG_DOMAIN");
+  const identity = { idps, ...(okta ? { okta } : {}), devAuth, googleClientSecret, ...mcpGoogle };
+  checkIdpConfig(identity);
 
   return {
     dbPath,
@@ -107,6 +124,8 @@ export function loadConfig(): Config {
     googleClientSecret,
     ...mcpGoogle,
     orgDomain,
+    idps,
+    ...(okta ? { okta } : {}),
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
@@ -164,6 +183,67 @@ function globalAndScoped(env: Record<string, string | undefined>, prefix: string
   const global = positiveInt(env, `${prefix}_GLOBAL`, global0, CAP_CEILING, unit);
   const scoped = positiveInt(env, `${prefix}_${scope}`, Math.min(scoped0, global), global, unit);
   return { global, scoped };
+}
+
+// GRAYBOARD_IDPS: provider IDs, comma-separated, in the chooser's order; unset is Google alone, so an existing
+// deployment's env is unchanged.
+function parseIdps(raw: string | undefined): IdpId[] {
+  if (raw === undefined) return ["google"];
+  const idps = raw.split(",").map(s => s.trim()) as IdpId[];
+  checkIdpList(idps);
+  return idps;
+}
+
+function checkIdpList(idps: readonly string[]): void {
+  if (!idps.length || idps.some(id => id === "")) throw new Error("GRAYBOARD_IDPS has an empty entry: list provider IDs, comma-separated (google, okta)");
+  for (const id of idps) if (!(IDP_IDS as readonly string[]).includes(id)) throw new Error(`GRAYBOARD_IDPS: unknown provider "${id}" (known: ${IDP_IDS.join(", ")})`);
+  if (new Set(idps).size !== idps.length) throw new Error("GRAYBOARD_IDPS lists a provider twice");
+}
+
+const OKTA_VARS = ["GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS"] as const;
+
+// Okta's four variables, all required when okta is listed. One set while it isn't is a typo, as half an MCP Google
+// pair is: a half-configured provider never silently goes unused.
+function oktaConfig(listed: boolean): OktaConfig | undefined {
+  const set = OKTA_VARS.filter(name => process.env[name]);
+  if (!listed) {
+    if (set.length) throw new Error(`${set.join(", ")} set but GRAYBOARD_IDPS doesn't list okta: list it, or unset them`);
+    return undefined;
+  }
+  for (const name of OKTA_VARS) if (!process.env[name]) throw new Error(`GRAYBOARD_IDPS lists okta, so ${name} is required`);
+  return {
+    issuer: process.env.GRAYBOARD_OKTA_ISSUER!,
+    clientId: process.env.GRAYBOARD_OKTA_CLIENT_ID!,
+    clientSecret: process.env.GRAYBOARD_OKTA_CLIENT_SECRET!,
+    allowedDomains: process.env.GRAYBOARD_OKTA_ALLOWED_DOMAINS!.split(",").map(d => d.trim().toLowerCase()),
+  };
+}
+
+const CREDENTIAL = /^[\x21-\x7e]{1,4096}$/;
+const DOMAIN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+// The identity-provider rules (#928 D6), on Config alone: loadConfig and createOAuthServer both run it, and neither
+// reads an injected provider list (tests inject a provider holding a secret under dev auth). Errors never quote a
+// credential.
+export function checkIdpConfig(config: Pick<Config, "idps" | "okta" | "devAuth" | "googleClientSecret" | "mcpGoogle">): void {
+  const idps = config.idps ?? ["google"];
+  checkIdpList(idps);
+  const okta = config.okta;
+  if (!idps.includes("okta") && okta) throw new Error("Okta is configured but GRAYBOARD_IDPS doesn't list okta");
+  if (idps.includes("okta")) {
+    if (!okta) throw new Error("GRAYBOARD_IDPS lists okta without its configuration");
+    let url: URL | undefined;
+    try { url = new URL(okta.issuer); } catch { /* refused below */ }
+    if (!url || url.protocol !== "https:" || /[?#]/.test(okta.issuer) || okta.issuer.endsWith("/") || url.username || url.password)
+      throw new Error("GRAYBOARD_OKTA_ISSUER must be an https URL with no query, fragment or trailing slash (the issuer exactly as the org's discovery document gives it)");
+    if (okta.issuer === GOOGLE_ISSUER) throw new Error("GRAYBOARD_OKTA_ISSUER can't be Google's issuer");
+    if (!CREDENTIAL.test(okta.clientId) || !CREDENTIAL.test(okta.clientSecret))
+      throw new Error("GRAYBOARD_OKTA_CLIENT_ID and GRAYBOARD_OKTA_CLIENT_SECRET must be nonempty credentials without whitespace");
+    if (!okta.allowedDomains.length || okta.allowedDomains.some(d => !DOMAIN.test(d)))
+      throw new Error(`GRAYBOARD_OKTA_ALLOWED_DOMAINS must be email domains, comma-separated (example.com), not "${okta.allowedDomains.join(",")}"`);
+  }
+  if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret || okta?.clientSecret))
+    throw new Error("dev auth must not coexist with an identity provider's client secret");
 }
 
 function mcpGoogleConfig(): Pick<Config, "mcpGoogle"> {
