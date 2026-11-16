@@ -1911,7 +1911,7 @@ function mailPort(db: Database): MailPort {
 
 // The writes take the body's `Tx` (#807 P1c-11), resolved to its connection before any argument is read, so a
 // kept `Tx` is refused whatever the call; the reads stay on the store's connection until their slice.
-// `writesOn`: the writes bound to a connection a store already resolved from its caller's handle (the OAuth store's ops).
+// `writesOn`: the writes bound to a connection a store already resolved from its caller's handle (the users, sessions and OAuth stores).
 type HostedStoreOf = HostedStore & { writesOn(c: Database): HostedWrites };
 function makeHostedStore(db: Database): HostedStoreOf {
   // The child IDs ended since the last take, queued at commit by whichever connection ended them (#475 item 1).

@@ -1571,7 +1571,7 @@ test("a child's native tool call under its exchange's verdict coalesces its touc
   const call = async () => {
     const { verdict } = await hosted.snapshot(principal, context("child"), false);
     const touches = spyOn(database.repo.hosted, "touch");
-    try { await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[0]); }
+    try { await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[1]); }
     finally { touches.mockRestore(); }
   };
   const start = [seen("root"), seen("child")];
