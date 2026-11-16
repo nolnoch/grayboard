@@ -31,7 +31,7 @@ test("#807: a session touch that fires while another body holds the write queue 
   const touches = createTouchQueue();
   cleanups.push(() => touches.cancelAll());
   const session = await seed(repo, tx => {
-    const user = repo.users.upsertByEmail("you@example.com", null);
+    const user = repo.users.upsertByEmail(tx, "you@example.com", null);
     const created = repo.sessions.create(tx, user.id, hashToken("raw-token"), "test");
     db.run("UPDATE sessions SET last_used_at = 0 WHERE id = ?", [created.id]);
     return created;

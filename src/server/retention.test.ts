@@ -84,8 +84,8 @@ describe("retention pruning", () => {
     const { db, repo: r } = open();
     const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
     // A board reads as missing to an address no principal owns (#284).
-    await seed(r, () => {
-      r.users.upsertByEmail("a@example.com", null);
+    await seed(r, tx => {
+      r.users.upsertByEmail(tx, "a@example.com", null);
       r.aliases.create({ scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
       createBoard(db, "a@example.com/be", "e2e", "test");
       post(db, "a@example.com/be", "e2e", "old");

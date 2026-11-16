@@ -33,7 +33,7 @@ beforeEach(async () => {
   store = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(store.repo, store.db);
   const user = (tx: Tx, email: string): AuthedUser => {
-    const u = store.repo.users.upsertByEmail(email, null);
+    const u = store.repo.users.upsertByEmail(tx, email, null);
     // A session needs a live sign-in (#351).
     return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email });
   };
@@ -213,7 +213,7 @@ test("reserved human authority is a separate trusted method, never a selected cl
   const human = (await application.attachHuman(alice, delivery())).session;
   application.disconnectUser(alice.user_id);
   expect(human.active).toBe(true);
-  await seed(store.repo, () => store.repo.users.setDisabled(alice.user_id, true));
+  await seed(store.repo, tx => store.repo.users.setDisabled(tx, alice.user_id, true));
   await expect(application.inbox(store.repo.read, human)).rejects.toThrow("an admin signed this user out");
 });
 
@@ -244,7 +244,7 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
   expect(store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
   await expect(application.pending(store.repo.read, b, 101)).rejects.toThrow();
   await expect(application.pending(store.repo.read, b, 0)).rejects.toThrow();
-  await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
+  await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.user_id, true));
   await expect(application.pending(store.repo.read, b)).rejects.toThrow("an admin signed this user out");
 });
 
@@ -434,7 +434,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
 });
 
 test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
-  const carol = await seed(store.repo, tx => { const u = store.repo.users.upsertByEmail("carol@example.com", null); return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email }); });
+  const carol = await seed(store.repo, tx => { const u = store.repo.users.upsertByEmail(tx, "carol@example.com", null); return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email }); });
   const a = await connect(alice, "be");
   const b = await connect(bob, "fe");
   await connect(carol, "sim");

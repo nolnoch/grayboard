@@ -51,7 +51,7 @@ beforeEach(async () => {
   revoked = new Set();
   resources = createResources(application, { isAuthorized: s => !revoked.has(s) });
   const user = async (email: string): Promise<AuthedUser> => {
-    const u = await seed(store.repo, () => store.repo.users.upsertByEmail(email, null));
+    const u = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
     return { user_id: u.id, user_email: email, session_id: 0 };
   };
   alice = await user("alice@example.com");
@@ -401,7 +401,7 @@ test("revocation, disabled users, application disconnect and stop close watchers
   await expect(resources.list(store.repo.read, a)).rejects.toThrow("unauthorized");
   const disabledHook = hooks();
   resources.watch(b, boardResourceUri("e2e"), disabledHook);
-  await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
+  await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.user_id, true));
   resources.revalidate();
   expect(disabledHook.counts.closed).toBe(1);
   revoked.delete(a);

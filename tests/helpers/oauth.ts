@@ -4,6 +4,7 @@ import { join, dirname } from "node:path";
 import { openDatabase, type Repo } from "../../src/server/db.ts";
 import { OAUTH_TTL, type OAuthResult } from "../../src/server/oauth-types.ts";
 import { seed } from "../support/seed.ts";
+import type { Tx } from "../../src/server/store/tx.ts";
 
 const random = () => randomBytes(32).toString("base64url");
 const checked = <T>(result: OAuthResult<T>): T => {
@@ -13,12 +14,12 @@ const checked = <T>(result: OAuthResult<T>): T => {
 
 // Trusted test-only issuance through the same atomic consent/code lifecycle as the AS, in one queued body (#807 P1b-4f).
 export function issueOAuth(repo: Repo, resource: string, email = "alice@example.com", scopes = ["grayboard:tools"], now = Date.now(), clientId = "test-native") {
-  return seed(repo, () => issueNow(repo, resource, email, scopes, now, clientId));
+  return seed(repo, tx => issueNow(repo, tx, resource, email, scopes, now, clientId));
 }
 export type IssuedOAuth = Awaited<ReturnType<typeof issueOAuth>>;
 
-function issueNow(repo: Repo, resource: string, email: string, scopes: string[], now: number, clientId: string) {
-  const user = repo.users.upsertByEmail(email, null);
+function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string) {
+  const user = repo.users.upsertByEmail(tx, email, null);
   const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
   const request = { ...binding, requestHash: hashToken(random()), browserHash: hashToken(random()), csrfHash: hashToken(random()), stateHash: hashToken(random()), consentSessionHash: null, createdAt: now, expiresAt: now + OAUTH_TTL.request };
   const sessionHash = hashToken(random());

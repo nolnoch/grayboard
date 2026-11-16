@@ -692,7 +692,7 @@ test("an attach that fails after a newer one for the same user went live leaves 
   const alice = await login("alice@example.com");
   await link(alice);
   const bridge = srv.app.slack!, application = srv.app.application;
-  const id = (await seed(srv.app.repo, () => srv.app.repo.users.upsertByEmail("alice@example.com", null))).id;
+  const id = (await seed(srv.app.repo, tx => srv.app.repo.users.upsertByEmail(tx, "alice@example.com", null))).id;
   let fail: ((e: Error) => void) | undefined;
   const attach = spyOn(application, "attachHuman").mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
   try {

@@ -492,7 +492,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 
   // The stamp runs once, with the column: a row unlink-idp cleared isn't re-stamped by a later open.
-  await srv.app.repo.write(() => srv!.app.repo.users.clearSubject(srv!.app.repo.users.findByEmail("bob@example.com")!.id));
+  await srv.app.repo.write(tx => srv!.app.repo.users.clearSubject(tx, srv!.app.repo.users.findByEmail("bob@example.com")!.id));
   await srv.stop();
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
   expect(srv.app.repo.users.findByEmail("bob@example.com")).toMatchObject({ idp_issuer: null, idp_subject: null });
@@ -509,7 +509,7 @@ test(`server: a database this tree wrote, run under ${FROM} and reopened, keeps 
   mkdirSync(join(dir, "old"));
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
   await srv.login("alice@example.com");
-  expect(await srv.app.repo.write(() => srv!.app.repo.users.signIn(GOOGLE_ISSUER, "g-alice", "alice@example.com", null).status)).toBe("ok");
+  expect(await srv.app.repo.write(tx => srv!.app.repo.users.signIn(tx, GOOGLE_ISSUER, "g-alice", "alice@example.com", null).status)).toBe("ok");
   await srv.stop();
   srv = undefined;
 
@@ -532,8 +532,8 @@ test(`server: a database this tree wrote, run under ${FROM} and reopened, keeps 
       : { email: "bob@example.com", idp_issuer: null, idp_subject: null },
   ]);
   const repo = srv.app.repo;
-  expect(await repo.write(() => repo.users.signIn(GOOGLE_ISSUER, "g-alice", "alice@example.com", null).status)).toBe("ok");
-  expect(await repo.write(() => repo.users.signIn(GOOGLE_ISSUER, "g-bob", "bob@example.com", null))).toMatchObject({ status: "ok", user: { idp_issuer: GOOGLE_ISSUER, idp_subject: "g-bob" } });
+  expect(await repo.write(tx => repo.users.signIn(tx, GOOGLE_ISSUER, "g-alice", "alice@example.com", null).status)).toBe("ok");
+  expect(await repo.write(tx => repo.users.signIn(tx, GOOGLE_ISSUER, "g-bob", "bob@example.com", null))).toMatchObject({ status: "ok", user: { idp_issuer: GOOGLE_ISSUER, idp_subject: "g-bob" } });
 }, 60_000);
 
 // #282, #475: this tree's server serves no WebSocket. `/ws`, or any path, answers an upgrade with the

@@ -6,6 +6,7 @@ import { accessAudits } from "../../tests/support/audit.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { openDatabase, type Repo } from "./db.ts";
+import type { Tx } from "./store/tx.ts";
 import { idpSignIn, type SignInProvider } from "./idp.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 
@@ -14,12 +15,12 @@ const okta: SignInProvider = { id: "okta", label: "Okta", issuer: "https://examp
 const fresh = () => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
 const id = (email: string, subject: string) => ({ email, subject, displayName: null });
 // In a queued body, as the OAuth callback runs it (#807 P1b-4f).
-const signIn = (repo: Repo, ...a: Parameters<typeof idpSignIn> extends [Repo, ...infer R] ? R : never) => seed(repo, () => idpSignIn(repo, ...a));
+const signIn = (repo: Repo, ...a: Parameters<typeof idpSignIn> extends [Repo, Tx, ...infer R] ? R : never) => seed(repo, tx => idpSignIn(repo, tx, ...a));
 
 // Security audit F-13, #928 D4/D9: each refusal says what the admin runs, and audits why, with the provider and issuer.
 test("idpSignIn refuses a reassigned or changed email with the admin's fix, and audits each outcome", async () => {
   const { db, repo } = fresh();
-  await seed(repo, () => repo.users.upsertByEmail("old@example.com", null));
+  await seed(repo, tx => repo.users.upsertByEmail(tx, "old@example.com", null));
   expect(await signIn(repo, google, id("old@example.com", "s-old"), { ip: "1.2.3.4" })).toMatchObject({ user: { email: "old@example.com" } });
   expect(accessAudits(db, "auth.subject_linked").map(r => [r.actor, r.detail])).toEqual([["old@example.com", { provider: "google", issuer: GOOGLE_ISSUER, ip: "1.2.3.4" }]]);
 

@@ -404,7 +404,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider); }
-      const signedIn = await repo.write(() => idpSignIn(repo, provider, identity!, { client_id: r.clientId }, providers));
+      const signedIn = await repo.write(tx => idpSignIn(repo, tx, provider, identity!, { client_id: r.clientId }, providers));
       // idpSignIn's text names only the person's email(s), the provider labels and the admin's unlink-idp remedy.
       if ("refused" in signedIn) return refuse(signedIn.refused);
       const { user } = signedIn;

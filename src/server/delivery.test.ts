@@ -30,7 +30,7 @@ beforeEach(async () => {
   store = openDatabase(scratchDbPath(), { blobDir: dir });
   application = createApplication(store.repo, store.db);
   const principal = async (email: string): Promise<DeliveryPrincipal> => {
-    const user = await seed(store.repo, () => store.repo.users.upsertByEmail(email, null));
+    const user = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
     return { authed: { user_id: user.id, user_email: email, session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
   };
   alice = await principal("alice@example.com"); bob = await principal("bob@example.com");
@@ -232,7 +232,7 @@ test("cross application-level/hosted holders share one exclusion path", async ()
 
 test("disable immediately closes held ownership and invalidates capability", async () => {
   const lease = await delivery.open(bob, context(bob));
-  await seed(store.repo, () => store.repo.users.setDisabled(bob.authed.user_id, true));
+  await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.authed.user_id, true));
   expect(hostedRowCount(store.db)).toBe(0);
   expect(delivery.activeLeaseCount).toBe(0);
   expect(() => delivery.describe(bob, context(bob), lease.capability)).toThrow();

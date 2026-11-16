@@ -113,7 +113,7 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
   const email = body.email.toLowerCase();
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
   return repo.write(tx => {
-    const user  = repo.users.upsertByEmail(email, null);
+    const user  = repo.users.upsertByEmail(tx, email, null);
     const disabled = refuseDisabled(repo, user, { dev: true, ip: ip ?? undefined });
     if (disabled) return disabled;
     const raw   = mintToken();
@@ -612,10 +612,10 @@ async function adminDisableUser(
 ): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
-  const target = await repo.write(() => {
+  const target = await repo.write((tx: Tx) => {
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
-    repo.users.setDisabled(target.id, true);
+    repo.users.setDisabled(tx, target.id, true);
     writeAudit(repo, "auth.user_disabled", authed.user_email, body.email);
     return target;
   }, target => { if (target) disconnectUser(target.id); return target; });
@@ -627,10 +627,10 @@ async function adminDisableUser(
 async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, slack?: SlackLinker): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
-  const target = await repo.write(() => {
+  const target = await repo.write(tx => {
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
-    repo.users.setDisabled(target.id, false);
+    repo.users.setDisabled(tx, target.id, false);
     writeAudit(repo, "auth.user_enabled", authed.user_email, body.email);
     return target;
   });
@@ -646,10 +646,10 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
 async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
-  return repo.write(() => {
+  return repo.write(tx => {
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return notFound();
-    repo.users.clearSubject(target.id);
+    repo.users.clearSubject(tx, target.id);
     writeAudit(repo, "auth.subject_cleared", authed.user_email, target.email, {
       had_subject: target.idp_subject !== null, provider: defaultProviders(config).find(p => p.issuer === target.idp_issuer)?.id ?? null, issuer: target.idp_issuer });
     return json({ ok: true });

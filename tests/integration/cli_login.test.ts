@@ -77,7 +77,7 @@ test("a denied consent fails the login and writes no credentials", async () => {
 // A refusal after the upstream sign-in returns to the CLI's loopback (#928): the CLI exits at once, printing the
 // server's reason, rather than waiting out its five minutes; the browser tab only says the sign-in didn't complete.
 test("a refusal at the provider callback reaches the CLI, which exits promptly with the reason", async () => {
-  await srv.app.repo.write(() => srv.app.repo.users.upsertByEmail(EMAIL, null));
+  await srv.app.repo.write(tx => srv.app.repo.users.upsertByEmail(tx, EMAIL, null));
   await srv.app.repo.write(() => srv.app.db.run("UPDATE users SET disabled_at = ? WHERE email = ?", [Date.now(), EMAIL]));
   const started = Date.now();
   const login = runCli(["login", "--server", srv.issuer], { env, timeoutMs: 30_000 });

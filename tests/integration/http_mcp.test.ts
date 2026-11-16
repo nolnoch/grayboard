@@ -282,8 +282,8 @@ test("live access, family, disable and admin revocation never reuse a cached pri
       case "family": await seed(app.repo, () => app.repo.oauth.revokeToken(issued.tokens.refreshHash, issued.binding.clientId, Date.now())); break;
       // Two bodies, as the two autocommit writes were: the disable commits before the re-enable.
       case "disable":
-        await seed(app.repo, () => app.repo.users.setDisabled(issued.authed.user_id, true));
-        await seed(app.repo, () => app.repo.users.setDisabled(issued.authed.user_id, false));
+        await seed(app.repo, tx => app.repo.users.setDisabled(tx, issued.authed.user_id, true));
+        await seed(app.repo, tx => app.repo.users.setDisabled(tx, issued.authed.user_id, false));
         break;
       case "admin": await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, issued.authed.user_id)); break;
     }

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
 import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
@@ -60,7 +61,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   const opts = { blobDir: join(dir, "blobs") };
   const old = openDatabase(path, opts);
   const { user, session } = await seed(old.repo, tx => {
-    const user = old.repo.users.upsertByEmail("you@example.com", "You");
+    const user = old.repo.users.upsertByEmail(tx, "you@example.com", "You");
     const session = old.repo.sessions.create(tx, user.id, "old-session-hash", "old client");
     old.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
     old.repo.messages.insert("you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
@@ -92,8 +93,8 @@ test("opening a database from before ids.root_id backfills each live hosted chil
   const old = openDatabase(path, opts);
   const now = Date.now();
   const [root, child, gone] = ["id:r000000000000", "id:c000000000000", "id:g000000000000"];
-  await seed(old.repo, () => {
-    const user = old.repo.users.upsertByEmail("you@example.com", null);
+  await seed(old.repo, tx => {
+    const user = old.repo.users.upsertByEmail(tx, "you@example.com", null);
     for (const id of [root, child, gone]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen) VALUES (?, ?, ?, ?)`).run(id, user.email, now, now);
     const ownership = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?) RETURNING id`).get(root, user.id, "grayboard-pi", now) as { id: number };
     const row = old.db.prepare(`INSERT INTO hosted_sessions (session_id, ownership_id, user_id, client_id, grant_id, source_session_id, root_session_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -125,8 +126,8 @@ test("opening a database clears launcher marks no live hosted root holds, auditi
   const old = openDatabase(path, opts);
   const now = Date.now();
   const [root, child, wss, ended, plain] = ["id:r000000000000", "id:c000000000000", "id:w000000000000", "id:e000000000000", "id:p000000000000"];
-  const user = await seed(old.repo, () => {
-    const user = old.repo.users.upsertByEmail("you@example.com", null);
+  const user = await seed(old.repo, tx => {
+    const user = old.repo.users.upsertByEmail(tx, "you@example.com", null);
     for (const id of [root, child, wss, ended, plain]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen, launcher) VALUES (?, ?, ?, ?, ?)`).run(id, user.email, now, now, id === plain ? 0 : 1);
     const own = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at, ended_at) VALUES (?, ?, ?, ?, ?) RETURNING id`);
     const live = own.get(root, user.id, "grayboard-pi", now, null) as { id: number };
@@ -177,21 +178,21 @@ describe("Repo", () => {
   });
 
   test("upsertByEmail creates user on first call", async () => {
-    const u = await seed(repo, () => repo.users.upsertByEmail("wade@example.com", "Wade"));
+    const u = await seed(repo, tx => repo.users.upsertByEmail(tx, "wade@example.com", "Wade"));
     expect(u.email).toBe("wade@example.com");
     expect(u.display_name).toBe("Wade");
     expect(u.disabled_at).toBeNull();
   });
 
   test("upsertByEmail updates display_name on collision", async () => {
-    await seed(repo, () => repo.users.upsertByEmail("wade@example.com", "Wade"));
-    const u = await seed(repo, () => repo.users.upsertByEmail("wade@example.com", "Wade B"));
+    await seed(repo, tx => repo.users.upsertByEmail(tx, "wade@example.com", "Wade"));
+    const u = await seed(repo, tx => repo.users.upsertByEmail(tx, "wade@example.com", "Wade B"));
     expect(u.display_name).toBe("Wade B");
   });
 
   test("sessions: create, findByTokenHash, revoke", async () => {
     const s = await seed(repo, tx => {
-      const u = repo.users.upsertByEmail("wade@example.com", null);
+      const u = repo.users.upsertByEmail(tx, "wade@example.com", null);
       return repo.sessions.create(tx, u.id, "hash123", "test");
     });
     const found = repo.sessions.findByTokenHash(repo.read, "hash123");
@@ -204,8 +205,8 @@ describe("Repo", () => {
   });
 
   test("aliases: create, list, remove", async () => {
-    const fe = await seed(repo, () => {
-      repo.users.upsertByEmail("you@example.com", null);
+    const fe = await seed(repo, tx => {
+      repo.users.upsertByEmail(tx, "you@example.com", null);
       const fe = repo.aliases.create(person("you@example.com", "fe"), "you@example.com");
       repo.aliases.create(person("you@example.com", "be"), "you@example.com");
       return fe;
@@ -223,8 +224,8 @@ describe("Repo", () => {
 
   // #284 S9: aliases are keyed by address in any scope.
   test("aliases: a team scope's alias is its own address, listed under its scope", async () => {
-    const team = await seed(repo, () => {
-      const u = repo.users.upsertByEmail("you@example.com", null);
+    const team = await seed(repo, tx => {
+      const u = repo.users.upsertByEmail(tx, "you@example.com", null);
       repo.teams.create("eng", u.id);
       repo.aliases.create(person("you@example.com", "be"), "you@example.com");
       return repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
@@ -239,8 +240,8 @@ describe("Repo", () => {
   });
 
   test("principals: findByName reads users and teams", async () => {
-    const { u, eng } = await seed(repo, () => {
-      const u = repo.users.upsertByEmail("you@example.com", null);
+    const { u, eng } = await seed(repo, tx => {
+      const u = repo.users.upsertByEmail(tx, "you@example.com", null);
       return { u, eng: repo.teams.create("eng", u.id) };
     });
     expect(repo.principals.findByName("you@example.com")).toMatchObject({ kind: "user", user_id: u.id, team_id: null });
@@ -249,9 +250,9 @@ describe("Repo", () => {
   });
 
   test("teams: create, join, leave, list members", async () => {
-    const { u2, t } = await seed(repo, () => {
-      const u1 = repo.users.upsertByEmail("a@example.com", null);
-      const u2 = repo.users.upsertByEmail("b@example.com", null);
+    const { u2, t } = await seed(repo, tx => {
+      const u1 = repo.users.upsertByEmail(tx, "a@example.com", null);
+      const u2 = repo.users.upsertByEmail(tx, "b@example.com", null);
       const t  = repo.teams.create("eng", u1.id);
       repo.teams.addMember(t.id, u1.id);
       repo.teams.addMember(t.id, u2.id);
@@ -368,9 +369,9 @@ describe("Repo", () => {
 // #284 decision 5: users, teams and service principals share one namespace.
 test("principals: a sign-in and a team create insert one; a team can't take another principal's name", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { u, eng } = await seed(repo, () => {
-    const u = repo.users.upsertByEmail("a@example.com", null);
-    repo.users.upsertByEmail("a@example.com", "A");
+  const { u, eng } = await seed(repo, tx => {
+    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
+    repo.users.upsertByEmail(tx, "a@example.com", "A");
     const eng = repo.teams.create("eng", u.id);
     // Service principals arrive with #270; the namespace guard is here now.
     db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
@@ -391,8 +392,8 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
 const fresh = () => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
 // Each write in a queued body, as the OAuth sign-in and the admin route run them (#807 P1b-4f).
-const signIn = (repo: Repo, ...a: Parameters<Repo["users"]["signIn"]>) => seed(repo, () => repo.users.signIn(...a));
-const upsert = (repo: Repo, email: string) => seed(repo, () => repo.users.upsertByEmail(email, null));
+const signIn = (repo: Repo, ...a: Parameters<Repo["users"]["signIn"]> extends [Tx, ...infer R] ? R : never) => seed(repo, tx => repo.users.signIn(tx, ...a));
+const upsert = (repo: Repo, email: string) => seed(repo, tx => repo.users.upsertByEmail(tx, email, null));
 
 test("signIn D4 branch 1: this (issuer, subject)'s user signs in, or is refused when its email changed", async () => {
   const { repo } = fresh();
@@ -460,7 +461,7 @@ test("signIn: the same sub under two issuers is two users; one issuer can't hold
 test("signIn: clearSubject clears issuer and subject, so the next sign-in from any issuer takes the email", async () => {
   const { repo } = fresh();
   const u = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
-  await seed(repo, () => repo.users.clearSubject(u.id));
+  await seed(repo, tx => repo.users.clearSubject(tx, u.id));
   expect(repo.users.findById(u.id)).toMatchObject({ idp_issuer: null, idp_subject: null });
   expect(await signIn(repo, OKTA, "o-1", "a@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { id: u.id, idp_issuer: OKTA, idp_subject: "o-1" } });
 });
@@ -484,7 +485,7 @@ for (const [winner, status] of [[OKTA, "issuer_mismatch"], [G, "subject_mismatch
 test("signIn: a disabled account without a subject isn't bound to whoever signs in", async () => {
   const { repo } = fresh();
   const departed = await upsert(repo, "gone@example.com");
-  await seed(repo, () => repo.users.setDisabled(departed.id, true));
+  await seed(repo, tx => repo.users.setDisabled(tx, departed.id, true));
   expect(await signIn(repo, G, "s-hire", "gone@example.com", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
   expect(repo.users.findById(departed.id)).toMatchObject({ idp_issuer: null, idp_subject: null });
 });
@@ -529,8 +530,8 @@ test("schema: a post-F-13 database (subject, no issuer) is stamped, its old inde
   ]);
   expect(indexes(path)).toEqual(["idx_users_idp_identity"]);
   const { repo, db } = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  await seed(repo, () => repo.users.clearSubject(repo.users.findByEmail("linked@example.com")!.id));
-  await seed(repo, () => repo.users.clearSubject(repo.users.findByEmail("legacy@example.com")!.id));
+  await seed(repo, tx => repo.users.clearSubject(tx, repo.users.findByEmail("linked@example.com")!.id));
+  await seed(repo, tx => repo.users.clearSubject(tx, repo.users.findByEmail("legacy@example.com")!.id));
   db.close();
   reopen(path);
   expect(identities(path)).toEqual([
@@ -565,9 +566,9 @@ test("schema: what a rolled-back binary writes (a subject, no issuer; its old in
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, tx => {
-    repo.users.upsertByEmail("a@example.com", null);
+    repo.users.upsertByEmail(tx, "a@example.com", null);
     repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
-    repo.users.upsertByEmail("b@example.com", null);
+    repo.users.upsertByEmail(tx, "b@example.com", null);
     repo.aliases.create(person("b@example.com", "be"), "b@example.com");
     repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
     repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
@@ -597,9 +598,9 @@ test("undeliveredFrom and sentPending search messages by sender, never by recipi
 test("queuedTo and retract look the read point up by its key, never a mailbox_cursors scan", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, tx => {
-    repo.users.upsertByEmail("a@example.com", null);
+    repo.users.upsertByEmail(tx, "a@example.com", null);
     repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
-    repo.users.upsertByEmail("b@example.com", null);
+    repo.users.upsertByEmail(tx, "b@example.com", null);
     repo.aliases.create(person("b@example.com", "be"), "b@example.com");
     repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
     repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
@@ -659,7 +660,7 @@ test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", as
 test("#807 P1c-6: sessions run on the handle they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const { kept, s, u } = await seed(repo, tx => {
-    const u = repo.users.upsertByEmail("a@example.com", null);
+    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
     const s = repo.sessions.create(tx, u.id, "hash-a", "test");
     repo.sessions.touch(tx, s.id, 7);
     return { kept: tx, s, u };
@@ -680,4 +681,19 @@ test("#807 P1c-6: sessions run on the handle they're given", async () => {
   expect(after.revoked_at).toBeNull();
   expect(after.last_used_at).toBe(7);
   expect(repo.sessions.findByTokenHash(repo.read, "hash-b")).toBeUndefined();
+});
+
+// #807 P1c-7: the users store's writes run on the handle they're given, as P1c-6's sessions do.
+test("#807 P1c-7: user writes run on the handle they're given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { kept, u } = await seed(repo, tx => ({ kept: tx, u: repo.users.upsertByEmail(tx, "a@example.com", null) }));
+  const settled = /used after its transaction settled/;
+  expect(() => repo.users.upsertByEmail(kept, "b@example.com", null)).toThrow(settled);
+  expect(() => repo.users.signIn(kept, GOOGLE_ISSUER, "s-1", "c@example.com", null)).toThrow(settled);
+  expect(() => repo.users.clearSubject(kept, u.id)).toThrow(settled);
+  expect(() => repo.users.setDisabled(kept, u.id, true)).toThrow(settled);
+  expect(() => repo.users.setDisabled({} as Tx, u.id, true)).toThrow("not a SQLite store handle");
+  expect(repo.users.findByEmail("b@example.com")).toBeUndefined();
+  expect(repo.users.findByEmail("c@example.com")).toBeUndefined();
+  expect(repo.users.findById(u.id)?.disabled_at).toBeNull();
 });
