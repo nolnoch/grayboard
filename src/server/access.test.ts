@@ -95,8 +95,8 @@ describe("checkCreate", () => {
     expect(access.checkCreate("eve@example.com/be", null)).toBeNull();
     expect(access.checkCreate(WADE_ID, "team:eng")).toBeNull();
     expect(access.checkCreate("eng/deploy", "team:eng")).toBeNull();
-    expect(access.checkCreate("eve@example.com/be", "team:eng")).toBe(`you're not a member of team "eng"`);
-    expect(access.checkCreate("eng/deploy", "team:ops")).toBe(`you're not a member of team "ops"`);
+    expect(access.checkCreate("eve@example.com/be", "team:eng")).toBe(`no such team "eng"`);
+    expect(access.checkCreate("eng/deploy", "team:ops")).toBe(`no such team "ops"`);
     expect(access.checkCreate("wade@example.com/be", "team:nope")).toBe(`no such team "nope"`);
     expect(access.checkCreate("wade@example.com/be", "open")).toBe(`invalid board scope "open"`);
   });

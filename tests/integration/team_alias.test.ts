@@ -67,12 +67,12 @@ test("a removed member's sessions lose the team's aliases: a holder keeps its ID
 
   // The holder keeps its ID (not ended) and can't take the alias back.
   expect(rows(`SELECT ended_at FROM ids WHERE id = ?`, build.id)).toEqual([{ ended_at: null }]);
-  await expect(build.bind("eng/build")).rejects.toMatchObject({ code: "forbidden" });
+  await expect(build.bind("eng/build")).rejects.toMatchObject({ code: "not_found" });
 
   // The tools-only writer had nothing else to be: its ID ends. No transport
   // closes it with a `forbidden` frame any more.
   expect(rows(`SELECT ended_at IS NOT NULL AS ended FROM ids WHERE id = ?`, writer.id)).toEqual([{ ended: 1 }]);
-  await expect(srv.appSession(bob, "eng/build", { push: false }).connect()).rejects.toMatchObject({ code: "forbidden" });
+  await expect(srv.appSession(bob, "eng/build", { push: false }).connect()).rejects.toMatchObject({ code: "not_found" });
 
   const audited = revoked();
   expect(audited).toHaveLength(3);
@@ -135,7 +135,7 @@ test("acting as a team alias over HTTP follows membership", async () => {
   await srv.appSession(bob, "eng/build").connect();
   expect((await actAs(bob, "eng/build")).status).toBe(200);
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
-  expect(await actAs(bob, "eng/build")).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "eng/build": ${REASON}` } });
+  expect(await actAs(bob, "eng/build")).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "eng/build": no principal owns its scope` } });
 });
 
 // #284 acceptance 4, #356: eng/x is one alias, reached by a DM to its one
@@ -281,7 +281,7 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   const carol = await srv.login("carol@example.com");
   const outsider = srv.appSession(carol, null);
   await outsider.connect();
-  await expect(outsider.bind("eng/build", { meta: { task: "mine" } })).rejects.toMatchObject({ code: "forbidden" });
+  await expect(outsider.bind("eng/build", { meta: { task: "mine" } })).rejects.toMatchObject({ code: "not_found" });
   expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
 
   // The labels and the session's facts reach a member (F-12); a non-member
