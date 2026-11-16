@@ -9,10 +9,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
-import { hashToken } from "./auth.ts";
+import { hashToken, verifySessionToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
 import type { Config } from "./config.ts";
-import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, CLI_CLIENT_ID, LOGIN_SCOPE, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { seed } from "../../tests/support/seed.ts";
@@ -20,6 +20,8 @@ import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_b
 import { accessAudits } from "../../tests/support/audit.ts";
 import { stubProvider } from "../../tests/support/stub_provider.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { DomainRefused } from "./idp.ts";
+import { REFUSED } from "./oauth.ts";
 import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -355,6 +357,17 @@ function authorization(clientId = "native", verifier = random(), redirectUri = "
     scope, state, code_challenge: s256(verifier), code_challenge_method: "S256" });
   return { url, verifier, state, clientId, redirectUri, scope };
 }
+// The provider callback's answer: "consent" when the sign-in goes on to consent, else the refusal's error_description
+// ("" for none). A refusal after the callback binds the request returns to the client (RFC 6749 §4.1.2.1, #928) with
+// access_denied, the client's state and the issuer.
+function callbackOutcome(res: Response, a: { state: string; redirectUri: string }): string {
+  expect(res.status).toBe(303);
+  const to = new URL(res.headers.get("location")!);
+  if (to.href.startsWith(base + "/oauth/consent?")) return "consent";
+  expect(to.origin + to.pathname).toBe(a.redirectUri);
+  expect([to.searchParams.get("error"), to.searchParams.get("state"), to.searchParams.get("iss"), to.searchParams.has("code")]).toEqual(["access_denied", a.state, base, false]);
+  return to.searchParams.get("error_description") ?? "";
+}
 async function loginConsent(browser: Browser, url: string) {
   const begin = await browser.request(url);
   expect(begin.status).toBe(303);
@@ -449,10 +462,10 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
   try {
     service.close();
     service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => { throw forged; })] });
-    const browser = new Browser();
-    const begin = await browser.request(authorization().url);
+    const browser = new Browser(), a = authorization();
+    const begin = await browser.request(a.url);
     const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
-    expect((await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" }))).status).toBe(403);
+    expect(callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" })), a)).toBe(REFUSED.provider);
     expect(log.mock.calls.flat()).toEqual([
       '[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error","class":"Error"}',
       '[grayboard] {"operation":"oauth.exchange","category":"failure","level":"error","class":"Error"}',
@@ -469,11 +482,12 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   expect((await fetch(authorization("https://client.example/client.json").url)).status).toBe(503);
   expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.cimd_failed'").get()).toEqual({ action: "oauth.cimd_failed" });
   service.close();
-  service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "other@elsewhere.example", displayName: null, subject: "google-other@elsewhere.example" }))] });
-  const browser = new Browser();
-  const first = await browser.request(authorization().url);
+  // The provider checks the domain inside its exchange (#928 D1; idp_google.test.ts); its refusal is audited as one.
+  service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => { throw new DomainRefused("account must be from @example.com"); })] });
+  const browser = new Browser(), a = authorization();
+  const first = await browser.request(a.url);
   const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
-  expect((await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" }))).status).toBe(403);
+  expect(callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "PRIVATE-CODE" })), a)).toBe(REFUSED.domain);
   expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.domain_refused'").get()).toEqual({ action: "oauth.domain_refused" });
   const log = spyOn(console, "error").mockImplementation(() => {});
   const create = storage.repo.oauth.createRequest;
@@ -487,18 +501,35 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   } finally { storage.repo.oauth.createRequest = create; log.mockRestore(); }
 });
 
+// #928: a disabled user's refusal at the callback reaches the client with its reason, is audited, and opens no
+// browser session.
+test("a disabled user is refused at the callback back to the client, and audited", async () => {
+  const signIn = async () => {
+    const browser = new Browser(), a = authorization();
+    const begin = await browser.request(a.url);
+    const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
+    return callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "fake-google-code" })), a);
+  };
+  expect(await signIn()).toBe("consent");
+  const user = storage.repo.users.findByEmail("you@example.com")!;
+  await seed(storage.repo, () => storage.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [clock, user.id]));
+  expect(await signIn()).toBe(REFUSED.disabled);
+  expect(accessAudits(storage.db, "oauth.user_refused")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: "native" } })]);
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
+});
+
 // Security audit F-13: an email Google hands to a new account doesn't bring the old account's user with it.
 test("a Google account presenting a linked user's email is refused at the callback and audited", async () => {
   const signIn = async (subject: string) => {
     service.close();
     service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "you@example.com", displayName: "You", subject }))] });
-    const browser = new Browser();
-    const first = await browser.request(authorization().url);
+    const browser = new Browser(), a = authorization();
+    const first = await browser.request(a.url);
     const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
-    return (await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "code" }))).status;
+    return callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "code" })), a);
   };
-  expect(await signIn("google-first")).toBe(303);
-  expect(await signIn("google-second")).toBe(403);
+  expect(await signIn("google-first")).toBe("consent");
+  expect(await signIn("google-second")).toBe("you@example.com is linked to a different Google account. If this account should have it, an admin runs grayboard admin unlink-idp --email you@example.com");
   expect(storage.db.query("SELECT action, actor, detail FROM access_log WHERE action LIKE 'auth.subject_%'").all()).toEqual([
     { action: "auth.subject_refused", actor: "you@example.com", detail: JSON.stringify({ reason: "subject_mismatch", provider: "google", issuer: GOOGLE_ISSUER, client_id: "native" }) },
   ]);
@@ -514,21 +545,24 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
     const signIn = async (idp: "google" | "okta") => {
       service.close();
       service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "you@example.com", displayName: "You", subject: idp + "-you" }), undefined, idp === "okta" ? okta : {})] });
-      const browser = new Browser();
-      const first = await browser.request(authorization().url);
+      const browser = new Browser(), a = authorization();
+      const first = await browser.request(a.url);
       const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
-      return (await browser.request(base + `/oauth/${idp}/callback?` + new URLSearchParams({ state, code: "code" }))).status;
+      return callbackOutcome(await browser.request(base + `/oauth/${idp}/callback?` + new URLSearchParams({ state, code: "code" })), a);
     };
     const issuer = (idp: "google" | "okta") => idp === "okta" ? okta.issuer : GOOGLE_ISSUER;
-    expect(await signIn(first)).toBe(303);
+    expect(await signIn(first)).toBe("consent");
     expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(first), idp_subject: first + "-you" });
-    expect(await signIn(second)).toBe(403);
+    // The CLI prints this. This server lists only the second provider, so the holder goes unnamed (its issuer may be an
+    // org's own host); the text names the person's email, the provider and the admin's remedy, nothing else.
+    const label = second === "okta" ? "Okta" : "Google";
+    expect(await signIn(second)).toBe(`you@example.com is linked to another provider's account, not ${label}. If this ${label} account should have it, an admin runs grayboard admin unlink-idp --email you@example.com`);
     expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
     expect(accessAudits(storage.db, "auth.subject_refused").map(r => [r.actor, r.detail])).toEqual([
       ["you@example.com", { reason: "issuer_mismatch", holding_issuer: issuer(first), provider: second, issuer: issuer(second), client_id: "native" }],
     ]);
     await storage.repo.write(() => storage.repo.users.clearSubject(storage.repo.users.findByEmail("you@example.com")!.id));
-    expect(await signIn(second)).toBe(303);
+    expect(await signIn(second)).toBe("consent");
     expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(second), idp_subject: second + "-you" });
     expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 2 });
   });
@@ -590,14 +624,18 @@ test("default Google exchange consistently selects the Web override or primary f
       nonce = upstream.searchParams.get("nonce")!;
       expect(nonce).toMatch(/^[\w-]{43}$/);
       const callback = await direct(cfg.publicUrl + "/oauth/google/callback?" + new URLSearchParams({ state: upstream.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" }));
-      expect(callback.status).toBe(mode === "wrong-audience" ? 403 : 303);
+      expect(callback.status).toBe(303);
       expect(tokenCalls).toBe(mode === "trusted-fixture" ? 0 : 1);
       expect(fixtureCalls).toBe(mode === "trusted-fixture" ? 1 : 0);
       if (mode !== "wrong-audience") {
         const consent = await direct(callback.headers.get("Location")!);
         expect(consent.status).toBe(200);
         expect(await consent.text()).toContain("you@example.com");
-      } else expect(await callback.text()).not.toContain("private");
+      } else {
+        const refused = new URL(callback.headers.get("Location")!);
+        expect([refused.origin + refused.pathname, refused.searchParams.get("error"), refused.searchParams.get("error_description")]).toEqual([a.redirectUri, "access_denied", REFUSED.provider]);
+        expect(refused.href + await callback.text()).not.toContain("private");
+      }
       const metadata = await direct("https://grayboard.example.com/.well-known/oauth-authorization-server/hosted");
       const text = await metadata.text();
       expect(text).not.toContain("web-private"); expect(text).not.toContain("desktop-private");
@@ -844,15 +882,15 @@ test("the default Google provider refuses an ID token whose nonce isn't the flow
     service.close();
     service = createOAuthServer(storage.repo, config, { now: () => clock });
     const signIn = async () => {
-      const browser = new Browser(), begin = await browser.request(authorization().url), google = new URL(begin.headers.get("Location")!);
+      const browser = new Browser(), a = authorization(), begin = await browser.request(a.url), google = new URL(begin.headers.get("Location")!);
       flowNonce = google.searchParams.get("nonce")!;
-      return (await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state: google.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" }))).status;
+      return callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state: google.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" })), a);
     };
     tokenNonce = () => random();
-    expect(await signIn()).toBe(403);
+    expect(await signIn()).toBe(REFUSED.provider);
     expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.google_failed'").all()).toEqual([{ action: "oauth.google_failed" }]);
     tokenNonce = n => n;
-    expect(await signIn()).toBe(303);
+    expect(await signIn()).toBe("consent");
   } finally { globalThis.fetch = originalFetch; }
 });
 
@@ -1285,4 +1323,172 @@ test("#881: one authorization reads the auth generation once, and a write betwee
     await seed(counted.repo, () => counted.repo.users.setDisabled(p.authed.user_id, true));
     expect(counting.isAuthorized(p)).toBe(false);
   } finally { counting.close(); counted.db.close(); }
+});
+
+// ── #928 step 3: CLI login through the AS (docs/future/okta-idp.md D8, R3) ──────────────────────────────────
+
+// An authorize URL as `grayboard login` builds it: grayboard-cli's login scope and no resource (open question 4).
+function cliAuthorization(clientId = CLI_CLIENT_ID, scope = LOGIN_SCOPE, verifier = random(), redirectUri = "http://127.0.0.1:45123/callback") {
+  const state = random();
+  const url = base + "/oauth/authorize?" + new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope, state, code_challenge: s256(verifier), code_challenge_method: "S256" });
+  return { url, verifier, state, clientId, redirectUri, scope };
+}
+async function cliCode(browser = new Browser()) {
+  const a = cliAuthorization();
+  const consent = await loginConsent(browser, a.url);
+  const decided = await decide(browser, consent);
+  expect(decided.status).toBe(303);
+  const callback = new URL(decided.headers.get("location")!);
+  expect(callback.searchParams.get("state")).toBe(a.state);
+  return { ...a, code: callback.searchParams.get("code")!, consent };
+}
+const cliTokenParams = (a: Awaited<ReturnType<typeof cliCode>>) => ({ grant_type: "authorization_code", client_id: CLI_CLIENT_ID, code: a.code, code_verifier: a.verifier, redirect_uri: a.redirectUri });
+// The authorize refusal a client's redirect carries, or "sign-in" when the request went on to the IdP.
+async function authorizeError(url: string): Promise<string | null> {
+  const r = await new Browser().request(url);
+  expect(r.status).toBe(303);
+  const location = new URL(r.headers.get("location")!);
+  return location.hostname === "accounts.google.com" ? "sign-in" : location.searchParams.get("error");
+}
+const touches = { schedule: () => {}, cancelAll: () => {} };
+
+test("R3: no client but grayboard-cli obtains grayboard:login, and it never travels with another scope", async () => {
+  expect((OAUTH_SCOPES as readonly string[]).includes(LOGIN_SCOPE)).toBe(false);
+  // A built-in, an operator client and a CIMD client each asking for it.
+  for (const clientId of [...BUILTIN_CLIENT_IDS, "native", "subscriber"]) expect(await authorizeError(cliAuthorization(clientId).url)).toBe("invalid_scope");
+  service.close();
+  const cimdId = "https://client.example/metadata.json";
+  service = makeService({ resolve: async () => [{ address: "93.184.216.34", family: 4 }], read: async () => JSON.stringify({ client_id: cimdId, client_name: "CIMD", redirect_uris: ["http://127.0.0.1/callback"], token_endpoint_auth_method: "none", scope: LOGIN_SCOPE }) });
+  expect(await authorizeError(cliAuthorization(cimdId).url)).toBe("invalid_scope");
+  expect(await authorizeError(cliAuthorization(cimdId, "grayboard:tools").url)).toBe("sign-in");
+  expect(await authorizeError(cliAuthorization().url)).toBe("sign-in");
+  // grayboard-cli mixing it with another scope, or asking for an OAUTH_SCOPES member.
+  for (const scope of [`${LOGIN_SCOPE} grayboard:tools`, `grayboard:delivery ${LOGIN_SCOPE}`, "grayboard:tools", "grayboard:delivery grayboard:tools"]) {
+    expect(await authorizeError(cliAuthorization(CLI_CLIENT_ID, scope).url)).toBe("invalid_scope");
+  }
+  // A refresh can't widen a grant to it.
+  const a = await issue("subscriber", "grayboard:delivery grayboard:tools");
+  const tokens = await redeem(a);
+  expect(await (await post("/oauth/token", { grant_type: "refresh_token", client_id: "subscriber", refresh_token: tokens.refresh_token, scope: LOGIN_SCOPE })).json()).toEqual({ error: "invalid_scope" });
+  // Nothing advertises it.
+  const metadata = await (await fetch(base + "/.well-known/oauth-authorization-server")).json();
+  expect(metadata.scopes_supported).not.toContain(LOGIN_SCOPE);
+  expect(metadata.grayboard_builtin_clients).not.toContain(CLI_CLIENT_ID);
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM sessions").get()).toEqual({ n: 0 });
+});
+
+test("R3: an operator client can't take grayboard-cli's ID", () => {
+  const entry = { clientId: CLI_CLIENT_ID, name: "Mine", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:tools"], tokenEndpointAuthMethod: "none" };
+  expect(() => parseOAuthClients(JSON.stringify([entry]))).toThrow(`OAuth client ID ${CLI_CLIENT_ID} is reserved`);
+  expect(() => createOAuthServer(storage.repo, { ...config, oauthClients: [entry as OAuthClient] })).toThrow("reserved");
+});
+
+test("a login code redeems once for a CLI session token: no refresh, no expiry, valid on the API", async () => {
+  const a = await cliCode();
+  // The consent page names what's granted, not the resource the code is stored with.
+  expect(a.consent.content).toContain("Authorize Grayboard for the CLI");
+  expect(a.consent.content).toContain("a grayboard CLI sign-in");
+  expect(a.consent.content).not.toContain("Resource:");
+  const r = await post("/oauth/token", cliTokenParams(a), { "User-Agent": "grayboard-test" });
+  expect(r.status).toBe(200);
+  const body = await r.json() as Record<string, unknown>;
+  expect(Object.keys(body).sort()).toEqual(["access_token", "scope", "token_type"]);
+  expect(body).toMatchObject({ token_type: "Bearer", scope: LOGIN_SCOPE });
+  const token = body.access_token as string;
+  expect(token).toStartWith("gbrd_v1_");
+  const authed = verifySessionToken(token, storage.repo, touches, 30);
+  expect(authed).toMatchObject({ user_email: "you@example.com" });
+  expect(storage.repo.sessions.findById(authed!.session_id)).toMatchObject({ label: "grayboard-test", revoked_at: null });
+  // Not an OAuth access token.
+  expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }))).toBeInstanceOf(Response);
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
+  expect(accessAudits(storage.db, "oauth.session_issued")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: CLI_CLIENT_ID, token_session: authed!.session_id } })]);
+  // The client has no refresh, and the code's other parameters are bound.
+  expect(await (await post("/oauth/token", { grant_type: "refresh_token", client_id: CLI_CLIENT_ID, refresh_token: random() })).json()).toEqual({ error: "invalid_grant" });
+});
+
+test("a replayed login code revokes its session and audits oauth.code_replay_revoked", async () => {
+  const warning = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const a = await cliCode();
+    const first = await post("/oauth/token", cliTokenParams(a));
+    const token = (await first.json() as { access_token: string }).access_token;
+    const authed = verifySessionToken(token, storage.repo, touches, 30)!;
+    expect(authed).not.toBeNull();
+    // Kept past its expiry while the session lives, so a late replay is still caught.
+    clock += OAUTH_TTL.code + 1;
+    await seed(storage.repo, () => storage.repo.oauth.cleanup(clock));
+    const again = await post("/oauth/token", cliTokenParams(a));
+    expect(again.status).toBe(400);
+    expect(await again.json()).toEqual({ error: "invalid_grant" });
+    expect(verifySessionToken(token, storage.repo, touches, 30)).toBeNull();
+    expect(storage.repo.sessions.findById(authed.session_id)!.revoked_at).not.toBeNull();
+    expect(accessAudits(storage.db, "oauth.code_replay_revoked")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: CLI_CLIENT_ID, token_session: authed.session_id, level: "warning" } })]);
+    // With its session revoked the spent code goes at the next sweep.
+    await seed(storage.repo, () => storage.repo.oauth.cleanup(clock));
+    expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_codes").get()).toEqual({ n: 0 });
+  } finally { warning.mockRestore(); }
+});
+
+test("a login code, spent or not, never becomes a grant, and a grant code never a session", async () => {
+  const a = await cliCode();
+  const binding = { clientId: CLI_CLIENT_ID, resource: service.resource, scopes: [LOGIN_SCOPE], redirectUri: a.redirectUri, codeChallenge: s256(a.verifier), codeHash: hashToken(a.code) };
+  const asGrant = () => seed(storage.repo, () => storage.repo.oauth.redeemCode({ ...binding, grantId: random(), grantExpiresAt: clock + OAUTH_TTL.grant,
+    tokens: { clientId: CLI_CLIENT_ID, resource: service.resource, scopes: [LOGIN_SCOPE], accessHash: hashToken(random()), refreshHash: hashToken(random()), accessExpiresAt: clock + OAUTH_TTL.access, refreshExpiresAt: clock + OAUTH_TTL.refresh } }, clock));
+  expect((await asGrant()).status).toBe("invalid");
+  expect((await post("/oauth/token", cliTokenParams(a))).status).toBe(200);
+  expect((await asGrant()).status).toBe("invalid");
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
+  // The reverse: a grant code presented to the login redeemer.
+  const g = await issue("native", "grayboard:tools");
+  const grantBinding = { clientId: "native", resource: service.resource, scopes: ["grayboard:tools"], redirectUri: g.redirectUri, codeChallenge: s256(g.verifier), codeHash: hashToken(g.code) };
+  expect((await seed(storage.repo, () => storage.repo.oauth.redeemLoginCode({ ...grantBinding, tokenHash: hashToken(random()), label: null }, clock))).status).toBe("invalid");
+  expect((await post("/oauth/token", tokenParams(g))).status).toBe(200);
+});
+
+test("a login code is refused with a wrong verifier, redirect or client, and for a disabled user, as grant codes are", async () => {
+  const a = await cliCode();
+  for (const params of [{ code_verifier: random() }, { redirect_uri: "http://127.0.0.1:45124/callback" }, { client_id: "grayboard-pi" }, { code: random() }]) {
+    const r = await post("/oauth/token", { ...cliTokenParams(a), ...params });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toEqual({ error: "invalid_grant" });
+  }
+  // None of those spent it; a disabled user's still can't redeem it (the row is kept to exercise the check).
+  const user = storage.repo.users.findByEmail("you@example.com")!;
+  await seed(storage.repo, () => storage.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [clock, user.id]));
+  expect((await post("/oauth/token", cliTokenParams(a))).status).toBe(400);
+  await seed(storage.repo, () => storage.db.run("UPDATE users SET disabled_at = NULL WHERE id = ?", [user.id]));
+  expect((await post("/oauth/token", cliTokenParams(a))).status).toBe(200);
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM sessions").get()).toEqual({ n: 1 });
+  // An expired, unspent login code is refused.
+  const late = await cliCode();
+  clock += OAUTH_TTL.code + 1;
+  expect((await post("/oauth/token", cliTokenParams(late))).status).toBe(400);
+});
+
+test("the grayboard-cli cutover revokes earlier grants and pending codes under its ID once per database", async () => {
+  service.close();
+  await seed(storage.repo, () => storage.db.run("DELETE FROM server_state WHERE key = 'builtin_clients_cli'"));
+  const old = await issueOAuth(storage.repo, service.resource, "op@example.com", ["grayboard:tools"], clock, CLI_CLIENT_ID);
+  const other = await issueOAuth(storage.repo, service.resource, "op@example.com", ["grayboard:tools"], clock, "native");
+  const user = storage.repo.users.findByEmail("op@example.com")!;
+  const pending = (clientId: string) => seed(storage.repo, () => storage.db.run("INSERT INTO oauth_codes(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)",
+    [hashToken(random()), user.id, clock + OAUTH_TTL.code, JSON.stringify({ clientId, resource: service.resource, scopes: ["grayboard:tools"], redirectUri: "http://127.0.0.1/callback", codeChallenge: random() })]));
+  await pending(CLI_CLIENT_ID); await pending("native");
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  let logged: string;
+  try { service = makeService(); logged = log.mock.calls.flat().join("\n"); } finally { log.mockRestore(); }
+  expect(service.isGrantActive(old.grantId)).toBe(false);
+  expect(service.isGrantActive(other.grantId)).toBe(true);
+  const codes = () => storage.db.query<{ client: string }, []>("SELECT json_extract(data, '$.clientId') AS client FROM oauth_codes WHERE grant_id IS NULL").all().map(r => r.client);
+  expect(codes()).toEqual(["native"]);
+  expect(accessAudits(storage.db, "oauth.builtin_client_grant_revoked").map(r => r.detail)).toEqual([{ client_id: CLI_CLIENT_ID }]);
+  expect(logged).toContain(`revoked 1 OAuth grant(s) issued under ${CLI_CLIENT_ID}`);
+  // A later open leaves later rows alone, even ones an operator downgrade made.
+  service.close();
+  const later = await issueOAuth(storage.repo, service.resource, "op@example.com", ["grayboard:tools"], clock, CLI_CLIENT_ID);
+  await pending(CLI_CLIENT_ID);
+  service = makeService();
+  expect(service.isGrantActive(later.grantId)).toBe(true);
+  expect(codes().sort()).toEqual([CLI_CLIENT_ID, "native"]);
 });

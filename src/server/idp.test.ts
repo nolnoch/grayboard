@@ -39,8 +39,8 @@ test("idpSignIn refuses an email another provider holds, naming that provider an
   expect(await signIn(repo, okta, id("a@example.com", "o-1"), { client_id: "native" }, [google, okta])).toEqual({
     refused: "a@example.com is linked to a Google account, not Okta. If this Okta account should have it, an admin runs grayboard admin unlink-idp --email a@example.com",
   });
-  // A holder the server doesn't list is named by its issuer.
-  expect(await signIn(repo, okta, id("a@example.com", "o-1"))).toEqual({ refused: expect.stringContaining(`linked to a ${GOOGLE_ISSUER} account, not Okta`) });
+  // A holder the server doesn't list isn't named: the text reaches the OAuth client; the audit keeps the issuer.
+  expect(await signIn(repo, okta, id("a@example.com", "o-1"))).toEqual({ refused: expect.stringContaining("linked to another provider's account, not Okta") });
   expect(accessAudits(db, "auth.subject_refused").map(r => [r.actor, r.detail])[0]).toEqual(
     ["a@example.com", { reason: "issuer_mismatch", holding_issuer: GOOGLE_ISSUER, provider: "okta", issuer: okta.issuer, client_id: "native" }]);
   expect(repo.users.findByEmail("a@example.com")).toMatchObject({ idp_issuer: GOOGLE_ISSUER, idp_subject: "s-1" });

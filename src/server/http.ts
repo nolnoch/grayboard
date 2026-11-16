@@ -5,11 +5,10 @@ import {
   verifySessionToken, extractBearer,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
-import { exchangeGoogleCliCode, type GoogleIdentity } from "./idp_google.ts";
-import { defaultProviders, idpSignIn } from "./idp.ts";
+import { defaultProviders } from "./idp.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
-import { userAgent, writeAudit } from "./audit.ts";
+import { writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
@@ -86,57 +85,14 @@ export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEF
   return json({ ok: true, version: pkg.version });
 }
 
-function authConfig(config: Config): Response {
-  // Public bootstrap endpoint. Returns only non-secret values the CLI needs to
-  // start the PKCE loopback flow against Google. The client_secret never appears here.
-  return json({
-    google_client_id: config.googleClientId,
-    org_domain:       config.orgDomain,
-  });
-}
-
-
 // A sign-in body must be JSON (#240): a cross-origin page can't send that
 // without a CORS preflight, so it can't spend an office's sign-in budget.
 export function isJsonRequest(req: Request): boolean {
   return req.headers.get("content-type")?.split(";")[0]!.trim().toLowerCase() === "application/json";
 }
 
-async function authExchange(req: Request, repo: Repo, config: Config, ip: string | null): Promise<Response> {
-  const body = await parseBody<{ code: string; code_verifier: string; redirect_uri: string }>(req);
-  if (!body?.code || !body.code_verifier || !body.redirect_uri) {
-    return badRequest("code, code_verifier, redirect_uri required");
-  }
-  let identity: GoogleIdentity;
-  try {
-    identity = await exchangeGoogleCliCode(config, { code: body.code, verifier: body.code_verifier, redirectUri: body.redirect_uri });
-  } catch (e) {
-    return jsonErr("forbidden", String(e), 403);
-  }
-  const email = identity.email;
-  if (!isValidEmail(email)) return jsonErr("forbidden", `grayboard can't address "${email}"`, 403);
-  const raw  = mintToken();
-  const ua   = userAgent(req);
-  // After the exchange's await: the sign-in, its checks and the session are one queued transaction (#807).
-  // Google's provider for its id, label and issuer; the exchange above is the CLI's own until #928 step 3.
-  const providers = defaultProviders(config);
-  return repo.write(() => {
-    const signedIn = idpSignIn(repo, providers[0]!, identity, { ip: ip ?? undefined }, providers);
-    if ("refused" in signedIn) return jsonErr("forbidden", signedIn.refused, 403);
-    const { user } = signedIn;
-    const disabled = refuseDisabled(repo, user, { ip: ip ?? undefined });
-    if (disabled) return disabled;
-    repo.sessions.create(user.id, hashToken(raw), ua);
-    writeAudit(repo, "auth.login", email, null, {
-      ip: ip ?? undefined,
-      ua: ua ?? undefined,
-    });
-    return json({ session_token: raw, user_email: email, expires_at: null });
-  });
-}
-
-// A disabled user gets no CLI token (security audit F-14); OAuth refuses the
-// same way at consent (oauth.user_refused).
+// A disabled user gets no dev-login token (security audit F-14); the AS refuses
+// one at its callback (oauth.user_refused) and at a code's redemption.
 function refuseDisabled(repo: Repo, user: User, detail: Record<string, unknown>): Response | null {
   if (user.disabled_at === null) return null;
   writeAudit(repo, "auth.user_refused", user.email, null, detail);
@@ -174,7 +130,6 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
 // grant material, since they must take form posts (#283).
 type SignInHandler = (req: Request, repo: Repo, config: Config, ip: string | null) => Promise<Response>;
 const SIGN_IN_ROUTES = new Map<string, { enabled: (config: Config) => boolean; handle: SignInHandler }>([
-  ["/api/auth/exchange", { enabled: () => true, handle: authExchange }],
   ["/api/auth/dev-login", { enabled: (config) => config.devAuth, handle: (req, repo, _config, ip) => devLogin(req, repo, ip) }],
 ]);
 
@@ -725,7 +680,6 @@ export async function handleHttp(
   const method = req.method;
 
   if (path === "/healthz" && method === "GET") return healthz(repo, performance.now(), config.healthzLag);
-  if (path === "/api/auth/config"    && method === "GET")  return authConfig(config);
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);
 

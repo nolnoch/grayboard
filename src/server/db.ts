@@ -24,7 +24,8 @@ import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type Attachme
 import { DiskBlobs } from "./blobs.ts";
 import { requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
-import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess } from "./oauth-types.ts";
+import { LOGIN_SCOPE } from "./oauth-config.ts";
+import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess, type OAuthFailure } from "./oauth-types.ts";
 
 // Row types
 // idp_issuer + idp_subject: the IdP that proved the user's email and its stable
@@ -528,7 +529,8 @@ function initSchema(db: Database): void {
     -- Server-wide scalar state. alive_at: the server's last heartbeat (epoch ms),
     -- so a restart can credit hosted leases with the downtime (#423). builtin_clients:
     -- when this database first ran with the built-in OAuth clients (#429), which revoked
-    -- older grants under their IDs (revokePreBuiltinGrants).
+    -- older grants under their IDs (revokePreBuiltinGrants); builtin_clients_cli: the same
+    -- for grayboard-cli (#928).
     CREATE TABLE IF NOT EXISTS server_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS oauth_requests (
       hash TEXT PRIMARY KEY, browser_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, data TEXT NOT NULL
@@ -711,6 +713,8 @@ function initSchema(db: Database): void {
   const oauthColumns: [string, string, string][] = [
     ["oauth_tokens", "access_scopes", "TEXT"],
     ["oauth_codes", "grant_id", "TEXT REFERENCES oauth_grants(id) ON DELETE CASCADE"],
+    // The CLI session a login code was redeemed for (#928 D8): a session can't fill grant_id, a grants key.
+    ["oauth_codes", "session_id", "INTEGER REFERENCES sessions(id) ON DELETE CASCADE"],
   ];
   // users.idp_subject (security audit F-13) and idp_issuer (#928 D3): unique as a pair among the users with a subject.
   const userColumns = db.query<{ name: string }, []>(`PRAGMA table_info(users)`).all();
@@ -849,7 +853,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     return value;
   };
   const hosted = makeHostedStore(db);
-  const oauth = makeOAuthStore(db, hosted);
+  const oauth = makeOAuthStore(db, hosted, (userId, tokenHash, label, now) => insertSession(db, userId, tokenHash, label, now));
   // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
   // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
   // on every cached auth read.
@@ -996,12 +1000,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     sessions: {
       create(userId, tokenHash, label) {
-        const now = clock();
-        const r = db.run(
-          `INSERT INTO sessions (user_id, token_hash, created_at, last_used_at, label) VALUES (?, ?, ?, ?, ?)`,
-          [userId, tokenHash, now, now, label],
-        );
-        return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(Number(r.lastInsertRowid))!;
+        return insertSession(db, userId, tokenHash, label, clock());
       },
       findByTokenHash(hash) {
         return (
@@ -1479,7 +1478,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   };
 }
 
-function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
+// A CLI session row: sessions.create's, and a login code's redemption's in its own transaction (#928 D8).
+function insertSession(db: Database, userId: number, tokenHash: string, label: string | null, now: number): Session {
+  const r = db.run(
+    `INSERT INTO sessions (user_id, token_hash, created_at, last_used_at, label) VALUES (?, ?, ?, ?, ?)`,
+    [userId, tokenHash, now, now, label],
+  );
+  return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(Number(r.lastInsertRowid))!;
+}
+
+function makeOAuthStore(db: Database, hosted: HostedStore, createSession: (userId: number, tokenHash: string, label: string | null, now: number) => Session): OAuthStore {
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(g.userId);
     insertAudit(db, now, user?.email ?? null, action, g.id, JSON.stringify({ client_id: g.clientId, ...detail }));
@@ -1536,6 +1544,26 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
   const browser = (h: string, now: number) => {
     const b = read<OAuthBrowserSession>("oauth_browsers", h, now);
     return b && activeUser(b.userId) ? b : undefined;
+  };
+  // A code row and the checks both redeemers share (#928 D8): the code exists and its binding (client, resource,
+  // scopes, redirect, fresh S256 challenge) is the presented one. A spent row (grant_id or session_id set) is the
+  // caller's replay; `usable` then checks expiry and the user.
+  type CodeRow = { data: string; expires_at: number; grant_id: string | null; session_id: number | null };
+  const codeRow = (h: string) => db.query<CodeRow, [string]>("SELECT data, expires_at, grant_id, session_id FROM oauth_codes WHERE hash = ?").get(h);
+  const presented = (input: OAuthAuthorization & { codeHash: string }, now: number): { c: OAuthCode; row: CodeRow } | OAuthFailure => {
+    if (!time(now) || !hash(input.codeHash)) return invalid;
+    const row = codeRow(input.codeHash);
+    if (!row) return missing;
+    const c: OAuthCode = JSON.parse(row.data);
+    return sameAuthorization(c, input) ? { c, row } : invalid;
+  };
+  const usable = (c: OAuthCode, row: CodeRow, now: number): OAuthFailure | undefined =>
+    row.expires_at <= now ? missing : activeUser(c.userId) ? undefined : invalid;
+  const isLogin = (c: OAuthBinding) => c.scopes.length === 1 && c.scopes[0] === LOGIN_SCOPE;
+  const liveSession = (id: number) => !!db.query("SELECT 1 FROM sessions WHERE id = ? AND revoked_at IS NULL").get(id);
+  const sessionAudit = (action: AuditAction, c: OAuthCode, sessionId: number, now: number, detail: Record<string, unknown> = {}) => {
+    const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(c.userId);
+    insertAudit(db, now, user?.email ?? null, action, null, JSON.stringify({ client_id: c.clientId, token_session: sessionId, ...detail }));
   };
   return {
     createRequest(input, now) {
@@ -1600,22 +1628,21 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
     },
     findCodeScopes(h, clientId, resource, redirectUri, now) {
       if (!time(now) || !hash(h)) return undefined;
-      const row = db.query<{ data: string; expires_at: number; grant_id: string | null }, [string]>(
-        "SELECT data, expires_at, grant_id FROM oauth_codes WHERE hash = ?").get(h);
+      const row = codeRow(h);
       if (!row) return undefined;
       const c: OAuthCode = JSON.parse(row.data);
       if (c.clientId !== clientId || c.resource !== resource || c.redirectUri !== redirectUri || !activeUser(c.userId)) return undefined;
-      if (row.grant_id === null ? row.expires_at <= now : !live(grant(row.grant_id), now)) return undefined;
+      // A spent code stays findable while what it minted lives, so a replay reaches its redeemer and revokes it.
+      if (row.grant_id !== null ? !live(grant(row.grant_id), now) : row.session_id !== null ? !liveSession(row.session_id) : row.expires_at <= now) return undefined;
       return [...c.scopes];
     },
     redeemCode(input, now) {
       return db.transaction(() => {
-        if (!time(now) || !hash(input.codeHash)) return invalid;
-        const row = db.query<{ data: string; expires_at: number; grant_id: string | null }, [string]>(
-          "SELECT data, expires_at, grant_id FROM oauth_codes WHERE hash = ?").get(input.codeHash);
-        if (!row) return missing;
-        const c: OAuthCode = JSON.parse(row.data);
-        if (!sameAuthorization(c, input)) return invalid;
+        const p = presented(input, now);
+        if ("status" in p) return p;
+        const { c, row } = p;
+        // A login code, spent or not, never becomes a grant (#928 D8).
+        if (row.session_id !== null || c.scopes.includes(LOGIN_SCOPE)) return invalid;
         if (row.grant_id !== null) {
           const g = grant(row.grant_id);
           if (!g || g.expiresAt <= now) return missing;
@@ -1623,9 +1650,9 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
           audit("oauth.code_replay_revoked", g, now, { level: "warning" });
           return { status: "replay" } as const;
         }
-        if (row.expires_at <= now) return missing;
-        if (!activeUser(c.userId) ||
-            !/^[A-Za-z0-9_-]{16,128}$/.test(input.grantId) ||
+        const unusable = usable(c, row, now);
+        if (unusable) return unusable;
+        if (!/^[A-Za-z0-9_-]{16,128}$/.test(input.grantId) ||
             !deadline(now, input.grantExpiresAt, now, OAUTH_TTL.grant) ||
             !validPair(input.tokens, c, now, input.grantExpiresAt)) return invalid;
         const g: OAuthGrant = { id: input.grantId, userId: c.userId, clientId: c.clientId, resource: c.resource,
@@ -1635,6 +1662,27 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
         insertPair(input.tokens, g.id, now);
         audit("oauth.grant_issued", g, now);
         return ok({ grant: g, tokens: input.tokens });
+      }).immediate();
+    },
+    redeemLoginCode(input, now) {
+      return db.transaction(() => {
+        const p = presented(input, now);
+        if ("status" in p) return p;
+        const { c, row } = p;
+        if (row.grant_id !== null || !isLogin(c)) return invalid;
+        if (row.session_id !== null) {
+          // As a replayed grant code revokes its grant: the code leaked, so the session it minted may have too.
+          db.run("UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, row.session_id]);
+          sessionAudit("oauth.code_replay_revoked", c, row.session_id, now, { level: "warning" });
+          return { status: "replay" } as const;
+        }
+        const unusable = usable(c, row, now);
+        if (unusable) return unusable;
+        if (!hash(input.tokenHash) || (input.label !== null && typeof input.label !== "string")) return invalid;
+        const session = createSession(c.userId, input.tokenHash, input.label, now);
+        db.run("UPDATE oauth_codes SET session_id = ? WHERE hash = ?", [session.id, input.codeHash]);
+        sessionAudit("oauth.session_issued", c, session.id, now);
+        return ok({ sessionId: session.id, userId: c.userId });
       }).immediate();
     },
     findRefreshGrant(h, clientId, resource, now) {
@@ -1707,10 +1755,10 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
       return !!db.query(`SELECT 1 FROM oauth_grants g JOIN users u ON u.id = g.user_id
         WHERE g.id = ? AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(id, now);
     },
-    revokePreBuiltinGrants(clientIds, now) {
+    revokePreBuiltinGrants(clientIds, now, key = "builtin_clients") {
       if (!time(now)) throw new RangeError("invalid OAuth cutover time");
       return db.transaction(() => {
-        if (db.query("SELECT 1 FROM server_state WHERE key = 'builtin_clients'").get()) return 0;
+        if (db.query("SELECT 1 FROM server_state WHERE key = ?").get(key)) return 0;
         const ids = JSON.stringify(clientIds);
         // An operator client could use these IDs before #429; its grants and codes must not
         // become a built-in's (write-capable, refreshed with no secret).
@@ -1721,7 +1769,7 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
           audit("oauth.builtin_client_grant_revoked", grant(id)!, now);
         }
         db.run("DELETE FROM oauth_codes WHERE grant_id IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))", [ids]);
-        db.run("INSERT INTO server_state(key, value) VALUES ('builtin_clients', ?)", [now]);
+        db.run("INSERT INTO server_state(key, value) VALUES (?, ?)", [key, now]);
         return grants.length;
       }).immediate();
     },
@@ -1729,7 +1777,9 @@ function makeOAuthStore(db: Database, hosted: HostedStore): OAuthStore {
       if (!time(now)) throw new RangeError("invalid OAuth cleanup time");
       db.transaction(() => {
         for (const table of ["oauth_requests", "oauth_browsers"]) db.run(`DELETE FROM ${table} WHERE expires_at <= ?`, [now]);
-        db.run("DELETE FROM oauth_codes WHERE grant_id IS NULL AND expires_at <= ?", [now]);
+        // A spent login code is kept while its session lives, as a grant code is while its grant does (replay).
+        db.run(`DELETE FROM oauth_codes WHERE grant_id IS NULL AND expires_at <= ?
+          AND (session_id IS NULL OR session_id NOT IN (SELECT id FROM sessions WHERE revoked_at IS NULL))`, [now]);
         db.run("DELETE FROM oauth_tokens WHERE kind = 'access' AND expires_at <= ?", [now]);
         // Keep refresh tombstones until the absolute family deadline, including revoked families.
         db.run("DELETE FROM oauth_grants WHERE expires_at <= ?", [now]);

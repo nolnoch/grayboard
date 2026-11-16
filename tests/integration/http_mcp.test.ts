@@ -295,7 +295,7 @@ test("live access, family, disable and admin revocation never reuse a cached pri
 test("old session remains accepted on retained API but not new MCP", async () => {
   const token = await legacyLogin();
   const headers = { Authorization: `Bearer ${token}` };
-  expect((await fetch(`${base}/api/auth/config`, { headers })).status).toBe(200);
+  expect((await fetch(`${base}/api/whoami`, { headers })).status).toBe(200);
   expect((await fetch(`${base}/api/identities`, { headers })).status).toBe(200);
   expect((await fetch(`${base}/mcp`, { headers: headers })).status).toBe(401);
 });
