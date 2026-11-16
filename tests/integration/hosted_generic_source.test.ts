@@ -21,6 +21,7 @@ import { reprDigest } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { withMeta } from "../helpers/hosted.ts";
 import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
+import { stubProvider } from "../support/stub_provider.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -42,7 +43,7 @@ function start(oauthClients: OAuthClient[]) {
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, hostedSubscriberLimit: { burst: 10_000, perSec: 10_000 }, oauthClients, oauthCimdClients: [OPENCODE_CLIENT, CIMD_CLIENT],
   }, { hostname: "127.0.0.1", background: false, oauth: {
-    exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }),
+    providers: [stubProvider(async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }))],
     cimd: {
       resolve: async () => [{ address: "93.184.216.34", family: 4 }],
       read: async url => JSON.stringify({ client_id: url.href, client_name: url.href === OPENCODE_CLIENT ? "OpenCode" : "Metadata client", redirect_uris: [redirectUrl], token_endpoint_auth_method: "none" }),
@@ -66,7 +67,7 @@ afterEach(async () => {
 
 const mapped = (url: string) => { const u = new URL(url); return base + u.pathname + u.search; };
 // The full authorization code flow with PKCE S256 a native client runs; only the upstream
-// identity provider is stubbed (`exchangeGoogle`).
+// identity provider is stubbed (`stubProvider`).
 async function grant(clientId: string): Promise<string> {
   const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url"), browser = new Browser({ rewrite: mapped });
   const begin = await browser.request(`${issuer}/oauth/authorize?` + new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: redirectUrl, scope: SCOPES, resource, state,

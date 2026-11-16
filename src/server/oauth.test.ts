@@ -17,9 +17,15 @@ import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_browser.ts";
 import { accessAudits } from "../../tests/support/audit.ts";
-import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { stubProvider } from "../../tests/support/stub_provider.ts";
+import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
+// One signing key for every test that mocks Google's JWKS: the default provider's key set (idp_google.ts) is
+// module-level and cached across tests, so a second key would be unknown inside jose's refetch cooldown.
+let googleKeyPair: Promise<{ jwk: JWK & { kid: string }; privateKey: KeyLike }> | undefined;
+const googleKey = () => googleKeyPair ??= generateKeyPair("RS256").then(async ({ publicKey, privateKey }) =>
+  ({ jwk: { ...await exportJWK(publicKey), kid: "google-fixture", alg: "RS256", use: "sig" }, privateKey }));
 const s256 = (s: string) => createHash("sha256").update(s).digest("base64url");
 let dir: string, storage: ReturnType<typeof openDatabase>, service: ReturnType<typeof createOAuthServer>, server: ReturnType<typeof Bun.serve>;
 let config: Config, base: string, clock: number, exchanges: number;
@@ -33,14 +39,14 @@ const registrations: OAuthClient[] = [
 function makeService(cimd?: import("./oauth-cimd.ts").CimdOptions) {
   return createOAuthServer(storage.repo, config, { now: () => clock, cimd,
     // Explicit fake upstream identity only; all downstream browser/code/token work is real HTTP + SQLite.
-    exchangeGoogle: async input => {
+    providers: [stubProvider(async input => {
       exchanges++;
       expect(input.nonce).toMatch(/^[\w-]{43}$/);
       expect(input.verifier).toMatch(/^[\w-]{43}$/);
       expect(input.redirectUri).toBe(base + "/oauth/google/callback");
       if (input.code !== "fake-google-code") throw new Error("fake rejection");
       return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
-    } });
+    })] });
 }
 beforeEach(() => {
   clock = Date.now(); exchanges = 0;
@@ -440,7 +446,7 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
   } finally { storage.repo.oauth.cleanup = cleanup; }
   try {
     service.close();
-    service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => { throw forged; } });
+    service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => { throw forged; })] });
     const browser = new Browser();
     const begin = await browser.request(authorization().url);
     const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
@@ -461,7 +467,7 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   expect((await fetch(authorization("https://client.example/client.json").url)).status).toBe(503);
   expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.cimd_failed'").get()).toEqual({ action: "oauth.cimd_failed" });
   service.close();
-  service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "other@elsewhere.example", displayName: null, subject: "google-other@elsewhere.example" }) });
+  service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "other@elsewhere.example", displayName: null, subject: "google-other@elsewhere.example" }))] });
   const browser = new Browser();
   const first = await browser.request(authorization().url);
   const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
@@ -483,7 +489,7 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
 test("a Google account presenting a linked user's email is refused at the callback and audited", async () => {
   const signIn = async (subject: string) => {
     service.close();
-    service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "you@example.com", displayName: "You", subject }) });
+    service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "you@example.com", displayName: "You", subject }))] });
     const browser = new Browser();
     const first = await browser.request(authorization().url);
     const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
@@ -505,8 +511,7 @@ test("direct config dev auth rejects either Google secret, including an override
 });
 
 test("default Google exchange consistently selects the Web override or primary fallback and verifies its audience", async () => {
-  const { publicKey, privateKey } = await generateKeyPair("RS256");
-  const jwk = { ...await exportJWK(publicKey), kid: "mcp-web-config-fixture", alg: "RS256", use: "sig" };
+  const { jwk, privateKey } = await googleKey();
   const originalFetch = globalThis.fetch;
   try {
     for (const mode of ["fallback", "override", "wrong-audience", "trusted-fixture"] as const) {
@@ -515,13 +520,13 @@ test("default Google exchange consistently selects the Web override or primary f
       const cfg = { ...config, publicUrl: "https://grayboard.example.com:443/hosted", devAuth: false, googleClientId: "desktop-client", googleClientSecret: "desktop-private", mcpGoogle };
       let nonce = "", tokenCalls = 0, fixtureCalls = 0;
       const selected = mcpGoogle ?? { clientId: cfg.googleClientId, clientSecret: cfg.googleClientSecret };
-      service = createOAuthServer(storage.repo, cfg, mode === "trusted-fixture" ? { exchangeGoogle: async input => {
+      service = createOAuthServer(storage.repo, cfg, mode === "trusted-fixture" ? { providers: [stubProvider(async input => {
         fixtureCalls++;
         expect(input.redirectUri).toBe(cfg.publicUrl + "/oauth/google/callback");
         expect(input.nonce).toBe(nonce);
         // The real path's ID token below carries sub "fixture-user"; the modes share one database.
         return { email: "you@example.com", displayName: "You", subject: "fixture-user" };
-      } } : {});
+      }, { clientId: selected.clientId, orgDomain: cfg.orgDomain })] } : {});
       globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
         const req = new Request(input, init);
         if (req.url === "https://www.googleapis.com/oauth2/v3/certs") return Response.json({ keys: [jwk] });
@@ -772,6 +777,53 @@ test("Google callback issuer hardening rejects mismatches before exchange or sta
   }
   expect((await browser.request(callback + "&iss=https%3A%2F%2Faccounts.google.com")).status).toBe(303);
   expect(exchanges).toBe(1);
+});
+
+test("a Google callback carrying a parameter outside the allowlist is refused before exchange", async () => {
+  const browser = new Browser(), begin = await browser.request(authorization().url), google = new URL(begin.headers.get("Location")!);
+  const callback = base + "/oauth/google/callback?" + new URLSearchParams({ state: google.searchParams.get("state")!, code: "fake-google-code" });
+  expect((await browser.request(callback + "&injected=1")).status).toBe(400);
+  expect(exchanges).toBe(0);
+});
+
+test("the default Google provider's authorize redirect carries hd=<orgDomain> from config", async () => {
+  service.close();
+  service = createOAuthServer(storage.repo, { ...config, orgDomain: "corp.example" }, { now: () => clock });
+  const begin = await new Browser().request(authorization().url);
+  expect(begin.status).toBe(303);
+  const google = new URL(begin.headers.get("Location")!);
+  expect(google.origin + google.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
+  expect(google.searchParams.get("hd")).toBe("corp.example");
+});
+
+// The real googleProvider: it must hand the AS's nonce to the token check, or a replayed ID token would pass.
+test("the default Google provider refuses an ID token whose nonce isn't the flow's", async () => {
+  const { jwk, privateKey } = await googleKey();
+  const originalFetch = globalThis.fetch;
+  let tokenNonce: (flowNonce: string) => string = n => n, flowNonce = "";
+  globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (req.url === "https://www.googleapis.com/oauth2/v3/certs") return Response.json({ keys: [jwk] });
+    if (req.url !== "https://oauth2.googleapis.com/token") return originalFetch(input, init);
+    const id_token = await new SignJWT({ hd: "example.com", email: "you@example.com", email_verified: true, nonce: tokenNonce(flowNonce) })
+      .setProtectedHeader({ alg: "RS256", kid: jwk.kid }).setIssuer("https://accounts.google.com").setSubject("nonce-user")
+      .setAudience(config.googleClientId).setIssuedAt().setExpirationTime("5m").sign(privateKey);
+    return Response.json({ id_token });
+  }, { preconnect: originalFetch.preconnect });
+  try {
+    service.close();
+    service = createOAuthServer(storage.repo, config, { now: () => clock });
+    const signIn = async () => {
+      const browser = new Browser(), begin = await browser.request(authorization().url), google = new URL(begin.headers.get("Location")!);
+      flowNonce = google.searchParams.get("nonce")!;
+      return (await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state: google.searchParams.get("state")!, code: "mock-google-code", iss: "https://accounts.google.com" }))).status;
+    };
+    tokenNonce = () => random();
+    expect(await signIn()).toBe(403);
+    expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.google_failed'").all()).toEqual([{ action: "oauth.google_failed" }]);
+    tokenNonce = n => n;
+    expect(await signIn()).toBe(303);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test("fixed registered loopback ports allow another authorization port but code redemption binds the actual URI", async () => {
@@ -1073,9 +1125,9 @@ test("URL-only SDK enrollment honors native challenge and obtains one tools+deli
 test("official SDK binds one canonical default-port resource while preserving exact configured issuer and iss", async () => {
   const publicUrl = "https://grayboard.example.com:443/hosted";
   service.close();
-  service = createOAuthServer(storage.repo, { ...config, publicUrl, devAuth: false }, { now: () => clock, exchangeGoogle: async input => {
+  service = createOAuthServer(storage.repo, { ...config, publicUrl, devAuth: false }, { now: () => clock, providers: [stubProvider(async input => {
     expect(input.redirectUri).toBe(publicUrl + "/oauth/google/callback"); return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
-  } });
+  })] });
   expect(service.resource).toBe("https://grayboard.example.com/hosted/mcp"); expect(service.issuer).toBe(publicUrl);
   const mapURL = (url: string) => { const u = new URL(url); expect(u.origin).toBe("https://grayboard.example.com"); return base + u.pathname + u.search; };
   const fetchFn = (input: RequestInfo | URL, init?: RequestInit) => {

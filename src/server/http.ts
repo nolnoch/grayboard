@@ -2,9 +2,10 @@ import pkg from "../../package.json" with { type: "json" };
 import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type Team, type TeamPolicy, type TeamRole, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
-  verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
+  verifySessionToken, extractBearer, googleSignIn,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
+import { exchangeGoogleCliCode, type GoogleIdentity } from "./idp_google.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
@@ -107,10 +108,7 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   }
   let identity: GoogleIdentity;
   try {
-    identity = await exchangeGoogleCode(
-      body.code, body.code_verifier, body.redirect_uri,
-      config.googleClientId, config.googleClientSecret, config.orgDomain,
-    );
+    identity = await exchangeGoogleCliCode(config, { code: body.code, verifier: body.code_verifier, redirectUri: body.redirect_uri });
   } catch (e) {
     return jsonErr("forbidden", String(e), 403);
   }
