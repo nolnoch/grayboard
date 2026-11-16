@@ -312,7 +312,7 @@ function helloOkFields(hub: Hub, authed: AuthedUser): SessionFacts {
   return {
     user_email: authed.user_email,
     teams: repo.teams.listForUser(authed.user_id).map((t) => formatTeamAddress(t.name)),
-    // Read committed: the link isn't written by the hosted bodies this runs in.
+    // Read committed: the link isn't written by any body this runs in.
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(repo.read, authed.user_id) },
     attachment_limits: repo.attachmentLimits,
   };
