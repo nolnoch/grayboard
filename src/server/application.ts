@@ -10,7 +10,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSC
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
-import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
@@ -1276,6 +1276,16 @@ function resolvePeer(repo: Repo, from: string, input: string, viewer: string = f
   return fail("not_found", `${which}; peer_list shows exact handles`);
 }
 
+// Whether `address` is a team's alias that `viewer` (a session ID, else the acting address) may not see exists: to
+// anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014). Only a team's: a
+// service's agents take mail from anyone in the org (vision.md principle 9).
+function teamAliasHidden(repo: Repo, viewer: string, address: string): boolean {
+  const a = repo.aliases.find(address);
+  if (a?.scope_kind !== "team" || a.scope_ref === null) return false;
+  const vp = repo.resolver.principalOf(viewer);
+  return vp === null || !authorize(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } }).allow;
+}
+
 // A send checked and resolved, ready to write: `from` the address it goes
 // out as, `to` the recipient's full handle, `digests` its files' blob
 // digests in call order.
@@ -1317,7 +1327,16 @@ function prepareSend(
   const to = resolvePeer(repo, from, recipientStr, session.sessionId || from);
   if (to.kind === "team") fail("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
-  if (to.kind === "alias" && !repo.aliases.find(to.address)) fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
+  // A team's alias the sender may not see reads as one nobody has (#1014), unless this replies in a thread with it:
+  // a handle that wrote to you is one you may answer.
+  const replyingTo = (address: string) => {
+    if (parentId === null) return false;
+    const parent = repo.messages.getById(parentId);
+    return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
+  };
+  if (to.kind === "alias" && (!repo.aliases.find(to.address) || (teamAliasHidden(repo, session.sessionId || from, to.address) && !replyingTo(to.address)))) {
+    fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
+  }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
   const decision = authorize(repo, { humanReach: hub.humanReach }, req);
   if (!decision.allow) {
@@ -1490,6 +1509,8 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   // request's grant can't be judged against a holder that isn't there
   // (security audit of #878).
   const reach = (to: string, recheck = false): DelegateReach => {
+    // A team's alias this session may not see reads as one nobody has (#1014), before any grant is judged.
+    if (teamAliasHidden(repo, session.sessionId || session.primary, to)) return { refused: neverConnected(to) };
     const owner = addressUser(db, to);
     if (owner === undefined && recheck) return { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` };
     if (owner === undefined || owner === authed.user_email) return { ok: "own" };

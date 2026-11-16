@@ -1,9 +1,10 @@
 // #348: a team's alias names reach only the team and its members, as its
 // boards and roster do. To anyone else the team reads as missing: no
 // peer_list row (global or a board's roster), no `match` or offline-count
-// probe, no name suggestion in a refused DM. People's names stay the open
-// directory, and mail to a team alias by its exact handle stays open
-// (vision.md principle 9; msg.wake keeps it from waking anyone).
+// probe, no name suggestion in a refused DM, and mail or a delegation to its
+// exact handle is refused as for a name nobody has (#1014), except a reply in
+// a thread it wrote. People's names stay the open directory (vision.md
+// principle 9).
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { WhoResult } from "../../src/core/boards.ts";
 import type { AppSession } from "../support/app_session.ts";
@@ -117,10 +118,45 @@ test("a refused bare name suggests only full handles the sender may see; hidden 
   expect(named.message).toContain("bob@example.com/build");
   expect(named.message).not.toContain("eng/build");
 
-  // Mail by exact handle stays open (principle 9): it lands in the holder's mail.
-  const sent = await outsider.send("eng/build", "by name");
-  expect(sent.message_id).toBeGreaterThan(0);
-  await build.next(direct((m) => m.body === "by name"));
+  // Its exact handle reads as one nobody has, too (#1014); a member's mail lands.
+  const exact = await refused(outsider, "eng/build");
+  const none = await refused(outsider, "eng/nosuch");
+  expect(exact).toEqual({ code: "not_found", message: none.message.replace(`"eng/nosuch"`, `"eng/build"`) });
+  await member.send("eng/build", "from a member");
+  await build.next(direct((m) => m.body === "from a member"));
+});
+
+test("mail and delegation to a team alias's exact handle read as a name nobody has outside the team, live or offline; a thread it wrote stays answerable (#1014)", async () => {
+  const outsider = srv.appSession(carol, "qa");
+  await outsider.connect();
+  const build = srv.appSession(bob, "eng/build", { bind: { create: true } });
+  await build.connect();
+  const old = srv.appSession(bob, "eng/old", { bind: { create: true } });
+  await old.connect();
+  old.close();
+
+  const answer = async (fn: () => Promise<unknown>, name: string) => {
+    try { await fn(); } catch (e) { return JSON.stringify({ code: (e as any).code, message: (e as Error).message }).replaceAll(name, "NAME"); }
+    throw new Error(`call naming ${name} landed`);
+  };
+  const absent = await answer(() => outsider.send("eng/nosuch", "hi"), "eng/nosuch");
+  expect(absent).toContain("not_found");
+  expect(await answer(() => outsider.send("eng/build", "hi"), "eng/build")).toBe(absent);
+  expect(await answer(() => outsider.send("eng/old", "hi"), "eng/old")).toBe(absent);
+  // A scope nobody has answers alike, so a team's existence doesn't show either.
+  expect(await answer(() => outsider.send("nosuchteam/x", "hi"), "nosuchteam/x")).toBe(absent);
+
+  // delegate's explicit `to`, before any grant is judged.
+  const delegated = async (to: string) => answer(() => outsider.delegate({ persona: "a researcher", task: "t", to }), to);
+  expect(await delegated("eng/build")).toBe(await delegated("eng/nosuch"));
+
+  // A thread the team alias wrote is answerable by parent_id; a fresh message to it still isn't.
+  const first = await build.send(`carol@example.com/qa`, "from the team");
+  await outsider.next(direct((m) => m.body === "from the team"));
+  const reply = await outsider.send("eng/build", "reply", { parent_id: first.message_id });
+  expect(reply.message_id).toBeGreaterThan(0);
+  await build.next(direct((m) => m.body === "reply"));
+  expect(await answer(() => outsider.send("eng/build", "fresh"), "eng/build")).toBe(absent);
 });
 
 test("a post's bare @name suggests only names the poster may see, and its result names only recipients it may see", async () => {

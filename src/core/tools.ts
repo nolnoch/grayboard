@@ -514,7 +514,7 @@ export function callBoardTool(
       const seen = (hs: string[]) => seenHandles(db, ctx.session ?? handle, hs);
       const shownDeferred = seen(deferred);
       // A mention of a name the poster may not see exists reads as one that matched nobody, in its place (#871);
-      // delivery is unchanged, as mail to a full handle is open.
+      // delivery is unchanged: a post's result shows no per-recipient state, unlike a DM's, which is refused (#1014).
       const missed = new Set(unresolved);
       const shownUnresolved = mentionTokens(str(a, "body")).filter((t) => missed.has(t) || seen([t]).length === 0);
       const result: BoardPostResult = {
