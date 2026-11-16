@@ -6,6 +6,7 @@ import { ApplicationError, type ApplicationSession, type DeliveryEvent, type Ide
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
+import type { Read } from "./store/tx.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { countRefusal } from "./metrics.ts";
 
@@ -41,7 +42,7 @@ function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
   return { id: item.kind === "push" ? `push:${item.post.id}` : `digest:${item.board}:${item.latest.id}`, actionable: item.kind === "push" && !item.deferred && !item.post.ungranted, event, ...stamp };
 }
 export function createDelivery(hosted: HostedSessions, options: DeliveryOptions) {
-  const application = hosted.application, store = application.repo.hosted;
+  const application = hosted.application, store = application.repo.hosted, pool = application.repo.read;
   const ttl = hosted.leaseTtl, now = options.now ?? hosted.now, caps = options.caps ?? DEFAULT_HOSTED_CAPS.leases;
   const leases = new Map<string, Lease>();
   // A session holds at most one lease (a reopen finishes the previous first): looked up and counted without a
@@ -69,7 +70,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   let stopped = false;
   function finish(lease: Lease) {
     if (!leases.delete(lease.capability)) return;
-    if (store.get(lease.sessionId)?.ownership_id !== lease.ownership) drained.delete(drainKey(lease));
+    if (store.get(pool, lease.sessionId)?.ownership_id !== lease.ownership) drained.delete(drainKey(lease));
     if (bySession.get(lease.sessionId) === lease) bySession.delete(lease.sessionId);
     const user = lease.principal.authed.user_id, n = (perUser.get(user) ?? 1) - 1;
     if (n) perUser.set(user, n); else perUser.delete(user);
@@ -83,7 +84,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   // `changed`: the one row a commit changed (#399), so only its leases are checked; null checks them all.
   const unlisten = hosted.listen(changed => {
     const check = changed === null ? [...leases.values()] : [bySession.get(changed)].filter(l => l !== undefined);
-    for (const lease of check) if (!matches(lease, store.get(lease.sessionId))) finish(lease);
+    for (const lease of check) if (!matches(lease, store.get(pool, lease.sessionId))) finish(lease);
   });
   function stale(p: DeliveryPrincipal, context: SessionContext, capability: string): never {
     throw new StaleCapability();
@@ -94,11 +95,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     throw error;
   }
   // `authorized`: the caller checked p's token this turn, with no await since (#853).
-  function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, authorized = false) {
+  // `r`: the body's Tx when this runs inside one, so the fallback row read stays in that transaction; else the pool.
+  function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, authorized = false, r: Read = pool) {
     const lease = leases.get(capability);
     if (stopped || !lease || !("id" in context) || context.id !== lease.sessionId ||
       p.authed.user_id !== lease.principal.authed.user_id || p.clientId !== lease.principal.clientId || p.grantId !== lease.principal.grantId ||
-      !matches(lease, row ?? store.get(lease.sessionId)) || (!authorized && !options.isAuthorized(p))) return stale(p, context, capability);
+      !matches(lease, row ?? store.get(r, lease.sessionId)) || (!authorized && !options.isAuthorized(p))) return stale(p, context, capability);
     return lease;
   }
   const describe = (l: Lease): DeliveryLease => ({ capability: l.capability, identity: structuredClone(l.identity), expiresAt: l.expiresAt, ownership: l.ownership, bind_gen: l.generation });
@@ -133,7 +135,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const { row, expiresAt } = result;
         let lease!: Lease;
         const selected = application.hostedSession(p.authed, row.session_id, application.hostedHolds(row.session_id), null, row, {
-          deliver() { if (lease && matches(lease, store.get(lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
+          deliver() { if (lease && matches(lease, store.get(pool, lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
           closed() { if (lease) finish(lease); },
         }, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
@@ -157,8 +159,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
       return hosted.control(p, context, false, async row => {
         const { lease } = await store.write(tx => {
-          const fresh = store.get(row.session_id);
-          const lease = get(p, context, capability, fresh), deadline = now() + ttl;
+          const fresh = store.get(tx, row.session_id);
+          const lease = get(p, context, capability, fresh, false, tx), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
           store.update(tx, { ...fresh, lease_deadline: deadline, last_seen_at: now() });
           return { lease, deadline };
@@ -194,8 +196,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         await testPauseAsync("hosted:receipt:before-txn");
         await store.write(async tx => {
           testPause("hosted:receipt:in-txn");
-          const row = "id" in context ? store.get(context.id) : undefined;
-          const lease = get(p, context, capability, row);
+          const row = "id" in context ? store.get(tx, context.id) : undefined;
+          const lease = get(p, context, capability, row, false, tx);
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
           const records: Issued[] = [];
@@ -227,7 +229,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
         await store.write(tx => {
-          get(p, context, capability, store.get(row.session_id));
+          get(p, context, capability, store.get(tx, row.session_id), false, tx);
           store.end(tx, row.session_id, "closed", now());
         });
       }).catch(error => refused(p, context, error));
@@ -243,7 +245,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       await hosted.gate(lease.sessionId).bind(async () => {
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
         await store.write(tx => {
-          if (matches(lease, store.get(lease.sessionId))) store.end(tx, lease.sessionId, "closed", now());
+          if (matches(lease, store.get(tx, lease.sessionId))) store.end(tx, lease.sessionId, "closed", now());
           hosted.settle(tx, lease.sessionId);
         }, () => {
           finish(lease);

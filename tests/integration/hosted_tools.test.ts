@@ -696,12 +696,12 @@ test("disable-user ends a hosted child and pushes its bounce to a live sender (#
   const { child, id } = await childOf(be, A, "reviewer-run");
   // Their clients drop first (no release), so the disable's 401s reach no client; the rows stay.
   await Promise.all([be.drop(), child.drop()]);
-  expect(srv.app.repo.hosted.get(id)?.root_session_id).toBeTruthy();
+  expect(srv.app.repo.hosted.get(srv.app.repo.read, id)?.root_session_id).toBeTruthy();
   await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
     VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, 0)`).run(`${B}/fe`, id, Date.now()));
   expect((await api(admin, "POST", "/api/admin/disable-user", { email: A })).status).toBe(200);
   expect((await fe.next(direct())).message).toMatchObject({ sender: id, kind: "bounce" });
-  expect(srv.app.repo.hosted.get(id)).toBeUndefined();
+  expect(srv.app.repo.hosted.get(srv.app.repo.read, id)).toBeUndefined();
 });
 
 test("#523: a child's DM and post carry its ID as via in pushes, reads and board snapshots, and still do after it ends; its root's carry none", async () => {

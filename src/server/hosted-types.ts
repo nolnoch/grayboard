@@ -1,4 +1,4 @@
-import type { Tx } from "./store/tx.ts";
+import type { Read, Tx } from "./store/tx.ts";
 import type { Sync } from "./db.ts";
 export type HostedSession = {
   session_id: string; ownership_id: number; user_id: number; client_id: string; grant_id: string;
@@ -30,21 +30,21 @@ export interface HostedStore {
   // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
   // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
   subscribe(fn: (changed: string | null) => void): () => void;
-  get(id: string): HostedSession | undefined;
+  get(r: Read, id: string): HostedSession | undefined;
   // Whether the session ID is a hosted session's: a root's ownership row
   // stays after it ends; a child's row only while it is registered.
-  owned(id: string): boolean;
+  owned(r: Read, id: string): boolean;
   // Every row but parked children (#566): the row set the limits count (`counts`) and the sweeps scan. `get` still returns a
   // parked row, and `children` lists a root's children, parked or not.
-  all(): HostedSession[];
+  all(r: Read): HostedSession[];
   // What admission counts, without loading rows (#805): unparked rows on the server and the user's. The user's is
   // O(own rows) on idx_hosted_user; the server's walks idx_hosted_parked, bounded by the global row cap.
-  counts(user: number): { total: number; user: number };
+  counts(r: Read, user: number): { total: number; user: number };
   // An ownership's unparked rows (idx_hosted_ownership): what a grant re-attach moves.
-  ofOwnership(ownership: number): HostedSession[];
-  children(root: string): HostedSession[];
+  ofOwnership(r: Read, ownership: number): HostedSession[];
+  children(r: Read, root: string): HostedSession[];
   // A user's live roots, oldest first (#475): peer_list's unbound sessions are those holding nothing.
-  roots(user: number): HostedSession[];
+  roots(r: Read, user: number): HostedSession[];
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
   park(tx: Tx, session: string, now: number): void;
   unpark(tx: Tx, session: string, grant: string, now: number): void;
@@ -54,9 +54,9 @@ export interface HostedStore {
   touch(tx: Tx, session: string, now: number): void;
   // The sweep's candidates by query, not by scanning every row (#399): roots whose lease lapsed by `now`; idle
   // unparked rows (children, and roots with no lease and no hold) last seen before `cutoff`; disabled users' roots.
-  expired(now: number): HostedSession[];
-  idle(cutoff: number): HostedSession[];
-  disabled(): HostedSession[];
+  expired(r: Read, now: number): HostedSession[];
+  idle(r: Read, cutoff: number): HostedSession[];
+  disabled(r: Read): HostedSession[];
   // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
   start(tx: Tx, session: string, user: number, client: string, now: number, suggested?: string | null): number;
   end(tx: Tx, session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
@@ -70,13 +70,13 @@ export interface HostedStore {
   // delivery_open: the Controller applied them before opening); `forgetLost` drops an alias the root bound again.
   // A hold both readers took is deleted.
   lose(tx: Tx, session: string, lost: HostedLost, now: number): void;
-  lost(session: string, reader: LostReader): HostedLost[];
+  lost(r: Read, session: string, reader: LostReader): HostedLost[];
   tellLost(tx: Tx, session: string, now: number): HostedLost[];
   reportLost(tx: Tx, session: string, now: number): HostedLost[];
   seeLost(tx: Tx, session: string, now: number): HostedLost[];
   forgetLost(tx: Tx, session: string, alias: string): void;
   // The server's last recorded liveness (epoch ms), absent before the first
   // heartbeat on this schema. A restart credits leases with the downtime (#423).
-  aliveAt(): number | undefined;
+  aliveAt(r: Read): number | undefined;
   heartbeat(tx: Tx, now: number): void;
 }

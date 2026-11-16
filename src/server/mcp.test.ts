@@ -1335,7 +1335,7 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   expect(hosted.activeListens).toBe(2);
   // A binding change committed outside any request of either session, so only the notice can reach the listens.
   const rebind = (email: string) => seed(store.repo, tx => store.repo.hosted.atomic(() => {
-    const row = store.repo.hosted.all().find(r => store.repo.users.findById(r.user_id)?.email === email)!;
+    const row = store.repo.hosted.all(tx).find(r => store.repo.users.findById(r.user_id)?.email === email)!;
     store.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 });
   }));
   await rebind("bob@example.com");
@@ -1381,7 +1381,7 @@ async function stampedListen(recheckMs = 3_600_000) {
   expect(hosted.activeListens).toBe(1);
   return { time, tick, tickStream, grant, listen };
 }
-const aliceRoot = () => store.repo.hosted.all().find(r => !r.root_session_id && r.user_id === user.user_id)!;
+const aliceRoot = () => store.repo.hosted.all(store.repo.read).find(r => !r.root_session_id && r.user_id === user.user_id)!;
 const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][] = [
   ["access revoke", ({ time }) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, time.now))],
   ["grant revoke", ({ time, grant }) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(grant.refreshToken), OPENCODE_CLIENT, time.now))],
@@ -1422,7 +1422,7 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   // Synchronously, before the hosted sweep's own timer could end the root: the stream tick settles it.
   f.time.now += 1; f.tick();
   expect(hosted.activeListens).toBe(0);
-  expect(store.repo.hosted.get(root)).toBeUndefined();
+  expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
   await f.listen.close();
 });
 
