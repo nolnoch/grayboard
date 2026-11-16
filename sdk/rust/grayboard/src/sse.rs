@@ -11,6 +11,8 @@ pub(crate) struct SseEvent {
 
 /// A line longer than this is refused rather than buffered without bound.
 const MAX_LINE: usize = 4 << 20;
+/// An event whose data (its `data:` lines joined) grows past this is refused: the JSON-RPC response limit.
+const MAX_DATA: usize = crate::transport::MAX_RESPONSE;
 
 #[derive(Default)]
 pub(crate) struct SseParser {
@@ -78,6 +80,11 @@ impl SseParser {
         };
         match field {
             "data" => {
+                if self.data.len() + value.len() + 1 > MAX_DATA {
+                    return Err(Error::InvalidResponse(
+                        "event-stream event too large".into(),
+                    ));
+                }
                 if self.has_data {
                     self.data.push('\n');
                 }
@@ -140,6 +147,20 @@ mod tests {
     fn no_data_no_event_and_bom_stripped() {
         assert_eq!(all(&[b"\xef\xbb\xbfevent: x\n\nid: 3\n\n"]), vec![]);
         assert_eq!(all(&[b"\xef\xbb\xbfdata: z\n\n"]), vec![ev(None, "z")]);
+    }
+
+    #[test]
+    fn an_event_without_end_is_refused_once_past_the_data_limit() {
+        let mut p = SseParser::default();
+        let line = format!("data: {}\n", "x".repeat(1 << 20));
+        let mut result = Ok(vec![]);
+        for _ in 0..(MAX_DATA >> 20) + 2 {
+            result = p.feed(line.as_bytes());
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(matches!(result, Err(Error::InvalidResponse(ref t)) if t.contains("too large")));
     }
 
     #[test]

@@ -74,6 +74,37 @@
         }
       }
     ],
+    "native_list_tools": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "tools/list",
+          "mcp-protocol-version": "2026-07-28"
+        },
+        "body": {
+          "method": "tools/list",
+          "params": {
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          },
+          "jsonrpc": "2.0",
+          "id": "<id>"
+        }
+      }
+    ],
     "subscriber_discover": [
       {
         "headers": {
@@ -122,6 +153,38 @@
           "params": {
             "name": "delivery_open",
             "arguments": {},
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          },
+          "jsonrpc": "2.0",
+          "id": "<id>"
+        }
+      }
+    ],
+    "subscriber_list_tools": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "tools/list",
+          "mcp-protocol-version": "2026-07-28",
+          "x-grayboard-client": "subscriber"
+        },
+        "body": {
+          "method": "tools/list",
+          "params": {
             "_meta": {
               "io.github.nolnoch.grayboard/sessionID": "fixture-session",
               "io.github.nolnoch.grayboard/delivery": {

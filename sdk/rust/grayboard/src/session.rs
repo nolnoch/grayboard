@@ -3,7 +3,9 @@
 use crate::credential::Credential;
 use crate::envelope::{CallToolResult, ClientInfo, Delivery};
 use crate::error::Error;
-use crate::transport::{Connection, Discovery, Role, Shared, Subscription, Timeouts};
+use crate::transport::{
+    CONNECT_TIMEOUT, Connection, Discovery, Role, Shared, Subscription, Timeouts,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -26,7 +28,7 @@ impl Client {
         }
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Timeouts::default().request)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| Error::InvalidResponse(format!("HTTP client: {e}")))?;
         Ok(Self {
@@ -76,6 +78,8 @@ impl Client {
 }
 
 /// One bus session: the agent tools on its native connection, and its lease, inbox and subscriber tools on its subscriber connection.
+///
+/// Call `end` when done. Dropping a session only cancels its in-flight requests: the server keeps the session, and any name it bound, until its idle sweep, so a replacement process that binds the same name meanwhile is refused `alias_held`.
 pub struct Session {
     id: String,
     native: Arc<Connection>,
@@ -91,6 +95,11 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn subscriber_connection(&self) -> &Connection {
         &self.subscriber
+    }
+
+    /// Sets or clears the lease capability (`delivery_open`'s `capability`) that the subscriber connection sends as `X-Grayboard-Lease`. `read_resource("grayboard://inbox")`, `listen` and the `delivery_*` lease tools need it.
+    pub fn set_lease(&self, capability: Option<String>) {
+        self.subscriber.set_lease(capability);
     }
 
     /// The native connection's `server/discover` result: the server's instructions and capabilities.

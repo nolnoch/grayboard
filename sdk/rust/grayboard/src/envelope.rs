@@ -159,7 +159,7 @@ impl CallToolResult {
             .filter_map(|b| b.text.as_deref())
     }
 
-    /// The refusal this result carries, when `is_error` is set: the code from `structuredContent.code` (`invalid_response` when absent), compared by callers, never the text.
+    /// The refusal this result carries, when `is_error` is set: the code from `structuredContent.code` (`invalid_response` when absent or not code-shaped), compared by callers, never the text. `known` and `holder` are kept only on the codes that carry them, and only when well-formed, as `wire.ts` `subscriberError` keeps them.
     pub fn refusal(&self) -> Option<crate::Error> {
         if !self.is_error {
             return None;
@@ -168,23 +168,31 @@ impl CallToolResult {
         let code = sc
             .and_then(|v| v.get("code"))
             .and_then(Value::as_str)
+            .filter(|c| crate::error::domain_code(c))
             .unwrap_or("invalid_response")
             .to_owned();
         let known = sc
+            .filter(|_| code == "identity_unknown")
             .and_then(|v| v.get("known"))
             .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .take(256)
-                    .map(str::to_owned)
-                    .collect()
+            .filter(|a| a.len() <= 256)
+            .and_then(|a| {
+                let mut names: Vec<String> = Vec::with_capacity(a.len());
+                for name in a {
+                    let name = name.as_str().filter(|n| known_name(n))?;
+                    if !names.iter().any(|k| k == name) {
+                        names.push(name.to_owned());
+                    }
+                }
+                Some(names)
             })
             .unwrap_or_default();
         let holder = sc
+            .filter(|_| code == "alias_held")
             .and_then(|v| v.get("holder"))
             .and_then(Value::as_str)
-            .map(crate::error::server_text);
+            .filter(|h| crate::error::shown_text(h))
+            .map(str::to_owned);
         let text = crate::error::server_text(&self.texts().collect::<Vec<_>>().join("\n"));
         Some(crate::Error::Refusal {
             code,
@@ -193,6 +201,14 @@ impl CallToolResult {
             text,
         })
     }
+}
+
+/// A suggested name in an `identity_unknown` refusal: `^[a-z0-9_-]{1,32}$`, as `wire.ts` accepts.
+fn known_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 #[cfg(test)]
@@ -252,6 +268,50 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        let hostile: CallToolResult = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "x"}],
+            "structuredContent": {"code": "Not A Code \u{1b}[2J", "holder": "h", "known": ["a"]},
+            "isError": true
+        }))
+        .unwrap();
+        match hostile.refusal() {
+            Some(crate::Error::Refusal {
+                code,
+                known,
+                holder,
+                ..
+            }) => {
+                assert_eq!(code, "invalid_response");
+                assert!(known.is_empty());
+                assert!(holder.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        let unknown: CallToolResult = serde_json::from_value(json!({
+            "structuredContent": {"code": "identity_unknown", "known": ["w1", "w1", "w2"]},
+            "isError": true
+        }))
+        .unwrap();
+        assert!(
+            matches!(unknown.refusal(), Some(crate::Error::Refusal { known, .. }) if known == ["w1", "w2"])
+        );
+        let bad_known: CallToolResult = serde_json::from_value(json!({
+            "structuredContent": {"code": "identity_unknown", "known": ["w1", "BAD NAME"]},
+            "isError": true
+        }))
+        .unwrap();
+        assert!(
+            matches!(bad_known.refusal(), Some(crate::Error::Refusal { known, .. }) if known.is_empty())
+        );
+        let bidi: CallToolResult = serde_json::from_value(json!({
+            "structuredContent": {"code": "alias_held", "holder": "evil\u{202e}txt"},
+            "isError": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            bidi.refusal(),
+            Some(crate::Error::Refusal { holder: None, .. })
+        ));
         let ok: CallToolResult =
             serde_json::from_value(json!({"content": [{"type": "text", "text": "ok"}]})).unwrap();
         assert!(ok.refusal().is_none());

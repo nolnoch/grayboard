@@ -4,12 +4,12 @@ use crate::credential::Credential;
 use crate::envelope::{
     ClientInfo, Delivery, PROTOCOL_VERSION, encode_header_value, mcp_name, request_meta,
 };
-use crate::error::{Error, server_text};
+use crate::error::{AuthError, Error, domain_code, server_text};
 use crate::sse::SseParser;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_TYPE, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::{Map, Value, json};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 /// The transport's time limits (#929 D2). Fixed in a release; tests shorten them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timeouts {
-    /// An ordinary request attempt, body included.
+    /// An ordinary request attempt, body included; also bounds a credential's `token` and `unauthorized`.
     pub request: Duration,
     /// A listen stream's acknowledgement.
     pub listen_ack: Duration,
@@ -43,7 +43,9 @@ const ADMISSION_ATTEMPTS: u32 = 8;
 /// A refused connect's body is kept up to this many bytes before the text cap.
 const REFUSAL_BODY_LIMIT: usize = 4096;
 /// A JSON-RPC response larger than this is refused.
-const MAX_RESPONSE: usize = 16 << 20;
+pub(crate) const MAX_RESPONSE: usize = 16 << 20;
+/// A connect that hasn't finished by then is unreachable: shorter than the request timeout, so a blackholed endpoint fails as a connect error (never sent) rather than a request timeout (outcome unknown for a write).
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -108,7 +110,6 @@ impl Connection {
     }
 
     /// Sets or clears the lease capability sent as `X-Grayboard-Lease` (subscriber role).
-    #[allow(dead_code)] // the delivery stream (#929 step 3) sets it
     pub(crate) fn set_lease(&self, capability: Option<String>) {
         *self.lease.lock().unwrap_or_else(|e| e.into_inner()) = capability;
     }
@@ -131,7 +132,7 @@ impl Connection {
                 if !offered.iter().any(|v| v == PROTOCOL_VERSION) {
                     return Err(Error::Incompatible {
                         expected: PROTOCOL_VERSION,
-                        offered,
+                        offered: offered.iter().take(16).map(|v| server_text(v)).collect(),
                     });
                 }
                 Ok(Discovery {
@@ -173,13 +174,21 @@ impl Connection {
         method: &str,
         body: &Value,
     ) -> Result<reqwest::RequestBuilder, Error> {
+        // Checked here, not deferred to `send`: reqwest would surface a bad value as a send error, classed like a lost request.
+        let mut authorization =
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                Error::Auth(AuthError(
+                    "the credential's token is not a valid header value".into(),
+                ))
+            })?;
+        authorization.set_sensitive(true);
         let mut rb = self
             .shared
             .http
             .post(self.shared.endpoint.clone())
             .header("accept", "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
-            .header("authorization", format!("Bearer {token}"))
+            .header(AUTHORIZATION, authorization)
             .header("mcp-protocol-version", PROTOCOL_VERSION);
         // Requests carry Mcp-Method; a notification (no id) doesn't, as the reference client sends it (sdk/rust/schema/wire/requests.json).
         if body.get("id").is_some() {
@@ -198,13 +207,19 @@ impl Connection {
                 .unwrap_or_else(|e| e.into_inner())
                 .as_deref()
             {
+                let mut lease = HeaderValue::from_str(lease).map_err(|_| {
+                    Error::InvalidArgument(
+                        "the lease capability is not a valid header value".into(),
+                    )
+                })?;
+                lease.set_sensitive(true);
                 rb = rb.header("x-grayboard-lease", lease);
             }
         }
         Ok(rb.body(serde_json::to_vec(body).expect("a JSON value serializes")))
     }
 
-    /// Sends with the 429 and 401 rules, returning a 2xx response. `timeout` bounds each attempt up to its headers; `None` for a stream.
+    /// Sends with the 429 and 401 rules, returning a 2xx response. `timeout` bounds each attempt until its body is read; `None` for a stream. The credential's calls are bounded by the request timeout either way.
     async fn send(
         &self,
         method: &str,
@@ -215,7 +230,12 @@ impl Connection {
         let mut reauthorized = false;
         let mut attempt = 0;
         loop {
-            let token = self.shared.credential.token().await?;
+            let limit = self.shared.timeouts.request;
+            let token = tokio::time::timeout(limit, self.shared.credential.token())
+                .await
+                .map_err(|_| {
+                    AuthError(format!("the credential gave no token within {limit:?}"))
+                })??;
             let mut rb = self.post(&token, method, body)?;
             if let Some(t) = timeout {
                 rb = rb.timeout(t);
@@ -231,10 +251,13 @@ impl Connection {
             match status {
                 StatusCode::UNAUTHORIZED if !reauthorized => {
                     reauthorized = true;
-                    self.shared
-                        .credential
-                        .unauthorized(&token)
+                    tokio::time::timeout(limit, self.shared.credential.unauthorized(&token))
                         .await
+                        .map_err(|_| {
+                            Error::Unauthorized(format!(
+                                "the credential did not replace the token within {limit:?}"
+                            ))
+                        })?
                         .map_err(|e| Error::Unauthorized(e.0))?;
                     continue;
                 }
@@ -531,6 +554,10 @@ async fn limited_text(response: reqwest::Response, limit: usize) -> String {
 
 fn transport_error(error: &reqwest::Error, write: bool) -> Error {
     let text = server_text(&error.to_string());
+    // Refused before anything was sent: a local fault, never retried as unreachable.
+    if error.is_builder() {
+        return Error::InvalidArgument(text);
+    }
     // A connect failure never reached the server, so even a write is safe to report as unreachable.
     if error.is_connect() || !write {
         Error::Unreachable(text)
@@ -548,6 +575,7 @@ fn rpc_error(error: &Value) -> Error {
     let data_code = error
         .pointer("/data/code")
         .and_then(Value::as_str)
+        .filter(|c| domain_code(c))
         .map(str::to_owned);
     Error::Protocol {
         code,

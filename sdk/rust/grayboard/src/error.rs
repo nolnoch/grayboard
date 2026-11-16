@@ -18,6 +18,25 @@ pub fn server_text(text: &str) -> String {
     )
 }
 
+/// Whether `code` has a domain code's shape (`not_found`, `alias_held`): server text that becomes `Refusal.code` or `Protocol.data_code` and that callers compare. Anything else is replaced, so a broken server or proxy can't put arbitrary text there.
+pub(crate) fn domain_code(code: &str) -> bool {
+    (1..=64).contains(&code.len())
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Server free text shown whole, such as an `alias_held` holder (`wire.ts` `shownText`): non-empty, at most 2048 UTF-16 units, and no control or bidi characters.
+pub(crate) fn shown_text(text: &str) -> bool {
+    !text.is_empty()
+        && text.encode_utf16().count() <= 2048
+        && !text.chars().any(|c| {
+            c.is_control()
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
+        })
+}
+
 /// A credential could not produce a token, or refused to replace a rejected one.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]

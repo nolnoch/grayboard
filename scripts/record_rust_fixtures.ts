@@ -15,8 +15,9 @@ import { TestServer } from "../tests/support/server.ts";
 
 export const FIXTURE_PATH = join(import.meta.dir, "../sdk/rust/schema/wire/requests.json");
 
-// The headers a request's meaning rides on; transport ones (host, length, encoding, user agent) are the HTTP stack's.
-const HEADERS = ["accept", "authorization", "content-type", "mcp-method", "mcp-name", "mcp-protocol-version", "x-grayboard-client", "x-grayboard-lease"];
+// Every header is recorded but the HTTP stack's own (host, length, encoding, user agent, connection), so a header the
+// reference client starts sending shows up as fixture drift. sdk/rust/grayboard/src/tests.rs drops the same set.
+const TRANSPORT_HEADERS = new Set(["host", "content-length", "user-agent", "accept-encoding", "connection", "transfer-encoding"]);
 
 export type RecordedRequest = { headers: Record<string, string>; body: unknown };
 export type Fixture = { client: { name: string; version: string }; session: string; source: string; operations: Record<string, RecordedRequest[]> };
@@ -28,9 +29,8 @@ const SOURCE = "fixture-source";
 // Ids, the bearer and the lease vary per run and per client; everything else is the envelope.
 function normalize(headers: Headers, body: any): RecordedRequest {
   const kept: Record<string, string> = {};
-  for (const name of HEADERS) {
-    const value = headers.get(name);
-    if (value === null) continue;
+  for (const [name, value] of [...headers.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    if (TRANSPORT_HEADERS.has(name)) continue;
     kept[name] = name === "authorization" ? "Bearer <token>" : name === "x-grayboard-lease" ? "<lease>" : value;
   }
   if (body && "id" in body) body.id = "<id>";
@@ -62,9 +62,11 @@ export async function recordWire(): Promise<Fixture> {
     const subscriber = new Wire(options, auth, abort.signal, SESSION);
     await op("native_discover", () => native.connect());
     await op("native_call", () => native.client.callTool({ name: "bind", arguments: { name: "fixture-w1", create: true } }, native.options()));
+    await op("native_list_tools", () => native.listTools());
     await op("subscriber_discover", () => subscriber.connect());
     let lease: { capability: string } | undefined;
     await op("subscriber_call", async () => { lease = await subscriber.call("delivery_open", {}) as { capability: string }; });
+    await op("subscriber_list_tools", () => subscriber.takes("delivery_open", "fixture"));
     subscriber.capability = lease!.capability;
     await op("read_resource", () => subscriber.read("grayboard://inbox"));
     await op("listen_and_close", async () => { const sub = await subscriber.listen(); await sub.close(); });

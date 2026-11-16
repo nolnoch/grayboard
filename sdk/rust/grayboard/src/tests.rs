@@ -192,7 +192,7 @@ fn fast() -> Timeouts {
     Timeouts {
         request: Duration::from_millis(500),
         listen_ack: Duration::from_millis(500),
-        listen_idle: Duration::from_millis(400),
+        listen_idle: Duration::from_millis(1500),
     }
 }
 
@@ -283,7 +283,7 @@ async fn lease_header_on_subscriber_requests_only_once_set() {
     .await;
     let s = session(&fake);
     s.call_subscriber("whoami", json!({})).await.unwrap();
-    s.subscriber_connection().set_lease(Some("cap-123".into()));
+    s.set_lease(Some("cap-123".into()));
     s.call_subscriber("delivery_renew", json!({}))
         .await
         .unwrap();
@@ -458,12 +458,20 @@ async fn connect_failure_is_unreachable_even_for_a_write() {
 
 #[tokio::test]
 async fn a_write_that_times_out_is_outcome_unknown_and_not_retried() {
-    let fake = Fake::start(false, |_, _| Reply::sse(vec![], Duration::from_secs(5))).await;
+    // The stream stays open well past the outer bound: only the request timeout (500 ms) can end these calls in time.
+    let fake = Fake::start(false, |_, _| Reply::sse(vec![], Duration::from_secs(30))).await;
     let s = session(&fake);
-    let err = s.call_raw("board_post", json!({})).await.unwrap_err();
+    let bound = Duration::from_secs(3);
+    let err = tokio::time::timeout(bound, s.call_raw("board_post", json!({})))
+        .await
+        .expect("the request timeout ends the write")
+        .unwrap_err();
     assert!(matches!(err, Error::OutcomeUnknown(_)), "{err:?}");
     assert_eq!(fake.calls("tools/call").len(), 1);
-    assert!(matches!(s.list_tools().await, Err(Error::Unreachable(_))));
+    let read = tokio::time::timeout(bound, s.list_tools())
+        .await
+        .expect("the request timeout ends the read");
+    assert!(matches!(read, Err(Error::Unreachable(_))), "{read:?}");
 }
 
 #[tokio::test]
@@ -657,7 +665,11 @@ async fn listen_without_an_acknowledgement_times_out() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Unreachable(_)), "{err:?}");
+    // The ack limit (500 ms), not the idle one (1500 ms), ends it.
+    assert!(
+        matches!(err, Error::Unreachable(ref t) if t.contains("not acknowledged")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -722,6 +734,52 @@ fn bad_arguments_are_refused_before_sending() {
     ));
 }
 
+#[tokio::test]
+async fn a_token_that_is_not_a_header_value_is_an_auth_error_and_nothing_is_sent() {
+    let fake = Fake::start(true, |req, _| ok_text(req)).await;
+    let s = Client::new(
+        &fake.url,
+        StaticBearer::new("tok-1\n"),
+        ClientInfo::new("rust-sdk-test", "0.0.1"),
+    )
+    .unwrap()
+    .with_timeouts(fast())
+    .session("s-1", Delivery::push("rust-sdk-test").unwrap());
+    let write = s.call_raw("board_post", json!({})).await.unwrap_err();
+    assert!(matches!(write, Error::Auth(_)), "{write:?}");
+    assert!(matches!(s.list_tools().await, Err(Error::Auth(_))));
+    assert!(fake.requests().is_empty());
+}
+
+struct Hanging;
+
+impl Credential for Hanging {
+    fn token(&self) -> BoxFuture<'_, Result<String, AuthError>> {
+        Box::pin(std::future::pending())
+    }
+    fn unauthorized<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout() {
+    let fake = Fake::start(true, |req, _| ok_text(req)).await;
+    let s = Client::new(
+        &fake.url,
+        Hanging,
+        ClientInfo::new("rust-sdk-test", "0.0.1"),
+    )
+    .unwrap()
+    .with_timeouts(fast())
+    .session("s-1", Delivery::push("rust-sdk-test").unwrap());
+    let err = tokio::time::timeout(Duration::from_secs(3), s.call_raw("board_post", json!({})))
+        .await
+        .expect("the credential's token call is bounded")
+        .unwrap_err();
+    assert!(matches!(err, Error::Auth(_)), "{err:?}");
+}
+
 #[derive(Default)]
 struct Counting {
     reads: Arc<AtomicUsize>,
@@ -755,26 +813,26 @@ impl Credential for Rotating {
 
 /// The headers and body fields `scripts/record_rust_fixtures.ts` keeps, normalized the same way.
 fn normalized(req: &Req) -> Value {
-    const HEADERS: [&str; 8] = [
-        "accept",
-        "authorization",
-        "content-type",
-        "mcp-method",
-        "mcp-name",
-        "mcp-protocol-version",
-        "x-grayboard-client",
-        "x-grayboard-lease",
+    // The HTTP stack's own headers; every other header is compared, as the recorder keeps it.
+    const TRANSPORT_HEADERS: [&str; 6] = [
+        "host",
+        "content-length",
+        "user-agent",
+        "accept-encoding",
+        "connection",
+        "transfer-encoding",
     ];
     let mut headers = serde_json::Map::new();
-    for name in HEADERS {
-        if let Some(value) = req.headers.get(name) {
-            let value = match name {
-                "authorization" => "Bearer <token>".to_owned(),
-                "x-grayboard-lease" => "<lease>".to_owned(),
-                _ => value.clone(),
-            };
-            headers.insert(name.to_owned(), Value::String(value));
+    for (name, value) in &req.headers {
+        if TRANSPORT_HEADERS.contains(&name.as_str()) {
+            continue;
         }
+        let value = match name.as_str() {
+            "authorization" => "Bearer <token>".to_owned(),
+            "x-grayboard-lease" => "<lease>".to_owned(),
+            _ => value.clone(),
+        };
+        headers.insert(name.clone(), Value::String(value));
     }
     let mut body = req.body.clone();
     if body.get("id").is_some() {
@@ -797,6 +855,7 @@ async fn requests_match_the_reference_clients_recording() {
             json!({"content": [{"type": "text", "text": "{\"capability\": \"cap-1\"}"}]}),
         ),
         "tools/call" => ok_text(req),
+        "tools/list" => Reply::result(req, json!({"tools": []})),
         "resources/read" => Reply::result(
             req,
             json!({"contents": [{"uri": "grayboard://inbox", "text": "{\"items\": []}"}]}),
@@ -843,12 +902,15 @@ async fn requests_match_the_reference_clients_recording() {
         .await
         .unwrap();
     took("native_call");
+    s.list_tools().await.unwrap();
+    took("native_list_tools");
     s.subscriber_connection().discover().await.unwrap();
     took("subscriber_discover");
     let lease = s.call_subscriber("delivery_open", json!({})).await.unwrap();
     took("subscriber_call");
-    s.subscriber_connection()
-        .set_lease(Some(lease["capability"].as_str().unwrap().into()));
+    s.list_subscriber_tools().await.unwrap();
+    took("subscriber_list_tools");
+    s.set_lease(Some(lease["capability"].as_str().unwrap().into()));
     s.read_resource("grayboard://inbox").await.unwrap();
     took("read_resource");
     let sub = s.listen(&["grayboard://inbox"]).await.unwrap();

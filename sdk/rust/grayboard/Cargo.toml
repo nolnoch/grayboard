@@ -3,7 +3,7 @@ name = "grayboard"
 # Equal to package.json's version: a root test checks it, and the release bump moves both.
 version = "2.4.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Client for grayboard's hosted MCP endpoint"
 repository = "https://github.com/nolnoch/grayboard"
