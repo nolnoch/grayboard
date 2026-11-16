@@ -56,7 +56,7 @@ flowchart TD
 | How docs work | `docs/CONTRACT.md` |
 | What grayboard is for, who it serves, the principles that decide features | `docs/vision.md` |
 | Process model, mode selection; the server's data, auth layers and tokens, Postgres seam | `docs/architecture.md` |
-| The server's embedded OAuth authorization server, client sources, built-in clients, adapter login | `docs/server-oauth.md` |
+| The server's embedded OAuth authorization server, client sources, built-in clients, CLI login | `docs/server-oauth.md` |
 | The server's HTTP MCP endpoint: session binding, streams, legacy sessions, hosted core's server contract, plugin children, attachment transfer | `docs/server-hosted-mcp.md` |
 | The as-built Rust client SDK: transport, wire fixture, delivery stream and its rules, typed tools, the Stage 3 example, the conformance driver | `docs/sdk-rust.md` |
 | Hosted admission, ownership history, grant attachment, the BindGate | `docs/server-hosted-ownership.md` |
@@ -74,6 +74,7 @@ flowchart TD
 | Delegation: launchers, `delegate` | `docs/delegation.md` |
 | Local-mode harness adapters and push ownership | `docs/adapters.md` |
 | Server-mode harness adapters (hosted core and its harnesses) | `docs/adapters-hosted.md` |
+| A hosted adapter's sign-in, grant store, refresh and the lock rule | `docs/adapters-hosted-login.md` |
 | The local Slack bridge, the routing and threading both bridges share, human handles | `docs/slack-bridge.md` |
 | The org Slack bridge inside the server: `<email>/human`, linking, reach, death notices | `docs/slack-org-bridge.md` |
 | Capability parity across harnesses and modes: the parity matrix, its gap cells, the maintaining-parity rule | `docs/parity.md` |
