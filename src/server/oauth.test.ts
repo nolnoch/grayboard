@@ -15,6 +15,7 @@ import type { Config } from "./config.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, type OAuthClient } from "./oauth-config.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { seed } from "../../tests/support/seed.ts";
 import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_browser.ts";
 import { accessAudits } from "../../tests/support/audit.ts";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -142,7 +143,7 @@ test("internal grant liveness survives individual access revocation but never au
   const principal = service.authenticate(request);
   if (principal instanceof Response) throw new Error("expected fixture principal");
   expect(service.isGrantActive(grant.grantId)).toBe(true);
-  storage.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+  await seed(storage.repo, () => storage.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
   expect(service.isGrantActive(grant.grantId)).toBe(true);
   expect(service.isAuthorized(principal)).toBe(false);
   expect(service.authenticate(request)).toBeInstanceOf(Response);
@@ -151,9 +152,9 @@ test("internal grant liveness survives individual access revocation but never au
   storage.repo.oauth.isGrantActive = () => { throw new Error("storage unavailable"); };
   try { expect(() => service.isGrantActive(grant.grantId)).toThrow("storage unavailable"); }
   finally { storage.repo.oauth.isGrantActive = active; }
-  storage.repo.users.setDisabled(grant.authed.user_id, true);
+  await seed(storage.repo, () => storage.repo.users.setDisabled(grant.authed.user_id, true));
   expect(service.isGrantActive(grant.grantId)).toBe(false);
-  storage.repo.users.setDisabled(grant.authed.user_id, false);
+  await seed(storage.repo, () => storage.repo.users.setDisabled(grant.authed.user_id, false));
   expect(service.isGrantActive(grant.grantId)).toBe(false);
   const next = await issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery"], clock);
   clock += OAUTH_TTL.grant;
@@ -280,7 +281,7 @@ test("the first start with built-in clients revokes the grants and codes an oper
   const old = await redeem(await issue("grayboard-pi", scope)), oldPrincipal = principal(old);
   const pending = await issue("grayboard-pi", scope);
   const unrelated = principal(await redeem(await issue()));
-  storage.db.run("DELETE FROM server_state WHERE key = 'builtin_clients'");
+  await seed(storage.repo, () => storage.db.run("DELETE FROM server_state WHERE key = 'builtin_clients'"));
   const audit = () => storage.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'oauth.builtin_client_grant_revoked'").all();
   const log = spyOn(console, "error").mockImplementation(() => {});
   const revokedLines = () => log.mock.calls.filter(([line]) => String(line).includes("issued under a built-in client ID"));
@@ -418,7 +419,7 @@ test("OAuth event trail records decisions, grant, strict replay warnings and rev
     const serialized = JSON.stringify(rows) + JSON.stringify(warning.mock.calls);
     for (const value of ["PRIVATE-QUERY", code.code, code.verifier, first.access_token, first.refresh_token, tokens.refresh_token]) expect(serialized).not.toContain(value);
     clock += OAUTH_TTL.grant + 1;
-    storage.repo.oauth.cleanup(clock);
+    await seed(storage.repo, () => storage.repo.oauth.cleanup(clock));
     expect(storage.db.query("SELECT count(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
     expect(storage.db.query("SELECT actor FROM access_log WHERE action = 'oauth.grant_issued' LIMIT 1").get()).toEqual({ actor: "you@example.com" });
   } finally { warning.mockRestore(); }
@@ -789,10 +790,11 @@ test("live disable/admin revoke, expiry, and database failures are not credentia
   expect(service.isAuthorized(p)).toBe(false);
   const refreshed = await post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: tokens.refresh_token, resource: service.resource });
   const next = await refreshed.json() as Tokens; const np = principal(next);
-  storage.repo.users.setDisabled(np.authed.user_id, true); storage.repo.users.setDisabled(np.authed.user_id, false);
+  await seed(storage.repo, () => storage.repo.users.setDisabled(np.authed.user_id, true));
+  await seed(storage.repo, () => storage.repo.users.setDisabled(np.authed.user_id, false));
   expect(service.isAuthorized(np)).toBe(false);
   const b = await issue(), t2 = await redeem(b), p2 = principal(t2);
-  storage.repo.sessions.revokeAllForUser(p2.authed.user_id); expect(service.isAuthorized(p2)).toBe(false);
+  await seed(storage.repo, () => storage.repo.sessions.revokeAllForUser(p2.authed.user_id)); expect(service.isAuthorized(p2)).toBe(false);
   const c = await issue(), t3 = await redeem(c);
   storage.db.exec("CREATE TRIGGER reject_revoke BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT, 'injected'); END");
   const failed = await post("/oauth/revoke", { client_id: "native", token: t3.refresh_token });
@@ -1145,24 +1147,24 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
     expect(joins()).toBe(0); // warm: no token join while nothing has changed
     // A write inside a transaction that rolls back: false within it, true again after.
-    expect(() => storage.repo.atomic(() => {
+    await expect(seed(storage.repo, () => {
       storage.repo.sessions.revokeAllForUser(p.authed.user_id);
       expect(service.isAuthorized(p)).toBe(false);
       throw new Error("roll back");
-    })).toThrow("roll back");
+    })).rejects.toThrow("roll back");
     expect(service.isAuthorized(p)).toBe(true);
     expect(joins()).toBeGreaterThan(0); // the read inside the transaction bypassed the cache, so the spy sees the join
     // Each committed way the access ends, against a warm entry.
-    const ends: [string, (p: OAuthPrincipal) => void][] = [
-      ["revokeAllForUser", p => storage.repo.sessions.revokeAllForUser(p.authed.user_id)],
-      ["disable", p => storage.repo.users.setDisabled(p.authed.user_id, true)],
+    const ends: [string, (p: OAuthPrincipal) => unknown][] = [
+      ["revokeAllForUser", p => seed(storage.repo, () => storage.repo.sessions.revokeAllForUser(p.authed.user_id))],
+      ["disable", p => seed(storage.repo, () => storage.repo.users.setDisabled(p.authed.user_id, true))],
       ["another connection's grant revoke", p => { const other = new Database(config.dbPath); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
       ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
     ];
     for (const [i, [what, end]] of ends.entries()) {
       const q = await mint(`end${i}@example.com`);
       expect(service.isAuthorized(q)).toBe(true);
-      end(q);
+      await end(q);
       expect(service.isAuthorized(q), what).toBe(false);
       expect(refused(q.bearer), what).toBe(true); // the bearer's own warm entry, not just the principal check
     }
@@ -1199,7 +1201,7 @@ test("#881: one authorization reads the auth generation once, and a write betwee
     reads = 0;
     expect(counting.isAuthorized(p)).toBe(true);
     expect(reads).toBe(1); // the token read and the user read share it; before #881, two
-    counted.repo.users.setDisabled(p.authed.user_id, true);
+    await seed(counted.repo, () => counted.repo.users.setDisabled(p.authed.user_id, true));
     expect(counting.isAuthorized(p)).toBe(false);
   } finally { counting.close(); counted.db.close(); }
 });

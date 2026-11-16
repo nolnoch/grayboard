@@ -15,6 +15,7 @@ import { accessAudits, auditOrigins } from "../support/audit.ts";
 import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 import { until } from "../support/until.ts";
 import { queueFor } from "../../src/server/store/queue.ts";
 const DM = "D0ALICE";
@@ -649,7 +650,7 @@ test("the bridge notice comes before the claims notice, so a cut takes the claim
   const alice = await login("alice@example.com");
   await link(alice);
   const { claim } = await import("../../src/core/claims.ts");
-  claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142");
+  await seed(srv.app.repo, () => claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142"));
   srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
   const notices = (await srv.appSession(alice, "be").connect()).bind?.notices ?? [];
   const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
@@ -691,7 +692,7 @@ test("an attach that fails after a newer one for the same user went live leaves 
   const alice = await login("alice@example.com");
   await link(alice);
   const bridge = srv.app.slack!, application = srv.app.application;
-  const id = srv.app.repo.users.upsertByEmail("alice@example.com", null).id;
+  const id = (await seed(srv.app.repo, () => srv.app.repo.users.upsertByEmail("alice@example.com", null))).id;
   let fail: ((e: Error) => void) | undefined;
   const attach = spyOn(application, "attachHuman").mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
   try {

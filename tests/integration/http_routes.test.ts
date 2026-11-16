@@ -7,6 +7,7 @@ import pkg from "../../package.json" with { type: "json" };
 import type { Config } from "../../src/server/config.ts";
 import { ROOT } from "../support/paths.ts";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 
 const SERVER = join(ROOT, "src/server/main.ts");
 
@@ -30,7 +31,7 @@ const api = (token: string, method: string, path: string, body?: unknown) => srv
 // #284 decision 5 (audit W8): a team can't take another principal's name.
 test("team create on another principal's name is a 409, and no team or board is made", async () => {
   const alice = await login("alice@example.com");
-  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run());
   const r = await api(alice, "POST", "/api/teams", { name: "ingest" });
   expect(r.status).toBe(409);
   expect(JSON.stringify(r.body)).toContain("ingest");
@@ -202,11 +203,12 @@ test("admin routes: refused for non-admins and when no admins are configured", a
 test("admin unlink-idp clears a user's IdP subject and audits it", async () => {
   await restart({ admins: ["root@example.com"] });
   const root = await login("root@example.com");
-  expect(srv.app.repo.users.signIn("bob@example.com", "google-bob", null).status).toBe("ok");
-  expect(srv.app.repo.users.signIn("bob@example.com", "google-new", null).status).toBe("subject_mismatch");
+  const signIn = (subject: string) => seed(srv.app.repo, () => srv.app.repo.users.signIn("bob@example.com", subject, null));
+  expect((await signIn("google-bob")).status).toBe("ok");
+  expect((await signIn("google-new")).status).toBe("subject_mismatch");
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "Bob@Example.com" })).status).toBe(200);
   expect(srv.app.repo.users.findByEmail("bob@example.com")!.idp_subject).toBeNull();
-  expect(srv.app.repo.users.signIn("bob@example.com", "google-new", null)).toMatchObject({ status: "ok", linked: true });
+  expect(await signIn("google-new")).toMatchObject({ status: "ok", linked: true });
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "nobody@example.com" })).status).toBe(404);
   expect(srv.app.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'auth.subject_cleared'").all())
     .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: '{"had_subject":true}' }]);
@@ -219,7 +221,7 @@ test("a CLI token idle past cliTokenIdleDays is refused; a fresh sign-in works",
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(200);
   // The request's last-used touch runs on a later setImmediate (TouchQueue); let it land first, or it overwrites the backdate.
   await new Promise((resolve) => setImmediate(resolve));
-  srv.app.db.run(`UPDATE sessions SET last_used_at = ?`, [Date.now() - 2 * 86_400_000]);
+  await seed(srv.app.repo, () => srv.app.db.run(`UPDATE sessions SET last_used_at = ?`, [Date.now() - 2 * 86_400_000]));
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
   expect((await api(await login("bob@example.com"), "GET", "/api/whoami")).status).toBe(200);
 });
