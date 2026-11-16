@@ -166,7 +166,7 @@ test("POST /api/teams/<t>/policy: owner sets it (audited once per change), membe
   ]);
 });
 
-test("the send result: an offline person alias says wakes:false; a team alias's holder isn't named; a human gets nothing", async () => {
+test("the send result: an offline person alias says wakes:false; a team alias's holder isn't named (mail to it is refused outside the team); a human gets nothing", async () => {
   await team();
   const abe = await srv.hosted(A, "be");
   await abe.close();
@@ -175,14 +175,13 @@ test("the send result: an offline person alias says wakes:false; a team alias's 
   expect(offline.delivered_now).toBe(false);
   expect(offline.wakes).toBe(false);
   expect(offline.wake_note).toContain(A);
-  // Bob holds the team alias; Carol, outside the team, mustn't learn whose it is.
+  // Bob holds the team alias; Carol, outside the team, mustn't learn whose it is, nor that it exists: her mail
+  // to it, held or not, is refused as to a name nobody has (#1014), so no send result can carry a wake note.
   await srv.hosted(B, "eng/deploy");
-  const toTeam = await cfe.call<{ wakes?: false; wake_note?: string }>("dm_send", { to: "eng/deploy", body: "deploy?" });
-  expect(toTeam.wakes).toBe(false);
-  expect(toTeam.wake_note).not.toContain(B);
-  // A team alias no one holds names no user: nothing said.
   await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "idle" }, A));
-  expect(await cfe.call<{ wakes?: false }>("dm_send", { to: "eng/idle", body: "anyone?" })).not.toHaveProperty("wakes");
+  for (const to of ["eng/deploy", "eng/idle"]) {
+    await expect(cfe.call("dm_send", { to, body: "deploy?" })).rejects.toThrow(`identity "${to}" not found`);
+  }
   // A human reads it: reach is msg.send's call, not a wake.
   const bfe = await srv.hosted(B, "fe");
   const aliceHuman = srv.app.repo.users.findByEmail(A)!;
