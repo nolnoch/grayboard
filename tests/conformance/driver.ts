@@ -139,7 +139,7 @@ export function rustDriver(bin: string): Driver {
       // scenario.ts opens a bus outside its try: a failed start stops what it started and removes the dir itself.
       let token: string, server: ServerProcess | undefined, proc: ReturnType<typeof spawnDriver>;
       try {
-        token = issueOAuthIn(dbPath, url, email, RUST_SCOPES, Date.now(), RUST_CLIENT).token;
+        token = (await issueOAuthIn(dbPath, url, email, RUST_SCOPES, Date.now(), RUST_CLIENT)).token;
         server = await ServerProcess.start(SERVER_BIN, dbPath, {
           GRAYBOARD_PUBLIC_URL: issuer,
           GRAYBOARD_HTTP_PORT: String(port),

@@ -34,16 +34,17 @@ test("a real access-expiry stream close with OpenCode's refresh landing after it
   try {
     // The access token expires 3 s from now; OpenCode stamped its stored expiry
     // 300 ms later, when the token response arrived.
-    const issued = issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now() - OAUTH_TTL.access + 3_000, OPENCODE_CLIENT);
+    const issued = await issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now() - OAUTH_TTL.access + 3_000, OPENCODE_CLIENT);
     const f = fixture();
     f.rotate(issued.token, issued.tokens.accessExpiresAt + 300 - Date.now());
     let expiredPolls = 0, rotation: string | undefined;
     // OpenCode's own refresh: the grant's refresh token rotates, and native MCP stores the new access token.
-    const refresh = () => {
+    // Through the write queue, as the server's token endpoint writes it (#807 P1b-4f); a failure is the rotation's status.
+    const refresh = async () => {
       const token = randomBytes(32).toString("base64url"), refreshToken = randomBytes(32).toString("base64url"), now = Date.now();
-      rotation = app.repo.oauth.rotateRefresh({ clientId: issued.binding.clientId, resource: issued.binding.resource, scopes: issued.binding.scopes, refreshHash: hashToken(issued.refreshToken), tokens: {
+      rotation = (await app.repo.write(() => app.repo.oauth.rotateRefresh({ clientId: issued.binding.clientId, resource: issued.binding.resource, scopes: issued.binding.scopes, refreshHash: hashToken(issued.refreshToken), tokens: {
         ...issued.tokens, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-      } }, now).status;
+      } }, now))).status;
       f.rotate(token);
     };
     const sessions = new Map([[ROOT, { id: ROOT, time: {}, metadata: {} as Record<string, unknown> }]]);
@@ -55,7 +56,7 @@ test("a real access-expiry stream close with OpenCode's refresh landing after it
     } } as unknown as Context;
     controller = new OpenCodeController(ctx, { mcpName: "grayboard" } as ConstructorParameters<typeof OpenCodeController>[1], undefined, undefined, record => {
       states.push(record.state);
-      if (record.state === "retrying" && record.code === "native_access_expired" && ++expiredPolls === 2) refresh();
+      if (record.state === "retrying" && record.code === "native_access_expired" && ++expiredPolls === 2) refresh().catch(e => { rotation = `failed: ${e}`; });
     });
     const root = () => controller!.status().roots.find(r => r.sessionID === ROOT);
     const audits = () => app.db.query<{ action: string; detail: string | null }, []>("SELECT action, detail FROM access_log WHERE action LIKE 'hosted.%' ORDER BY rowid").all().map(r => ({ action: r.action, ...JSON.parse(r.detail ?? "{}") as Record<string, unknown> }));
@@ -76,8 +77,10 @@ test("a real access-expiry stream close with OpenCode's refresh landing after it
     // The reopen found the lease still live and attached it again: never closed, never reopened.
     expect(opened().map(a => [a.ownership, a.reopened])).toEqual([[ownership, false]]);
     // Push delivery still reaches the root.
-    const board = createBoard(app.db, "you@example.com/sim", "rollover", "Rollover"); subscribe(app.db, "you@example.com/be", board.name, "push");
-    const posted = post(app.db, "you@example.com/sim", board.name, "After the rollover"); app.application.boardsChanged([board.name]); app.application.wake(posted.wake);
+    const { board, posted } = await app.repo.write(() => {
+      const board = createBoard(app.db, "you@example.com/sim", "rollover", "Rollover"); subscribe(app.db, "you@example.com/be", board.name, "push");
+      return { board, posted: post(app.db, "you@example.com/sim", board.name, "After the rollover") };
+    }); app.application.boardsChanged([board.name]); app.application.wake(posted.wake);
     await until(() => admitted.some(text => text.includes("After the rollover")), 10_000, "post admitted after the rollover");
   } finally {
     await controller?.close();

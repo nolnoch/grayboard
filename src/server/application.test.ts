@@ -6,7 +6,8 @@ import { createApplication, type DeliverySink } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { tokenSessionIn } from "../../tests/support/token_session.ts";
+import { seed } from "../../tests/support/seed.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
@@ -20,23 +21,22 @@ function delivery(): DeliverySink {
   return { deliver: () => {}, closed: () => {} };
 }
 // A connected AppSession: it registers like a hosted session and binds `alias`.
-async function connect(user: AuthedUser, alias: string | null, opts: ConstructorParameters<typeof AppSession>[3] = {}): Promise<AppSession> {
-  const s = new AppSession(application, user, alias, opts);
+async function connect(user: AuthedUser, alias: string | null, opts: ConstructorParameters<typeof AppSession>[4] = {}): Promise<AppSession> {
+  const s = new AppSession(application, store.repo, user, alias, opts);
   await s.connect();
   return s;
 }
 const isDirect = (e: { kind: string }) => e.kind === "direct";
-beforeEach(() => {
+beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-application-"));
   store = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(store.repo, store.db);
   const user = (email: string): AuthedUser => {
     const u = store.repo.users.upsertByEmail(email, null);
     // A session needs a live sign-in (#351).
-    return tokenSession(store.repo, { user_id: u.id, user_email: u.email });
+    return tokenSessionIn(store.repo, { user_id: u.id, user_email: u.email });
   };
-  alice = user("alice@example.com");
-  bob = user("bob@example.com");
+  [alice, bob] = await seed(store.repo, () => [user("alice@example.com"), user("bob@example.com")]);
 });
 afterEach(() => {
   application.stopExpiry();
@@ -89,14 +89,14 @@ test("a receipt stamps delivered_at once; a cursor-only delivery shows delivered
   expect((await a.thread(sent.message_id))[0]!.delivered_at).toBe(stamp);
   expect((await b.inbox()).unanswered[0]).toMatchObject({ id: sent.message_id, delivered_at: stamp });
   // A repeated receipt keeps the first stamp.
-  store.repo.messages.markDelivered(sent.message_id, stamp + 60_000);
+  await seed(store.repo, () => store.repo.messages.markDelivered(sent.message_id, stamp + 60_000));
   await b.ack([sent.message_id]);
   expect((await a.history())[0]!.delivered_at).toBe(stamp);
 
   b.close();
   const queued = await a.send("bob@example.com/fe", "skipped backlog");
   expect((await a.history()).at(-1)).toMatchObject({ id: queued.message_id, delivered: false });
-  store.repo.cursors.advance("bob@example.com/fe", "direct", "bob@example.com/fe", queued.message_id);
+  await seed(store.repo, () => store.repo.cursors.advance("bob@example.com/fe", "direct", "bob@example.com/fe", queued.message_id));
   const skipped = (await a.history()).at(-1)!;
   expect(skipped).toMatchObject({ id: queued.message_id, delivered: true });
   expect(skipped).not.toHaveProperty("delivered_at");
@@ -104,18 +104,18 @@ test("a receipt stamps delivered_at once; a cursor-only delivery shows delivered
 
 test("board observers are independent hints with concealed access and explicit lifecycle cleanup", async () => {
   const a = (await connect(alice, "be", { push: false })).session;
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await seed(store.repo, () => application.call(a, "board_create", { name: "e2e", purpose: "tests" }));
   let changed = 0, closed = 0;
   const unsubscribe = application.observeBoard(a, "#E2E", { changed: () => { changed++; }, closed: () => { closed++; } });
   application.observeBoard(a, "e2e", { changed: () => { throw new Error("ignored hint"); } });
-  application.call(a, "board_post", { board: "e2e", body: "hello" });
+  await seed(store.repo, () => application.call(a, "board_post", { board: "e2e", body: "hello" }));
   expect(changed).toBe(1);
   expect(application.boardSnapshot(a, "e2e").posts[0]!.body).toBe("hello");
   expect(application.boardCatalog(a).boards.map(b => b.name)).toContain("e2e");
   unsubscribe();
   unsubscribe();
   expect(closed).toBe(1);
-  application.call(a, "board_post", { board: "e2e", body: "later" });
+  await seed(store.repo, () => application.call(a, "board_post", { board: "e2e", body: "later" }));
   expect(changed).toBe(1);
   application.close(a);
   expect(() => application.observeBoard(a, "e2e", { changed: () => {} })).toThrow("session is closed");
@@ -127,14 +127,14 @@ test("board observers are independent hints with concealed access and explicit l
 test("#831: board and session observer indexes: a post tells its board's observers, a close ends its session's", async () => {
   const a = (await connect(alice, "be", { push: false })).session;
   const b = (await connect(bob, "fe", { push: false })).session;
-  for (const name of ["one", "two"]) application.call(a, "board_create", { name, purpose: "tests" });
+  await seed(store.repo, () => { for (const name of ["one", "two"]) application.call(a, "board_create", { name, purpose: "tests" }); });
   const seen: string[] = [];
   const watch = (s: typeof a, board: string, tag: string) =>
     application.observeBoard(s, board, { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
   watch(a, "one", "a1"); watch(a, "two", "a2"); watch(b, "one", "b1");
   const b2off = watch(b, "two", "b2");
   expect(application.observerCount).toBe(4);
-  application.call(a, "board_post", { board: "one", body: "x" });
+  await seed(store.repo, () => application.call(a, "board_post", { board: "one", body: "x" }));
   expect(seen.sort()).toEqual(["a1+", "b1+"]);
 
   seen.length = 0;
@@ -143,7 +143,7 @@ test("#831: board and session observer indexes: a post tells its board's observe
   expect(application.observerCount).toBe(2);
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
   seen.length = 0;
-  application.call(b, "board_post", { board: "two", body: "y" });
+  await seed(store.repo, () => application.call(b, "board_post", { board: "two", body: "y" }));
   expect(seen).toEqual(["b2+"]);
 
   // "two"'s last observer leaves, emptying its index entry; a new one on the emptied board is told.
@@ -152,17 +152,17 @@ test("#831: board and session observer indexes: a post tells its board's observe
   watch(b, "two", "b2'");
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
   seen.length = 0;
-  application.call(b, "board_post", { board: "two", body: "u" });
+  await seed(store.repo, () => application.call(b, "board_post", { board: "two", body: "u" }));
   expect(seen).toEqual(["b2'+"]);
 
   // A second observer of "one" joins and leaves; the board's first is still told.
   seen.length = 0;
   const again = watch(b, "one", "b1'");
-  application.call(b, "board_post", { board: "one", body: "z" });
+  await seed(store.repo, () => application.call(b, "board_post", { board: "one", body: "z" }));
   expect(seen.sort()).toEqual(["b1'+", "b1+"]);
   again();
   seen.length = 0;
-  application.call(b, "board_post", { board: "one", body: "w" });
+  await seed(store.repo, () => application.call(b, "board_post", { board: "one", body: "w" }));
   expect(seen).toEqual(["b1+"]);
 
   // A dead session's observer is dropped by the walk that finds it; the board's live observers are still told.
@@ -170,7 +170,7 @@ test("#831: board and session observer indexes: a post tells its board's observe
   watch(c.session, "one", "c1");
   c.session.active = false;
   seen.length = 0;
-  application.call(b, "board_post", { board: "one", body: "v" });
+  await seed(store.repo, () => application.call(b, "board_post", { board: "one", body: "v" }));
   expect(seen.sort()).toEqual(["b1+", "c1-"]);
   expect(application.observerCount).toBe(2);
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
@@ -212,7 +212,7 @@ test("reserved human authority is a separate trusted method, never a selected cl
   const human = (await application.attachHuman(alice, delivery())).session;
   application.disconnectUser(alice.user_id);
   expect(human.active).toBe(true);
-  store.repo.users.setDisabled(alice.user_id, true);
+  await seed(store.repo, () => store.repo.users.setDisabled(alice.user_id, true));
   expect(() => application.inbox(human)).toThrow("an admin signed this user out");
 });
 
@@ -243,7 +243,7 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
   expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
   expect(() => application.pending(b, 101)).toThrow();
   expect(() => application.pending(b, 0)).toThrow();
-  store.repo.users.setDisabled(bob.user_id, true);
+  await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
   expect(() => application.pending(b)).toThrow("an admin signed this user out");
 });
 
@@ -261,18 +261,20 @@ test("hosted Slack has no dependency on the transitional wire adapter", async ()
 // identity that #announce authority rests on.
 test("unbound hosted reads never use the human address and still list and read boards", async () => {
   const owner = (await connect(alice, "be", { key: "owner-secret" })).session;
-  application.call(owner, "board_create", { name: "e2e", purpose: "fixture" });
-  application.call(owner, "board_post", { board: "e2e", body: "hello" });
-  const team = store.repo.teams.create("private", bob.user_id);
-  store.repo.teams.addMember(team.id, bob.user_id);
+  await seed(store.repo, () => {
+    application.call(owner, "board_create", { name: "e2e", purpose: "fixture" });
+    application.call(owner, "board_post", { board: "e2e", body: "hello" });
+    const team = store.repo.teams.create("private", bob.user_id);
+    store.repo.teams.addMember(team.id, bob.user_id);
+  });
   const bobBe = (await connect(bob, "be", { key: "bob-secret" })).session;
-  application.call(bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" });
+  await seed(store.repo, () => application.call(bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" }));
   const asked: string[] = [];
   const principalOf = store.repo.resolver.principalOf.bind(store.repo.resolver);
   store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
   const unregistered = application.hostedSession(alice, "id:0000000000000", [], null, null, delivery()).session;
-  application.hostedRegister(alice, "id:1111111111111", "opencode");
+  await seed(store.repo, () => application.hostedRegister(alice, "id:1111111111111", "opencode"));
   const registered = application.hostedSession(alice, "id:1111111111111", [], null, null, delivery()).session;
   for (const session of [unregistered, registered]) {
     expect(application.boardCatalog(session).boards.map(b => b.name)).toContain("e2e");
@@ -296,7 +298,7 @@ test("a hosted session whose hello facts throw is left unregistered (#385 item 9
     expect(() => application.hostedSession(alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).toThrow("db gone");
   } finally { teams.mockRestore(); }
   // An unheld "be": a DM to it is pushed only to a session the hub routes it to.
-  store.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
+  await seed(store.repo, () => store.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com"));
   const sender = await connect(alice, "sender");
   await sender.send("alice@example.com/be", "no route left behind");
   expect(pushed).toEqual([]);
@@ -306,10 +308,12 @@ test("a hosted session whose hello facts throw is left unregistered (#385 item 9
 test("unbound hosted sessions cannot use named operations or persist synthetic handles", async () => {
   // A hosted root's row: peer_list reads unbound roots from the store (#475).
   const now = Date.now();
-  const ownership = store.repo.hosted.start("hosted-unbound", alice.user_id, "test", now);
-  store.repo.hosted.insert({
-    session_id: "hosted-unbound", ownership_id: ownership, user_id: alice.user_id, client_id: "test", grant_id: "grant", source_session_id: "hosted-unbound",
-    writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null,
+  await seed(store.repo, () => {
+    const ownership = store.repo.hosted.start("hosted-unbound", alice.user_id, "test", now);
+    store.repo.hosted.insert({
+      session_id: "hosted-unbound", ownership_id: ownership, user_id: alice.user_id, client_id: "test", grant_id: "grant", source_session_id: "hosted-unbound",
+      writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null,
+    });
   });
   const { session, info } = application.hostedSession(alice, "hosted-unbound", [], null, null, delivery());
   expect(session.writerId).toBeUndefined();
@@ -429,7 +433,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
 });
 
 test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
-  const carol = tokenSession(store.repo, (u => ({ user_id: u.id, user_email: u.email }))(store.repo.users.upsertByEmail("carol@example.com", null)));
+  const carol = await seed(store.repo, () => { const u = store.repo.users.upsertByEmail("carol@example.com", null); return tokenSessionIn(store.repo, { user_id: u.id, user_email: u.email }); });
   const a = await connect(alice, "be");
   const b = await connect(bob, "fe");
   await connect(carol, "sim");

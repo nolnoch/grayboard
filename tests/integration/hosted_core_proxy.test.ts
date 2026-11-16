@@ -20,6 +20,7 @@ import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, ATTACHMENTS_PARAM, attachRoots, publishedLimits } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { seed } from "../support/seed.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
@@ -99,7 +100,7 @@ test("the MCP URL must be canonical HTTPS or loopback HTTP, without credentials,
 });
 
 test("a write tool round trip binds the calling session through _meta; results come back verbatim; hooks wrap each call", async () => {
-  const { token, authed } = issue();
+  const { token, authed } = await issue();
   const hooks = recorder();
   const changed: NativeTool[][] = [];
   const p = proxy({ token: async () => token }, { hooks, onTools: tools => { changed.push(tools); } });
@@ -143,7 +144,7 @@ test("a write tool round trip binds the calling session through _meta; results c
 });
 
 test("each new native connection re-lists the tools; a changed list reaches the adapter", async () => {
-  const { token } = issue();
+  const { token } = await issue();
   const changed: string[][] = [];
   const p = proxy({ token: async () => token }, { onTools: tools => { changed.push(tools.map(t => t.name)); } });
   const list = NativeWire.prototype.listTools, call = NativeWire.prototype.callTool;
@@ -186,7 +187,7 @@ test("each new native connection re-lists the tools; a changed list reaches the 
 });
 
 test("a call's own failure leaves the shared connection to the calls in flight on it; a transport failure replaces it", async () => {
-  const { token } = issue();
+  const { token } = await issue();
   const p = proxy({ token: async () => token });
   const list = NativeWire.prototype.listTools, call = NativeWire.prototype.callTool, fetch0 = globalThis.fetch;
   let lists = 0, fail: Error | undefined;
@@ -229,7 +230,7 @@ test("a call's own failure leaves the shared connection to the calls in flight o
 });
 
 test("connect() and retire() leave calls in flight to finish: a new connection takes the new calls, and the one it replaced closes after its last", async () => {
-  const { token } = issue();
+  const { token } = await issue();
   const p = proxy({ token: async () => token });
   const list = NativeWire.prototype.listTools, close = NativeWire.prototype.close, fetch0 = globalThis.fetch;
   let lists = 0, closes = 0;
@@ -284,7 +285,7 @@ test("connect() and retire() leave calls in flight to finish: a new connection t
 });
 
 test("instructions are per session and cached until that session's bind result or forget()", async () => {
-  const { token } = issue();
+  const { token } = await issue();
   const p = proxy({ token: async () => token });
   const first = p.instructions("pi-root");
   expect(p.instructions("pi-root")).toBe(first);
@@ -305,7 +306,7 @@ test("instructions are per session and cached until that session's bind result o
 });
 
 test("dm_send with a local file uploads and attaches it; attachment_get saves it after checking the digest", async () => {
-  const alice = issue("alice@example.com"), bob = issue("bob@example.com");
+  const alice = await issue("alice@example.com"), bob = await issue("bob@example.com");
   const sender = proxy({ token: async () => alice.token }), reader = proxy({ token: async () => bob.token });
   await sender.call("bind", { name: "proxy-a", create: true }, "pi-a");
   await reader.call("bind", { name: "proxy-b", create: true }, "pi-b");
@@ -359,7 +360,7 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
 test("attachment_get cancels an oversized download before saving it", async () => {
   await srv.stop();
   srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
-  const alice = issue(), p = proxy({ token: async () => alice.token });
+  const alice = await issue(), p = proxy({ token: async () => alice.token });
   await p.call("bind", { name: "download-cap", create: true }, "pi-cap");
   writeFileSync(join(dir, "small.txt"), "small file");
   const sent = JSON.parse(textOf(await p.call("dm_send", { to: "download-cap", body: "file", attachments: [join(dir, "small.txt")] }, "pi-cap"))) as { attachments: { id: number }[] };
@@ -382,7 +383,7 @@ test("attachment_get cancels an oversized download before saving it", async () =
 test("uploads are checked against the server's published caps; a server that publishes none gets the defaults", async () => {
   await srv.stop();
   srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
-  const alice = issue("alice@example.com");
+  const alice = await issue("alice@example.com");
   const p = proxy({ token: async () => alice.token });
   await p.call("bind", { name: "proxy-caps", create: true }, "pi-caps");
   writeFileSync(join(dir, "big.txt"), "twenty bytes long!!\n");
@@ -419,7 +420,7 @@ test("uploads are checked against the server's published caps; a server that pub
 });
 
 test("an attachment request refused with 401 runs the credential's onUnauthorized once, then retries", async () => {
-  const { token } = issue();
+  const { token } = await issue();
   let refreshed = 0, current = token;
   const p = proxy({ token: async () => current, onUnauthorized: async () => { refreshed++; current = token; } });
   await p.call("bind", { name: "proxy-self", create: true }, "pi-root");
@@ -433,7 +434,7 @@ test("an attachment request refused with 401 runs the credential's onUnauthorize
 });
 
 test("a token without the tools scope needs a new login, never a refresh", async () => {
-  const { token } = issue("alice@example.com", ["grayboard:delivery"]);
+  const { token } = await issue("alice@example.com", ["grayboard:delivery"]);
   let refreshed = 0;
   const p = proxy({ token: async () => token, onUnauthorized: async () => { refreshed++; } });
   expect(textOf(await p.call("whoami", {}, "pi-root"))).toBe("error: Signed out of grayboard in pi; run /grayboard login");
@@ -441,12 +442,12 @@ test("a token without the tools scope needs a new login, never a refresh", async
 });
 
 test("a 401 the credential's refresh doesn't fix needs a new login: tool calls, uploads and instructions alike", async () => {
-  const { token, refreshToken } = issue();
+  const { token, refreshToken } = await issue();
   let refreshed = 0;
   const p = proxy({ token: async () => token, onUnauthorized: async () => { refreshed++; } });
   expect((await p.call("bind", { name: "proxy-gone", create: true }, "pi-root")).isError).toBeUndefined();
   // Revoking the refresh token revokes the grant (RFC 7009), so the access token dies with it.
-  srv.app.repo.oauth.revokeToken(hashToken(refreshToken), CLIENT, Date.now());
+  await seed(srv.app.repo, () => srv.app.repo.oauth.revokeToken(hashToken(refreshToken), CLIENT, Date.now()));
   const signedOut = "error: Signed out of grayboard in pi; run /grayboard login";
   expect(await p.call("whoami", {}, "pi-root")).toEqual({ content: [{ type: "text", text: signedOut }], isError: true });
   writeFileSync(join(dir, "gone.txt"), "gone\n");

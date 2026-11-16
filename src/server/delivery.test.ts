@@ -12,6 +12,7 @@ import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { openDatabase } from "./db.ts";
 import { createBoard, post, subscribe } from "../core/boards.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -28,15 +29,15 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-delivery-"));
   store = openDatabase(scratchDbPath(), { blobDir: dir });
   application = createApplication(store.repo, store.db);
-  const principal = (email: string): DeliveryPrincipal => {
-    const user = store.repo.users.upsertByEmail(email, null);
+  const principal = async (email: string): Promise<DeliveryPrincipal> => {
+    const user = await seed(store.repo, () => store.repo.users.upsertByEmail(email, null));
     return { authed: { user_id: user.id, user_email: email, session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
   };
-  alice = principal("alice@example.com"); bob = principal("bob@example.com");
+  alice = await principal("alice@example.com"); bob = await principal("bob@example.com");
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
-  sender = new AppSession(application, alice.authed, "be", { push: false });
+  sender = new AppSession(application, store.repo, alice.authed, "be", { push: false });
   await sender.connect();
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
@@ -158,7 +159,7 @@ test("reads repeat without admission; receipt and dm_ack remain distinct", async
 test("only an issued contiguous direct prefix advances MAX cursor, ignoring global gaps", async () => {
   const lease = await delivery.open(bob, context(bob));
   await send("first");
-  store.repo.messages.insert("alice@example.com/be", "user", "alice@example.com/be", "gap", null, false);
+  await seed(store.repo, () => store.repo.messages.insert("alice@example.com/be", "user", "alice@example.com/be", "gap", null, false));
   await send("second");
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[1]!.id])).rejects.toHaveProperty("code", "not_found");
@@ -219,8 +220,8 @@ test("explicit release ends ownership and closes all children", async () => {
 });
 
 test("cross application-level/hosted holders share one exclusion path", async () => {
-  await expect(new AppSession(application, bob.authed, "fe").connect()).rejects.toHaveProperty("code", "alias_held");
-  const holder = new AppSession(application, bob.authed, "be");
+  await expect(new AppSession(application, store.repo, bob.authed, "fe").connect()).rejects.toHaveProperty("code", "alias_held");
+  const holder = new AppSession(application, store.repo, bob.authed, "be");
   await holder.connect();
   await expect(hosted.bind(bob, context(bob), { name: "be" })).rejects.toHaveProperty("code", "alias_held");
   // Since #282 close() leaves an application-level hold (there is no grace to sweep it) and a hosted bind never probes it; an unbind frees it.
@@ -231,17 +232,19 @@ test("cross application-level/hosted holders share one exclusion path", async ()
 
 test("disable immediately closes held ownership and invalidates capability", async () => {
   const lease = await delivery.open(bob, context(bob));
-  store.repo.users.setDisabled(bob.authed.user_id, true);
+  await seed(store.repo, () => store.repo.users.setDisabled(bob.authed.user_id, true));
   expect(hostedRowCount(store.db)).toBe(0);
   expect(delivery.activeLeaseCount).toBe(0);
   expect(() => delivery.describe(bob, context(bob), lease.capability)).toThrow();
 });
 
 test("board receipt is issued and scoped, not an arbitrary high-water cursor", async () => {
-  createBoard(store.db, "alice@example.com/be", "#e2e", "test delivery");
-  subscribe(store.db, "bob@example.com/fe", "#e2e", "push");
+  await seed(store.repo, () => {
+    createBoard(store.db, "alice@example.com/be", "#e2e", "test delivery");
+    subscribe(store.db, "bob@example.com/fe", "#e2e", "push");
+  });
   const lease = await delivery.open(bob, context(bob));
-  post(store.db, "alice@example.com/be", "#e2e", "hello");
+  await seed(store.repo, () => post(store.db, "alice@example.com/be", "#e2e", "hello"));
   const items = await delivery.pending(bob, context(bob), lease.capability);
   expect(items.length).toBeGreaterThan(0);
   await expect(delivery.receipt(bob, context(bob), lease.capability, ["push:99999"])).rejects.toHaveProperty("code", "not_found");

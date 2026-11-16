@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ApplicationError, createApplication, type ApplicationSession } from "./application.ts";
-import { openDatabase } from "./db.ts";
+import { openDatabase, queuedTx } from "./db.ts";
 import { boardResourceUri, createResources, parseBoardResourceUri } from "./resources.ts";
 import { isSubscribed, subscribe } from "../core/boards.ts";
 import { storeAttachment } from "../core/attachments.ts";
@@ -16,6 +16,7 @@ import { runRetention } from "./retention.ts";
 import type { Config } from "./config.ts";
 import { handleHttp } from "./http.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -32,25 +33,29 @@ const hooks = () => {
 const quotaOf = (user: AuthedUser) => ({ principal: user.user_email, unsent: 1 << 20, stored: 1 << 20 });
 // push: false is a tools-only session (it writes as the alias and holds nothing), push: true a holder that is delivered to.
 async function open(user: AuthedUser, name = "be", push = false) {
-  const s = new AppSession(application, user, name, { push });
+  const s = new AppSession(application, store.repo, user, name, { push });
   await s.connect();
   return s;
 }
 async function select(user: AuthedUser, name = "be", push = false) {
   return (await open(user, name, push)).session;
 }
-beforeEach(() => {
+// A board or claim tool on a raw session, in a queued body, as hosted run holds the write queue around a tool.
+async function call<T = unknown>(session: ApplicationSession, tool: string, args: Record<string, unknown>): Promise<T> {
+  return await seed(store.repo, () => application.call(session, tool, args)) as T;
+}
+beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
   store = openDatabase(scratchDbPath(), { blobDir: dir });
   application = createApplication(store.repo, store.db);
   revoked = new Set();
   resources = createResources(application, { isAuthorized: s => !revoked.has(s) });
-  const user = (email: string): AuthedUser => {
-    const u = store.repo.users.upsertByEmail(email, null);
+  const user = async (email: string): Promise<AuthedUser> => {
+    const u = await seed(store.repo, () => store.repo.users.upsertByEmail(email, null));
     return { user_id: u.id, user_email: email, session_id: 0 };
   };
-  alice = user("alice@example.com");
-  bob = user("bob@example.com");
+  alice = await user("alice@example.com");
+  bob = await user("bob@example.com");
 });
 afterEach(() => {
   resources.close();
@@ -70,12 +75,12 @@ test("canonical board URIs reject encoded, delimiter, traversal, case and newlin
 
 test("resource hook failures emit one fixed diagnostic without forged stack or cause", async () => {
   const s = await select(alice);
-  application.call(s, "board_create", { name: "e2e", purpose: "test" });
+  await call(s, "board_create", { name: "e2e", purpose: "test" });
   const log = spyOn(console, "error").mockImplementation(() => {});
   const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
   try {
     resources.watch(s, boardResourceUri("e2e"), { changed: async () => { throw forged; } });
-    application.call(s, "board_post", { board: "e2e", body: "test" });
+    await call(s, "board_post", { board: "e2e", body: "test" });
     await Promise.resolve(); await Promise.resolve();
     expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"resources.changed","category":"failure","level":"error","class":"Error"}']);
   } finally { log.mockRestore(); }
@@ -87,15 +92,15 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
   await owner.call("peer_status", { text: "working" });
   const a = await select(alice);
   const b = await select(bob);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
-  subscribe(store.db, a.identityFull, "e2e", "off");
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
   const h1 = hooks(), h2 = hooks(), h3 = hooks();
   resources.watch(a, boardResourceUri("e2e"), h1);
   resources.watch(a, boardResourceUri("e2e"), h2);
   resources.watch(b, boardResourceUri("e2e"), h3);
   expect(isSubscribed(store.db, a.identityFull, "e2e")).toBe(false);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
-  application.call(b, "board_post", { board: "e2e", body: "hello" });
+  await call(b, "board_post", { board: "e2e", body: "hello" });
   expect([h1.counts.changed, h2.counts.changed, h3.counts.changed]).toEqual([1, 1, 1]);
   expect(resources.read(a, boardResourceUri("e2e")).posts[0]!.body).toBe("hello");
   expect(ownerEvents).toEqual([]);
@@ -105,64 +110,70 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
   await expect(select(alice, "be", true)).rejects.toMatchObject({ code: "alias_held" });
   resources.close();
   expect([h1.counts.closed, h2.counts.closed, h3.counts.closed]).toEqual([1, 1, 1]);
-  application.send(b, a.identityFull, "direct");
+  await seed(store.repo, () => application.send(b, a.identityFull, "direct"));
   expect(ownerEvents).toHaveLength(1);
   expect(store.repo.cursors.directFor(a.identityFull)).toBe(0);
 });
 
 test("only authorized same-board watchers receive hints; lost membership closes without private data", async () => {
-  const team = store.repo.teams.create("private", alice.user_id);
-  store.repo.teams.addMember(team.id, alice.user_id);
-  store.repo.teams.addMember(team.id, bob.user_id);
+  const team = await seed(store.repo, () => {
+    const t = store.repo.teams.create("private", alice.user_id);
+    store.repo.teams.addMember(t.id, alice.user_id);
+    store.repo.teams.addMember(t.id, bob.user_id);
+    return t;
+  });
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "open", purpose: "open" });
+  await call(a, "board_create", { name: "open", purpose: "open" });
   const privateUri = boardResourceUri("private");
   const ha = hooks(), hb = hooks(), other = hooks();
   resources.watch(a, privateUri, ha);
   resources.watch(b, privateUri, hb);
   resources.watch(b, boardResourceUri("open"), other);
-  application.call(a, "board_post", { board: "private", body: "secret" });
+  await call(a, "board_post", { board: "private", body: "secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([1, 1, 0]);
-  store.repo.teams.removeMember(team.id, bob.user_id);
-  application.call(a, "board_post", { board: "private", body: "after removal" });
+  await seed(store.repo, () => store.repo.teams.removeMember(team.id, bob.user_id));
+  await call(a, "board_post", { board: "private", body: "after removal" });
   expect(hb.counts).toEqual({ changed: 1, closed: 1 });
   resources.revalidate();
   expect(hb.counts.closed).toBe(1);
   expect(resources.list(b).resources.map(r => r.uri)).not.toContain(privateUri);
   expect(() => resources.read(b, privateUri)).toThrow("no such board #private; see board_list");
   expect(() => resources.watch(b, privateUri, hooks())).toThrow("no such board #private; see board_list");
-  application.call(a, "board_post", { board: "private", body: "new secret" });
+  await call(a, "board_post", { board: "private", body: "new secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([3, 1, 0]);
 });
 
 test("attachments are metadata only and cannot escape the selected board/page", async () => {
-  const team = store.repo.teams.create("private", alice.user_id);
-  store.repo.teams.addMember(team.id, alice.user_id);
+  const team = await seed(store.repo, () => {
+    const t = store.repo.teams.create("private", alice.user_id);
+    store.repo.teams.addMember(t.id, alice.user_id);
+    return t;
+  });
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "open", purpose: "open" });
-  const file = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "visible.txt", type: "text/plain", data: new TextEncoder().encode("visible") }, { quota: quotaOf(alice) });
-  application.call(a, "board_post", { board: "open", body: "file", attachment_ids: [file.id] });
-  const hidden = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "hidden.txt", type: "text/plain", data: new TextEncoder().encode("hidden") }, { quota: quotaOf(alice) });
-  application.call(a, "board_post", { board: "private", body: "hidden", attachment_ids: [hidden.id] });
+  await call(a, "board_create", { name: "open", purpose: "open" });
+  const file = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "visible.txt", type: "text/plain", data: new TextEncoder().encode("visible") }, { quota: quotaOf(alice), tx: queuedTx(store.repo) });
+  await call(a, "board_post", { board: "open", body: "file", attachment_ids: [file.id] });
+  const hidden = await storeAttachment(store.db, store.repo.blobs, a.identityFull, { filename: "hidden.txt", type: "text/plain", data: new TextEncoder().encode("hidden") }, { quota: quotaOf(alice), tx: queuedTx(store.repo) });
+  await call(a, "board_post", { board: "private", body: "hidden", attachment_ids: [hidden.id] });
   const result = resources.read(b, boardResourceUri("open"));
   expect(result.posts[0]!.attachments).toEqual([{ id: file.id, filename: file.filename, type: file.type, size: file.size, sha256: file.sha256 }]);
   expect(JSON.stringify(result)).not.toContain("hidden");
   expect(JSON.stringify(result)).not.toContain(dir);
   expect(() => resources.read(b, boardResourceUri("private"))).toThrow("no such board");
-  application.call(a, "board_post", { board: "open", body: "no file" });
+  await call(a, "board_post", { board: "open", body: "no file" });
   expect(resources.read(b, boardResourceUri("open"), { limit: 1 }).posts[0]!.attachments).toBeUndefined();
 });
 
 test("failed/missed callbacks do not acknowledge; reconcile reads recover and callback exceptions are isolated", async () => {
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
   resources.watch(b, boardResourceUri("e2e"), { changed: () => { throw new Error("sync"); } });
   resources.watch(b, boardResourceUri("e2e"), { changed: async () => { throw new Error("async"); } });
   const good = hooks();
   resources.watch(b, boardResourceUri("e2e"), good);
-  subscribe(store.db, b.identityFull, "e2e", "push");
-  application.call(a, "board_post", { board: "e2e", body: "first" });
-  application.call(a, "board_post", { board: "e2e", body: "second" });
+  await seed(store.repo, () => subscribe(store.db, b.identityFull, "e2e", "push"));
+  await call(a, "board_post", { board: "e2e", body: "first" });
+  await call(a, "board_post", { board: "e2e", body: "second" });
   await Promise.resolve();
   expect(good.counts.changed).toBe(2);
   const pending = application.pending(b);
@@ -175,27 +186,27 @@ test("failed/missed callbacks do not acknowledge; reconcile reads recover and ca
 test("claim create/update/release and refused acquisition's opportunistic lapse signal without attention watchers", async () => {
   const a = await select(alice), b = await select(bob);
   const uri = boardResourceUri("e2e");
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
-  subscribe(store.db, a.identityFull, "e2e", "off");
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
   const h = hooks();
   resources.watch(b, uri, h);
-  const take = (key: string, extra = {}) => application.call(a, "claim_take", { key, board: "e2e", ...extra });
-  const created = take("ticket:ENG-142") as Record<string, unknown>;
+  const take = (key: string, extra = {}) => call(a, "claim_take", { key, board: "e2e", ...extra });
+  const created = await take("ticket:ENG-142") as Record<string, unknown>;
   expect(created.ok).toBe(true);
   expect(created.boards).toBeUndefined();
   expect(h.counts.changed).toBe(1);
-  take("ticket:ENG-142"); // No post for an unchanged renewal.
+  await take("ticket:ENG-142"); // No post for an unchanged renewal.
   expect(h.counts.changed).toBe(1);
-  take("ticket:ENG-142", { note: "progress" });
+  await take("ticket:ENG-142", { note: "progress" });
   expect(h.counts.changed).toBe(2);
-  expect(() => application.call(b, "claim_release", { key: "ticket:ENG-142" })).toThrow("not you");
+  await expect(call(b, "claim_release", { key: "ticket:ENG-142" })).rejects.toThrow("not you");
   expect(h.counts.changed).toBe(2);
-  application.call(a, "claim_release", { key: "ticket:ENG-142" });
+  await call(a, "claim_release", { key: "ticket:ENG-142" });
   expect(h.counts.changed).toBe(3);
-  take("lapsed");
-  application.call(a, "claim_take", { key: "occupied" });
-  store.db.run("UPDATE claims SET expires_at = 0 WHERE key = 'lapsed'");
-  const refused = application.call(b, "claim_take", { key: "occupied" }) as { ok: boolean };
+  await take("lapsed");
+  await call(a, "claim_take", { key: "occupied" });
+  await seed(store.repo, () => store.db.run("UPDATE claims SET expires_at = 0 WHERE key = 'lapsed'"));
+  const refused = await call<{ ok: boolean }>(b, "claim_take", { key: "occupied" });
   expect(refused.ok).toBe(false);
   expect(h.counts.changed).toBe(5);
   expect(resources.read(b, uri).posts.map(p => p.body)).toEqual([
@@ -208,35 +219,41 @@ test("claim create/update/release and refused acquisition's opportunistic lapse 
 });
 
 test("rolled back claims and unauthorized board mutations emit no hint or transient lapse", async () => {
-  const team = store.repo.teams.create("private", alice.user_id);
-  store.repo.teams.addMember(team.id, alice.user_id);
+  const team = await seed(store.repo, () => {
+    const t = store.repo.teams.create("private", alice.user_id);
+    store.repo.teams.addMember(t.id, alice.user_id);
+    return t;
+  });
   const a = await select(alice), b = await select(bob);
   const uri = boardResourceUri("e2e");
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
-  subscribe(store.db, a.identityFull, "e2e", "off");
-  application.call(a, "claim_take", { key: "lapsed", board: "e2e" });
-  store.db.run("UPDATE claims SET expires_at = 0 WHERE key = 'lapsed'");
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
+  await call(a, "claim_take", { key: "lapsed", board: "e2e" });
+  await seed(store.repo, () => store.db.run("UPDATE claims SET expires_at = 0 WHERE key = 'lapsed'"));
   const h = hooks();
   resources.watch(b, uri, h);
   store.db.run(`CREATE TRIGGER fail_claim_post BEFORE INSERT ON posts WHEN NEW.body = '[claim] rollback'
     BEGIN SELECT RAISE(ABORT, 'rollback'); END`);
-  expect(() => application.call(a, "claim_take", { key: "rollback", board: "e2e" })).toThrow("claim_take failed");
+  await expect(call(a, "claim_take", { key: "rollback", board: "e2e" })).rejects.toThrow("claim_take failed");
   expect(h.counts.changed).toBe(0);
   expect(resources.read(b, uri).posts.map(p => p.body)).toEqual(["[claim] lapsed"]);
   expect(store.db.query("SELECT key FROM claims WHERE key = 'lapsed'").get()).toEqual({ key: "lapsed" });
-  expect(() => application.call(b, "board_post", { board: "private", body: "no" })).toThrow("no such board");
-  expect(() => application.call(b, "claim_take", { key: "private", board: "private" })).toThrow("no such board");
+  await expect(call(b, "board_post", { board: "private", body: "no" })).rejects.toThrow("no such board");
+  await expect(call(b, "claim_take", { key: "private", board: "private" })).rejects.toThrow("no such board");
   expect(h.counts.changed).toBe(0);
 });
 
 test("real bearer CLI claim route hints committed posts without attention subscribers or private leaks", async () => {
-  const team = store.repo.teams.create("private", alice.user_id);
-  store.repo.teams.addMember(team.id, alice.user_id);
-  store.repo.teams.addMember(team.id, bob.user_id);
+  const team = await seed(store.repo, () => {
+    const t = store.repo.teams.create("private", alice.user_id);
+    store.repo.teams.addMember(t.id, alice.user_id);
+    store.repo.teams.addMember(t.id, bob.user_id);
+    return t;
+  });
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
   for (const session of [a, b]) {
-    for (const board of ["e2e", "private"]) subscribe(store.db, session.identityFull, board, "off");
+    await seed(store.repo, () => { for (const board of ["e2e", "private"]) subscribe(store.db, session.identityFull, board, "off"); });
   }
   const publicHint = hooks(), privateHint = hooks(), removedHint = hooks();
   resources.watch(b, boardResourceUri("e2e"), publicHint);
@@ -281,7 +298,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     expect(publicHint.counts.changed).toBe(4);
     await call(at, "claim_take", { key: "lapsed", board: "e2e" });
     await call(at, "claim_take", { key: "occupied" });
-    store.db.run("UPDATE claims SET expires_at = 0 WHERE key = 'lapsed'");
+    await seed(store.repo, () => store.db.run("UPDATE claims SET expires_at = 0 WHERE key = 'lapsed'"));
     const refused = await call(bt, "claim_take", { key: "occupied" });
     expect(refused.status).toBe(200);
     expect(refused.body.ok).toBe(false);
@@ -290,7 +307,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     const bodies = resources.read(b, boardResourceUri("e2e")).posts.map(p => p.body);
     expect(bodies.slice(2, 5)).toEqual(["[claim] ticket:ENG-142", "[release] ticket:ENG-142", "[claim] lapsed"]);
     expect(bodies.at(-1)).toStartWith("[expired] lapsed:");
-    store.repo.teams.removeMember(team.id, bob.user_id);
+    await seed(store.repo, () => store.repo.teams.removeMember(team.id, bob.user_id));
     expect((await call(at, "claim_take", { key: "secret", board: "private" })).status).toBe(200);
     expect(privateHint.counts.changed).toBe(1);
     expect(removedHint.counts).toEqual({ changed: 0, closed: 1 });
@@ -317,11 +334,11 @@ test("real bearer CLI claim route hints committed posts without attention subscr
 test("timer expiry independently hints with no attention subscribers", async () => {
   const a = await select(alice), b = await select(bob);
   const uri = boardResourceUri("e2e");
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
-  subscribe(store.db, a.identityFull, "e2e", "off");
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
   const h = hooks();
   resources.watch(b, uri, h);
-  application.call(a, "claim_take", { key: "short", board: "e2e", ttl_minutes: 0.001 });
+  await call(a, "claim_take", { key: "short", board: "e2e", ttl_minutes: 0.001 });
   expect(h.counts.changed).toBe(1);
   const deadline = Date.now() + 2_000;
   while (h.counts.changed < 2 && Date.now() < deadline) await Bun.sleep(10);
@@ -335,11 +352,11 @@ test("timer expiry independently hints with no attention subscribers", async () 
 test("retention hints only actual committed post deletions and snapshot reads leave attention state intact", async () => {
   const a = await select(alice), b = await select(bob);
   const uri = boardResourceUri("e2e");
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
-  subscribe(store.db, a.identityFull, "e2e", "off");
-  application.call(a, "board_post", { board: "e2e", body: "old" });
-  store.db.run("UPDATE posts SET created_at = 0 WHERE board = 'e2e'");
-  application.call(a, "board_post", { board: "e2e", body: "kept" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
+  await call(a, "board_post", { board: "e2e", body: "old" });
+  await seed(store.repo, () => store.db.run("UPDATE posts SET created_at = 0 WHERE board = 'e2e'"));
+  await call(a, "board_post", { board: "e2e", body: "kept" });
   const h = hooks();
   resources.watch(b, uri, h);
   const state = () => ({
@@ -358,7 +375,7 @@ test("retention hints only actual committed post deletions and snapshot reads le
 
 test("unwatch is session-bound and bounded capacity is reclaimed by cancellation and closure", async () => {
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
   const h = hooks();
   const ids = Array.from({ length: 32 }, () => resources.watch(a, boardResourceUri("e2e"), h));
   expect(() => resources.watch(a, boardResourceUri("e2e"), h)).toThrow("capacity");
@@ -374,17 +391,17 @@ test("unwatch is session-bound and bounded capacity is reclaimed by cancellation
 
 test("revocation, disabled users, application disconnect and stop close watchers", async () => {
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
   const revokedHook = hooks();
   resources.watch(a, boardResourceUri("e2e"), revokedHook);
   revoked.add(a);
   // Notification must recheck authorization even without explicit revalidation.
-  application.call(b, "board_post", { board: "e2e", body: "after revoke" });
+  await call(b, "board_post", { board: "e2e", body: "after revoke" });
   expect(revokedHook.counts).toEqual({ changed: 0, closed: 1 });
   expect(() => resources.list(a)).toThrow("unauthorized");
   const disabledHook = hooks();
   resources.watch(b, boardResourceUri("e2e"), disabledHook);
-  store.repo.users.setDisabled(bob.user_id, true);
+  await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
   resources.revalidate();
   expect(disabledHook.counts.closed).toBe(1);
   revoked.delete(a);
@@ -403,7 +420,7 @@ test("revocation, disabled users, application disconnect and stop close watchers
 
 for (const boundary of ["grant", "session"] as const) for (const internal of [false, true]) test(`strict resource ${boundary} faults preserve provenance and watches (application error: ${internal})`, async () => {
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
   resources.close();
   const failure = internal ? new ApplicationError("internal", "storage unavailable") : new Error("storage unavailable");
   let failed = false;
@@ -426,7 +443,7 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
     expect(h.counts).toEqual({ changed: 0, closed: 0 });
     expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
   } finally { failed = false; application.revalidateSession = validate; }
-  application.call(a, "board_post", { board: "e2e", body: "healthy" });
+  await call(a, "board_post", { board: "e2e", body: "healthy" });
   expect(h.counts).toEqual({ changed: 1, closed: 0 });
   expect(resources.read(b, uri).posts.map(p => p.body)).toEqual(["healthy"]);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
@@ -436,7 +453,7 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
 
 for (const background of ["revalidate", "hint", "closed", "timer"] as const) test(`background resource ${background} faults isolate cleanup and close callbacks`, async () => {
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
   resources.close();
   let failed = false;
   resources = createResources(application, { isAuthorized: () => {
@@ -455,7 +472,7 @@ for (const background of ["revalidate", "hint", "closed", "timer"] as const) tes
     });
     failed = true;
     if (background === "revalidate") expect(() => resources.revalidate()).not.toThrow();
-    if (background === "hint") expect(() => application.call(a, "board_post", { board: "e2e", body: "committed" })).not.toThrow();
+    if (background === "hint") await call(a, "board_post", { board: "e2e", body: "committed" });
     if (background === "closed") expect(() => application.close(b)).not.toThrow();
     if (background === "timer") {
       const deadline = Date.now() + 2_000;
@@ -472,7 +489,7 @@ for (const background of ["revalidate", "hint", "closed", "timer"] as const) tes
 
 test("resource background session storage faults fail closed, but authoritative refusals still refuse requests", async () => {
   const a = await select(alice);
-  application.call(a, "board_create", { name: "e2e", purpose: "tests" });
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
   const h = hooks();
   resources.watch(a, boardResourceUri("e2e"), h);
   const validate = application.revalidateSession;
@@ -492,8 +509,8 @@ test("resource background session storage faults fail closed, but authoritative 
 // a revoked session's watches all close.
 test("per-session watch capacity counts only that session's watches and frees on unwatch and revoke", async () => {
   const a = await select(alice), b = await select(bob);
-  application.call(a, "board_create", { name: "cap", purpose: "capacity" });
-  application.call(b, "board_create", { name: "other", purpose: "capacity" });
+  await call(a, "board_create", { name: "cap", purpose: "capacity" });
+  await call(b, "board_create", { name: "other", purpose: "capacity" });
   const ids = Array.from({ length: 32 }, () => resources.watch(a, "grayboard://boards/cap", hooks()));
   const counted = refusalCount("resource_watch");
   expect(() => resources.watch(a, "grayboard://boards/cap", hooks())).toThrow("resource watch capacity reached");
@@ -517,7 +534,7 @@ test("configured watch caps admit past the defaults and refuse at the configured
   application = createApplication(store.repo, store.db, { observerCap: 1100 });
   resources = createResources(application, { isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
   const a = await select(alice);
-  application.call(a, "board_create", { name: "wide", purpose: "capacity" });
+  await call(a, "board_create", { name: "wide", purpose: "capacity" });
   for (let i = 0; i < 1100; i++) resources.watch(a, "grayboard://boards/wide", hooks());
   expect(resources.activeWatchCount).toBe(1100);
   expect(() => resources.watch(a, "grayboard://boards/wide", hooks())).toThrow("resource watch capacity reached");

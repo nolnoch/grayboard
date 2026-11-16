@@ -109,7 +109,7 @@ test("the listener serves /metrics on its own address, refuses anything else, an
     const base = `http://127.0.0.1:${srv.app.metrics!.port}`;
     const before = sample(await (await fetch(`${base}/metrics`)).text(), 'grayboard_capacity_refusals_total{kind="mcp_post"}')!;
     // A real refusal site: every POST /mcp is over a zero post cap.
-    const { token } = issueOAuth(srv.app.repo, srv.app.oauth.resource, "you@example.com", ["grayboard:tools"], Date.now());
+    const { token } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, "you@example.com", ["grayboard:tools"], Date.now());
     const refused = await fetch(`${srv.base}/mcp`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: "{}" });
     expect(refused.status).toBe(429);
     const res = await fetch(`${base}/metrics`);

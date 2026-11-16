@@ -13,6 +13,7 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { scratchDbPath } from "../support/scratch_db.ts";
+import { seed } from "../support/seed.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string;
@@ -51,9 +52,9 @@ async function attachment(token: string, method = "POST", id?: number, alias = f
 }
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant uploads, MCP binds, participant downloads, own unsent releases`, async () => {
-  const alice = issue(), bob = issue("bob@example.com"), outsider = issue("outsider@example.com");
+  const alice = await issue(), bob = await issue("bob@example.com"), outsider = await issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
-  app.repo.aliases.create({ scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email);
+  await seed(app.repo, () => app.repo.aliases.create({ scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email));
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
   await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
@@ -88,15 +89,18 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant up
 });
 
 test("private board visibility is checked again after reading the blob", async () => {
-  const alice = issue(), bob = issue("bob@example.com");
+  const alice = await issue(), bob = await issue("bob@example.com");
   const [a, b] = await Promise.all([connect(alice.token, "2026-07-28"), connect(bob.token, "2026-07-28")]);
-  const team = app.repo.teams.create("private", alice.authed.user_id);
-  app.repo.teams.addMember(team.id, alice.authed.user_id);
-  app.repo.teams.addMember(team.id, bob.authed.user_id);
   const { ensureTeamBoard, onTeamJoined, onTeamLeft } = await import("../../src/server/teams.ts");
-  ensureTeamBoard(app.db, team, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, "alice@example.com");
-  onTeamJoined(app.db, app.repo, team, "bob@example.com");
+  const team = await seed(app.repo, () => {
+    const team = app.repo.teams.create("private", alice.authed.user_id);
+    app.repo.teams.addMember(team.id, alice.authed.user_id);
+    app.repo.teams.addMember(team.id, bob.authed.user_id);
+    ensureTeamBoard(app.db, team, "alice@example.com");
+    onTeamJoined(app.db, app.repo, team, "alice@example.com");
+    onTeamJoined(app.db, app.repo, team, "bob@example.com");
+    return team;
+  });
   const id = (await (await attachment(alice.token)).json() as { id: number }).id;
   expect((await a.callTool({ name: "board_post", arguments: { board: "private", body: "team file", attachment_ids: [id] } })).isError).not.toBe(true);
   expect((await b.readResource({ uri: "grayboard://boards/private" })).contents.length).toBe(1);
@@ -106,8 +110,11 @@ test("private board visibility is checked again after reading the blob", async (
   app.repo.blobs.get = async hash => { const data = await get(hash); enter(); await resumed; return data; };
   const reading = attachment(bob.token, "GET", id);
   await Promise.race([entered, reading.then(response => { throw new Error(`blob read was bypassed: ${response.status}`); })]);
-  app.repo.teams.removeMember(team.id, bob.authed.user_id);
-  onTeamLeft(app.db, app.repo, team, "bob@example.com");
+  // The download holds no write: its blob read waits outside the queue, so this body runs now.
+  await seed(app.repo, () => {
+    app.repo.teams.removeMember(team.id, bob.authed.user_id);
+    onTeamLeft(app.db, app.repo, team, "bob@example.com");
+  });
   resume();
   const response = await reading;
   expect(response.status).toBe(404);
@@ -115,7 +122,7 @@ test("private board visibility is checked again after reading the blob", async (
 });
 
 test("old API remains session-only and OAuth cannot become admin or WS credentials", async () => {
-  const alice = issue();
+  const alice = await issue();
   const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const legacy = (await login.json() as { session_token: string }).session_token;
   expect((await attachment(legacy)).status).toBe(401);
@@ -125,7 +132,7 @@ test("old API remains session-only and OAuth cannot become admin or WS credentia
     expect(response.status).toBe(401);
     await response.arrayBuffer();
   }
-  expect((await attachment(issue("alice@example.com", ["grayboard:delivery"]).token)).status).toBe(403);
+  expect((await attachment((await issue("alice@example.com", ["grayboard:delivery"])).token)).status).toBe(403);
   await connect(alice.token, "2026-07-28");
-  expect((await attachment(issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"]).token)).status).toBe(201);
+  expect((await attachment((await issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"])).token)).status).toBe(201);
 });

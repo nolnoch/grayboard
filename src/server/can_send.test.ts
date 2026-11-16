@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { canSend, canAdmin, reachesHuman, type SendTarget, type SendContext } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 const FROM = "wade@example.com/fe";
 
@@ -35,15 +36,17 @@ describe("canSend", () => {
 // #284 S12: reach is decided by the sending address's principal.
 describe("reachesHuman", () => {
   let repo: Repo;
-  beforeEach(() => {
+  beforeEach(async () => {
     repo = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
-    const wade = repo.users.upsertByEmail("wade@example.com", null);
-    const bob = repo.users.upsertByEmail("bob@example.com", null);
-    repo.users.upsertByEmail("eve@example.com", null);
-    const eng = repo.teams.create("eng", wade.id);
-    repo.teams.addMember(eng.id, wade.id);
-    repo.teams.addMember(eng.id, bob.id);
-    repo.teams.create("ops", wade.id);
+    await seed(repo, () => {
+      const wade = repo.users.upsertByEmail("wade@example.com", null);
+      const bob = repo.users.upsertByEmail("bob@example.com", null);
+      repo.users.upsertByEmail("eve@example.com", null);
+      const eng = repo.teams.create("eng", wade.id);
+      repo.teams.addMember(eng.id, wade.id);
+      repo.teams.addMember(eng.id, bob.id);
+      repo.teams.create("ops", wade.id);
+    });
   });
 
   test("a person reaches their own human and a teammate's, not a stranger's", () => {

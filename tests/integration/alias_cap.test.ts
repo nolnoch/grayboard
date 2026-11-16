@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { endSession } from "../../src/core/session_end.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 
 const ROOT = "root@example.com";
 const B = "bob@example.com";
@@ -52,7 +53,7 @@ test("a team at its cap refuses a new name by bind and by writes_as; an existing
 test("a user at the cap is refused a new identity over HTTP; the Slack human is not counted", async () => {
   expect((await srv.api(bob, "POST", "/api/identities", { name: "one" })).status).toBe(201);
   // A human row (as a Slack link makes) neither counts nor is capped.
-  srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: B, name: "human" }, B);
+  await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: B, name: "human" }, B));
   expect((await srv.api(bob, "POST", "/api/identities", { name: "two" })).status).toBe(201);
   const r = await srv.api(bob, "POST", "/api/identities", { name: "three" });
   expect(r).toMatchObject({ status: 400, body: { message: expect.stringMatching(/your scope already has 2 names.*grayboard identity rm <name>/) } });
@@ -78,7 +79,7 @@ test("a team owner or an admin deletes an unused team name, freeing a slot; a me
   await writer.connect();
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toMatchObject({ status: 409, body: { code: "alias_held" } });
   writer.close();
-  srv.app.repo.atomic(() => endSession(srv.app.db, srv.app.repo.mail, writer.id, { why: "exit", now: Date.now() }));
+  await seed(srv.app.repo, () => srv.app.repo.atomic(() => endSession(srv.app.db, srv.app.repo.mail, writer.id, { why: "exit", now: Date.now() })));
   expect(subs("eng/b").length).toBeGreaterThan(0);
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "a" })).toMatchObject({ status: 409, body: { code: "alias_held", message: expect.stringContaining(held.id) } });
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "zzz" })).toMatchObject({ status: 404 });

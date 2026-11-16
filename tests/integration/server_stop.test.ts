@@ -4,6 +4,7 @@ import { expect, spyOn, test } from "bun:test";
 
 import { verifySessionToken } from "../../src/server/auth.ts";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 
 test("stop() closes the database it opened", async () => {
   const srv = new TestServer();
@@ -57,7 +58,7 @@ test("a session's deferred last-used touch lands when the server keeps running",
   // Pin a known-past stamp after scheduling; the deferred touch overwrites it
   // with the fire-time now. (A before/after pair around the fire collides:
   // the immediate runs within the same millisecond as the snapshot.)
-  srv.app.repo.sessions.touch(authed!.session_id, 1);
+  await seed(srv.app.repo, () => srv.app.repo.sessions.touch(authed!.session_id, 1));
   await Bun.sleep(10);
   const after = (srv.app.db.query("SELECT last_used_at FROM sessions WHERE id = ?").get(authed!.session_id) as { last_used_at: number }).last_used_at;
   expect(after).toBeGreaterThan(1_000_000);
@@ -73,7 +74,7 @@ test("stopping one server leaves another live server's pending touch alone", asy
   const authedA = verifySessionToken(tokenA, a.app.repo, a.app.touches, 0)!;
   // Pin a known-past stamp after scheduling; the deferred touch overwrites it
   // with the fire-time now (the immediate cannot run mid-sync-block).
-  a.app.repo.sessions.touch(authedA.session_id, 1);
+  await seed(a.app.repo, () => a.app.repo.sessions.touch(authedA.session_id, 1));
   await b.stop();
   await Bun.sleep(10);
   const after = (a.app.db.query("SELECT last_used_at FROM sessions WHERE id = ?").get(authedA.session_id) as { last_used_at: number }).last_used_at;

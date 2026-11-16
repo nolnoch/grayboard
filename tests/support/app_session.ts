@@ -25,8 +25,10 @@ import {
   type UnbindResult,
 } from "../../src/server/application.ts";
 import type { startServer } from "../../src/server/app.ts";
+import type { Repo, Sync } from "../../src/server/db.ts";
 import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
 import type { DelegateRequest, DelegateResult, ErrorCode } from "../../src/shared/protocol.ts";
+import { seed } from "./seed.ts";
 import { until } from "./until.ts";
 
 type StartedServer = ReturnType<typeof startServer>;
@@ -59,7 +61,7 @@ export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
 export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
   const authed = verifySessionToken(token, app.repo, app.touches, 0);
   if (!authed) throw new Error("appSession: the token doesn't authenticate");
-  return new AppSession(app.application, authed, identity, opts);
+  return new AppSession(app.application, app.repo, authed, identity, opts);
 }
 
 // The ApplicationError `p` (a connect, a bind, a call) is refused with.
@@ -83,6 +85,8 @@ export class AppSession {
 
   constructor(
     private readonly application: Application,
+    // A handler that writes runs in a queued body, as hosted `run` holds the write queue around it (#807 P1b-4f).
+    private readonly repo: Pick<Repo, "write" | "atomic">,
     private readonly authed: AuthedUser,
     // The alias to bind after connecting; null stays an unbound session.
     private readonly identity: string | null,
@@ -93,6 +97,35 @@ export class AppSession {
 
   private get label(): string {
     return this.identity ?? (this.id || "unbound");
+  }
+
+  // fn, a handler on `session`, in one queued transaction, as hosted `run` runs a tool: a refusal's rows (the
+  // session's `afterRollback`) are written after the rollback, in a body of their own. As Slack's inWrite does, the
+  // collector is set and cleared inside the synchronous body, so overlapping calls on one session can't leave it
+  // pointing at another call's.
+  private async write<T>(session: ApplicationSession, fn: () => Sync<T>): Promise<Awaited<T>> {
+    const rows: Array<() => void> = [];
+    try {
+      return await seed(this.repo, () => {
+        rows.length = 0;
+        session.afterRollback = (w) => { rows.push(w); };
+        try { return fn(); } finally { session.afterRollback = undefined; }
+      });
+    } catch (e) {
+      await this.flushRefusal(rows);
+      throw e;
+    }
+  }
+
+  // A refusal's rows in a body of their own, each in its own savepoint, as hosted's flushQueued writes them: one that
+  // fails is logged and the rest still land, so the caller's ApplicationError is what it rethrows.
+  private async flushRefusal(rows: Array<() => void>): Promise<void> {
+    if (!rows.length) return;
+    await seed(this.repo, () => {
+      for (const w of rows) {
+        try { this.repo.atomic(w); } catch (failure) { console.error("[app_session] refusal row failed:", failure); }
+      }
+    }).catch(failure => console.error("[app_session] refusal rows failed:", failure));
   }
 
   // The sink a hosted session has, with events in place of a stream.
@@ -143,12 +176,19 @@ export class AppSession {
     const toolsOnly = this.opts.push === false && this.opts.hold !== true;
     const id = idAddress(this.key);
     let info: IdentityInfo;
+    // A refusal's rows, written after its rollback, as hosted registration hands them to `later` (#807 P1b-4f).
+    const rows: Array<() => void> = [], later = (w: () => void) => { rows.push(w); };
     try {
-      const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
-      this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
-      if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
-      ({ session: this.session, info } = this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false));
+      ({ session: this.session, info } = await seed(this.repo, () => {
+        const writesAs = toolsOnly && this.identity !== null
+          ? this.application.hostedWritesAs(this.authed, id, this.identity, true, (address, detail) => later(() => this.application.hostedRefused(id, address, detail)), later)
+          : null;
+        this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs, why => later(() => this.application.hostedCollided(this.authed, id, why)));
+        if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
+        return this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
+      }));
     } catch (e) {
+      await this.flushRefusal(rows);
       this.drop(`connect refused: ${(e as Error).message}`);
       throw e;
     }
@@ -162,7 +202,7 @@ export class AppSession {
   // session a writer, as a rebuilt hosted session is.
   async bind(alias: string, extra: { create?: boolean; meta?: unknown } = {}): Promise<BindResult> {
     const session = this.live();
-    const ok = this.application.bindNow(session, { alias, ...extra } as Parameters<Application["bindNow"]>[1]);
+    const ok = await this.write(session, () => this.application.bindNow(session, { alias, ...extra } as Parameters<Application["bindNow"]>[1]));
     if (session.readOnly) {
       session.readOnly = false;
       session.writerId = this.id;
@@ -172,7 +212,8 @@ export class AppSession {
   }
 
   async unbind(alias: string): Promise<UnbindResult> {
-    return this.application.unbind(this.live(), alias);
+    const session = this.live();
+    return this.write(session, () => this.application.unbind(session, alias));
   }
 
   async send(
@@ -180,11 +221,13 @@ export class AppSession {
     body: string,
     opts: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
   ): Promise<SendResult> {
-    return this.application.send(this.live(), recipient, body, opts);
+    const session = this.live();
+    return this.write(session, () => this.application.send(session, recipient, body, opts));
   }
 
   async delegate(req: Omit<DelegateRequest, "type" | "req_id">): Promise<DelegateResult> {
-    return this.application.delegate(this.live(), req);
+    const session = this.live();
+    return this.write(session, () => this.application.delegate(session, req));
   }
 
   async history(opts: { peer?: string; limit?: number; before_id?: number } = {}): Promise<HistoryMessage[]> {
@@ -210,24 +253,28 @@ export class AppSession {
   async call<T = unknown>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
     const session = this.live();
     const { promise, resolve } = Promise.withResolvers<T>();
-    this.application.call(session, tool, args, (result) => resolve(result as T));
+    await this.write(session, () => { this.application.call(session, tool, args, (result) => resolve(result as T)); });
     return promise;
   }
 
   async ack(ids: number[]): Promise<void> {
-    this.application.receiptDirect(this.live(), ids);
+    const session = this.live();
+    await this.write(session, () => { this.application.receiptDirect(session, ids); });
   }
 
   async boardAck(refs: PendingRef[]): Promise<void> {
-    this.application.receiptBoards(this.live(), refs);
+    const session = this.live();
+    await this.write(session, () => { this.application.receiptBoards(session, refs); });
   }
 
   async dmAck(id: number): Promise<void> {
-    this.application.acknowledgeDm(this.live(), id);
+    const session = this.live();
+    await this.write(session, () => { this.application.acknowledgeDm(session, id); });
   }
 
   async retract(id: number): Promise<{ note?: string }> {
-    return this.application.retract(this.live(), id);
+    const session = this.live();
+    return this.write(session, () => this.application.retract(session, id));
   }
 
   // The first event matching pred, taken from those already here or the

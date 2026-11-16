@@ -814,7 +814,7 @@ test("a delivery lock that couldn't be opened is retried by the next tool call: 
 // the run loop takes waits in admit until the shutdown.
 test("a shutdown while an admit waits for `initialized` records no pause", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
-  const { token } = issueOAuth(srv.app.repo, srv.resource, EMAIL, ["grayboard:delivery", "grayboard:tools"], Date.now(), CLIENT_ID);
+  const { token } = await issueOAuth(srv.app.repo, srv.resource, EMAIL, ["grayboard:delivery", "grayboard:tools"], Date.now(), CLIENT_ID);
   const proxy = new ToolProxy({
     wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT_ID, version: "1.0.0" }, delivery: { mode: "poll", source: SOURCE } },
     harness: "Claude Code", loginAction: "log in", auth: { token: async () => token }, report: () => {},

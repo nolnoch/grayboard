@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 const options = (delivery: unknown = { mode: "push", source: "grayboard-pi" }): WireOptions =>
   ({ url: `${srv.base}/mcp`, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-pi", version: "1.0.0" }, delivery: delivery as WireOptions["delivery"] });
-const issue = (scopes = ["grayboard:tools", "grayboard:delivery"]) => issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", scopes, Date.now(), CLIENT).token;
+const issue = async (scopes = ["grayboard:tools", "grayboard:delivery"]) => (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", scopes, Date.now(), CLIENT)).token;
 function subscriber(token: string, wireOptions = options()) {
   const wire = new Wire(wireOptions, { token: async () => token }, new AbortController().signal, "raw-root");
   wires.push(wire);
@@ -37,7 +37,7 @@ test("the wire's delivery key is the one the server reads", () => {
 
 // Pins that the 2026-07-28 stream isn't held back like the legacy GET (#431).
 test("subscriptions/listen acknowledges the leased inbox within 1 s", async () => {
-  const wire = subscriber(issue());
+  const wire = subscriber(await issue());
   await wire.connect();
   await wire.call("bind", { name: "be", create: true });
   wire.capability = (await wire.call("delivery_open") as { capability: string }).capability;
@@ -51,7 +51,7 @@ test("subscriptions/listen acknowledges the leased inbox within 1 s", async () =
 // The SDK reports a 400 at initialize only as "Version negotiation failed".
 // The server checks the declaration on the native role only.
 test("a refusal at initialize surfaces the server's HTTP status and body", async () => {
-  const token = issue();
+  const token = await issue();
   const wire = new NativeWire(options({ mode: "shout", source: "grayboard-pi" }), { token: async () => token }, new AbortController().signal, "raw-root");
   wires.push(wire);
   const error = await wire.connect().then(() => undefined, e => e);
@@ -74,7 +74,7 @@ test("a token without the tools scope is a scope refusal, never a refresh", asyn
 // OpenCode's native client starts a root's ownership with no plugin `_meta`; the plugin's subscriber wire declares
 // the launcher on a later request, and that turns the ownership's flag on (#520).
 test("a root's later subscriber request declares the launcher its native first request didn't", async () => {
-  const token = issue();
+  const token = await issue();
   const native = new NativeWire(options(), { token: async () => token }, new AbortController().signal, "raw-root");
   wires.push(native);
   await native.connect();
@@ -91,7 +91,7 @@ test("a root's later subscriber request declares the launcher its native first r
 // sessions, sends each call's own session's facts; a change reaches the server on the next request; a provider that
 // throws or answers nothing sends no keys, which never clears what the server holds.
 test("each request carries its session's current model and effort, and a provider that fails sends none (#364)", async () => {
-  const token = issue();
+  const token = await issue();
   const facts = new Map<string, { model?: string | null; effort?: string | null }>([["raw-a", { model: "anthropic/claude-opus-5-5", effort: "high" }], ["raw-b", { model: "openai/gpt-6" }]]);
   let broken = false;
   const native = new NativeWire({ ...options(), facts: id => { if (broken) throw new Error("gone"); return facts.get(id); } }, { token: async () => token }, new AbortController().signal);
@@ -134,7 +134,7 @@ test("each request carries its session's current model and effort, and a provide
 // The suggested name rides every request of the session it names (#522): the subscriber wire's first request fixes the
 // ownership's, so a native request that never names a suggestion still sees it offered; a provider that throws sends none.
 test("a wire's suggested name reaches the server and is offered first while unbound (#522)", async () => {
-  const token = issue();
+  const token = await issue();
   const native = new NativeWire({ ...options(), suggested: id => { if (id === "raw-x") throw new Error("gone"); return id === "raw-s" ? "repo-name" : undefined; } }, { token: async () => token }, new AbortController().signal);
   wires.push(native);
   await native.connect();
@@ -164,7 +164,7 @@ test("server-supplied error text is capped at connect and on a call", async () =
     return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
   } });
   try {
-    const token = issue();
+    const token = await issue();
     const proxied = { ...options(), url: `http://127.0.0.1:${proxy.port}/mcp` };
     const wire = new NativeWire(proxied, { token: async () => token }, new AbortController().signal, "raw-root");
     wires.push(wire);

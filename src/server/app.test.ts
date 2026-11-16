@@ -14,6 +14,7 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 const hostname = "127.0.0.1";
 
@@ -50,7 +51,7 @@ const restartConfig = (dir: string) => ({ dbPath: join(dir, "bus.db"), blobDir: 
 
 // A bound root with a child and an open delivery lease on a real server.
 async function leasedRoot(app: ReturnType<typeof startServer>) {
-  const issued = issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   const principal = app.oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${issued.token}` } }));
   if (principal instanceof Response) throw new Error("fixture unauthorized");
   const context = sessionContext(principal, { [OPENCODE_SESSION_META]: "root" });
@@ -287,7 +288,8 @@ test("a server started without dev auth revokes dev sign-in tokens for good", as
     expect(login.status).toBe(200);
     const dev = (await login.json() as { session_token: string }).session_token;
     const real = mintToken();
-    app.repo.sessions.create(app.repo.users.upsertByEmail("them@example.com", null).id, hashToken(real), "grayboard/1.0");
+    const repo = app.repo;
+    await seed(repo, () => repo.sessions.create(repo.users.upsertByEmail("them@example.com", null).id, hashToken(real), "grayboard/1.0"));
     expect(await whoami(dev)).toBe(200);
     await app.stop(); app = undefined;
 

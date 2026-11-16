@@ -7,6 +7,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import { board, direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -59,8 +60,9 @@ test("the user's own human is not marked; another user's human is", async () => 
   const abe = await srv.hosted(A, "be");
   const own = await human(A);
   const other = await human(B);
-  srv.app.application.send(own, `${A}/be`, "own human");
-  srv.app.application.send(other, `${A}/be`, "bob's human");
+  // In a queued body each, as the Slack bridge sends.
+  await seed(srv.app.repo, () => srv.app.application.send(own, `${A}/be`, "own human"));
+  await seed(srv.app.repo, () => srv.app.application.send(other, `${A}/be`, "bob's human"));
   expect(marked((await abe.next(dm("own human"))).event)).toBeUndefined();
   expect(marked((await abe.next(dm("bob's human"))).event)).toBe(true);
   srv.app.application.close(own);

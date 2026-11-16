@@ -53,7 +53,7 @@ const mcpList = (srv: TestServer, token: string, from: string) =>
       params: { _meta: { [PROTOCOL_VERSION_META_KEY]: "2026-07-28", [CLIENT_INFO_META_KEY]: { name: "fixture", version: "1" }, [CLIENT_CAPABILITIES_META_KEY]: {} } },
     }),
   });
-const hostedToken = (srv: TestServer) => issueOAuth(srv.app.repo, srv.app.oauth.resource, A, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT).token;
+const hostedToken = async (srv: TestServer) => (await issueOAuth(srv.app.repo, srv.app.oauth.resource, A, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT)).token;
 const audit = (srv: TestServer, action: string) => accessAudits(srv.app.db, action);
 
 const X = "198.51.100.1";
@@ -76,7 +76,7 @@ test("burst refused tokens on a route are refused 401; the next gets 429 with a 
 test("a limited address is refused everything, a valid token, /healthz and the hosted MCP too; another address isn't", async () => {
   const { srv } = serve();
   const alice = await srv.login(A);
-  const hosted = hostedToken(srv);
+  const hosted = await hostedToken(srv);
   for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", `bad${i}`, X);
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(429);
   expect((await get(srv, "/healthz", null, X)).status).toBe(429);
@@ -88,7 +88,7 @@ test("a limited address is refused everything, a valid token, /healthz and the h
 test("valid traffic, hosted MCP included, 403s, 404s and requests with no token never spend; a refused token on any path does", async () => {
   const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
   const alice = await srv.login(A);
-  const hosted = hostedToken(srv);
+  const hosted = await hostedToken(srv);
   for (let i = 0; i < 5; i++) {
     expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
     expect((await mcpList(srv, hosted, X)).status).toBe(200);

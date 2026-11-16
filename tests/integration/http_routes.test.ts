@@ -7,6 +7,7 @@ import pkg from "../../package.json" with { type: "json" };
 import type { Config } from "../../src/server/config.ts";
 import { ROOT } from "../support/paths.ts";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 import { GOOGLE_ISSUER } from "../../src/server/idp_google.ts";
 
 const SERVER = join(ROOT, "src/server/main.ts");
@@ -31,7 +32,7 @@ const api = (token: string, method: string, path: string, body?: unknown) => srv
 // #284 decision 5 (audit W8): a team can't take another principal's name.
 test("team create on another principal's name is a 409, and no team or board is made", async () => {
   const alice = await login("alice@example.com");
-  srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
+  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run());
   const r = await api(alice, "POST", "/api/teams", { name: "ingest" });
   expect(r.status).toBe(409);
   expect(JSON.stringify(r.body)).toContain("ingest");
@@ -168,7 +169,7 @@ test("a team from before roles: its creator owns it, per row", async () => {
     await api(alice, "POST", "/api/teams", { name });
     await api(alice, "POST", `/api/teams/${name}/add`, { email: "bob@example.com" });
   }
-  srv.app.db.run("UPDATE team_members SET role = NULL");
+  await seed(srv.app.repo, () => { srv.app.db.run("UPDATE team_members SET role = NULL"); });
 
   expect((await api(bob, "POST", "/api/teams/eng/add", { email: "carol@example.com" })).status).toBe(403);
   expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" })).status).toBe(200);
@@ -177,7 +178,7 @@ test("a team from before roles: its creator owns it, per row", async () => {
 
   // ops: the creator left before roles; nobody owns it, so bob can't manage
   // it, and leaving isn't guarded; an admin can.
-  srv.app.db.run("DELETE FROM team_members WHERE team_id = (SELECT id FROM teams WHERE name = 'ops') AND user_id = (SELECT id FROM users WHERE email = 'alice@example.com')");
+  await seed(srv.app.repo, () => { srv.app.db.run("DELETE FROM team_members WHERE team_id = (SELECT id FROM teams WHERE name = 'ops') AND user_id = (SELECT id FROM users WHERE email = 'alice@example.com')"); });
   expect((await api(bob, "POST", "/api/teams/ops/add", { email: "carol@example.com" })).status).toBe(403);
   expect((await api(root, "POST", "/api/teams/ops/add", { email: "carol@example.com", role: "owner" })).status).toBe(200);
   expect((await api(carol, "POST", "/api/teams/ops/remove", { email: "bob@example.com" })).status).toBe(200);
@@ -205,12 +206,13 @@ test("admin unlink-idp clears a user's IdP issuer and subject and audits them", 
   await restart({ admins: ["root@example.com"] });
   const root = await login("root@example.com");
   const okta = "https://example.okta.com";
-  expect(srv.app.repo.users.signIn(GOOGLE_ISSUER, "google-bob", "bob@example.com", null).status).toBe("ok");
-  expect(srv.app.repo.users.signIn(GOOGLE_ISSUER, "google-new", "bob@example.com", null).status).toBe("subject_mismatch");
-  expect(srv.app.repo.users.signIn(okta, "okta-bob", "bob@example.com", null).status).toBe("issuer_mismatch");
+  const signIn = (issuer: string, subject: string) => seed(srv.app.repo, () => srv.app.repo.users.signIn(issuer, subject, "bob@example.com", null));
+  expect((await signIn(GOOGLE_ISSUER, "google-bob")).status).toBe("ok");
+  expect((await signIn(GOOGLE_ISSUER, "google-new")).status).toBe("subject_mismatch");
+  expect((await signIn(okta, "okta-bob")).status).toBe("issuer_mismatch");
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "Bob@Example.com" })).status).toBe(200);
   expect(srv.app.repo.users.findByEmail("bob@example.com")).toMatchObject({ idp_issuer: null, idp_subject: null });
-  expect(srv.app.repo.users.signIn(okta, "okta-bob", "bob@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { idp_issuer: okta } });
+  expect(await signIn(okta, "okta-bob")).toMatchObject({ status: "ok", linked: true, user: { idp_issuer: okta } });
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "nobody@example.com" })).status).toBe(404);
   expect(srv.app.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'auth.subject_cleared'").all())
     .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: JSON.stringify({ had_subject: true, provider: "google", issuer: GOOGLE_ISSUER }) }]);
@@ -223,7 +225,7 @@ test("a CLI token idle past cliTokenIdleDays is refused; a fresh sign-in works",
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(200);
   // The request's last-used touch runs on a later setImmediate (TouchQueue); let it land first, or it overwrites the backdate.
   await new Promise((resolve) => setImmediate(resolve));
-  srv.app.db.run(`UPDATE sessions SET last_used_at = ?`, [Date.now() - 2 * 86_400_000]);
+  await seed(srv.app.repo, () => srv.app.db.run(`UPDATE sessions SET last_used_at = ?`, [Date.now() - 2 * 86_400_000]));
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
   expect((await api(await login("bob@example.com"), "GET", "/api/whoami")).status).toBe(200);
 });

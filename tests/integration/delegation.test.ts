@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
+import { seed } from "../support/seed.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
@@ -470,7 +471,7 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     // A refusal never masquerades as a request: with the human's alias
     // row gone (a broken unlink's state), the send is refused — and the
     // audit says refused, with no id-less requested row beside it.
-    srv.app.db.exec(`DELETE FROM aliases WHERE name = 'human'`);
+    await seed(srv.app.repo, () => { srv.app.db.exec(`DELETE FROM aliases WHERE name = 'human'`); });
     await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
     const after = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
     expect(after.filter((a) => a.action === "delegation.requested")).toHaveLength(1);

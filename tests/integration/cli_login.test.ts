@@ -78,7 +78,7 @@ test("a denied consent fails the login and writes no credentials", async () => {
 // server's reason, rather than waiting out its five minutes; the browser tab only says the sign-in didn't complete.
 test("a refusal at the provider callback reaches the CLI, which exits promptly with the reason", async () => {
   await srv.app.repo.write(() => srv.app.repo.users.upsertByEmail(EMAIL, null));
-  srv.app.db.run("UPDATE users SET disabled_at = ? WHERE email = ?", [Date.now(), EMAIL]);
+  await srv.app.repo.write(() => srv.app.db.run("UPDATE users SET disabled_at = ? WHERE email = ?", [Date.now(), EMAIL]));
   const started = Date.now();
   const login = runCli(["login", "--server", srv.issuer], { env, timeoutMs: 30_000 });
   await until(() => existsSync(opened), 20_000, "the CLI to open the authorize URL");
