@@ -6,7 +6,7 @@ invariants: the SDK speaks only modern MCP (`2026-07-28`) as raw JSON-RPC over H
 code-pointers: sdk/rust/grayboard/src/ (transport.rs, session.rs, envelope.rs, credential.rs), sdk/rust/schema/, scripts/record_rust_fixtures.ts, scripts/snapshot_native_tools.ts, scripts/e2e.sh (rust-sdk), tests/integration/rust_sdk.test.ts, rust_fixtures.test.ts, rust_sdk_version.test.ts, adapters/hosted-core/src/wire.ts, adapters/hosted-core/src/controller.ts (the lease protocol D6 ports), tests/conformance/driver.ts
 companions: ../server-hosted-mcp.md §2 (the as-built transport and its fixtures), service-principals.md (#270: the credential and run tokens step 6 consumes), ../vision.md (principles 2, 3, 10, 12, 14), ../parity.md
 trigger: in progress under #929; steps 3 to 5 need no trigger, step 6 waits on #270's token route
-last-verified: 2026-11-16 (origin/master 72ce9d68)
+last-verified: 2026-11-16 (origin/master 11dec52b)
 ```
 
 ## Problem
