@@ -933,7 +933,8 @@ async fn requests_match_the_reference_clients_recording() {
     };
     s.discover().await.unwrap();
     took("native_discover");
-    s.call_raw("bind", json!({"name": "fixture-w1", "create": true}))
+    // The bare native call: `call_raw("bind")` adds the bind rule's subscriber whoami, which isn't this operation.
+    s.native_call("bind", json!({"name": "fixture-w1", "create": true}))
         .await
         .unwrap();
     took("native_call");

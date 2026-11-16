@@ -1,4 +1,4 @@
-//! The delivery stream's rules (#929 D6), one test per row, against a stateful scripted bus on the fake endpoint.
+//! The delivery stream's rules (#929; the table in `docs/sdk-rust.md` §2), one test per row, against a stateful scripted bus on the fake endpoint.
 
 use crate::tests::{Fake, Reply, Req, event, fast, hint};
 use crate::transport::Timeouts;
@@ -28,6 +28,7 @@ struct Call {
     op: String,
     lease: Option<String>,
     args: Value,
+    at: std::time::Instant,
 }
 
 /// A small model of the server's lease protocol: holds, ownership, bind generation, one lease, pending items.
@@ -42,6 +43,8 @@ struct Bus {
     alias_lost: Vec<String>,
     /// The next N renews are refused `not_found` (a lost lease).
     renew_refusals: u32,
+    /// A held-open native response: its request ID and the stream to answer it on.
+    parked: Option<(Value, mpsc::UnboundedSender<Vec<u8>>)>,
     script: HashMap<String, VecDeque<Script>>,
     streams: Vec<mpsc::UnboundedSender<Vec<u8>>>,
     log: Vec<Call>,
@@ -142,6 +145,7 @@ impl Bus {
                     op: "cancel".into(),
                     lease: req.headers.get("x-grayboard-lease").cloned(),
                     args: Value::Null,
+                    at: std::time::Instant::now(),
                 });
                 return Reply::status(202, "");
             }
@@ -151,6 +155,7 @@ impl Bus {
             op: op.clone(),
             lease: req.headers.get("x-grayboard-lease").cloned(),
             args: req.body["params"]["arguments"].clone(),
+            at: std::time::Instant::now(),
         });
         if let Some(script) = self.script.get_mut(&op).and_then(VecDeque::pop_front) {
             return script(req, self);
@@ -431,7 +436,7 @@ async fn open_stops_when_the_holds_changed_without_a_bind_through_the_session() 
     assert_eq!(w.count("sub:delivery_open"), 1);
 }
 
-// Row: whoami reports alias_lost: drop those holds; if none remain, stop with AliasLost.
+// Row: whoami reports alias_lost: drop those holds; if none remain, stop (alias_lost).
 #[tokio::test]
 async fn alias_lost_drops_the_lost_holds_and_stops_when_none_remain() {
     let w = World::start(Bus::new(&["a", "b"])).await;
@@ -571,9 +576,6 @@ async fn hints_mark_the_inbox_dirty_and_a_full_page_reads_again() {
     assert_eq!(got.last().unwrap(), "direct:101");
     // One read for the first page, one because it was full; no hint, no renew.
     assert_eq!(w.count("read"), 2);
-    for read in w.bus().log.iter().filter(|c| c.op == "read") {
-        let _ = read;
-    }
     let reads: Vec<Value> = w
         ._fake
         .requests()
@@ -597,10 +599,11 @@ async fn hints_mark_the_inbox_dirty_and_a_full_page_reads_again() {
 
 // Row: per item, in order: check ownership/bind_gen/address, delivery_renew, hand over, renew in the background until receipt(), then delivery_receipt({ ids: [id] }).
 #[tokio::test]
-async fn each_item_is_renewed_before_hand_over_renewed_while_out_and_receipted_by_id() {
+async fn each_item_is_renewed_before_hand_over_and_receipted_by_id() {
     let mut bus = Bus::new(&["a"]);
     bus.direct(1);
-    let w = World::with(bus, |t| t.renew = Duration::from_millis(25)).await;
+    // A renew interval far beyond the test, so the only renew is the one before the hand-over.
+    let w = World::with(bus, |t| t.renew = Duration::from_secs(60)).await;
     let mut stream = w.s().deliveries();
     let d = next(&mut stream).await.unwrap();
     let ops = w.ops();
@@ -610,17 +613,26 @@ async fn each_item_is_renewed_before_hand_over_renewed_while_out_and_receipted_b
         ["sub:delivery_renew"],
         "renewed, then handed over"
     );
-    // Out and not receipted: background renews keep the lease, and nothing reads the inbox meanwhile.
-    w.until("three renews while out", |b| {
-        ops_count(b, "sub:delivery_renew") >= 4
-    })
-    .await;
-    assert_eq!(w.count("read"), 1);
     assert_eq!(d.id, "direct:1");
     d.receipt().await.unwrap();
     let receipts = w.calls("sub:delivery_receipt");
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].args, json!({"ids": ["direct:1"]}));
+}
+
+#[tokio::test]
+async fn an_item_out_is_renewed_in_the_background_without_reading_the_inbox() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    let w = World::with(bus, |t| t.renew = Duration::from_millis(25)).await;
+    let mut stream = w.s().deliveries();
+    let d = next(&mut stream).await.unwrap();
+    w.until("three renews while out", |b| {
+        ops_count(b, "sub:delivery_renew") >= 4
+    })
+    .await;
+    assert_eq!(w.count("read"), 1);
+    d.receipt().await.unwrap();
 }
 
 #[tokio::test]
@@ -775,9 +787,9 @@ async fn a_lease_lost_while_an_item_is_out_keeps_its_handle_under_the_same_key()
     let w = World::with(bus, |t| t.renew = Duration::from_millis(10)).await;
     let mut stream = w.s().deliveries();
     let d = next(&mut stream).await.unwrap();
-    // Five losses while out: more than the three a reopen tolerates outside an item.
-    w.bus().renew_refusals = 5;
-    w.until("five losses and a healthy lease", |b| {
+    // Three losses while out, the most a reopen tolerates without a healthy renew.
+    w.bus().renew_refusals = 3;
+    w.until("three losses and a healthy lease", |b| {
         b.renew_refusals == 0
             && b.opens >= 4
             && b.log.last().is_some_and(|c| c.op == "sub:delivery_renew")
@@ -808,7 +820,13 @@ async fn a_reopen_under_another_bind_generation_loses_the_handle_and_shows_the_i
     let again = next(&mut stream).await.unwrap();
     assert_eq!(again.id, "direct:1");
     assert_eq!(again.stable_id, first.stable_id);
-    assert!(matches!(first.receipt().await, Err(Error::DeliveryLost(_))));
+    match first.receipt().await {
+        Err(Error::DeliveryLost(why)) => assert!(
+            why.contains("another ownership or bind generation"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
     again.receipt().await.unwrap();
     assert_eq!(w.count("sub:delivery_receipt"), 1);
 }
@@ -1058,4 +1076,325 @@ async fn trust_marks_come_from_the_message_or_the_post() {
     d.receipt().await.unwrap();
     let d = next(&mut stream).await.unwrap();
     assert_eq!(marks(&d), (false, false, false, true));
+}
+
+fn lost_reason(r: Result<(), Error>) -> String {
+    match r {
+        Err(Error::DeliveryLost(why)) => why,
+        other => panic!("expected DeliveryLost, got {other:?}"),
+    }
+}
+
+fn unbound_result(req: &Req) -> Reply {
+    Reply::result(
+        req,
+        json!({"content": [{"type": "text", "text": "{\"unbound\":true}"}]}),
+    )
+}
+
+fn bad_leases(w: &World, n: usize) {
+    for _ in 0..n {
+        w.bus().on("sub:delivery_open", |req, b| {
+            value(
+                req,
+                json!({"capability": "short", "identity": {"user_email": EMAIL, "identity_full": b.held[0]}, "ownership": 1, "bind_gen": 1, "expiresAt": 1.0e13}),
+            )
+        });
+    }
+}
+
+// Audit A: a bind with no stream running (this one stopped, and the server since ended the session) is what the next stream holds.
+#[tokio::test]
+async fn a_bind_between_streams_is_what_the_next_stream_holds() {
+    let w = World::start(Bus::new(&["a"])).await;
+    bad_leases(&w, 2);
+    let mut stream = w.s().deliveries();
+    assert_eq!(stopped(next(&mut stream).await).0, "identity");
+    // The task is gone once the stream ends: nothing pauses, so only the bind rule itself can refresh the holds.
+    ended(&mut stream).await;
+    {
+        let mut b = w.bus();
+        b.held.clear();
+        b.ownership += 1;
+    }
+    w.s().bind("b", true).await.unwrap();
+    let _again = w.s().deliveries();
+    w.until("the second stream listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    // Opened holding b alone, with nothing rebound.
+    assert_eq!(w.count("sub:bind"), 0);
+    assert_eq!(w.bus().held, vec![addr("b")]);
+}
+
+// Audit A: an unbind after a terminal stop isn't undone by the next stream, which idles with nothing held until a bind.
+#[tokio::test]
+async fn an_unbind_between_streams_is_not_undone_and_the_next_stream_idles_until_a_bind() {
+    let w = World::start(Bus::new(&["a"])).await;
+    for _ in 0..2 {
+        w.bus().on("sub:delivery_open", |req, b| {
+            value(
+                req,
+                json!({"capability": "short", "identity": {"user_email": EMAIL, "identity_full": b.held[0]}, "ownership": 1, "bind_gen": 1, "expiresAt": 1.0e13}),
+            )
+        });
+    }
+    let mut stream = w.s().deliveries();
+    assert_eq!(stopped(next(&mut stream).await).0, "identity");
+    w.s()
+        .call_raw("unbind", json!({"name": "a"}))
+        .await
+        .unwrap();
+    let whoamis = w.count("sub:whoami");
+    let _idle = w.s().deliveries();
+    w.until("the idle stream's whoami", |b| {
+        ops_count(b, "sub:whoami") == whoamis + 1
+    })
+    .await;
+    // Room for a wrong rebind of a to show up before the bind of c pauses the stream; nothing observable marks the task idle.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    w.s().bind("c", true).await.unwrap();
+    w.until("the stream opens after the bind", |b| {
+        ops_count(b, "listen") == 1
+    })
+    .await;
+    // Never rebinds the released a; the bind of c came through the session.
+    assert_eq!(w.count("sub:bind"), 0);
+    assert_eq!(w.bus().held, vec![addr("c")]);
+}
+
+// Audit B(1): unbinding the last hold with an item out gives the handle up with that reason; a bind shows the item again.
+#[tokio::test]
+async fn unbinding_the_last_hold_with_an_item_out_loses_its_handle() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    let w = World::start(bus).await;
+    let mut stream = w.s().deliveries();
+    let d = next(&mut stream).await.unwrap();
+    w.s()
+        .call_raw("unbind", json!({"name": "a"}))
+        .await
+        .unwrap();
+    let why = tokio::time::timeout(Duration::from_secs(5), d.receipt())
+        .await
+        .expect("receipt() resolves while idle");
+    assert!(lost_reason(why).contains("unbound"));
+    w.s().bind("a", false).await.unwrap();
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+}
+
+// Audit B(2): a dropped Session ends a stream idling with nothing held.
+#[tokio::test]
+async fn dropping_the_session_ends_an_idle_stream() {
+    let mut w = World::start(Bus::new(&[])).await;
+    let mut stream = w.s().deliveries();
+    w.until("the idle stream's whoami", |b| {
+        ops_count(b, "sub:whoami") == 1
+    })
+    .await;
+    drop(w.session.take());
+    ended(&mut stream).await;
+}
+
+// Audit C: an unbound result on a concurrent native call during a bind waits for the bind's resume, instead of reopening on holds the session hasn't refreshed yet.
+#[tokio::test]
+async fn a_restart_during_a_bind_waits_for_the_resume() {
+    let w = World::start(Bus::new(&["a"])).await;
+    let _stream = w.s().deliveries();
+    w.until("the first read", |b| ops_count(b, "read") == 1)
+        .await;
+    w.bus().on("native:bind", |req, b| {
+        let name = req.body["params"]["arguments"]["name"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        b.bind(&name);
+        let (tx, rx) = mpsc::unbounded_channel();
+        b.parked = Some((req.id(), tx));
+        Reply::live(vec![], rx)
+    });
+    w.bus()
+        .on("native:board_read", |req, _| unbound_result(req));
+    let poke = async {
+        w.until("the bind is held open", |b| b.parked.is_some())
+            .await;
+        w.s().call_raw("board_read", json!({})).await.unwrap();
+        let (id, tx) = w.bus().parked.take().unwrap();
+        tx.send(
+            event(json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": "bound"}], "structuredContent": {"name": "b", "instructions": [], "ownership": 1}}}))
+                .into_bytes(),
+        )
+        .unwrap();
+    };
+    let (bound, ()) = tokio::join!(w.s().bind("b", true), poke);
+    bound.unwrap();
+    w.until("the stream reopens under a and b", |b| {
+        ops_count(b, "listen") == 2
+    })
+    .await;
+    assert_eq!(w.bus().held, vec![addr("a"), addr("b")]);
+}
+
+// Audit D: lease losses with an item out are bounded too; the stream stops naming the item and the handle is lost.
+#[tokio::test]
+async fn lease_losses_with_an_item_out_stop_the_stream() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    let w = World::with(bus, |t| t.renew = Duration::from_millis(10)).await;
+    let mut stream = w.s().deliveries();
+    let d = next(&mut stream).await.unwrap();
+    w.bus().renew_refusals = 1000;
+    assert_eq!(
+        stopped(next(&mut stream).await),
+        ("lease_lost", Some("direct:1".into()))
+    );
+    assert!(lost_reason(d.receipt().await).contains("stopped"));
+}
+
+// Audit E: not_found on delivery_open is a lost lease (recoveries, 3), not a failure (8).
+#[tokio::test]
+async fn a_lease_refusal_on_delivery_open_spends_recoveries() {
+    let w = World::start(Bus::new(&["a"])).await;
+    for _ in 0..20 {
+        w.bus()
+            .on("sub:delivery_open", |req, _| refusal(req, "not_found"));
+    }
+    let mut stream = w.s().deliveries();
+    assert_eq!(stopped(next(&mut stream).await).0, "lease_lost");
+    assert_eq!(w.count("sub:delivery_open"), 4);
+}
+
+// Audit F: an invalid whoami (a child session) stops at once.
+#[tokio::test]
+async fn a_child_session_whoami_stops_at_once() {
+    let w = World::start(Bus::new(&["a"])).await;
+    for _ in 0..20 {
+        w.bus().on("sub:whoami", |req, b| {
+            let mut v = b.whoami();
+            v["child"] = json!(true);
+            value(req, v)
+        });
+    }
+    let mut stream = w.s().deliveries();
+    assert!(matches!(
+        next(&mut stream).await,
+        Err(Error::InvalidResponse(_))
+    ));
+    ended(&mut stream).await;
+    assert_eq!(w.count("sub:whoami"), 1);
+}
+
+// Audit G: a re-read whose full page doesn't show the accepted item can't conclude its receipt landed: the handle goes, no receipt is claimed, and the page's items are kept.
+#[tokio::test]
+async fn a_full_page_without_the_item_does_not_claim_its_receipt() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    bus.on("sub:delivery_receipt", |_, b| {
+        b.close_streams();
+        Reply::status(503, "gateway")
+    });
+    let w = World::start(bus).await;
+    let mut stream = w.s().deliveries();
+    let d = next(&mut stream).await.unwrap();
+    w.bus().on("read", |req, b| {
+        let items: Vec<Value> = (1000..1100)
+            .map(|n| json!({"id": format!("push:{n}"), "actionable": true, "event": {"kind": "board", "item": {"kind": "push", "post": {"id": n}}}, "ownership": b.ownership, "bind_gen": b.bind_gen}))
+            .collect();
+        let text = json!({"items": items}).to_string();
+        Reply::result(req, json!({"contents": [{"uri": INBOX, "text": text}]}))
+    });
+    let why = tokio::time::timeout(Duration::from_secs(5), d.receipt())
+        .await
+        .expect("receipt() resolves");
+    assert!(lost_reason(why).contains("could not confirm"));
+    assert_eq!(w.count("sub:delivery_receipt"), 1);
+    assert_eq!(next(&mut stream).await.unwrap().id, "push:1000");
+}
+
+// Audit H: the terminal error survives control messages that arrive while the one-slot channel is full.
+#[tokio::test]
+async fn the_terminal_error_survives_restarts_while_the_channel_is_full() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    let w = World::start(bus).await;
+    let mut stream = w.s().deliveries();
+    // Handed over into the slot, not taken.
+    w.until("the hand-over renew", |b| {
+        ops_count(b, "sub:delivery_renew") == 1
+    })
+    .await;
+    {
+        let mut b = w.bus();
+        b.held.push(addr("other"));
+        b.close_streams();
+        for _ in 0..40 {
+            b.on("native:board_read", |req, _| unbound_result(req));
+        }
+    }
+    w.until("the reopen's whoami", |b| ops_count(b, "sub:whoami") == 2)
+        .await;
+    for _ in 0..40 {
+        w.s().call_raw("board_read", json!({})).await.unwrap();
+    }
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+    assert_eq!(stopped(next(&mut stream).await).0, "holds_changed");
+    ended(&mut stream).await;
+}
+
+// A healthy renew resets the lease-loss count: two runs of three losses each, a healthy renew between, don't stop.
+#[tokio::test]
+async fn a_healthy_renew_resets_the_lease_loss_count() {
+    let w = World::with(Bus::new(&["a"]), |t| t.renew = Duration::from_millis(10)).await;
+    let mut stream = w.s().deliveries();
+    for opens in [4, 7] {
+        w.bus().renew_refusals = 3;
+        w.until("three losses, then a healthy renew", |b| {
+            b.renew_refusals == 0
+                && b.opens == opens
+                && b.log.last().is_some_and(|c| c.op == "sub:delivery_renew")
+        })
+        .await;
+    }
+    w.bus().direct(1);
+    w.bus().hint();
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+}
+
+// Row: the throttled wait is max(retry_after, min(8 s, unit * 2^n)): a retry_after above the floor holds the reopen back.
+#[tokio::test]
+async fn a_throttled_reopen_waits_at_least_retry_after() {
+    let w = World::start(Bus::new(&["a"])).await;
+    for _ in 0..8 {
+        w.bus().on("sub:delivery_open", |req, _| {
+            Reply::json(
+                json!({"jsonrpc": "2.0", "id": req.id(), "error": {"code": -32000, "message": "slow down", "data": {"code": "rate_limited", "retry_after_ms": 60}}}),
+            )
+            .with_status(429)
+        });
+    }
+    let _stream = w.s().deliveries();
+    w.until("the ninth open listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    let opens = w.calls("sub:delivery_open");
+    assert_eq!(opens.len(), 9);
+    // The transport's own 8 attempts, then the stream's wait: 60 ms, not the 10 ms floor.
+    let gap = opens[8].at - opens[7].at;
+    assert!(gap >= Duration::from_millis(60), "{gap:?}");
+}
+
+// Row: a lease naming another identity reopens once, and the second lease serves.
+#[tokio::test]
+async fn a_lease_naming_another_identity_once_reopens_and_serves() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    bus.on("sub:delivery_open", |req, _| {
+        value(
+            req,
+            json!({"capability": format!("c{:042}", 99), "identity": {"user_email": EMAIL, "identity_full": addr("someone-else")}, "ownership": 1, "bind_gen": 1, "expiresAt": 1.0e13}),
+        )
+    });
+    let w = World::start(bus).await;
+    let mut stream = w.s().deliveries();
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+    assert_eq!(w.count("sub:delivery_open"), 2);
+    assert_eq!(w.count("sub:whoami"), 2);
 }

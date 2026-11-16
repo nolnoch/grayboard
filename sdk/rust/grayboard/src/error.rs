@@ -103,14 +103,14 @@ pub enum Error {
     /// The session was ended or dropped while the request was in flight.
     #[error("cancelled")]
     Cancelled,
-    /// The delivery stream stopped on a rule of its own; it yields this once, then ends. `code` is one of `alias_lost` (the server took every hold), `holds_changed` (the holds changed without a `bind` or `unbind` through this session), `identity` (a lease or an item that doesn't match the holds), `lease_lost` (a fourth lease loss outside an item), `retry_exhausted` (an item attempted 8 times, or 8 failures in a row; `item` names the item) and `already_open` (the session already has a stream). A stop the server caused (`alias_held`, `identity_unknown`, a credential or scope refusal, eight admission-throttled reopens) is yielded as that error instead.
+    /// The delivery stream stopped on a rule of its own; it yields this once, then ends. `code` is one of `alias_lost` (the server took every hold), `holds_changed` (the holds changed without a `bind` or `unbind` through this session), `identity` (a lease or an item that doesn't match the holds), `lease_lost` (a fourth lease loss without a healthy renew; `item` names an item out), `retry_exhausted` (an item attempted 8 times, or 8 failures in a row; `item` names the item) and `already_open` (the session already has a stream). A stop the server caused (`alias_held`, `identity_unknown`, a credential or scope refusal, eight admission-throttled reopens, an invalid `whoami` such as a child session's) is yielded as that error instead.
     #[error("delivery stopped ({code}): {message}")]
     DeliveryStopped {
         code: &'static str,
         item: Option<String>,
         message: String,
     },
-    /// `Delivery::receipt` can no longer reach the server under this handle: the stream stopped or was dropped, or a reopen gave a lease under another ownership or bind generation. The item is shown again (same `stable_id`) unless the stream stopped.
+    /// `Delivery::receipt` can no longer reach the server under this handle; the text says why: the stream stopped or was dropped, a reopen gave a lease under another ownership or bind generation, a `bind` or `unbind` ran, the last hold was unbound, or a re-read couldn't confirm the item. When the stream goes on and the server still has the item issued, it is shown again with the same `stable_id`.
     #[error("delivery lost: {0}")]
     DeliveryLost(String),
 }

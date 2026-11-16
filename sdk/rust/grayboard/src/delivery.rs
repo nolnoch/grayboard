@@ -1,4 +1,4 @@
-//! The delivery stream (#929 D4, D6): the lease protocol of `adapters/hosted-core/src/controller.ts` `run`, as a spawned task feeding a one-slot channel.
+//! The delivery stream (#929; its rules: `docs/sdk-rust.md` §2): the lease protocol of `adapters/hosted-core/src/controller.ts` `run`, as a spawned task feeding a one-slot channel.
 //!
 //! Deliberate differences from the controller, each a consequence of handing items to a caller instead of admitting them inline: one item is out at a time (the server receipts direct items only as an in-order prefix of unread), so the in-process dedup state is that one item rather than a 100-key set; the lease is renewed in the background while an item is out (the controller has no renew between admission and receipt, #845, because its admission is inline and fast); a `Delivery` dropped without `receipt()` is a failed admission.
 
@@ -73,6 +73,15 @@ pub struct Delivery {
     /// Another account's, under a delegation grant the server checked.
     pub delegated: bool,
     receipt: oneshot::Sender<Answer>,
+    lost: Reason,
+}
+
+/// Why a handle can no longer be receipted, set by the stream when it gives the handle up.
+type Reason = Arc<Mutex<Option<String>>>;
+
+fn reason_of(reason: &Reason, fallback: &str) -> Error {
+    let why = reason.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    lost(why.as_deref().unwrap_or(fallback))
 }
 
 impl std::fmt::Debug for Delivery {
@@ -90,15 +99,19 @@ impl std::fmt::Debug for Delivery {
 }
 
 impl Delivery {
-    /// Durable acceptance, not completion: the server's `delivery_receipt`, so the item isn't shown again. Resolves when the server has it; through an outage or a lease loss the stream keeps the acceptance and sends it under the next lease. `Error::DeliveryLost` when that can't happen (the stream stopped, or the next lease is under another ownership or bind generation, so the item is shown again).
+    /// Durable acceptance, not completion: the server's `delivery_receipt`, so the item isn't shown again. Resolves when the server has it; through an outage or a lease loss the stream keeps the acceptance and sends it under the next lease. `Error::DeliveryLost`, with the reason, when the stream gave this handle up: it stopped, a reopen gave a lease under another ownership or bind generation, a `bind` or `unbind` ran, the last hold was unbound, or a re-read couldn't confirm the item. If the stream goes on and the server still has the item issued, it is shown again with the same `stable_id`.
     pub async fn receipt(self) -> Result<(), Error> {
         let (answer, result) = oneshot::channel();
-        self.receipt
-            .send(answer)
-            .map_err(|_| lost("the delivery stream ended"))?;
-        result
-            .await
-            .map_err(|_| lost("the delivery stream ended before the receipt"))?
+        if self.receipt.send(answer).is_err() {
+            return Err(reason_of(&self.lost, "the delivery stream ended"));
+        }
+        match result.await {
+            Ok(r) => r,
+            Err(_) => Err(reason_of(
+                &self.lost,
+                "the delivery stream ended before the receipt",
+            )),
+        }
     }
 }
 
@@ -222,6 +235,7 @@ struct Outstanding {
     key: String,
     confirmed: bool,
     held: Held,
+    lost: Reason,
 }
 
 enum Held {
@@ -232,6 +246,7 @@ enum Held {
 impl Outstanding {
     /// The handle can't be receipted any more: a `receipt()` waiting or to come gets `DeliveryLost`.
     fn invalidate(self, why: &str) {
+        *self.lost.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_owned());
         if let Held::Receipting(Some(answer)) = self.held {
             let _ = answer.send(Err(lost(why)));
         }
@@ -403,6 +418,8 @@ impl Task {
                 }
                 Fail::Idle => {
                     self.lose_lease();
+                    // Nothing held: the item can't be receipted under any lease until a bind, which starts a new bind generation anyway.
+                    self.drop_outstanding("the last hold was unbound");
                     next = self.wait_resume().await;
                     continue;
                 }
@@ -412,20 +429,22 @@ impl Task {
                 }
                 Fail::Terminal(e) => return self.finish(e).await,
                 Fail::Lease => {
+                    // Counted with an item out too (controller.ts exempts losses inside an item, whose admission is inline and brief): a caller holding an item would otherwise keep a lease that never comes back reopening forever. The item's own reconfirming renew is healthy and resets the count.
                     self.lose_lease();
-                    if self.outstanding.is_none() {
-                        self.recoveries += 1;
-                        if self.recoveries > RECOVERY_LIMIT {
-                            return self
-                                .finish(Error::DeliveryStopped {
-                                    code: "lease_lost",
-                                    item: None,
-                                    message: "the delivery lease was lost four times without a healthy renew".into(),
-                                })
-                                .await;
-                        }
+                    self.recoveries += 1;
+                    if self.recoveries > RECOVERY_LIMIT {
+                        let item = self.pending_item();
+                        return self
+                            .finish(Error::DeliveryStopped {
+                                code: "lease_lost",
+                                item,
+                                message:
+                                    "the delivery lease was lost four times without a healthy renew"
+                                        .into(),
+                            })
+                            .await;
                     }
-                    self.backoff(self.failures, self.t.backoff_unit)
+                    self.backoff(self.recoveries, self.t.backoff_unit)
                 }
                 Fail::Err(e) => match self.classify(e).await {
                     Ok(wait) => wait,
@@ -489,12 +508,18 @@ impl Task {
         }
     }
 
-    /// Paused or idle: waits for `Resume` (or a `Restart`). `None` reopens.
+    /// Paused or idle: waits for `Resume`. `None` reopens. A `Restart` (an unbound or alias-lost result on a concurrent native call) waits too: reopening mid-bind would see the bind's holds before the session refreshed them; the `Resume` reopens from `whoami` anyway. The session's cancellation ends the wait, so a dropped `Session` ends an idle stream.
     async fn wait_resume(&mut self) -> Option<Fail> {
+        let cancel = self.sub.cancel.clone();
         loop {
-            match self.ctl.recv().await {
+            let c = tokio::select! {
+                c = self.ctl.recv() => c,
+                _ = cancel.cancelled() => return Some(Fail::Gone),
+            };
+            match c {
                 None => return Some(Fail::Gone),
-                Some(Control::Resume | Control::Restart) => return None,
+                Some(Control::Restart) => {}
+                Some(Control::Resume) => return None,
                 Some(Control::Pause(ack)) => {
                     let _ = ack.send(());
                 }
@@ -532,7 +557,26 @@ impl Task {
         if matches!(e, Error::Cancelled) {
             return;
         }
-        let _ = watch(&mut self.ctl, self.out.send(Err(e))).await;
+        // The error survives pauses and restarts (the stream is over; a bind just proceeds); only a Stop, the caller giving up the stream, or the session going drops it.
+        let cancel = self.sub.cancel.clone();
+        let send = self.out.send(Err(e));
+        tokio::pin!(send);
+        loop {
+            tokio::select! {
+                biased;
+                c = self.ctl.recv() => match c {
+                    Some(Control::Pause(ack)) => { let _ = ack.send(()); }
+                    Some(Control::Resume | Control::Restart) => {}
+                    Some(Control::Stop(ack)) => {
+                        if let Some(ack) = ack { let _ = ack.send(()); }
+                        return;
+                    }
+                    None => return,
+                },
+                _ = cancel.cancelled() => return,
+                _ = &mut send => return,
+            }
+        }
     }
 
     /// One lease: open it, then serve the inbox until something ends it.
@@ -545,9 +589,10 @@ impl Task {
             call_subscriber(&sub, "whoami", json!({})),
             Fail::Err
         );
+        // An invalid whoami (a child session, a malformed hold) stops at once, as `model.ts` `bindingOf` does: retrying can't fix the server's answer.
         let binding = match Binding::of(&current) {
             Ok(b) => b,
-            Err(e) => return Fail::Err(e),
+            Err(e) => return Fail::Terminal(e),
         };
         let mut holds = self.holds();
         // Holds the server took (#453): dropped from the remembered ones, so neither this loop nor a later one binds them again; the rest keep receiving.
@@ -605,7 +650,7 @@ impl Task {
         let opened = call!(
             &mut self.ctl,
             call_subscriber(&sub, "delivery_open", json!({})),
-            Fail::Err
+            lease_fail
         );
         let lease = match Lease::of(&opened, &holds[0]) {
             Ok(l) => l,
@@ -744,8 +789,8 @@ impl Task {
                     let id = o.id.clone();
                     match batch.iter().position(|i| i.id == id) {
                         Some(pos) => {
-                            let item = batch[pos].clone();
-                            batch.drain(..=pos);
+                            // Items ahead of it stay in the batch, for after its receipt.
+                            let item = batch.remove(pos).expect("found");
                             if let Err(f) = self.show(sub, &item).await {
                                 return f;
                             }
@@ -754,6 +799,11 @@ impl Task {
                             }
                             renew_at = Instant::now() + self.t.renew;
                         }
+                        // Not on a full page: it may be further on, and a read has no cursor to reach it, so the handle goes (`DeliveryLost`); the item comes again once it reaches the first page.
+                        None if more => self.drop_outstanding(
+                            "a re-read could not confirm the item: the inbox has more than a page ahead of it",
+                        ),
+                        // Not in the whole inbox: its receipt landed before the lease was lost (or, for an item never accepted, the server withdrew it).
                         None => {
                             if let Some(Outstanding {
                                 held: Held::Receipting(Some(answer)),
@@ -776,7 +826,9 @@ impl Task {
                 }
                 let lease = self.lease.as_ref().expect("serving under a lease");
                 let (receipt, rx) = oneshot::channel();
+                let reason = Reason::default();
                 let delivery = Delivery {
+                    lost: Arc::clone(&reason),
                     stable_id: stable_id(&lease.email, &self.resource, &item, &self.session),
                     other_user: mark(&item.event, "other_user"),
                     ungranted: mark(&item.event, "ungranted"),
@@ -792,6 +844,7 @@ impl Task {
                     id: item.id,
                     confirmed: true,
                     held: Held::Out(rx),
+                    lost: reason,
                 });
                 match watch(&mut self.ctl, self.out.send(Ok(delivery))).await {
                     Err(f) => return f,
@@ -865,7 +918,11 @@ impl Task {
         {
             Err(f) => Err(f),
             Ok(Err(e)) => Err(lease_fail(e)),
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(_)) => {
+                self.recoveries = 0;
+                self.unreachable = 0;
+                Ok(())
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-//! `Client` and `Session` (#929 D4): one session owns a native and a subscriber connection.
+//! `Client` and `Session` (#929): one session owns a native and a subscriber connection.
 
 use crate::credential::Credential;
 use crate::delivery::{Control, DeliveryStream, Holds, alias_lost_meta, held_of, unbound_output};
@@ -92,7 +92,7 @@ pub struct Session {
     cancel: CancellationToken,
     /// The delivery stream's task, while one runs.
     stream: Mutex<Option<StreamSlot>>,
-    /// The holds the delivery stream rebinds with `create: false` (#929 D6), refreshed from the subscriber `whoami` after every `bind` and `unbind`.
+    /// The holds the delivery stream rebinds with `create: false`, refreshed from the subscriber `whoami` after every `bind` and `unbind`.
     holds: Holds,
     /// One `bind` or `unbind` at a time, so each pauses and resumes the stream around itself only.
     binding: tokio::sync::Mutex<()>,
@@ -179,19 +179,17 @@ impl Session {
 
     /// A native tool call, its result untouched: a refusal comes back as `is_error` (see `CallToolResult::refusal`), never as `Err`. `Err` is the transport's.
     ///
-    /// The bind rule lives here (#929 D4): `bind` and `unbind` pause the delivery stream, run, refresh the holds it rebinds from the subscriber `whoami`, then resume it under them; any other result that reports the session `unbound: true` or carries the alias-lost marker restarts it, so it rebinds the remembered holds or drops the lost ones.
+    /// The bind rule lives here (`docs/sdk-rust.md` §2): `bind` and `unbind` pause the delivery stream, run, refresh the holds it rebinds from the subscriber `whoami`, then resume it under them; any other result that reports the session `unbound: true` or carries the alias-lost marker restarts it, so it rebinds the remembered holds or drops the lost ones.
     pub async fn call_raw(&self, tool: &str, arguments: Value) -> Result<CallToolResult, Error> {
         if tool == "bind" || tool == "unbind" {
             let _one = self.binding.lock().await;
             let paused = self.pause().await;
             let result = self.native_call(tool, arguments).await;
-            if paused.0.is_some() {
-                // A failed read keeps the holds as they were: the reopen's own whoami then stops on a change it can't explain.
-                if let Ok(value) = call_subscriber(&self.subscriber, "whoami", json!({})).await
-                    && let Ok(held) = held_of(&value)
-                {
-                    *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = held;
-                }
+            // After every bind and unbind, stream or not: a later `deliveries()` rebinds these, so they must be what the session holds now, not what a stopped or dropped stream last saw. A failed read keeps them as they were: the next open's whoami then stops on a change it can't explain.
+            if let Ok(value) = call_subscriber(&self.subscriber, "whoami", json!({})).await
+                && let Ok(held) = held_of(&value)
+            {
+                *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = held;
             }
             drop(paused);
             return result;
@@ -205,7 +203,11 @@ impl Session {
         Ok(result)
     }
 
-    async fn native_call(&self, tool: &str, arguments: Value) -> Result<CallToolResult, Error> {
+    pub(crate) async fn native_call(
+        &self,
+        tool: &str,
+        arguments: Value,
+    ) -> Result<CallToolResult, Error> {
         let result = self
             .native
             .request("tools/call", json!({"name": tool, "arguments": arguments}))
@@ -311,7 +313,7 @@ impl Session {
         })
     }
 
-    /// The session's deliveries, one at a time (#929 D4, D6): a background task opens and renews the lease, listens for inbox hints and hands over each item; the next comes only after this one's `receipt()`. Delivery is at-least-once: dedupe on `Delivery::stable_id`. A terminal stop is one `Err`, then the stream ends. A session has one stream at a time; dropping it releases the lease, which ends the session on the server.
+    /// The session's deliveries, one at a time (`docs/sdk-rust.md` §2): a background task opens and renews the lease, listens for inbox hints and hands over each item; the next comes only after this one's `receipt()`. Delivery is at-least-once: dedupe on `Delivery::stable_id`. A terminal stop is one `Err`, then the stream ends. A session has one stream at a time; dropping it releases the lease, which ends the session on the server.
     pub fn deliveries(&self) -> DeliveryStream {
         let mut slot = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         if slot
@@ -474,7 +476,7 @@ pub(crate) async fn read_resource(conn: &Connection, uri: &str) -> Result<Value,
     }
 }
 
-/// A native result read as D4 says: a refusal is `Err`; the value is `structuredContent`, else the first text block parsed as JSON (`"ok"` or `"ok: …"` is unit success, `None`); the text blocks after it are notices.
+/// A native result read as typed methods read it: a refusal is `Err`; the value is `structuredContent`, else the first text block parsed as JSON (`"ok"` or `"ok: …"` is unit success, `None`); the text blocks after it are notices.
 pub(crate) fn read_result(result: &CallToolResult) -> Result<(Option<Value>, Vec<String>), Error> {
     if let Some(refusal) = result.refusal() {
         return Err(refusal);

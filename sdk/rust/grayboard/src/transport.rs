@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-/// The transport's and the delivery stream's time limits (#929 D2, D6). Fixed in a release; tests shorten them.
+/// The transport's and the delivery stream's time limits (#929; `docs/sdk-rust.md`). Fixed in a release; tests shorten them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timeouts {
     /// An ordinary request attempt, body included; also bounds a credential's `token` and `unauthorized`.
@@ -88,7 +88,7 @@ pub(crate) struct Connection {
     session: String,
     delivery: Option<DeliveryMode>,
     lease: Mutex<Option<String>>,
-    cancel: CancellationToken,
+    pub(crate) cancel: CancellationToken,
     next_id: AtomicU64,
     discovered: OnceCell<Discovery>,
 }
