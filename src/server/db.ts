@@ -16,7 +16,7 @@ import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
 import { endSession, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
-import { afterCommit, guardTopLevel, openReader, openSqlite, reclaimFreePages, routeReads } from "../core/sqlite.ts";
+import { afterCommit, type Boundary, openBoundary, openReader, openSqlite, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./policy.ts";
@@ -100,13 +100,25 @@ export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 // A top-level write transaction, through db's write queue. `committed` runs after the commit and before the queue's
 // next body (D4: in-memory state a transaction reads changes only inside one or right after its commit, never in
 // the gap before its caller resumes). Its result is boxed, so a promise it returns doesn't hold the queue.
-function queued<T, R>(db: Database, fn: () => T, committed?: (value: T) => R): Promise<Awaited<R>> {
-  if (db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls atomic"));
-  return queueFor(db).run(() => {
-    const value = db.transaction(fn).immediate() as T;
-    return { out: committed ? committed(value) : value as unknown as R };
+// fn may await (#807 P1b-4e): the transaction stays open, and the queue held, until its promise settles; it commits
+// on fulfilment and rolls back on rejection. Meanwhile other tasks read committed state on the reader and their
+// writes wait in the queue (core/sqlite.ts ownWriter).
+function queued<T, R>(db: Database, fn: () => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
+  const queue = queueFor(db);
+  if (queue.mine && db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls atomic"));
+  const settle = (b: Boundary, value: T) => { b.commit(); return { out: committed ? committed(value) : value as unknown as R }; };
+  return queue.run(() => {
+    const b = openBoundary(db);
+    let out: T | PromiseLike<T>;
+    try { out = fn(); } catch (error) { b.rollback(); throw error; }
+    if (!isThenable(out)) return settle(b, out as T);
+    // Reactions attached here run as the holder (the queue's context follows them), so the commit is the writer's.
+    return Promise.resolve(out).then(value => settle(b, value), error => { b.rollback(); throw error; });
   }).then(box => box.out) as Promise<Awaited<R>>;
 }
+
+const isThenable = (v: unknown): v is PromiseLike<unknown> =>
+  v !== null && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
 
 // Core's shared writes (attachment store/release/sweep, claim expiry, #807 D4) through repo's write queue. Core's
 // bodies are synchronous, so the cast only restates that.
@@ -134,13 +146,13 @@ function queuedNow<T>(db: Database, fn: () => T, committed?: (value: T) => unkno
 
 // A write no caller waits for (an audit row, a closing session's last-seen touch, a lapsed lease's settle; #807 P1b-4b),
 // for code that can't await: a sync finally, a timer, a sync check on the request path. It runs now as part of the
-// caller's open transaction (the queue's holder's, or an unqueued one a caller opened at top level), as its own
+// caller's open transaction (the queue's holder's), as its own
 // transaction when the caller holds the queue outside one, or through the idle queue; when another body holds the
 // queue it waits behind it, and its failure is logged as `what` failed. True when it ran now (its error thrown,
 // `committed` run after the open transaction's commit or at once), false when it waits.
 function posted<T>(db: Database, fn: () => T, committed: ((value: T) => unknown) | undefined, what: string): boolean {
   const queue = queueFor(db);
-  if (db.inTransaction && (queue.mine || !queue.held)) {
+  if (queue.mine && db.inTransaction) {
     const value = fn();
     if (committed) afterCommit(db, () => { committed(value); });
     return true;
@@ -164,6 +176,8 @@ export interface Repo {
   // transaction's outermost caller. Inside an open transaction it refuses, since a nested body can't wait for
   // the queue its own transaction holds; nested code calls atomic. `committed(value)` runs after the commit, before
   // the queue's next body: in-memory state the transaction's readers see changes there, not after the await.
+  // fn may be async: its transaction stays open across its awaits, other tasks' writes waiting behind it (P1b-4e).
+  write<T, R = T>(fn: () => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   write<T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // write's transaction run now, for startup only (a constructor, before anything serves): returns fn's value, throws
   // its error, and throws when the queue is held or a transaction is open.
@@ -416,7 +430,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
   authGenerationTriggers(db);
   routeReads(db, openReader(path));
   const queue = queueFor(db);
-  guardTopLevel(db, () => queue.assertFree());
+  ownWriter(db, { holds: () => queue.mine, check: () => queue.assertMine() });
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, opts.now);
   setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
   return { db, repo };
@@ -888,7 +902,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     atomic<T>(fn: () => Sync<T>): T {
       return db.transaction(fn).immediate() as T;
     },
-    write: <T, R = T>(fn: () => Sync<T>, committed?: (value: T) => R) => queued(db, fn, committed),
+    write: <T, R = T>(fn: () => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     writeNow: <T>(fn: () => Sync<T>) => queuedNow(db, fn) as T,
     post: <T>(fn: () => Sync<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn as () => T, committed, what),
     authRead<T>(fn: () => Sync<T>): T {

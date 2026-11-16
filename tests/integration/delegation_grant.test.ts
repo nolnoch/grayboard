@@ -4,9 +4,7 @@
 // a replay re-checks the grant against the session holding the name now; a
 // granted requester fills at most half a launcher's open cap; and a policy
 // deny keeps its decision row past the call's rollback (#867), through the
-// session's afterRollback as hosted `run` sets it. handleDelegate's own
-// collector for a session with none is unreachable once every write is
-// queued (#807 P1b-4f); 4e removes it.
+// session's afterRollback as hosted `run` sets it.
 import { expect, test } from "bun:test";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
