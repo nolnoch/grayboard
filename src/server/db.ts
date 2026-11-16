@@ -23,20 +23,25 @@ import type { HumanReach } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
 import { requestOrigin } from "./request_context.ts";
+import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess } from "./oauth-types.ts";
 
 // Row types
-// idp_subject: the IdP's stable account ID (Google `sub`), set at the first
-// sign-in that carries one; null for a dev-auth user and one not signed in since
-// (security audit F-13).
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_subject: string | null };
-// What an IdP sign-in resolved to (security audit F-13). `linked`: the user had
-// no subject yet and now has this one. Refusals: `subject_mismatch`, the email's
-// user belongs to another IdP account (the email was reassigned);
-// `email_changed`, this IdP account's user has another email.
+// idp_issuer + idp_subject: the IdP that proved the user's email and its stable
+// account ID there (Google `sub`), keyed together (security audit F-13, #928
+// D3). Both: linked. Issuer only: a pre-F-13 row, reserved for that IdP.
+// Neither: a dev-auth user, or one an admin unlinked.
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null };
+// What an IdP sign-in resolved to (security audit F-13, #928 D4). `linked`: the
+// user had no subject yet and now has this one. Refusals: `subject_mismatch`,
+// the email's user belongs to another account at the same IdP (the email was
+// reassigned); `issuer_mismatch`, the email's user belongs to another IdP
+// (`issuer`, the one holding it); `email_changed`, this IdP account's user has
+// another email.
 export type IdpSignIn =
   | { status: "ok"; user: User; linked: boolean }
-  | { status: "subject_mismatch" | "email_changed"; user: User };
+  | { status: "subject_mismatch" | "email_changed"; user: User }
+  | { status: "issuer_mismatch"; user: User; issuer: string };
 // The label `grayboard login --dev` sessions carry: a server started without dev auth revokes them (#805 F-04).
 export const DEV_SESSION_LABEL = "dev";
 export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
@@ -176,9 +181,9 @@ export interface Repo {
   hosted: HostedStore;
   users: {
     upsertByEmail(email: string, displayName: string | null): User;
-    // An IdP sign-in: matches the subject first, then the email (F-13).
-    signIn(email: string, subject: string, displayName: string | null): IdpSignIn;
-    // Forgets a user's IdP subject, so the next sign-in with the email links its account.
+    // An IdP sign-in: matches (issuer, subject) first, then the email (F-13, #928 D4).
+    signIn(issuer: string, subject: string, email: string, displayName: string | null): IdpSignIn;
+    // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
     clearSubject(userId: number): void;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
@@ -693,10 +698,20 @@ function initSchema(db: Database): void {
     ["oauth_tokens", "access_scopes", "TEXT"],
     ["oauth_codes", "grant_id", "TEXT REFERENCES oauth_grants(id) ON DELETE CASCADE"],
   ];
-  // users.idp_subject (security audit F-13): unique among the users that have one.
+  // users.idp_subject (security audit F-13) and idp_issuer (#928 D3): unique as a pair among the users with a subject.
   const userColumns = db.query<{ name: string }, []>(`PRAGMA table_info(users)`).all();
   if (!userColumns.some(c => c.name === "idp_subject")) db.exec(`ALTER TABLE users ADD COLUMN idp_subject TEXT`);
-  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_idp_subject ON users(idp_subject) WHERE idp_subject IS NOT NULL");
+  if (!userColumns.some(c => c.name === "idp_issuer")) {
+    db.exec(`ALTER TABLE users ADD COLUMN idp_issuer TEXT`);
+    // Once, with the column: every existing subject is Google's, and every subjectless row's email was last proven
+    // by Google (or dev login). Never on a later open, which would re-stamp a row unlink-idp cleared.
+    db.run("UPDATE users SET idp_issuer = ?", [GOOGLE_ISSUER]);
+  }
+  // Every open: a rolled-back binary (which knows only Google) links or creates users with a subject and no issuer.
+  db.run("UPDATE users SET idp_issuer = ? WHERE idp_issuer IS NULL AND idp_subject IS NOT NULL", [GOOGLE_ISSUER]);
+  // Every open, since a rolled-back binary recreates it: one `sub` is not unique across issuers.
+  db.exec("DROP INDEX IF EXISTS idx_users_idp_subject");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_idp_identity ON users(idp_issuer, idp_subject) WHERE idp_subject IS NOT NULL");
   for (const [table, column, definition] of oauthColumns) {
     const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
     if (!columns.some(c => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -898,26 +913,44 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return user;
         })();
       },
-      signIn(email, subject, displayName) {
+      signIn(issuer, subject, email, displayName) {
         return db.transaction((): IdpSignIn => {
-          const bySubject = db.query<User, [string]>("SELECT * FROM users WHERE idp_subject = ?").get(subject);
-          if (bySubject) {
-            if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
-            db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
-            return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+          // A link is conditional on the row still being unlinked (D3): on Postgres another sign-in may link it
+          // between the read and the write. Zero rows: re-read and decide again, now a refusal.
+          const link = (id: number) => db.run(
+            `UPDATE users SET idp_issuer = ?, idp_subject = ?, display_name = ?
+             WHERE id = ? AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ?)`,
+            [issuer, subject, displayName, id, issuer]).changes === 1;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            // 1. This IdP account's user.
+            const bySubject = db.query<User, [string, string]>("SELECT * FROM users WHERE idp_issuer = ? AND idp_subject = ?").get(issuer, subject);
+            if (bySubject) {
+              if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
+              db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
+              return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+            }
+            const byEmail = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email);
+            if (byEmail) {
+              // 3. Another IdP holds the email, linked or (pre-F-13) not: never a merge by email.
+              if (byEmail.idp_issuer !== null && byEmail.idp_issuer !== issuer) return { status: "issuer_mismatch", user: byEmail, issuer: byEmail.idp_issuer };
+              // 2. Another account at this IdP holds it.
+              if (byEmail.idp_subject !== null) return { status: "subject_mismatch", user: byEmail };
+              // A disabled account is refused by the caller: a refused sign-in
+              // must not bind it to whoever tried (security audit F-13).
+              if (byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
+              // 4 and 5. This IdP's unlinked row, or a row with neither.
+              if (link(byEmail.id)) return { status: "ok", user: { ...byEmail, idp_issuer: issuer, idp_subject: subject, display_name: displayName }, linked: true };
+              continue;
+            }
+            // 6. A new user, created with both.
+            const user = this.upsertByEmail(email, displayName);
+            if (link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject }, linked: false };
           }
-          const byEmail = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email);
-          if (byEmail?.idp_subject) return { status: "subject_mismatch", user: byEmail };
-          // A disabled account is refused by the caller: a refused sign-in
-          // must not bind it to whoever tried (security audit F-13).
-          if (byEmail && byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
-          const user = this.upsertByEmail(email, displayName);
-          db.run("UPDATE users SET idp_subject = ? WHERE id = ?", [subject, user.id]);
-          return { status: "ok", user: { ...user, idp_subject: subject }, linked: byEmail !== null && byEmail !== undefined };
+          throw new Error(`sign-in for ${email} kept losing its link to concurrent sign-ins`);
         }).immediate();
       },
       clearSubject(userId) {
-        db.run("UPDATE users SET idp_subject = NULL WHERE id = ?", [userId]);
+        db.run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
       },
       findByEmail(email) {
         return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;

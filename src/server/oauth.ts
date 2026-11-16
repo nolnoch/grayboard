@@ -1,7 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { googleSignIn, hashToken, type AuthedUser } from "./auth.ts";
-import { callbackPath, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
-import { googleProvider } from "./idp_google.ts";
+import { hashToken, type AuthedUser } from "./auth.ts";
+import { callbackPath, defaultProviders, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
@@ -97,8 +96,7 @@ async function form(req: Request): Promise<URLSearchParams> {
 
 export function createOAuthServer(repo: Repo, config: Config, options: OAuthOptions = {}) {
   if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret)) throw new Error("dev auth must not coexist with a Google client secret");
-  const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
-  const providers = options.providers ?? [googleProvider({ ...googleClient, orgDomain: config.orgDomain })];
+  const providers = options.providers ?? defaultProviders(config);
   if (providers.length !== 1) throw new Error("exactly one identity provider is supported");
   const provider = providers[0]!, providerCallback = callbackPath(provider);
   const issuer = oauthPublicUrl(config.publicUrl, config.devAuth);
@@ -383,7 +381,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       catch (e) { hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email) || identity!.email.split("@")[1] !== config.orgDomain) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
-      const signedIn = await repo.write(() => googleSignIn(repo, identity!, { client_id: r.clientId }));
+      const signedIn = await repo.write(() => idpSignIn(repo, provider, identity!, { client_id: r.clientId }, providers));
       if ("refused" in signedIn) fail("access_denied", 403);
       const { user } = signedIn;
       if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); fail("access_denied", 403); }
