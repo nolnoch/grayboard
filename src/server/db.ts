@@ -1098,8 +1098,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     aliases: {
-      create(tx, { scope_kind, scope_ref, name }, createdBy) {
-        return sqliteOf(tx).query<Alias, [string, string, string, string, string, number]>(
+      create(tx, scope, createdBy) {
+        const db = sqliteOf(tx);
+        const { scope_kind, scope_ref, name } = scope;
+        return db.query<Alias, [string, string, string, string, string, number]>(
           `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
            VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
         ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;

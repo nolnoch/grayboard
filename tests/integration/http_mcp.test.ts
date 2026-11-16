@@ -38,7 +38,7 @@ async function legacyLogin(email = "alice@example.com") {
   const user = app.repo.users.findByEmail(email)!;
   await seed(app.repo, tx => {
     for (const name of ["be", "allowed"]) {
-      if (!app.repo.aliases.find(app.repo.read, `${user.email}/${name}`)) app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
+      if (!app.repo.aliases.find(tx, `${user.email}/${name}`)) app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
     }
   });
   return token;
