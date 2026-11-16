@@ -18,7 +18,7 @@ import { SlackError, SlackWeb } from "../bridge/web.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import type { Repo, SlackLink, Sync } from "./db.ts";
+import type { Repo, SlackLink } from "./db.ts";
 import { onAliasCreated } from "./teams.ts";
 import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
@@ -357,14 +357,15 @@ export class SlackBridge implements SlackLinker {
 
     // A Slack user's tool call runs in one transaction through the write queue (#807 D4), as a hosted call does
     // (hosted.run): its refusal rows, which the rollback would drop, are written after it in a body of their own.
-    // Bodies run one at a time and synchronously, so the shared session's afterRollback is set only inside one.
-    const inWrite = async <T>(fn: () => T): Promise<T> => {
+    // Bodies hold the write queue one at a time, so the shared session's afterRollback is set only inside one, and
+    // cleared once fn (an application operation, async since #807 P1c-3) settles.
+    const inWrite = async <T>(fn: () => Promise<T>): Promise<T> => {
       const rows: Array<() => void> = [];
       try {
-        return await repo.write(() => {
+        return await repo.write(async () => {
           rows.length = 0;
           session.afterRollback = write => { rows.push(write); };
-          try { return fn() as Sync<T>; } finally { session.afterRollback = undefined; }
+          try { return await fn(); } finally { session.afterRollback = undefined; }
         }) as T;
       } catch (error) {
         if (rows.length) {
@@ -452,7 +453,7 @@ export class SlackBridge implements SlackLinker {
         return now && now.slack_user === link.slack_user && now.dm_channel === link.dm_channel ? null : "the Slack link changed";
       }));
       this.linked.set(link.user_id, { link, session, relay });
-      application.replay(session);
+      await application.replay(session);
     } catch (e) {
       this.log(`${link.email}: couldn't bring the human online: ${(e as Error).message}`);
       // Undo this attempt only (#385): a replay that threw after the set is

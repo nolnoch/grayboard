@@ -81,15 +81,15 @@ export function createResources(application: Application, options: ResourceOptio
   }
   const service = {
     get activeWatchCount() { return watches.size; },
-    list(session: ApplicationSession, after?: string) {
+    async list(session: ApplicationSession, after?: string) {
       requireSession(session, true);
-      const page = application.boardCatalog(session, after);
+      const page = await application.boardCatalog(session, after);
       return { resources: page.boards.map(board => ({ uri: boardResourceUri(board.name), board })), next_after: page.next_after };
     },
-    read(session: ApplicationSession, uri: string, options: SnapshotOptions = {}) {
+    async read(session: ApplicationSession, uri: string, options: SnapshotOptions = {}) {
       requireSession(session, true);
       const board = parseBoardResourceUri(uri);
-      return { uri: boardResourceUri(board), ...application.boardSnapshot(session, board, options) };
+      return { uri: boardResourceUri(board), ...await application.boardSnapshot(session, board, options) };
     },
     watch(session: ApplicationSession, uri: string, hooks: ResourceHooks): string {
       requireSession(session);

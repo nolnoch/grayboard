@@ -175,7 +175,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const lease = get(p, context, capability, row);
         await testPauseAsync("hosted:pending:in-gate");
         get(p, context, capability);
-        let items = application.pending(lease.session, limit).map(event => itemOf(event, lease));
+        let items = (await application.pending(lease.session, limit)).map(event => itemOf(event, lease));
         // Security audit F-03 (#854): a host without context starts a turn for every item it's given, so
         // after the ownership's first drain (local mode's) a lone non-waking item (ungranted,
         // deferred, a digest) stays unreceipted until a waking one arrives to carry it. A full page with
@@ -192,7 +192,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
       return hosted.control(p, context, false, async () => {
         await testPauseAsync("hosted:receipt:before-txn");
-        await store.write(() => {
+        await store.write(async () => {
           testPause("hosted:receipt:in-txn");
           const row = "id" in context ? store.get(context.id) : undefined;
           const lease = get(p, context, capability, row);
@@ -207,7 +207,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           }
           const direct = records.filter(r => r.item.event.kind === "direct");
           if (direct.length) {
-            const unread = application.pending(lease.session, 100).filter(e => e.kind === "direct");
+            const unread = (await application.pending(lease.session, 100)).filter(e => e.kind === "direct");
             const requested = new Set(direct.map(r => r.item.id));
             if (unread.length < direct.length || unread.slice(0, direct.length).some(e => !requested.has(itemOf(e, lease).id))) stale(p, context, capability);
           }

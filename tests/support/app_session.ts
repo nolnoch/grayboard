@@ -101,16 +101,16 @@ export class AppSession {
 
   // fn, a handler on `session`, in one queued transaction, as hosted `run` runs a tool: a refusal's rows (the
   // session's `afterRollback`) are written after the rollback, in a body of their own. As Slack's inWrite does, the
-  // collector is set and cleared inside the synchronous body, so overlapping calls on one session can't leave it
-  // pointing at another call's.
-  private async write<T>(session: ApplicationSession, fn: () => Sync<T>): Promise<Awaited<T>> {
+  // collector is set and cleared inside the body, which holds the write queue, so overlapping calls on one session
+  // can't leave it pointing at another call's. fn may be async (an application operation, #807 P1c-3).
+  private async write<T>(session: ApplicationSession, fn: () => T | Promise<T>): Promise<Awaited<T>> {
     const rows: Array<() => void> = [];
     try {
-      return await seed(this.repo, () => {
+      return await this.repo.write(async () => {
         rows.length = 0;
         session.afterRollback = (w) => { rows.push(w); };
-        try { return fn(); } finally { session.afterRollback = undefined; }
-      });
+        try { return await fn(); } finally { session.afterRollback = undefined; }
+      }) as Awaited<T>;
     } catch (e) {
       await this.flushRefusal(rows);
       throw e;
@@ -207,7 +207,7 @@ export class AppSession {
       session.readOnly = false;
       session.writerId = this.id;
     }
-    this.application.replay(session, [ok.alias]);
+    await this.application.replay(session, [ok.alias]);
     return ok;
   }
 
@@ -253,7 +253,7 @@ export class AppSession {
   async call<T = unknown>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
     const session = this.live();
     const { promise, resolve } = Promise.withResolvers<T>();
-    await this.write(session, () => { this.application.call(session, tool, args, (result) => resolve(result as T)); });
+    await this.write(session, () => this.application.call(session, tool, args, (result) => resolve(result as T)));
     return promise;
   }
 
@@ -269,7 +269,7 @@ export class AppSession {
 
   async dmAck(id: number): Promise<void> {
     const session = this.live();
-    await this.write(session, () => { this.application.acknowledgeDm(session, id); });
+    await this.write(session, () => this.application.acknowledgeDm(session, id));
   }
 
   async retract(id: number): Promise<{ note?: string }> {

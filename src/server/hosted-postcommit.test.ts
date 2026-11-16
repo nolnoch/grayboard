@@ -62,7 +62,7 @@ const delegate = (session: Parameters<typeof application.delegate>[0]) => applic
 for (const tool of ["dm_send", "delegate"]) test(`${tool}: late hosted audit rollback discards live payload`, async () => {
   failAudit("hosted.write");
   await expect(mcp.sessions.run(principal, context(), tool, session => tool === "delegate" ? delegate(session) : application.send(session, "launcher", "no ghost"))).rejects.toThrow("forced late audit failure");
-  expect(application.history(recipient.session)).toEqual([]);
+  expect(await application.history(recipient.session)).toEqual([]);
   expect(events).toEqual([]);
   expect(database.db.query("SELECT * FROM write_receipts").all()).toEqual([]);
   expect(database.db.query("SELECT action FROM access_log WHERE action IN ('request.replayed', 'request.resent', 'delegation.requested')").all()).toEqual([]);
@@ -80,7 +80,7 @@ test("actual HTTP delegation audit rollback cannot publish a launcher request", 
   expect(response.status).toBe(200);
   expect(JSON.parse(body)).toMatchObject({ id: "rollback", result: { isError: true, content: [{ type: "text", text: "error: internal error" }] } });
   expect(body).not.toContain("forced late audit");
-  expect(application.history(recipient.session)).toEqual([]); expect(events).toEqual([]);
+  expect(await application.history(recipient.session)).toEqual([]); expect(events).toEqual([]);
 });
 
 test("live sink sees committed message and both delegation audits on a separate connection", async () => {
@@ -107,7 +107,7 @@ test("postcommit sink failure cannot fail or roll back a committed native messag
   try {
     const sent = await mcp.sessions.run(principal, context(), "dm_send", session => application.send(session, "launcher", "durable despite sink"));
     expect(sent.message_id).toBeGreaterThan(0);
-    expect(application.history(recipient.session)).toHaveLength(1);
+    expect(await application.history(recipient.session)).toHaveLength(1);
     expect(database.db.query("SELECT action FROM access_log WHERE action='hosted.write'").all()).toHaveLength(1);
     expect(log).toHaveBeenCalled();
   } finally { log.mockRestore(); }
@@ -132,7 +132,7 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
     expect(events).toEqual([]); expect(invalidations).toBe(0);
     expect(closed).not.toHaveBeenCalled();
     expect(database.repo.hosted.get(context().id!)).toBeDefined();
-    expect(application.history(recipient.session)).toEqual([]);
+    expect(await application.history(recipient.session)).toEqual([]);
     // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
     await seed(database.repo, () => {
       database.repo.hosted.atomic(() => { application.send(recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(id, Date.now()); });
@@ -161,13 +161,13 @@ test("caught inner rollback discards only inner effects and preserves outer effe
     expect(events).toEqual([]);
   });
   expect(observed).toEqual(["outer-first", "outer-last"]);
-  expect(events).toHaveLength(1); expect(application.history(recipient.session).map(message => message.body)).toEqual(["outer durable"]);
+  expect(events).toHaveLength(1); expect((await application.history(recipient.session)).map(message => message.body)).toEqual(["outer durable"]);
 });
 
 test("rolled-back board post neither publishes payload nor invalidates observers or inflight state", async () => {
-  await seed(database.repo, () => {
-    application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-    application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+  await seed(database.repo, async () => {
+    await application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
+    await application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
   });
   const observer = mock(() => {});
   application.observeBoard(recipient.session, "updates", { changed: observer });
@@ -182,12 +182,12 @@ test("rolled-back board post neither publishes payload nor invalidates observers
 
 test("failed SQLite COMMIT discards queued payload and leaves the connection reusable", async () => {
   database.db.exec("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_child(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)");
-  await expect(seed(database.repo, () => {
-    application.send(recipient.session, "launcher", "commit must fail");
+  await expect(seed(database.repo, async () => {
+    await application.send(recipient.session, "launcher", "commit must fail");
     database.db.run("INSERT INTO commit_child(parent) VALUES (1)");
   })).rejects.toThrow();
-  expect(events).toEqual([]); expect(application.history(recipient.session)).toEqual([]);
-  await seed(database.repo, () => { application.send(recipient.session, "launcher", "next commit succeeds"); });
+  expect(events).toEqual([]); expect(await application.history(recipient.session)).toEqual([]);
+  await seed(database.repo, () => application.send(recipient.session, "launcher", "next commit succeeds"));
   expect(events).toHaveLength(1);
 });
 
@@ -201,9 +201,9 @@ test("a failing postcommit effect does not suppress later effects or retain boar
       afterCommit(database.db, () => { observed.push("last delivered"); });
     });
     expect(observed).toEqual(["last delivered"]);
-    await seed(database.repo, () => {
-      application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-      application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+    await seed(database.repo, async () => {
+      await application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
+      await application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
     });
     recipient.session.sink.deliver = () => { throw new Error("board sink failed"); };
     await mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "durable post" }));

@@ -974,9 +974,9 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta, inputSchema: DM_ACK_INPUT,
   }, async (a, ctx) => {
     const acked: number[] = [], missing: number[] = [];
-    const result = await run(ctx, "dm_ack", session => {
+    const result = await run(ctx, "dm_ack", async session => {
       for (const n of new Set(Array.isArray(a.message_id) ? a.message_id : [a.message_id])) {
-        try { application.acknowledgeDm(session, n); acked.push(n); } catch (e) {
+        try { await application.acknowledgeDm(session, n); acked.push(n); } catch (e) {
           if (!(e instanceof ApplicationError) || e.code !== "not_found") throw e;
           missing.push(n);
         }
