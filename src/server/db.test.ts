@@ -9,6 +9,8 @@ import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { hashToken } from "./auth.ts";
+import { issueOAuth } from "../../tests/helpers/oauth.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -728,4 +730,10 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   expect(() => o.isGrantActive(kept, "g", 1)).toThrow(settled);
   expect(() => o.revokeToken({} as Tx, "t", "c", 1)).toThrow("not a SQLite store handle");
   expect(o.isGrantActive(repo.read, "g", 1)).toBe(false);
+  // A warm access cache still resolves the handle first.
+  const issued = await issueOAuth(repo, "https://grayboard.example.com/mcp");
+  const live = () => o.findActiveAccess(repo.read, hashToken(issued.token), issued.binding.resource, [], issued.now);
+  expect(live()).toBeDefined();
+  expect(live()).toBeDefined();
+  expect(() => o.findActiveAccess(kept, hashToken(issued.token), issued.binding.resource, [], issued.now)).toThrow(settled);
 });

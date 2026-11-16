@@ -916,8 +916,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // are unexpired, the join's own time conditions; required scopes are checked against the held scopes.
   let accessGeneration: string | undefined;
   const accesses = new Map<string, OAuthAccess>();
-  // Inside a transaction (authGeneration undefined) it reads on the caller's handle, uncached.
+  // Inside a transaction (authGeneration undefined) it reads on the caller's handle, uncached. The handle is
+  // resolved first, so a kept Tx is refused on a cache hit too.
   const findActiveAccess: OAuthStore["findActiveAccess"] = (r, h, resource, requiredScopes, now) => {
+    sqliteOf(r);
     const g = authGeneration();
     if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(r, h, resource, requiredScopes, now);
     if (g !== accessGeneration) { accesses.clear(); accessGeneration = g; }
@@ -1529,8 +1531,8 @@ function insertSession(db: Database, userId: number, tokenHash: string, label: s
 }
 
 // The OAuth store over its handle (#807 P1c-8): each method runs its statements on the connection its `Tx` or `Read`
-// names (sqliteOf refuses a settled Tx). The hosted sessions a revoked grant or disabled user ends go through the
-// hosted store, which keeps the ambient writer until its slice (#998).
+// names (sqliteOf refuses a settled Tx). The hosted sessions a revoked grant ends go through the hosted store,
+// which keeps the ambient writer until its slice (#998).
 function makeOAuthStore(hosted: HostedStore): OAuthStore {
   const ops = new WeakMap<Database, OAuthOps>();
   const on = (h: Read): OAuthOps => {
