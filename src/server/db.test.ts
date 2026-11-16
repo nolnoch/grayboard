@@ -628,7 +628,7 @@ test("audit.last searches access_log by (action, target), never a scan or a sort
 });
 
 // #807 P1c-5: a leaf store runs its statements on the handle it's given, so a Tx kept past its body (D4) is refused
-// rather than writing into whichever transaction is open by then, and a handle from another store is refused.
+// rather than writing into whichever transaction is open by then, and a value that isn't a SQLite store handle is refused.
 test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const kept = await seed(repo, tx => {
@@ -642,8 +642,15 @@ test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", as
   expect(() => repo.cursors.advance(kept, "a@example.com/fe", "direct", "a@example.com/fe", 4)).toThrow(settled);
   expect(() => repo.writeReceipts.prune(kept, 10)).toThrow(settled);
   expect(() => repo.cursors.get(kept, "a@example.com/fe", "direct", "a@example.com/fe")).toThrow(settled);
+  expect(() => repo.cursors.directFor(kept, "a@example.com/fe")).toThrow(settled);
+  expect(() => repo.writeReceipts.find(kept, "s1", "a@example.com/fe", "f", 0)).toThrow(settled);
+  expect(() => repo.writeReceipts.refExists(kept, "message", 1)).toThrow(settled);
+  expect(() => repo.writeReceipts.upsert(kept, { session: "s2", sender: "a@example.com/fe", fp: "g", tool: "dm_send", ref_kind: "message", ref_id: 2, result_json: "{}", at: 6 })).toThrow(settled);
+  expect(() => repo.writeReceipts.pruneSession(kept, "s1", 10)).toThrow(settled);
   const foreign = {} as typeof repo.read;
   expect(() => repo.cursors.directFor(foreign, "a@example.com/fe")).toThrow("not a SQLite store handle");
   expect(() => repo.writeReceipts.refExists(foreign, "message", 1)).toThrow("not a SQLite store handle");
   expect(repo.cursors.directFor(repo.read, "a@example.com/fe")).toBe(3);
+  expect(repo.writeReceipts.find(repo.read, "s1", "a@example.com/fe", "f", 0)?.at).toBe(5);
+  expect(repo.writeReceipts.find(repo.read, "s2", "a@example.com/fe", "g", 0)).toBeUndefined();
 });

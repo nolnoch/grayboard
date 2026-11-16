@@ -4,6 +4,7 @@ import { BOARD_NAME_RE, type SnapshotOptions } from "../core/boards.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { countRefusal } from "./metrics.ts";
+import type { Read } from "./store/tx.ts";
 
 export function boardResourceUri(board: string): string {
   if (!BOARD_NAME_RE.test(board) || board.trim() !== board) throw new ApplicationError("bad_request", "invalid board resource name");
@@ -81,15 +82,15 @@ export function createResources(application: Application, options: ResourceOptio
   }
   const service = {
     get activeWatchCount() { return watches.size; },
-    async list(session: ApplicationSession, after?: string) {
+    async list(r: Read, session: ApplicationSession, after?: string) {
       requireSession(session, true);
-      const page = await application.boardCatalog(application.repo.read, session, after);
+      const page = await application.boardCatalog(r, session, after);
       return { resources: page.boards.map(board => ({ uri: boardResourceUri(board.name), board })), next_after: page.next_after };
     },
-    async read(session: ApplicationSession, uri: string, options: SnapshotOptions = {}) {
+    async read(r: Read, session: ApplicationSession, uri: string, options: SnapshotOptions = {}) {
       requireSession(session, true);
       const board = parseBoardResourceUri(uri);
-      return { uri: boardResourceUri(board), ...await application.boardSnapshot(application.repo.read, session, board, options) };
+      return { uri: boardResourceUri(board), ...await application.boardSnapshot(r, session, board, options) };
     },
     watch(session: ApplicationSession, uri: string, hooks: ResourceHooks): string {
       requireSession(session);

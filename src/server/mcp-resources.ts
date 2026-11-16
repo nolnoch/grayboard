@@ -126,7 +126,7 @@ export function registerHostedResources(server: McpServer, context: {
         if (params.cursor !== undefined) throw new ApplicationError("bad_request", "invalid catalog cursor");
         return { resources: [metadata(inboxUri, "inbox")] };
       }
-      const page = await hosted.run(principal, sessionContext, "board_list", session => resources.list(session, params.cursor));
+      const page = await hosted.run(principal, sessionContext, "board_list", (session, tx) => resources.list(tx, session, params.cursor));
       return {
         resources: page.resources.map(r => ({ ...metadata(r.uri, r.board.name), description: r.board.purpose })),
         ...(page.next_after === null ? {} : { nextCursor: page.next_after }),
@@ -149,7 +149,7 @@ export function registerHostedResources(server: McpServer, context: {
         return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(ctx.mcpReq.signal, checked), 100) });
       }
       const read = boardRead(params.uri);
-      return json(params.uri, await hosted.run(principal, sessionContext, "board_read", session => resources.read(session, read.uri, read.options)));
+      return json(params.uri, await hosted.run(principal, sessionContext, "board_read", (session, tx) => resources.read(tx, session, read.uri, read.options)));
     } catch (error) {
       if (role === "subscriber") throw resourceError(error);
       if (error instanceof CoreError || error instanceof ApplicationError && error.code === "not_found") throw new ResourceNotFoundError(params.uri, "resource not found");
