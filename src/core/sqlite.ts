@@ -78,7 +78,9 @@ export function openBoundary(db: Database): Boundary {
   const frame: CommitEffect[] = [];
   frames.push(frame);
   let open = true;
-  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i, 1); };
+  // Drops any savepoint frame left above it too (a body that returned without awaiting its savepoint): the
+  // transaction's end ends them.
+  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i); };
   return {
     commit() {
       if (!open) throw new Error("boundary already settled");
@@ -94,6 +96,38 @@ export function openBoundary(db: Database): Boundary {
       if (!open) return;
       pop();
       if (db.inTransaction) db.run("ROLLBACK");
+    },
+  };
+}
+
+// A savepoint inside the caller's own open transaction whose body may await (#807 P1c, the server's `Tx.savepoint`):
+// db.transaction's nested form can't stay open across an await. Its effects collect in their own frame: commit()
+// releases it and hands them to the enclosing frame (they run at the outer commit, not before); rollback() undoes the
+// savepoint's writes and drops them. Each settles it once.
+let savepoints = 0;
+export function openSavepoint(db: Database): Boundary {
+  const frames = effects.get(db);
+  if (!frames) throw new Error("openSavepoint: the connection doesn't track commits (openSqlite)");
+  if (!ownsTx(db) || !frames.length) throw new Error("openSavepoint: no open transaction of the caller's");
+  const name = `gb_sp_${++savepoints}`;
+  db.run(`SAVEPOINT ${name}`);
+  const frame: CommitEffect[] = [];
+  frames.push(frame);
+  let open = true;
+  // False when its transaction already ended (and dropped its frame): the savepoint went with it.
+  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i, 1); return i >= 0; };
+  return {
+    commit() {
+      if (!open) throw new Error("savepoint already settled");
+      if (!frames.includes(frame)) { open = false; throw new Error("savepoint outlived its transaction"); }
+      if (frames.at(-1) !== frame) throw new Error("savepoint commit out of order: an inner one is still open");
+      try { db.run(`RELEASE ${name}`); } catch (error) { this.rollback(); throw error; }
+      pop();
+      frames.at(-1)!.push(...frame);
+    },
+    rollback() {
+      if (!open) return;
+      if (pop() && db.inTransaction) { db.run(`ROLLBACK TO ${name}`); db.run(`RELEASE ${name}`); }
     },
   };
 }
