@@ -31,7 +31,7 @@ async function metadata(serverUrl: string): Promise<Metadata> {
   let res: Response;
   try { res = await fetch(`${u.origin}/.well-known/oauth-authorization-server${path}`, { signal: AbortSignal.timeout(10_000), redirect: "error" }); }
   catch (e) { throw new Error(`couldn't reach ${serverUrl} (${(e as Error).message})`); }
-  if (!res.ok) throw new Error(`${serverUrl} has no OAuth authorization server (HTTP ${res.status}); is it a grayboard server?`);
+  if (!res.ok) throw new Error(`${serverUrl} has no OAuth authorization server (HTTP ${res.status}): it isn't a grayboard server, or one older than v2.0.0, too old for this CLI's sign-in (upgrade it, or sign in with grayboard CLI v2.4.2)`);
   const m = await res.json().catch(() => ({})) as Partial<Metadata>;
   if (typeof m.issuer !== "string" || typeof m.authorization_endpoint !== "string" || typeof m.token_endpoint !== "string") throw new Error(`${serverUrl} sent malformed OAuth metadata`);
   // The endpoints must be this server's: the browser and the code go nowhere else.

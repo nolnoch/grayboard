@@ -65,6 +65,10 @@ test("a server whose metadata doesn't name grayboard-cli is refused as too old b
   await expect(loginThroughServer(as.issuer, () => { throw new Error("the browser opened"); })).rejects.toThrow("too old");
 });
 
+test("a server with no AS metadata (a v1.x server, or not grayboard) is named as possibly too old (#991)", async () => {
+  await expect(loginThroughServer(as.issuer + "/nowhere", () => { throw new Error("the browser opened"); })).rejects.toThrow("(HTTP 404): it isn't a grayboard server, or one older than v2.0.0");
+});
+
 test("metadata naming an endpoint on another origin is refused before the browser opens", async () => {
   for (const key of ["issuer", "authorization_endpoint", "token_endpoint"]) {
     const meta = { ...as.meta };
