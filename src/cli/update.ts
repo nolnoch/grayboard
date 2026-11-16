@@ -3,6 +3,7 @@ import { closeSync, constants, fchmodSync, lstatSync, openSync, readdirSync, ren
 import { basename, dirname, join } from "node:path";
 import { LOOPBACK } from "../shared/endpoint.ts";
 import { sha256Hex } from "../shared/hash.ts";
+import { cappedBody } from "../shared/capped_body.ts";
 import { HTTP_TIMEOUT_MS, describeFetchError, transferTimeoutMs } from "../shared/http.ts";
 import { RELEASE_TAG, SIG, SUMS, verifySums } from "../shared/release_verify.ts";
 
@@ -47,43 +48,13 @@ export async function get(url: string, what: string, ms: number, max: number, in
   let got: { status: number } | { body: Uint8Array<ArrayBuffer> | null };
   try {
     const res = await fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
-    got = res.ok ? { body: await capped(res, max) } : { status: res.status };
+    got = res.ok ? { body: await cappedBody(res, max) } : { status: res.status };
   } catch (e) {
     throw new Error(`couldn't fetch ${what} from ${url}: ${describeFetchError(e, ms)}`);
   }
   if ("status" in got) throw new Error(`couldn't fetch ${what} from ${url} (HTTP ${got.status})`);
   if (got.body === null) throw new Error(`${what} from ${url} is larger than ${max} bytes; not updating`);
   return got.body;
-}
-
-/** The body, or null once it's over `max` bytes (stated or streamed), having stopped reading. */
-async function capped(res: Response, max: number): Promise<Uint8Array<ArrayBuffer> | null> {
-  if (Number(res.headers.get("content-length") ?? NaN) > max) {
-    await res.body?.cancel();
-    return null;
-  }
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  if (res.body) {
-    const reader = res.body.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > max) {
-        await reader.cancel();
-        return null;
-      }
-      chunks.push(value);
-    }
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
 }
 
 /** A release version, `X.Y.Z[-pre]` with an optional leading `v`: a release tag or a `package.json` version. */
