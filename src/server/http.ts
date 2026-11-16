@@ -160,10 +160,17 @@ function whoami(authed: AuthedUser, repo: Repo): Response {
 // ── claims ────────────────────────────────────────────────────────────────────
 
 // For `grayboard claims`. Signed in as a user, not one handle, so a claim's
-// board, which a handle may not be able to see, is left out.
-function claimList(url: URL, db: CoreDb): Response {
+// board, which a handle may not be able to see, is left out, and a holder
+// whose name the user may not see (a team's alias, outside the team) is
+// withheld with its note, as claim_list does (#871).
+function claimList(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
   const prefix = url.searchParams.get("prefix") ?? undefined;
-  return json(listClaims(db, prefix).map(({ board: _b, ...c }) => c));
+  const principal = { kind: "user" as const, name: authed.user_email };
+  const sees = (holder: string): boolean => {
+    const a = repo.aliases.find(holder);
+    return !a || authorize(repo, {}, { verb: "alias.see", principal, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow;
+  };
+  return json(listClaims(db, prefix).map(({ board: _b, ...c }) => (sees(c.holder) ? c : { ...c, holder: null, note: null })));
 }
 
 // An address the caller may act as (#284 S11), in full, or the refusal: a
@@ -690,7 +697,7 @@ export async function handleHttp(
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
-  if (path === "/api/claims" && method === "GET") return claimList(url, db);
+  if (path === "/api/claims" && method === "GET") return claimList(url, authed, repo, db);
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);

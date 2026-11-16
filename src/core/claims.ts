@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, type Viewer } from "./boards.ts";
 import { addressParts } from "./addresses.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
@@ -32,10 +32,19 @@ function holderUser(db: Database, c: ClaimRow): string | undefined {
   return p?.kind === "alias" && p.scopeKind === "person" ? p.scope : undefined;
 }
 
+// A claim as a reader sees it: a holder whose name the reader may not see (a team's alias, outside the team,
+// #871) reads as held by nobody named, its note withheld with it, since a team's labels stay inside it (#284 S13).
+export type ClaimView = Omit<Claim, "holder"> & { holder: string | null };
+
+// Whether `seer` (a session ID or handle) may not see that `holder` exists (#348, #871).
+function holderHidden(db: Database, seer: string, holder: string): boolean {
+  return seenHandles(db, seer, [holder]).length === 0;
+}
+
 type ClaimChanges = { wake: string[]; boards: string[] };
 export type ClaimResult = ClaimChanges & (
   | { ok: true; claim: Claim; renewed: boolean }
-  | { ok: false; held_by: string; note: string | null; expires_at: number }
+  | { ok: false; held_by: string | null; note: string | null; expires_at: number }
 );
 
 const DEFAULT_TTL_MIN = 30;
@@ -141,7 +150,8 @@ export function claim(
     const renewed = !!cur && cur.expires_at > now && addresses.includes(cur.holder);
     if (cur && cur.expires_at > now && !renewed) {
       logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
-      return { ok: false, held_by: cur.holder, note: cur.note, expires_at: cur.expires_at, ...lapsed };
+      const hidden = holderHidden(db, opts.session ?? handle, cur.holder);
+      return { ok: false, held_by: hidden ? null : cur.holder, note: hidden ? null : cur.note, expires_at: cur.expires_at, ...lapsed };
     }
     const as = renewed ? cur.holder : handle;
     if (renewed && opts.ttl_minutes === undefined && opts.until === undefined) expires = Math.max(expires, cur.expires_at);
@@ -212,7 +222,7 @@ export function release(
       const releasedAt = releasedBy(db, key, addresses);
       if (releasedAt !== undefined) return { wake: [], boards: [], releasedAt };
       if (!active) throw new CoreError(`no active claim on "${key}"`);
-      throw new CoreError(`"${key}" is held by ${cur.holder}, not you`);
+      throw new CoreError(holderHidden(db, ctx.session ?? handle, cur.holder) ? `"${key}" is held by someone else` : `"${key}" is held by ${cur.holder}, not you`);
     }
     const as = cur.holder;
     db.prepare(`DELETE FROM claims WHERE key = ?`).run(key);
@@ -253,7 +263,7 @@ export function ackQueueClaim(db: Database, addresses: string[], key: string, no
 // its board: the update, release or expiry post @mentions you. Needs a claim with a board, which
 // is where that post goes. off: stop watching. A claim held by any of
 // `addresses` is yours.
-export function watch(db: Database, handle: string, keyInput: string, off = false, addresses: string[] = [handle]): string {
+export function watch(db: Database, handle: string, keyInput: string, off = false, addresses: string[] = [handle], seer: string = handle): string {
   const key = validKey(keyInput);
   if (off) {
     db.prepare(`DELETE FROM claim_watches WHERE key = ? AND handle = ?`).run(key, handle);
@@ -264,7 +274,7 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
   if (addresses.includes(cur.holder)) throw new CoreError(`you hold "${key}"`);
   if (!cur.board || !canSeeBoard(db, handle, cur.board)) {
     throw new CoreError(
-      `"${key}" isn't announced on a board you can see, so its end can't reach you; ask ${cur.holder} to renew it with board=`,
+      `"${key}" isn't announced on a board you can see, so its end can't reach you; ask ${holderHidden(db, seer, cur.holder) ? "its holder" : cur.holder} to renew it with board=`,
     );
   }
   db.prepare(`INSERT OR IGNORE INTO claim_watches (key, handle) VALUES (?, ?)`).run(key, handle);
@@ -272,15 +282,21 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
 }
 
 // Claims are visible to everyone on the bus. The announcing board's name is
-// hidden from handles that can't see that board.
-export function listClaims(db: Database, prefix?: string, viewer?: Viewer): Claim[] {
+// hidden from handles that can't see that board; with `seer` (a session ID or
+// handle), a holder it may not see is withheld with its note (#871).
+export function listClaims(db: Database, prefix?: string): Claim[];
+export function listClaims(db: Database, prefix: string | undefined, viewer: Viewer, seer?: string): ClaimView[];
+export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?: string): ClaimView[] {
   const rows = db
     .prepare(
       `SELECT ${CLAIM_COLS} FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
     )
     .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
-  return rows.map((c) => (c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c));
+  return rows.map((c) => {
+    const v: ClaimView = c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c;
+    return seer !== undefined && holderHidden(db, seer, c.holder) ? { ...v, holder: null, note: null } : v;
+  });
 }
 
 // Delete lapsed claims and say so on their boards. The holder never confirmed
