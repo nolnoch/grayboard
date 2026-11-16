@@ -41,11 +41,11 @@ test("#807: retention while another body holds the write queue waits, then prune
   const holder = hold(db);
   const ran = runRetention(repo, db, { messageRetentionDays: 1, auditRetentionDays: 1 } as Config);
   await ticks();
-  expect(repo.messages.getById(m.id)).toBeDefined();
+  expect(repo.messages.getById(repo.read, m.id)).toBeDefined();
   holder.release();
   await holder.done;
   await ran;
-  expect(repo.messages.getById(m.id)).toBeUndefined();
+  expect(repo.messages.getById(repo.read, m.id)).toBeUndefined();
 });
 
 test("#807: a server claim expiry timer's sweep waits behind another body holding the write queue", async () => {

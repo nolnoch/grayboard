@@ -354,7 +354,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo, db);
   if (handle instanceof Response) return handle;
-  const read = requestAttachment(repo, db, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
+  const read = requestAttachment(repo, repo.read, db, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
   if ("refused" in read) return jsonErr("not_found", read.refused, 404);
   const { row } = read;
   // Audited once the bytes are in hand, so a failed read isn't logged as a download.
@@ -367,11 +367,11 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
     if (e instanceof BlobMissing) return jsonErr("not_found", `attachment ${row.id}'s bytes are gone`, 404);
     throw e;
   }
-  return repo.write(() => {
+  return repo.write(tx => {
   guard?.();
   if (guard) {
     // A refusal here is a decision too (#851); the transaction returns, so its rows commit.
-    const current = requestAttachment(repo, db, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
+    const current = requestAttachment(repo, tx, db, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
     if ("refused" in current || current.row.sha256 !== row.sha256) return notFound();
   }
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });

@@ -178,6 +178,81 @@ test("#807 P1c-13: alias reads inside hosted bodies run on that body's Tx", asyn
   }
 });
 
+// #807 P1c-14b: the DM reads a hosted body makes (bind's undelivered notice, a send's parent and its
+// undelivered count, dm_history, dm_thread, dm_inbox, dm_ack, unbind's candidates and their last-seen) run on
+// that body's Tx; an unbound root's whoami lists its candidates on the pool, outside any body.
+// Every messages read and aliases.seen, recording the handle each was given and whether a body was open.
+function spyMessageReads() {
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const spy = <S extends object>(store: S, names: readonly (keyof S & string)[]) => names.map(name => {
+    const original = (store[name] as (...a: unknown[]) => unknown).bind(store);
+    return spyOn(store, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push({ op: name, inTxn: database.db.inTransaction, handle: r === database.repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  const spies = [
+    ...spy(database.repo.messages, ["getById", "writerUsers", "delegationIds", "bouncesFrom", "history", "thread", "unreadSince",
+      "queuedTo", "undeliveredFrom", "receivedUnacked", "sentPending", "openDelegations"] as const),
+    ...spy(database.repo.aliases, ["seen"] as const),
+  ];
+  return { checks, restore: () => { for (const s of spies) s.mockRestore(); } };
+}
+
+test("#807 P1c-14b: messages reads inside hosted bodies run on that body's Tx", async () => {
+  const { checks, restore } = spyMessageReads();
+  const a = context("p14-a"), b = context("p14-b");
+  try {
+    await hosted.bind(principal, a, { name: "p14a", create: true });
+    await hosted.bind(principal, b, { name: "p14b", create: true });
+    const sent = await hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, "p14b", "question", { pending: true })) as { message_id: number };
+    await hosted.run(principal, b, "dm_send", (session, tx) => application.send(tx, session, "p14a", "answer", { parent_id: sent.message_id }));
+    await hosted.run(principal, a, "dm_history", (session, tx) => application.history(tx, session, {}));
+    await hosted.run(principal, a, "dm_thread", (session, tx) => application.thread(tx, session, sent.message_id));
+    await hosted.run(principal, a, "dm_inbox", (session, tx) => application.inbox(tx, session));
+    await hosted.run(principal, a, "dm_ack", (session, tx) => application.acknowledgeDm(tx, session, sent.message_id));
+    const late = await hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, "p14b", "never mind")) as { message_id: number };
+    const retracted = checks.length;
+    await hosted.run(principal, a, "dm_retract", (session, tx) => application.retract(tx, session, late.message_id));
+    expect(checks.slice(retracted).map(c => `${c.op}:${c.handle}`)).toEqual(["getById:tx"]);
+    await hosted.run(principal, a, "board_create", (session, tx) => application.call(tx, session, "board_create", { name: "p14", purpose: "tests" }));
+    await hosted.run(principal, a, "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "p14", body: "x" }));
+    const read = checks.length;
+    await hosted.run(principal, a, "board_read", (session, tx) => application.call(tx, session, "board_read", { board: "p14" }));
+    expect(checks.slice(read).map(c => `${c.op}:${c.handle}`)).toEqual(["writerUsers:tx"]);
+    await hosted.bind(principal, a, { name: "p14a-2", create: true });
+    await hosted.unbind(principal, a, { name: "p14a-2" });
+    await hosted.unbind(principal, a, { name: "p14a" });
+    const inBody = new Set(checks.filter(c => c.inTxn).map(c => c.op));
+    for (const op of ["getById", "writerUsers", "history", "thread", "queuedTo", "undeliveredFrom", "receivedUnacked", "sentPending", "seen"]) expect(inBody).toContain(op);
+    const outside = checks.length;
+    await hosted.whoami(principal, a);
+    expect(checks.slice(outside).filter(c => c.op === "queuedTo" || c.op === "seen").map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["queuedTo:pool:false", "seen:pool:false"]);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { restore(); }
+});
+
+// #807 P1c-14b: a lease's pull reads on the pool; its receipt's unread check and the ack it records read on the receipt body's Tx.
+test("#807 P1c-14b: a delivery receipt's messages reads run on its body's Tx", async () => {
+  const { checks, restore } = spyMessageReads();
+  const a = context("p14-lease"), b = context("p14-sender");
+  try {
+    await hosted.bind(principal, a, { name: "p14r", create: true });
+    await hosted.bind(principal, b, { name: "p14s", create: true });
+    const lease = await delivery.open(principal, a);
+    await hosted.run(principal, b, "dm_send", (session, tx) => application.send(tx, session, "p14r", "hello"));
+    const pulled = checks.length;
+    const items = await delivery.pending(principal, a, lease.capability);
+    expect(items).toHaveLength(1);
+    expect(checks.slice(pulled).filter(c => c.op === "unreadSince").map(c => `${c.handle}:${c.inTxn}`)).toEqual(["pool:false"]);
+    const received = checks.length;
+    await delivery.receipt(principal, a, lease.capability, items.map(i => i.id));
+    const ops = checks.slice(received).map(c => `${c.op}:${c.handle}`);
+    expect(ops).toEqual(expect.arrayContaining(["unreadSince:tx", "getById:tx"]));
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { restore(); }
+});
+
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
   const invalidations: (string | null)[] = [];
