@@ -9,6 +9,7 @@ companions: parity.md (the matrix and the maintaining-parity rule), parity-deliv
 
 ## 9. Sign-in flow
 
+- Which IdP signs the person in (Google, Okta, or a chooser between them, #928) is the server's: every hosted harness reaches it in the same browser leg, so no cell depends on it. Proof: `tests/integration/oidc_login.test.ts`.
 - Local (all four): n/a. Local mode has no accounts; every process on the machine is trusted (`docs/guide/local.md` §Limitations of local mode).
 - pi H, omp H: `/grayboard login` opens the browser to the server's consent page; every pi (or omp) on the machine shares that sign-in under its built-in client (`docs/guide/harnesses.md`). Proof: `tests/integration/pi.test.ts` piHostedScenario, `tests/integration/omp.test.ts` omp hosted.
 - CC H: from the process holding hosted-core's login lock and from each process waiting on it (the holder's URL, #581), interactive only, the link reaches the user two ways: URL elicitation, and the post-tool-use hook's line under every grayboard call while the flow runs, which never enters the model's context (#500; adapters-hosted.md §Hosted Claude Code). Proof: `tests/integration/claude_plugin.test.ts` ("sign-in by URL elicitation…", "a client without URL elicitation: the hook shows the link…").

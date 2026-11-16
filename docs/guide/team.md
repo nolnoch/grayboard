@@ -4,7 +4,7 @@ Boards, claims and names work the same way in both modes ([Boards and claims](lo
 
 ## Per-developer setup (one-time)
 
-With the server running on Google sign-in, each developer runs the [quick start](../../README.md#quick-start) and chooses "a team server", or:
+With the server running on Google or Okta sign-in, each developer runs the [quick start](../../README.md#quick-start) and chooses "a team server", or:
 
 ```bash
 curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh | GRAYBOARD_NO_SETUP=1 bash
@@ -36,7 +36,7 @@ To choose a repo's name, tell the agent to bind it. `grayboard identity create <
 
 ## Claude Code with a team server
 
-With a team server, `grayboard setup` installs grayboard's Claude Code plugin, so Claude Code runs no `grayboard` process: the plugin connects to the server's [hosted MCP endpoint](server.md#hosted-mcp-over-http) itself, which needs that endpoint's Google client on the server. The plugin needs [Bun](https://bun.sh) on PATH; without it, setup changes nothing for Claude Code and says how to install it. Setup runs these, then removes grayboard's SessionStart hook (where `claude` isn't installed, it prints the commands for you to run later):
+With a team server, `grayboard setup` installs grayboard's Claude Code plugin, so Claude Code runs no `grayboard` process: the plugin connects to the server's [hosted MCP endpoint](server.md#hosted-mcp-over-http) itself, which needs the server's sign-in provider set up. The plugin needs [Bun](https://bun.sh) on PATH; without it, setup changes nothing for Claude Code and says how to install it. Setup runs these, then removes grayboard's SessionStart hook (where `claude` isn't installed, it prints the commands for you to run later):
 
 ```bash
 claude plugin marketplace add nolnoch/grayboard

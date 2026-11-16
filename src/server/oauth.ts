@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
 import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
-import type { Config } from "./config.ts";
+import { checkIdpConfig, type Config } from "./config.ts";
 import type { Repo } from "./db.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, LOGIN_SCOPE, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
@@ -22,7 +22,7 @@ export type OAuthOptions = {
   now?: () => number;
   cimd?: CimdOptions;
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
-  // Defaults to Google built from config. Exactly one until per-provider callbacks (#928).
+  // Defaults to the providers config lists (defaultProviders). Config's own checks never read this list (#928 D6).
   providers?: IdentityProvider[];
 };
 // The auth gate's keys for the caller: its address (/64 for IPv6) and, for
@@ -106,10 +106,12 @@ async function form(req: Request): Promise<URLSearchParams> {
 }
 
 export function createOAuthServer(repo: Repo, config: Config, options: OAuthOptions = {}) {
-  if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret)) throw new Error("dev auth must not coexist with a Google client secret");
+  checkIdpConfig(config);
   const providers = options.providers ?? defaultProviders(config);
-  if (providers.length !== 1) throw new Error("exactly one identity provider is supported");
-  const provider = providers[0]!, providerCallback = callbackPath(provider);
+  if (!providers.length || new Set(providers.map(p => p.id)).size !== providers.length || providers.some(p => !/^[a-z0-9-]{1,32}$/.test(p.id)))
+    throw new Error("identity providers need distinct, path-safe IDs");
+  const providerById = new Map(providers.map(p => [p.id, p]));
+  const providerByCallback = new Map(providers.map(p => [callbackPath(p), p]));
   const issuer = oauthPublicUrl(config.publicUrl, config.devAuth);
   const base = new URL(issuer);
   const prefix = base.pathname === "/" ? "" : base.pathname;
@@ -163,7 +165,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     }
     return { binding: found.get(cookiePrefix + "binding"), session: found.get(cookiePrefix + "session") };
   };
-  type Flow = { client: OAuthClient; state: string; csrf: string; expiresAt: number; upstream?: { stateHash: string; verifier: string; nonce: string } };
+  // `upstream.provider`: the provider this flow went to; only its callback path may complete it (#928 D7).
+  type Flow = { client: OAuthClient; state: string; csrf: string; expiresAt: number; upstream?: { provider: string; stateHash: string; verifier: string; nonce: string } };
   const flows = new Map<string, Flow>();
   const upstream = new Map<string, string>();
   const limiter = (limit: RateLimit, scope: string, maxKeys: number) => new RateLimiter(limit, {
@@ -204,7 +207,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
   const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("oauth.sweep", e); } }, 60_000);
   timer.unref();
-  const routes = ["/oauth/authorize", "/oauth/token", "/oauth/revoke", ...providers.map(callbackPath), "/oauth/consent", "/oauth/complete"];
+  const routes = ["/oauth/authorize", "/oauth/upstream", "/oauth/token", "/oauth/revoke", ...providers.map(callbackPath), "/oauth/consent", "/oauth/complete"];
   const routeName = (path: string) => routes.includes(path) ? path : "/oauth/unknown";
   // Token and revocation posts have their own address bucket and are charged
   // only when they present grant material and are refused (#283): a
@@ -281,6 +284,28 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     return redirect(url.href);
   };
   const returnToClient = (r: OAuthRequest, f: Flow, fields: Record<string, string>) => authorizationResponse(r.redirectUri, f.state, fields);
+  // A fresh upstream state, verifier and nonce for this flow, bound to `provider` (#928 D7). Choosing again replaces
+  // the flow's earlier upstream state, which then completes nothing. A provider that can't build its URL (the OIDC
+  // provider's discovery failed) ends the flow back at the client as temporarily_unavailable, so a waiting
+  // `grayboard login` reports it; the log keeps the error's class.
+  const toUpstream = async (id: string, f: Flow, provider: IdentityProvider, redirectUri: string): Promise<Response> => {
+    if (f.upstream) upstream.delete(f.upstream.stateHash);
+    const upstreamState = random(), verifier = random(), nonce = random();
+    f.upstream = { provider: provider.id, stateHash: hashToken(upstreamState), verifier, nonce };
+    upstream.set(f.upstream.stateHash, id);
+    try {
+      return redirect(await provider.authorizeUrl({ redirectUri: endpoint(callbackPath(provider)), state: upstreamState, nonce, challenge: challenge(verifier) }));
+    } catch (e) {
+      hostedFailure("oauth.upstream", e);
+      writeAudit(repo, "oauth.upstream_failed", null, null, { client_id: f.client.clientId, provider: provider.id });
+      upstream.delete(f.upstream.stateHash);
+      flows.delete(hashToken(id));
+      return authorizationResponse(redirectUri, f.state, { error: "temporarily_unavailable" });
+    }
+  };
+  // Several providers and no browser session: one link per provider, in config order, to /oauth/upstream.
+  const chooser = (id: string) => html(`<h1>Sign in to Grayboard</h1><ul>${providers.map(p =>
+    `<li><a href="${escapeHTML(endpoint("/oauth/upstream") + "?" + new URLSearchParams({ request: id, provider: p.id }))}">Sign in with ${escapeHTML(p.label)}</a></li>`).join("")}</ul>`);
   const consent = (req: Request, id: string): Response => {
     const { r, c } = getFlow(req, id);
     const sessionHash = c.session && hashToken(c.session);
@@ -369,17 +394,26 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       let response: Response;
       if (c.session && repo.oauth.findBrowserSession(hashToken(c.session), t)) {
         response = redirect(endpoint("/oauth/consent") + "?request=" + id);
+      } else if (providers.length === 1) {
+        response = await toUpstream(id, f, providers[0]!, redirectUri);
       } else {
-        const upstreamState = random(), verifier = random(), nonce = random();
-        f.upstream = { stateHash: hashToken(upstreamState), verifier, nonce };
-        upstream.set(f.upstream.stateHash, id);
-        response = redirect(await provider.authorizeUrl({ redirectUri: endpoint(providerCallback), state: upstreamState, nonce, challenge: challenge(verifier) }));
+        response = chooser(id);
       }
       response.headers.append("Set-Cookie", cookie("binding", binding, OAUTH_TTL.browser / 1000));
       writeAudit(repo, "oauth.authorize", null, null, { client_id: client.clientId });
       return response;
     }
-    if (path === providerCallback && req.method === "GET") {
+    if (path === "/oauth/upstream" && req.method === "GET") {
+      // The chooser's link: the flow is found through the binding cookie, as consent's is.
+      const p = parameters(u.search.slice(1), ["request", "provider"]);
+      const id = required(p, "request");
+      const provider = providerById.get(required(p, "provider"));
+      if (!provider) fail();
+      const { f, r } = getFlow(req, id);
+      return toUpstream(id, f, provider!, r.redirectUri);
+    }
+    const provider = req.method === "GET" ? providerByCallback.get(path) : undefined;
+    if (provider) {
       const p = parameters(u.search.slice(1), [...provider.callbackParams]);
       if (p.has("iss") && p.get("iss") !== provider.issuer) fail();
       const state = required(p, "state");
@@ -391,19 +425,23 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const upstreamFlow = f.upstream!;
       upstream.delete(stateHash);
       delete f.upstream;
+      // Each provider has its own redirect URI and the state names its provider (D7): a code that arrives on
+      // another provider's path is refused before any exchange, and its state is spent.
+      if (upstreamFlow.provider !== provider.id) fail();
       // From here the request is bound: a refusal goes back to the client (RFC 6749 §4.1.2.1), so `grayboard login` and
       // any other client can report it, with a fixed description per reason. The audit rows are as before.
       const refuse = (description?: string) => { flows.delete(r.requestHash); return returnToClient(r, f, description ? { error: "access_denied", error_description: errorDescription(description) } : { error: "access_denied" }); };
-      if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); return refuse(); }
+      if (p.has("error")) { writeAudit(repo, "oauth.upstream_denied", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(); }
       let identity: UpstreamIdentity;
-      try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(providerCallback) }); }
+      try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(callbackPath(provider)) }); }
       catch (e) {
         // The provider checked the email's domain (D1, D5); its refusal is audited as such.
-        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.domain); }
-        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider);
+        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.domain); }
+        // The log keeps the error's class, which names the failed stage for the OIDC provider (OidcDiscoveryError…).
+        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.upstream_failed", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider);
       }
       if (f.expiresAt <= now() || closed) fail();
-      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider); }
+      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider); }
       const signedIn = await repo.write(tx => idpSignIn(repo, tx, provider, identity!, { client_id: r.clientId }, providers));
       // idpSignIn's text names only the person's email(s), the provider labels and the admin's unlink-idp remedy.
       if ("refused" in signedIn) return refuse(signedIn.refused);
@@ -415,7 +453,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (created.status !== "ok") fail("temporarily_unavailable", 503);
       const response = redirect(endpoint("/oauth/consent") + "?request=" + id);
       response.headers.append("Set-Cookie", cookie("session", session, OAUTH_TTL.browser / 1000));
-      writeAudit(repo, "oauth.google_authenticated", user.email, null, { client_id: r.clientId });
+      writeAudit(repo, "oauth.upstream_authenticated", user.email, null, { client_id: r.clientId, provider: provider.id });
       return response;
     }
     if (path === "/oauth/consent" && req.method === "GET") {
