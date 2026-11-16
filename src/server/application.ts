@@ -312,7 +312,8 @@ function helloOkFields(hub: Hub, authed: AuthedUser): SessionFacts {
   return {
     user_email: authed.user_email,
     teams: repo.teams.listForUser(authed.user_id).map((t) => formatTeamAddress(t.name)),
-    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(authed.user_id) },
+    // Read committed: the link isn't written by any body this runs in.
+    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(repo.read, authed.user_id) },
     attachment_limits: repo.attachmentLimits,
   };
 }
@@ -705,11 +706,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Its alias, audit and binding row commit in one transaction through the write queue (#807 D4); the registry
   // changes after the commit, so a rolled-back attach leaves an earlier connection in place. `current` runs inside
   // that transaction: the bridge's checks went stale while the write waited (an unlink or stop queued ahead of it).
-  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: () => string | null): Promise<{ session: ApplicationSession; ok: HelloResult }> {
+  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
-    return repo.write(() => {
+    return repo.write(tx => {
       if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
-      const stale = current?.();
+      const stale = current?.(tx);
       if (stale) fail("unauthenticated", stale);
       if (!repo.aliases.find(addr)) {
         repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
@@ -1464,7 +1465,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   const online = (h: string) => hub.registry.get(h)?.active === true;
   // The human fallback's reachability is the server's own knowledge: the
   // bridge is running and this user is linked (#191).
-  const humanReachable = () => hub.slackRunning() && !!repo.slack.linkFor(authed.user_id);
+  const humanReachable = () => hub.slackRunning() && !!repo.slack.linkFor(tx, authed.user_id);
   const args = { to: to ?? null, persona: m.persona, task: m.task, context: m.context ?? null };
   // Where a refused send was headed, for its audit row.
   let picked: string | undefined;

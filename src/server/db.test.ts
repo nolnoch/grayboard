@@ -737,3 +737,37 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   expect(live()).toBeDefined();
   expect(() => o.findActiveAccess(kept, hashToken(issued.token), issued.binding.resource, [], issued.now)).toThrow(settled);
 });
+
+// #807 P1c-9: the Slack store runs on the handle it's given, as P1c-6's sessions do.
+test("#807 P1c-9: the Slack store runs on the handle it's given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const t = { thread_ts: "1.1", kind: "dm" as const, board: null, root_id: 1, peer: null, last_id: 1 };
+  const { kept, u } = await seed(repo, tx => {
+    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
+    repo.slack.link(tx, u.id, "U1", "D1");
+    repo.slack.addThread(tx, u.id, t);
+    repo.slack.setProgress(tx, u.id, "dm:1", { posted: true });
+    return { kept: tx, u };
+  });
+  const settled = /used after its transaction settled/;
+  const s = repo.slack;
+  expect(() => s.link(kept, u.id, "U2", "D2")).toThrow(settled);
+  expect(() => s.unlink(kept, u.id)).toThrow(settled);
+  expect(() => s.addThread(kept, u.id, { ...t, thread_ts: "2.2" })).toThrow(settled);
+  expect(() => s.advanceThread(kept, u.id, "1.1", 9)).toThrow(settled);
+  expect(() => s.setProgress(kept, u.id, "dm:1", { posted: false })).toThrow(settled);
+  expect(() => s.clearProgress(kept, u.id, "dm:1")).toThrow(settled);
+  expect(() => s.links(kept)).toThrow(settled);
+  expect(() => s.linkFor(kept, u.id)).toThrow(settled);
+  expect(() => s.linkBySlackUser(kept, "U1")).toThrow(settled);
+  expect(() => s.thread(kept, u.id, "dm", null, 1)).toThrow(settled);
+  expect(() => s.threadByTs(kept, u.id, "1.1")).toThrow(settled);
+  expect(() => s.progress(kept, u.id, "dm:1")).toThrow(settled);
+  expect(() => s.linkFor({} as Tx, u.id)).toThrow("not a SQLite store handle");
+  expect(s.links(repo.read)).toMatchObject([{ user_id: u.id, slack_user: "U1", dm_channel: "D1" }]);
+  expect(s.linkBySlackUser(repo.read, "U2")).toBeUndefined();
+  expect(s.threadByTs(repo.read, u.id, "1.1")?.last_id).toBe(1);
+  expect(s.thread(repo.read, u.id, "dm", null, 1)?.thread_ts).toBe("1.1");
+  expect(s.threadByTs(repo.read, u.id, "2.2")).toBeUndefined();
+  expect(s.progress(repo.read, u.id, "dm:1")).toEqual({ posted: true });
+});
