@@ -6,7 +6,8 @@ import { createApplication, type DeliverySink } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
-import { tokenSession } from "../../tests/support/token_session.ts";
+import { tokenSessionIn } from "../../tests/support/token_session.ts";
+import { seed } from "../../tests/support/seed.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
@@ -26,17 +27,16 @@ async function connect(user: AuthedUser, alias: string | null, opts: Constructor
   return s;
 }
 const isDirect = (e: { kind: string }) => e.kind === "direct";
-beforeEach(() => {
+beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-application-"));
   store = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(store.repo, store.db);
   const user = (email: string): AuthedUser => {
     const u = store.repo.users.upsertByEmail(email, null);
     // A session needs a live sign-in (#351).
-    return tokenSession(store.repo, { user_id: u.id, user_email: u.email });
+    return tokenSessionIn(store.repo, { user_id: u.id, user_email: u.email });
   };
-  alice = user("alice@example.com");
-  bob = user("bob@example.com");
+  [alice, bob] = await seed(store.repo, () => [user("alice@example.com"), user("bob@example.com")]);
 });
 afterEach(() => {
   application.stopExpiry();
@@ -429,7 +429,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
 });
 
 test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
-  const carol = tokenSession(store.repo, (u => ({ user_id: u.id, user_email: u.email }))(store.repo.users.upsertByEmail("carol@example.com", null)));
+  const carol = await seed(store.repo, () => { const u = store.repo.users.upsertByEmail("carol@example.com", null); return tokenSessionIn(store.repo, { user_id: u.id, user_email: u.email }); });
   const a = await connect(alice, "be");
   const b = await connect(bob, "fe");
   await connect(carol, "sim");
