@@ -119,6 +119,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "conformance-driver"
+version = "0.0.0"
+dependencies = [
+ "grayboard",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

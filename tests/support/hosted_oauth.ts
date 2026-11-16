@@ -14,7 +14,7 @@ import { TestServer } from "./server.ts";
 const SCOPES = ["grayboard:delivery", "grayboard:tools"];
 
 // A port nothing listens on: the server's public URL must name its port before it starts.
-function freePort(): number {
+export function freePort(): number {
   const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
   const port = probe.port!;
   probe.stop(true);

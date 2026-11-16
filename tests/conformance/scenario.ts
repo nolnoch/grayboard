@@ -25,11 +25,11 @@ export function conformance(family: string, scenarios: Scenario[]): void {
   });
   for (const make of DRIVERS) {
     const driver: Driver = make();
-    describe(`${family} [${driver.mode}]`, () => {
+    describe(`${family} [${driver.label}]`, () => {
       afterAll(() => driver.stop());
       for (const s of scenarios) {
         if (s.modes && !s.modes.includes(driver.mode)) {
-          skips.push(`${family} [${driver.mode}] ${s.name}: ${s.modes.join("/")} only${s.why ? ` (${s.why})` : ""}`);
+          skips.push(`${family} [${driver.label}] ${s.name}: ${s.modes.join("/")} only${s.why ? ` (${s.why})` : ""}`);
           test.skip(s.name, () => {});
           continue;
         }
@@ -58,7 +58,7 @@ export function conformance(family: string, scenarios: Scenario[]): void {
               await bus.close();
             } catch (e) {
               if (passed) throw e;
-              console.error(`conformance ${family} [${driver.mode}] ${s.name}: close failed after the scenario failed:`, e);
+              console.error(`conformance ${family} [${driver.label}] ${s.name}: close failed after the scenario failed:`, e);
             }
           }
         }, 30_000);

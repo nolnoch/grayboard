@@ -22,6 +22,9 @@
 #                                   rust-toolchain.toml names, fmt, clippy,
 #                                   cargo test, then its example against a real
 #                                   server (tests/integration/rust_sdk.test.ts)
+#                                   and the conformance suite through its
+#                                   driver (tests/conformance, hosted/rust)
+#                                   against the compiled server
 # Each run writes its run dir (GRAYBOARD_E2E_RUN_DIR, default
 # .e2e-runs/<suite>-<UTC time>): per bun test run, its output (.log) and JUnit
 # report (.xml), plus whatever the tests keep (tests/support/run_dir.ts), and
@@ -122,9 +125,14 @@ case "$suite" in
     # it installs the toolchain the directory's rust-toolchain.toml names.
     export PATH="$HOME/.cargo/bin:$PATH"
     cargo_log="$run/cargo.log"
-    if ! (cd sdk/rust && rustup toolchain install && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --locked --example roundtrip) 2>&1 | tee "$cargo_log"; then
+    if ! (cd sdk/rust && rustup toolchain install && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --locked --example roundtrip && cargo build --locked -p conformance-driver) 2>&1 | tee "$cargo_log"; then
       verdict "failed (cargo.log in the run dir)"
     fi
-    if GRAYBOARD_RUST_EXAMPLE="$root/sdk/rust/target/debug/examples/roundtrip" suite_run rust-sdk ./tests/integration/rust_sdk.test.ts; then verdict "passed"; else verdict "failed (rust-sdk.log in the run dir)"; fi
+    # The conformance driver's buses are the compiled server (dist/grayboard-server), a process each.
+    if ! bun run build 2>&1 | tee "$run/build.log"; then verdict "failed (build.log in the run dir)"; fi
+    failed=()
+    GRAYBOARD_RUST_EXAMPLE="$root/sdk/rust/target/debug/examples/roundtrip" suite_run rust-sdk ./tests/integration/rust_sdk.test.ts || failed+=(rust-sdk.log)
+    GRAYBOARD_RUST_DRIVER="$root/sdk/rust/target/debug/conformance-driver" suite_run conformance ./tests/conformance/ || failed+=(conformance.log)
+    if [ ${#failed[@]} -eq 0 ]; then verdict "passed"; else verdict "failed (${failed[*]} in the run dir)"; fi
     ;;
 esac

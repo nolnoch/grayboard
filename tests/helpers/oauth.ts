@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { hashToken, type AuthedUser } from "../../src/server/auth.ts";
-import type { Repo } from "../../src/server/db.ts";
+import { join, dirname } from "node:path";
+import { openDatabase, type Repo } from "../../src/server/db.ts";
 import { OAUTH_TTL, type OAuthResult } from "../../src/server/oauth-types.ts";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -34,4 +35,14 @@ export function rotateOAuth(repo: Repo, grant: Pick<ReturnType<typeof issueOAuth
     ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
   } }, now).status;
   return { access, refresh, status };
+}
+
+/** `issueOAuth` into the server database at `dbPath`, opened and closed here, for a server process started on it afterwards. */
+export function issueOAuthIn(dbPath: string, ...args: Parameters<typeof issueOAuth> extends [Repo, ...infer Rest] ? Rest : never) {
+  const { db, repo } = openDatabase(dbPath, { blobDir: join(dirname(dbPath), "blobs") });
+  try {
+    return issueOAuth(repo, ...args);
+  } finally {
+    db.close();
+  }
 }
