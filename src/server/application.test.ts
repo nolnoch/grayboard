@@ -265,8 +265,8 @@ test("unbound hosted reads never use the human address and still list and read b
   await seed(store.repo, async tx => {
     await application.call(tx, owner, "board_create", { name: "e2e", purpose: "fixture" });
     await application.call(tx, owner, "board_post", { board: "e2e", body: "hello" });
-    const team = store.repo.teams.create("private", bob.user_id);
-    store.repo.teams.addMember(team.id, bob.user_id);
+    const team = store.repo.teams.create(tx, "private", bob.user_id);
+    store.repo.teams.addMember(tx, team.id, bob.user_id);
   });
   const bobBe = (await connect(bob, "be", { key: "bob-secret" })).session;
   await seed(store.repo, tx => application.call(tx, bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" }));

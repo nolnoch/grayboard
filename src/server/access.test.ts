@@ -32,12 +32,12 @@ beforeEach(async () => {
     const wade = repo.users.upsertByEmail(tx, "wade@example.com", null);
     const bob = repo.users.upsertByEmail(tx, "bob@example.com", null);
     const eve = repo.users.upsertByEmail(tx, "eve@example.com", null);
-    const eng = repo.teams.create("eng", wade.id);
-    repo.teams.addMember(eng.id, wade.id);
-    repo.teams.addMember(eng.id, bob.id);
-    const ops = repo.teams.create("ops", eve.id);
-    repo.teams.addMember(ops.id, eve.id);
-    repo.teams.addMember(ops.id, wade.id);
+    const eng = repo.teams.create(tx, "eng", wade.id);
+    repo.teams.addMember(tx, eng.id, wade.id);
+    repo.teams.addMember(tx, eng.id, bob.id);
+    const ops = repo.teams.create(tx, "ops", eve.id);
+    repo.teams.addMember(tx, ops.id, eve.id);
+    repo.teams.addMember(tx, ops.id, wade.id);
     for (const [email, name] of [["wade@example.com", "be"], ["bob@example.com", "be"], ["bob@example.com", "qa"], ["eve@example.com", "be"]] as const) {
       repo.aliases.create(person(email, name), email);
     }
@@ -204,6 +204,6 @@ test("mayActIn: a user acts in its own person scope and its teams' scopes; servi
   expect(may(bob, "service", "ci")).toBe("service principals arrive with #270");
   expect(may({ kind: "service", name: "ci" }, "team", "eng")).toBe("service principals arrive with #270");
   expect(may({ kind: "team", name: "eng" }, "team", "eng")).toBe("eng is a team, not a user");
-  await seed(repo, () => repo.teams.removeMember(repo.teams.findByName("eng")!.id, repo.users.findByEmail("bob@example.com")!.id));
+  await seed(repo, (tx) => repo.teams.removeMember(tx, repo.teams.findByName("eng")!.id, repo.users.findByEmail("bob@example.com")!.id));
   expect(may(bob, "team", "eng")).toBe("bob@example.com isn't a member of team eng");
 });

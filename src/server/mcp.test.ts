@@ -118,9 +118,9 @@ async function unboundReader(mapped: boolean) {
   const owner = await connect();
   expect((await owner.callTool({ name: "board_create", arguments: { name: "general", purpose: "visible catalog" } })).isError).not.toBe(true);
   expect((await owner.callTool({ name: "board_post", arguments: { board: "general", body: "open hello" } })).isError).not.toBe(true);
-  await seed(store.repo, () => {
-    const team = store.repo.teams.create("private", user.user_id);
-    store.repo.teams.addMember(team.id, user.user_id);
+  await seed(store.repo, (tx) => {
+    const team = store.repo.teams.create(tx, "private", user.user_id);
+    store.repo.teams.addMember(tx, team.id, user.user_id);
   });
   expect((await owner.callTool({ name: "board_create", arguments: { name: "secret", purpose: "team only", team: "private" } })).isError).not.toBe(true);
   expect((await owner.callTool({ name: "board_post", arguments: { board: "secret", body: "team hello" } })).isError).not.toBe(true);

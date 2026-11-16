@@ -42,10 +42,10 @@ describe("reachesHuman", () => {
       const wade = repo.users.upsertByEmail(tx, "wade@example.com", null);
       const bob = repo.users.upsertByEmail(tx, "bob@example.com", null);
       repo.users.upsertByEmail(tx, "eve@example.com", null);
-      const eng = repo.teams.create("eng", wade.id);
-      repo.teams.addMember(eng.id, wade.id);
-      repo.teams.addMember(eng.id, bob.id);
-      repo.teams.create("ops", wade.id);
+      const eng = repo.teams.create(tx, "eng", wade.id);
+      repo.teams.addMember(tx, eng.id, wade.id);
+      repo.teams.addMember(tx, eng.id, bob.id);
+      repo.teams.create(tx, "ops", wade.id);
     });
   });
 

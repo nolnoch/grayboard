@@ -1069,10 +1069,10 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
   const repo = srv.app.repo;
   await seed(repo, tx => {
     const alice = repo.users.upsertByEmail(tx, "alice@example.com", null), bob = repo.users.findByEmail("bob@example.com")!;
-    const team = repo.teams.findByName("peers") ?? repo.teams.create("peers", alice.id);
-    repo.teams.addMember(team.id, alice.id, "owner");
-    repo.teams.addMember(team.id, bob.id);
-    repo.teams.setPolicy(team.id, "collaborative");
+    const team = repo.teams.findByName("peers") ?? repo.teams.create(tx, "peers", alice.id);
+    repo.teams.addMember(tx, team.id, alice.id, "owner");
+    repo.teams.addMember(tx, team.id, bob.id);
+    repo.teams.setPolicy(tx, team.id, "collaborative");
   });
   return { dir: home, reports, call, close: () => proxy.close() };
 }

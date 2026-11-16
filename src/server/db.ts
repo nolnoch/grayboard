@@ -258,24 +258,24 @@ export interface Repo {
   teams: {
     // Inserts the team's principal in the same transaction; throws
     // PrincipalTaken if another principal has the name.
-    create(name: string, createdBy: number): Team;
+    create(tx: Tx, name: string, createdBy: number): Team;
     findByName(name: string): Team | undefined;
     listForUser(userId: number): Team[];
     // Adds a member with an explicit role; an existing member is left as is
     // (false). Roles change through setRole.
-    addMember(teamId: number, userId: number, role?: TeamRole): boolean;
+    addMember(tx: Tx, teamId: number, userId: number, role?: TeamRole): boolean;
     // Both throw LastOwner rather than leave a team with members and no
     // owner (security audit F-02); the check and the write share one
     // transaction. A team that already has no owner isn't guarded.
-    removeMember(teamId: number, userId: number): void;
+    removeMember(tx: Tx, teamId: number, userId: number): void;
     // The member's previous role, or null when it isn't a member.
-    setRole(teamId: number, userId: number, role: TeamRole): TeamRole | null;
+    setRole(tx: Tx, teamId: number, userId: number, role: TeamRole): TeamRole | null;
     isOwner(teamId: number, userId: number): boolean;
     listMembers(teamId: number): { user_id: number; email: string; role: TeamRole }[];
     listMemberUserIds(teamId: number): number[];
     isMember(teamId: number, userId: number): boolean;
     // The previous policy, or null when the team is gone.
-    setPolicy(teamId: number, policy: TeamPolicy): TeamPolicy | null;
+    setPolicy(tx: Tx, teamId: number, policy: TeamPolicy): TeamPolicy | null;
     // Whether two users share a team whose policy is 'collaborative' or
     // 'delegating': the grant under which one's agents may wake the other's (#806).
     shareCollaborative(userA: number, userB: number): boolean;
@@ -837,7 +837,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // Refuses to take `userId`'s ownership away when it is the team's last
   // owner and other members remain. A sole member may leave; a team with
   // no owner (its creator left before roles existed) has nothing to guard.
-  const guardLastOwner = (teamId: number, userId: number): void => {
+  const guardLastOwner = (db: Database, teamId: number, userId: number): void => {
     const c = db.query<{ owners: number; members: number; me: number }, [number, number]>(
       `SELECT COALESCE(SUM(${OWNER_SQL}), 0) AS owners, COUNT(*) AS members,
               COALESCE(SUM(tm.user_id = ? AND ${OWNER_SQL}), 0) AS me
@@ -1128,7 +1128,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     teams: {
-      create(name, createdBy) {
+      create(tx, name, createdBy) {
+        const db = sqliteOf(tx);
         return db.transaction(() => {
           const now = clock();
           if (db.query<{ x: number }, [string]>("SELECT 1 AS x FROM principals WHERE name = ?").get(name)) throw new PrincipalTaken(name);
@@ -1147,25 +1148,28 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`,
         ).all(userId);
       },
-      addMember(teamId, userId, role = "member") {
+      addMember(tx, teamId, userId, role = "member") {
+        const db = sqliteOf(tx);
         return db.run(
           "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at, role) VALUES (?, ?, ?, ?)",
           [teamId, userId, clock(), role],
         ).changes > 0;
       },
-      removeMember(teamId, userId) {
+      removeMember(tx, teamId, userId) {
+        const db = sqliteOf(tx);
         db.transaction(() => {
-          guardLastOwner(teamId, userId);
+          guardLastOwner(db, teamId, userId);
           db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
         })();
       },
-      setRole(teamId, userId, role) {
+      setRole(tx, teamId, userId, role) {
+        const db = sqliteOf(tx);
         return db.transaction(() => {
           const row = db.query<{ owner: number }, [number, number]>(
             `SELECT ${OWNER_SQL} AS owner FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ?`,
           ).get(teamId, userId);
           if (!row) return null;
-          if (role === "member") guardLastOwner(teamId, userId);
+          if (role === "member") guardLastOwner(db, teamId, userId);
           db.run("UPDATE team_members SET role = ? WHERE team_id = ? AND user_id = ?", [role, teamId, userId]);
           return row.owner ? "owner" : "member";
         })();
@@ -1191,7 +1195,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           "SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?",
         ).get(teamId, userId);
       },
-      setPolicy(teamId, policy) {
+      setPolicy(tx, teamId, policy) {
+        const db = sqliteOf(tx);
         return db.transaction(() => {
           const row = db.query<{ policy: string }, [number]>("SELECT policy FROM teams WHERE id = ?").get(teamId);
           if (!row) return null;
