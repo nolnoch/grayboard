@@ -202,3 +202,26 @@ test("resetting the policy to open revokes the grant at the next pull", async ()
   await bfe.call("dm_send", { to: `${A}/be`, body: "revoked" });
   expect((await abe.next(dm("revoked"))).actionable).toBe(false);
 });
+
+// #855: the system's claim posts (a lapse's [expired], a session end's [release]) are written as the claimant's user,
+// so a key that @mentions another user's agent reaches it marked as any post of the claimant's would: other_user and
+// ungranted, not actionable. The claimant's own watcher still wakes.
+test("an expired claim's post @mentioning another user's agent arrives ungranted; the claimant's watcher wakes", async () => {
+  const abe = await srv.hosted(A, "be");
+  await abe.call("board_create", { name: "lobby", purpose: "general" });
+  const bfe = await srv.hosted(B, "fe");
+  const bqa = await srv.hosted(B, "qa");
+  const key = `deploy @${A}/be run it`;
+  await bfe.call("claim_take", { key, board: "lobby", ttl_minutes: 60 });
+  await bqa.call("claim_watch", { key });
+  await seed(srv.app.repo, () => srv.app.db.run("UPDATE claims SET expires_at = 1 WHERE key = ?", [key]));
+  // Any claim call sweeps the lapse.
+  await bfe.call("claim_list", {});
+  const expired = board((i) => i.kind === "push" && i.post.body.startsWith(`[expired] ${key}`));
+  const mentioned = await abe.next(expired);
+  expect(mentioned.actionable).toBe(false);
+  expect(ungranted(mentioned.event)).toBe(true);
+  const watcher = await bqa.next(expired);
+  expect(watcher.actionable).toBe(true);
+  expect(ungranted(watcher.event)).toBeUndefined();
+});

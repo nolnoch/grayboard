@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { storeAttachment } from "./attachments.ts";
 import { holdAlias } from "./bindings.ts";
 import { createBoard, ensureAlias, openAccess, post, registerId, setAccess, subscribe } from "./boards.ts";
-import { claim, sweepExpired, watch } from "./claims.ts";
+import { claim, listClaims, sweepExpired, watch } from "./claims.ts";
 import { CoreError } from "./errors.ts";
 import { assertDeliverableId, endSession } from "./session_end.ts";
 import { SqliteBlobs } from "../local/blobs.ts";
@@ -228,4 +228,35 @@ test("a claim whose release post fails is freed and recorded in id.ended", () =>
   ]);
   const detail = JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail);
   expect(detail.release_failed).toEqual([{ key: "ticket:ENG-4", error: "mention refused" }]);
+});
+
+// #855: the system's own claim posts (an expiry, a session end's release) record the claimant's user as their
+// writer, so a server marks them other_user/ungranted for another user's agent like the holder's own posts; a
+// claim from before holder_user falls back to an ID holder's principal. The user never reaches a claim's reader.
+test("expiry and session-end release posts carry the claimant's user; claim rows don't show it", () => {
+  const db = bus();
+  createBoard(db, "be", "work", "work items");
+  const writer = (key: string) => (db.prepare(`SELECT author_user FROM posts WHERE body LIKE ? ORDER BY id DESC LIMIT 1`).get(`%${key}%`) as { author_user: string | null }).author_user;
+  // An alias's claim lapses: the [expired] post is the claimant's user's.
+  const taken = claim(db, "be", "x @qa run the deploy", { board: "work", ttl_minutes: 60, user: "bob@example.com" });
+  expect(taken.ok && Object.keys(taken.claim)).toEqual(["key", "holder", "note", "board", "acquired_at", "expires_at"]);
+  db.prepare(`UPDATE claims SET expires_at = 1 WHERE key = 'x @qa run the deploy'`).run();
+  sweepExpired(db);
+  expect(writer("[expired] x @qa")).toBe("bob@example.com");
+  // An ID's claim released by its session end: the [release] post is the claimant's user's.
+  claim(db, ID, "ticket:ENG-7", { board: "work", ttl_minutes: 60, user: "bob@example.com" });
+  expect(listClaims(db).map(c => Object.keys(c))).toEqual([["key", "holder", "note", "board", "acquired_at", "expires_at"]]);
+  end(db, ID, Date.now());
+  expect(writer("[release] ticket:ENG-7")).toBe("bob@example.com");
+  // A claim from before the column: an ID holder's principal stands in.
+  db.prepare(`UPDATE ids SET principal = 'carol@example.com' WHERE id = ?`).run(OTHER);
+  claim(db, OTHER, "ticket:ENG-8", { board: "work", ttl_minutes: 60 });
+  db.prepare(`UPDATE claims SET holder_user = NULL, expires_at = 1 WHERE key = 'ticket:ENG-8'`).run();
+  sweepExpired(db);
+  expect(writer("[expired] ticket:ENG-8")).toBe("carol@example.com");
+  // ... else a person alias's person.
+  claim(db, "dave@example.com/fe", "ticket:ENG-9", { board: "work", ttl_minutes: 60 });
+  db.prepare(`UPDATE claims SET holder_user = NULL, expires_at = 1 WHERE key = 'ticket:ENG-9'`).run();
+  sweepExpired(db);
+  expect(writer("[expired] ticket:ENG-9")).toBe("dave@example.com");
 });
