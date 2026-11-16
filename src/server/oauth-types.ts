@@ -39,6 +39,10 @@ export interface OAuthStore {
   findCodeScopes(codeHash: string, clientId: string, resource: string, redirectUri: string, now: number): string[] | undefined;
   // codeChallenge must be freshly computed from the submitted verifier (S256); bound reuse revokes the family.
   redeemCode(input: OAuthAuthorization & { codeHash: string; grantId: string; grantExpiresAt: number; tokens: OAuthTokenPair }, now: number): OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>;
+  // A login code (scopes exactly LOGIN_SCOPE, #928 D8): consumes it and creates the CLI session in one transaction,
+  // with redeemCode's client, redirect, verifier and active-user checks. A spent one presented again revokes its
+  // session (replay). redeemCode refuses a login code, spent or not, and this refuses any other.
+  redeemLoginCode(input: OAuthAuthorization & { codeHash: string; tokenHash: string; label: string | null }, now: number): OAuthResult<{ sessionId: number; userId: number }>;
   // Resolves original scopes for an omitted refresh scope; rotation rechecks everything atomically.
   findRefreshGrant(refreshHash: string, clientId: string, resource: string, now: number): OAuthGrant | undefined;
   // input.scopes requests nonempty canonical access scopes within the original grant; tokens.scopes must match.
@@ -47,9 +51,9 @@ export interface OAuthStore {
   revokeToken(tokenHash: string, clientId: string, now: number): void;
   findActiveAccess(tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;
   isGrantActive(grantId: string, now: number): boolean;
-  // Once per database (#429): revokes every unrevoked grant, and drops every unredeemed code,
-  // under `clientIds` (the built-ins), audits each grant, then records the cutover so grants
-  // the built-ins issue later survive restarts. Returns the grants revoked; 0 after the first run.
-  revokePreBuiltinGrants(clientIds: readonly string[], now: number): number;
+  // Once per database and `key` (#429: builtin_clients; #928: builtin_clients_cli): revokes every unrevoked
+  // grant, and drops every unredeemed code, under `clientIds`, audits each grant, then records the cutover under
+  // `key` so grants those clients issue later survive restarts. Returns the grants revoked; 0 after the first run.
+  revokePreBuiltinGrants(clientIds: readonly string[], now: number, key?: "builtin_clients" | "builtin_clients_cli"): number;
   cleanup(now: number): void;
 }

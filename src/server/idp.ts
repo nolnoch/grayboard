@@ -27,6 +27,10 @@ export type IdentityProvider = {
   exchange(i: ExchangeInput): Promise<UpstreamIdentity>;
 };
 
+// A provider's refusal of a verified identity whose email is outside the org's domains (D5). The AS
+// audits it as oauth.domain_refused rather than as a failed exchange.
+export class DomainRefused extends Error {}
+
 export const callbackPath = (p: Pick<IdentityProvider, "id">) => `/oauth/${p.id}/callback`;
 
 // The providers a server signs in with when OAuthOptions.providers doesn't inject any: Google, with the client pair
@@ -41,7 +45,7 @@ export type SignInProvider = Pick<IdentityProvider, "id" | "label" | "issuer">;
 // Resolves a verified sign-in to its user by (issuer, subject) first (security
 // audit F-13, #928 D4), and audits a first link or a refusal. The issuer is the
 // provider's constant, never the token's. A refusal's text tells the person
-// signing in what an admin can do; `detail` joins each audit row, and `known`
+// signing in what an admin can do and reaches the OAuth client as its error_description; `detail` joins each audit row, and `known`
 // names the provider holding an email another issuer holds. Callers run it
 // inside repo.write.
 export function idpSignIn(
@@ -53,8 +57,10 @@ export function idpSignIn(
   const fix = (email: string) => `an admin runs grayboard admin unlink-idp --email ${email}`;
   if (r.status === "issuer_mismatch") {
     writeAudit(repo, "auth.subject_refused", identity.email, null, { reason: r.status, holding_issuer: r.issuer, ...audited });
-    const holder = known.find(p => p.issuer === r.issuer)?.label ?? r.issuer;
-    return { refused: `${identity.email} is linked to a ${holder} account, not ${provider.label}. If this ${provider.label} account should have it, ${fix(identity.email)}` };
+    // An unlisted holder isn't named by its issuer: this text reaches whichever client started the sign-in,
+    // and the audit row above keeps the issuer.
+    const holder = known.find(p => p.issuer === r.issuer)?.label;
+    return { refused: `${identity.email} is linked to ${holder ? `a ${holder}` : "another provider's"} account, not ${provider.label}. If this ${provider.label} account should have it, ${fix(identity.email)}` };
   }
   if (r.status === "subject_mismatch") {
     writeAudit(repo, "auth.subject_refused", identity.email, null, { reason: r.status, ...audited });

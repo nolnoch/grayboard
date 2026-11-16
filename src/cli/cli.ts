@@ -4,7 +4,7 @@ import { Command } from "commander";
 import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
-import { runOAuthFlow } from "./oauth_flow.ts";
+import { loginThroughServer } from "./oauth_flow.ts";
 import { UPGRADE_REFUSAL } from "../shared/protocol.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
@@ -310,44 +310,22 @@ async function login(serverUrl: string, devEmail?: string): Promise<void> {
     return;
   }
 
-  // Bootstrap: fetch the public OAuth config from the server. Env vars override
-  // for unusual setups (e.g. pointing the loopback flow at a different OAuth app
-  // than the server's own).
-  let googleClientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  let orgDomain      = process.env.GRAYBOARD_ORG_DOMAIN;
-  if (!googleClientId || !orgDomain) {
-    try {
-      const cfg = await client.get("/api/auth/config") as { google_client_id: string; org_domain: string };
-      googleClientId ??= cfg.google_client_id;
-      orgDomain      ??= cfg.org_domain;
-    } catch (e) {
-      handleApiError(e);
-    }
-  }
-  if (!googleClientId) {
-    console.error("Server did not return a google_client_id and GOOGLE_OAUTH_CLIENT_ID is not set.");
-    process.exit(1);
-  }
-
-  let oauthResult;
+  // Through the server's OAuth authorization server (#928 D8): the browser
+  // signs in with whatever IdP the server uses and approves grayboard-cli;
+  // the token endpoint answers with this CLI's API token.
+  let token: string;
+  try { token = await loginThroughServer(serverUrl); }
+  catch (e) { console.error(`Sign-in failed: ${(e as Error).message}`); process.exit(1); }
   try {
-    oauthResult = await runOAuthFlow(googleClientId, serverUrl, orgDomain);
-  } catch (e) { handleApiError(e); }
-
-  try {
-    const res = await client.post("/api/auth/exchange", {
-      code:          oauthResult.code,
-      code_verifier: oauthResult.codeVerifier,
-      redirect_uri:  oauthResult.redirectUri,
-    }) as { session_token: string; user_email: string };
-    writeCredentials({ session_token: res.session_token, server: serverUrl, user_email: res.user_email });
-    console.log(`Logged in as ${res.user_email}`);
+    const me = await new ApiClient(serverUrl, token).get("/api/whoami") as { email: string };
+    writeCredentials({ session_token: token, server: serverUrl, user_email: me.email });
+    console.log(`Logged in as ${me.email}`);
   } catch (e) { handleApiError(e); }
 }
 
 program
   .command("login")
-  .description("Authenticate with Google and store credentials")
+  .description("Sign in through the server in your browser and store credentials")
   .option("--dev <email>", "Dev-mode login (only works if server has GRAYBOARD_DEV_AUTH=1)")
   .option("--server <url>", "Server URL (or set GRAYBOARD_SERVER env var)")
   .action(async (opts: { dev?: string; server?: string }) => {

@@ -1,98 +1,109 @@
+// `grayboard login` as a client of the server's OAuth authorization server
+// (#928 D8): the client grayboard-cli, a loopback redirect on an ephemeral
+// port (RFC 8252), PKCE and state, the scope grayboard:login and no resource.
+// The server's token endpoint answers that code with the CLI's API token
+// (gbrd_v1_), which the credentials file holds as before. Which IdP the person
+// signs in with is the server's business, not this binary's.
 import { createHash, randomBytes } from "node:crypto";
 import { openBrowser } from "../shared/browser.ts";
 
-function base64url(buf: Buffer): string {
-  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-}
+// The server's constants (src/server/oauth-config.ts); the CLI doesn't import server code.
+const CLI_CLIENT_ID = "grayboard-cli";
+const LOGIN_SCOPE = "grayboard:login";
+const FLOW_MS = 5 * 60_000;
 
-function generateCodeVerifier(): string {
-  return base64url(randomBytes(64)).slice(0, 128);
-}
-
-function computeCodeChallenge(verifier: string): string {
-  return base64url(createHash("sha256").update(verifier).digest());
-}
-
-function generateState(): string {
-  return randomBytes(16).toString("hex");
-}
-
-export type OAuthResult = {
-  code: string;
-  codeVerifier: string;
-  redirectUri: string;
+// The server's words reach the terminal only as printable text: control characters (escape sequences
+// among them) become spaces, and the length is capped.
+const printable = (text: string, max = 300) => {
+  const clean = text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ").replace(/\s+/g, " ").trim();
+  return clean.length > max ? clean.slice(0, max) + "..." : clean;
 };
 
-/** Runs a PKCE loopback OAuth flow. Resolves with the authorization code. */
-export function runOAuthFlow(googleClientId: string, serverPublicUrl: string, orgDomain?: string): Promise<OAuthResult> {
-  return new Promise((resolve, reject) => {
-    const codeVerifier   = generateCodeVerifier();
-    const codeChallenge  = computeCodeChallenge(codeVerifier);
-    const state          = generateState();
+type Metadata = { issuer: string; authorization_endpoint: string; token_endpoint: string; code_challenge_methods_supported?: string[] };
 
-    let httpServer: ReturnType<typeof Bun.serve> | null = null;
+const page = (title: string) => new Response(`<!doctype html><meta charset="utf-8"><title>Grayboard</title><h1>${title}</h1><p>You may close this tab and return to your terminal.</p>`,
+  { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 
-    const timeout = setTimeout(() => {
-      httpServer?.stop();
-      reject(new Error("OAuth flow timed out (5 minutes)"));
-    }, 5 * 60 * 1000);
+// RFC 8414 §3: an issuer with a path has its metadata under the origin's well-known path.
+async function metadata(serverUrl: string): Promise<Metadata> {
+  const u = new URL(serverUrl);
+  const path = u.pathname.replace(/\/$/, "");
+  let res: Response;
+  try { res = await fetch(`${u.origin}/.well-known/oauth-authorization-server${path}`, { signal: AbortSignal.timeout(10_000), redirect: "error" }); }
+  catch (e) { throw new Error(`couldn't reach ${serverUrl} (${(e as Error).message})`); }
+  if (!res.ok) throw new Error(`${serverUrl} has no OAuth authorization server (HTTP ${res.status}); is it a grayboard server?`);
+  const m = await res.json().catch(() => ({})) as Partial<Metadata>;
+  if (typeof m.issuer !== "string" || typeof m.authorization_endpoint !== "string" || typeof m.token_endpoint !== "string") throw new Error(`${serverUrl} sent malformed OAuth metadata`);
+  // The endpoints must be this server's: the browser and the code go nowhere else.
+  for (const e of [m.issuer, m.authorization_endpoint, m.token_endpoint]) if (new URL(e).origin !== u.origin) throw new Error(`${serverUrl}'s OAuth metadata names another origin (${new URL(e).origin})`);
+  if (!m.code_challenge_methods_supported?.includes("S256")) throw new Error(`${serverUrl}'s OAuth server doesn't offer PKCE S256`);
+  return m as Metadata;
+}
 
-    httpServer = Bun.serve({
-      port: 0, // OS-assigned
-      fetch(req) {
-        const url = new URL(req.url);
-        if (url.pathname !== "/cb") return new Response("not found", { status: 404 });
-
-        const code  = url.searchParams.get("code");
-        const rxState = url.searchParams.get("state");
-        const error = url.searchParams.get("error");
-
-        if (error) {
-          httpServer?.stop();
-          clearTimeout(timeout);
-          reject(new Error(`OAuth error: ${error}`));
-          return new Response("<html><body>Login failed. You may close this tab.</body></html>", {
-            headers: { "Content-Type": "text/html" },
-          });
-        }
-
-        if (rxState !== state || !code) {
-          httpServer?.stop();
-          clearTimeout(timeout);
-          reject(new Error("Invalid OAuth callback (state mismatch)"));
-          return new Response("<html><body>Invalid callback. You may close this tab.</body></html>", {
-            headers: { "Content-Type": "text/html" },
-          });
-        }
-
-        const redirectUri = `http://127.0.0.1:${httpServer!.port}/cb`;
-        clearTimeout(timeout);
-
-        // Resolve before stopping so the response is sent first
-        setTimeout(() => httpServer?.stop(), 100);
-
-        resolve({ code, codeVerifier, redirectUri });
-        return new Response(
-          "<html><body><strong>Login successful!</strong> You may close this tab.</body></html>",
-          { headers: { "Content-Type": "text/html" } },
-        );
-      },
-    });
-
-    const redirectUri = `http://127.0.0.1:${httpServer.port}/cb`;
-    const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-    authUrl.searchParams.set("client_id",             googleClientId);
-    authUrl.searchParams.set("redirect_uri",          redirectUri);
-    authUrl.searchParams.set("response_type",         "code");
-    authUrl.searchParams.set("scope",                 "openid email profile");
-    if (orgDomain) authUrl.searchParams.set("hd", orgDomain);
-    authUrl.searchParams.set("code_challenge",        codeChallenge);
-    authUrl.searchParams.set("code_challenge_method", "S256");
-    authUrl.searchParams.set("state",                 state);
-    authUrl.searchParams.set("prompt",                "select_account");
-
-    console.log(`\nOpening browser for Google login...`);
-    console.log(`If the browser did not open, visit:\n${authUrl.toString()}\n`);
-    openBrowser(authUrl.toString());
+// Resolves with the loopback callback's parameters once a request carries this flow's state; a request with
+// another state is answered and ignored. Bound to 127.0.0.1 only: the redirect names it.
+function loopback(state: string): { redirectUri: string; result: Promise<URLSearchParams>; close(): Promise<void> } {
+  let settle!: (p: URLSearchParams) => void;
+  const result = new Promise<URLSearchParams>(resolve => { settle = resolve; });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req) {
+      const url = new URL(req.url);
+      if (req.method !== "GET" || url.pathname !== "/callback") return new Response("not found", { status: 404 });
+      if (url.searchParams.get("state") !== state) return new Response("Unknown sign-in", { status: 400 });
+      settle(url.searchParams);
+      return page(url.searchParams.has("code") && !url.searchParams.has("error") ? "Signed in to grayboard" : "Grayboard sign-in did not complete");
+    },
   });
+  // Stopped without force and awaited, so the page above reaches the browser before the CLI exits; a
+  // connection still open after a second is cut.
+  const close = async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([server.stop(), new Promise<void>(resolve => { timer = setTimeout(resolve, 1000); })]);
+    clearTimeout(timer);
+    void server.stop(true);
+  };
+  return { redirectUri: `http://127.0.0.1:${server.port}/callback`, result, close };
+}
+
+/** Signs in through `serverUrl`'s authorization server and returns the CLI's API token. `open` shows the
+ *  authorize URL (the system browser by default). */
+export async function loginThroughServer(serverUrl: string, open: (url: string) => void = url => openBrowser(url)): Promise<string> {
+  const meta = await metadata(serverUrl);
+  const verifier = randomBytes(32).toString("base64url"), state = randomBytes(16).toString("base64url");
+  const callback = loopback(state);
+  let params: URLSearchParams;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const url = new URL(meta.authorization_endpoint);
+    url.search = new URLSearchParams({ response_type: "code", client_id: CLI_CLIENT_ID, redirect_uri: callback.redirectUri, scope: LOGIN_SCOPE, state,
+      code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }).toString();
+    console.log(`\nOpening your browser to sign in to ${serverUrl}...`);
+    console.log(`If it did not open, visit:\n${url.href}\n`);
+    open(url.href);
+    params = await Promise.race([callback.result, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("sign-in timed out (5 minutes)")), FLOW_MS); })]);
+  } finally {
+    clearTimeout(timer);
+    await callback.close();
+  }
+  // RFC 9207: the response names its issuer, so another server's code can't land here.
+  if (params.get("iss") !== meta.issuer) throw new Error("sign-in response came from an unexpected issuer");
+  const error = params.get("error");
+  if (error !== null) {
+    if (error !== "access_denied") throw new Error(`sign-in failed (${printable(error)})`);
+    const description = printable(params.get("error_description") ?? "");
+    throw new Error(description ? `sign-in was refused: ${description}` : "sign-in was denied");
+  }
+  const code = params.get("code");
+  if (!code) throw new Error("sign-in response carried no code");
+  let res: Response;
+  try {
+    res = await fetch(meta.token_endpoint, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, redirect: "error", signal: AbortSignal.timeout(10_000),
+      body: new URLSearchParams({ grant_type: "authorization_code", client_id: CLI_CLIENT_ID, code, code_verifier: verifier, redirect_uri: callback.redirectUri }) });
+  } catch (e) { throw new Error(`couldn't reach ${serverUrl}'s token endpoint (${(e as Error).message})`); }
+  const body = await res.json().catch(() => ({})) as { access_token?: unknown; error?: unknown };
+  if (res.status !== 200) throw new Error(`the server refused the sign-in code (HTTP ${res.status}${typeof body.error === "string" ? `: ${printable(body.error)}` : ""})`);
+  if (typeof body.access_token !== "string" || !body.access_token.startsWith("gbrd_v1_")) throw new Error("the server's token response carried no grayboard token");
+  return body.access_token;
 }

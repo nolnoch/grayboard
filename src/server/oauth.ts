@@ -1,13 +1,13 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { hashToken, type AuthedUser } from "./auth.ts";
-import { callbackPath, defaultProviders, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
+import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
+import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
-import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
+import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, LOGIN_SCOPE, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
-import { writeAudit } from "./audit.ts";
+import { userAgent, writeAudit } from "./audit.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isTrustedOrigin } from "./origin.ts";
@@ -36,6 +36,14 @@ class OAuthError extends Error {
   constructor(readonly error: string, readonly status = 400) { super(error); }
 }
 function fail(error = "invalid_request", status = 400): never { throw new OAuthError(error, status); }
+// error_description texts for a refusal after the request is bound (#928): fixed, since they reach any client.
+export const REFUSED = {
+  domain: "this account's domain isn't allowed on this server",
+  provider: "sign-in with the provider failed",
+  disabled: "this account is disabled on this server",
+} as const;
+// RFC 6749 §4.1.2.1: error_description is %x20-21 / %x23-5B / %x5D-7E.
+const errorDescription = (text: string) => text.replace(/[^\x20-\x21\x23-\x5b\x5d-\x7e]/g, "?").slice(0, 300);
 const headers = { "Cache-Control": "no-store", Pragma: "no-cache", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff" };
 const json = (data: unknown, status = 200, extra: Record<string, string> = {}) => Response.json(data, { status, headers: { ...headers, ...extra } });
 const html = (body: string, status = 200, callbackOrigin?: string) => new Response(`<!doctype html><html><meta charset="utf-8"><title>Grayboard authorization</title><body>${body}</body></html>`, {
@@ -58,11 +66,14 @@ const required = (p: URLSearchParams, key: string) => p.get(key) || fail();
 const optional = (p: URLSearchParams, key: string) => p.get(key) || null;
 const recognized = (p: URLSearchParams, keys: string[]) => new URLSearchParams([...p].filter(([k]) => keys.includes(k)));
 const withoutEmpty = (p: URLSearchParams) => new URLSearchParams([...p].filter(([, v]) => v !== ""));
+// LOGIN_SCOPE is recognized here and only alone (#928 D8, R3); the caller's per-client check
+// (client.scopes.includes) then refuses it for every client but grayboard-cli.
 function scopes(raw: string | null, defaults?: string[]): string[] {
   if (raw === null && defaults) return [...defaults];
   if (!raw || !/^[a-zA-Z0-9:_-]+(?: [a-zA-Z0-9:_-]+)*$/.test(raw)) fail("invalid_scope");
   const list = raw!.split(" ");
-  if (new Set(list).size !== list.length || list.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s))) fail("invalid_scope");
+  if (new Set(list).size !== list.length || list.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s) && s !== LOGIN_SCOPE)) fail("invalid_scope");
+  if (list.includes(LOGIN_SCOPE) && list.length > 1) fail("invalid_scope");
   return list.sort();
 }
 async function form(req: Request): Promise<URLSearchParams> {
@@ -106,13 +117,16 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const endpoint = (path: string) => issuer + path;
   const metadataPath = "/.well-known/oauth-protected-resource" + prefix + "/mcp";
   const resourceMetadata = base.origin + metadataPath;
-  // Built-ins first; parseOAuthClients refuses an operator entry that reuses a built-in ID.
-  const clients = new Map([...BUILTIN_CLIENTS, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
+  // Built-ins and the CLI first; parseOAuthClients refuses an operator entry that reuses one of their IDs.
+  const clients = new Map([...BUILTIN_CLIENTS, CLI_CLIENT, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
   // Before any request, and only once the config parsed: a grant an operator client issued
   // under a now-built-in ID (before #429) would otherwise act as a built-in's.
   const revoked = repo.writeNow(() => repo.oauth.revokePreBuiltinGrants(BUILTIN_CLIENT_IDS, now()));
   if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
+  // The same once for grayboard-cli (#928 D8), under its own key: the cutover above already ran on most databases.
+  const revokedCli = repo.writeNow(() => repo.oauth.revokePreBuiltinGrants([CLI_CLIENT_ID], now(), "builtin_clients_cli"));
+  if (revokedCli) console.error(`[grayboard] revoked ${revokedCli} OAuth grant(s) issued under ${CLI_CLIENT_ID} before this server reserved it for CLI sign-in`);
   const cimd = createCimdResolver({ ...options.cimd, now });
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
   // redirects that authorize errors follow, and a name the consent page shows.
@@ -280,7 +294,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     // A metadata-document client is known by its host; the name in its document is its own claim.
     const host = clients.has(client.clientId) ? undefined : new URL(client.clientId).host;
     const headline = host ? `<h1>Authorize ${escapeHTML(host)}</h1><p>This client calls itself ${escapeHTML(client.name)}; that name is self-declared.</p>` : `<h1>Authorize ${escapeHTML(client.name)}</h1>`;
-    return html(`${headline}<p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`, 200, new URL(r.redirectUri).origin);
+    // A login code mints a CLI token, not access to the resource it's stored with (#928 D8).
+    const grants = r.scopes.includes(LOGIN_SCOPE) ? "<p>Grants: a grayboard CLI sign-in (an API token on this machine)</p>" : `<p>Resource: ${escapeHTML(r.resource)}</p>`;
+    return html(`${headline}<p>Account: ${escapeHTML(user.email)}</p>${grants}<p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`, 200, new URL(r.redirectUri).origin);
   };
 
   async function route(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
@@ -375,16 +391,24 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const upstreamFlow = f.upstream!;
       upstream.delete(stateHash);
       delete f.upstream;
-      if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); flows.delete(r.requestHash); return returnToClient(r, f, { error: "access_denied" }); }
+      // From here the request is bound: a refusal goes back to the client (RFC 6749 §4.1.2.1), so `grayboard login` and
+      // any other client can report it, with a fixed description per reason. The audit rows are as before.
+      const refuse = (description?: string) => { flows.delete(r.requestHash); return returnToClient(r, f, description ? { error: "access_denied", error_description: errorDescription(description) } : { error: "access_denied" }); };
+      if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); return refuse(); }
       let identity: UpstreamIdentity;
       try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(providerCallback) }); }
-      catch (e) { hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
+      catch (e) {
+        // The provider checked the email's domain (D1, D5); its refusal is audited as such.
+        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.domain); }
+        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider);
+      }
       if (f.expiresAt <= now() || closed) fail();
-      if (!isValidEmail(identity!.email) || identity!.email.split("@")[1] !== config.orgDomain) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
+      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider); }
       const signedIn = await repo.write(() => idpSignIn(repo, provider, identity!, { client_id: r.clientId }, providers));
-      if ("refused" in signedIn) fail("access_denied", 403);
+      // idpSignIn's text names only the person's email(s), the provider labels and the admin's unlink-idp remedy.
+      if ("refused" in signedIn) return refuse(signedIn.refused);
       const { user } = signedIn;
-      if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); fail("access_denied", 403); }
+      if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); return refuse(REFUSED.disabled); }
       const session = random(), t = now();
       const created = await repo.write(() => repo.oauth.createBrowserSession({ sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
         c.session && hashToken(c.session)));
@@ -461,15 +485,24 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           const verifier = required(p, "code_verifier");
           if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) fail("invalid_grant");
           const codeHash = hashToken(required(p, "code")), redirectUri = required(p, "redirect_uri");
+          const sessionToken = mintToken();
           // The code's scopes are read in the redemption's transaction. A refusal before the redemption writes
-          // nothing; the redemption's own (a replay revokes the grant) commits and is checked after.
-          result = await repo.write(() => {
+          // nothing; the redemption's own (a replay revokes the grant or session) commits and is checked after.
+          // The stored code's scopes alone pick the redemption: a login code becomes a CLI session (#928 D8).
+          const redeemed = await repo.write(() => {
             const selected = repo.oauth.findCodeScopes(codeHash, client.clientId, resource, redirectUri, t) ?? [];
             if (!selected.length) fail("invalid_grant");
             if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
-            return repo.oauth.redeemCode({ clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash,
-              grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected) }, t);
+            const authorization = { clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash };
+            if (selected.includes(LOGIN_SCOPE)) return { login: repo.oauth.redeemLoginCode({ ...authorization, tokenHash: hashToken(sessionToken), label: userAgent(req) }, t) };
+            return { grant: repo.oauth.redeemCode({ ...authorization, grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected) }, t) };
           });
+          if (redeemed.login) {
+            if (redeemed.login.status !== "ok") { if (redeemed.login.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
+            // The CLI's API token (verifySessionToken), not an OAuth access token: no expiry, no refresh.
+            return json({ access_token: sessionToken, token_type: "Bearer", scope: LOGIN_SCOPE });
+          }
+          result = redeemed.grant!;
         } else {
           if (!client.allowRefresh) fail("invalid_grant");
           const refreshHash = hashToken(required(p, "refresh_token"));
