@@ -3,7 +3,7 @@
 use crate::credential::Credential;
 use crate::error::AuthError;
 use crate::transport::Timeouts;
-use crate::{Client, ClientInfo, Delivery, Error, StaticBearer};
+use crate::{Client, ClientInfo, DeliveryMode, Error, StaticBearer};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -14,49 +14,53 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[derive(Debug, Clone)]
-struct Req {
-    headers: HashMap<String, String>,
-    body: Value,
+pub(crate) struct Req {
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Value,
 }
 
 impl Req {
-    fn method(&self) -> &str {
+    pub(crate) fn method(&self) -> &str {
         self.body["method"].as_str().unwrap_or("")
     }
-    fn id(&self) -> Value {
+    pub(crate) fn id(&self) -> Value {
         self.body["id"].clone()
     }
 }
 
 /// A reply: status, headers, then body chunks, each after its delay. `hold` keeps the connection open afterwards for that long.
-struct Reply {
+pub(crate) struct Reply {
     status: u16,
     headers: Vec<(&'static str, String)>,
     chunks: Vec<(Duration, Vec<u8>)>,
     hold: Duration,
+    /// After `chunks`, each chunk sent here is written as it comes; the connection closes when every sender is gone.
+    live: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 impl Reply {
-    fn json(value: Value) -> Self {
+    pub(crate) fn json(value: Value) -> Self {
         Self {
             status: 200,
             headers: vec![("content-type", "application/json".into())],
             chunks: vec![(Duration::ZERO, value.to_string().into_bytes())],
             hold: Duration::ZERO,
+            live: None,
         }
     }
-    fn result(req: &Req, result: Value) -> Self {
+    pub(crate) fn result(req: &Req, result: Value) -> Self {
         Self::json(json!({"jsonrpc": "2.0", "id": req.id(), "result": result}))
     }
-    fn status(status: u16, body: &str) -> Self {
+    pub(crate) fn status(status: u16, body: &str) -> Self {
         Self {
             status,
             headers: vec![("content-type", "text/plain".into())],
             chunks: vec![(Duration::ZERO, body.as_bytes().to_vec())],
             hold: Duration::ZERO,
+            live: None,
         }
     }
-    fn sse(events: Vec<(Duration, String)>, hold: Duration) -> Self {
+    pub(crate) fn sse(events: Vec<(Duration, String)>, hold: Duration) -> Self {
         Self {
             status: 200,
             headers: vec![("content-type", "text/event-stream".into())],
@@ -65,11 +69,28 @@ impl Reply {
                 .map(|(d, e)| (d, e.into_bytes()))
                 .collect(),
             hold,
+            live: None,
         }
+    }
+    pub(crate) fn with_status(mut self, status: u16) -> Self {
+        self.status = status;
+        self
+    }
+    /// An event stream: `first`, then whatever `live` sends, until its senders are gone.
+    pub(crate) fn live(
+        first: Vec<String>,
+        live: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Self {
+        let mut reply = Self::sse(
+            first.into_iter().map(|e| (Duration::ZERO, e)).collect(),
+            Duration::ZERO,
+        );
+        reply.live = Some(live);
+        reply
     }
 }
 
-fn event(message: Value) -> String {
+pub(crate) fn event(message: Value) -> String {
     format!("event: message\ndata: {message}\n\n")
 }
 
@@ -82,14 +103,14 @@ fn discover(req: &Req) -> Reply {
 
 type Handler = Arc<dyn Fn(&Req, usize) -> Reply + Send + Sync>;
 
-struct Fake {
-    url: String,
+pub(crate) struct Fake {
+    pub(crate) url: String,
     requests: Arc<Mutex<Vec<Req>>>,
 }
 
 impl Fake {
     /// `handler` gets each non-discover request and its index among them; discover is answered as a current server would unless `handle_discover`.
-    async fn start(
+    pub(crate) async fn start(
         handle_discover: bool,
         handler: impl Fn(&Req, usize) -> Reply + Send + Sync + 'static,
     ) -> Self {
@@ -134,6 +155,13 @@ impl Fake {
                             return;
                         }
                     }
+                    if let Some(mut live) = reply.live {
+                        while let Some(chunk) = live.recv().await {
+                            if socket.write_all(&chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                     tokio::time::sleep(reply.hold).await;
                     let _ = socket.shutdown().await;
                 });
@@ -142,7 +170,7 @@ impl Fake {
         Self { url, requests }
     }
 
-    fn requests(&self) -> Vec<Req> {
+    pub(crate) fn requests(&self) -> Vec<Req> {
         self.requests.lock().unwrap().clone()
     }
     fn calls(&self, method: &str) -> Vec<Req> {
@@ -188,11 +216,15 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Req> {
     Some(Req { headers, body })
 }
 
-fn fast() -> Timeouts {
+pub(crate) fn fast() -> Timeouts {
     Timeouts {
         request: Duration::from_millis(500),
         listen_ack: Duration::from_millis(500),
         listen_idle: Duration::from_millis(1500),
+        renew: Duration::from_secs(10),
+        backoff_unit: Duration::from_millis(5),
+        backoff_max: Duration::from_millis(40),
+        throttle_unit: Duration::from_millis(5),
     }
 }
 
@@ -207,7 +239,7 @@ fn client(fake: &Fake) -> Client {
 }
 
 fn session(fake: &Fake) -> crate::Session {
-    client(fake).session("s-1", Delivery::push("rust-sdk-test").unwrap())
+    client(fake).session("s-1", DeliveryMode::push("rust-sdk-test").unwrap())
 }
 
 fn ok_text(req: &Req) -> Reply {
@@ -346,7 +378,7 @@ async fn admission_429_retries_with_a_fresh_token_read() {
         .unwrap()
         .with_timeouts(fast());
     let r = c
-        .session("s-1", Delivery::push("t").unwrap())
+        .session("s-1", DeliveryMode::push("t").unwrap())
         .call_raw("board_post", json!({}))
         .await
         .unwrap();
@@ -413,7 +445,7 @@ async fn a_401_lets_the_credential_replace_its_token_once() {
         .with_timeouts(fast());
     // discover is refused with the stale token, rotated, then everything uses the fresh one.
     let r = c
-        .session("s-1", Delivery::push("t").unwrap())
+        .session("s-1", DeliveryMode::push("t").unwrap())
         .call_raw("board_post", json!({}))
         .await
         .unwrap();
@@ -449,7 +481,7 @@ async fn connect_failure_is_unreachable_even_for_a_write() {
         .unwrap()
         .with_timeouts(fast());
     let err = c
-        .session("s", Delivery::push("t").unwrap())
+        .session("s", DeliveryMode::push("t").unwrap())
         .call_raw("board_post", json!({}))
         .await
         .unwrap_err();
@@ -565,7 +597,7 @@ async fn tools_list_follows_pagination() {
     assert_eq!(names, [json!("a"), json!("b")]);
 }
 
-fn listen_reply(
+pub(crate) fn listen_reply(
     req: &Req,
     honored: &[&str],
     then: Vec<(Duration, String)>,
@@ -581,7 +613,7 @@ fn listen_reply(
     Reply::sse(events, hold)
 }
 
-fn hint() -> String {
+pub(crate) fn hint() -> String {
     event(
         json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": "grayboard://inbox"}}),
     )
@@ -605,6 +637,7 @@ async fn listen_delivers_hints_through_keepalives_and_closes_with_cancelled() {
             headers: vec![],
             chunks: vec![],
             hold: Duration::ZERO,
+            live: None,
         },
     })
     .await;
@@ -636,6 +669,7 @@ async fn listen_requires_the_uri_in_the_honored_filter() {
             headers: vec![],
             chunks: vec![],
             hold: Duration::ZERO,
+            live: None,
         },
     })
     .await;
@@ -744,7 +778,7 @@ async fn a_token_that_is_not_a_header_value_is_an_auth_error_and_nothing_is_sent
     )
     .unwrap()
     .with_timeouts(fast())
-    .session("s-1", Delivery::push("rust-sdk-test").unwrap());
+    .session("s-1", DeliveryMode::push("rust-sdk-test").unwrap());
     let write = s.call_raw("board_post", json!({})).await.unwrap_err();
     assert!(matches!(write, Error::Auth(_)), "{write:?}");
     assert!(matches!(s.list_tools().await, Err(Error::Auth(_))));
@@ -772,7 +806,7 @@ async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout() {
     )
     .unwrap()
     .with_timeouts(fast())
-    .session("s-1", Delivery::push("rust-sdk-test").unwrap());
+    .session("s-1", DeliveryMode::push("rust-sdk-test").unwrap());
     let err = tokio::time::timeout(Duration::from_secs(3), s.call_raw("board_post", json!({})))
         .await
         .expect("the credential's token call is bounded")
@@ -868,6 +902,7 @@ async fn requests_match_the_reference_clients_recording() {
             headers: vec![],
             chunks: vec![],
             hold: Duration::ZERO,
+            live: None,
         },
     })
     .await;
@@ -883,7 +918,7 @@ async fn requests_match_the_reference_clients_recording() {
     .with_timeouts(fast());
     let s = client.session(
         fixture["session"].as_str().unwrap(),
-        Delivery::push(fixture["source"].as_str().unwrap()).unwrap(),
+        DeliveryMode::push(fixture["source"].as_str().unwrap()).unwrap(),
     );
     let mut seen = 0;
     let mut took = |name: &str| {

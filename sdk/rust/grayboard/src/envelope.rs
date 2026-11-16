@@ -7,6 +7,8 @@ use serde_json::{Map, Value, json};
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 pub(crate) const SESSION_META: &str = "io.github.nolnoch.grayboard/sessionID";
 pub(crate) const DELIVERY_META: &str = "io.github.nolnoch.grayboard/delivery";
+/// A native result's `_meta` marker: the server took one of the session's holds (#453; `src/shared/session_meta.ts`).
+pub(crate) const ALIAS_LOST_META: &str = "io.github.nolnoch.grayboard/alias_lost";
 
 /// Who is calling, sent as `clientInfo` on every request.
 #[derive(Debug, Clone, Serialize)]
@@ -26,12 +28,12 @@ impl ClientInfo {
 
 /// The delivery declaration native requests carry: push, with `source` naming the session's own subscriber. A push-mode `bind` depends on it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct Delivery {
+pub struct DeliveryMode {
     mode: &'static str,
     source: String,
 }
 
-impl Delivery {
+impl DeliveryMode {
     /// `source` must match `^[a-z0-9][a-z0-9:._-]{0,63}$` (the server's rule, `src/server/hosted.ts`).
     pub fn push(source: impl Into<String>) -> Result<Self, crate::Error> {
         let source = source.into();
@@ -56,7 +58,7 @@ impl Delivery {
 /// The `_meta` every request carries, merged under any `_meta` the request names itself.
 pub(crate) fn request_meta(
     session: &str,
-    delivery: Option<&Delivery>,
+    delivery: Option<&DeliveryMode>,
     info: &ClientInfo,
 ) -> Map<String, Value> {
     let mut meta = Map::new();
@@ -243,11 +245,11 @@ mod tests {
 
     #[test]
     fn delivery_source_rule() {
-        assert!(Delivery::push("rust-sdk:s1").is_ok());
-        assert!(Delivery::push("").is_err());
-        assert!(Delivery::push("-x").is_err());
-        assert!(Delivery::push("Upper").is_err());
-        assert!(Delivery::push("a".repeat(65)).is_err());
+        assert!(DeliveryMode::push("rust-sdk:s1").is_ok());
+        assert!(DeliveryMode::push("").is_err());
+        assert!(DeliveryMode::push("-x").is_err());
+        assert!(DeliveryMode::push("Upper").is_err());
+        assert!(DeliveryMode::push("a".repeat(65)).is_err());
     }
 
     #[test]

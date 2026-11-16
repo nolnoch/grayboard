@@ -2,7 +2,7 @@
 
 use crate::credential::Credential;
 use crate::envelope::{
-    ClientInfo, Delivery, PROTOCOL_VERSION, encode_header_value, mcp_name, request_meta,
+    ClientInfo, DeliveryMode, PROTOCOL_VERSION, encode_header_value, mcp_name, request_meta,
 };
 use crate::error::{AuthError, Error, domain_code, server_text};
 use crate::sse::SseParser;
@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-/// The transport's time limits (#929 D2). Fixed in a release; tests shorten them.
+/// The transport's and the delivery stream's time limits (#929 D2, D6). Fixed in a release; tests shorten them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timeouts {
     /// An ordinary request attempt, body included; also bounds a credential's `token` and `unauthorized`.
@@ -27,6 +27,13 @@ pub(crate) struct Timeouts {
     pub listen_ack: Duration,
     /// An open listen stream with no bytes for this long is dead: three missed 5 s keepalives.
     pub listen_idle: Duration,
+    /// The delivery stream renews its lease this often, idle or while an item is handed out (the server's TTL is 30 s).
+    pub renew: Duration,
+    /// A reopen waits `min(backoff_max, backoff_unit * 2^n)` after its n-th outage or failure in a row.
+    pub backoff_unit: Duration,
+    pub backoff_max: Duration,
+    /// An admission-throttled reopen waits at least `min(backoff_max, throttle_unit * 2^n)`.
+    pub throttle_unit: Duration,
 }
 
 impl Default for Timeouts {
@@ -35,6 +42,10 @@ impl Default for Timeouts {
             request: Duration::from_secs(10),
             listen_ack: Duration::from_secs(10),
             listen_idle: Duration::from_secs(15),
+            renew: Duration::from_secs(10),
+            backoff_unit: Duration::from_millis(250),
+            backoff_max: Duration::from_secs(8),
+            throttle_unit: Duration::from_millis(500),
         }
     }
 }
@@ -72,10 +83,10 @@ pub(crate) struct Shared {
 }
 
 pub(crate) struct Connection {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     role: Role,
     session: String,
-    delivery: Option<Delivery>,
+    delivery: Option<DeliveryMode>,
     lease: Mutex<Option<String>>,
     cancel: CancellationToken,
     next_id: AtomicU64,
@@ -94,7 +105,7 @@ impl Connection {
         shared: Arc<Shared>,
         role: Role,
         session: String,
-        delivery: Option<Delivery>,
+        delivery: Option<DeliveryMode>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
