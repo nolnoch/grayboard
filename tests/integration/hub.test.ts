@@ -16,6 +16,8 @@ import type { Pending } from "../../src/shared/notifications.ts";
 import type { AppEvent, AppSession, AppSessionOptions } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
+import { queueFor } from "../../src/server/store/queue.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -61,6 +63,31 @@ const postOf = (item: Pending) => {
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
 
+
+// #807 D4: pendingFor acknowledges a push its reader can no longer see; the server posts that write through its
+// write queue, since the read that finds it runs outside any transaction.
+test("#807: a push on a board its reader lost is acknowledged through the write queue", async () => {
+  const alice = await login(A);
+  const carol = await login(C);
+  await api(alice, "POST", "/api/teams", { name: "eng" });
+  await api(alice, "POST", "/api/teams/eng/add", { email: C });
+  const a = await srv.hosted(A, "be");
+  const c = await srv.connected(carol, "sim");
+  await a.call("board_post", { board: "eng", body: `@${C}/sim ping` });
+  const pushed = await c.next(board());
+  const id = postOf(pushed.item).id;
+  const deliveredAt = () => (srv.app.db.prepare(`SELECT delivered_at FROM outbox WHERE handle = ? AND post_id = ?`).get(`${C}/sim`, id) as { delivered_at: number | null }).delivered_at;
+  expect((await api(alice, "POST", "/api/teams/eng/remove", { email: C })).status).toBe(200);
+  expect(deliveredAt()).toBeNull();
+  let release!: () => void;
+  const held = queueFor(srv.app.db).run(() => new Promise<void>((r) => { release = r; }));
+  try {
+    expect(await c.pending(100)).toEqual([]);
+    expect(deliveredAt()).toBeNull();
+  } finally { release(); }
+  await held;
+  await until(() => deliveredAt() !== null, 5000, "the lost push was acknowledged");
+});
 
 // hosted twin: #451 (a reconnect on the session's key)
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {

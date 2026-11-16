@@ -213,13 +213,19 @@ type Hub = {
   boardChanged: (board: string) => void;
 };
 
+// A push its reader can no longer see, acknowledged as pendingFor finds it: posted through the write queue (#807 D4),
+// since the reads that find it run outside any transaction.
+const lostAck = (hub: Hub) => (handle: string, ref: PendingRef) => {
+  hub.repo.post(() => acknowledge(hub.db, handle, ref), undefined, "lost-visibility push ack");
+};
+
 // Send this session everything pending on boards, for any of its addresses,
 // that it hasn't been sent: a subscription taken as the ID while unbound and
 // the alias's own both deliver. all: also deferred pushes and digests (at
 // hello; see pendingFor).
-function drainBoards(session: ApplicationSession, db: CoreDb, all = false): void {
+function drainBoards(session: ApplicationSession, hub: Hub, all = false): void {
   for (const address of session.addresses) {
-    for (const item of pendingFor(db, address, { all })) {
+    for (const item of pendingFor(hub.db, address, { all, ack: lostAck(hub) })) {
       const key = pendingKey(refOf(item));
       const sent = session.inflight.get(key);
       if (sent) {
@@ -247,7 +253,7 @@ function drainDirect(hub: Hub, session: ApplicationSession, addresses: string[])
 function wake(hub: Hub, handles: string[]): void {
   afterCommit(hub.db, () => {
     for (const session of new Set(handles.map((h) => hub.registry.get(h)))) {
-      if (session?.active) drainBoards(session, hub.db, session.human);
+      if (session?.active) drainBoards(session, hub, session.human);
     }
   });
 }
@@ -1006,7 +1012,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       afterCommit(db, () => {
         valid(session, true);
         drainDirect(hub, session, addresses ?? session.addresses);
-        drainBoards(session, db, true);
+        drainBoards(session, hub, true);
       });
     },
     send(
@@ -1044,7 +1050,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const seen = new Set<string>();
       const all: Pending[] = [];
       for (const a of session.addresses) {
-        for (const item of pendingFor(db, a, { all: true })) {
+        for (const item of pendingFor(db, a, { all: true, ack: lostAck(hub) })) {
           const key = pendingKey(refOf(item));
           if (!seen.has(key)) { seen.add(key); all.push(item); }
         }
