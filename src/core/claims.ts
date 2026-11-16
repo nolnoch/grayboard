@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 
 import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
+import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
 import { immediateTx, type WriteTx } from "./write_tx.ts";
 
@@ -12,6 +13,19 @@ export type Claim = {
   acquired_at: number;
   expires_at: number;
 };
+
+// The columns a caller sees: every one but holder_user, which names the claimant's user (#855).
+const CLAIM_COLS = "key, holder, note, board, acquired_at, expires_at";
+// A row as the claim's own code reads it: holder_user is the claimant's signed-in user, null in local mode and
+// on a claim taken before the column.
+type ClaimRow = Claim & { holder_user: string | null };
+
+// The user an announcement the system writes for a claim (its expiry, a session end's release) is recorded
+// as written by (#855): the claimant's, or an ID holder's principal for a claim from before holder_user.
+function holderUser(db: Database, c: ClaimRow): string | undefined {
+  if (c.holder_user) return c.holder_user;
+  return idRow(db, c.holder)?.principal ?? undefined;
+}
 
 type ClaimChanges = { wake: string[]; boards: string[] };
 export type ClaimResult = ClaimChanges & (
@@ -128,18 +142,19 @@ export function claim(
     if (renewed && opts.ttl_minutes === undefined && opts.until === undefined) expires = Math.max(expires, cur.expires_at);
     const row = db
       .prepare(
-        `INSERT INTO claims (key, holder, note, board, acquired_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(key) DO UPDATE SET
            holder = excluded.holder,
+           holder_user = excluded.holder_user,
            note = COALESCE(excluded.note, CASE WHEN claims.holder = excluded.holder THEN claims.note END),
            board = COALESCE(excluded.board, CASE WHEN claims.holder = excluded.holder THEN claims.board END),
            acquired_at = CASE WHEN claims.holder = excluded.holder AND claims.expires_at > ?
                               THEN claims.acquired_at ELSE excluded.acquired_at END,
            expires_at = excluded.expires_at
-         RETURNING *`,
+         RETURNING ${CLAIM_COLS}`,
       )
-      .get(key, as, opts.note ?? null, board, now, expires, now) as Claim;
+      .get(key, as, opts.note ?? null, board, now, expires, opts.user ?? null, now) as Claim;
     // A renewal that moves the claim onto an archived board would start new
     // business there (#635), like a fresh [claim]; it rolls back instead.
     if (renewed && row.board && row.board !== cur.board && getBoard(db, row.board)?.archived_at) {
@@ -186,7 +201,7 @@ export function release(
   validNote(note);
   const addresses = ctx.addresses ?? [handle];
   return db.transaction(() => {
-    const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as Claim | undefined;
+    const cur = db.prepare(`SELECT * FROM claims WHERE key = ?`).get(key) as ClaimRow | undefined;
     const active = !!cur && cur.expires_at > Date.now();
     if (!active || !addresses.includes(cur.holder)) {
       const releasedAt = releasedBy(db, key, addresses);
@@ -209,7 +224,8 @@ export function release(
     // If the holder lost access to the board since claiming, release quietly;
     // watchers too, since they're told through the board.
     const board = cur.board && canSeeBoard(db, as, cur.board) ? cur.board : null;
-    return announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, ctx);
+    // A release with no signed-in caller is the system's (a session end's): it posts as the claimant's user (#855).
+    return announce(db, as, board, `[release] ${key}${note ? ` — ${note}` : ""}${cc}`, { ...ctx, user: ctx.user ?? holderUser(db, cur) });
   }).immediate();
 }
 
@@ -255,7 +271,7 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
 export function listClaims(db: Database, prefix?: string, viewer?: Viewer): Claim[] {
   const rows = db
     .prepare(
-      `SELECT * FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
+      `SELECT ${CLAIM_COLS} FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
     )
     .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
@@ -267,7 +283,7 @@ export function listClaims(db: Database, prefix?: string, viewer?: Viewer): Clai
 // caller's transaction: the delete makes each lapse announce once, however
 // many sessions sweep.
 function sweepChanges(db: Database, now: number): ClaimChanges {
-  const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as Claim[];
+  const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as ClaimRow[];
   const wake = new Set<string>();
   const boards = new Set<string>();
   for (const c of gone) {
@@ -285,7 +301,7 @@ function sweepChanges(db: Database, now: number): ClaimChanges {
     // As in release(): a holder who lost access to the board lapses quietly.
     if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
     const text = `[expired] ${c.key}: not released by ${c.holder}; check with them before relying on it${cc}`;
-    const changed = announce(db, c.holder, c.board, text);
+    const changed = announce(db, c.holder, c.board, text, { user: holderUser(db, c) });
     for (const h of changed.wake) wake.add(h);
     for (const board of changed.boards) boards.add(board);
   }

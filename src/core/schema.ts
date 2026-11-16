@@ -212,6 +212,11 @@ export function initCoreSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_attachments_unbound ON attachments(created_at) WHERE message_id IS NULL AND post_id IS NULL;
     CREATE INDEX IF NOT EXISTS idx_attachments_uploader ON attachments(uploader);
   `);
+  // The claimant's signed-in user (server only; #855): a claim's expiry and a session end's release post
+  // carry it as author_user, so they're marked other_user/ungranted like the holder's own posts. Never shown:
+  // claim rows reach callers through CLAIM_COLS (src/core/claims.ts), which leaves it out.
+  const claimCols = new Set((db.prepare(`PRAGMA table_info(claims)`).all() as { name: string }[]).map((c) => c.name));
+  if (!claimCols.has("holder_user")) db.exec(`ALTER TABLE claims ADD COLUMN holder_user TEXT`);
   // Session end and kinds (#284 PR 2). held_aliases_json: the aliases the ID
   // held when it ended, for the id_ended hint and bounces. delivery: 'push'
   // (default) or 'none', a tools-only process (BUS_PUSH=off) that receives
