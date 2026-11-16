@@ -752,3 +752,106 @@ impl Credential for Rotating {
         Box::pin(async { Ok(()) })
     }
 }
+
+/// The headers and body fields `scripts/record_rust_fixtures.ts` keeps, normalized the same way.
+fn normalized(req: &Req) -> Value {
+    const HEADERS: [&str; 8] = [
+        "accept",
+        "authorization",
+        "content-type",
+        "mcp-method",
+        "mcp-name",
+        "mcp-protocol-version",
+        "x-grayboard-client",
+        "x-grayboard-lease",
+    ];
+    let mut headers = serde_json::Map::new();
+    for name in HEADERS {
+        if let Some(value) = req.headers.get(name) {
+            let value = match name {
+                "authorization" => "Bearer <token>".to_owned(),
+                "x-grayboard-lease" => "<lease>".to_owned(),
+                _ => value.clone(),
+            };
+            headers.insert(name.to_owned(), Value::String(value));
+        }
+    }
+    let mut body = req.body.clone();
+    if body.get("id").is_some() {
+        body["id"] = json!("<id>");
+    }
+    if body["params"].get("requestId").is_some() {
+        body["params"]["requestId"] = json!("<id>");
+    }
+    json!({"headers": headers, "body": body})
+}
+
+/// Each operation's requests equal the reference client's, as recorded in `sdk/rust/schema/wire/requests.json` (#929 R1): the envelope is checked against the TS wire, not against this crate's idea of it.
+#[tokio::test]
+async fn requests_match_the_reference_clients_recording() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../schema/wire/requests.json")).unwrap();
+    let fake = Fake::start(false, |req, _| match req.method() {
+        "tools/call" if req.body["params"]["name"] == "delivery_open" => Reply::result(
+            req,
+            json!({"content": [{"type": "text", "text": "{\"capability\": \"cap-1\"}"}]}),
+        ),
+        "tools/call" => ok_text(req),
+        "resources/read" => Reply::result(
+            req,
+            json!({"contents": [{"uri": "grayboard://inbox", "text": "{\"items\": []}"}]}),
+        ),
+        "subscriptions/listen" => {
+            listen_reply(req, &["grayboard://inbox"], vec![], Duration::from_secs(5))
+        }
+        _ => Reply {
+            status: 202,
+            headers: vec![],
+            chunks: vec![],
+            hold: Duration::ZERO,
+        },
+    })
+    .await;
+    let client = Client::new(
+        &fake.url,
+        StaticBearer::new("tok-1"),
+        ClientInfo::new(
+            fixture["client"]["name"].as_str().unwrap(),
+            fixture["client"]["version"].as_str().unwrap(),
+        ),
+    )
+    .unwrap()
+    .with_timeouts(fast());
+    let s = client.session(
+        fixture["session"].as_str().unwrap(),
+        Delivery::push(fixture["source"].as_str().unwrap()).unwrap(),
+    );
+    let mut seen = 0;
+    let mut took = |name: &str| {
+        let all = fake.requests.lock().unwrap().clone();
+        let got: Vec<Value> = all[seen..].iter().map(normalized).collect();
+        seen = all.len();
+        assert_eq!(
+            Value::Array(got),
+            fixture["operations"][name],
+            "operation {name} differs from the reference client's recording"
+        );
+    };
+    s.discover().await.unwrap();
+    took("native_discover");
+    s.call_raw("bind", json!({"name": "fixture-w1", "create": true}))
+        .await
+        .unwrap();
+    took("native_call");
+    s.subscriber_connection().discover().await.unwrap();
+    took("subscriber_discover");
+    let lease = s.call_subscriber("delivery_open", json!({})).await.unwrap();
+    took("subscriber_call");
+    s.subscriber_connection()
+        .set_lease(Some(lease["capability"].as_str().unwrap().into()));
+    s.read_resource("grayboard://inbox").await.unwrap();
+    took("read_resource");
+    let sub = s.listen(&["grayboard://inbox"]).await.unwrap();
+    sub.close().await;
+    took("listen_and_close");
+}

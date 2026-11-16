@@ -180,8 +180,11 @@ impl Connection {
             .header("accept", "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
             .header("authorization", format!("Bearer {token}"))
-            .header("mcp-protocol-version", PROTOCOL_VERSION)
-            .header("mcp-method", method);
+            .header("mcp-protocol-version", PROTOCOL_VERSION);
+        // Requests carry Mcp-Method; a notification (no id) doesn't, as the reference client sends it (sdk/rust/schema/wire/requests.json).
+        if body.get("id").is_some() {
+            rb = rb.header("mcp-method", method);
+        }
         if let Some(name) = body.get("params").and_then(|p| mcp_name(method, p)) {
             let value = HeaderValue::from_str(&encode_header_value(name))
                 .map_err(|e| Error::InvalidResponse(format!("unencodable Mcp-Name: {e}")))?;

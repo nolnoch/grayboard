@@ -1,0 +1,248 @@
+{
+  "client": {
+    "name": "fixture-client",
+    "version": "0.0.0"
+  },
+  "session": "fixture-session",
+  "source": "fixture-source",
+  "operations": {
+    "native_discover": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "server/discover",
+          "mcp-protocol-version": "2026-07-28"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": "<id>",
+          "method": "server/discover",
+          "params": {
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          }
+        }
+      }
+    ],
+    "native_call": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "tools/call",
+          "mcp-name": "bind",
+          "mcp-protocol-version": "2026-07-28"
+        },
+        "body": {
+          "method": "tools/call",
+          "params": {
+            "name": "bind",
+            "arguments": {
+              "name": "fixture-w1",
+              "create": true
+            },
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          },
+          "jsonrpc": "2.0",
+          "id": "<id>"
+        }
+      }
+    ],
+    "subscriber_discover": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "server/discover",
+          "mcp-protocol-version": "2026-07-28",
+          "x-grayboard-client": "subscriber"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": "<id>",
+          "method": "server/discover",
+          "params": {
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          }
+        }
+      }
+    ],
+    "subscriber_call": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "tools/call",
+          "mcp-name": "delivery_open",
+          "mcp-protocol-version": "2026-07-28",
+          "x-grayboard-client": "subscriber"
+        },
+        "body": {
+          "method": "tools/call",
+          "params": {
+            "name": "delivery_open",
+            "arguments": {},
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          },
+          "jsonrpc": "2.0",
+          "id": "<id>"
+        }
+      }
+    ],
+    "read_resource": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "resources/read",
+          "mcp-name": "grayboard://inbox",
+          "mcp-protocol-version": "2026-07-28",
+          "x-grayboard-client": "subscriber",
+          "x-grayboard-lease": "<lease>"
+        },
+        "body": {
+          "method": "resources/read",
+          "params": {
+            "uri": "grayboard://inbox",
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          },
+          "jsonrpc": "2.0",
+          "id": "<id>"
+        }
+      }
+    ],
+    "listen_and_close": [
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-method": "subscriptions/listen",
+          "mcp-protocol-version": "2026-07-28",
+          "x-grayboard-client": "subscriber",
+          "x-grayboard-lease": "<lease>"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": "<id>",
+          "method": "subscriptions/listen",
+          "params": {
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "notifications": {
+              "resourceSubscriptions": [
+                "grayboard://inbox"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "authorization": "Bearer <token>",
+          "content-type": "application/json",
+          "mcp-protocol-version": "2026-07-28",
+          "x-grayboard-client": "subscriber",
+          "x-grayboard-lease": "<lease>"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "method": "notifications/cancelled",
+          "params": {
+            "requestId": "<id>",
+            "_meta": {
+              "io.github.nolnoch.grayboard/sessionID": "fixture-session",
+              "io.github.nolnoch.grayboard/delivery": {
+                "mode": "push",
+                "source": "fixture-source"
+              },
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": {
+                "name": "fixture-client",
+                "version": "0.0.0"
+              },
+              "io.modelcontextprotocol/clientCapabilities": {}
+            }
+          }
+        }
+      }
+    ]
+  }
+}
