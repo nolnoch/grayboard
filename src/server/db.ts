@@ -18,7 +18,7 @@ import { endSession, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
-import { type Read, type Tx, sqliteRead, sqliteTx } from "./store/tx.ts";
+import { type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
@@ -337,10 +337,10 @@ export interface Repo {
   // Read points (#284), keyed by the reading address: how far it has
   // received a stream (its direct messages, stream_ref = the address itself).
   cursors: {
-    get(address: string, streamType: "direct" | "team", streamRef: string): number;
+    get(r: Read, address: string, streamType: "direct" | "team", streamRef: string): number;
     // How far an address has received its direct messages.
-    directFor(address: string): number;
-    advance(address: string, streamType: "direct" | "team", streamRef: string, messageId: number): void;
+    directFor(r: Read, address: string): number;
+    advance(tx: Tx, address: string, streamType: "direct" | "team", streamRef: string, messageId: number): void;
   };
   audit: {
     write(row: AccessLogRow): void;
@@ -370,14 +370,14 @@ export interface Repo {
   };
   writeReceipts: {
     // The receipt for (session, sender, fp) written after `since`.
-    find(session: string, sender: string, fp: string, since: number): WriteReceipt | undefined;
+    find(r: Read, session: string, sender: string, fp: string, since: number): WriteReceipt | undefined;
     // Replaces any receipt for the same (session, sender, fp).
-    upsert(r: WriteReceipt): void;
+    upsert(tx: Tx, r: WriteReceipt): void;
     // Whether the row a receipt names still exists (a retract or retention removes it).
-    refExists(kind: "message" | "post", id: number): boolean;
+    refExists(r: Read, kind: "message" | "post", id: number): boolean;
     // Deletes receipts written at or before `before`: one session's, or all. Returns how many.
-    pruneSession(session: string, before: number): number;
-    prune(before: number): number;
+    pruneSession(tx: Tx, session: string, before: number): number;
+    prune(tx: Tx, before: number): number;
   };
   // The database file's free pages (#137).
   storage: {
@@ -1356,20 +1356,20 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     mail: mailPort(db),
 
     cursors: {
-      get(address, streamType, streamRef) {
-        const row = db.query<{ last_seen_id: number }, [string, string, string]>(
+      get(r, address, streamType, streamRef) {
+        const row = sqliteOf(r).query<{ last_seen_id: number }, [string, string, string]>(
           "SELECT last_seen_id FROM mailbox_cursors WHERE address = ? AND stream_type = ? AND stream_ref = ?",
         ).get(address, streamType, streamRef);
         return row?.last_seen_id ?? 0;
       },
-      directFor(address) {
-        const row = db.query<{ last_seen_id: number }, [string, string]>(
+      directFor(r, address) {
+        const row = sqliteOf(r).query<{ last_seen_id: number }, [string, string]>(
           "SELECT last_seen_id FROM mailbox_cursors WHERE address = ? AND stream_type = 'direct' AND stream_ref = ?",
         ).get(address, address);
         return row?.last_seen_id ?? 0;
       },
-      advance(address, streamType, streamRef, messageId) {
-        db.run(
+      advance(tx, address, streamType, streamRef, messageId) {
+        sqliteOf(tx).run(
           `INSERT INTO mailbox_cursors (address, stream_type, stream_ref, last_seen_id) VALUES (?, ?, ?, ?)
            ON CONFLICT(address, stream_type, stream_ref)
            DO UPDATE SET last_seen_id = MAX(excluded.last_seen_id, mailbox_cursors.last_seen_id)`,
@@ -1477,28 +1477,28 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     writeReceipts: {
-      find(session, sender, fp, since) {
-        return db.query<WriteReceipt, [string, string, string, number]>(
+      find(r, session, sender, fp, since) {
+        return sqliteOf(r).query<WriteReceipt, [string, string, string, number]>(
           "SELECT * FROM write_receipts WHERE session = ? AND sender = ? AND fp = ? AND at > ?",
         ).get(session, sender, fp, since) ?? undefined;
       },
-      upsert(r) {
-        db.run(
+      upsert(tx, r) {
+        sqliteOf(tx).run(
           `INSERT INTO write_receipts (session, sender, fp, tool, ref_kind, ref_id, result_json, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(session, sender, fp) DO UPDATE SET
              tool = excluded.tool, ref_kind = excluded.ref_kind, ref_id = excluded.ref_id, result_json = excluded.result_json, at = excluded.at`,
           [r.session, r.sender, r.fp, r.tool, r.ref_kind, r.ref_id, r.result_json, r.at],
         );
       },
-      refExists(kind, id) {
+      refExists(r, kind, id) {
         const table = kind === "message" ? "messages" : "posts";
-        return !!db.query<{ x: number }, [number]>(`SELECT 1 AS x FROM ${table} WHERE id = ?`).get(id);
+        return !!sqliteOf(r).query<{ x: number }, [number]>(`SELECT 1 AS x FROM ${table} WHERE id = ?`).get(id);
       },
-      pruneSession(session, before) {
-        return db.run("DELETE FROM write_receipts WHERE session = ? AND at <= ?", [session, before]).changes;
+      pruneSession(tx, session, before) {
+        return sqliteOf(tx).run("DELETE FROM write_receipts WHERE session = ? AND at <= ?", [session, before]).changes;
       },
-      prune(before) {
-        return db.run("DELETE FROM write_receipts WHERE at <= ?", [before]).changes;
+      prune(tx, before) {
+        return sqliteOf(tx).run("DELETE FROM write_receipts WHERE at <= ?", [before]).changes;
       },
     },
 

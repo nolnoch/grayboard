@@ -310,7 +310,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["list", "read
     await expect(request).rejects.toThrow(/internal.*error/i);
     expect(accessChecks).toBeGreaterThanOrEqual(5);
     expect(sessionChecks).toBe(boundary === "grant" ? 0 : 2);
-    expect(store.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+    expect(store.repo.cursors.directFor(store.repo.read, "alice@example.com/be")).toBe(0);
   } finally { store.repo.oauth.findActiveAccess = findAccess; application.revalidateSession = validate; }
   expect((await client.listResources()).resources.every(r => r.uri !== "grayboard://identity")).toBe(true);
 });
@@ -337,7 +337,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["renew", "inb
     }
     expect(calls).toBe(faultAt);
     expect(hosted.activeLeases).toBe(1);
-    expect(store.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+    expect(store.repo.cursors.directFor(store.repo.read, "alice@example.com/be")).toBe(0);
   } finally { store.repo.oauth.findActiveAccess = isActive; }
   const renewed = await client.callTool({ name: "delivery_renew", arguments: {} });
   expect(renewed.isError).toBeUndefined();

@@ -173,7 +173,7 @@ test("concurrent requests are principal isolated; inbox reads never acknowledge 
   const histories = await Promise.all(Array.from({ length: 12 }, (_, i) => (i % 2 ? a : b).callTool({ name: "peer_list", arguments: { include_offline: true } })));
   histories.forEach((r, i) => expect(value(r).you).toBe(`${i % 2 ? "alice" : "bob"}@example.com/be`));
   expect(value(await b.callTool({ name: "dm_inbox", arguments: {} })).unanswered).toHaveLength(1);
-  expect(app.repo.cursors.directFor("bob@example.com/be")).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, "bob@example.com/be")).toBe(0);
   expect(value(await a.callTool({ name: "dm_inbox", arguments: {} })).unanswered).toHaveLength(0);
   expect(value(await a.callTool({ name: "dm_inbox", arguments: {} })).promised).toHaveLength(1);
   const c = await connect(await login("carol@example.com"));
@@ -181,7 +181,7 @@ test("concurrent requests are principal isolated; inbox reads never acknowledge 
   expect((await c.callTool({ name: "dm_ack", arguments: { message_id: sent.message_id } })).isError).toBe(true);
   expect(value(await b.callTool({ name: "dm_ack", arguments: { message_id: [sent.message_id, 999999] } }))).toMatchObject({ acked: [sent.message_id], not_found: [999999] });
   expect(value(await b.callTool({ name: "dm_inbox", arguments: {} })).unanswered).toHaveLength(0);
-  expect(app.repo.cursors.directFor("bob@example.com/be")).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, "bob@example.com/be")).toBe(0);
   expect((await a.callTool({ name: "dm_retract", arguments: { message_id: sent.message_id } })).isError).not.toBe(true);
   expect(value(await b.callTool({ name: "dm_history", arguments: {} }))).toEqual([]);
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);

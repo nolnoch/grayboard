@@ -168,7 +168,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: an opted-in opera
   expect(inbox.items).toMatchObject([{ id: `direct:${sent.message_id}`, event: { kind: "direct", message: { body: "brokered hello" } } }]);
   json(await call(sub, "delivery_renew"));
   json(await call(sub, "delivery_receipt", { ids: inbox.items.map((i: { id: string }) => i.id) }));
-  expect(app.repo.cursors.directFor("alice@example.com/broker-run")).toBe(sent.message_id);
+  expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/broker-run")).toBe(sent.message_id);
 
   const upload = await attachment(token, root);
   expect(upload.status).toBe(201);

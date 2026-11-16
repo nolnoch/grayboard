@@ -26,6 +26,7 @@ import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimit
 import { writeAudit } from "./audit.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { countRefusal, timeTool } from "./metrics.ts";
+import type { Tx } from "./store/tx.ts";
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 // A POST body the SDK's isLegacyRequest can only answer false for, decided without its zod parses (#940): a
@@ -923,7 +924,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
     return { ...text(`error: ${message}`), structuredContent: domainData(e), isError: true };
   };
-  const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession) => unknown): Promise<CallToolResult> => {
+  const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession, tx: Tx) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
       return said(text(await timeTool(tool, () => { const context = current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict); }) ?? "ok"), notice);
@@ -956,27 +957,27 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
   for (const { name, config } of NATIVE_BOARD_TOOLS) {
-    server.registerTool(name, config, (args, ctx) => run(ctx, name, session => application.call(session, name, args)));
+    server.registerTool(name, config, (args, ctx) => run(ctx, name, (session, tx) => application.call(tx, session, name, args)));
   }
   const dm = NATIVE_DM_TOOLS;
   server.registerTool("dm_send", dm.dm_send,
-    (a, ctx) => run(ctx, "dm_send", session => application.send(session, a.to as string, a.body as string, a as Parameters<typeof application.send>[3])));
+    (a, ctx) => run(ctx, "dm_send", (session, tx) => application.send(tx, session, a.to as string, a.body as string, a as Parameters<typeof application.send>[4])));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,
     inputSchema: NATIVE_DELEGATE_INPUT,
-  }, (a, ctx) => run(ctx, "delegate", session => application.delegate(session, a)));
+  }, (a, ctx) => run(ctx, "delegate", (session, tx) => application.delegate(tx, session, a)));
   server.registerTool("dm_history", dm.dm_history,
-    (a, ctx) => run(ctx, "dm_history", session => application.history(session, a as Parameters<typeof application.history>[1])));
-  server.registerTool("dm_thread", dm.dm_thread, (a, ctx) => run(ctx, "dm_thread", session => application.thread(session, a.thread as number)));
+    (a, ctx) => run(ctx, "dm_history", (session, tx) => application.history(tx, session, a as Parameters<typeof application.history>[2])));
+  server.registerTool("dm_thread", dm.dm_thread, (a, ctx) => run(ctx, "dm_thread", (session, tx) => application.thread(tx, session, a.thread as number)));
   server.registerTool(DM_INBOX_TOOL.name, { description: DM_INBOX_TOOL.description, _meta: DM_INBOX_TOOL._meta, inputSchema: DM_INBOX_INPUT },
-    (a, ctx) => run(ctx, "dm_inbox", session => application.inbox(session, a.days)));
+    (a, ctx) => run(ctx, "dm_inbox", (session, tx) => application.inbox(tx, session, a.days)));
   server.registerTool(DM_ACK_TOOL.name, {
     description: DM_ACK_TOOL.description, _meta: DM_ACK_TOOL._meta, inputSchema: DM_ACK_INPUT,
   }, async (a, ctx) => {
     const acked: number[] = [], missing: number[] = [];
-    const result = await run(ctx, "dm_ack", async session => {
+    const result = await run(ctx, "dm_ack", async (session, tx) => {
       for (const n of new Set(Array.isArray(a.message_id) ? a.message_id : [a.message_id])) {
-        try { await application.acknowledgeDm(session, n); acked.push(n); } catch (e) {
+        try { await application.acknowledgeDm(tx, session, n); acked.push(n); } catch (e) {
           if (!(e instanceof ApplicationError) || e.code !== "not_found") throw e;
           missing.push(n);
         }
@@ -986,5 +987,5 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     return { ...result, ...(missing.length && !acked.length && !result.isError ? { structuredContent: { code: "not_found" }, isError: true } : {}) };
   });
   server.registerTool(DM_RETRACT_TOOL.name, { description: DM_RETRACT_TOOL.description, inputSchema: DM_RETRACT_INPUT },
-    (a, ctx) => run(ctx, "dm_retract", session => application.retract(session, a.message_id)));
+    (a, ctx) => run(ctx, "dm_retract", (session, tx) => application.retract(tx, session, a.message_id)));
 }

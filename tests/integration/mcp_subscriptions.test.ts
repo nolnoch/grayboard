@@ -112,7 +112,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: independent nativ
   await until(() => first.hints.length === 1 && second.hints.length === 1);
   expect(first.hints).toEqual([boardUri]); expect(second.hints).toEqual([boardUri]);
   expect(app.mcp.activeLeases).toBe(0);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
   const observer = await connect((await issue("bob@example.com")).token, version);
   const peers = await call(observer, "peer_list", { include_offline: true });
   expect(peers.peers.find((peer: { handle: string }) => peer.handle === "alice@example.com/be").online).toBe(false);
@@ -144,7 +144,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox hints are l
   expect(batch).toHaveLength(1);
   expect(batch.at(-1).id).toBe(`direct:${sent.message_id}`);
   expect(await pending(subscriber)).toEqual(batch);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
   const oldHints = subscriber.hints.length;
   await call(subscriber, "delivery_release");
   await until(() => app.mcp.activeInboxListeners === 0);
@@ -194,7 +194,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: inbox listen requ
   await expect(watch(owner, "grayboard://inbox")).rejects.toThrow();
   expect(app.mcp.activeInboxListeners).toBe(0);
   expect(app.mcp.activeLeases).toBe(1);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: malformed/read-only/private resources cannot be watched`, async () => {
@@ -271,7 +271,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current 
     await call(c, "board_post", { board: "e2e", body: "old registration while disconnected" });
     await call(c, "board_post", { board: "next", body: "current registration while disconnected" });
     expect(c.hints).toEqual([]);
-    expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+    expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
   } finally { resume(); }
   await until(() => app.mcp.activeWatches === 2);
   expect(c.transport.sessionId).toBe(sid);
@@ -340,7 +340,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membershi
   try { await until(() => app.mcp.activeWatches === 0); }
   finally { app.repo.oauth.findActiveAccess = original; }
   expect(app.mcp.activeLeases).toBe(0);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
 });
 
 test("modern methods refuse session operations and unsupported catalog hints are not honored", async () => {

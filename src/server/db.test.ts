@@ -212,13 +212,13 @@ describe("Repo", () => {
     });
     expect(fe.address).toBe("you@example.com/fe");
     expect(repo.aliases.listForScope("person", "you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
-    await seed(repo, () => {
-      repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 7);
+    await seed(repo, tx => {
+      repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 7);
       repo.aliases.remove("you@example.com/fe");
     });
     expect(repo.aliases.listForScope("person", "you@example.com")).toHaveLength(1);
     // Its read point goes with it: a new alias of the name starts from scratch.
-    expect(repo.cursors.directFor("you@example.com/fe")).toBe(0);
+    expect(repo.cursors.directFor(repo.read, "you@example.com/fe")).toBe(0);
   });
 
   // #284 S9: aliases are keyed by address in any scope.
@@ -275,11 +275,11 @@ describe("Repo", () => {
   });
 
   test("cursors: advance is idempotent and takes MAX", async () => {
-    await seed(repo, () => repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 10));
-    await seed(repo, () => repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 5));  // lower — should not regress
-    expect(repo.cursors.get("you@example.com/fe", "direct", "you@example.com/fe")).toBe(10);
-    await seed(repo, () => repo.cursors.advance("you@example.com/fe", "direct", "you@example.com/fe", 20));
-    expect(repo.cursors.directFor("you@example.com/fe")).toBe(20);
+    await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 10));
+    await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 5));  // lower — should not regress
+    expect(repo.cursors.get(repo.read, "you@example.com/fe", "direct", "you@example.com/fe")).toBe(10);
+    await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 20));
+    expect(repo.cursors.directFor(repo.read, "you@example.com/fe")).toBe(20);
   });
 
   test("unreadSince returns only messages after cursor", async () => {
@@ -331,13 +331,13 @@ describe("Repo", () => {
   // #284 S5: the MailPort core endSession runs on the server.
   test("mail: unread is the ID's unread direct mail from others; bounce and dropReader", async () => {
     const [id, peer] = ["id:s1", "b@example.com/be"];
-    const { read, unread } = await seed(repo, () => {
+    const { read, unread } = await seed(repo, tx => {
       const read = repo.messages.insert(peer, "user", id, "read", null);
       const unread = repo.messages.insert(peer, "user", id, "unread", null);
       repo.messages.insert(id, "user", id, "to itself", null);
       repo.messages.insert(peer, "team", id, "a team stream of the same name", null);
       repo.messages.insert(peer, "user", "a@example.com/fe", "to someone else", null);
-      repo.cursors.advance(id, "direct", id, read.id);
+      repo.cursors.advance(tx, id, "direct", id, read.id);
       return { read, unread };
     });
     expect(repo.mail.unread(id)).toEqual([{ id: unread.id, sender: peer }]);
@@ -352,7 +352,7 @@ describe("Repo", () => {
       repo.messages.ack(peer, bounce!.id);
       repo.mail.dropReader(id);
     });
-    expect(repo.cursors.directFor(id)).toBe(0);
+    expect(repo.cursors.directFor(repo.read, id)).toBe(0);
     expect(repo.messages.receivedUnacked([id], 0).map((m) => m.id)).toEqual([read.id, unread.id]);
     expect(repo.messages.receivedUnacked([peer], 0)).toEqual([]);
   });
@@ -564,13 +564,13 @@ test("schema: what a rolled-back binary writes (a subject, no issuer; its old in
 
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  await seed(repo, () => {
+  await seed(repo, tx => {
     repo.users.upsertByEmail("a@example.com", null);
     repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
     repo.users.upsertByEmail("b@example.com", null);
     repo.aliases.create(person("b@example.com", "be"), "b@example.com");
     repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
-    repo.cursors.advance("b@example.com/be", "direct", "b@example.com/be", 1);
+    repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
   const plan = db.prepare("EXPLAIN QUERY PLAN " + UNDELIVERED_FROM_SQL)
     .all(JSON.stringify(["a@example.com/fe"]), Number.MAX_SAFE_INTEGER) as { detail: string }[];
@@ -596,13 +596,13 @@ test("undeliveredFrom and sentPending search messages by sender, never by recipi
 // #284 audit: queuedTo and retract read the read point by its key too.
 test("queuedTo and retract look the read point up by its key, never a mailbox_cursors scan", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  await seed(repo, () => {
+  await seed(repo, tx => {
     repo.users.upsertByEmail("a@example.com", null);
     repo.aliases.create(person("a@example.com", "fe"), "a@example.com");
     repo.users.upsertByEmail("b@example.com", null);
     repo.aliases.create(person("b@example.com", "be"), "b@example.com");
     repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
-    repo.cursors.advance("b@example.com/be", "direct", "b@example.com/be", 1);
+    repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
   const detail = (sql: string, ...args: (string | number)[]) =>
     (db.prepare("EXPLAIN QUERY PLAN " + sql).all(...args) as { detail: string }[]).map((p) => p.detail).join(" ");
@@ -625,4 +625,32 @@ test("audit.last searches access_log by (action, target), never a scan or a sort
     for (const [at, target] of [[1, "7"], [3, "7"], [2, "7"], [4, "8"]] as const) db.prepare("INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, 'a', 'dm.retract', ?, ?)").run(at, target, `row ${at}`);
   });
   expect(repo.audit.last("dm.retract", "7")?.detail).toBe("row 3");
+});
+
+// #807 P1c-5: a leaf store runs its statements on the handle it's given, so a Tx kept past its body (D4) is refused
+// rather than writing into whichever transaction is open by then, and a value that isn't a SQLite store handle is refused.
+test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const kept = await seed(repo, tx => {
+    repo.cursors.advance(tx, "a@example.com/fe", "direct", "a@example.com/fe", 3);
+    repo.writeReceipts.upsert(tx, { session: "s1", sender: "a@example.com/fe", fp: "f", tool: "dm_send", ref_kind: "message", ref_id: 1, result_json: "{}", at: 5 });
+    return tx;
+  });
+  expect(repo.cursors.directFor(repo.read, "a@example.com/fe")).toBe(3);
+  expect(repo.writeReceipts.find(repo.read, "s1", "a@example.com/fe", "f", 0)?.at).toBe(5);
+  const settled = /used after its transaction settled/;
+  expect(() => repo.cursors.advance(kept, "a@example.com/fe", "direct", "a@example.com/fe", 4)).toThrow(settled);
+  expect(() => repo.writeReceipts.prune(kept, 10)).toThrow(settled);
+  expect(() => repo.cursors.get(kept, "a@example.com/fe", "direct", "a@example.com/fe")).toThrow(settled);
+  expect(() => repo.cursors.directFor(kept, "a@example.com/fe")).toThrow(settled);
+  expect(() => repo.writeReceipts.find(kept, "s1", "a@example.com/fe", "f", 0)).toThrow(settled);
+  expect(() => repo.writeReceipts.refExists(kept, "message", 1)).toThrow(settled);
+  expect(() => repo.writeReceipts.upsert(kept, { session: "s2", sender: "a@example.com/fe", fp: "g", tool: "dm_send", ref_kind: "message", ref_id: 2, result_json: "{}", at: 6 })).toThrow(settled);
+  expect(() => repo.writeReceipts.pruneSession(kept, "s1", 10)).toThrow(settled);
+  const foreign = {} as typeof repo.read;
+  expect(() => repo.cursors.directFor(foreign, "a@example.com/fe")).toThrow("not a SQLite store handle");
+  expect(() => repo.writeReceipts.refExists(foreign, "message", 1)).toThrow("not a SQLite store handle");
+  expect(repo.cursors.directFor(repo.read, "a@example.com/fe")).toBe(3);
+  expect(repo.writeReceipts.find(repo.read, "s1", "a@example.com/fe", "f", 0)?.at).toBe(5);
+  expect(repo.writeReceipts.find(repo.read, "s2", "a@example.com/fe", "g", 0)).toBeUndefined();
 });

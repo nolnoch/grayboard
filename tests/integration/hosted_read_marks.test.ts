@@ -89,7 +89,7 @@ test("board_read marks another user's post, follows the grant, and leaves the re
 
   // A board resource read (a native client's snapshot) is a read too.
   const reader = await srv.connected(alice, "ops");
-  const snap = async () => (await srv.app.application.boardSnapshot(reader.session, "e2e")).posts as Marked[];
+  const snap = async () => (await srv.app.application.boardSnapshot(srv.app.repo.read, reader.session, "e2e")).posts as Marked[];
   expect(marks(await snap(), "bob's post")).toEqual(OTHER);
   expect(marks(await snap(), "alice's post")).toEqual(OWN);
   expect((await policy("collaborative")).status).toBe(200);
