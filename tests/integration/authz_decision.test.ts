@@ -145,7 +145,7 @@ describe("session acts", () => {
     const [a, b] = await Promise.all([srv.login(A), srv.login(B)]);
     expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     const tools = srv.appSession(b, "eng/build", { push: false });
-    await expect(tools.connect()).rejects.toThrow(/you can't act as "eng\/build"/);
+    await expect(tools.connect()).rejects.toThrow(/"eng\/build": no team or service is named "eng"/);
     const got = accessAudits(srv.app.db, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule])).toEqual([[B, "team:eng", "alias.bind", false, "scope.team_member"]]);
     expect(got[0].detail).toMatchObject({ address: "eng/build", session: expect.stringMatching(/^id:/) });

@@ -204,3 +204,31 @@ test("suggestions follow the session's user, not the team address it acts as", a
   await expect(build.send("run", "hi")).rejects.toMatchObject({ message: expect.stringContaining("name it in full: ops/run") });
   await expect(build.call("board_post", { board: "general", body: "@run hi" })).rejects.toThrow("name it in full: ops/run");
 });
+
+// #1020: to a non-member, a team that exists refuses exactly as one that
+// doesn't, in each team-scoped refusal: board_create, bind (app and hosted,
+// the reserved human name too), an app writes_as and an HTTP `as`.
+test("a team-scoped refusal reads the same to a non-member whether or not the team exists", async () => {
+  // The refusal for eng, and for nosuch with its name put back as eng.
+  const both = async (refused: (team: string) => Promise<unknown>) => {
+    const one = async (team: string) => {
+      const e = await refused(team);
+      return JSON.stringify(e).replaceAll(team, "TEAM");
+    };
+    const [real, missing] = [await one("eng"), await one("nosuch")];
+    expect(real).toBe(missing);
+    return JSON.parse(real) as Record<string, unknown>;
+  };
+  const err = (p: Promise<unknown>) => p.then(() => ({ ok: true }), (e: { code?: string; message?: string }) => ({ code: e.code, message: e.message }));
+  const outsider = srv.appSession(carol, "qa");
+  await outsider.connect();
+
+  expect(await both((t) => err(outsider.call("board_create", { name: "plans", purpose: "p", team: t })))).toEqual({ code: "bad_request", message: 'no such team "TEAM"' });
+  expect(await both((t) => err(outsider.bind(`${t}/x`)))).toEqual({ code: "not_found", message: '"TEAM/x": no team or service is named "TEAM"' });
+  expect(await both((t) => err(outsider.bind(`${t}/human`)))).toMatchObject({ code: "forbidden" });
+  expect(await both((t) => err(srv.appSession(carol, `${t}/x`, { push: false }).connect()))).toMatchObject({ code: "not_found" });
+  const hosted = await srv.hosted("carol@example.com", null);
+  expect(await both((t) => err(hosted.call("bind", { name: `${t}/x`, create: true })))).toMatchObject({ code: "not_found" });
+  const http = await both((t) => srv.api(carol, "POST", "/api/claims/call", { as: `${t}/x`, tool: "claim_take", args: { key: "k" } }));
+  expect(http).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "TEAM/x": no principal owns its scope` } });
+});

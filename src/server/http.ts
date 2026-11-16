@@ -204,7 +204,8 @@ function ownAddress(input: string | null | undefined, authed: AuthedUser, repo: 
   if (!d.allow) {
     recordDecision(repo, { user: authed.user_email, address }, req, d);
     if (d.rule === "alias.human_reserved") return forbidden(humanReason);
-    if (d.rule === "scope.ownerless") return forbidden(`you can't act as "${address}": no principal owns its scope`);
+    // A team reads as missing to a non-member (#1020), as a scope nobody owns.
+    if (d.rule === "scope.ownerless" || d.rule === "scope.team_member") return forbidden(`you can't act as "${address}": no principal owns its scope`);
     return forbidden(`you can't act as "${address}": ${d.reason}`);
   }
   if (!repo.aliases.find(address)) {

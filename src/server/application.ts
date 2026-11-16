@@ -365,6 +365,8 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
       return kind === "team" || kind === "service" ? kind : null;
     });
   } catch (e) {
+    // The reserved name refuses alike in a team that exists and one that doesn't (#1020).
+    if (e instanceof CoreError && p.name === HUMAN_NAME) return { code: "forbidden", error: HUMAN_RESERVED, address };
     if (e instanceof CoreError) return { code: "not_found", error: e.message, address };
     throw e;
   }
@@ -372,6 +374,8 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
   const req: AuthzRequest = { verb: "alias.bind", principal: userPrincipal(authed), scope: t, name: scope.name };
   const d = authorize(repo, {}, req);
   if (!d.allow && d.rule === "alias.human_reserved") return { code: "forbidden", error: HUMAN_RESERVED, address, authz: { req, d } };
+  // A team reads as missing to a non-member (#1020): the refusal aliasScope gives a scope nobody owns.
+  if (!d.allow && d.rule === "scope.team_member") return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
   if (!d.allow) return { code: "forbidden", error: `you can't act as "${address}": ${d.reason}; bind a name in your own scope, or in a team's you belong to`, address, authz: { req, d } };
   return { address, scope: t };
 }

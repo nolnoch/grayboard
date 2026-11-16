@@ -630,6 +630,22 @@ test("a resume whose rebind is refused says so at once and in the next tool resu
   expect(await again.ext.instructions()).toStartWith(`You are "${EMAIL}/rebinder" on grayboard.`);
 });
 
+// #1020: a team the user left reads as missing (not_found), which a resume skips like a revoked name.
+test("a resume whose team name is refused because its user left the team skips that name and resumes the rest", async () => {
+  const bob = await srv.login("bob@example.com");
+  expect((await srv.api(bob, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(bob, "POST", "/api/teams/eng/add", { email: EMAIL })).status).toBe(200);
+  const first = await root("team-s", "keeper");
+  expect((await first.call("bind", { name: "eng/build", create: true })).isError).toBeUndefined();
+  await first.ext.shutdown("quit");
+  expect((await srv.api(bob, "POST", "/api/teams/eng/remove", { email: EMAIL })).status).toBe(200);
+
+  const again = instance();
+  await again.ext.start({ id: "team-s", reason: "resume" });
+  await active(again, "team-s", "keeper");
+  expect(again.notices.map(n => n.message).join("\n")).toContain("not_found");
+});
+
 // #523: a child is told it acts as its root's name as a subagent, not given its root's delivery lines.
 test("a child's system-prompt instructions are its registered session's, even fetched before its first call", async () => {
   await root("prompt-root", "prompter");

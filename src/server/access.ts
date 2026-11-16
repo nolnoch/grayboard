@@ -77,9 +77,9 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
       if (scope === null) return null;
       const team = teamOf(scope);
       if (team === null) return `invalid board scope "${scope}"`;
-      if (!repo.teams.findByName(team)) return `no such team "${team}"`;
+      // A team reads as missing to a non-member (#1020): one refusal for both.
       const p = repo.resolver.principalOf(handle);
-      return p && inTeam(p, team) ? null : `you're not a member of team "${team}"`;
+      return repo.teams.findByName(team) && p && inTeam(p, team) ? null : `no such team "${team}"`;
     },
 
     // The grammar of #284 decision 16 (S13): @id:… is the session itself (a
