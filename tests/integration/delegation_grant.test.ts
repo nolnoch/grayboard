@@ -246,7 +246,7 @@ test("server: delegate's msg.send deny leaves a decision row on a fresh call and
     expect((await sim.delegate(replayed)).replayed).toBeDefined();
     await seed(srv.app.repo, () => { srv.app.db.exec(`DELETE FROM team_members`); });
     // A replay of the first call rechecks msg.send against the launcher it picked.
-    await refusal(sim.delegate(replayed));
+    expect((await refusal(sim.delegate(replayed))).message).toMatch(/auto-picked "alice@example\.com\/human"/);
     expect(decisions(srv, "human.team_alias")).toEqual(denied);
     // A fresh call's prepareSend decides it too.
     await refusal(sim.delegate({ persona: "p", task: "fresh" }));

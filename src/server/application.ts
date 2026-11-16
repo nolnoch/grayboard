@@ -1518,9 +1518,10 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
     if (teamAliasHidden(repo, session.sessionId || session.primary, to)) {
       return { refused: recheck ? `"${to}" is a team's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) };
     }
-    // A person's human is that person's, though no session holds it (the Slack bridge's connection has none), so a
-    // replay of a human-fallback delegation is rechecked rather than refused as unheld (#1030).
-    const t = addressParts(to);
+    // On a replay, a person's human is that person's, though no session holds it (the Slack bridge's connection has
+    // none), so a human-fallback delegation is rechecked rather than refused as unheld (#1030). A fresh call naming a
+    // human keeps reading as own, and routing refuses it as no launcher.
+    const t = recheck ? addressParts(to) : null;
     const owner = t?.kind === "alias" && t.name === HUMAN_NAME && t.scopeKind === "person" ? t.scope : addressUser(db, to);
     if (owner === undefined && recheck) return { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` };
     if (owner === undefined || owner === authed.user_email) return { ok: "own" };
