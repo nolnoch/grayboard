@@ -9,9 +9,10 @@ cp -R ../../src "$root/source/"
 cp ../../package.json "$root/source/package.json"
 cp -R src "$root/source/adapters/opencode-v2/"
 cp tests/host.ts tests/real-races.ts tests/real-reload.ts tests/real-transactions.ts tests/real-server.ts tests/server-db.ts tests/reload-state.ts tests/causal.ts tests/subscriber-work.ts tests/failed-continuation.ts tests/effect-host.ts tests/effect-instrument.ts tests/cimd-fixture.ts "$root/source/adapters/opencode-v2/tests/"
-# The transaction races' process helpers (real-server.ts, real-transactions.ts) and their second writer.
+# The transaction races' process helpers (real-server.ts, real-transactions.ts), their second writer, and the
+# stubbed upstream identity provider host.ts and real-server.ts start the server with (its imports are under src/).
 mkdir -p "$root/source/tests/support"
-cp ../../tests/support/transaction-process.ts ../../tests/support/hosted-operation.ts "$root/source/tests/support/"
+cp ../../tests/support/transaction-process.ts ../../tests/support/hosted-operation.ts ../../tests/support/stub_provider.ts "$root/source/tests/support/"
 mkdir -p "$root/source/adapters/opencode-v2/tests/fixtures"
 cp tests/fixtures/opencode-client.json tests/fixtures/opencode-client.source.json "$root/source/adapters/opencode-v2/tests/fixtures/"
 ln -s "$PWD/node_modules" "$root/source/node_modules"
