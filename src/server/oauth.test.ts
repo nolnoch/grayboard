@@ -17,6 +17,7 @@ import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { Browser, consentForm, submitConsent } from "../../tests/support/oauth_browser.ts";
 import { accessAudits } from "../../tests/support/audit.ts";
+import { stubProvider } from "../../tests/support/stub_provider.ts";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
 const random = () => randomBytes(32).toString("base64url");
@@ -33,14 +34,14 @@ const registrations: OAuthClient[] = [
 function makeService(cimd?: import("./oauth-cimd.ts").CimdOptions) {
   return createOAuthServer(storage.repo, config, { now: () => clock, cimd,
     // Explicit fake upstream identity only; all downstream browser/code/token work is real HTTP + SQLite.
-    exchangeGoogle: async input => {
+    providers: [stubProvider(async input => {
       exchanges++;
       expect(input.nonce).toMatch(/^[\w-]{43}$/);
       expect(input.verifier).toMatch(/^[\w-]{43}$/);
       expect(input.redirectUri).toBe(base + "/oauth/google/callback");
       if (input.code !== "fake-google-code") throw new Error("fake rejection");
       return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
-    } });
+    })] });
 }
 beforeEach(() => {
   clock = Date.now(); exchanges = 0;
@@ -440,7 +441,7 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
   } finally { storage.repo.oauth.cleanup = cleanup; }
   try {
     service.close();
-    service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => { throw forged; } });
+    service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => { throw forged; })] });
     const browser = new Browser();
     const begin = await browser.request(authorization().url);
     const state = new URL(begin.headers.get("location")!).searchParams.get("state")!;
@@ -461,7 +462,7 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
   expect((await fetch(authorization("https://client.example/client.json").url)).status).toBe(503);
   expect(storage.db.query("SELECT action FROM access_log WHERE action = 'oauth.cimd_failed'").get()).toEqual({ action: "oauth.cimd_failed" });
   service.close();
-  service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "other@elsewhere.example", displayName: null, subject: "google-other@elsewhere.example" }) });
+  service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "other@elsewhere.example", displayName: null, subject: "google-other@elsewhere.example" }))] });
   const browser = new Browser();
   const first = await browser.request(authorization().url);
   const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
@@ -483,7 +484,7 @@ test("CIMD, domain and unexpected OAuth failures retain safe audit categories", 
 test("a Google account presenting a linked user's email is refused at the callback and audited", async () => {
   const signIn = async (subject: string) => {
     service.close();
-    service = createOAuthServer(storage.repo, config, { now: () => clock, exchangeGoogle: async () => ({ email: "you@example.com", displayName: "You", subject }) });
+    service = createOAuthServer(storage.repo, config, { now: () => clock, providers: [stubProvider(async () => ({ email: "you@example.com", displayName: "You", subject }))] });
     const browser = new Browser();
     const first = await browser.request(authorization().url);
     const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
@@ -515,13 +516,13 @@ test("default Google exchange consistently selects the Web override or primary f
       const cfg = { ...config, publicUrl: "https://grayboard.example.com:443/hosted", devAuth: false, googleClientId: "desktop-client", googleClientSecret: "desktop-private", mcpGoogle };
       let nonce = "", tokenCalls = 0, fixtureCalls = 0;
       const selected = mcpGoogle ?? { clientId: cfg.googleClientId, clientSecret: cfg.googleClientSecret };
-      service = createOAuthServer(storage.repo, cfg, mode === "trusted-fixture" ? { exchangeGoogle: async input => {
+      service = createOAuthServer(storage.repo, cfg, mode === "trusted-fixture" ? { providers: [stubProvider(async input => {
         fixtureCalls++;
         expect(input.redirectUri).toBe(cfg.publicUrl + "/oauth/google/callback");
         expect(input.nonce).toBe(nonce);
         // The real path's ID token below carries sub "fixture-user"; the modes share one database.
         return { email: "you@example.com", displayName: "You", subject: "fixture-user" };
-      } } : {});
+      }, { clientId: selected.clientId, orgDomain: cfg.orgDomain })] } : {});
       globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
         const req = new Request(input, init);
         if (req.url === "https://www.googleapis.com/oauth2/v3/certs") return Response.json({ keys: [jwk] });
@@ -1073,9 +1074,9 @@ test("URL-only SDK enrollment honors native challenge and obtains one tools+deli
 test("official SDK binds one canonical default-port resource while preserving exact configured issuer and iss", async () => {
   const publicUrl = "https://grayboard.example.com:443/hosted";
   service.close();
-  service = createOAuthServer(storage.repo, { ...config, publicUrl, devAuth: false }, { now: () => clock, exchangeGoogle: async input => {
+  service = createOAuthServer(storage.repo, { ...config, publicUrl, devAuth: false }, { now: () => clock, providers: [stubProvider(async input => {
     expect(input.redirectUri).toBe(publicUrl + "/oauth/google/callback"); return { email: "you@example.com", displayName: "You", subject: "google-you@example.com" };
-  } });
+  })] });
   expect(service.resource).toBe("https://grayboard.example.com/hosted/mcp"); expect(service.issuer).toBe(publicUrl);
   const mapURL = (url: string) => { const u = new URL(url); expect(u.origin).toBe("https://grayboard.example.com"); return base + u.pathname + u.search; };
   const fetchFn = (input: RequestInfo | URL, init?: RequestInit) => {

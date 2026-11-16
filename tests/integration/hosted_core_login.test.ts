@@ -24,6 +24,7 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { accessAudits } from "../support/audit.ts";
 import { browse as browseConsent } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
+import { stubProvider } from "../support/stub_provider.ts";
 
 const CLIENT = "grayboard-pi";
 const FIXTURE = join(import.meta.dir, "../../adapters/hosted-core/tests/fixtures/login-client.ts");
@@ -78,7 +79,7 @@ beforeEach(async () => {
   app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, hostedSubscriberLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [],
-  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }) } });
+  }, { hostname: "127.0.0.1", background: false, oauth: { providers: [stubProvider(async () => ({ email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" }))] } });
   target = `http://127.0.0.1:${app.server.port}`;
   resource = app.oauth.resource;
 });
