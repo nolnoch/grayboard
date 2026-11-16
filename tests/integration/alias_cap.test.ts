@@ -3,7 +3,11 @@
 // identity add); an existing name binds at any count; a team owner or an
 // admin deletes a team's unused name to free a slot.
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { endSession } from "../../src/core/session_end.ts";
+import { runCli } from "../support/cli.ts";
+import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
@@ -97,3 +101,38 @@ test("a team owner or an admin deletes an unused team name, freeing a slot; a me
     { actor: ROOT, target: "eng/c", detail: { team: "eng", as_admin: true } },
   ]);
 });
+
+// #870: the hosted MCP bind tool, where a refused bind's binding row is deferred past the hosted transaction's rollback.
+test("over hosted MCP, a new team name at the cap is refused and its refused binding event survives", async () => {
+  for (const n of ["a", "b"]) {
+    const s = srv.appSession(bob, `eng/${n}`);
+    await s.connect();
+    await s.unbind(`eng/${n}`);
+  }
+  const s = await srv.hosted(B, null);
+  await expect(s.call("bind", { name: "eng/c", create: true })).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(CAPPED) });
+  expect(srv.app.db.query(`SELECT event FROM binding_events WHERE name = 'eng/c'`).all()).toEqual([{ event: "refused" }]);
+  expect(names("eng")).toEqual(["a", "b"]);
+  // An existing name still binds over the same tool.
+  expect(await s.call("bind", { name: "eng/a" })).toMatchObject({ name: "eng/a" });
+});
+
+// #870: `grayboard team delete-alias` reaches the route and prints its result or the server's refusal.
+test("grayboard team delete-alias deletes an unused team name; a member is refused", async () => {
+  const b = srv.appSession(bob, "eng/b");
+  await b.connect();
+  await b.unbind("eng/b");
+  const creds = (email: string, token: string) => {
+    const path = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");
+    writeFileSync(path, JSON.stringify({ session_token: token, server: srv.base, user_email: email }));
+    return cleanEnv({ GRAYBOARD_CREDENTIALS: path });
+  };
+  const refused = await runCli(["team", "delete-alias", "eng", "b"], { env: creds(B, bob) });
+  expect(refused.code).toBe(1);
+  expect(refused.err).toContain("forbidden");
+  expect(names("eng")).toEqual(["b"]);
+  const ok = await runCli(["--json", "team", "delete-alias", "eng", "b"], { env: creds("alice@example.com", alice) });
+  expect(ok.code).toBe(0);
+  expect(JSON.parse(ok.out)).toEqual({ ok: true, deleted: "eng/b" });
+  expect(names("eng")).toEqual([]);
+}, 20_000);
