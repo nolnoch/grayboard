@@ -1,0 +1,13 @@
+[package]
+name = "conformance-driver"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Drives the Rust SDK under the conformance suite (tests/conformance; docs/sdk-rust.md §4)"
+publish = false
+
+[dependencies]
+grayboard = { path = "../grayboard" }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "io-std", "io-util"] }
