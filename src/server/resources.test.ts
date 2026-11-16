@@ -137,7 +137,7 @@ test("only authorized same-board watchers receive hints; lost membership closes 
   resources.revalidate();
   expect(hb.counts.closed).toBe(1);
   expect((await resources.list(b)).resources.map(r => r.uri)).not.toContain(privateUri);
-  expect(() => resources.read(b, privateUri)).toThrow("no such board #private; see board_list");
+  await expect(resources.read(b, privateUri)).rejects.toThrow("no such board #private; see board_list");
   expect(() => resources.watch(b, privateUri, hooks())).toThrow("no such board #private; see board_list");
   await call(a, "board_post", { board: "private", body: "new secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([3, 1, 0]);
@@ -159,7 +159,7 @@ test("attachments are metadata only and cannot escape the selected board/page", 
   expect(result.posts[0]!.attachments).toEqual([{ id: file.id, filename: file.filename, type: file.type, size: file.size, sha256: file.sha256 }]);
   expect(JSON.stringify(result)).not.toContain("hidden");
   expect(JSON.stringify(result)).not.toContain(dir);
-  expect(() => resources.read(b, boardResourceUri("private"))).toThrow("no such board");
+  await expect(resources.read(b, boardResourceUri("private"))).rejects.toThrow("no such board");
   await call(a, "board_post", { board: "open", body: "no file" });
   expect((await resources.read(b, boardResourceUri("open"), { limit: 1 })).posts[0]!.attachments).toBeUndefined();
 });
@@ -386,7 +386,7 @@ test("unwatch is session-bound and bounded capacity is reclaimed by cancellation
   expect(h.counts.closed).toBe(1);
   application.close(a);
   expect(h.counts.closed).toBe(33);
-  expect(() => resources.read(a, boardResourceUri("e2e"))).toThrow("unauthorized");
+  await expect(resources.read(a, boardResourceUri("e2e"))).rejects.toThrow("unauthorized");
 });
 
 test("revocation, disabled users, application disconnect and stop close watchers", async () => {
@@ -398,7 +398,7 @@ test("revocation, disabled users, application disconnect and stop close watchers
   // Notification must recheck authorization even without explicit revalidation.
   await call(b, "board_post", { board: "e2e", body: "after revoke" });
   expect(revokedHook.counts).toEqual({ changed: 0, closed: 1 });
-  expect(() => resources.list(a)).toThrow("unauthorized");
+  await expect(resources.list(a)).rejects.toThrow("unauthorized");
   const disabledHook = hooks();
   resources.watch(b, boardResourceUri("e2e"), disabledHook);
   await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
@@ -500,7 +500,7 @@ test("resource background session storage faults fail closed, but authoritative 
   } finally { application.revalidateSession = validate; }
   for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
   application.revalidateSession = () => { throw new ApplicationError("unauthenticated", "closed session"); };
-  try { expect(() => resources.list(a)).toThrow("unauthorized"); }
+  try { await expect(resources.list(a)).rejects.toThrow("unauthorized"); }
   finally { application.revalidateSession = validate; }
   for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
 });
@@ -520,7 +520,7 @@ test("per-session watch capacity counts only that session's watches and frees on
   ids[0] = resources.watch(a, "grayboard://boards/cap", hooks());
   expect(resources.activeWatchCount).toBe(33);
   revoked.add(a);
-  expect(() => resources.list(a)).toThrow("resource session is closed or unauthorized");
+  await expect(resources.list(a)).rejects.toThrow("resource session is closed or unauthorized");
   expect(resources.activeWatchCount).toBe(1);
   resources.unwatch(b, theirs);
   expect(resources.activeWatchCount).toBe(0);

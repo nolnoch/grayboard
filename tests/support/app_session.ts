@@ -25,7 +25,7 @@ import {
   type UnbindResult,
 } from "../../src/server/application.ts";
 import type { startServer } from "../../src/server/app.ts";
-import type { Repo, Sync } from "../../src/server/db.ts";
+import type { Repo } from "../../src/server/db.ts";
 import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
 import type { DelegateRequest, DelegateResult, ErrorCode } from "../../src/shared/protocol.ts";
 import { seed } from "./seed.ts";
