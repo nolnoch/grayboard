@@ -52,15 +52,15 @@ test("typed operations and delivery need no frames; receipts alone move the deli
   expect(sent).toMatchObject({ delivered_now: true, pending: true });
   expect(sent).not.toHaveProperty("type");
   expect(await b.next(isDirect)).toMatchObject({ kind: "direct", message: { id: sent.message_id, body: "question?" } });
-  expect(store.repo.cursors.directFor(b.session.identityFull)).toBe(0);
+  expect(store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(0);
   await b.dmAck(sent.message_id);
-  expect(store.repo.cursors.directFor(b.session.identityFull)).toBe(0);
+  expect(store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(0);
   b.close();
   // A rebuilt session on the same key is the same ID: it re-binds the alias it holds and replays its mail.
   const b2 = await connect(bob, "fe", { key: "bob-key" });
   expect(await b2.next(isDirect)).toMatchObject({ message: { id: sent.message_id } });
   await b2.ack([sent.message_id]);
-  expect(store.repo.cursors.directFor(b.session.identityFull)).toBe(sent.message_id);
+  expect(store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(sent.message_id);
   expect((await a.history())[0]).toMatchObject({ delivered: true });
   expect((await a.inbox()).promised).toHaveLength(1);
   await a.dmAck(sent.message_id);
@@ -96,7 +96,7 @@ test("a receipt stamps delivered_at once; a cursor-only delivery shows delivered
   b.close();
   const queued = await a.send("bob@example.com/fe", "skipped backlog");
   expect((await a.history()).at(-1)).toMatchObject({ id: queued.message_id, delivered: false });
-  await seed(store.repo, () => store.repo.cursors.advance("bob@example.com/fe", "direct", "bob@example.com/fe", queued.message_id));
+  await seed(store.repo, tx => store.repo.cursors.advance(tx, "bob@example.com/fe", "direct", "bob@example.com/fe", queued.message_id));
   const skipped = (await a.history()).at(-1)!;
   expect(skipped).toMatchObject({ id: queued.message_id, delivered: true });
   expect(skipped).not.toHaveProperty("delivered_at");
@@ -240,7 +240,7 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
   const pending = await application.pending(store.repo.read, b, 1);
   expect(pending).toMatchObject([{ kind: "direct", message: { id, body: "pending", pending: true } }]);
   expect(await application.pending(store.repo.read, b, 1)).toEqual(pending);
-  expect(store.repo.cursors.directFor(b.identityFull)).toBe(0);
+  expect(store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
   await expect(application.pending(store.repo.read, b, 101)).rejects.toThrow();
   await expect(application.pending(store.repo.read, b, 0)).rejects.toThrow();
   await seed(store.repo, () => store.repo.users.setDisabled(bob.user_id, true));
@@ -326,7 +326,7 @@ test("unbound hosted sessions cannot use named operations or persist synthetic h
     () => application.history(store.repo.read, session),
     () => application.thread(store.repo.read, session, 1),
     () => application.inbox(store.repo.read, session),
-    () => application.receiptDirect(session, [1]),
+    () => seed(store.repo, tx => application.receiptDirect(tx, session, [1])),
     () => application.receiptBoards(session, []),
     () => seed(store.repo, tx => application.acknowledgeDm(tx, session, 1)),
     () => seed(store.repo, tx => application.retract(tx, session, 1)),

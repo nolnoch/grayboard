@@ -260,7 +260,7 @@ export class AppSession {
 
   async ack(ids: number[]): Promise<void> {
     const session = this.live();
-    await this.write(session, () => { this.application.receiptDirect(session, ids); });
+    await this.write(session, tx => { this.application.receiptDirect(tx, session, ids); });
   }
 
   async boardAck(refs: PendingRef[]): Promise<void> {

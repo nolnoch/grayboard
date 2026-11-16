@@ -78,7 +78,7 @@ describe("dedupWrite", () => {
   };
   // A tool call's dedup, inside a queued body as the application's handlers run it.
   const dedup = <W extends Written>(now: number, c: DedupCall, write: () => Sync<W>) =>
-    seed(repo, () => dedupWrite(repo, now, c, write) as Sync<DedupOutcome<W>>) as Promise<DedupOutcome<W>>;
+    seed(repo, tx => dedupWrite(repo, tx, now, c, write) as Sync<DedupOutcome<W>>) as Promise<DedupOutcome<W>>;
   const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
   const audits = (action: string) => db.prepare("SELECT target, actor, detail FROM access_log WHERE action = ?").all(action) as { target: string; actor: string; detail: string }[];
 

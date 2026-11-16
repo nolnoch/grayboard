@@ -243,7 +243,7 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): void {
 // Direct messages to any of `addresses` past each one's cursor (unacked ones
 // are resent).
 function drainDirect(hub: Hub, session: ApplicationSession, addresses: string[]): void {
-  const streams = addresses.map((a) => ({ type: "direct" as const, ref: a, since: hub.repo.cursors.get(a, "direct", a) }));
+  const streams = addresses.map((a) => ({ type: "direct" as const, ref: a, since: hub.repo.cursors.get(hub.repo.read, a, "direct", a) }));
   for (const message of hub.repo.messages.unreadSince(streams)) {
     session.sink.deliver({ kind: "direct", message: showMessage(message) });
   }
@@ -1024,15 +1024,15 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       options: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
     ) {
       valid(session);
-      return handleSend(hub, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
+      return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       valid(session);
-      return handleDelegate(hub, session, request);
+      return handleDelegate(hub, tx, session, request);
     },
     async history(r: Read, session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
       valid(session);
-      return handleHistory(hub, session, options.peer, options.limit, options.before_id);
+      return handleHistory(hub, r, session, options.peer, options.limit, options.before_id);
     },
     async thread(r: Read, session: ApplicationSession, id: number) {
       valid(session);
@@ -1047,7 +1047,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
       valid(session);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
-      const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(a, "direct", a) }));
+      const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(r, a, "direct", a) }));
       const messages = repo.messages.unreadSince(streams).slice(0, limit);
       const seen = new Set<string>();
       const all: Pending[] = [];
@@ -1098,9 +1098,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     // handed: false is a give-up (Slack refused the message): the cursor
     // moves so it isn't retried, but nothing reached the harness to stamp.
-    receiptDirect(session: ApplicationSession, ids: number[], opts: { handed: boolean } = { handed: true }) {
+    receiptDirect(tx: Tx, session: ApplicationSession, ids: number[], opts: { handed: boolean } = { handed: true }) {
       valid(session);
-      handleAck(session, ids, repo, opts.handed ? now() : null);
+      handleAck(tx, session, ids, repo, opts.handed ? now() : null);
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
@@ -1127,12 +1127,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
       valid(session);
-      return handleRetract(hub, session, id);
+      return handleRetract(hub, tx, session, id);
     },
     async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool));
       // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
-      try { return handleCall(hub, session, tool, args, publish); }
+      try { return handleCall(hub, tx, session, tool, args, publish); }
       finally { afterCommit(db, () => expiry.arm()); }
     },
     // Trusted committed domain operations, not client-supplied invalidations.
@@ -1404,13 +1404,13 @@ function deliverSend(hub: Hub, msg: MessageRow): void {
 // addresses' (S5); a replay releases them (the retry uploaded its files
 // afresh, and nothing will bind them), audited like any release.
 function writeOnce<W extends Written>(
-  hub: Hub, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: () => Sync<W>,
+  hub: Hub, tx: Tx, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: () => Sync<W>,
   recheck?: (stored: W["payload"]) => void,
 ): DedupOutcome<W> {
   const { repo } = hub;
   if (session.human) return { fresh: repo.atomic(write) };
   const { authed } = session;
-  const out = dedupWrite(repo, hub.now(), {
+  const out = dedupWrite(repo, tx, hub.now(), {
     tool, session: session.sessionId, sender, actor: authed.user_email, transport: session.transport, args, resend,
   }, write, () => {
     for (const row of dropUnsentUploads(hub.db, uploads, uploaderOf(session))) {
@@ -1424,12 +1424,12 @@ function writeOnce<W extends Written>(
 }
 
 function handleSend(
-  hub: Hub, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean, as: string | undefined,
+  hub: Hub, tx: Tx, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean, as: string | undefined,
 ): SendResult {
   const p = prepareSend(hub, session, sendAs(hub, session, as, parentId), recipient, body, parentId, pending, ids);
   // Keyed by what the server resolved, so two spellings of one call collide.
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
-  const out = writeOnce(hub, session, "dm_send", p.from, args, resend, p.ids, () => writeSend(hub, session, p));
+  const out = writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, () => writeSend(hub, session, p));
   if ("replay" in out) return out.replay;
   afterCommit(hub.db, () => {
     // Committed, not yet answered: a lost answer's window (tests force it here).
@@ -1445,7 +1445,7 @@ function handleSend(
 // picked and why, or the refusal (#184 review 4). Deduplicated as a
 // delegate (#254): the fingerprint is the request as given, taken before
 // resolution picks a launcher.
-function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateRequest, "type" | "req_id">): DelegateResult {
+function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<DelegateRequest, "type" | "req_id">): DelegateResult {
   const { repo, db } = hub;
   const { authed } = session;
   // The audit rows name the child that called, beside the routing `via` (#523).
@@ -1500,7 +1500,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
     return { refused: crossUserRefusal(to) };
   };
   try {
-    out = writeOnce(hub, session, "delegate", session.primary, args, m.resend === true, [], () => {
+    out = writeOnce(hub, tx, session, "delegate", session.primary, args, m.resend === true, [], () => {
       // Checked and spent in here, so a dedup replay is neither charged nor
       // refused; resend writes again, so it's charged (#252).
       // The user's bucket, not the address's (#252): the row names the session that tripped it.
@@ -1568,7 +1568,7 @@ function handleDelegate(hub: Hub, session: ApplicationSession, m: Omit<DelegateR
 // The cursor moves only when the recipient acks, so a live recipient may hold
 // a pushed message past it: liveness counts as reached too. A repeat of a
 // retract that landed (its answer lost, #254) is answered from its audit row.
-function handleRetract(hub: Hub, session: ApplicationSession, id: number): { note?: string } {
+function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number): { note?: string } {
   const { repo, registry } = hub;
   const mine = session.addresses;
   const m = repo.messages.getById(id);
@@ -1579,13 +1579,13 @@ function handleRetract(hub: Hub, session: ApplicationSession, id: number): { not
   }
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
-  if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
+  if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(tx, m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (!repo.messages.retract(m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
   afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
   return {};
 }
 
-function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): unknown {
+function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): unknown {
   const { db } = hub;
   if (!isBoardTool(tool)) fail("bad_request", `unknown tool: ${tool}`);
   childState(session, tool);
@@ -1609,7 +1609,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
     throw e;
   }
   const { as: _as, ...rest } = args;
-  if (tool === "board_post") return handleBoardPost(hub, session, actor, rest, ctx, publish);
+  if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish);
   let outcome;
   try { outcome = callBoardTool(db, actor, tool, rest, ctx); }
   catch (e) {
@@ -1634,7 +1634,7 @@ function handleCall(hub: Hub, session: ApplicationSession, tool: string, args: R
 
 // board_post, deduplicated (#254): a repeat replays the first post's result,
 // and a queue board gets no second work item.
-function handleBoardPost(hub: Hub, session: ApplicationSession, me: string, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void): unknown {
+function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: string, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void): unknown {
   const { db, repo } = hub;
   const { resend, ...postArgs } = args;
   let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
@@ -1650,7 +1650,7 @@ function handleBoardPost(hub: Hub, session: ApplicationSession, me: string, args
     // Before the write is deduplicated: access is re-checked on a repeat, so a caller who has lost the board is refused, not replayed (#296).
     checkPostAccess(db, me, postArgs.board, parentId);
     const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: uploadDigests(db, ids, uploaderOf(session)) };
-    out = writeOnce(hub, session, "board_post", me, fp, resend === true, ids, () => {
+    out = writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, () => {
       const o = callBoardTool(db, me, "board_post", postArgs, ctx);
       const r = o.result as BoardPostResult;
       for (const a of r.attachments ?? []) writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
@@ -1712,7 +1712,7 @@ function writerMarks(repo: Repo, session: ApplicationSession, messageIds: number
   };
 }
 
-function handleHistory(hub: Hub, session: ApplicationSession, peer: string | undefined, limit: number | undefined, beforeId: number | undefined): HistoryMessage[] {
+function handleHistory(hub: Hub, r: Read, session: ApplicationSession, peer: string | undefined, limit: number | undefined, beforeId: number | undefined): HistoryMessage[] {
   const { repo } = hub;
   let lim: number;
   try {
@@ -1724,7 +1724,7 @@ function handleHistory(hub: Hub, session: ApplicationSession, peer: string | und
   const mine = session.addresses;
   const cursors = new Map<string, number>();
   const reached = (to: string) => {
-    if (!cursors.has(to)) cursors.set(to, repo.cursors.directFor(to));
+    if (!cursors.has(to)) cursors.set(to, repo.cursors.directFor(r, to));
     return cursors.get(to)!;
   };
   // Newest `lim` before beforeId, shown oldest first as in local mode.
@@ -1769,11 +1769,11 @@ function handleThread(session: ApplicationSession, messageId: number, repo: Repo
 // A receipt: the harness was handed these ids. Each stamps its delivery time
 // once (unless `at` is null: given up, not handed) and moves its recipient
 // address's cursor; only your own direct messages count (S8).
-function handleAck(session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): void {
+function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): void {
   for (const msgId of messageIds) {
     const msg = repo.messages.getById(msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
     if (at !== null) repo.messages.markDelivered(msgId, at);
-    repo.cursors.advance(msg.recipient, "direct", msg.recipient, msgId);
+    repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
   }
 }
