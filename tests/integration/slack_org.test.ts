@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import { ApplicationError } from "../../src/server/application.ts";
+import { writeAudit } from "../../src/server/audit.ts";
 import type { SendResult } from "../../src/shared/protocol.ts";
 import { createHash } from "node:crypto";
 
@@ -367,6 +368,75 @@ test("#807: an HTTP unlink while another body holds the write queue waits, then 
   await holder.done;
   expect(await unlinked).toBe(true);
   expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+});
+
+// #807 D4: a Slack user's tool call is one transaction through the write queue, as a hosted call is.
+test("#807: a Slack user's dm_send and board_post run inside a write-queue transaction", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const app = srv.app.application;
+  const { call, send } = app;
+  const seen: Record<string, boolean> = {};
+  const queued = () => srv.app.db.inTransaction && queueFor(srv.app.db).mine;
+  app.call = (s, n, a, p) => { seen[n] = queued(); return call.call(app, s, n, a, p); };
+  app.send = (s, to, body, o) => { seen.dm_send = queued(); return send.call(app, s, to, body, o); };
+  try {
+    slack.say("#e2e queued post");
+    slack.say("@be queued dm");
+    await until(() => "board_post" in seen && "dm_send" in seen, 5000, "both calls reached the application");
+  } finally { app.call = call; app.send = send; }
+  expect(seen).toEqual({ board_post: true, dm_send: true });
+});
+
+// A refusal's row (rowAfterRollback, application.ts) is written after the rollback that drops the call's other
+// writes (#452), as a hosted call's are: the stub refuses the way send does.
+test("#807: a Slack user's refused call keeps its refusal row", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  await hosted("alice@example.com", "be");
+  const app = srv.app.application;
+  const { send } = app;
+  app.send = (s) => {
+    const row = () => writeAudit(srv.app.repo, "delegation.refused", "alice@example.com", "be", {});
+    if (s.afterRollback) s.afterRollback(row); else row();
+    throw new ApplicationError("forbidden", "stub refusal");
+  };
+  try {
+    slack.say("@be refused");
+    await until(() => slack.posts().find((p) => p.markdown_text?.includes("stub refusal")), 5000, "the refusal reached Slack");
+  } finally { app.send = send; }
+  await until(() => accessAudits(srv.app.db, "delegation.refused").length === 1, 5000, "the refusal row was written");
+});
+
+// #807 D4: a delivered item's receipt and progress clear are one posted write: behind a held queue it waits, and
+// reads the progress written before it.
+test("#807: a Slack delivery receipt waits for the write queue, then stamps the message delivered", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const repo = srv.app.repo;
+  const { post } = repo;
+  const receipts: boolean[] = [];
+  repo.post = (fn, committed, what) => {
+    const now = (post as (...a: unknown[]) => boolean).call(repo, fn, committed, what);
+    if (what === "Slack receipt") receipts.push(now);
+    return now;
+  };
+  let holder: ReturnType<typeof holdQueue> | undefined;
+  // Held as Slack takes the post, so the progress write and the receipt both queue behind it.
+  slack.onPost = (body) => { if (!holder && String(body.markdown_text).includes("receipt fixture")) holder = holdQueue(); };
+  try {
+    const sent = await be.call<SendResult>("dm_send", { to: "human", body: "receipt fixture" });
+    await until(() => receipts.length > 0, 5000, "the relay posted the receipt");
+    expect(receipts).toEqual([false]);
+    const deliveredAt = () => (srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(sent.message_id) as { delivered_at: number | null }).delivered_at;
+    expect(deliveredAt()).toBeNull();
+    holder!.release();
+    await holder!.done;
+    await until(() => deliveredAt() !== null, 5000, "the receipt stamped the message delivered");
+  } finally { repo.post = post; slack.onPost = null; holder?.release(); }
 });
 
 test("#807: an unlink for one Slack account leaves a link that moved to another account while it waited", async () => {

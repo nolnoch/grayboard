@@ -18,7 +18,7 @@ import { SlackError, SlackWeb } from "../bridge/web.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import type { Repo, SlackLink } from "./db.ts";
+import type { Repo, SlackLink, Sync } from "./db.ts";
 import { onAliasCreated } from "./teams.ts";
 import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
@@ -305,7 +305,7 @@ export class SlackBridge implements SlackLinker {
         // address (security audit F-19).
         if (m.kind === "direct") detached(() => relay.notify(dmNotification(m.message)));
         else if (m.item.kind === "digest") {
-          try { application.receiptBoards(session, [refOf(m.item)]); } catch {}
+          try { repo.post(() => application.receiptBoards(session, [refOf(m.item)]), undefined, "Slack digest receipt"); } catch {}
         }
         else detached(() => relay.notify(boardNotification(m.item)));
       },
@@ -338,31 +338,58 @@ export class SlackBridge implements SlackLinker {
         const p = outbox.get(id);
         const m = p?.meta ?? {};
         if (!session.active) throw new Error("Slack delivery session ended before receipt");
-        // A message Slack refused (msg_too_long) is given up, never posted: its
-        // cursor moves but it isn't stamped delivered (#470).
-        const posted = (repo.slack.progress(link.user_id, ref(id)) as { posted?: boolean } | undefined)?.posted === true;
-        // Receipt is synchronous and validates the live session; retain progress on any refusal.
-        if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
-        else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)], { handed: posted });
+        // The receipt validates the live session; it and the progress clear are one posted write (#807 D4). Run now
+        // (the idle queue, as always under SQLite today), a refusal throws and keeps the item and its progress for
+        // the next drain. Waiting behind another body, the item leaves the outbox now so the drain doesn't post it
+        // again; a refusal then rolls both back and is logged, and the unacked item is resent at the next start.
         const r = ref(id);
-        repo.post(() => repo.slack.clearProgress(link.user_id, r), undefined, "Slack progress clear");
-        outbox.delete(id);
+        const now = repo.post(() => {
+          // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
+          // delivered (#470). Read in the body, after the progress writes queued before it.
+          const posted = (repo.slack.progress(link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
+          if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
+          else if (m.message_id) application.receiptDirect(session, [Number(m.message_id)], { handed: posted });
+          repo.slack.clearProgress(link.user_id, r);
+        }, () => { outbox.delete(id); }, "Slack receipt");
+        if (!now) outbox.delete(id);
       },
     };
 
+    // A Slack user's tool call runs in one transaction through the write queue (#807 D4), as a hosted call does
+    // (hosted.run): its refusal rows, which the rollback would drop, are written after it in a body of their own.
+    // Bodies run one at a time and synchronously, so the shared session's afterRollback is set only inside one.
+    const inWrite = async <T>(fn: () => T): Promise<T> => {
+      const rows: Array<() => void> = [];
+      try {
+        return await repo.write(() => {
+          rows.length = 0;
+          session.afterRollback = write => { rows.push(write); };
+          try { return fn() as Sync<T>; } finally { session.afterRollback = undefined; }
+        }) as T;
+      } catch (error) {
+        if (rows.length) {
+          await repo.write(() => {
+            for (const write of rows) {
+              try { repo.atomic(write); } catch (failure) { console.error("[grayboard slack] refusal row failed:", failure); }
+            }
+          }).catch(failure => console.error("[grayboard slack] refusal rows failed:", failure));
+        }
+        throw error;
+      }
+    };
     const bus: Bus = {
       async call(name, args) {
         try {
           if (name === "dm_send") {
-            return { ok: true, value: application.send(session, String(args.to), String(args.body), {
+            return { ok: true, value: await inWrite(() => application.send(session, String(args.to), String(args.body), {
               ...(args.parent_id !== undefined ? { parent_id: Number(args.parent_id) } : {}),
               ...(args.attachment_ids !== undefined ? { attachment_ids: args.attachment_ids as number[] } : {}),
-            }) };
+            })) };
           }
           if (name === "dm_thread") {
-            return { ok: true, value: application.thread(session, Number(args.thread)) };
+            return { ok: true, value: await inWrite(() => application.thread(session, Number(args.thread))) };
           }
-          return { ok: true, value: application.call(session, name, args) };
+          return { ok: true, value: await inWrite(() => application.call(session, name, args)) };
         } catch (e) {
           if (e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError) return { ok: false, error: e.message, ...(typeof (e as { code?: unknown }).code === "string" ? { code: (e as { code: string }).code } : {}) };
           console.error(`[grayboard slack] bus call failed: ${JSON.stringify({ principal: link.user_id, identity: handle, session: session.sessionId, tool: name, protocol: "slack", ...failureDiagnostic("slack-bus", e) })}`);
