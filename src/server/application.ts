@@ -365,6 +365,8 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
       return kind === "team" || kind === "service" ? kind : null;
     });
   } catch (e) {
+    // The reserved name refuses alike in a team that exists and one that doesn't (#1020).
+    if (e instanceof CoreError && p.name === HUMAN_NAME) return { code: "forbidden", error: HUMAN_RESERVED, address };
     if (e instanceof CoreError) return { code: "not_found", error: e.message, address };
     throw e;
   }

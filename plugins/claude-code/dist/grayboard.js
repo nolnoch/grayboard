@@ -36895,7 +36895,7 @@ class Controller {
       try {
         await wire.call("bind", { name: address, create: false, where: this.port.place() });
       } catch (error) {
-        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden"].includes(error.code)))
+        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden", "not_found"].includes(error.code)))
           throw error;
         refused.push(error);
       }

@@ -378,7 +378,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   // Binds the remembered holds `have` lacks (all of them after an ended ownership, the missing ones after a partial
   // loss). `tolerant` (a resume's prepare): a hold now refused (revoked, taken, deleted) is skipped and recorded, so
-  // it doesn't keep the others from resuming, and the refusals are returned for the caller to raise if nothing ends
+  // it doesn't keep the others from resuming (a team the user left reads as missing, not_found, #1020), and the refusals are returned for the caller to raise if nothing ends
   // up held, or record if something did; the run loop, which must end up holding exactly `held`, and anything else (sign-in, outage) throws.
   private async bindAll(r: Root<E>, wire: Wire, held: readonly string[], have: readonly string[], tolerant = false) {
     const refused: SubscriberError[] = [];
@@ -386,7 +386,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       if (have.includes(address)) continue;
       try { await wire.call("bind", { name: address, create: false, where: this.port.place() }); }
       catch (error) {
-        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden"].includes(error.code))) throw error;
+        if (!(tolerant && error instanceof SubscriberError && ["alias_held", "identity_unknown", "forbidden", "not_found"].includes(error.code))) throw error;
         refused.push(error);
       }
     }

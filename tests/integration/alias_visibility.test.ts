@@ -206,8 +206,8 @@ test("suggestions follow the session's user, not the team address it acts as", a
 });
 
 // #1020: to a non-member, a team that exists refuses exactly as one that
-// doesn't, in each team-scoped refusal: board_create, bind, writes_as (app
-// and hosted) and an HTTP `as`.
+// doesn't, in each team-scoped refusal: board_create, bind (app and hosted,
+// the reserved human name too), an app writes_as and an HTTP `as`.
 test("a team-scoped refusal reads the same to a non-member whether or not the team exists", async () => {
   // The refusal for eng, and for nosuch with its name put back as eng.
   const both = async (refused: (team: string) => Promise<unknown>) => {
@@ -225,6 +225,7 @@ test("a team-scoped refusal reads the same to a non-member whether or not the te
 
   expect(await both((t) => err(outsider.call("board_create", { name: "plans", purpose: "p", team: t })))).toEqual({ code: "bad_request", message: 'no such team "TEAM"' });
   expect(await both((t) => err(outsider.bind(`${t}/x`)))).toEqual({ code: "not_found", message: '"TEAM/x": no team or service is named "TEAM"' });
+  expect(await both((t) => err(outsider.bind(`${t}/human`)))).toMatchObject({ code: "forbidden" });
   expect(await both((t) => err(srv.appSession(carol, `${t}/x`, { push: false }).connect()))).toMatchObject({ code: "not_found" });
   const hosted = await srv.hosted("carol@example.com", null);
   expect(await both((t) => err(hosted.call("bind", { name: `${t}/x`, create: true })))).toMatchObject({ code: "not_found" });
