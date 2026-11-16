@@ -890,7 +890,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const readCommitted = () => { try { committed = counter.get()!.n; } catch (error) { committed = undefined; console.error("[grayboard] auth generation read failed:", error); } };
   readCommitted();
   onCommit(db, readCommitted);
-  const readGeneration = () => committed === undefined ? undefined : `${committed}:${dataVersion.get()!.data_version}`;
+  // Outside any transaction the live counter is the committed one, and covers a write that committed without a
+  // tracked boundary (an autocommit statement: no hook ran); only while another task's transaction is open does it
+  // serve the value the last hook read.
+  const readGeneration = () => {
+    const n = db.inTransaction ? committed : counter.get()!.n;
+    return n === undefined ? undefined : `${n}:${dataVersion.get()!.data_version}`;
+  };
   const authGeneration = () => ownsTx(db) ? undefined : pinned ?? readGeneration();
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
   // Caches of what the auth tables say, cleared when authGeneration moves: a live access token only (an

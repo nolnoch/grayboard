@@ -5,6 +5,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, type Repo } from "./db.ts";
+import { sqliteOf } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 const open = (): Repo => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
@@ -63,4 +64,32 @@ test("a synchronous transaction's commit moves the generation too", () => {
   expect(mid).not.toBe(before);
   expect(repo.post(() => { repo.users.upsertByEmail("d@example.com", null); })).toBe(true);
   expect(repo.authGeneration()).not.toBe(mid);
+});
+
+test("a failed counter read leaves the generation undefined, never stale, until a commit reads it again", async () => {
+  const repo = open();
+  repo.writeNow(() => repo.users.upsertByEmail("g@example.com", null));
+  // Drops the counter table: the commit's hook can't read it.
+  repo.writeNow(tx => { sqliteOf(tx).run("DROP TABLE temp.auth_generation"); });
+  const h = hold(repo, () => {});
+  await h.wrote;
+  expect(repo.authGeneration()).toBeUndefined();
+  expect(repo.authRead(() => repo.authGeneration())).toBeUndefined();
+  h.release();
+  await h.done;
+  repo.writeNow(tx => { sqliteOf(tx).run("CREATE TEMP TABLE auth_generation(n INTEGER NOT NULL); INSERT INTO auth_generation(n) VALUES (7)"); });
+  const h2 = hold(repo, () => {});
+  await h2.wrote;
+  expect(repo.authGeneration()).toStartWith("7:");
+  h2.release();
+  await h2.done;
+});
+
+test("an auth-table write that commits without a tracked boundary still moves the generation", async () => {
+  const repo = open();
+  const user = repo.writeNow(() => repo.users.upsertByEmail("h@example.com", null));
+  const before = repo.authGeneration();
+  // A holder's committed callback, outside any transaction: clearSubject is a bare autocommit UPDATE.
+  await repo.write(() => {}, () => { repo.users.clearSubject(user.id); });
+  expect(repo.authGeneration()).not.toBe(before);
 });
