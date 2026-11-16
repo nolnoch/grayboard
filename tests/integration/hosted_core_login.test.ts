@@ -103,7 +103,7 @@ function login(overrides: Partial<LoginConfig> = {}): Login & { seen: Recorder }
 // A store holding a real grant, its access token already expired locally so
 // the next token() refreshes.
 async function seed(options: { scopes?: string[]; access?: string; expiresIn?: number; clientId?: string; refresh?: string } = {}) {
-  const issued = issueOAuth(app.repo, resource, "alice@example.com", options.scopes ?? ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  const issued = await issueOAuth(app.repo, resource, "alice@example.com", options.scopes ?? ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
   const store: GrantStore = { version: 1, resource, clientId: options.clientId ?? CLIENT, epoch: "seeded", issuer, scope: (options.scopes ?? ["grayboard:delivery", "grayboard:tools"]).join(" "),
     access: options.access ?? issued.token, accessExpiresAt: Date.now() + (options.expiresIn ?? -1_000), refresh: options.refresh ?? issued.refreshToken };
   await writeJsonAtomic(login({ clientId: store.clientId }).path, store);
@@ -542,7 +542,7 @@ test("a TLS failure once the refresh request may have gone out is an unknown out
 });
 
 test("a successful refresh sends the revokes still queued; one the server doesn't confirm stays queued and is recorded", async () => {
-  const other = issueOAuth(app.repo, resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  const other = await issueOAuth(app.repo, resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
   const { store } = await seed();
   const l = login();
   await writeJsonAtomic(l.path, { ...store, revoke: [other.refreshToken] } satisfies GrantStore);

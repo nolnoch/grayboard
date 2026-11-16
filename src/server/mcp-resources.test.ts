@@ -10,7 +10,7 @@ import { ApplicationError, createApplication } from "./application.ts";
 import { createHostedMcp, MCP_PROTOCOL_VERSIONS } from "./mcp.ts";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
-import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
@@ -20,7 +20,7 @@ const meta = { "ai.opencode/sessionID": "resource-root" };
 
 let store: ReturnType<typeof openDatabase>, application: ReturnType<typeof createApplication>;
 let oauth: ReturnType<typeof createOAuthServer>, hosted: ReturnType<typeof createHostedMcp>;
-let dir: string, grant: ReturnType<typeof issueOAuth>;
+let dir: string, grant: IssuedOAuth;
 const clients: Client[] = [];
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-resource-unit-"));
@@ -28,7 +28,7 @@ beforeEach(async () => {
   application = createApplication(store.repo, store.db);
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer });
-  grant = issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true });
@@ -115,7 +115,7 @@ test("receipt capacity is structured and release then bind false reopens under a
 });
 
 test("subscriber known suggestions stay account scoped and reject malformed extra fields without getters", async () => {
-  const bob = issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
+  const bob = await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
   const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${bob.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "private-name", create: true });

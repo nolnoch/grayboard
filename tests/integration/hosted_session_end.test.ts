@@ -56,7 +56,7 @@ async function bind(client: Client, name: string) {
 }
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: root ends actual registered child IDs without ending siblings or foreign ownership`, async () => {
-  const grant = issue(), foreignGrant = issue("bob@example.com");
+  const grant = await issue(), foreignGrant = await issue("bob@example.com");
   const root = await connect(version, grant.token, "root");
   await bind(root, "be");
   const first = await value(root, "session_register", { child: "first" });
@@ -93,7 +93,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: root ends actual 
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child end frees the existing child capacity`, async () => {
-  const grant = issue();
+  const grant = await issue();
   const root = await connect(version, grant.token, "capacity-root");
   await bind(root, "be");
   const first = await value(root, "session_register", { child: "first" });
@@ -115,7 +115,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child e
 // #566: a root past MAX_CHILDREN registrations keeps registering once its earlier children idle past the window,
 // and a parked child's next call runs as that root's child again.
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: idle children are parked, so registration MAX_CHILDREN + 1 succeeds and a parked child acts again`, async () => {
-  const grant = issue();
+  const grant = await issue();
   const root = await connect(version, grant.token, "busy-root");
   await bind(root, "be");
   const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
@@ -136,7 +136,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: idle children are
 // #566 audit 1: an exchange's selection doesn't wake a parked child, so its session_end over HTTP ends it even
 // with the root at full child capacity, and writes no unpark row.
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's session_end over HTTP ends it at full child capacity`, async () => {
-  const grant = issue();
+  const grant = await issue();
   const root = await connect(version, grant.token, "full-root");
   await bind(root, "be");
   const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));

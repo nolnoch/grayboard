@@ -34,7 +34,7 @@ afterEach(async () => {
 // generic session key and the alias it writes as (`writesAs`, changeable
 // between calls), so the server's own transaction and `later` hook decide.
 async function toolsOnly(email: string, sessionId: string, writesAs: () => string): Promise<(tool: string, args?: Record<string, unknown>) => Promise<CallToolResult>> {
-  const { token } = issueOAuth(srv.app.repo, srv.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
+  const { token } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
   const version = MCP_PROTOCOL_VERSIONS[0]!;
   const client = new Client({ name: "tools-only", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);

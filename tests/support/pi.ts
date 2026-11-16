@@ -1048,7 +1048,7 @@ export type Peer = { dir: string; reports: string[]; call(tool: string, args?: R
 export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> {
   const home = join(dir, "peer");
   mkdirSync(home, { recursive: true });
-  const { token } = issueOAuth(srv.app.repo, srv.resource, "bob@example.com", ["grayboard:delivery", "grayboard:tools"], Date.now(), "grayboard-omp");
+  const { token } = await issueOAuth(srv.app.repo, srv.resource, "bob@example.com", ["grayboard:delivery", "grayboard:tools"], Date.now(), "grayboard-omp");
   const reports: string[] = [];
   const proxy = new ToolProxy({
     wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-omp", version: "1.0.0" }, delivery: { mode: "poll", source: "grayboard" } },

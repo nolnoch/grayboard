@@ -14,7 +14,7 @@ import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 
 let application: ReturnType<typeof createApplication>;
 let hosted: ReturnType<typeof createHostedSessions>;
-import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
 import { getAttachment, bindAttachments } from "../core/attachments.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
@@ -22,7 +22,7 @@ let store: ReturnType<typeof openDatabase>;
 let oauth: ReturnType<typeof createOAuthServer>;
 let router: ReturnType<typeof createMcpAttachments>;
 let gate: UploadGate;
-let issued: ReturnType<typeof issueOAuth>;
+let issued: IssuedOAuth;
 let dir: string;
 let now: number;
 const origin = "https://grayboard.example.com";
@@ -44,7 +44,7 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-oauth-attachments-"));
   store = openDatabase(join(dir, "bus.db"), { blobDir: dir });
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: `${origin}:443/hosted`, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => now });
-  issued = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now, OPENCODE_CLIENT);
+  issued = await issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now, OPENCODE_CLIENT);
   store.repo.aliases.create({ scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email);
   gate = new UploadGate(1024, 1024);
   application = createApplication(store.repo, store.db);
@@ -104,7 +104,7 @@ function external(operation: "bind" | "end", rawSession: string) {
 
 test("all private attachment methods require mapped bound context, not a name override", async () => {
   const id = await uploaded();
-  const unmapped = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now);
+  const unmapped = await issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now);
   for (const method of ["POST", "GET", "DELETE"]) {
     const path = method === "POST" ? "/mcp/attachments?identity=be&filename=report.txt" : `/mcp/attachments/${id}?identity=be`;
     for (const raw of [undefined, "never-bound", "%61ttachment-root", "%FF"]) {
@@ -177,8 +177,8 @@ test("Origin precedes authentication; scope and audience never fall back", async
     req.headers.set("Origin", value);
     expect((await send(req)).status).toBe(403);
   }
-  const delivery = issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:delivery"], now);
-  const wrongResource = issueOAuth(store.repo, `${origin}/other/mcp`, "alice@example.com", ["grayboard:tools"], now);
+  const delivery = await issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:delivery"], now);
+  const wrongResource = await issueOAuth(store.repo, `${origin}/other/mcp`, "alice@example.com", ["grayboard:tools"], now);
   for (const method of ["POST", "GET", "DELETE"]) {
     const path = method === "POST" ? "/mcp/attachments?identity=be&filename=report.txt" : "/mcp/attachments/1?identity=be";
     expect((await send(request(method, path, bytes, delivery.token))).status).toBe(403);

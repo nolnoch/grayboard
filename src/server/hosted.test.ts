@@ -226,13 +226,13 @@ test("the authenticated client selects the source key and harness; nothing else 
     { clientId: "plain", name: "Plain", redirectUris: ["http://127.0.0.1/callback"], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none" },
   ] });
   try {
-    const authenticate = (clientId: string) => {
-      const issued = issueOAuth(database.repo, oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], now, clientId);
+    const authenticate = async (clientId: string) => {
+      const issued = await issueOAuth(database.repo, oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], now, clientId);
       const p = oauth.authenticate(new Request(oauth.resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
       if (p instanceof Response) throw new Error("fixture authorization failed");
       return p;
     };
-    const [broker, opencode, plain, cimd, ...builtins] = ["broker", OPENCODE_CLIENT, "plain", "https://client.example/client.json", ...BUILTIN_CLIENT_IDS].map(authenticate);
+    const [broker, opencode, plain, cimd, ...builtins] = await Promise.all(["broker", OPENCODE_CLIENT, "plain", "https://client.example/client.json", ...BUILTIN_CLIENT_IDS].map(authenticate));
     expect([broker!.sourceKey, opencode!.sourceKey, plain!.sourceKey, cimd!.sourceKey]).toEqual([GRAYBOARD_SESSION_META, OPENCODE_SESSION_META, null, null]);
     expect(builtins.map(p => [p.clientId, p.sourceKey])).toEqual(BUILTIN_CLIENT_IDS.map(id => [id, GRAYBOARD_SESSION_META]));
     const both = { [GRAYBOARD_SESSION_META]: "generic", [OPENCODE_SESSION_META]: "opencode" };

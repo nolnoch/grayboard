@@ -136,8 +136,8 @@ test("CIMD automatic registration uses one native grant and omitted resource sta
   expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${next.access_token}` } }))).toBeInstanceOf(Response);
 });
 
-test("internal grant liveness survives individual access revocation but never authorizes that access", () => {
-  const grant = issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery", "grayboard:tools"], clock);
+test("internal grant liveness survives individual access revocation but never authorizes that access", async () => {
+  const grant = await issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery", "grayboard:tools"], clock);
   const request = new Request(service.resource, { headers: { Authorization: `Bearer ${grant.token}` } });
   const principal = service.authenticate(request);
   if (principal instanceof Response) throw new Error("expected fixture principal");
@@ -155,7 +155,7 @@ test("internal grant liveness survives individual access revocation but never au
   expect(service.isGrantActive(grant.grantId)).toBe(false);
   storage.repo.users.setDisabled(grant.authed.user_id, false);
   expect(service.isGrantActive(grant.grantId)).toBe(false);
-  const next = issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery"], clock);
+  const next = await issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery"], clock);
   clock += OAUTH_TTL.grant;
   expect(service.isGrantActive(next.grantId)).toBe(false);
   service.close();
@@ -1129,8 +1129,8 @@ for (const version of ["2026-07-28", "2025-11-25"]) test(`${version} official SD
 
 test("#853: a cached authorization ends with the write that ends it, from this connection or another, and a rolled-back write leaves it standing", async () => {
   const { Database } = await import("bun:sqlite");
-  const mint = (email: string) => {
-    const { token } = issueOAuth(storage.repo, service.resource, email, ["grayboard:tools"], clock, "native");
+  const mint = async (email: string) => {
+    const { token } = await issueOAuth(storage.repo, service.resource, email, ["grayboard:tools"], clock, "native");
     const p = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
     return Object.assign(p, { bearer: new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }) });
@@ -1140,7 +1140,7 @@ test("#853: a cached authorization ends with the write that ends it, from this c
   const query = spyOn(Database.prototype, "query");
   try {
     const joins = () => query.mock.calls.filter(([sql]) => String(sql).includes("FROM oauth_tokens t")).length;
-    const p = mint("cached@example.com");
+    const p = await mint("cached@example.com");
     query.mockClear();
     for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
     expect(joins()).toBe(0); // warm: no token join while nothing has changed
@@ -1160,14 +1160,14 @@ test("#853: a cached authorization ends with the write that ends it, from this c
       ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
     ];
     for (const [i, [what, end]] of ends.entries()) {
-      const q = mint(`end${i}@example.com`);
+      const q = await mint(`end${i}@example.com`);
       expect(service.isAuthorized(q)).toBe(true);
       end(q);
       expect(service.isAuthorized(q), what).toBe(false);
       expect(refused(q.bearer), what).toBe(true); // the bearer's own warm entry, not just the principal check
     }
     // Expiry needs no write: the entry's own deadline ends it.
-    const e = mint("expiry@example.com");
+    const e = await mint("expiry@example.com");
     expect(service.isAuthorized(e)).toBe(true);
     expect(refused(e.bearer)).toBe(false);
     clock = e.accessExpiry;
@@ -1192,7 +1192,7 @@ test("#881: one authorization reads the auth generation once, and a write betwee
   const counting = makeService();
   storage = saved;
   try {
-    const { token } = issueOAuth(counted.repo, counting.resource, "generation@example.com", ["grayboard:tools"], clock, "native");
+    const { token } = await issueOAuth(counted.repo, counting.resource, "generation@example.com", ["grayboard:tools"], clock, "native");
     const p = counting.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
     expect(counting.isAuthorized(p)).toBe(true);

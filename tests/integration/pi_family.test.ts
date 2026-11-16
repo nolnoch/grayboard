@@ -147,14 +147,14 @@ async function root(id: string, name: string, extra: Partial<SessionInfo> = {}, 
 // sign-out revokes and logs the store out.
 const storeLogin = () => new Login({ resource: srv.resource, clientId: CLIENT, stateDir, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} });
 async function loginElsewhere(epoch: string) {
-  const issued = issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
+  const issued = await issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
   await writeJsonAtomic(storeLogin().path, { version: 1, resource: srv.resource, clientId: CLIENT, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
     access: issued.token, accessExpiresAt: Date.now() + 3_600_000, refresh: issued.refreshToken });
 }
 const logoutElsewhere = () => storeLogin().logout();
 // A session in another pi process, with its own grant and connection.
-function elsewhere(): ToolProxy {
-  const { token } = issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
+async function elsewhere(): Promise<ToolProxy> {
+  const { token } = await issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
   return new ToolProxy({
     wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT, version: "1.0.0" }, delivery: { mode: "poll", source: "grayboard" } },
     harness: "pi", loginAction: "run /grayboard login", auth: { token: async () => token }, report: () => {},
@@ -310,7 +310,7 @@ test("/new carries the outgoing root's name, bound with this checkout as its pla
   await second.ext.shutdown("new");
   // Between the two sessions a session in another pi process (its own grant
   // and connection, none of this process's extension state) takes the name.
-  const thief = elsewhere();
+  const thief = await elsewhere();
   try { expect((await thief.call("bind", { name: "carrier", create: false }, "carry-thief")).isError).toBeUndefined(); }
   finally { await thief.close(); }
   const third = instance();
@@ -609,7 +609,7 @@ test("/new after a sign-in that dropped the root's name carries nothing: a remem
 test("a resume whose rebind is refused says so at once and in the next tool result; once the name is free, /grayboard resume rebinds it and the instructions follow", async () => {
   const first = await root("rebind-s", "rebinder");
   await first.ext.shutdown("quit");
-  const thief = elsewhere();
+  const thief = await elsewhere();
   try { expect((await thief.call("bind", { name: "rebinder", create: false }, "rebind-thief")).isError).toBeUndefined(); }
   finally { await thief.close(); }
 
@@ -643,7 +643,7 @@ test("a pause the Controller's run loop reaches on its own is said at once and i
   const a = await root("sink-a", "sinker");
   // The same session bound to another name outside this extension: the run
   // loop won't deliver under a binding it didn't make.
-  const other = elsewhere();
+  const other = await elsewhere();
   try { expect((await other.call("bind", { name: "switched", create: true }, "sink-a")).isError).toBeUndefined(); }
   finally { await other.close(); }
   const paused = "grayboard: delivery paused: Operation failed; run /grayboard resume";

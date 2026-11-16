@@ -15,3 +15,17 @@ export function seed<T>(on: Pick<Repo, "write"> | Database, fn: () => Sync<T>): 
   if (db.inTransaction) return Promise.reject(new Error("seed() inside an open transaction"));
   return queueFor(db).run(() => ({ value: db.transaction(fn).immediate() as T })).then(box => box.value) as Promise<Awaited<T>>;
 }
+
+// seed() for a write a synchronous hook makes (a test's stand-in for a production function, called outside any queued
+// body), which can't await: an idle queue runs fn inside the call, so its value is back before this returns. Throws
+// when another body holds the queue, rather than letting the write land after the hook has returned.
+export function seedSync<T>(on: Pick<Repo, "write"> | Database, fn: () => Sync<T>): T {
+  let ran = false, value: T | undefined, error: unknown, threw = false;
+  seed(on, () => {
+    ran = true;
+    try { const v = fn(); value = v as T; return v; } catch (e) { threw = true; error = e; throw e; }
+  }).catch(() => {});
+  if (!ran) throw new Error("seedSync: the write queue is held; this write would land after the hook returns");
+  if (threw) throw error;
+  return value as T;
+}

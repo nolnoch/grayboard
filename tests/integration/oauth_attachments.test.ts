@@ -51,7 +51,7 @@ async function attachment(token: string, method = "POST", id?: number, alias = f
 }
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant uploads, MCP binds, participant downloads, own unsent releases`, async () => {
-  const alice = issue(), bob = issue("bob@example.com"), outsider = issue("outsider@example.com");
+  const alice = await issue(), bob = await issue("bob@example.com"), outsider = await issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
   app.repo.aliases.create({ scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email);
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
@@ -88,7 +88,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant up
 });
 
 test("private board visibility is checked again after reading the blob", async () => {
-  const alice = issue(), bob = issue("bob@example.com");
+  const alice = await issue(), bob = await issue("bob@example.com");
   const [a, b] = await Promise.all([connect(alice.token, "2026-07-28"), connect(bob.token, "2026-07-28")]);
   const team = app.repo.teams.create("private", alice.authed.user_id);
   app.repo.teams.addMember(team.id, alice.authed.user_id);
@@ -115,7 +115,7 @@ test("private board visibility is checked again after reading the blob", async (
 });
 
 test("old API remains session-only and OAuth cannot become admin or WS credentials", async () => {
-  const alice = issue();
+  const alice = await issue();
   const login = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "alice@example.com" }) });
   const legacy = (await login.json() as { session_token: string }).session_token;
   expect((await attachment(legacy)).status).toBe(401);
@@ -125,7 +125,7 @@ test("old API remains session-only and OAuth cannot become admin or WS credentia
     expect(response.status).toBe(401);
     await response.arrayBuffer();
   }
-  expect((await attachment(issue("alice@example.com", ["grayboard:delivery"]).token)).status).toBe(403);
+  expect((await attachment((await issue("alice@example.com", ["grayboard:delivery"])).token)).status).toBe(403);
   await connect(alice.token, "2026-07-28");
-  expect((await attachment(issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"]).token)).status).toBe(201);
+  expect((await attachment((await issue("alice@example.com", ["grayboard:delivery", "grayboard:tools"])).token)).status).toBe(201);
 });

@@ -17,8 +17,8 @@ test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion i
   try {
     const token = await srv.login("alice@example.com");
     const other = await srv.login("bob@example.com");
-    const hostedToken = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT).token;
-    const otherHostedToken = issueOAuth(srv.app.repo, srv.app.oauth.resource, "bob@example.com").token;
+    const hostedToken = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT)).token;
+    const otherHostedToken = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "bob@example.com")).token;
     srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
     srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "bob@example.com", name: "be" }, "bob@example.com");
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
@@ -62,7 +62,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
   });
   let last: { status: number; retryAfter: string | null; body: string } | undefined;
   try {
-    const { token, authed } = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
+    const { token, authed } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
     const user = srv.app.repo.users.findByEmail("alice@example.com")!;
     srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "be" }, user.email);
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
@@ -116,7 +116,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
   let now = 0;
   const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, now: () => now });
   try {
-    const { token } = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
+    const { token } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
     srv.app.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
     const aliases = srv.app.repo.aliases;
     const find = aliases.find.bind(aliases), listFor = aliases.listForScope.bind(aliases);
@@ -228,8 +228,8 @@ test("subscriber-role requests and tool calls draw on separate per-user buckets 
   let now = 0;
   const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, hostedSubscriberLimit: { burst: 3, perSec: 1 }, now: () => now });
   try {
-    const tools = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"]).token;
-    const delivery = issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:delivery"]).token;
+    const tools = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"])).token;
+    const delivery = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:delivery"])).token;
     const version = "2026-07-28";
     const call = async (token: string, id: number, role?: string) => {
       const response = await fetch(`${srv.base}/mcp`, {

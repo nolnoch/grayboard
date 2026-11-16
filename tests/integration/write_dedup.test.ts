@@ -149,9 +149,9 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
     // public URL is http://localhost, so its OAuth resource is http://localhost/mcp.
     const store = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
     try {
-      const token = (email: string) => issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT).token;
-      alice = token("alice@example.com");
-      bob = token("bob@example.com");
+      const token = async (email: string) => (await issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT)).token;
+      alice = await token("alice@example.com");
+      bob = await token("bob@example.com");
     } finally {
       store.db.close();
     }

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { hashToken, type AuthedUser } from "../../src/server/auth.ts";
 import type { Repo } from "../../src/server/db.ts";
 import { OAUTH_TTL, type OAuthResult } from "../../src/server/oauth-types.ts";
+import { seed } from "../support/seed.ts";
 
 const random = () => randomBytes(32).toString("base64url");
 const checked = <T>(result: OAuthResult<T>): T => {
@@ -9,8 +10,13 @@ const checked = <T>(result: OAuthResult<T>): T => {
   return result.value;
 };
 
-// Trusted test-only issuance through the same atomic consent/code lifecycle as the AS.
+// Trusted test-only issuance through the same atomic consent/code lifecycle as the AS, in one queued body (#807 P1b-4f).
 export function issueOAuth(repo: Repo, resource: string, email = "alice@example.com", scopes = ["grayboard:tools"], now = Date.now(), clientId = "test-native") {
+  return seed(repo, () => issueNow(repo, resource, email, scopes, now, clientId));
+}
+export type IssuedOAuth = Awaited<ReturnType<typeof issueOAuth>>;
+
+function issueNow(repo: Repo, resource: string, email: string, scopes: string[], now: number, clientId: string) {
   const user = repo.users.upsertByEmail(email, null);
   const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
   const request = { ...binding, requestHash: hashToken(random()), browserHash: hashToken(random()), csrfHash: hashToken(random()), stateHash: hashToken(random()), consentSessionHash: null, createdAt: now, expiresAt: now + OAUTH_TTL.request };
@@ -28,10 +34,10 @@ export function issueOAuth(repo: Repo, resource: string, email = "alice@example.
 }
 
 /** Rotates `refreshToken` on the issued grant, as a client's refresh does; the new tokens' lifetimes start at `now`. */
-export function rotateOAuth(repo: Repo, grant: Pick<ReturnType<typeof issueOAuth>, "binding" | "tokens">, refreshToken: string, now = Date.now()) {
+export async function rotateOAuth(repo: Repo, grant: Pick<IssuedOAuth, "binding" | "tokens">, refreshToken: string, now = Date.now()) {
   const access = random(), refresh = random();
-  const status = repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
+  const status = await seed(repo, () => repo.oauth.rotateRefresh({ ...grant.binding, refreshHash: hashToken(refreshToken), tokens: {
     ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-  } }, now).status;
+  } }, now).status);
   return { access, refresh, status };
 }
