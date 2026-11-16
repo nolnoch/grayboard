@@ -1499,7 +1499,7 @@ const windows: [string, (m: { root: string; child: string; other: string; name: 
   // The child alone goes idle: the root stays live (touched, its lease renewed), so a miss here is the child's.
   ["the child parked", async ({ root, child }) => { now += 900_001; await keepLive(root); hosted.sweep(); const row = database.repo.hosted.get(database.repo.read, hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
   ["the root's lease lapsed", async ({ root }) => { await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, hostedId(root)])); }],
-  ["the root's generation moved", async ({ root }) => { await seed(database.repo, tx => { const r = database.repo.hosted.get(database.repo.read, hostedId(root))!; database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); }); }],
+  ["the root's generation moved", async ({ root }) => { await seed(database.repo, tx => { const r = database.repo.hosted.get(tx, hostedId(root))!; database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); }); }],
   ["the root ended and started again", async ({ root }) => { await hosted.end(principal, context(root)); await hosted.whoami(principal, context(root)); }],
   ["the child moved to another root", async ({ root, other, child }) => { await hosted.end(principal, context(root), hostedId(child)); await hosted.register(principal, context(other), child); }],
   ["the child's idle window passed", async ({ root, child }) => { now += 900_001; await keepLive(root); expect(database.repo.hosted.get(database.repo.read, hostedId(child))).toBeDefined(); }],

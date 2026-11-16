@@ -1335,7 +1335,7 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   expect(hosted.activeListens).toBe(2);
   // A binding change committed outside any request of either session, so only the notice can reach the listens.
   const rebind = (email: string) => seed(store.repo, tx => store.repo.hosted.atomic(() => {
-    const row = store.repo.hosted.all(store.repo.read).find(r => store.repo.users.findById(r.user_id)?.email === email)!;
+    const row = store.repo.hosted.all(tx).find(r => store.repo.users.findById(r.user_id)?.email === email)!;
     store.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 });
   }));
   await rebind("bob@example.com");

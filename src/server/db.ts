@@ -1910,7 +1910,7 @@ function mailPort(db: Database): MailPort {
 }
 
 // The writes take the body's `Tx` (#807 P1c-11), resolved to its connection before any argument is read, so a
-// kept `Tx` is refused whatever the call; the reads stay on the store's connection until their slice.
+// kept `Tx` is refused whatever the call; the reads take a `Read` the same way (P1c-12).
 // `writesOn`: the writes bound to a connection a store already resolved from its caller's handle (the users, sessions and OAuth stores).
 type HostedStoreOf = HostedStore & { writesOn(c: Database): HostedWrites };
 function makeHostedStore(db: Database): HostedStoreOf {
@@ -2088,8 +2088,8 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
 
 // The repo's own hosted store, never a fresh one: a child's end queues its wakes in that store's `ended`,
 // which the application drains (#475 item 1).
-// `db`: the connection of the caller's transaction, already resolved from its handle. The candidates are read on the
-// store's own connection, as its reads are until their slice.
+// `db`: the connection of the caller's transaction, already resolved from its handle; the candidates are read on it
+// too (the same rows `all` reads).
 function endHostedWhere(hosted: HostedStoreOf, db: Database, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
   const w = hosted.writesOn(db);
   for (const row of db.query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all()) if (!row.root_session_id && predicate(row)) w.end(row.session_id, reason, now);

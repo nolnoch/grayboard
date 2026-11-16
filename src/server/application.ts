@@ -1226,7 +1226,7 @@ function candidates(hub: Hub, authed: AuthedUser, suggestedInput: string | null)
 // root) aren't listed; nor is a root whose only live connections are idle
 // legacy GETs, which receive nothing (#431). A hosted session with no name is
 // listed as master listed it (#402). One row per session ID.
-function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
+function unboundPeers(hub: Hub, r: Read, session: ApplicationSession): UnboundPeer[] {
   const user = session.authed.user_id;
   // Per live session ID: whether any of its connections is listed (#489: a call adds its own beside others).
   const live = new Map<string, boolean>();
@@ -1234,7 +1234,7 @@ function unboundPeers(hub: Hub, session: ApplicationSession): UnboundPeer[] {
     if (c.transport !== "hosted" || c.authed.user_id !== user) continue;
     live.set(c.sessionId, (live.get(c.sessionId) ?? false) || c.listed);
   }
-  const roots = hub.repo.hosted.roots(hub.repo.read, user).filter((r) =>
+  const roots = hub.repo.hosted.roots(r, user).filter((r) =>
     r.writes_as === null && live.get(r.session_id) !== false && holdsOf(hub.db, r.session_id).length === 0);
   const statuses = idStatuses(hub.db, roots.map((r) => r.session_id));
   const now = hub.now();
@@ -1599,7 +1599,7 @@ function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string,
     user: session.authed.user_email,
     addresses: session.addresses,
     ...(session.readOnly ? { reader: seer(hub.repo, session) } : {}),
-    ...(tool === "peer_list" ? { unbound: unboundPeers(hub, session) } : {}),
+    ...(tool === "peer_list" ? { unbound: unboundPeers(hub, tx, session) } : {}),
   };
   // `as`, else the first address that can see the board (#284 S3, S14).
   let actor: string;
