@@ -254,4 +254,9 @@ test("expiry and session-end release posts carry the claimant's user; claim rows
   db.prepare(`UPDATE claims SET holder_user = NULL, expires_at = 1 WHERE key = 'ticket:ENG-8'`).run();
   sweepExpired(db);
   expect(writer("[expired] ticket:ENG-8")).toBe("carol@example.com");
+  // ... else a person alias's person.
+  claim(db, "dave@example.com/fe", "ticket:ENG-9", { board: "work", ttl_minutes: 60 });
+  db.prepare(`UPDATE claims SET holder_user = NULL, expires_at = 1 WHERE key = 'ticket:ENG-9'`).run();
+  sweepExpired(db);
+  expect(writer("[expired] ticket:ENG-9")).toBe("dave@example.com");
 });

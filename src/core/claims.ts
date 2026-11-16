@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 
 import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, type Viewer } from "./boards.ts";
+import { addressParts } from "./addresses.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
 import { immediateTx, type WriteTx } from "./write_tx.ts";
@@ -21,10 +22,14 @@ const CLAIM_COLS = "key, holder, note, board, acquired_at, expires_at";
 type ClaimRow = Claim & { holder_user: string | null };
 
 // The user an announcement the system writes for a claim (its expiry, a session end's release) is recorded
-// as written by (#855): the claimant's, or an ID holder's principal for a claim from before holder_user.
+// as written by (#855): the claimant's, or for a claim from before holder_user an ID holder's principal, else a
+// person alias's person (a team alias names no user).
 function holderUser(db: Database, c: ClaimRow): string | undefined {
   if (c.holder_user) return c.holder_user;
-  return idRow(db, c.holder)?.principal ?? undefined;
+  const principal = idRow(db, c.holder)?.principal;
+  if (principal) return principal;
+  const p = addressParts(c.holder);
+  return p?.kind === "alias" && p.scopeKind === "person" ? p.scope : undefined;
 }
 
 type ClaimChanges = { wake: string[]; boards: string[] };
