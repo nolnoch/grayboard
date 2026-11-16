@@ -61,8 +61,8 @@ test("the user's own human is not marked; another user's human is", async () => 
   const own = await human(A);
   const other = await human(B);
   // In a queued body each, as the Slack bridge sends.
-  await seed(srv.app.repo, () => srv.app.application.send(own, `${A}/be`, "own human"));
-  await seed(srv.app.repo, () => srv.app.application.send(other, `${A}/be`, "bob's human"));
+  await seed(srv.app.repo, tx => srv.app.application.send(tx, own, `${A}/be`, "own human"));
+  await seed(srv.app.repo, tx => srv.app.application.send(tx, other, `${A}/be`, "bob's human"));
   expect(marked((await abe.next(dm("own human"))).event)).toBeUndefined();
   expect(marked((await abe.next(dm("bob's human"))).event)).toBe(true);
   srv.app.application.close(own);

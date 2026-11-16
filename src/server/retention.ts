@@ -52,7 +52,7 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
     await repo.write(() => pruneEndedIds(db, now - config.messageRetentionDays * 86_400_000, now));
     await repo.write(() => pruneAudit(repo, now - config.auditRetentionDays * 86_400_000));
     await repo.write(() => pruneUnbound(db, now - UNBOUND_TTL_MS));
-    await repo.write(() => repo.writeReceipts.prune(now - WRITE_DEDUP_WINDOW_MS));
+    await repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS));
   } catch (e) {
     console.error("[grayboard] retention failed:", e);
   }

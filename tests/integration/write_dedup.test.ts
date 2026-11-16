@@ -474,15 +474,15 @@ describe("dedup and state answers (in process)", () => {
     );
     // Each line in its own queued body, as the bridge's inWrite runs it.
     const repo = srv.app.repo;
-    const a = await seed(repo, () => srv.app.application.send(session, "you@example.com/be", "yes"));
-    const b = await seed(repo, () => srv.app.application.send(session, "you@example.com/be", "yes")) as SendResult & Replayed;
+    const a = await seed(repo, tx => srv.app.application.send(tx, session, "you@example.com/be", "yes"));
+    const b = await seed(repo, tx => srv.app.application.send(tx, session, "you@example.com/be", "yes")) as SendResult & Replayed;
     expect(a.message_id).toBeGreaterThan(0);
     expect(b.replayed).toBeUndefined();
     expect(b.message_id).not.toBe(a.message_id);
     expect(n("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);
     const args = { name: "slack-made", purpose: "fixtures" };
-    expect(await seed(repo, () => srv.app.application.call(session, "board_create", args))).toHaveProperty("name", "slack-made");
-    await expect(seed(repo, () => srv.app.application.call(session, "board_create", args))).rejects.toThrow("already exists");
+    expect(await seed(repo, tx => srv.app.application.call(tx, session, "board_create", args))).toHaveProperty("name", "slack-made");
+    await expect(seed(repo, tx => srv.app.application.call(tx, session, "board_create", args))).rejects.toThrow("already exists");
     srv.app.application.close(session);
   });
 });

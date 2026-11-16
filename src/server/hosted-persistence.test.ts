@@ -227,7 +227,7 @@ for (const operation of ["revoke", "bind"] as const) {
       expect(external({ operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }).ok).toBe(true);
     });
     await expect(receipt).rejects.toHaveProperty("code", "not_found");
-    expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(0);
+    expect(database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
   });
 
   test(`receipt lock precedes external ${operation}, consumes only the authorized batch`, async () => {
@@ -236,7 +236,7 @@ for (const operation of ["revoke", "bind"] as const) {
     const message = await seed(database.repo, () => database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
     const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
     expect(results.every(result => result.ok)).toBe(true);
-    expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(message.id);
+    expect(database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(message.id);
   }, 15_000);
 }
 
@@ -245,9 +245,9 @@ for (const child of [false, true]) test(`external rebind during native dispatch 
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   if (child) await hosted.register(principal, context(principal), "child");
   let dispatched = false;
-  const call = hostedPause("hosted:tool:in-gate", () => hosted.run(principal, context(principal, child ? "child" : "root"), "peer_status", session => {
+  const call = hostedPause("hosted:tool:in-gate", () => hosted.run(principal, context(principal, child ? "child" : "root"), "peer_status", (session, tx) => {
     dispatched = true;
-    return application.call(session, "peer_status", { text: "stale write" });
+    return application.call(tx, session, "peer_status", { text: "stale write" });
   }), async () => { expect(external({ operation: "bind", principal, name: "be" }).ok).toBe(true); });
   await expect(call).rejects.toHaveProperty("code", "unbound");
   expect(dispatched).toBe(false);

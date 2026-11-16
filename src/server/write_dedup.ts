@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 
 import { writeAudit } from "./audit.ts";
 import type { Repo, Sync } from "./db.ts";
+import type { Tx } from "./store/tx.ts";
 import { canonicalJson, WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { Replayed, WriteRef } from "../shared/protocol.ts";
 
@@ -62,7 +63,7 @@ export type DedupOutcome<W extends Written> =
 // fresh call would get when authority over what the first call wrote has gone
 // since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
 export function dedupWrite<W extends Written>(
-  repo: Repo, now: number, call: DedupCall, write: () => Sync<W>, onReplay: () => void = () => {},
+  repo: Repo, tx: Tx, now: number, call: DedupCall, write: () => Sync<W>, onReplay: () => void = () => {},
   recheck: (stored: W["payload"]) => void = () => {},
 ): DedupOutcome<W> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
@@ -70,12 +71,12 @@ export function dedupWrite<W extends Written>(
   return repo.atomic((): DedupOutcome<W> => {
     const receipts = repo.writeReceipts;
     // Bounds one session's rows by what it wrote in the window.
-    receipts.pruneSession(call.session, since);
+    receipts.pruneSession(tx, call.session, since);
     if (!call.resend) {
-      const hit = receipts.find(call.session, call.sender, fp, since);
+      const hit = receipts.find(tx, call.session, call.sender, fp, since);
       // A receipt whose row is gone (retracted, pruned) is a miss: the upsert
       // below replaces it, and the audit says why this repeat wrote fresh (#306).
-      if (hit && !receipts.refExists(hit.ref_kind, hit.ref_id)) {
+      if (hit && !receipts.refExists(tx, hit.ref_kind, hit.ref_id)) {
         writeAudit(repo, "request.receipt_stale", call.actor, call.sender, {
           tool: call.tool, fp, ref_kind: hit.ref_kind, ref_id: hit.ref_id, first_at: new Date(hit.at).toISOString(), session: call.session,
         });
@@ -92,7 +93,7 @@ export function dedupWrite<W extends Written>(
       }
     }
     const w = write() as W;
-    receipts.upsert({
+    receipts.upsert(tx, {
       session: call.session, sender: call.sender, fp, tool: call.tool,
       ref_kind: w.ref.kind, ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at: now,
     });

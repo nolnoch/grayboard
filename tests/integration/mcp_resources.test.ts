@@ -122,12 +122,12 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native and subscr
   const pending = await read(sub.client, "grayboard://inbox");
   expect(pending).toMatchObject({ items: [{ id: `direct:${sent.message_id}`, actionable: true, event: { kind: "direct", message: { body: "durable" } } }] });
   expect(await read(sub.client, "grayboard://inbox")).toEqual(pending);
-  expect(app.repo.cursors.directFor(identity.identity_full)).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, identity.identity_full)).toBe(0);
   value(await call(sub.client, "delivery_renew"));
   value(await call(sub.client, "delivery_receipt", { ids: pending.items.map((i: { id: string }) => i.id) }));
   value(await call(sub.client, "delivery_receipt", { ids: pending.items.map((i: { id: string }) => i.id) }));
   expect(await read(sub.client, "grayboard://inbox")).toEqual({ items: [] });
-  expect(app.repo.cursors.directFor(identity.identity_full)).toBe(sent.message_id);
+  expect(app.repo.cursors.directFor(app.repo.read, identity.identity_full)).toBe(sent.message_id);
   expect(app.db.query("SELECT * FROM dm_acks WHERE message_id=?").all(sent.message_id)).toEqual([]);
   value(await call(sub.client, "delivery_release"));
   expect(app.mcp.activeLeases).toBe(0);
@@ -242,10 +242,10 @@ test("issued contiguous DM prefix receipts survive lost responses, but not out-o
   expect((await call(sub.client, "delivery_receipt", { ids: [`direct:${one}`] })).isError).toBe(true);
   await read(sub.client, "grayboard://inbox");
   expect((await call(sub.client, "delivery_receipt", { ids: [`direct:${two}`] })).isError).toBe(true);
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(0);
+  expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
   value(await call(sub.client, "delivery_receipt", { ids: [`direct:${one}`] }));
   value(await call(sub.client, "delivery_receipt", { ids: [`direct:${one}`, `direct:${two}`] }));
-  expect(app.repo.cursors.directFor("alice@example.com/be")).toBe(two);
+  expect(app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(two);
 });
 
 test("wire board receipts bind the issued snapshot and reject removed private-board membership", async () => {
