@@ -81,3 +81,44 @@ test("a non-member's @mention of a team alias reads as one that matched nobody, 
   const member = await ahost.call<{ unresolved?: string[] }>("board_post", { board: "lobby", body: "@nobody1 @eng/build hello" });
   expect(member.unresolved).toEqual(["nobody1"]);
 });
+
+test("board_read's active_claims withholds a holder the reader may not see, with its note", async () => {
+  const build = await srv.hosted(B, null);
+  await build.call("bind", { name: "eng/build", create: true });
+  const ahost = await srv.hosted(A, "be");
+  await ahost.call("board_create", { name: "lobby", purpose: "general" });
+  await build.call("claim_take", { key: "ticket:ENG-3", note: "eng's secret plan", board: "lobby" });
+  const cqa = await srv.hosted(C, "qa");
+  type Read = { active_claims?: Listed[] };
+  expect(row((await cqa.call<Read>("board_read", { board: "lobby" })).active_claims ?? [], "ticket:ENG-3")).toMatchObject({ holder: null, note: null });
+  expect(row((await ahost.call<Read>("board_read", { board: "lobby" })).active_claims ?? [], "ticket:ENG-3")).toMatchObject({ holder: "eng/build", note: "eng's secret plan" });
+});
+
+test("on a queue board, a non-member's @mention of a team alias still routes to a lane, as one that matched nobody", async () => {
+  const build = await srv.hosted(B, null);
+  await build.call("bind", { name: "eng/build", create: true });
+  const lane = await srv.hosted(A, "lane");
+  await lane.call("board_create", { name: "work", purpose: "a queue", kind: "queue" });
+  const cqa = await srv.hosted(C, "qa");
+  const outcome = async (name: string) => {
+    const { post_id: id, ...r } = await cqa.call<{ post_id: number }>("board_post", { board: "work", body: `@${name} go` });
+    const queued = srv.app.db.prepare("SELECT holder FROM claims WHERE key = ?").all(`queue:work:${id}`);
+    return JSON.stringify({ r, queued }).replaceAll(name, "NAME");
+  };
+  const real = await outcome("eng/build");
+  expect(real).toBe(await outcome("eng/nope"));
+  expect(JSON.parse(real).queued).toEqual([{ holder: `${A}/lane` }]);
+});
+
+test("a deleted team name's claim stays hidden outside the team", async () => {
+  const build = await srv.hosted(B, null);
+  await build.call("bind", { name: "eng/build", create: true });
+  await build.call("claim_take", { key: "ticket:ENG-4", note: "eng's secret plan", ttl_minutes: 60 });
+  await build.call("unbind", { name: "eng/build" });
+  expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "build" })).toMatchObject({ status: 200 });
+  const cqa = await srv.hosted(C, "qa");
+  expect(row(await cqa.call<Listed[]>("claim_list", {}), "ticket:ENG-4")).toMatchObject({ holder: null, note: null });
+  expect(row((await srv.api(carol, "GET", "/api/claims")).body as Listed[], "ticket:ENG-4")).toMatchObject({ holder: null, note: null });
+  const ahost = await srv.hosted(A, "be");
+  expect(row(await ahost.call<Listed[]>("claim_list", {}), "ticket:ENG-4")).toMatchObject({ holder: "eng/build" });
+});

@@ -536,7 +536,7 @@ export function callBoardTool(
         peek: ctx.via !== undefined,
       });
       // Claims announced here stay in front of anyone reading the board.
-      const held = listClaims(db).filter((c) => c.board === r.board);
+      const held = listClaims(db, undefined, ctx.reader ?? handle, ctx.session ?? handle).filter((c) => c.board === r.board);
       return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
     }
 

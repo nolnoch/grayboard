@@ -167,8 +167,11 @@ function claimList(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Respon
   const prefix = url.searchParams.get("prefix") ?? undefined;
   const principal = { kind: "user" as const, name: authed.user_email };
   const sees = (holder: string): boolean => {
+    // A deleted team name (#347) keeps its claims and stays inside the team that had it.
     const a = repo.aliases.find(holder);
-    return !a || authorize(repo, {}, { verb: "alias.see", principal, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow;
+    const p = a ? null : addressParts(holder);
+    const scope = a ? { scope_kind: a.scope_kind, scope_ref: a.scope_ref } : p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team" as const, scope_ref: p.scope } : null;
+    return !scope || scope.scope_ref === null || authorize(repo, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
   };
   return json(listClaims(db, prefix).map(({ board: _b, ...c }) => (sees(c.holder) ? c : { ...c, holder: null, note: null })));
 }
