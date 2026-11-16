@@ -69,6 +69,8 @@ Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–19:
 
 Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only) and the Slack bridges themselves (slack-bridge.md) have no columns.
 
+The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness adapter: no column, no cell. Its envelope is proved equal to hosted-core's by `tests/integration/rust_fixtures.test.ts` and the Rust test `requests_match_the_reference_clients_recording`, and its round trip by `tests/integration/rust_sdk.test.ts` (`scripts/e2e.sh rust-sdk`); its push delivery stream (`sdk-rust.md` §2), a typed method per native tool (`sdk-rust.md` §3) and its conformance driver, which runs every hosted scenario of `tests/conformance/` as `hosted/rust` (`sdk-rust.md` §4), are built; the service credential is unbuilt (`future/rust-sdk.md`).
+
 ### 17. Repo-name suggestion while unbound
 
 - Local (all four): `grayboard mcp` offers `sessionIdentity` first among an unbound session's candidates (handles.md §1). Proof: `tests/integration/binding.test.ts`.

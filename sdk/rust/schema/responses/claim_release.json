@@ -1,0 +1,19 @@
+{
+  "arguments": {
+    "key": "ticket:ENG-142"
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "released ticket:ENG-142"
+      }
+    ]
+  }
+}

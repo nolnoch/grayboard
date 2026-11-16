@@ -11,6 +11,7 @@ import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
+import { stubProvider } from "../support/stub_provider.ts";
 
 const issuer = "https://grayboard.example.com:443/hosted";
 const resource = "https://grayboard.example.com/hosted/mcp";
@@ -25,13 +26,13 @@ beforeEach(() => {
     googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     oauthClients: [{ clientId: OPENCODE_CLIENT, name: "Native fixture", redirectUris: [redirectUrl], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", allowRefresh: true }],
-  }, { hostname: "127.0.0.1", background: false, oauth: { exchangeGoogle: async input => {
+  }, { hostname: "127.0.0.1", background: false, oauth: { providers: [stubProvider(async input => {
     exchanges++;
     expect(input.redirectUri).toBe(issuer + "/oauth/google/callback");
     expect(input.verifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(input.nonce.length).toBeGreaterThan(30);
     return { email: "alice@example.com", displayName: "Alice", subject: "google-alice@example.com" };
-  } } });
+  })] } });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {

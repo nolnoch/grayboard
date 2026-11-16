@@ -30,7 +30,7 @@ Facts in the code that shape it:
 `role_bindings.principal_id` and `granted_by` reference `principals(id)`.
 
 - Not email: #927 rules it out, and an email is a name, not an account.
-- Not `users.idp_subject`: it is null for dev-auth users and for anyone not signed in since F-13, it is per IdP (#928 adds a second), and `admin unlink-idp` clears it.
+- Not `users.idp_subject` (with `idp_issuer`, #928): it is null for dev-auth users and for anyone not signed in since F-13, it is per IdP, and `admin unlink-idp` clears it.
 - Not `users.id`: it works for users and services but can never name a team, and a team as the holder of `service_invoke` ("every member of `eng` may invoke `ingest`") is the likely #270 grant. `principals.id` covers it with no schema change.
 - Not a typed `kind:id` string: it is a foreign key without the database's enforcement. `principals.kind` is the type.
 - A service principal fits before #270 exists because its `principals` row is the key; nothing here waits on its credential.
@@ -45,7 +45,7 @@ Which kinds may hold which role is code, in one table in `policy.ts` (role → s
 
 - Not `ActScope`'s `(scope_kind, scope_ref)` text: a deleted team's name can be taken by a new team, and a name-keyed binding would then own the new one.
 - **A dangling scope can't exist.** The foreign key is declared `ON DELETE RESTRICT` explicitly (the default, `NO ACTION`, behaves the same only while the key isn't deferred), not `CASCADE`: whoever adds team or service deletion must revoke the scope's bindings in the same transaction, each with its `role.revoked` row, or the delete fails. A cascade would remove authority with no audit row (principle 8).
-- Uniqueness is two partial unique indexes, `(principal_id, role) WHERE scope_id IS NULL` and `(principal_id, role, scope_id) WHERE scope_id IS NOT NULL`, because a null never collides in a plain unique index on SQLite or Postgres. `idx_users_idp_subject` is the precedent for a partial unique index.
+- Uniqueness is two partial unique indexes, `(principal_id, role) WHERE scope_id IS NULL` and `(principal_id, role, scope_id) WHERE scope_id IS NOT NULL`, because a null never collides in a plain unique index on SQLite or Postgres. `idx_users_idp_identity` is the precedent for a partial unique index.
 - A second index on `(scope_id, role)` serves "this team's owners" (R6's last-owner count, the roster).
 - No `CHECK` on `role`: SQLite can't widen a `CHECK` additively, so a new role would break the additive rule. The role table in code validates; a row whose role the running code doesn't know grants nothing, because every lookup names its role.
 

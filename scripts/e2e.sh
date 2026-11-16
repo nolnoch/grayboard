@@ -18,6 +18,13 @@
 #                                   (see tests/e2e/claude_local.e2e.ts); and
 #                                   the factory's Claude runner
 #                                   (tests/e2e/factory_claude.e2e.ts)
+#   scripts/e2e.sh rust-sdk         the Rust SDK (sdk/rust): the toolchain its
+#                                   rust-toolchain.toml names, fmt, clippy,
+#                                   cargo test, then its example against a real
+#                                   server (tests/integration/rust_sdk.test.ts)
+#                                   and the conformance suite through its
+#                                   driver (tests/conformance, hosted/rust)
+#                                   against the compiled server
 # Each run writes its run dir (GRAYBOARD_E2E_RUN_DIR, default
 # .e2e-runs/<suite>-<UTC time>): per bun test run, its output (.log) and JUnit
 # report (.xml), plus whatever the tests keep (tests/support/run_dir.ts), and
@@ -28,9 +35,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 case "${1:-}" in
-  upgrade-matrix | binaries | claude-hosted | claude-local | local-resume | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
+  upgrade-matrix | binaries | claude-hosted | claude-local | local-resume | rust-sdk | hosted-strict | hosted-git | hosted-config | hosted-public | hosted-host | hosted-live | hosted-matrix | hosted-native | hosted-durable) suite="$1" ;;
   *)
-    echo "usage: $0 upgrade-matrix|binaries|claude-hosted|claude-local|local-resume|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
+    echo "usage: $0 upgrade-matrix|binaries|claude-hosted|claude-local|local-resume|rust-sdk|hosted-{strict,git,config,public,host,live,matrix,native,durable}" >&2
     exit 2
     ;;
 esac
@@ -112,5 +119,20 @@ case "$suite" in
     ;;
   local-resume)
     if suite_run local-resume ./tests/e2e/local_resume.e2e.ts; then verdict "passed"; else verdict "failed (local-resume.log in the run dir)"; fi
+    ;;
+  rust-sdk)
+    # rustup is on CI's runners and dev boxes that build Rust; with no argument
+    # it installs the toolchain the directory's rust-toolchain.toml names.
+    export PATH="$HOME/.cargo/bin:$PATH"
+    cargo_log="$run/cargo.log"
+    if ! (cd sdk/rust && rustup toolchain install && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --locked --example roundtrip && cargo build --locked -p conformance-driver) 2>&1 | tee "$cargo_log"; then
+      verdict "failed (cargo.log in the run dir)"
+    fi
+    # The conformance driver's buses are the compiled server (dist/grayboard-server), a process each.
+    if ! bun run build 2>&1 | tee "$run/build.log"; then verdict "failed (build.log in the run dir)"; fi
+    failed=()
+    GRAYBOARD_RUST_EXAMPLE="$root/sdk/rust/target/debug/examples/roundtrip" suite_run rust-sdk ./tests/integration/rust_sdk.test.ts || failed+=(rust-sdk.log)
+    GRAYBOARD_RUST_DRIVER="$root/sdk/rust/target/debug/conformance-driver" suite_run conformance ./tests/conformance/ || failed+=(conformance.log)
+    if [ ${#failed[@]} -eq 0 ]; then verdict "passed"; else verdict "failed (${failed[*]} in the run dir)"; fi
     ;;
 esac

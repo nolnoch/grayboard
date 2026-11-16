@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { exchangeGoogleCode, googleSignIn, hashToken, type AuthedUser, type GoogleIdentity } from "./auth.ts";
+import { hashToken, type AuthedUser } from "./auth.ts";
+import { callbackPath, defaultProviders, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
 import type { Config } from "./config.ts";
 import type { Repo } from "./db.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
@@ -21,7 +22,8 @@ export type OAuthOptions = {
   now?: () => number;
   cimd?: CimdOptions;
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
-  exchangeGoogle?: (input: { code: string; verifier: string; redirectUri: string; nonce: string }) => Promise<GoogleIdentity>;
+  // Defaults to Google built from config. Exactly one until per-provider callbacks (#928).
+  providers?: IdentityProvider[];
 };
 // The auth gate's keys for the caller: its address (/64 for IPv6) and, for
 // IPv6, its /48 (#274), else null.
@@ -94,7 +96,9 @@ async function form(req: Request): Promise<URLSearchParams> {
 
 export function createOAuthServer(repo: Repo, config: Config, options: OAuthOptions = {}) {
   if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret)) throw new Error("dev auth must not coexist with a Google client secret");
-  const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
+  const providers = options.providers ?? defaultProviders(config);
+  if (providers.length !== 1) throw new Error("exactly one identity provider is supported");
+  const provider = providers[0]!, providerCallback = callbackPath(provider);
   const issuer = oauthPublicUrl(config.publicUrl, config.devAuth);
   const base = new URL(issuer);
   const prefix = base.pathname === "/" ? "" : base.pathname;
@@ -186,7 +190,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
   const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("oauth.sweep", e); } }, 60_000);
   timer.unref();
-  const routeName = (path: string) => ["/oauth/authorize", "/oauth/token", "/oauth/revoke", "/oauth/google/callback", "/oauth/consent", "/oauth/complete"].includes(path) ? path : "/oauth/unknown";
+  const routes = ["/oauth/authorize", "/oauth/token", "/oauth/revoke", ...providers.map(callbackPath), "/oauth/consent", "/oauth/complete"];
+  const routeName = (path: string) => routes.includes(path) ? path : "/oauth/unknown";
   // Token and revocation posts have their own address bucket and are charged
   // only when they present grant material and are refused (#283): a
   // cross-site form post reaches them, and must not lock an office NAT out of
@@ -277,8 +282,6 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const headline = host ? `<h1>Authorize ${escapeHTML(host)}</h1><p>This client calls itself ${escapeHTML(client.name)}; that name is self-declared.</p>` : `<h1>Authorize ${escapeHTML(client.name)}</h1>`;
     return html(`${headline}<p>Account: ${escapeHTML(user.email)}</p><p>Resource: ${escapeHTML(r.resource)}</p><p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`, 200, new URL(r.redirectUri).origin);
   };
-  const exchange = options.exchangeGoogle ?? (async (input: { code: string; verifier: string; redirectUri: string; nonce: string }) =>
-    exchangeGoogleCode(input.code, input.verifier, input.redirectUri, googleClient.clientId, googleClient.clientSecret, config.orgDomain, input.nonce));
 
   async function route(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
     const u = new URL(req.url);
@@ -354,18 +357,15 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         const upstreamState = random(), verifier = random(), nonce = random();
         f.upstream = { stateHash: hashToken(upstreamState), verifier, nonce };
         upstream.set(f.upstream.stateHash, id);
-        const google = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-        google.search = new URLSearchParams({ client_id: googleClient.clientId, redirect_uri: endpoint("/oauth/google/callback"), response_type: "code",
-          scope: "openid email profile", state: upstreamState, nonce, code_challenge: challenge(verifier), code_challenge_method: "S256", hd: config.orgDomain }).toString();
-        response = redirect(google.href);
+        response = redirect(await provider.authorizeUrl({ redirectUri: endpoint(providerCallback), state: upstreamState, nonce, challenge: challenge(verifier) }));
       }
       response.headers.append("Set-Cookie", cookie("binding", binding, OAUTH_TTL.browser / 1000));
       writeAudit(repo, "oauth.authorize", null, null, { client_id: client.clientId });
       return response;
     }
-    if (path === "/oauth/google/callback" && req.method === "GET") {
-      const p = parameters(u.search.slice(1), ["code", "state", "error", "error_description", "scope", "authuser", "prompt", "hd", "iss"]);
-      if (p.has("iss") && p.get("iss") !== "https://accounts.google.com") fail();
+    if (path === providerCallback && req.method === "GET") {
+      const p = parameters(u.search.slice(1), [...provider.callbackParams]);
+      if (p.has("iss") && p.get("iss") !== provider.issuer) fail();
       const state = required(p, "state");
       if (!secret(state)) fail();
       const stateHash = hashToken(state), id = upstream.get(stateHash);
@@ -376,12 +376,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       upstream.delete(stateHash);
       delete f.upstream;
       if (p.has("error")) { writeAudit(repo, "oauth.google_denied", null, null, { client_id: r.clientId }); flows.delete(r.requestHash); return returnToClient(r, f, { error: "access_denied" }); }
-      let identity: GoogleIdentity;
-      try { identity = await exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint("/oauth/google/callback") }); }
+      let identity: UpstreamIdentity;
+      try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(providerCallback) }); }
       catch (e) { hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.google_failed", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email) || identity!.email.split("@")[1] !== config.orgDomain) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); fail("access_denied", 403); }
-      const signedIn = await repo.write(() => googleSignIn(repo, identity!, { client_id: r.clientId }));
+      const signedIn = await repo.write(() => idpSignIn(repo, provider, identity!, { client_id: r.clientId }, providers));
       if ("refused" in signedIn) fail("access_denied", 403);
       const { user } = signedIn;
       if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); fail("access_denied", 403); }

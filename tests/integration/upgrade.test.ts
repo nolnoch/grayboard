@@ -23,6 +23,7 @@ import { localEnv, serverEnv } from "../support/env.ts";
 import { closeSessions, localSession, mcpSession, stopSession, type Session } from "../support/mcp.ts";
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import { hashToken } from "../../src/server/auth.ts";
+import { GOOGLE_ISSUER } from "../../src/server/idp_google.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
 import { CLI } from "../support/paths.ts";
@@ -131,6 +132,25 @@ function schema(path: string): Schema {
         ),
       ]),
     );
+  } finally {
+    db.close();
+  }
+}
+
+// users' IdP columns and its own indexes (#928 D3), read-only.
+function identities(path: string): { email: string; idp_issuer: string | null; idp_subject: string | null }[] {
+  const db = new Database(path, { readonly: true });
+  try {
+    return db.query("SELECT email, idp_issuer, idp_subject FROM users ORDER BY id").all() as { email: string; idp_issuer: string | null; idp_subject: string | null }[];
+  } finally {
+    db.close();
+  }
+}
+
+function userIndexes(path: string): string[] {
+  const db = new Database(path, { readonly: true });
+  try {
+    return (db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'users' AND name LIKE 'idx_%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
   } finally {
     db.close();
   }
@@ -450,6 +470,10 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   const before = schema(dbPath);
 
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  // #928 D3: every user the release wrote (a v1.0.0 one with no idp_subject, or a post-F-13 one) is stamped with
+  // Google's issuer, and the old index is gone.
+  expect(identities(dbPath).map(u => u.idp_issuer)).toEqual(identities(dbPath).map(() => GOOGLE_ISSUER));
+  expect(userIndexes(dbPath)).toEqual(["idx_users_idp_identity"]);
   // The old sign-ins still hold.
   for (const token of [alice, bob]) expect((await srv.api(token, "GET", "/api/whoami")).status).toBe(200);
   // The read-back is a hosted session's: the names the release wrote bind as they stand.
@@ -466,6 +490,50 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   const fresh = new TestServer({ dbPath: join(dir, "fresh.db") });
   await fresh.stop();
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
+
+  // The stamp runs once, with the column: a row unlink-idp cleared isn't re-stamped by a later open.
+  await srv.app.repo.write(() => srv!.app.repo.users.clearSubject(srv!.app.repo.users.findByEmail("bob@example.com")!.id));
+  await srv.stop();
+  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+  expect(srv.app.repo.users.findByEmail("bob@example.com")).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect(srv.app.repo.users.findByEmail("alice@example.com")).toMatchObject({ idp_issuer: GOOGLE_ISSUER });
+}, 60_000);
+
+// #928 D3, the documented rollback: this tree opens a database, the release's binary then runs on it, and this
+// tree opens it again. A release's Google sign-in can't be driven from another process (releaseToken), so the
+// subject it would link is written by hand, and only for a release that knows idp_subject (it recreates
+// idx_users_idp_subject); an older release only adds subjectless users, which come back with neither column.
+test(`server: a database this tree wrote, run under ${FROM} and reopened, keeps every identity Google's`, async () => {
+  label = "rollback";
+  const dbPath = join(dir, "old", "grayboard.db");
+  mkdirSync(join(dir, "old"));
+  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+  await srv.login("alice@example.com");
+  expect(await srv.app.repo.write(() => srv!.app.repo.users.signIn(GOOGLE_ISSUER, "g-alice", "alice@example.com", null).status)).toBe("ok");
+  await srv.stop();
+  srv = undefined;
+
+  old = await ServerProcess.start(rel.server, dbPath);
+  await old.login("bob@example.com");
+  await stopOld();
+  const knowsSubjects = userIndexes(dbPath).includes("idx_users_idp_subject");
+  if (knowsSubjects) {
+    const db = new Database(dbPath);
+    try { db.run("UPDATE users SET idp_subject = 'g-bob' WHERE email = 'bob@example.com'"); } finally { db.close(); }
+  }
+  keep(`${label}-as-rolled-back`, join(dir, "old"));
+
+  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+  expect(userIndexes(dbPath)).toEqual(["idx_users_idp_identity"]);
+  expect(identities(dbPath)).toEqual([
+    { email: "alice@example.com", idp_issuer: GOOGLE_ISSUER, idp_subject: "g-alice" },
+    knowsSubjects
+      ? { email: "bob@example.com", idp_issuer: GOOGLE_ISSUER, idp_subject: "g-bob" }
+      : { email: "bob@example.com", idp_issuer: null, idp_subject: null },
+  ]);
+  const repo = srv.app.repo;
+  expect(await repo.write(() => repo.users.signIn(GOOGLE_ISSUER, "g-alice", "alice@example.com", null).status)).toBe("ok");
+  expect(await repo.write(() => repo.users.signIn(GOOGLE_ISSUER, "g-bob", "bob@example.com", null))).toMatchObject({ status: "ok", user: { idp_issuer: GOOGLE_ISSUER, idp_subject: "g-bob" } });
 }, 60_000);
 
 // #282, #475: this tree's server serves no WebSocket. `/ws`, or any path, answers an upgrade with the

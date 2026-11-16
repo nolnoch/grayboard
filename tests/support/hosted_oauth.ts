@@ -10,11 +10,12 @@ import type { Config } from "../../src/server/config.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { Browser, consentForm, submitConsent } from "./oauth_browser.ts";
 import { TestServer } from "./server.ts";
+import { stubProvider } from "./stub_provider.ts";
 
 const SCOPES = ["grayboard:delivery", "grayboard:tools"];
 
 // A port nothing listens on: the server's public URL must name its port before it starts.
-function freePort(): number {
+export function freePort(): number {
   const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
   const port = probe.port!;
   probe.stop(true);
@@ -28,7 +29,7 @@ export function hostedServer(overrides: Partial<Config> = {}, email = "alice@exa
   const port = freePort();
   const issuer = `http://127.0.0.1:${port}`;
   const srv = new TestServer({ httpPort: port, publicUrl: issuer, hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [], ...overrides },
-    { hostname: "127.0.0.1", oauth: { exchangeGoogle: async () => ({ email, displayName: email.split("@")[0]!, subject: "google-" + email }) } });
+    { hostname: "127.0.0.1", oauth: { providers: [stubProvider(async () => ({ email, displayName: email.split("@")[0]!, subject: "google-" + email }))] } });
   return Object.assign(srv, { issuer, resource: srv.app.oauth.resource });
 }
 

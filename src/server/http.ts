@@ -2,9 +2,11 @@ import pkg from "../../package.json" with { type: "json" };
 import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type Team, type TeamPolicy, type TeamRole, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
-  verifySessionToken, extractBearer, exchangeGoogleCode, googleSignIn, type GoogleIdentity,
+  verifySessionToken, extractBearer,
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
+import { exchangeGoogleCliCode, type GoogleIdentity } from "./idp_google.ts";
+import { defaultProviders, idpSignIn } from "./idp.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { userAgent, writeAudit } from "./audit.ts";
@@ -107,10 +109,7 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   }
   let identity: GoogleIdentity;
   try {
-    identity = await exchangeGoogleCode(
-      body.code, body.code_verifier, body.redirect_uri,
-      config.googleClientId, config.googleClientSecret, config.orgDomain,
-    );
+    identity = await exchangeGoogleCliCode(config, { code: body.code, verifier: body.code_verifier, redirectUri: body.redirect_uri });
   } catch (e) {
     return jsonErr("forbidden", String(e), 403);
   }
@@ -119,8 +118,10 @@ async function authExchange(req: Request, repo: Repo, config: Config, ip: string
   const raw  = mintToken();
   const ua   = userAgent(req);
   // After the exchange's await: the sign-in, its checks and the session are one queued transaction (#807).
+  // Google's provider for its id, label and issuer; the exchange above is the CLI's own until #928 step 3.
+  const providers = defaultProviders(config);
   return repo.write(() => {
-    const signedIn = googleSignIn(repo, identity, { ip: ip ?? undefined });
+    const signedIn = idpSignIn(repo, providers[0]!, identity, { ip: ip ?? undefined }, providers);
     if ("refused" in signedIn) return jsonErr("forbidden", signedIn.refused, 403);
     const { user } = signedIn;
     const disabled = refuseDisabled(repo, user, { ip: ip ?? undefined });
@@ -682,17 +683,19 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
   return json({ ok: true });
 }
 
-// Forgets a user's Google account (security audit F-13), so the next Google
-// sign-in with the email takes the account over: for a person whose Google
-// account was recreated, or an email an admin chooses to hand on.
-async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+// Forgets a user's IdP account, issuer and subject (security audit F-13, #928
+// D4), so the next verified sign-in with the email, from any enabled provider,
+// takes the account over: for a person whose IdP account was recreated, one
+// moving to another IdP, or an email an admin chooses to hand on.
+async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   return repo.write(() => {
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return notFound();
     repo.users.clearSubject(target.id);
-    writeAudit(repo, "auth.subject_cleared", authed.user_email, target.email, { had_subject: target.idp_subject !== null });
+    writeAudit(repo, "auth.subject_cleared", authed.user_email, target.email, {
+      had_subject: target.idp_subject !== null, provider: defaultProviders(config).find(p => p.issuer === target.idp_issuer)?.id ?? null, issuer: target.idp_issuer });
     return json({ ok: true });
   });
 }
@@ -777,7 +780,7 @@ export async function handleHttp(
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
-  if (path === "/api/admin/unlink-idp"     && method === "POST") return adminUnlinkIdp(req, authed, repo);
+  if (path === "/api/admin/unlink-idp"     && method === "POST") return adminUnlinkIdp(req, authed, repo, config);
 
   return notFound();
 }

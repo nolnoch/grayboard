@@ -1,0 +1,26 @@
+{
+  "arguments": {
+    "name": "rec-a"
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "<prose>"
+      }
+    ],
+    "structuredContent": {
+      "name": null,
+      "instructions": [
+        "<instruction>"
+      ],
+      "ownership": 1
+    }
+  }
+}

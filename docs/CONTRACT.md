@@ -58,6 +58,7 @@ flowchart TD
 | Process model, mode selection; the server's data, auth layers and tokens, Postgres seam | `docs/architecture.md` |
 | The server's embedded OAuth authorization server, client sources, built-in clients, adapter login | `docs/server-oauth.md` |
 | The server's HTTP MCP endpoint: session binding, streams, legacy sessions, hosted core's server contract, plugin children, attachment transfer | `docs/server-hosted-mcp.md` |
+| The as-built Rust client SDK: transport, wire fixture, delivery stream and its rules, typed tools, the Stage 3 example, the conformance driver | `docs/sdk-rust.md` |
 | Hosted admission, ownership history, grant attachment, the BindGate | `docs/server-hosted-ownership.md` |
 | The server's application sessions: request context, bind, the server's binding-event sources, address set, revalidation | `docs/server-sessions.md` |
 | The server's operations: delegation, DM send, write dedup, `call` | `docs/server-operations.md` |

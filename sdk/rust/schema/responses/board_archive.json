@@ -1,0 +1,19 @@
+{
+  "arguments": {
+    "board": "rec-old"
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"name\": \"rec-old\",\n  \"purpose\": \"archived\",\n  \"scope\": null,\n  \"created_by\": \"you@example.com/rec-a\",\n  \"created_at\": 1700000000000,\n  \"kind\": \"broadcast\",\n  \"archived_at\": 1700000000000,\n  \"archived_by\": \"you@example.com/rec-a\"\n}"
+      }
+    ]
+  }
+}

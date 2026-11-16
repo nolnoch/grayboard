@@ -7,6 +7,7 @@ import { Glob } from "bun";
 import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { GOOGLE_ISSUER } from "./idp_google.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -384,40 +385,179 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
   ]);
 });
 
-// Security audit F-13: users are matched by IdP subject first, so a reassigned
-// email can't inherit an account.
-test("signIn: a subject owns its user; a reassigned or changed email is refused; clearSubject hands the email on", async () => {
-  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const signIn = (email: string, subject: string, name: string | null) => seed(repo, () => repo.users.signIn(email, subject, name));
-  const legacy = await seed(repo, () => repo.users.upsertByEmail("old@example.com", null));
-  expect(legacy.idp_subject).toBeNull();
-  // A user from before the column links on its next sign-in.
-  expect(await signIn("old@example.com", "s-old", "Old")).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_subject: "s-old" } });
-  expect(await signIn("old@example.com", "s-old", "Old 2")).toMatchObject({ status: "ok", linked: false, user: { id: legacy.id, display_name: "Old 2" } });
-  // A new user is created with its subject.
-  const fresh = await signIn("new@example.com", "s-new", null);
-  expect(fresh).toMatchObject({ status: "ok", linked: false, user: { email: "new@example.com", idp_subject: "s-new" } });
-  // Another IdP account presenting the email is refused, and nothing changes.
-  expect(await signIn("old@example.com", "s-intruder", null)).toMatchObject({ status: "subject_mismatch", user: { id: legacy.id } });
+// Security audit F-13, #928 D4: users are matched by (issuer, subject) first,
+// so a reassigned email can't inherit an account, and one IdP's account never
+// signs into another IdP's by email.
+const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
+const fresh = () => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+// Each write in a queued body, as the OAuth sign-in and the admin route run them (#807 P1b-4f).
+const signIn = (repo: Repo, ...a: Parameters<Repo["users"]["signIn"]>) => seed(repo, () => repo.users.signIn(...a));
+const upsert = (repo: Repo, email: string) => seed(repo, () => repo.users.upsertByEmail(email, null));
+
+test("signIn D4 branch 1: this (issuer, subject)'s user signs in, or is refused when its email changed", async () => {
+  const { repo } = fresh();
+  const u = await signIn(repo, G, "s-1", "a@example.com", "A");
+  expect(await signIn(repo, G, "s-1", "a@example.com", "A 2")).toMatchObject({ status: "ok", linked: false, user: { id: u.user.id, display_name: "A 2" } });
   // The same IdP account reporting another email is refused, and no user is created.
-  expect(await signIn("renamed@example.com", "s-old", null)).toMatchObject({ status: "email_changed", user: { id: legacy.id } });
+  expect(await signIn(repo, G, "s-1", "renamed@example.com", null)).toMatchObject({ status: "email_changed", user: { id: u.user.id } });
   expect(repo.users.findByEmail("renamed@example.com")).toBeUndefined();
-  expect(repo.users.findById(legacy.id)!.idp_subject).toBe("s-old");
-  // An admin's unlink lets the next account to present the email take it.
-  await seed(repo, () => repo.users.clearSubject(legacy.id));
-  expect(await signIn("old@example.com", "s-intruder", null)).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_subject: "s-intruder" } });
-  await expect(seed(repo, () => { db.run("UPDATE users SET idp_subject = 's-new' WHERE id = ?", [legacy.id]); })).rejects.toThrow(/UNIQUE/);
 });
 
-test("signIn: a disabled account without a subject isn't bound to whoever signs in", async () => {
-  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const departed = await seed(repo, () => {
-    const departed = repo.users.upsertByEmail("gone@example.com", null);
-    repo.users.setDisabled(departed.id, true);
-    return departed;
+test("signIn D4 branch 2: another subject under the same issuer is subject_mismatch, and nothing changes", async () => {
+  const { repo } = fresh();
+  const u = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
+  expect(await signIn(repo, G, "s-intruder", "a@example.com", null)).toEqual({ status: "subject_mismatch", user: u });
+  expect(repo.users.findById(u.id)).toEqual(u);
+});
+
+test("signIn D4 branch 3: an email another issuer holds, with or without a subject, is issuer_mismatch naming the holder", async () => {
+  const { db, repo } = fresh();
+  const linked = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
+  expect(await signIn(repo, OKTA, "o-1", "a@example.com", null)).toEqual({ status: "issuer_mismatch", user: linked, issuer: G });
+  // A pre-F-13 row: Google's issuer, no subject. Reserved for Google.
+  const legacy = await upsert(repo, "old@example.com");
+  await seed(repo, () => { db.run("UPDATE users SET idp_issuer = ? WHERE id = ?", [G, legacy.id]); });
+  expect(await signIn(repo, OKTA, "o-2", "old@example.com", null)).toMatchObject({ status: "issuer_mismatch", user: { id: legacy.id, idp_subject: null }, issuer: G });
+  expect(repo.users.findById(legacy.id)).toMatchObject({ idp_issuer: G, idp_subject: null });
+});
+
+test("signIn D4 branch 4: this issuer's subjectless row links", async () => {
+  const { db, repo } = fresh();
+  const legacy = await upsert(repo, "old@example.com");
+  await seed(repo, () => { db.run("UPDATE users SET idp_issuer = ? WHERE id = ?", [G, legacy.id]); });
+  expect(await signIn(repo, G, "s-old", "old@example.com", "Old")).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_issuer: G, idp_subject: "s-old", display_name: "Old" } });
+  expect(repo.users.findById(legacy.id)).toMatchObject({ idp_issuer: G, idp_subject: "s-old", display_name: "Old" });
+});
+
+test("signIn D4 branch 5: a row with neither links to whichever issuer signs in first, both columns set", async () => {
+  const { repo } = fresh();
+  const dev = await upsert(repo, "dev@example.com");
+  expect(dev).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect(await signIn(repo, OKTA, "o-1", "dev@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { id: dev.id, idp_issuer: OKTA, idp_subject: "o-1" } });
+  expect(repo.users.findById(dev.id)).toMatchObject({ idp_issuer: OKTA, idp_subject: "o-1" });
+  expect(await signIn(repo, G, "s-1", "dev@example.com", null)).toMatchObject({ status: "issuer_mismatch", issuer: OKTA });
+});
+
+test("signIn D4 branch 6: no row creates the user with issuer and subject, and its principal", async () => {
+  const { db, repo } = fresh();
+  const r = await signIn(repo, G, "s-new", "new@example.com", "New");
+  expect(r).toMatchObject({ status: "ok", linked: false, user: { email: "new@example.com", idp_issuer: G, idp_subject: "s-new", display_name: "New" } });
+  expect(repo.users.findByEmail("new@example.com")).toMatchObject({ idp_issuer: G, idp_subject: "s-new" });
+  expect(db.query("SELECT kind FROM principals WHERE name = 'new@example.com'").all()).toEqual([{ kind: "user" }]);
+});
+
+test("signIn: the same sub under two issuers is two users; one issuer can't hold a sub twice", async () => {
+  const { db, repo } = fresh();
+  const a = (await signIn(repo, G, "same", "a@example.com", null)).user;
+  const b = (await signIn(repo, OKTA, "same", "b@example.com", null)).user;
+  expect(a.id).not.toBe(b.id);
+  expect(await signIn(repo, OKTA, "same", "b@example.com", null)).toMatchObject({ status: "ok", user: { id: b.id } });
+  expect(await signIn(repo, G, "same", "a@example.com", null)).toMatchObject({ status: "ok", user: { id: a.id } });
+  const c = await upsert(repo, "c@example.com");
+  await expect(seed(repo, () => { db.run("UPDATE users SET idp_issuer = ?, idp_subject = 'same' WHERE id = ?", [G, c.id]); })).rejects.toThrow(/UNIQUE/);
+});
+
+test("signIn: clearSubject clears issuer and subject, so the next sign-in from any issuer takes the email", async () => {
+  const { repo } = fresh();
+  const u = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
+  await seed(repo, () => repo.users.clearSubject(u.id));
+  expect(repo.users.findById(u.id)).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect(await signIn(repo, OKTA, "o-1", "a@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { id: u.id, idp_issuer: OKTA, idp_subject: "o-1" } });
+});
+
+// D3: the link is a conditional write. A trigger links the row to another
+// account between signIn's read and its write (what a concurrent sign-in does
+// on Postgres) and drops signIn's own update: signIn re-reads and refuses.
+for (const [winner, status] of [[OKTA, "issuer_mismatch"], [G, "subject_mismatch"]] as const) {
+  test(`signIn: a row linked between the read and the conditional write ends in ${status}, not a double link`, async () => {
+    const { db, repo } = fresh();
+    const u = await upsert(repo, "race@example.com");
+    db.run(`CREATE TRIGGER race BEFORE UPDATE OF idp_subject ON users WHEN NEW.idp_subject = 's-mine' BEGIN
+      UPDATE users SET idp_issuer = '${winner}', idp_subject = 's-theirs' WHERE id = OLD.id;
+      SELECT RAISE(IGNORE);
+    END`);
+    expect(await signIn(repo, G, "s-mine", "race@example.com", null)).toMatchObject({ status, user: { id: u.id, idp_issuer: winner, idp_subject: "s-theirs" } });
+    expect(repo.users.findById(u.id)).toMatchObject({ idp_issuer: winner, idp_subject: "s-theirs" });
   });
-  expect(await seed(repo, () => repo.users.signIn("gone@example.com", "s-hire", null))).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
-  expect(repo.users.findById(departed.id)!.idp_subject).toBeNull();
+}
+
+test("signIn: a disabled account without a subject isn't bound to whoever signs in", async () => {
+  const { repo } = fresh();
+  const departed = await upsert(repo, "gone@example.com");
+  await seed(repo, () => repo.users.setDisabled(departed.id, true));
+  expect(await signIn(repo, G, "s-hire", "gone@example.com", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
+  expect(repo.users.findById(departed.id)).toMatchObject({ idp_issuer: null, idp_subject: null });
+});
+
+// #928 D3: the issuer column, its one-time stamp, the every-open repair and the index swap.
+const usersV1 = `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE, display_name TEXT, created_at INTEGER NOT NULL, disabled_at INTEGER)`;
+const identities = (path: string) => {
+  const db = new Database(path, { readonly: true });
+  try { return db.query("SELECT email, idp_issuer, idp_subject FROM users ORDER BY id").all(); } finally { db.close(); }
+};
+const indexes = (path: string) => {
+  const db = new Database(path, { readonly: true });
+  try { return (db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'users' AND name LIKE 'idx_%' ORDER BY name").all() as { name: string }[]).map(r => r.name); } finally { db.close(); }
+};
+const reopen = (path: string) => openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).db.close();
+
+test("schema: a v1.0.0-shaped database (no idp_subject) comes out stamped with Google's issuer", () => {
+  const path = scratchDbPath();
+  const raw = new Database(path);
+  raw.exec(usersV1);
+  raw.run("INSERT INTO users (email, created_at) VALUES ('a@example.com', 0), ('b@example.com', 0)");
+  raw.close();
+  reopen(path);
+  expect(identities(path)).toEqual([
+    { email: "a@example.com", idp_issuer: G, idp_subject: null },
+    { email: "b@example.com", idp_issuer: G, idp_subject: null },
+  ]);
+});
+
+test("schema: a post-F-13 database (subject, no issuer) is stamped, its old index dropped; a later open doesn't re-stamp a cleared row", async () => {
+  const path = scratchDbPath();
+  const raw = new Database(path);
+  raw.exec(usersV1);
+  raw.exec("ALTER TABLE users ADD COLUMN idp_subject TEXT");
+  raw.exec("CREATE UNIQUE INDEX idx_users_idp_subject ON users(idp_subject) WHERE idp_subject IS NOT NULL");
+  raw.run("INSERT INTO users (email, created_at, idp_subject) VALUES ('linked@example.com', 0, 's-1'), ('legacy@example.com', 0, NULL)");
+  raw.close();
+  reopen(path);
+  expect(identities(path)).toEqual([
+    { email: "linked@example.com", idp_issuer: G, idp_subject: "s-1" },
+    { email: "legacy@example.com", idp_issuer: G, idp_subject: null },
+  ]);
+  expect(indexes(path)).toEqual(["idx_users_idp_identity"]);
+  const { repo, db } = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  await seed(repo, () => repo.users.clearSubject(repo.users.findByEmail("linked@example.com")!.id));
+  await seed(repo, () => repo.users.clearSubject(repo.users.findByEmail("legacy@example.com")!.id));
+  db.close();
+  reopen(path);
+  expect(identities(path)).toEqual([
+    { email: "linked@example.com", idp_issuer: null, idp_subject: null },
+    { email: "legacy@example.com", idp_issuer: null, idp_subject: null },
+  ]);
+});
+
+test("schema: what a rolled-back binary writes (a subject, no issuer; its old index) is repaired on the next open", async () => {
+  const path = scratchDbPath();
+  reopen(path);
+  // The previous release on this database: it links a user with no issuer and recreates its index.
+  const raw = new Database(path);
+  raw.run("INSERT INTO users (email, created_at, idp_subject) VALUES ('back@example.com', 0, 's-back'), ('dev@example.com', 0, NULL)");
+  raw.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_idp_subject ON users(idp_subject) WHERE idp_subject IS NOT NULL");
+  raw.close();
+  expect(indexes(path)).toEqual(["idx_users_idp_identity", "idx_users_idp_subject"]);
+  reopen(path);
+  expect(identities(path)).toEqual([
+    { email: "back@example.com", idp_issuer: G, idp_subject: "s-back" },
+    // No subject: a dev login's row, which the repair leaves with neither.
+    { email: "dev@example.com", idp_issuer: null, idp_subject: null },
+  ]);
+  expect(indexes(path)).toEqual(["idx_users_idp_identity"]);
+  const { repo, db } = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  expect(await signIn(repo, G, "s-back", "back@example.com", null)).toMatchObject({ status: "ok", linked: false });
+  db.close();
 });
 
 // ── #130: the undeliveredFrom plan ────────────────────────────────────────────

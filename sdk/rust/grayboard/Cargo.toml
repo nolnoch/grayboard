@@ -1,0 +1,26 @@
+[package]
+name = "grayboard"
+# Equal to package.json's version: a root test checks it, and the release bump moves both.
+version = "2.4.2"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Client for grayboard's hosted MCP endpoint"
+repository = "https://github.com/nolnoch/grayboard"
+# A git dependency by release tag until the pilot proves the API (#929 D9).
+publish = false
+
+[dependencies]
+bytes = "1.12.1"
+futures-util = "0.3.34"
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "time", "macros", "sync"] }
+tokio-util = "0.7.20"
+
+[dev-dependencies]
+schemars = "1.2.3"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "macros"] }

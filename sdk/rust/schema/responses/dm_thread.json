@@ -1,0 +1,19 @@
+{
+  "arguments": {
+    "thread": 1
+  },
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "[\n  {\n    \"id\": 1,\n    \"sender\": \"you@example.com/rec-a\",\n    \"recipient_type\": \"user\",\n    \"recipient\": \"you@example.com/rec-b\",\n    \"body\": \"a message\",\n    \"parent_id\": null,\n    \"created_at\": 1700000000000\n  }\n]"
+      }
+    ]
+  }
+}

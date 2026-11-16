@@ -54,10 +54,10 @@ test("the hosted suite list agrees across hosted-evidence.ts, hosted-e2e.sh, e2e
   expect(accepted.filter((s) => s.startsWith("hosted-")).toSorted()).toEqual(HOSTED_SUITES.map((s) => `hosted-${s}`).toSorted());
   const usage = /usage: \$0 ([^ "]+)/.exec(e2e)![1]!.replace(/hosted-\{([a-z,]+)\}/, (_, list: string) => list.split(",").map((s) => `hosted-${s}`).join("|")).split("|");
   expect(usage.toSorted()).toEqual(accepted.toSorted());
-  // hosted.yml: every hosted suite but the outside-network ones, plus claude-hosted (#501); each an e2e.sh name.
+  // hosted.yml: every hosted suite but the outside-network ones, plus claude-hosted (#501) and rust-sdk (#929); each an e2e.sh name.
   const matrix: string[] = (Bun.YAML.parse(read(".github/workflows/hosted.yml")) as any).jobs.hosted.strategy.matrix.suite;
   expect(matrix.filter((s) => s.startsWith("hosted-")).toSorted()).toEqual(HOSTED_SUITES.filter((s) => !NETWORK.includes(s)).map((s) => `hosted-${s}`).toSorted());
-  expect(matrix.filter((s) => !s.startsWith("hosted-"))).toEqual(["claude-hosted"]);
+  expect(matrix.filter((s) => !s.startsWith("hosted-"))).toEqual(["claude-hosted", "rust-sdk"]);
   for (const s of matrix) expect(accepted).toContain(s);
   // e2e.yml: the outside-network suites, by hand and nightly.
   const nightly = Bun.YAML.parse(read(".github/workflows/e2e.yml")) as any;

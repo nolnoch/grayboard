@@ -1,0 +1,17 @@
+{
+  "arguments": {},
+  "result": {
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "grayboard",
+        "version": "<version>"
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"you\": \"you@example.com/rec-a\",\n  \"peers\": [\n    {\n      \"handle\": \"you@example.com/rec-a\",\n      \"online\": true,\n      \"last_seen\": 1700000000000,\n      \"self\": true,\n      \"id\": \"id:#1\",\n      \"status\": \"recording\",\n      \"status_age\": \"0m\",\n      \"harness\": \"pi\"\n    },\n    {\n      \"handle\": \"you@example.com/rec-b\",\n      \"online\": true,\n      \"last_seen\": 1700000000000,\n      \"id\": \"id:#2\",\n      \"harness\": \"pi\"\n    },\n    {\n      \"handle\": \"you@example.com/rec-launcher\",\n      \"online\": true,\n      \"last_seen\": 1700000000000,\n      \"id\": \"id:#3\",\n      \"harness\": \"test\",\n      \"launcher\": true\n    }\n  ]\n}"
+      }
+    ]
+  }
+}

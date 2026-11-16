@@ -4,6 +4,8 @@
 # run against them (#379); each family's pins in that package move in one
 # PR. The MCP client is also pinned at the root and in hosted-core, which
 # Dependabot doesn't move: ci_sources.test.ts fails until the PR moves them.
+# The Rust SDK's crates (sdk/rust, #929) arrive as one grouped PR, which the
+# hosted matrix's rust-sdk leg tests.
 # Actions are pinned by commit SHA (#161; the repo requires it), so new
 # releases arrive as PRs that move the SHA and its version comment together.
 version: 2
@@ -28,6 +30,14 @@ updates:
       mcp-sdk:
         patterns:
           - "@modelcontextprotocol/*"
+  - package-ecosystem: cargo
+    directory: /sdk/rust
+    schedule:
+      interval: weekly
+    groups:
+      rust-sdk:
+        patterns:
+          - "*"
   - package-ecosystem: github-actions
     directories:
       - /

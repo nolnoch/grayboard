@@ -2,26 +2,10 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTouchQueue, googleSignIn, hashToken, mintToken, verifySessionToken, verifyGoogleIdToken } from "./auth.ts";
-import { accessAudits } from "../../tests/support/audit.ts";
-import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWTPayload } from "jose";
+import { createTouchQueue, hashToken, mintToken, verifySessionToken } from "./auth.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
-
-test("Google JWT verification preserves issuer/audience/domain and requires verified typed email and bound nonce", async () => {
-  const { privateKey, publicKey } = await generateKeyPair("RS256");
-  const keyResolver = createLocalJWKSet({ keys: [{ ...await exportJWK(publicKey), kid: "test" }] });
-  const claims: JWTPayload = { iss: "https://accounts.google.com", aud: "client", sub: "subject", iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 60,
-    hd: "example.com", email: "YOU@example.com", email_verified: true, nonce: "nonce", name: "You" };
-  const sign = (payload: JWTPayload) => new SignJWT(payload).setProtectedHeader({ alg: "RS256", kid: "test" }).sign(privateKey);
-  expect(await verifyGoogleIdToken(await sign(claims), "client", "example.com", { expectedNonce: "nonce", keyResolver })).toEqual({ email: "you@example.com", displayName: "You", subject: "subject" });
-  for (const patch of [{ iss: "https://evil.example" }, { aud: "wrong" }, { hd: "wrong" }, { email_verified: false }, { email_verified: "true" }, { email: 12 }, { email: "" }, { nonce: "wrong" }, { nonce: undefined }, { exp: 1 }, { exp: undefined }, { sub: undefined }]) {
-    await expect(verifyGoogleIdToken(await sign({ ...claims, ...patch }), "client", "example.com", { expectedNonce: "nonce", keyResolver })).rejects.toThrow();
-  }
-  // Existing CLI calls do not supply a nonce; AS calls always do.
-  expect((await verifyGoogleIdToken(await sign({ ...claims, nonce: undefined }), "client", "example.com", { keyResolver })).email).toBe("you@example.com");
-});
 
 describe("token helpers", () => {
   test("mintToken has gbrd_v1_ prefix", () => {
@@ -132,23 +116,4 @@ describe("verifySessionToken", () => {
     await seed(repo, () => repo.sessions.create(u.id, hashToken(fresh), null));
     expect(verifySessionToken(fresh, repo, touches, 0)).not.toBeNull();
   });
-});
-
-// Security audit F-13: each refusal says what the admin runs, and audits why.
-test("googleSignIn refuses a reassigned or changed email with the admin's fix, and audits each outcome", async () => {
-  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  await seed(repo, () => repo.users.upsertByEmail("old@example.com", null));
-  // In a queued body, as the OAuth sign-in runs it.
-  const signIn = (identity: Parameters<typeof googleSignIn>[1]) => seed(repo, () => googleSignIn(repo, identity, { ip: "1.2.3.4" }));
-  expect(await signIn({ email: "old@example.com", subject: "s-old", displayName: null })).toMatchObject({ user: { email: "old@example.com" } });
-  expect(accessAudits(db, "auth.subject_linked").map(r => [r.actor, r.detail])).toEqual([["old@example.com", { ip: "1.2.3.4" }]]);
-
-  const mismatch = await signIn({ email: "old@example.com", subject: "s-hire", displayName: null });
-  expect(mismatch).toEqual({ refused: expect.stringContaining("unlink-idp --email old@example.com") });
-  const changed = await signIn({ email: "new@example.com", subject: "s-old", displayName: null });
-  expect(changed).toEqual({ refused: expect.stringContaining("belongs to grayboard user old@example.com but now reports new@example.com") });
-  expect(accessAudits(db, "auth.subject_refused").map(r => [r.actor, r.detail])).toEqual([
-    ["old@example.com", { reason: "subject_mismatch", ip: "1.2.3.4" }],
-    ["old@example.com", { reason: "email_changed", email: "new@example.com", ip: "1.2.3.4" }],
-  ]);
 });
