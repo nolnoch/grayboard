@@ -100,16 +100,32 @@ export class AppSession {
   }
 
   // fn, a handler on `session`, in one queued transaction, as hosted `run` runs a tool: a refusal's rows (the
-  // session's `afterRollback`) are written after the rollback, in a body of their own.
+  // session's `afterRollback`) are written after the rollback, in a body of their own. As Slack's inWrite does, the
+  // collector is set and cleared inside the synchronous body, so overlapping calls on one session can't leave it
+  // pointing at another call's.
   private async write<T>(session: ApplicationSession, fn: () => Sync<T>): Promise<Awaited<T>> {
-    const rows: Array<() => void> = [], own = session.afterRollback;
-    session.afterRollback = (w) => { rows.push(w); };
+    const rows: Array<() => void> = [];
     try {
-      return await seed(this.repo, fn);
+      return await seed(this.repo, () => {
+        rows.length = 0;
+        session.afterRollback = (w) => { rows.push(w); };
+        try { return fn(); } finally { session.afterRollback = undefined; }
+      });
     } catch (e) {
-      if (rows.length) await seed(this.repo, () => { for (const w of rows) this.repo.atomic(w); });
+      await this.flushRefusal(rows);
       throw e;
-    } finally { session.afterRollback = own; }
+    }
+  }
+
+  // A refusal's rows in a body of their own, each in its own savepoint, as hosted's flushQueued writes them: one that
+  // fails is logged and the rest still land, so the caller's ApplicationError is what it rethrows.
+  private async flushRefusal(rows: Array<() => void>): Promise<void> {
+    if (!rows.length) return;
+    await seed(this.repo, () => {
+      for (const w of rows) {
+        try { this.repo.atomic(w); } catch (failure) { console.error("[app_session] refusal row failed:", failure); }
+      }
+    }).catch(failure => console.error("[app_session] refusal rows failed:", failure));
   }
 
   // The sink a hosted session has, with events in place of a stream.
@@ -172,7 +188,7 @@ export class AppSession {
         return this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
       }));
     } catch (e) {
-      if (rows.length) await seed(this.repo, () => { for (const w of rows) this.repo.atomic(w); });
+      await this.flushRefusal(rows);
       this.drop(`connect refused: ${(e as Error).message}`);
       throw e;
     }

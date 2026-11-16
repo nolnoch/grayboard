@@ -4,7 +4,7 @@
 // `await seed(repo, () => …)`. An idle queue runs fn at once, inside the call, as the one transaction it was; a busy
 // one (a timer's sweep, a request still in flight) makes it wait its turn rather than interleave with the holder.
 // fn is synchronous, its throw the rejection. `on`: the server's Repo, or its connection when a test holds only that
-// (core functions on `store.db`). Startup writes in production use `repo.writeNow`; nothing in a test does.
+// (core functions on `store.db`). Startup writes in production use `repo.writeNow`; in a test only seedSync does.
 import type { Database } from "bun:sqlite";
 import type { Repo, Sync } from "../../src/server/db.ts";
 import { queueFor } from "../../src/server/store/queue.ts";
@@ -17,15 +17,9 @@ export function seed<T>(on: Pick<Repo, "write"> | Database, fn: () => Sync<T>): 
 }
 
 // seed() for a write a synchronous hook makes (a test's stand-in for a production function, called outside any queued
-// body), which can't await: an idle queue runs fn inside the call, so its value is back before this returns. Throws
-// when another body holds the queue, rather than letting the write land after the hook has returned.
-export function seedSync<T>(on: Pick<Repo, "write"> | Database, fn: () => Sync<T>): T {
-  let ran = false, value: T | undefined, error: unknown, threw = false;
-  seed(on, () => {
-    ran = true;
-    try { const v = fn(); value = v as T; return v; } catch (e) { threw = true; error = e; throw e; }
-  }).catch(() => {});
-  if (!ran) throw new Error("seedSync: the write queue is held; this write would land after the hook returns");
-  if (threw) throw error;
-  return value as T;
+// body), which can't await: the Repo's writeNow, which runs fn now on an idle queue and returns its value. It throws,
+// queueing nothing, when another body holds the queue or a transaction is open, rather than letting the write land
+// after the hook has returned.
+export function seedSync<T>(on: Pick<Repo, "writeNow">, fn: () => Sync<T>): T {
+  return on.writeNow(fn);
 }
