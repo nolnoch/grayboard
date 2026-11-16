@@ -26,8 +26,9 @@ jobs:
       matrix:
         # scripts/e2e.sh suite names: the hosted OpenCode suites less the
         # outside-network ones (e2e.yml), and the real Claude Code with the
-        # hosted plugin (#501; no credentials: a fake Anthropic API).
-        suite: [hosted-strict, hosted-git, hosted-config, hosted-host, hosted-matrix, hosted-native, hosted-durable, claude-hosted]
+        # hosted plugin (#501; no credentials: a fake Anthropic API), and the
+        # Rust client SDK against a real server (#929).
+        suite: [hosted-strict, hosted-git, hosted-config, hosted-host, hosted-matrix, hosted-native, hosted-durable, claude-hosted, rust-sdk]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,6 +43,16 @@ jobs:
         working-directory: adapters/opencode-v2
         run: bun install --frozen-lockfile
 
+      - name: Cargo cache
+        if: matrix.suite == 'rust-sdk'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sdk/rust/target
+          key: rust-sdk-${{ runner.os }}-${{ hashFiles('sdk/rust/Cargo.lock', 'sdk/rust/rust-toolchain.toml') }}
+
       - name: Run ${{ matrix.suite }}
         env:
           GRAYBOARD_E2E_RUN_DIR: ${{ runner.temp }}/hosted-run
@@ -54,7 +65,8 @@ jobs:
         with:
           name: ${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.rep && format('-{0}', inputs.rep) || '' }}
           # A hosted suite's evidence only (never its fixture HOME or auth
-          # store); claude-hosted's whole run dir, as e2e.yml uploads it.
+          # store); claude-hosted's and rust-sdk's whole run dir, as e2e.yml
+          # uploads it (rust-sdk's token is seeded in-process, never written).
           path: |
             ${{ runner.temp }}/hosted-run/evidence
             ${{ !startsWith(matrix.suite, 'hosted-') && format('{0}/hosted-run', runner.temp) || '' }}
