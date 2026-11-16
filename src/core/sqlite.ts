@@ -21,9 +21,14 @@ export function ownWriter(db: Database, writer: Writer): void { writers.set(db, 
 // Whether the caller is inside the connection's open transaction: one is open and, on a connection with a writer,
 // the caller holds it. Another task, while the holder awaits, is outside it: it reads committed state on the reader
 // and its post-commit effects run now.
-function ownsTx(db: Database): boolean {
+export function ownsTx(db: Database): boolean {
   return db.inTransaction && (writers.get(db)?.holds() ?? true);
 }
+
+// Called after each outermost commit on the connection, before its effects (#996: the server's committed auth
+// generation). One per connection; it must not throw.
+const commitHooks = new WeakMap<Database, () => void>();
+export function onCommit(db: Database, hook: () => void): void { commitHooks.set(db, hook); }
 
 export function afterCommit(db: Database, effect: CommitEffect): void {
   if (!ownsTx(db)) { flush(effect); return; }
@@ -60,7 +65,7 @@ function trackCommits(db: Database): void {
       // A released savepoint is not durable until its outer transaction commits.
       const parent = frames.at(-1);
       if (parent) parent.push(...frame);
-      else for (const effect of frame) flush(effect);
+      else { commitHooks.get(db)?.(); for (const effect of frame) flush(effect); }
       return value;
     };
     return Object.assign(wrap(native), {
@@ -93,6 +98,7 @@ export function openBoundary(db: Database): Boundary {
         throw error;
       }
       pop();
+      commitHooks.get(db)?.();
       for (const effect of frame) flush(effect);
     },
     rollback() {

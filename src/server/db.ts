@@ -16,7 +16,7 @@ import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
 import { endSession, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
-import { afterCommit, type Boundary, openBoundary, openReader, openSqlite, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
+import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
 import { type Read, type Tx, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { serverAccess } from "./access.ts";
@@ -146,7 +146,6 @@ export function queuedTx(repo: Repo): WriteTx {
 function queuedNow<T>(db: Database, fn: (tx: Tx) => T, committed?: (value: T) => unknown): T {
   const queue = queueFor(db);
   if (queue.held) throw new Error("writeNow while the write queue is held: only startup calls it; await write() instead");
-  if (db.inTransaction) throw new Error("writeNow inside an open transaction: nested code calls atomic");
   let box: { value: T } | { error: unknown } | undefined;
   void queue.run(() => {
     try { box = { value: db.transaction(withTx(db, fn)).immediate() as T }; } catch (error) { box = { error }; return; }
@@ -203,11 +202,13 @@ export interface Repo {
   // The store's read handle outside any transaction (#807 P1c): reads committed state.
   read: Read;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
-  // body (#881): one authorization's token and user reads share it. Inside a transaction, or nested, it's plain fn().
+  // body (#881): one authorization's token and user reads share it. Inside the caller's own transaction, nested, or
+  // with no generation to read, it's plain fn().
   authRead<T>(fn: () => Sync<T>): T;
-  // The auth cache's generation: authRead's pinned one inside its body, else read now; undefined inside a
-  // transaction. Equal values mean no committed write to oauth_tokens, oauth_grants or users from this connection,
-  // and no commit at all from another, came between them (#899).
+  // The auth cache's generation: authRead's pinned one inside its body, else read now; undefined inside the caller's
+  // own transaction. Another task's open transaction doesn't move it: it reflects commits only (#996). Equal values
+  // mean no committed write to oauth_tokens, oauth_grants or users from this connection, and no commit at all from
+  // another, came between them (#899).
   authGeneration(): string | undefined;
   oauth: OAuthStore;
   hosted: HostedStore;
@@ -455,7 +456,8 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
 
 // #853: a connection-local counter every write to the authorization tables bumps, by trigger, so no
 // write site can forget to. TEMP objects live and die with this connection, outside the schema, and
-// roll back with their transaction: authGeneration (makeRepo) reads the counter only outside one.
+// roll back with their transaction: makeRepo reads the counter only after a commit (onCommit), and authGeneration
+// serves that value.
 function authGenerationTriggers(db: Database): void {
   db.exec(`CREATE TEMP TABLE IF NOT EXISTS auth_generation(n INTEGER NOT NULL);
     INSERT INTO auth_generation(n) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM auth_generation)`);
@@ -877,11 +879,25 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const counter = db.query<{ n: number }, []>("SELECT n FROM temp.auth_generation");
   const dataVersion = db.query<{ data_version: number }, []>("PRAGMA data_version");
   // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this connection or
-  // another; undefined inside a transaction, whose writes may yet roll back (#853).
+  // another (#853). The counter's part is the value at this connection's last commit (#996), not the live one: while
+  // a write body holds a transaction open across an await, other tasks read committed rows (the reader) and must not
+  // key a cache entry on the holder's uncommitted bump, which its rollback would undo. Undefined to the holder inside
+  // its own transaction, whose reads see writes that may yet roll back, and after a failed counter read until the
+  // next commit reads it again (uncached rather than stale).
   // `pinned`: the generation authRead read for its body (#881); null outside one.
   let pinned: string | null = null;
-  const readGeneration = () => `${counter.get()!.n}:${dataVersion.get()!.data_version}`;
-  const authGeneration = () => db.inTransaction ? undefined : pinned ?? readGeneration();
+  let committed: number | undefined;
+  const readCommitted = () => { try { committed = counter.get()!.n; } catch (error) { committed = undefined; console.error("[grayboard] auth generation read failed:", error); } };
+  readCommitted();
+  onCommit(db, readCommitted);
+  // Outside any transaction the live counter is the committed one, and covers a write that committed without a
+  // tracked boundary (an autocommit statement: no hook ran); only while another task's transaction is open does it
+  // serve the value the last hook read.
+  const readGeneration = () => {
+    const n = db.inTransaction ? committed : counter.get()!.n;
+    return n === undefined ? undefined : `${n}:${dataVersion.get()!.data_version}`;
+  };
+  const authGeneration = () => ownsTx(db) ? undefined : pinned ?? readGeneration();
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
   // Caches of what the auth tables say, cleared when authGeneration moves: a live access token only (an
   // unknown or dead one is re-read every time); a user row, or its absence, as read (#853). They sit
@@ -924,8 +940,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     post: <T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn as (tx: Tx) => T, committed, what),
     read: sqliteRead(db),
     authRead<T>(fn: () => Sync<T>): T {
-      if (pinned !== null || db.inTransaction) return fn() as T;
-      pinned = readGeneration();
+      if (pinned !== null || ownsTx(db)) return fn() as T;
+      const g = readGeneration();
+      if (g === undefined) return fn() as T;
+      pinned = g;
       try { return fn() as T; } finally { pinned = null; }
     },
     authGeneration,
