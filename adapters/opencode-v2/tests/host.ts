@@ -408,7 +408,7 @@ try {
     await wait(() => app.mcp.activeLeases, n => n === 1, "native refresh initial lease");
     const before = await ctx.integration.connection.resolve(selected); assert(before?.type === "oauth");
     const principal = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } })); assert(!(principal instanceof Response));
-    await app.repo.write(() => app.repo.oauth.revokeToken(principal.accessHash, OPENCODE_CLIENT, Date.now()));
+    await app.repo.write(tx => app.repo.oauth.revokeToken(tx, principal.accessHash, OPENCODE_CLIENT, Date.now()));
     await invoke(s.id, "whoami", {});
     await wait(() => refreshes, n => n === 1, "native MCP refresh after revoked access");
     const current = await ctx.integration.connection.resolve(selected); assert(current?.type === "oauth"); assert.notEqual(current.access, before.access);
@@ -742,7 +742,7 @@ try {
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit approval of successor real binding");
   const revokeFixtureGrant = async (grantID: string) => {
     const token = app.db.prepare("SELECT hash FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' LIMIT 1").get(grantID) as { hash: string }; assert(token);
-    await app.repo.write(() => app.repo.oauth.revokeToken(token.hash, OPENCODE_CLIENT, Date.now()));
+    await app.repo.write(tx => app.repo.oauth.revokeToken(tx, token.hash, OPENCODE_CLIENT, Date.now()));
   };
   const g1 = row(a.id)!.grant_id, second = await signIn(native.integrationID); assert(second?.type === "credential");
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "native new grant latches receiving approval"); await host.mcp.connect({ server: "grayboard", location });

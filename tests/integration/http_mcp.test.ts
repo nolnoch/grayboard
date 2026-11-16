@@ -278,8 +278,8 @@ test("live access, family, disable and admin revocation never reuse a cached pri
     const issued = await issueOAuth(app.repo, app.oauth.resource, `${action}@example.com`, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT);
     const client = await connect(issued.token);
     switch (action) {
-      case "access": await seed(app.repo, () => app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now())); break;
-      case "family": await seed(app.repo, () => app.repo.oauth.revokeToken(issued.tokens.refreshHash, issued.binding.clientId, Date.now())); break;
+      case "access": await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, Date.now())); break;
+      case "family": await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.refreshHash, issued.binding.clientId, Date.now())); break;
       // Two bodies, as the two autocommit writes were: the disable commits before the re-enable.
       case "disable":
         await seed(app.repo, tx => app.repo.users.setDisabled(tx, issued.authed.user_id, true));
@@ -348,7 +348,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
     const pending = fetch(base + "/mcp", { method: "POST", headers: { Authorization: `Bearer ${issued.token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body });
     await authenticated;
     if (failure === "expiry") clock = Date.now() + 3_600_001;
-    if (failure === "revoke") await seed(app.repo, () => app.repo.oauth.revokeToken(issued.tokens.accessHash, issued.binding.clientId, Date.now()));
+    if (failure === "revoke") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, Date.now()));
     const valid = failure === "revoke" ? await connect(await login("bob@example.com")) : undefined;
     controller.enqueue(encoder.encode(json.slice(1))); controller.close();
     const [response, validResult] = await Promise.all([pending, valid?.callTool({ name: "board_list", arguments: {} })]);

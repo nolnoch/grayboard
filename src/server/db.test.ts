@@ -9,6 +9,8 @@ import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { hashToken } from "./auth.ts";
+import { issueOAuth } from "../../tests/helpers/oauth.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -75,7 +77,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
     expect(reopened.repo.sessions.findByTokenHash(reopened.repo.read, "old-session-hash")?.id).toBe(session.id);
     expect(reopened.repo.aliases.listForScope("person", user.email).map(i => i.name)).toEqual(["fe"]);
     expect(reopened.repo.messages.history(["you@example.com/fe"])[0]?.body).toBe("preserved");
-    expect(reopened.repo.oauth.isGrantActive("missing", Date.now())).toBe(false);
+    expect(reopened.repo.oauth.isGrantActive(reopened.repo.read, "missing", Date.now())).toBe(false);
     expect(reopened.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'oauth_%'").all()).toHaveLength(5);
   } finally {
     reopened.db.close();
@@ -696,4 +698,42 @@ test("#807 P1c-7: user writes run on the handle they're given", async () => {
   expect(repo.users.findByEmail("b@example.com")).toBeUndefined();
   expect(repo.users.findByEmail("c@example.com")).toBeUndefined();
   expect(repo.users.findById(u.id)?.disabled_at).toBeNull();
+});
+
+// #807 P1c-8: the OAuth store runs on the handle it's given, as P1c-6's sessions do. The facade resolves the handle
+// before it reads any argument, so a kept Tx is refused whatever the rest of the call says.
+test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const kept = await seed(repo, tx => {
+    repo.oauth.cleanup(tx, 1);
+    return tx;
+  });
+  const settled = /used after its transaction settled/;
+  const x = {} as never;
+  const o = repo.oauth;
+  expect(() => o.createRequest(kept, x, 1)).toThrow(settled);
+  expect(() => o.bindRequestSession(kept, "r", "b", "s", 1)).toThrow(settled);
+  expect(() => o.createBrowserSession(kept, x, 1)).toThrow(settled);
+  expect(() => o.revokeBrowserSession(kept, "s")).toThrow(settled);
+  expect(() => o.decideRequest(kept, x, 1)).toThrow(settled);
+  expect(() => o.redeemCode(kept, x, 1)).toThrow(settled);
+  expect(() => o.redeemLoginCode(kept, x, 1)).toThrow(settled);
+  expect(() => o.rotateRefresh(kept, x, 1)).toThrow(settled);
+  expect(() => o.revokeToken(kept, "t", "c", 1)).toThrow(settled);
+  expect(() => o.revokePreBuiltinGrants(kept, ["c"], 1)).toThrow(settled);
+  expect(() => o.cleanup(kept, 1)).toThrow(settled);
+  expect(() => o.findRequest(kept, "r", "b", 1)).toThrow(settled);
+  expect(() => o.findBrowserSession(kept, "s", 1)).toThrow(settled);
+  expect(() => o.findCodeScopes(kept, "c", "c", "r", "u", 1)).toThrow(settled);
+  expect(() => o.findRefreshGrant(kept, "h", "c", "r", 1)).toThrow(settled);
+  expect(() => o.findActiveAccess(kept, "h", "r", [], 1)).toThrow(settled);
+  expect(() => o.isGrantActive(kept, "g", 1)).toThrow(settled);
+  expect(() => o.revokeToken({} as Tx, "t", "c", 1)).toThrow("not a SQLite store handle");
+  expect(o.isGrantActive(repo.read, "g", 1)).toBe(false);
+  // A warm access cache still resolves the handle first.
+  const issued = await issueOAuth(repo, "https://grayboard.example.com/mcp");
+  const live = () => o.findActiveAccess(repo.read, hashToken(issued.token), issued.binding.resource, [], issued.now);
+  expect(live()).toBeDefined();
+  expect(live()).toBeDefined();
+  expect(() => o.findActiveAccess(kept, hashToken(issued.token), issued.binding.resource, [], issued.now)).toThrow(settled);
 });

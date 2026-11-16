@@ -169,9 +169,9 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const action of ["access", "ex
   await call(connection, "board_create", { name: "e2e", purpose: "fixtures" });
   await watch(connection, boardUri);
   await until(() => app.mcp.activeWatches === 1);
-  if (action === "access") await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
+  if (action === "access") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
   if (action === "expiry") clock += OAUTH_TTL.access;
-  if (action === "grant") await seed(app.repo, () => app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock));
+  if (action === "grant") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, hashToken(grant.refreshToken), grant.binding.clientId, clock));
   if (action === "disable") await seed(app.repo, tx => app.repo.users.setDisabled(tx, grant.authed.user_id, true));
   if (action === "admin") await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, grant.authed.user_id));
   await until(() => version === "2026-07-28" ? app.mcp.activeListens === 0 : app.mcp.activeGetStreams === 0);
@@ -242,7 +242,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const kind of ["http", "sdk"] 
 
 async function refresh(grant: IssuedOAuth, priorRefresh = grant.refreshToken) {
   const token = randomBytes(32).toString("base64url"), refreshToken = randomBytes(32).toString("base64url"), now = Date.now();
-  expect((await seed(app.repo, () => app.repo.oauth.rotateRefresh({ clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(priorRefresh), tokens: {
+  expect((await seed(app.repo, tx => app.repo.oauth.rotateRefresh(tx, { clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(priorRefresh), tokens: {
     ...grant.tokens, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
   } }, now))).status).toBe("ok");
   return { token, refreshToken };
@@ -259,7 +259,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current 
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
   const resume = c.pauseGets();
   try {
-    await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
+    await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
     expect(await c.client.subscribeResource({ uri: "grayboard://boards/next" })).toEqual({});
     await until(() => c.getHeaders.length === 2);
     expect(c.getHeaders[0]!.get("Authorization")).toBe(`Bearer ${grant.token}`);
@@ -291,7 +291,7 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   await watch(c, boardUri);
   const rotated = await refresh(grant);
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
-  await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now()));
+  await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, Date.now()));
   expect(await call(c, "whoami")).toMatchObject({ primary: "alice@example.com/be" });
   await until(() => app.mcp.activeWatches === 0);
   expect(app.mcp.activeLegacySessions).toBe(1);

@@ -42,7 +42,7 @@ test("a real access-expiry stream close with OpenCode's refresh landing after it
     // Through the write queue, as the server's token endpoint writes it (#807 P1b-4f); a failure is the rotation's status.
     const refresh = async () => {
       const token = randomBytes(32).toString("base64url"), refreshToken = randomBytes(32).toString("base64url"), now = Date.now();
-      rotation = (await app.repo.write(() => app.repo.oauth.rotateRefresh({ clientId: issued.binding.clientId, resource: issued.binding.resource, scopes: issued.binding.scopes, refreshHash: hashToken(issued.refreshToken), tokens: {
+      rotation = (await app.repo.write(tx => app.repo.oauth.rotateRefresh(tx, { clientId: issued.binding.clientId, resource: issued.binding.resource, scopes: issued.binding.scopes, refreshHash: hashToken(issued.refreshToken), tokens: {
         ...issued.tokens, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
       } }, now))).status;
       f.rotate(token);

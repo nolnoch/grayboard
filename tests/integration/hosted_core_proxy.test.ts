@@ -447,7 +447,7 @@ test("a 401 the credential's refresh doesn't fix needs a new login: tool calls, 
   const p = proxy({ token: async () => token, onUnauthorized: async () => { refreshed++; } });
   expect((await p.call("bind", { name: "proxy-gone", create: true }, "pi-root")).isError).toBeUndefined();
   // Revoking the refresh token revokes the grant (RFC 7009), so the access token dies with it.
-  await seed(srv.app.repo, () => srv.app.repo.oauth.revokeToken(hashToken(refreshToken), CLIENT, Date.now()));
+  await seed(srv.app.repo, tx => srv.app.repo.oauth.revokeToken(tx, hashToken(refreshToken), CLIENT, Date.now()));
   const signedOut = "error: Signed out of grayboard in pi; run /grayboard login";
   expect(await p.call("whoami", {}, "pi-root")).toEqual({ content: [{ type: "text", text: signedOut }], isError: true });
   writeFileSync(join(dir, "gone.txt"), "gone\n");

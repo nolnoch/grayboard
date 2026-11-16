@@ -179,7 +179,7 @@ test("hosted audit actors and clients survive grant deletion and ownership clean
   if (p instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.register(p, sessionContext(p, meta), "audit-child");
   await hosted.sessions.end(p, sessionContext(p, meta));
-  await seed(store.repo, () => store.repo.oauth.cleanup(Date.now() + OAUTH_TTL.grant + 1));
+  await seed(store.repo, tx => store.repo.oauth.cleanup(tx, Date.now() + OAUTH_TTL.grant + 1));
   const rows = store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action LIKE 'hosted.%'").all();
   expect(rows.length).toBeGreaterThanOrEqual(5);
   for (const row of rows) {
@@ -253,7 +253,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     const pending = client.callTool({ name: "delivery_open", arguments: {} }, { signal: abort.signal }).catch(e => e);
     await ready;
     expect(hosted.activeLeases).toBe(1);
-    if (stop === "access") await seed(store.repo, () => store.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now()));
+    if (stop === "access") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, Date.now()));
     if (stop === "abort") abort.abort();
     const closing = stop === "close" ? hosted.close() : undefined;
     resume();

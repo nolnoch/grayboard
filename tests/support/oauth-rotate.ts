@@ -6,7 +6,7 @@ console.log("READY");
 await Bun.stdin.text();
 console.error("ROTATING");
 try {
-  console.log(JSON.stringify(await repo.write(() => repo.oauth.rotateRefresh(JSON.parse(raw!), Number(at)))));
+  console.log(JSON.stringify(await repo.write(tx => repo.oauth.rotateRefresh(tx, JSON.parse(raw!), Number(at)))));
 } finally {
   db.close();
 }
