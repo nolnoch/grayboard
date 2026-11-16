@@ -30,7 +30,7 @@ Facts in the code that shape it:
 `role_bindings.principal_id` and `granted_by` reference `principals(id)`.
 
 - Not email: #927 rules it out, and an email is a name, not an account.
-- Not `users.idp_subject` (with `idp_issuer`, #928): it is null for dev-auth users and for anyone not signed in since F-13, it is per IdP, and `admin unlink-idp` clears it.
+- Not `users.idp_subject` (with `idp_issuer`, #928; [../architecture.md](../architecture.md) §3): it is null for dev-auth users and for anyone not signed in since F-13, it is per IdP, and `admin unlink-idp` clears it.
 - Not `users.id`: it works for users and services but can never name a team, and a team as the holder of `service_invoke` ("every member of `eng` may invoke `ingest`") is the likely #270 grant. `principals.id` covers it with no schema change.
 - Not a typed `kind:id` string: it is a foreign key without the database's enforcement. `principals.kind` is the type.
 - A service principal fits before #270 exists because its `principals` row is the key; nothing here waits on its credential.

@@ -471,8 +471,8 @@ elif [ "$unit_new" = "1" ]; then
     kept) echo "Your ${caddy_dest} was kept, not the release's. To take the release's: rerun with GRAYBOARD_DEPLOY_REPLACE=1 (the old one is kept as .prev), set your hostname in it, and reload Caddy." ;;
     *) echo "Set your hostname in ${caddy_dest}." ;;
   esac
-  echo "Create /etc/grayboard/env (GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL, GRAYBOARD_ORG_DOMAIN,"
-  echo "GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET), then \`systemctl enable --now grayboard\`."
+  echo "Create /etc/grayboard/env (GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL, and the sign-in provider's"
+  echo "variables: Google's or Okta's, docs/guide/server.md §3), then \`systemctl enable --now grayboard\`."
   echo "For nightly backups, schedule ${backup_dest} (docs/guide/server.md §6, Backups)."
 elif [ "$INSTALL_SERVER" = "1" ]; then
   echo "Server binary installed; systemd runs no grayboard unit from it. A server already running"
@@ -481,7 +481,7 @@ elif [ "$INSTALL_SERVER" = "1" ]; then
     echo "The unit, Caddyfile and backup script were not installed: ${deploy_skip}. For a new server,"
     echo "install them on a systemd host (rerun without GRAYBOARD_NO_DEPLOY=1, or take the deploy-*"
     echo "assets from the release), then create /etc/grayboard/env with GRAYBOARD_DB_PATH,"
-    echo "GRAYBOARD_PUBLIC_URL, GRAYBOARD_ORG_DOMAIN, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET."
+    echo "GRAYBOARD_PUBLIC_URL and the sign-in provider's variables (docs/guide/server.md §3)."
   fi
 elif [ "${GRAYBOARD_NO_SETUP:-0}" != "1" ] && [ -t 1 ] && (: < /dev/tty) 2>/dev/null; then
   # Under `curl | bash`, stdin is this script; setup asks its questions on the terminal.

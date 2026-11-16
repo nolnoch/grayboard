@@ -16,7 +16,7 @@ Every credential comes from a person at a browser, so a pipeline's agents can't 
 Code facts that shape it:
 
 - **The account key is already the principal name.** `AuthedUser.user_email` is read as the acting principal's name (audit actor, limiter key, `ids.principal`, `bindTarget`, `messages.sender_user`); only a few sites hardcode the kind (D1).
-- **Google is consulted only at sign-in** (`hd` in `src/server/idp_google.ts` `verifyGoogleIdToken`, the domain in `/oauth/google/callback`); token use checks `users.disabled_at` and the token row.
+- **An IdP is consulted only at sign-in** (each provider's `exchange`, `src/server/idp.ts`, with its domain check; [../architecture.md](../architecture.md) §3); token use checks `users.disabled_at` and the token row.
 - **The service kind is reserved, and refused.** `principals.kind`, the address grammar and `aliases.scope_kind` carry it; `actIn` denies it (`scope.service`).
 - **The token route knows two grant types**; `resolveClient` (authorize and token) checks a startup map first. Confidential clients use `client_secret_basic` only.
 - **The session source is a pure function of the client ID** (`sourceKeyFor`): only OpenCode's CIMD client ID maps `ai.opencode/sessionID`.

@@ -42,7 +42,7 @@ mkdir -p "$HOME/.local/share/grayboard-opencode"
 
 The installed directory is `$HOME/.local/share/grayboard-opencode/node_modules/grayboard-opencode`. Alternatively use the absolute `adapters/opencode-v2` directory after its frozen install. Git loading and directory wrappers run shipped TypeScript source; no `dist` or install/build lifecycle hook is required. Keep that directory and dependencies available to the OpenCode server. Do not pass a tarball to `opencode plugin add`; OpenCode loads the installed directory's root `index.js`, with its companion `./tui` export.
 
-**Configure without a Grayboard CLI.** The server's `/mcp` endpoint and OpenCode's client-metadata registration are always on; the operator only needs a server build that includes them and the Google Web callback described under [hosted MCP](server.md#hosted-mcp-over-http). Merge this into your selected `opencode.json` or `opencode.jsonc`, replacing the HTTPS endpoint with your server. Native OAuth discovers the client and scopes; do not add an OAuth block or fixed identity header. For the installed-directory fallback, replace the Git package reference with the absolute installed directory:
+**Configure without a Grayboard CLI.** The server's `/mcp` endpoint and OpenCode's client-metadata registration are always on; the operator only needs a server build that includes them and its sign-in provider set up ([Configure](server.md#3-configure)). Merge this into your selected `opencode.json` or `opencode.jsonc`, replacing the HTTPS endpoint with your server. Native OAuth discovers the client and scopes; do not add an OAuth block or fixed identity header. For the installed-directory fallback, replace the Git package reference with the absolute installed directory:
 
 ```json
 {

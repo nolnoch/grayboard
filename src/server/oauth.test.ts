@@ -1328,7 +1328,7 @@ test("#881: one authorization reads the auth generation once, and a write betwee
   } finally { counting.close(); counted.db.close(); }
 });
 
-// ── #928 step 3: CLI login through the AS (docs/future/okta-idp.md D8, R3) ──────────────────────────────────
+// ── #928 step 3: CLI login through the AS (docs/server-oauth.md §2, CLI login) ──────────────────────────────────
 
 // An authorize URL as `grayboard login` builds it: grayboard-cli's login scope and no resource (open question 4).
 function cliAuthorization(clientId = CLI_CLIENT_ID, scope = LOGIN_SCOPE, verifier = random(), redirectUri = "http://127.0.0.1:45123/callback") {

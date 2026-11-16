@@ -1,4 +1,4 @@
-// The upstream identity-provider seam (#928, docs/future/okta-idp.md D1). The
+// The upstream identity-provider seam (#928, docs/server-oauth.md §1). The
 // OAuth authorization server (oauth.ts) owns everything that isn't
 // provider-specific: upstream state, the PKCE verifier, the nonce, the binding
 // cookie and the callback route. A provider builds its authorize URL and turns

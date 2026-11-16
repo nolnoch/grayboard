@@ -1,4 +1,4 @@
-// A loopback OpenID Connect issuer for the OIDC provider's tests (#928, docs/future/okta-idp.md D10), in the pattern of
+// A loopback OpenID Connect issuer for the OIDC provider's tests (#928), in the pattern of
 // startFakeAnthropic(): discovery, JWKS, an authorize endpoint that redirects back with a code, a token endpoint that
 // checks client_secret_basic (each half form-decoded), each code's single use and the PKCE verifier, and userinfo.
 // Bad tokens are minted, not stubbed: next() shapes the next ID token, signed with jose.
