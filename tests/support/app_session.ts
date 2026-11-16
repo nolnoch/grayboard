@@ -160,14 +160,19 @@ export class AppSession {
     const toolsOnly = this.opts.push === false && this.opts.hold !== true;
     const id = idAddress(this.key);
     let info: IdentityInfo;
+    // A refusal's rows, written after its rollback, as hosted registration hands them to `later` (#807 P1b-4f).
+    const rows: Array<() => void> = [], later = (w: () => void) => { rows.push(w); };
     try {
       ({ session: this.session, info } = await seed(this.repo, () => {
-        const writesAs = toolsOnly && this.identity !== null ? this.application.hostedWritesAs(this.authed, id, this.identity, true) : null;
-        this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs);
+        const writesAs = toolsOnly && this.identity !== null
+          ? this.application.hostedWritesAs(this.authed, id, this.identity, true, (address, detail) => later(() => this.application.hostedRefused(id, address, detail)), later)
+          : null;
+        this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs, why => later(() => this.application.hostedCollided(this.authed, id, why)));
         if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
         return this.application.hostedSession(this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
       }));
     } catch (e) {
+      if (rows.length) await seed(this.repo, () => { for (const w of rows) this.repo.atomic(w); });
       this.drop(`connect refused: ${(e as Error).message}`);
       throw e;
     }
