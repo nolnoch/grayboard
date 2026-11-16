@@ -7,7 +7,7 @@ import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, LOGIN_S
 import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
-import { userAgent, writeAudit } from "./audit.ts";
+import { userAgent, writeAudit, type AuditAction } from "./audit.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isTrustedOrigin } from "./origin.ts";
@@ -49,6 +49,7 @@ const json = (data: unknown, status = 200, extra: Record<string, string> = {}) =
 const html = (body: string, status = 200, callbackOrigin?: string) => new Response(`<!doctype html><html><meta charset="utf-8"><title>Grayboard authorization</title><body>${body}</body></html>`, {
   status, headers: { ...headers, ...(callbackOrigin ? { "Referrer-Policy": "same-origin" } : {}), "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": `default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'${callbackOrigin ? " " + callbackOrigin : ""}`, "X-Frame-Options": "DENY" },
 });
+const cimdUnavailable = () => json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "30" });
 const refusal = (e: OAuthError) => json({ error: e.error }, e.status, e.error === "invalid_client" ? { "WWW-Authenticate": "Basic realm=\"oauth\"" } : {});
 const redirect = (url: string) => new Response(null, { status: 303, headers: { ...headers, Location: url } });
 
@@ -133,17 +134,19 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
   // redirects that authorize errors follow, and a name the consent page shows.
   const cimdClients = new Set(config.oauthCimdClients ?? [OPENCODE_CLIENT]);
-  // unlisted: the token routes are told instead of a row being written, and
-  // write it with their refusal row while refusalRows has room (F-18), so a
-  // bogus-post flood can't write one each.
-  const resolveClient = async (id: string, unlisted?: () => void) => {
+  // defer: the token routes take the CIMD rows instead of their being written, and
+  // write them with their refusal row while refusalRows has room (F-18, #933), so a
+  // bogus-post flood, or token posts during a listed document's outage, can't write one each.
+  type Row = readonly [action: AuditAction, detail?: Record<string, unknown>];
+  const resolveClient = async (id: string, defer?: (row: Row) => void) => {
+    const row = (r: Row) => { if (defer) defer(r); else writeAudit(repo, r[0], null, null, r[1]); };
     const manual = clients.get(id);
     if (manual) return manual;
-    if (!cimdClients.has(id)) { if (unlisted) unlisted(); else writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" }); return undefined; }
+    if (!cimdClients.has(id)) { row(["oauth.cimd_refused", { reason: "not_allowed" }]); return undefined; }
     let client: OAuthClient | undefined;
     try { client = await cimd.resolve(id); }
-    catch (error) { writeAudit(repo, "oauth.cimd_failed", null, null, { category: error instanceof CimdUnavailable ? "unavailable" : "unexpected" }); throw error; }
-    if (!client || client.redirectUris.some(uri => new URL(uri).origin === base.origin)) writeAudit(repo, "oauth.cimd_refused", null, null);
+    catch (error) { row(["oauth.cimd_failed", { category: error instanceof CimdUnavailable ? "unavailable" : "unexpected" }]); throw error; }
+    if (!client || client.redirectUris.some(uri => new URL(uri).origin === base.origin)) row(["oauth.cimd_refused"]);
     if (client?.redirectUris.some(uri => new URL(uri).origin === base.origin)) return undefined;
     return client;
   };
@@ -252,7 +255,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!r) fail();
     return { h, f: f!, r: r!, c };
   };
-  const clientAuth = async (req: Request, p: URLSearchParams, unlisted: () => void): Promise<OAuthClient> => {
+  const clientAuth = async (req: Request, p: URLSearchParams, defer: (row: Row) => void): Promise<OAuthClient> => {
     if (p.has("client_secret")) fail("invalid_client", 401);
     const auth = req.headers.get("authorization");
     if (auth && auth.length > 8192) fail("invalid_client", 401);
@@ -268,7 +271,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         password = decodeURIComponent(decoded.slice(colon + 1).replace(/\+/g, " "));
       } catch { return fail("invalid_client", 401); }
     } else id = p.get("client_id") ?? "";
-    const c = await resolveClient(id!, unlisted);
+    const c = await resolveClient(id!, defer);
     if (closed) fail("temporarily_unavailable", 503);
     if (!c) fail("invalid_client", 401);
     if (c!.tokenEndpointAuthMethod === "none") {
@@ -487,7 +490,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       // Set once the request presents grant material: before that it is
       // refused uncharged and unaudited, since a cross-site form post can
       // reach that far (#283), and clientAuth's CIMD fetch is never reached.
-      let material = false, unlisted = false;
+      let material = false;
+      const deferred: Row[] = [];
       try {
         sameOrigin(req);
         strictQuery();
@@ -500,7 +504,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (submitted.has("access_token")) fail();
         if (!req.headers.has("authorization") && !(path === "/oauth/token" ? ["code", "refresh_token"] : ["token"]).some(k => submitted.has(k))) fail();
         material = true;
-        const client = await clientAuth(req, submitted, () => { unlisted = true; });
+        const client = await clientAuth(req, submitted, r => { deferred.push(r); });
         if (path === "/oauth/revoke") {
           const p = recognized(submitted, ["token", "token_type_hint"]);
           const token = hashToken(required(p, "token"));
@@ -557,13 +561,18 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),
           ...(client.allowRefresh ? { refresh_token: refresh } : {}) });
       } catch (e) {
-        if (!(e instanceof OAuthError)) throw e;
-        if (!material) return refusal(e);
-        if (e.status < 500) {
-          spend(checks, path);
-          // One decision per refusal, after every await, for both its rows.
-          if (!refusalRows.take("global", { path: routeName(path) }).ok) return refusal(e);
-          if (unlisted) writeAudit(repo, "oauth.cimd_refused", null, null, { reason: "not_allowed" });
+        if (!material) { if (e instanceof OAuthError) return refusal(e); throw e; }
+        const refused = e instanceof OAuthError && e.status < 500;
+        // A listed client's document unavailable is charged as a refusal (#933): retrying posts spend their address.
+        if (refused || e instanceof CimdUnavailable) spend(checks, path);
+        if (refused || deferred.length) {
+          // One decision per refusal, after every await, for all its rows; the CIMD rows go with it.
+          if (!refusalRows.take("global", { path: routeName(path) }).ok) {
+            if (e instanceof OAuthError) return refusal(e);
+            if (e instanceof CimdUnavailable) return cimdUnavailable();
+            throw e;
+          }
+          for (const [action, detail] of deferred) writeAudit(repo, action, null, null, detail);
         }
         throw e;
       }
@@ -594,7 +603,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     async fetch(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
       try { return await route(req, context); }
       catch (e) {
-        if (e instanceof CimdUnavailable) return json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "30" });
+        if (e instanceof CimdUnavailable) return cimdUnavailable();
         if (e instanceof OAuthError) { writeAudit(repo, "oauth.request_refused", null, null, { code: e.error, status: e.status }); return refusal(e); }
         hostedFailure("oauth.request", e);
         writeAudit(repo, "oauth.request_failed", null, null, { category: "unexpected" });
