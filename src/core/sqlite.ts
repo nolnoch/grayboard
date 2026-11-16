@@ -162,13 +162,14 @@ export function routeReads(db: Database, reader: Database): void {
     if (routers.size > STATEMENT_CACHE_SIZE) routers.delete(routers.keys().next().value!);
     return r;
   }) as Database["query"];
-  // db.run without bindings is exec and never reaches db.query: its writes are checked here. Schema SQL is exempt
-  // (startup's, and a test's DDL).
+  // db.run without bindings is exec and never reaches db.query: its writes are checked here, and db.exec's (Bun's
+  // prototype exec is its native run, past both instance overrides). Schema SQL is exempt (startup's, and a test's DDL).
   const run = db.run.bind(db);
   db.run = ((sql: string, ...params: unknown[]) => {
     if (writes.test(sql) && !ddl.test(sql)) writers.get(db)?.check();
     return run(sql, ...(params as never[]));
   }) as Database["run"];
+  db.exec = db.run;
   const close = db.close.bind(db);
   // Reader first: only the last connection to close checkpoints the WAL into the file, and a read-only one can't.
   db.close = ((throwOnError?: boolean) => { try { reader.close(); } finally { close(throwOnError); } }) as Database["close"];

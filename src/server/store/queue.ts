@@ -44,7 +44,7 @@ export class WriteQueue {
   // The server's connection runs it before every top-level transaction and every write (ownWriter in core/sqlite.ts).
   assertMine(): void {
     if (this.mine) return;
-    if (this.busy) throw new Error("top-level transaction while another body holds the write queue: route it through write() (docs/future/postgres-server.md D4)");
+    if (this.busy) throw new Error("write or top-level transaction while another body holds the write queue: route it through write() (docs/future/postgres-server.md D4)");
     throw new Error("write outside the write queue: route it through write() (docs/future/postgres-server.md D4)");
   }
 

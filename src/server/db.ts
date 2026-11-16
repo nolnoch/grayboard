@@ -145,7 +145,7 @@ function queuedNow<T>(db: Database, fn: () => T, committed?: (value: T) => unkno
 
 // A write no caller waits for (an audit row, a closing session's last-seen touch, a lapsed lease's settle; #807 P1b-4b),
 // for code that can't await: a sync finally, a timer, a sync check on the request path. It runs now as part of the
-// caller's open transaction (the queue's holder's, or an unqueued one a caller opened at top level), as its own
+// caller's open transaction (the queue's holder's), as its own
 // transaction when the caller holds the queue outside one, or through the idle queue; when another body holds the
 // queue it waits behind it, and its failure is logged as `what` failed. True when it ran now (its error thrown,
 // `committed` run after the open transaction's commit or at once), false when it waits.

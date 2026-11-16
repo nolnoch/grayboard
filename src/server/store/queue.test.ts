@@ -196,6 +196,7 @@ test("a top-level transaction refuses unless its caller holds the queue; the hol
   // A bare autocommit write, by a statement or by exec (db.run with no bindings); DDL stays open to tests.
   expect(() => db.prepare("DELETE FROM users WHERE email = ?").run("holder@example.com")).toThrow("write outside the write queue");
   expect(() => db.run("DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
+  expect(() => db.exec("DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
   expect(repo.users.findByEmail("holder@example.com")).toBeDefined();
   db.run("CREATE TEMP TRIGGER IF NOT EXISTS t_queue_test AFTER INSERT ON users BEGIN SELECT 1; END");
   expect(repo.users.findByEmail("after@example.com")).toBeUndefined();
@@ -369,6 +370,28 @@ test("an async write body that rejects after an await rolls back, drops its effe
   expect(db.inTransaction).toBe(false);
   expect(queueFor(db).held).toBe(false);
   // The queue goes on: the next body commits.
+  await repo.write(() => repo.users.upsertByEmail("next@example.com", null));
+  expect(repo.users.findByEmail("next@example.com")).toBeDefined();
+});
+
+test("a COMMIT that fails rolls the body back, drops its effects and releases the queue", async () => {
+  const { db, repo } = open();
+  // A deferred foreign key is checked at COMMIT, so the body runs clean and its COMMIT fails.
+  db.run("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)");
+  db.run("CREATE TABLE fk_child (p INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED)");
+  const seen: string[] = [];
+  for (const body of [() => 1, async () => { await Promise.resolve(); return 1; }]) {
+    await expect(repo.write((() => {
+      repo.users.upsertByEmail("orphaned@example.com", null);
+      db.query("INSERT INTO fk_child (p) VALUES (?)").run(99);
+      afterCommit(db, () => { seen.push("effect"); });
+      return body();
+    }) as () => Promise<number>)).rejects.toThrow(/FOREIGN KEY/);
+    expect(repo.users.findByEmail("orphaned@example.com")).toBeUndefined();
+    expect(seen).toEqual([]);
+    expect(db.inTransaction).toBe(false);
+    expect(queueFor(db).held).toBe(false);
+  }
   await repo.write(() => repo.users.upsertByEmail("next@example.com", null));
   expect(repo.users.findByEmail("next@example.com")).toBeDefined();
 });
