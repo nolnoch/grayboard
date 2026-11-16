@@ -39,9 +39,9 @@ beforeEach(async () => {
     repo.teams.addMember(tx, ops.id, eve.id);
     repo.teams.addMember(tx, ops.id, wade.id);
     for (const [email, name] of [["wade@example.com", "be"], ["bob@example.com", "be"], ["bob@example.com", "qa"], ["eve@example.com", "be"]] as const) {
-      repo.aliases.create(person(email, name), email);
+      repo.aliases.create(tx, person(email, name), email);
     }
-    repo.aliases.create(team("eng", "deploy"), "wade@example.com");
+    repo.aliases.create(tx, team("eng", "deploy"), "wade@example.com");
     registerId(db, { id: WADE_ID, principal: "wade@example.com", launcher: false });
   });
   access = serverAccess(repo, db);
@@ -133,13 +133,13 @@ describe("resolveMention", () => {
   });
 
   test("a bare @human is only ever your own", async () => {
-    await seed(repo, () => repo.aliases.create(person("bob@example.com", "human"), "bob@example.com"));
+    await seed(repo, tx => repo.aliases.create(tx, person("bob@example.com", "human"), "bob@example.com"));
     expect(access.resolveMention("human", AUTHOR, OPEN, true)).toBeNull();
     expect(access.resolveMention("human", "bob@example.com/qa", OPEN, true)).toBe("bob@example.com/human");
   });
 
   test("an exact human mention follows DM reach", async () => {
-    await seed(repo, () => repo.aliases.create(person("bob@example.com", "human"), "bob@example.com"));
+    await seed(repo, tx => repo.aliases.create(tx, person("bob@example.com", "human"), "bob@example.com"));
     expect(access.resolveMention("bob@example.com/human", AUTHOR, OPEN, true)).toBe("bob@example.com/human");
     expect(access.resolveMention("bob@example.com/human", "eve@example.com/be", OPEN, true)).toBeNull();
     expect(access.resolveMention("bob@example.com/human", "eng/deploy", OPEN, true)).toBe("bob@example.com/human");
@@ -176,10 +176,10 @@ test("seesAliasMeta: only a principal that may act in the alias's scope", async 
 // are the open directory. No admin exemption, and an unknown address sees none.
 test("seesAlias: a person scope to anyone signed in, a team's to its members and its own aliases", async () => {
   const eveId = idAddress("e".repeat(64));
-  await seed(repo, () => {
+  await seed(repo, tx => {
     registerId(db, { id: eveId, principal: "eve@example.com", launcher: false });
-    repo.aliases.create(team("eng", "build"), "wade@example.com");
-    repo.aliases.create(team("ops", "run"), "eve@example.com");
+    repo.aliases.create(tx, team("eng", "build"), "wade@example.com");
+    repo.aliases.create(tx, team("ops", "run"), "eve@example.com");
   });
   const eng = { scope_kind: "team" as const, scope_ref: "eng" };
   expect(access.seesAlias!(WADE_ID, eng)).toBe(true);

@@ -200,12 +200,29 @@ test("bind budget is per user and spent before an alias is created or a hold tak
   application = createApplication(store.repo, store.db, { helloLimit: { burst: 1, perSec: 0.01 } });
   const a = await connect(alice, "be");
   await expect(a.bind("refused")).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
-  expect(store.repo.aliases.listForScope("person", alice.user_email).map(x => x.name)).toEqual(["be"]);
+  expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email).map(x => x.name)).toEqual(["be"]);
   expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([{ event: "bound" }]);
   expect(store.db.query("SELECT * FROM access_log WHERE action = 'bind.rate_limited'").all()).toHaveLength(1);
   expect((await application.attachHuman(alice, delivery())).session.human).toBe(true);
   // Per user: bob's bind spends his own budget.
   expect((await connect(bob, "fe")).session.holds).toEqual(["bob@example.com/fe"]);
+});
+
+// #807 P1c-13: attachHuman's lazy human alias (the find, then the create) runs on its write's Tx.
+test("#807 P1c-13: attachHuman reads and creates the human alias on its write's Tx", async () => {
+  const repo = store.repo;
+  const checks: string[] = [];
+  const spies = (["find", "create"] as const).map(name => {
+    const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
+    return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push(`${name}:${store.db.inTransaction && r !== repo.read ? "tx" : "pool"}`);
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    await application.attachHuman(alice, delivery());
+  } finally { for (const spy of spies) spy.mockRestore(); }
+  expect(checks).toEqual(["find:tx", "create:tx"]);
 });
 
 test("reserved human authority is a separate trusted method, never a selected client field", async () => {
@@ -274,9 +291,9 @@ test("unbound hosted reads never use the human address and still list and read b
   const principalOf = store.repo.resolver.principalOf.bind(store.repo.resolver);
   store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
-  const unregistered = application.hostedSession(alice, "id:0000000000000", [], null, null, delivery()).session;
+  const unregistered = application.hostedSession(store.repo.read, alice, "id:0000000000000", [], null, null, delivery()).session;
   await seed(store.repo, () => application.hostedRegister(alice, "id:1111111111111", "opencode"));
-  const registered = application.hostedSession(alice, "id:1111111111111", [], null, null, delivery()).session;
+  const registered = application.hostedSession(store.repo.read, alice, "id:1111111111111", [], null, null, delivery()).session;
   for (const session of [unregistered, registered]) {
     expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).toContain("e2e");
     expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).not.toContain("secret");
@@ -286,7 +303,7 @@ test("unbound hosted reads never use the human address and still list and read b
   expect(((await seed(store.repo, tx => application.call(tx, registered, "board_list", {}))) as { name: string }[]).map(b => b.name)).toContain("e2e");
   expect(((await seed(store.repo, tx => application.call(tx, registered, "board_read", { board: "e2e" }))) as { posts: { body: string }[] }).posts.map(p => p.body)).toEqual(["hello"]);
   expect(asked.filter(a => a.endsWith("/human"))).toEqual([]);
-  expect(store.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  expect(store.repo.aliases.find(store.repo.read, "alice@example.com/human")).toBeUndefined();
   expect(store.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE handle LIKE '%/human'").get()).toEqual({ n: 0 });
   application.close(owner);
   application.close(bobBe);
@@ -296,10 +313,10 @@ test("a hosted session whose hello facts throw is left unregistered (#385 item 9
   const pushed: unknown[] = [];
   const teams = spyOn(store.repo.teams, "listForUser").mockImplementation(() => { throw new Error("db gone"); });
   try {
-    expect(() => application.hostedSession(alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).toThrow("db gone");
+    expect(() => application.hostedSession(store.repo.read, alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).toThrow("db gone");
   } finally { teams.mockRestore(); }
   // An unheld "be": a DM to it is pushed only to a session the hub routes it to.
-  await seed(store.repo, () => store.repo.aliases.create({ scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com"));
+  await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com"));
   const sender = await connect(alice, "sender");
   await sender.send("alice@example.com/be", "no route left behind");
   expect(pushed).toEqual([]);
@@ -316,10 +333,10 @@ test("unbound hosted sessions cannot use named operations or persist synthetic h
       writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null,
     });
   });
-  const { session, info } = application.hostedSession(alice, "hosted-unbound", [], null, null, delivery());
+  const { session, info } = application.hostedSession(store.repo.read, alice, "hosted-unbound", [], null, null, delivery());
   expect(session.writerId).toBeUndefined();
   expect(info.candidates).toEqual([]);
-  expect(store.repo.aliases.listForScope("person", alice.user_email)).toEqual([]);
+  expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email)).toEqual([]);
   expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
   const operations = [
     () => seed(store.repo, tx => application.send(tx, session, "be", "no")),
@@ -350,12 +367,12 @@ test("hold sessions block binding and candidates without push or online presence
   const owner = await connect(alice, "held", { push: false, hold: true, key: "hold-secret" });
   await owner.call("peer_status", { text: "working" });
   const tools = await connect(alice, "held", { push: false });
-  const observer = application.hostedSession(alice, "hosted-observer", [], null, null, delivery()).session;
+  const observer = application.hostedSession(store.repo.read, alice, "hosted-observer", [], null, null, delivery()).session;
   expect(((await seed(store.repo, tx => application.call(tx, observer, "peer_list", { include_offline: true }))) as { peers: unknown[] }).peers).toMatchObject([{ online: false }]);
   expect(tools.session.toolsOnly).toBe(true);
   expect(tools.session.holds).toEqual([]);
   await expect(connect(alice, "held")).rejects.toMatchObject({ code: "alias_held", extra: { holder: expect.stringContaining(owner.id) } });
-  expect(application.hostedCandidates(alice, null)).toEqual([]);
+  expect(application.hostedCandidates(store.repo.read, alice, null)).toEqual([]);
   const sender = await connect(bob, "sender");
   expect((await sender.send("alice@example.com/held", "queued")).delivered_now).toBe(false);
   await owner.none(() => true);
@@ -368,7 +385,7 @@ test("hold sessions block binding and candidates without push or online presence
 
 test("unknown and reserved names are audited without creation; trusted human gets binding attribution", async () => {
   await expect(connect(alice, "typo", { bind: { create: false }, key: "typo-secret" })).rejects.toMatchObject({ code: "identity_unknown", extra: { known: [] } });
-  expect(store.repo.aliases.listForScope("person", alice.user_email)).toEqual([]);
+  expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email)).toEqual([]);
   await expect(connect(alice, "human", { key: "human-secret" })).rejects.toMatchObject({ code: "forbidden" });
   const human = (await application.attachHuman(alice, delivery())).session;
   // The bridge's human has no session ID (#284 S16); it logs as `human`.
@@ -430,7 +447,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
   // A close leaves its hold (#451).
   expect(store.db.query("SELECT id FROM alias_holds WHERE address = ?").get(first.session.identityFull)).toEqual({ id: first.id });
   await expect(connect(bob, "other", { key: "first-session" })).rejects.toMatchObject({ code: "id_collision" });
-  expect(store.repo.aliases.find(`${bob.user_email}/other`)).toBeUndefined();
+  expect(store.repo.aliases.find(store.repo.read, `${bob.user_email}/other`)).toBeUndefined();
 });
 
 test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
@@ -456,7 +473,7 @@ test("#807: attachHuman while another body holds the write queue waits, then bin
   const attached = application.attachHuman(alice, delivery());
   for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
   expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([]);
-  expect(store.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  expect(store.repo.aliases.find(store.repo.read, "alice@example.com/human")).toBeUndefined();
   release();
   await done;
   expect((await attached).session.human).toBe(true);

@@ -54,7 +54,7 @@ async function attachment(token: string, method = "POST", id?: number, alias = f
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: standard grant uploads, MCP binds, participant downloads, own unsent releases`, async () => {
   const alice = await issue(), bob = await issue("bob@example.com"), outsider = await issue("outsider@example.com");
   const [a, b] = await Promise.all([connect(alice.token, version), connect(bob.token, version)]);
-  await seed(app.repo, () => app.repo.aliases.create({ scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email));
+  await seed(app.repo, tx => app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: outsider.authed.user_email, name: "be" }, outsider.authed.user_email));
   expect((await attachment(outsider.token, "GET", 1)).status).toBe(403);
   await connect(outsider.token, version);
   const info = value(await a.callTool({ name: "whoami", arguments: {} }));
@@ -97,8 +97,8 @@ test("private board visibility is checked again after reading the blob", async (
     app.repo.teams.addMember(tx, team.id, alice.authed.user_id);
     app.repo.teams.addMember(tx, team.id, bob.authed.user_id);
     ensureTeamBoard(app.db, team, "alice@example.com");
-    onTeamJoined(app.db, app.repo, team, "alice@example.com");
-    onTeamJoined(app.db, app.repo, team, "bob@example.com");
+    onTeamJoined(app.db, app.repo, tx, team, "alice@example.com");
+    onTeamJoined(app.db, app.repo, tx, team, "bob@example.com");
     return team;
   });
   const id = (await (await attachment(alice.token)).json() as { id: number }).id;
@@ -113,7 +113,7 @@ test("private board visibility is checked again after reading the blob", async (
   // The download holds no write: its blob read waits outside the queue, so this body runs now.
   await seed(app.repo, (tx) => {
     app.repo.teams.removeMember(tx, team.id, bob.authed.user_id);
-    onTeamLeft(app.db, app.repo, team, "bob@example.com");
+    onTeamLeft(app.db, app.repo, tx, team, "bob@example.com");
   });
   resume();
   const response = await reading;

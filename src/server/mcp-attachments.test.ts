@@ -46,7 +46,7 @@ beforeEach(async () => {
   store = openDatabase(join(dir, "bus.db"), { blobDir: dir });
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: `${origin}:443/hosted`, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => now });
   issued = await issueOAuth(store.repo, resource, "alice@example.com", ["grayboard:tools"], now, OPENCODE_CLIENT);
-  await seed(store.repo, () => store.repo.aliases.create({ scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email));
+  await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email));
   gate = new UploadGate(1024, 1024);
   application = createApplication(store.repo, store.db);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r) => oauth.isAuthorized(p, r) });
@@ -85,7 +85,7 @@ test("precise routing, canonical challenge, strict query and existing identity o
     expect((await send(request("POST", `/mcp/attachments?${query}`))).status).toBe(query.includes("access_token") ? 401 : query.startsWith("identity=human&") || query.startsWith("identity=alice%40") ? 403 : 400);
   }
   expect((await send(request("POST", "/mcp/attachments?identity=missing&filename=x.txt"))).status).toBe(403);
-  expect(store.repo.aliases.find(`${issued.authed.user_email}/missing`)).toBeUndefined();
+  expect(store.repo.aliases.find(store.repo.read, `${issued.authed.user_email}/missing`)).toBeUndefined();
   for (const id of ["0", "-1", "1e2", "01", "9007199254740992", "%31"]) expect((await send(request("GET", `/mcp/attachments/${id}?identity=be`))).status).toBe(400);
   expect(count()).toBe(0);
 });
@@ -237,7 +237,7 @@ for (const boundary of ["quota", "body", "store"] as const) for (const invalidat
   if (invalidation === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   if (invalidation === "expire") now += 60 * 60 * 1000;
   if (invalidation === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
-  if (invalidation === "identity") await seed(store.repo, () => store.repo.aliases.remove(`${issued.authed.user_email}/be`));
+  if (invalidation === "identity") await seed(store.repo, tx => store.repo.aliases.remove(tx, `${issued.authed.user_email}/be`));
   resume.resolve(); release();
   const response = await operation;
   expect(response.status).toBe(invalidation === "identity" ? 404 : 401);
@@ -273,7 +273,7 @@ for (const change of ["revoke", "expire", "disable", "identity", "retention", "f
   if (change === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, issued.tokens.accessHash, issued.binding.clientId, now));
   if (change === "expire") now += 60 * 60 * 1000;
   if (change === "disable") await seed(store.repo, tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
-  if (change === "identity") await seed(store.repo, () => store.repo.aliases.remove(`${issued.authed.user_email}/be`));
+  if (change === "identity") await seed(store.repo, tx => store.repo.aliases.remove(tx, `${issued.authed.user_email}/be`));
   if (change === "retention") await seed(store.repo, () => store.db.query("DELETE FROM attachments WHERE id = ?").run(id));
   resume.resolve();
   const response = await operation;

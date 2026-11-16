@@ -245,15 +245,15 @@ export interface Repo {
   // Names in scopes, keyed by address.
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
-    create(scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
-    find(address: string): Alias | undefined;
-    listForScope(kind: ScopeKind, ref: string): Alias[];
+    create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
+    find(r: Read, address: string): Alias | undefined;
+    listForScope(r: Read, kind: ScopeKind, ref: string): Alias[];
     // The scope's names less the Slack link's human, for the cap (#347).
-    countForScope(kind: ScopeKind, ref: string): number;
+    countForScope(r: Read, kind: ScopeKind, ref: string): number;
     // Every scope's alias of this name.
-    findAllByName(name: string): Alias[];
+    findAllByName(r: Read, name: string): Alias[];
     // Also deletes the alias's read points.
-    remove(address: string): void;
+    remove(tx: Tx, address: string): void;
   };
   teams: {
     // Inserts the team's principal in the same transaction; throws
@@ -1098,29 +1098,32 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     aliases: {
-      create({ scope_kind, scope_ref, name }, createdBy) {
+      create(tx, scope, createdBy) {
+        const db = sqliteOf(tx);
+        const { scope_kind, scope_ref, name } = scope;
         return db.query<Alias, [string, string, string, string, string, number]>(
           `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
            VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
         ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;
       },
-      find(address) {
-        return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
+      find(r, address) {
+        return sqliteOf(r).query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
       },
-      listForScope(kind, ref) {
-        return db.query<Alias, [string, string]>(
+      listForScope(r, kind, ref) {
+        return sqliteOf(r).query<Alias, [string, string]>(
           `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
         ).all(ref, kind);
       },
-      countForScope(kind, ref) {
-        return db.query<{ n: number }, [string, string, string]>(
+      countForScope(r, kind, ref) {
+        return sqliteOf(r).query<{ n: number }, [string, string, string]>(
           `SELECT COUNT(*) AS n FROM aliases WHERE scope_ref = ? AND scope_kind = ? AND name != ?`,
         ).get(ref, kind, HUMAN_NAME)!.n;
       },
-      findAllByName(name) {
-        return db.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
+      findAllByName(r, name) {
+        return sqliteOf(r).query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
       },
-      remove(address) {
+      remove(tx, address) {
+        const db = sqliteOf(tx);
         db.transaction(() => {
           db.run("DELETE FROM mailbox_cursors WHERE address = ?", [address]);
           db.run("DELETE FROM aliases WHERE address = ?", [address]);

@@ -6,7 +6,7 @@
 // fallback, refusals and their audit rows (kept by a hosted call since #452),
 // and result-return through the pending/promise machinery.
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -285,6 +285,35 @@ test("server: a team alias doesn't carry delegation to a teammate's launcher", a
   } finally {
     await srv.stop();
   }
+}, 30_000);
+
+// #807 P1c-13: a delegate's peer resolution (a bare name in or outside the sender's scope) and its hidden-team-alias
+// check read aliases on the request's Tx, not the pool.
+test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async () => {
+  const srv = serve();
+  const repo = srv.app.repo;
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const spies = (["find", "findAllByName"] as const).map((name) => {
+    const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
+    return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (new Error().stack?.includes("handleDelegate")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await srv.login("alice@example.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    await launcher(srv, alice, "eng/builder");
+    const sim = await srv.connected(alice, "eng/sim");
+    await sim.delegate({ persona: "p", task: "t", to: "builder" });
+    await sim.delegate({ persona: "p", task: "t", to: "eng/builder" });
+    expect((await refusal(sim.delegate({ persona: "p", task: "t", to: "nobody" }))).code).toBe("not_found");
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+    await srv.stop();
+  }
+  expect(checks.map((c) => c.op)).toEqual(expect.arrayContaining(["find", "findAllByName"]));
+  expect(checks.filter((c) => !c.inTxn || c.handle !== "tx")).toEqual([]);
 }, 30_000);
 
 // #393 1 (docs/vision.md principle 11): a repeat inside the dedup window

@@ -99,15 +99,15 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
         return why ? null : t.address;
       }
       const reach = (h: string) => canSee(h, board) && reaches(repo, humanReach, author, h);
-      if (t.kind === "alias") return repo.aliases.find(t.address) && reach(t.address) ? t.address : null;
+      if (t.kind === "alias") return repo.aliases.find(repo.read, t.address) && reach(t.address) ? t.address : null;
       const scope = ownScope(repo.resolver, author);
       const own = scope ? `${scope}/${t.name}` : null;
-      if (own && repo.aliases.find(own)) return own;
+      if (own && repo.aliases.find(repo.read, own)) return own;
       if (t.name === HUMAN_NAME) return null;
       if (!strict) return null;
       // Only names the posting session may see exist (#348): a team's stay
       // inside the team, so a hidden one refuses nothing.
-      const roster = repo.aliases.findAllByName(t.name).filter((a) => seesAlias(viewer, a)).map((i) => i.address).filter(reach);
+      const roster = repo.aliases.findAllByName(repo.read, t.name).filter((a) => seesAlias(viewer, a)).map((i) => i.address).filter(reach);
       if (roster.length) throw new CoreError(`@${t.name} isn't in your scope; name it in full: ${roster.join(", ")}`);
       return null;
     },

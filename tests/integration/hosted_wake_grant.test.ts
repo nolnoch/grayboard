@@ -178,7 +178,7 @@ test("the send result: an offline person alias says wakes:false; a team alias's 
   // Bob holds the team alias; Carol, outside the team, mustn't learn whose it is, nor that it exists: her mail
   // to it, held or not, is refused as to a name nobody has (#1014), so no send result can carry a wake note.
   await srv.hosted(B, "eng/deploy");
-  await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "idle" }, A));
+  await seed(srv.app.repo, tx => srv.app.repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "idle" }, A));
   for (const to of ["eng/deploy", "eng/idle"]) {
     await expect(cfe.call("dm_send", { to, body: "deploy?" })).rejects.toThrow(`identity "${to}" not found`);
   }

@@ -9,6 +9,7 @@ import {
 } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
 import type { Repo, Team } from "./db.ts";
+import type { Read } from "./store/tx.ts";
 
 export const teamScope = (name: string) => `team:${name}`;
 
@@ -22,13 +23,14 @@ function follow(db: CoreDb, handle: string, team: Team): void {
   if (!isSubscribed(db, handle, team.name)) subscribe(db, handle, team.name, "digest");
 }
 
-export function onTeamJoined(db: CoreDb, repo: Repo, team: Team, email: string): void {
+// `r`: the team route's write body, the one that changed the membership.
+export function onTeamJoined(db: CoreDb, repo: Repo, r: Read, team: Team, email: string): void {
   ensureTeamBoard(db, team, email);
-  for (const alias of repo.aliases.listForScope("person", email)) follow(db, alias.address, team);
+  for (const alias of repo.aliases.listForScope(r, "person", email)) follow(db, alias.address, team);
 }
 
-export function onTeamLeft(db: CoreDb, repo: Repo, team: Team, email: string): void {
-  for (const alias of repo.aliases.listForScope("person", email)) unsubscribeScope(db, alias.address, teamScope(team.name));
+export function onTeamLeft(db: CoreDb, repo: Repo, r: Read, team: Team, email: string): void {
+  for (const alias of repo.aliases.listForScope(r, "person", email)) unsubscribeScope(db, alias.address, teamScope(team.name));
 }
 
 // A person's alias follows each of its user's teams; a team's alias follows

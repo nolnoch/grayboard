@@ -1,4 +1,5 @@
 import type { Repo } from "./db.ts";
+import type { Read } from "./store/tx.ts";
 import type { ScopeKind } from "../core/addresses.ts";
 
 // Names one scope (a user's, a team's) may hold (#347). Every create path a
@@ -12,9 +13,9 @@ export const ALIAS_SCOPE_CAP = 500;
 
 // The refusal for a new name in a scope at its cap, or null. Callers check
 // and create with no await between, so two creates can't both pass at the
-// last slot.
-export function aliasCapRefusal(repo: Repo, scope: { scope_kind: ScopeKind; scope_ref: string }, cap: number): string | null {
-  const n = repo.aliases.countForScope(scope.scope_kind, scope.scope_ref);
+// last slot. `r`: the body's Tx the create runs in, so the count sees its own creates.
+export function aliasCapRefusal(repo: Repo, r: Read, scope: { scope_kind: ScopeKind; scope_ref: string }, cap: number): string | null {
+  const n = repo.aliases.countForScope(r, scope.scope_kind, scope.scope_ref);
   if (n < cap) return null;
   const free = scope.scope_kind === "team"
     ? `a team owner frees one with grayboard team delete-alias ${scope.scope_ref} <name>`
