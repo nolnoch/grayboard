@@ -1373,7 +1373,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
-    mailOn: (tx) => mailPort(sqliteOf(tx)),
+    // Each method resolves the handle when called, so a port kept past its body is refused, as a kept Tx is.
+    mailOn: (tx) => {
+      sqliteOf(tx);
+      return {
+        unread: (id) => mailPort(sqliteOf(tx)).unread(id),
+        bounce: (from, to, parentId, body, now) => mailPort(sqliteOf(tx)).bounce(from, to, parentId, body, now),
+        dropReader: (id) => mailPort(sqliteOf(tx)).dropReader(id),
+      };
+    },
 
     cursors: {
       get(r, address, streamType, streamRef) {
