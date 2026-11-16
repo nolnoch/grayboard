@@ -5,7 +5,7 @@
 |---|---|
 | HTTPS to the host fails or has a certificate error | DNS doesn't point at the host, or port 80 is closed; see `journalctl -u caddy` |
 | `grayboard-server` won't start | A required env var is missing or invalid, an OAuth client registration is invalid, `GRAYBOARD_PUBLIC_URL` isn't HTTPS (loopback HTTP is allowed only with dev auth), only half the MCP Google pair is set, or dev auth is set alongside either Google client secret; see `journalctl -u grayboard` |
-| Google shows `redirect_uri_mismatch` | For `grayboard login`, use a *Desktop app* client in `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`. For hosted MCP, use a *Web application* pair in `GRAYBOARD_MCP_GOOGLE_CLIENT_ID` and `GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET` and register the exact public `/oauth/google/callback` URL, including any configured prefix; see [hosted MCP](server.md#hosted-mcp-over-http) |
+| Google shows `redirect_uri_mismatch` | The server's Google client must be a *Web application* whose *Authorized redirect URI* is exactly `GRAYBOARD_PUBLIC_URL` followed by `/oauth/google/callback`, including any path prefix; it's in `GRAYBOARD_MCP_GOOGLE_CLIENT_ID`/`_SECRET` when those are set, else `GOOGLE_OAUTH_CLIENT_ID`/`_SECRET`. `grayboard login` and every agent sign in through it; see [Configure](server.md#3-configure) |
 | Google shows "access blocked" or the app isn't available | *External* audience in *Testing* without you listed as a test user, or *Internal* with the Cloud project outside your Workspace org |
 | `login` returns 403 after Google succeeds | The account isn't on `GRAYBOARD_ORG_DOMAIN` (`hd` mismatch), or its email isn't verified |
 | `login --dev` returns 404 | Dev auth is off (`GRAYBOARD_DEV_AUTH=1` not set) |

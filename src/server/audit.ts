@@ -75,6 +75,7 @@ export type AuditAction =
   | "oauth.request_refused"
   | "oauth.revoke_requested"
   | "oauth.revoked"
+  | "oauth.session_issued"
   | "oauth.user_refused"
   | "hosted.rate_limit_ended"
   | "hosted.rate_limited"

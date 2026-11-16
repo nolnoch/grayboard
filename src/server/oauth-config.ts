@@ -2,6 +2,10 @@ import { SESSION_FACT_MAX } from "../shared/protocol.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
 
 export const OAUTH_SCOPES = ["grayboard:delivery", "grayboard:tools"] as const;
+// The scope that mints a CLI session (#928 D8, R3). Never a member of OAUTH_SCOPES: every built-in, every CIMD
+// client, operator validation, scopes_supported and the 401 hint are drawn from that list, so adding it there
+// would hand session minting to all of them. Only CLI_CLIENT's scope list holds it.
+export const LOGIN_SCOPE = "grayboard:login";
 
 export type OAuthClient = {
   clientId: string;
@@ -37,6 +41,14 @@ export const BUILTIN_CLIENT_IDS: readonly string[] = BUILTINS.map(b => b.clientI
 export const BUILTIN_CLIENTS: readonly OAuthClient[] = BUILTINS.map(({ clientId, name }) => ({
   clientId, name, redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"], scopes: [...OAUTH_SCOPES], tokenEndpointAuthMethod: "none", allowRefresh: true,
 }));
+// `grayboard login` (#928 D8): its own constant, not a BUILTINS row, which would get both scopes, refresh and the
+// generic source key. Public, the built-ins' loopback redirects, PKCE, no refresh, exactly the login scope, no
+// source key and no harness. Operator config can't reuse its ID.
+export const CLI_CLIENT_ID = "grayboard-cli";
+export const CLI_CLIENT: OAuthClient = {
+  clientId: CLI_CLIENT_ID, name: "Grayboard for the CLI", redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"],
+  scopes: [LOGIN_SCOPE], tokenEndpointAuthMethod: "none", allowRefresh: false,
+};
 export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAuthClient>): string | null {
   if (clientId === OPENCODE_CLIENT) return OPENCODE_SESSION_META;
   if (builtinHarness.has(clientId)) return GRAYBOARD_SESSION_META;
@@ -108,7 +120,7 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
       !["none", "client_secret_basic"].includes(String(v.tokenEndpointAuthMethod)) ||
       (v.allowRefresh !== undefined && typeof v.allowRefresh !== "boolean") ||
       (v.sessionSource !== undefined && typeof v.sessionSource !== "boolean")) throw new Error("invalid OAuth client configuration");
-    if (builtinHarness.has(v.clientId)) throw new Error(`OAuth client ID ${v.clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
+    if (builtinHarness.has(v.clientId) || v.clientId === CLI_CLIENT_ID) throw new Error(`OAuth client ID ${v.clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     // CIMD resolves only https: identifiers and grants keep only the client ID string, so an
     // https: ID never maps the generic key: a grant consented under a metadata document can't
     // turn write-capable because the operator later registers the same ID.

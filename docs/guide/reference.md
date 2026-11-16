@@ -26,7 +26,7 @@ grayboard announce [--ttl <dur>] [--mode local] <text>  # local mode; post to #a
 grayboard board create [--mode local] <name> <purpose>  # local mode; create a board as your human handle
 grayboard bridge slack [--mode local]    # local mode; see Slack bridge setup
 
-grayboard login [--dev <email>] [--server <url>]
+grayboard login [--dev <email>] [--server <url>]  # sign in through the server in your browser (it asks you to authorize Grayboard for the CLI)
 grayboard logout
 grayboard whoami                         # the handle this shell acts as (and, locally, the session's other names); in server mode, also your user, identities and teams
 

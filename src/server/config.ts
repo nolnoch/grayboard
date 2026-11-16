@@ -91,8 +91,12 @@ export function loadConfig(): Config {
     throw new Error(`GRAYBOARD_DEV_AUTH=1 needs a loopback GRAYBOARD_PUBLIC_URL (localhost, 127.0.0.1 or [::1]), not ${publicUrl}: dev sign-in lets anyone who reaches the server act as anyone`);
   }
 
-  const googleClientId     = devAuth ? (process.env.GOOGLE_OAUTH_CLIENT_ID ?? "dev") : requireEnv("GOOGLE_OAUTH_CLIENT_ID");
-  const googleClientSecret = devAuth ? "" : requireEnv("GOOGLE_OAUTH_CLIENT_SECRET");
+  // One Google client pair (#928 D6, D8): the MCP pair when set, else the primary, which is then required. A
+  // deployment with a Desktop primary pair and a Web MCP pair runs on the Web pair; its Desktop pair goes unused.
+  const mcpGoogle          = mcpGoogleConfig();
+  const primaryRequired    = !devAuth && !mcpGoogle.mcpGoogle;
+  const googleClientId     = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_ID") : (process.env.GOOGLE_OAUTH_CLIENT_ID ?? (devAuth ? "dev" : ""));
+  const googleClientSecret = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_SECRET") : devAuth ? "" : (process.env.GOOGLE_OAUTH_CLIENT_SECRET ?? "");
   const orgDomain          = devAuth ? (process.env.GRAYBOARD_ORG_DOMAIN ?? "example.com") : requireEnv("GRAYBOARD_ORG_DOMAIN");
 
   return {
@@ -101,7 +105,7 @@ export function loadConfig(): Config {
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
-    ...mcpGoogleConfig(),
+    ...mcpGoogle,
     orgDomain,
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),

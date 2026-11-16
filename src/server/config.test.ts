@@ -114,17 +114,22 @@ describe("loadConfig", () => {
     }
   });
 
-  test("MCP Google override is optional and never replaces the retained primary pair", () => {
+  // #928 D6/D8: one pair. The primary is required only when the MCP pair is absent; with both set (a Desktop
+  // primary and a Web MCP pair) the MCP pair is the AS's and the primary goes unused.
+  test("the primary Google pair is required only without the MCP pair", () => {
     primary();
     expect(loadConfig().mcpGoogle).toBeUndefined();
-    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = "web-client";
-    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = "web-secret";
-    expect(loadConfig()).toMatchObject({ googleClientId: "desktop-client", googleClientSecret: "desktop-secret", mcpGoogle: { clientId: "web-client", clientSecret: "web-secret" } });
     for (const name of ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]) {
       delete process.env[name];
       expect(() => loadConfig()).toThrow(`Required env var ${name} is not set`);
       primary();
     }
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_ID = "web-client";
+    process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET = "web-secret";
+    expect(loadConfig()).toMatchObject({ googleClientId: "desktop-client", googleClientSecret: "desktop-secret", mcpGoogle: { clientId: "web-client", clientSecret: "web-secret" } });
+    delete process.env.GOOGLE_OAUTH_CLIENT_ID;
+    delete process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+    expect(loadConfig()).toMatchObject({ googleClientId: "", googleClientSecret: "", mcpGoogle: { clientId: "web-client", clientSecret: "web-secret" } });
   });
 
   test("half, empty and malformed MCP Google pairs fail without exposing credentials", () => {

@@ -1,6 +1,5 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
-import type { Config } from "./config.ts";
-import type { IdentityProvider } from "./idp.ts";
+import { DomainRefused, type IdentityProvider } from "./idp.ts";
 
 const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_ISSUERS  = ["accounts.google.com", "https://accounts.google.com"];
@@ -18,7 +17,7 @@ export async function verifyGoogleIdToken(
   idToken: string,
   clientId: string,
   allowedDomain: string,
-  options: { expectedNonce?: string; keyResolver?: JWTVerifyGetKey } = {},
+  options: { expectedNonce: string; keyResolver?: JWTVerifyGetKey },
 ): Promise<GoogleIdentity> {
   const { payload } = await jwtVerify(idToken, options.keyResolver ?? googleJwks, {
     issuer: GOOGLE_ISSUERS,
@@ -30,12 +29,15 @@ export async function verifyGoogleIdToken(
   if (payload["hd"] !== allowedDomain) {
     throw new Error(`account must be from @${allowedDomain}`);
   }
-  if (options.expectedNonce !== undefined && payload["nonce"] !== options.expectedNonce) throw new Error("invalid Google nonce");
+  // Required (#928 D1): every caller sent one on the authorize URL.
+  if (typeof payload["nonce"] !== "string" || !options.expectedNonce || payload["nonce"] !== options.expectedNonce) throw new Error("invalid Google nonce");
   if (typeof payload["email"] !== "string" || !payload["email"].trim()) throw new Error("invalid Google email");
   if (payload["email_verified"] !== true) {
     throw new Error("email is not verified");
   }
   const email = (payload["email"] as string).toLowerCase();
+  // `hd` is the Workspace's primary domain; the email is the bus address, so its domain is checked too (D5).
+  if (email.split("@")[1] !== allowedDomain) throw new DomainRefused(`account must be from @${allowedDomain}`);
   const displayName = typeof payload["name"] === "string" ? payload["name"] : null;
   return { email, displayName, subject: payload.sub };
 }
@@ -47,7 +49,7 @@ export async function exchangeGoogleCode(
   clientId: string,
   clientSecret: string,
   allowedDomain: string,
-  expectedNonce?: string,
+  expectedNonce: string,
 ): Promise<GoogleIdentity> {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -71,8 +73,8 @@ export async function exchangeGoogleCode(
 }
 
 // Google behind the AS: the client pair the AS selected (mcpGoogle, else the
-// primary), a nonce on every exchange, `hd` on the authorize URL. The AS
-// re-checks the email's domain after the exchange (oauth.domain_refused).
+// primary), a nonce on every exchange, `hd` on the authorize URL. The exchange
+// refuses an email outside the org domain (DomainRefused).
 export function googleProvider(google: { clientId: string; clientSecret: string; orgDomain: string }): IdentityProvider {
   return {
     id: "google",
@@ -90,14 +92,4 @@ export function googleProvider(google: { clientId: string; clientSecret: string;
       return { issuer: GOOGLE_ISSUER, ...identity };
     },
   };
-}
-
-// The CLI's direct exchange (/api/auth/exchange): the primary client pair, no
-// nonce (the CLI builds its own authorize URL) and `hd` alone. It isn't an
-// IdentityProvider; #928 step 3 deletes it with the route.
-export function exchangeGoogleCliCode(
-  config: Pick<Config, "googleClientId" | "googleClientSecret" | "orgDomain">,
-  input: { code: string; verifier: string; redirectUri: string },
-): Promise<GoogleIdentity> {
-  return exchangeGoogleCode(input.code, input.verifier, input.redirectUri, config.googleClientId, config.googleClientSecret, config.orgDomain);
 }

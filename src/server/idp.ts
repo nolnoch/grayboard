@@ -27,6 +27,10 @@ export type IdentityProvider = {
   exchange(i: ExchangeInput): Promise<UpstreamIdentity>;
 };
 
+// A provider's refusal of a verified identity whose email is outside the org's domains (D5). The AS
+// audits it as oauth.domain_refused rather than as a failed exchange.
+export class DomainRefused extends Error {}
+
 export const callbackPath = (p: Pick<IdentityProvider, "id">) => `/oauth/${p.id}/callback`;
 
 // The providers a server signs in with when OAuthOptions.providers doesn't inject any: Google, with the client pair
