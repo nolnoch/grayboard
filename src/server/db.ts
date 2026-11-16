@@ -227,14 +227,14 @@ export interface Repo {
     setDisabled(userId: number, disabled: boolean): void;
   };
   sessions: {
-    create(userId: number, tokenHash: string, label: string | null): Session;
-    findByTokenHash(hash: string): Session | undefined;
-    findById(sessionId: number): Session | undefined;
-    revoke(sessionId: number): void;
-    revokeAllForUser(userId: number): void;
+    create(tx: Tx, userId: number, tokenHash: string, label: string | null): Session;
+    findByTokenHash(r: Read, hash: string): Session | undefined;
+    findById(r: Read, sessionId: number): Session | undefined;
+    revoke(tx: Tx, sessionId: number): void;
+    revokeAllForUser(tx: Tx, userId: number): void;
     // Revokes every live dev-auth session (`grayboard login --dev`); returns how many.
-    revokeDev(): number;
-    touch(sessionId: number, now: number): void;
+    revokeDev(tx: Tx): number;
+    touch(tx: Tx, sessionId: number, now: number): void;
   };
   principals: {
     findByName(name: string): PrincipalRow | undefined;
@@ -1035,24 +1035,25 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     sessions: {
-      create(userId, tokenHash, label) {
-        return insertSession(db, userId, tokenHash, label, clock());
+      create(tx, userId, tokenHash, label) {
+        return insertSession(sqliteOf(tx), userId, tokenHash, label, clock());
       },
-      findByTokenHash(hash) {
+      findByTokenHash(r, hash) {
         return (
-          db.query<Session, [string]>(
+          sqliteOf(r).query<Session, [string]>(
             "SELECT * FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
           ).get(hash) ?? undefined
         );
       },
       // By row, revoked ones included: the caller reads revoked_at (#351).
-      findById(sessionId) {
-        return db.query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(sessionId) ?? undefined;
+      findById(r, sessionId) {
+        return sqliteOf(r).query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(sessionId) ?? undefined;
       },
-      revoke(sessionId) {
-        db.run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [clock(), sessionId]);
+      revoke(tx, sessionId) {
+        sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [clock(), sessionId]);
       },
-      revokeAllForUser(userId) {
+      revokeAllForUser(tx, userId) {
+        const db = sqliteOf(tx);
         db.transaction(() => {
           const now = clock();
           db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
@@ -1062,11 +1063,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         }).immediate();
         changed(null);
       },
-      revokeDev() {
-        return db.run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
+      revokeDev(tx) {
+        return sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
       },
-      touch(sessionId, now) {
-        db.run("UPDATE sessions SET last_used_at = ? WHERE id = ?", [now, sessionId]);
+      touch(tx, sessionId, now) {
+        sqliteOf(tx).run("UPDATE sessions SET last_used_at = ? WHERE id = ?", [now, sessionId]);
       },
     },
 

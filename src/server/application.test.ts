@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createApplication, type DeliverySink } from "./application.ts";
 import { openDatabase } from "./db.ts";
 import type { AuthedUser } from "./auth.ts";
+import type { Tx } from "./store/tx.ts";
 import { writeAudit } from "./audit.ts";
 import { tokenSessionIn } from "../../tests/support/token_session.ts";
 import { seed } from "../../tests/support/seed.ts";
@@ -31,12 +32,12 @@ beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-application-"));
   store = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(store.repo, store.db);
-  const user = (email: string): AuthedUser => {
+  const user = (tx: Tx, email: string): AuthedUser => {
     const u = store.repo.users.upsertByEmail(email, null);
     // A session needs a live sign-in (#351).
-    return tokenSessionIn(store.repo, { user_id: u.id, user_email: u.email });
+    return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email });
   };
-  [alice, bob] = await seed(store.repo, () => [user("alice@example.com"), user("bob@example.com")]);
+  [alice, bob] = await seed(store.repo, tx => [user(tx, "alice@example.com"), user(tx, "bob@example.com")]);
 });
 afterEach(() => {
   application.stopExpiry();
@@ -433,7 +434,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
 });
 
 test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
-  const carol = await seed(store.repo, () => { const u = store.repo.users.upsertByEmail("carol@example.com", null); return tokenSessionIn(store.repo, { user_id: u.id, user_email: u.email }); });
+  const carol = await seed(store.repo, tx => { const u = store.repo.users.upsertByEmail("carol@example.com", null); return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email }); });
   const a = await connect(alice, "be");
   const b = await connect(bob, "fe");
   await connect(carol, "sim");

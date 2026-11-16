@@ -48,9 +48,9 @@ describe("verifySessionToken", () => {
 
   test("valid token returns authed user", async () => {
     const raw = mintToken();
-    await seed(repo, () => {
+    await seed(repo, tx => {
       const u = repo.users.upsertByEmail("wade@example.com", null);
-      repo.sessions.create(u.id, hashToken(raw), null);
+      repo.sessions.create(tx, u.id, hashToken(raw), null);
     });
     const authed = verifySessionToken(raw, repo, touches, 0);
     expect(authed).not.toBeNull();
@@ -61,18 +61,18 @@ describe("verifySessionToken", () => {
   // working however old it is; one unused for longer is refused; 0 never expires.
   test("a token unused longer than idleDays is refused; use keeps it alive", async () => {
     const raw = mintToken();
-    const s   = await seed(repo, () => repo.sessions.create(repo.users.upsertByEmail("wade@example.com", null).id, hashToken(raw), null));
+    const s   = await seed(repo, tx => repo.sessions.create(tx, repo.users.upsertByEmail("wade@example.com", null).id, hashToken(raw), null));
     const day = 86_400_000;
-    const idle = (days: number) => seed(repo, () => repo.sessions.touch(s.id, repo.now() - days * day));
+    const idle = (days: number) => seed(repo, tx => repo.sessions.touch(tx, s.id, repo.now() - days * day));
     await idle(29);
     expect(verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
     await idle(31);
     expect(verifySessionToken(raw, repo, touches, 30)).toBeNull();
     expect(verifySessionToken(raw, repo, touches, 0)).not.toBeNull();
     // Age doesn't count: a year-old token used yesterday works.
-    await seed(repo, () => {
+    await seed(repo, tx => {
       db.run("UPDATE sessions SET created_at = ? WHERE id = ?", [repo.now() - 365 * day, s.id]);
-      repo.sessions.touch(s.id, repo.now() - day);
+      repo.sessions.touch(tx, s.id, repo.now() - day);
     });
     expect(verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
   });
@@ -83,19 +83,19 @@ describe("verifySessionToken", () => {
 
   test("revoked token returns null", async () => {
     const raw = mintToken();
-    await seed(repo, () => {
+    await seed(repo, tx => {
       const u = repo.users.upsertByEmail("wade@example.com", null);
-      const s = repo.sessions.create(u.id, hashToken(raw), null);
-      repo.sessions.revoke(s.id);
+      const s = repo.sessions.create(tx, u.id, hashToken(raw), null);
+      repo.sessions.revoke(tx, s.id);
     });
     expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
   });
 
   test("disabled user returns null", async () => {
     const raw = mintToken();
-    await seed(repo, () => {
+    await seed(repo, tx => {
       const u = repo.users.upsertByEmail("wade@example.com", null);
-      repo.sessions.create(u.id, hashToken(raw), null);
+      repo.sessions.create(tx, u.id, hashToken(raw), null);
       repo.users.setDisabled(u.id, true);
     });
     expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
@@ -104,16 +104,16 @@ describe("verifySessionToken", () => {
   // Security audit F-14: disable revokes the token, so enable doesn't revive it.
   test("re-enabled user's old token stays revoked; a new one works", async () => {
     const raw = mintToken();
-    const u = await seed(repo, () => {
+    const u = await seed(repo, tx => {
       const u = repo.users.upsertByEmail("wade@example.com", null);
-      repo.sessions.create(u.id, hashToken(raw), null);
+      repo.sessions.create(tx, u.id, hashToken(raw), null);
       repo.users.setDisabled(u.id, true);
       repo.users.setDisabled(u.id, false);
       return u;
     });
     expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
     const fresh = mintToken();
-    await seed(repo, () => repo.sessions.create(u.id, hashToken(fresh), null));
+    await seed(repo, tx => repo.sessions.create(tx, u.id, hashToken(fresh), null));
     expect(verifySessionToken(fresh, repo, touches, 0)).not.toBeNull();
   });
 });

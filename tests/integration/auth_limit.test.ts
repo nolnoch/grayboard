@@ -31,7 +31,7 @@ function serve(o: ConstructorParameters<typeof TestServer>[0] = {}) {
   // Every token lookup, to show a refused request makes none.
   let lookups = 0;
   const find = srv.app.repo.sessions.findByTokenHash.bind(srv.app.repo.sessions);
-  srv.app.repo.sessions.findByTokenHash = (h: string) => (lookups++, find(h));
+  srv.app.repo.sessions.findByTokenHash = (...a: Parameters<typeof find>) => (lookups++, find(...a));
   // The hosted MCP's access-token lookup too.
   const access = srv.app.repo.oauth.findActiveAccess.bind(srv.app.repo.oauth);
   srv.app.repo.oauth.findActiveAccess = (...a: Parameters<typeof access>) => (lookups++, access(...a));
