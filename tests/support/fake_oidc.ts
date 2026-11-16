@@ -22,7 +22,7 @@ export type FakeOidcOptions = {
 
 export type FakeOidc = {
   issuer: string;
-  hits: { discovery: number; jwks: number; authorize: number; token: number; userinfo: number };
+  hits: { discovery: number; jwks: number; authorize: number; token: number; userinfo: number; other: number };
   // The Authorization header of each token request, as sent.
   tokenAuthorizations: (string | null)[];
   // Refusals the token endpoint answered, by reason.
@@ -32,6 +32,8 @@ export type FakeOidc = {
   discovery(patch: Record<string, unknown> | "fail" | null): void;
   // A patch on every userinfo answer (another `sub`, say); null resets.
   userinfo(patch: Record<string, unknown> | null): void;
+  // A raw answer from that endpoint in place of the real one (a redirect, an oversized body); null resets.
+  answer(endpoint: "discovery" | "token" | "userinfo", make: ((issuer: string) => Response) | null): void;
   // A new signing key under a new kid; the JWKS publishes only it.
   rotateKeys(): Promise<void>;
   // The next JWKS answer sends its headers and the start of its body, then stalls until released.
@@ -62,7 +64,8 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
   const releases: (() => void)[] = [];
   const codes = new Map<string, { nonce: string | null; challenge: string; redirectUri: string }>();
   const accessTokens = new Set<string>();
-  const hits = { discovery: 0, jwks: 0, authorize: 0, token: 0, userinfo: 0 };
+  const hits = { discovery: 0, jwks: 0, authorize: 0, token: 0, userinfo: 0, other: 0 };
+  const answers: Partial<Record<"discovery" | "token" | "userinfo", (issuer: string) => Response>> = {};
   const tokenAuthorizations: (string | null)[] = [];
   const tokenRefusals: string[] = [];
 
@@ -74,6 +77,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
       const path = u.pathname.slice(base.length);
       if (req.method === "GET" && path === "/.well-known/openid-configuration") {
         hits.discovery++;
+        if (answers.discovery) return answers.discovery(issuer);
         if (discoveryPatch === "fail") return new Response("down", { status: 500 });
         return Response.json(patched(discoveryDoc(), discoveryPatch ?? {}));
       }
@@ -104,6 +108,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
       }
       if (req.method === "POST" && path === "/token") {
         hits.token++;
+        if (answers.token) return answers.token(issuer);
         const authorization = req.headers.get("authorization");
         tokenAuthorizations.push(authorization);
         const refuse = (error: string, reason: string, status = 400) => { tokenRefusals.push(reason); return Response.json({ error }, { status }); };
@@ -130,10 +135,12 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
       }
       if (req.method === "GET" && path === "/userinfo") {
         hits.userinfo++;
+        if (answers.userinfo) return answers.userinfo(issuer);
         const token = /^Bearer (\S+)$/.exec(req.headers.get("authorization") ?? "")?.[1];
         if (!token || !accessTokens.has(token)) return Response.json({ error: "invalid_token" }, { status: 401 });
         return Response.json(patched({ ...o.user }, userinfoPatch ?? {}));
       }
+      hits.other++;
       return new Response("not served by the fake OIDC issuer", { status: 404 });
     },
   });
@@ -176,6 +183,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
     next(t) { nextToken = t; },
     discovery(patch) { discoveryPatch = patch; },
     userinfo(patch) { userinfoPatch = patch; },
+    answer(endpoint, make) { if (make) answers[endpoint] = make; else delete answers[endpoint]; },
     async rotateKeys() { key = await newKey(`k${Number(key.kid.slice(1)) + 1}`); },
     stallJwks() {
       let release!: () => void;

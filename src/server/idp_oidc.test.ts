@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { startFakeOidc, type FakeOidc, type FakeOidcOptions, type OidcUser } from "../../tests/support/fake_oidc.ts";
 import { until } from "../../tests/support/until.ts";
 import { DomainRefused, type IdentityProvider } from "./idp.ts";
-import { oidcProvider, type OidcProviderOptions } from "./idp_oidc.ts";
+import { OidcDiscoveryError, OidcEndpointError, OidcIdentityError, OidcKeysError, oidcProvider, type OidcProviderOptions } from "./idp_oidc.ts";
 
 // Characters form-encoding changes: a space, `+`, `:`, `%`, `/`, `=` and a non-ASCII one.
 const CLIENT_ID = "fake client+id:1";
@@ -253,9 +253,9 @@ test("a code is redeemed once, and the PKCE verifier is checked", async () => {
 test("discovery is lazy: constructing the provider fetches nothing", async () => {
   const f = await fake();
   provider(f);
-  // A request after construction: one the provider had started would have reached the fake first.
+  // A request after construction: one the provider had started would have reached the fake first (`other` counts the probe itself).
   await (await fetch(`${f.issuer}/nothing`)).text();
-  expect(f.hits).toEqual({ discovery: 0, jwks: 0, authorize: 0, token: 0, userinfo: 0 });
+  expect(f.hits).toEqual({ discovery: 0, jwks: 0, authorize: 0, token: 0, userinfo: 0, other: 1 });
 });
 
 test("discovery is cached an hour: two sign-ins fetch it once", async () => {
@@ -318,14 +318,45 @@ test("with the default cooldown, a key rotated inside it is refused", async () =
   expect(f.hits.jwks).toBe(1);
 });
 
-test("a stalled JWKS body fails that sign-in at the deadline, and a later one completes once it settles", async () => {
+test("a stalled JWKS body fails that sign-in at the deadline, and the next starts a fresh key set without waiting on it", async () => {
   const f = await fake();
   const p = provider(f, { verifyDeadlineMs: 200 });
-  const release = f.stallJwks();
+  f.stallJwks(); // never released: stop() ends it
   const started = Date.now();
-  await expect(signIn(p, f)).rejects.toThrow(/exceeded 200 ms/);
+  await expect(signIn(p, f)).rejects.toBeInstanceOf(OidcKeysError);
   expect(Date.now() - started).toBeLessThan(5000);
   expect(f.hits.jwks).toBe(1);
-  release();
-  await until(async () => (await signIn(p, f).catch(() => undefined))?.subject === USER.sub, 5000, "a sign-in after the stalled JWKS body settles");
+  expect((await signIn(p, f)).subject).toBe(USER.sub);
+  expect(f.hits.jwks).toBe(2);
+});
+
+// The provider's own fetches (D2): no redirects, a bounded body; and a refusal's class names the stage.
+
+test("refuses a redirect from discovery or the token endpoint, never following it", async () => {
+  const f = await fake();
+  f.answer("discovery", issuer => new Response(null, { status: 302, headers: { Location: `${issuer}/elsewhere` } }));
+  await expect(signIn(provider(f), f)).rejects.toBeInstanceOf(OidcDiscoveryError);
+  f.answer("discovery", null);
+  f.answer("token", issuer => new Response(null, { status: 307, headers: { Location: `${issuer}/elsewhere` } }));
+  await expect(signIn(provider(f), f)).rejects.toBeInstanceOf(OidcEndpointError);
+  expect(f.hits.other).toBe(0);
+});
+
+test("refuses a token or userinfo answer over 256 KiB", async () => {
+  const f = await fake({ claimsInUserinfoOnly: true });
+  const big = () => Response.json({ padding: "x".repeat(300 * 1024) });
+  f.answer("token", big);
+  await expect(signIn(provider(f), f)).rejects.toThrow(/token exchange: response over 262144 bytes/);
+  f.answer("token", null);
+  f.answer("userinfo", big);
+  await expect(signIn(provider(f), f)).rejects.toThrow(/userinfo: response over 262144 bytes/);
+});
+
+test("a forged ID token is an identity refusal, a JWKS outage a keys refusal", async () => {
+  const f = await fake();
+  f.next({ foreignKey: true });
+  await expect(signIn(provider(f), f)).rejects.toBeInstanceOf(OidcIdentityError);
+  const g = await fake();
+  g.discovery({ jwks_uri: `${g.issuer}/no-keys-here` });
+  await expect(signIn(provider(g), g)).rejects.toBeInstanceOf(OidcKeysError);
 });

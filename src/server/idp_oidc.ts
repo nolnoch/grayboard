@@ -28,14 +28,26 @@ const DISCOVERY_RETRY_MS = 30_000;
 const VERIFY_DEADLINE_MS = 10_000;
 // Asymmetric only: never `none`, never HS* (an HS256 token keyed by the client secret is the classic confusion).
 const ASYMMETRIC = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"];
+// jose error codes that mean the token failed a check, as opposed to the key set failing to load.
+const TOKEN_CODES = /^(ERR_JW[ST]_|ERR_JWKS_(NO|MULTIPLE)_MATCHING_KEY|ERR_JOSE_ALG_NOT_ALLOWED$|ERR_JOSE_NOT_SUPPORTED$)/;
 // OIDC Core §2: `sub` is at most 255 ASCII characters.
 const MAX_SUBJECT = 255;
 
 type Discovery = { authorization: URL; token: URL; userinfo: URL | null; jwksUri: string; algorithms: string[] };
 
+// A refusal's class says which stage failed, since the AS's failure log keeps only the class (errorDiagnostic): the
+// IdP's discovery, its token or userinfo endpoint, its signing keys (JWKS fetch or the verification deadline), or the
+// identity itself (a token or claim that failed a check).
+export class OidcError extends Error {}
+export class OidcDiscoveryError extends OidcError { override name = "OidcDiscoveryError"; }
+export class OidcEndpointError extends OidcError { override name = "OidcEndpointError"; }
+export class OidcKeysError extends OidcError { override name = "OidcKeysError"; }
+export class OidcIdentityError extends OidcError { override name = "OidcIdentityError"; }
+type OidcErrorClass = new (message: string, options?: ErrorOptions) => OidcError;
+
 // RFC 6749 §2.3.1: the client ID and secret are each form-encoded (application/x-www-form-urlencoded) before base64.
 const formEncode = (s: string) => new URLSearchParams({ v: s }).toString().slice(2);
-export const basicAuthorization = (id: string, secret: string) => `Basic ${Buffer.from(`${formEncode(id)}:${formEncode(secret)}`).toString("base64")}`;
+const basicAuthorization = (id: string, secret: string) => `Basic ${Buffer.from(`${formEncode(id)}:${formEncode(secret)}`).toString("base64")}`;
 
 export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
   const now = o.now ?? Date.now;
@@ -45,24 +57,27 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
 
   const endpoint = (raw: unknown, what: string): URL => {
     let u: URL;
-    try { u = new URL(raw as string); } catch { throw new Error(`${o.label} discovery: ${what} is not a URL`); }
+    try { u = new URL(raw as string); } catch { throw new OidcDiscoveryError(`${o.label} discovery: ${what} is not a URL`); }
     if (typeof raw !== "string" || !(u.protocol === "https:" || (o.allowLoopbackHttp && u.protocol === "http:" && LOOPBACK.has(u.hostname))))
-      throw new Error(`${o.label} discovery: ${what} must be https`);
+      throw new OidcDiscoveryError(`${o.label} discovery: ${what} must be https`);
     return u;
   };
 
   // The provider's own requests: no redirects, a 10 s deadline (headers and body), a bounded body, JSON.
-  async function json(url: URL, init: RequestInit, what: string): Promise<Record<string, unknown>> {
-    const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    const body = await cappedBody(res, MAX_BODY);
-    if (body === null) throw new Error(`${o.label} ${what}: response over ${MAX_BODY} bytes`);
+  async function json(url: URL, init: RequestInit, what: string, Refusal: OidcErrorClass): Promise<Record<string, unknown>> {
+    let res: Response, body: Uint8Array | null;
+    try {
+      res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      body = await cappedBody(res, MAX_BODY);
+    } catch (error) { throw new Refusal(`${o.label} ${what} request failed`, { cause: error }); }
+    if (body === null) throw new Refusal(`${o.label} ${what}: response over ${MAX_BODY} bytes`);
     let parsed: unknown;
     try { parsed = JSON.parse(new TextDecoder().decode(body)); } catch { parsed = undefined; }
     if (!res.ok) {
       const error = parsed && typeof parsed === "object" && typeof (parsed as { error?: unknown }).error === "string" ? `: ${(parsed as { error: string }).error.slice(0, 100)}` : "";
-      throw new Error(`${o.label} ${what} failed (HTTP ${res.status}${error})`);
+      throw new Refusal(`${o.label} ${what} failed (HTTP ${res.status}${error})`);
     }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${o.label} ${what}: not a JSON object`);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Refusal(`${o.label} ${what}: not a JSON object`);
     return parsed as Record<string, unknown>;
   }
 
@@ -73,15 +88,15 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
 
   async function load(): Promise<Discovery> {
     const url = endpoint(`${o.issuer.replace(/\/$/, "")}/.well-known/openid-configuration`, "the discovery URL");
-    const d = await json(url, { headers: { Accept: "application/json" } }, "discovery");
+    const d = await json(url, { headers: { Accept: "application/json" } }, "discovery", OidcDiscoveryError);
     // Exact, no URL normalizing, as for the AS's own issuer.
-    if (d.issuer !== o.issuer) throw new Error(`${o.label} discovery names another issuer`);
+    if (d.issuer !== o.issuer) throw new OidcDiscoveryError(`${o.label} discovery names another issuer`);
     for (const [k, v] of Object.entries(d)) if ((k.endsWith("_endpoint") || k === "jwks_uri") && v !== undefined) endpoint(v, k);
     if (!Array.isArray(d.code_challenge_methods_supported) || !d.code_challenge_methods_supported.includes("S256"))
-      throw new Error(`${o.label} discovery doesn't offer PKCE S256`);
+      throw new OidcDiscoveryError(`${o.label} discovery doesn't offer PKCE S256`);
     const offered = Array.isArray(d.id_token_signing_alg_values_supported) ? d.id_token_signing_alg_values_supported : [];
     const algorithms = ASYMMETRIC.filter(a => offered.includes(a));
-    if (!algorithms.length) throw new Error(`${o.label} discovery offers no asymmetric ID token algorithm`);
+    if (!algorithms.length) throw new OidcDiscoveryError(`${o.label} discovery offers no asymmetric ID token algorithm`);
     return {
       authorization: endpoint(d.authorization_endpoint, "authorization_endpoint"),
       token: endpoint(d.token_endpoint, "token_endpoint"),
@@ -109,11 +124,14 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
     return jwks.get;
   };
 
-  // jwtVerify takes no signal, and jose coalesces JWKS reloads: one stalled JWKS body would hold every sign-in. So
-  // each verification has its own overall deadline, its timer cleared on every path.
+  // jwtVerify takes no signal, and jose coalesces JWKS reloads: one stalled JWKS body would hold every sign-in that
+  // needs a reload until it settles. So each verification has its own overall deadline, its timer cleared on every
+  // path, and a miss drops that key set: the next sign-in starts a fresh one rather than waiting on the stalled fetch
+  // (one replacement per stall; the orphaned fetch ends at Bun's socket idle timeout).
   async function verify(idToken: string, d: Discovery): Promise<JWTPayload> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const verifying = jwtVerify(idToken, keys(d), {
+    const get = keys(d);
+    const verifying = jwtVerify(idToken, get, {
       issuer: o.issuer,
       audience: o.clientId,
       algorithms: d.algorithms,
@@ -124,9 +142,19 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
     verifying.catch(() => {});
     try {
       const { payload } = await Promise.race([verifying, new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${o.label} ID token verification exceeded ${deadline} ms`)), deadline);
+        timer = setTimeout(() => {
+          if (jwks?.get === get) jwks = undefined;
+          reject(new OidcKeysError(`${o.label} ID token verification exceeded ${deadline} ms`));
+        }, deadline);
       })]);
       return payload;
+    } catch (error) {
+      if (error instanceof OidcError) throw error;
+      // jose's: a token that failed a check is the identity; anything else (a JWKS fetch's timeout, status, network
+      // error or bad body) is the IdP's keys.
+      const code = (error as { code?: unknown }).code;
+      const Refusal = typeof code === "string" && TOKEN_CODES.test(code) ? OidcIdentityError : OidcKeysError;
+      throw new Refusal(`${o.label} ID token refused: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     } finally { clearTimeout(timer); }
   }
 
@@ -148,30 +176,30 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
         method: "POST",
         headers: { Authorization: basicAuthorization(o.clientId, o.clientSecret), "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
         body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: redirectUri, code_verifier: verifier }),
-      }, "token exchange");
-      if (typeof tokens.id_token !== "string") throw new Error(`${o.label} token response has no id_token`);
+      }, "token exchange", OidcEndpointError);
+      if (typeof tokens.id_token !== "string") throw new OidcEndpointError(`${o.label} token response has no id_token`);
       const claims = await verify(tokens.id_token, d);
       // Google's azp rules (verifyGoogleIdToken): a present azp is the client; several audiences need it.
       if ((claims.azp !== undefined && claims.azp !== o.clientId) || (Array.isArray(claims.aud) && claims.aud.length > 1 && claims.azp !== o.clientId))
-        throw new Error(`${o.label} ID token's azp is not this client`);
-      if (typeof claims.nonce !== "string" || !nonce || claims.nonce !== nonce) throw new Error(`${o.label} ID token nonce mismatch`);
+        throw new OidcIdentityError(`${o.label} ID token's azp is not this client`);
+      if (typeof claims.nonce !== "string" || !nonce || claims.nonce !== nonce) throw new OidcIdentityError(`${o.label} ID token nonce mismatch`);
       const subject = claims.sub;
-      if (typeof subject !== "string" || !subject || subject.length > MAX_SUBJECT) throw new Error(`${o.label} ID token sub is invalid`);
+      if (typeof subject !== "string" || !subject || subject.length > MAX_SUBJECT) throw new OidcIdentityError(`${o.label} ID token sub is invalid`);
 
       // email and email_verified come from one document: the ID token when it has both, else userinfo.
       let source: Record<string, unknown> = claims;
       if (claims.email === undefined || claims.email_verified === undefined) {
-        if (!d.userinfo) throw new Error(`${o.label} ID token lacks email claims and discovery has no userinfo_endpoint`);
-        if (typeof tokens.access_token !== "string") throw new Error(`${o.label} token response has no access_token`);
-        source = await json(d.userinfo, { headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: "application/json" } }, "userinfo");
+        if (!d.userinfo) throw new OidcIdentityError(`${o.label} ID token lacks email claims and discovery has no userinfo_endpoint`);
+        if (typeof tokens.access_token !== "string") throw new OidcEndpointError(`${o.label} token response has no access_token`);
+        source = await json(d.userinfo, { headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: "application/json" } }, "userinfo", OidcEndpointError);
         // OIDC Core §5.3.2.
-        if (source.sub !== subject) throw new Error(`${o.label} userinfo names another subject`);
+        if (source.sub !== subject) throw new OidcIdentityError(`${o.label} userinfo names another subject`);
       }
-      if (typeof source.email !== "string" || !source.email.trim()) throw new Error(`${o.label} sent no email`);
-      if (source.email_verified !== true) throw new Error(`${o.label} email is not verified`);
+      if (typeof source.email !== "string" || !source.email.trim()) throw new OidcIdentityError(`${o.label} sent no email`);
+      if (source.email_verified !== true) throw new OidcIdentityError(`${o.label} email is not verified`);
       const email = source.email.toLowerCase();
       const at = email.lastIndexOf("@");
-      if (at < 1) throw new Error(`${o.label} sent an invalid email`);
+      if (at < 1) throw new OidcIdentityError(`${o.label} sent an invalid email`);
       if (!domains.includes(email.slice(at + 1))) throw new DomainRefused(`account must be from one of ${domains.map(d => `@${d}`).join(", ")}`);
       const name = typeof claims.name === "string" ? claims.name : typeof source.name === "string" ? source.name : null;
       return { issuer: o.issuer, subject, email, displayName: name };
