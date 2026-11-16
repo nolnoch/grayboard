@@ -6,7 +6,7 @@ invariants: a service is a `users` row and a `principals` row of kind `service`,
 code-pointers: src/server/oauth.ts (token route, clientAuth, authenticate), src/server/oauth-config.ts (sourceKeyFor, harnessFor), src/server/db.ts (users, principals, oauth_grants, oauth_tokens, setDisabled, endHostedWhere, authGenerationTriggers, findActiveAccess), src/server/http.ts (admin user routes), src/server/policy.ts (actIn, wakeRule), src/server/access.ts (principalCanSee), src/server/application.ts (userPrincipal, bindTarget, writerMarks, helloOkFields), src/core/boards.ts (Access, queueLanes), src/server/config.ts (DEFAULT_HOSTED_CAPS, globalAndScoped), adapters/opencode-v2/src/binding.ts, adapters/opencode-v2/src/lifecycle.ts (Options.issuer)
 companions: role-bindings.md (the binding store and `service_invoke`: R1, R2, R5, R7, R8, R10), postgres-server.md (D2, D3, D5, D7), ../server-oauth.md, ../server-access.md, ../server-hosted-ownership.md and ../boards.md (which take the as-built facts), ../vision.md (§1; principles 2, 7 to 13), ../parity.md
 trigger: Postgres P1c merged (`Repo` methods async, #807 Stage 3), with role-bindings.md (#927) landed first
-last-verified: 2026-11-15 (origin/master 3d44c96c)
+last-verified: 2026-11-16 (origin/master eec82db1)
 ```
 
 ## Problem
@@ -92,7 +92,7 @@ sequenceDiagram
 - One live session per name holds (`../handles.md` §1). A service running N agents binds N names; it pools them (`w-1`…`w-n`) because aliases are durable and `ALIAS_SCOPE_CAP` bounds a scope. `admin service delete-alias` is the team route's twin for an unheld name.
 - Two credentials of one service are two OAuth clients: their sessions read as missing to each other (`hosted.other_client`).
 - **Caps get a service tier**: `sessions`, `leases`, the hosted request buckets and the bind bucket each gain a per-service value in `src/server/config.ts`, picked by the principal's kind at admission: no per-row read on the hot path. Like the per-user values it is clamped under the global caps (`globalAndScoped`) and sized against them, so one service can't starve people. Why not raise the per-user values: they bound what one phished person's grant holds.
-- `alias.see` for a service scope: the service itself and `service_invoke` holders (rule `alias.see_service`, a binding read per service-scope row in `peer_list`: R5), as a team's names are its members' (#348).
+- `alias.see` for a service scope: the service itself and `service_invoke` holders, direct or through a team (rule `alias.see_service`, a binding read per service-scope row in `peer_list`: R5), as a team's names are its members' (#348).
 
 ### D5. A service board is a queue board in the service's scope
 
@@ -104,10 +104,11 @@ sequenceDiagram
 ### D6. `service.invoke`
 
 - **Meaning**: posting on a service's board. Not a new tool, not `delegate` (#874), not a DM. grayboard checks the right, picks a lane by rotation and delivers.
-- **The grant** is a `service_invoke` binding (role-bindings.md R7): holder the invoker, scope the service. Holder kinds: user and service only; team holders wait on open question 8. One statement: `EXISTS` over `role_bindings` on `(scope_id, role, holder)`.
+- **The grant** is a `service_invoke` binding (role-bindings.md R7): holder the invoker, scope the service. Holder kinds: user, service and team (the maintainer, 2026-11-16: a whole team must be grantable from the start). A user holds the right through a direct binding or through a binding held by a team they are a member of; a service is never a team member (D1), so it holds it only directly. One statement: `EXISTS` over `role_bindings` on `(scope_id, role)` whose holder is the actor's principal or one of its teams' (`team_members` by user). Membership is read live (R8), so removing a member ends their team-derived right at the next check.
+- **Delegation is a separate grant.** `service_invoke` lets a principal ask a service for work; whether the service starts a worker to do it is the service's own behaviour, accepted when the grant is given. #874's `delegate` grant (one agent sending work to another agent) is unrelated and never reads `service_invoke`.
 - **Verb** `service.invoke` in `authorize`, decided for the acting address's principal where the tool call is handled (`src/server/application.ts`), inside the post's transaction (principle 11; R8: no cache). Allow: rule `role.service_invoke` with the binding id (R5), or `service.own` for the service's own post. Deny: rule `role.service_invoke`, code `not_found`, the same text as a hidden board, recorded after the rollback. Allows are recorded too: an invocation exercises a grant (principle 8).
-- **Waking** (principles 9, 10). `msg.wake`'s request gains the post's board, and `writerMarks`' cache key includes it; `unwoken` stays DM-only. Rule `wake.service_invoke`: a post on a `service:<name>` board wakes across accounts when one side is that service and the other's user holds `service_invoke` on it, in both directions, re-decided at each pull or read. A binding revoked in between turns both to `ungranted` data. DMs between a service and a holder stay mail.
-- **Granting** is `grayboard admin role grant service_invoke <principal> --scope <service>` (R10), `org_admin` only for now.
+- **Waking** (principles 9, 10). `msg.wake`'s request gains the post's board, and `writerMarks`' cache key includes it; `unwoken` stays DM-only. Rule `wake.service_invoke`: a post on a `service:<name>` board wakes across accounts when one side is that service and the other's user holds `service_invoke` on it, in both directions, re-decided at each pull or read; a team-held binding counts for the team's members. A binding revoked, or a membership removed, in between turns both to `ungranted` data. DMs between a service and a holder stay mail.
+- **Granting** is `grayboard admin role grant service_invoke <principal> --scope <service>` (R10), `org_admin` only for now; `<principal>` may name a team. A team's owners can then extend the right by adding members (`team.manage`, role-bindings.md R6): accepted for now, with a fast-follow to tighten it (Risks R8).
 
 ### D7. Local mode
 
@@ -122,7 +123,7 @@ After P1c, each PR against the async store; DDL twice (SQLite, then P3) as role-
 3. **Credential**: `service_credentials`, `client_credentials`, source mapping, caps tier, revocation.
 4. **OpenCode V2**: the static credential mode and service enrollment (`adapters/opencode-v2/`, its own lane, `bun run test:opencode`).
 5. **Boards and invoke**: the scope, the lane hook, the verb, the wake rule. Closes #807's exit test on SQLite; P3 re-runs it on Postgres.
-6. Later: #929 (SDK, credential from PR 3), #271 (header source), #874 (delegation; its service case is open question 9), #930 (owner offboarding; per-grant list covers credentials), #928 (nothing here).
+6. Later: #929 (SDK, credential from PR 3), #271 (header source), #874 (delegation, its own `delegate` grant, independent of `service_invoke`: D6), #930 (owner offboarding; per-grant list covers credentials), #928 (nothing here).
 
 The implementing PRs add one `../parity.md` row each for the credential and for invocation, and move as-built facts to the companions; this file is then deleted.
 
@@ -133,7 +134,7 @@ On `TestServer` with `accessAudits` unless said.
 1. **Created and revoked, both audited** (#270): create with an owner, add a credential, revoke it, disable the service; each row names the admin and the service. Create with no owner, with a team's name, or an email-shaped name is refused. One `runCli` pass against a `ServerProcess`.
 2. **A token with no browser, bind, post** (#270): a raw `fetch` to `/oauth/token`, then a `HostedSession` with the run token (not `srv.hosted`, which mints a built-in client's token in-process) binds `<service>/w-1` and posts, against a `ServerProcess`. The OpenCode half is the adapter's `test:native-host` with a static-header entry; the conformance suite's hosted driver (#926) runs its scenarios under a service token, and #929 repeats them through the SDK.
 3. **Revoke ends sessions** (#270): with a bound, delivery-open session, revoking the credential leaves no `hosted_sessions` row (`hostedRowCount`), closes the stream and refuses the next call; the same for disable; rotating a secret keeps the session. A second case revokes with raw SQL on another connection (role-bindings.md test 1's reason).
-4. **Pilot gate** (#807): a holder's post reaches exactly one service lane, actionable; the reply wakes the holder; a non-holder's post is refused as a missing board with a deny row; a holder's push subscription never becomes a lane; after the binding is revoked the queued item is delivered `ungranted`.
+4. **Pilot gate** (#807): a holder's post reaches exactly one service lane, actionable; the reply wakes the holder; a member of a holding team posts and is woken the same way, and after `team remove` is refused; a non-holder's post is refused as a missing board with a deny row; a holder's push subscription never becomes a lane; after the binding is revoked the queued item is delivered `ungranted`.
 
 Also: `policy.ts` unit tests per rule; a user can't bind in a service scope and a service can't bind in a person's or a team's; a Google or dev sign-in can't link to a service row; `upgrade.test.ts` opens a release database unchanged; the mint cap and the grant read each get postgres-server.md D9's interleaving test at P3; `scripts/loadtest.ts` holds R5's binding reads inside the request budget.
 
@@ -146,6 +147,7 @@ Also: `policy.ts` unit tests per rule; a user can't bind in a service scope and 
 - **R5. Hot-path binding reads** (R7, R8). Not one per post: for a service board, `Access.canSee` → `principalCanSee` (`src/server/access.ts`) reads the binding on every visibility check, so in `board_list`, `board_read`, the snapshot, the catalog, mention resolution and once per lane in `queueLanes`; plus `alias.see_service` per service-scope row in `peer_list`, and the post's `service.invoke`. role-bindings.md R8's "CLI routes, at human rates" understates this. The load test drives each path. A cache, if needed, joins postgres-server.md D5's generation and `NOTIFY` set or misses outside revokes.
 - **R6. `user_email` now names non-emails**: code that splits it on `@` or mails it breaks for services. A rename is mechanical and separate.
 - **R7. Auto-enrollment trusts the launcher.** Project config can't set the mode or the issuer, and a person's token gets no auto-enroll (the server reports the kind). Residual: whoever controls the launcher's environment controls mode, pin and token, and a service's operator can enroll roots no human looked at. That is the service's accountability, recorded by its owners.
+- **R8. Team owners are de facto granters.** A team holding `service_invoke` lets its owners give a service's invoke right to anyone by adding them to the team, with no `org_admin` involved. The maintainer accepted this to start (2026-11-16); the fast-follow narrows it (for example, team grants only by a service owner once open question 2 lands, or membership changes on holding teams audited as `service_invoke` changes).
 
 ## Where #270, #807 and the code disagree
 
@@ -154,7 +156,7 @@ Also: `policy.ts` unit tests per rule; a user can't bind in a service scope and 
 - **"Pull-only"** (#270 Value, #271): queue rotation picks push subscribers, so the OpenCode path keeps delivery; pull-only is #271's client.
 - **"Usable by opencode-v2"** (#807): OpenCode's native OAuth can't do client credentials, and the plugin refuses static headers and needs a human's enrollment (D3).
 - **`service_invoke` holder kinds and cost** were left to this doc (role-bindings.md R1, R7); `service_owner` is a role #927 doesn't list.
-- **#874** proposes its own grant row for "an org service opened broadly" (open question 9).
+- **#874** proposes its own grant row for "an org service opened broadly"; its `delegate` grant stays its own and never reads `service_invoke` (D6).
 - **"A synthetic, non-addressable key"** (the maintainer's #270 comment on `users.email`): D1 uses the bare service name, which is no address on the server (a bare name resolves in the caller's scope).
 
 ## Open questions
@@ -168,5 +170,4 @@ Sent to the maintainer with defaults; with no answer, the defaults are the desig
 5. **Workload identity** (a JWT bearer from the cluster's issuer in place of a held secret). Default: after the pilot.
 6. **Per-service caps** beside the one service tier. Default: the tier only, until a second service needs different sizing.
 7. **The wake grant's width.** Board posts only (D6), or every message between a service and its holders. Default: board posts only.
-8. **Team holders of `service_invoke`.** A team holding it would delegate invoke rights to the team's owners (`team.manage`, role-bindings.md R6), past `org_admin`. Default: not allowed until question 2 is answered.
-9. **#874's service case.** Default: it reads `service_invoke`, which equates "may post on its queue board" with "may ask its launcher to spawn".
+Decided by the maintainer, 2026-11-16: team holders of `service_invoke` are allowed now (D6, Risks R8); #874's `delegate` grant is separate from `service_invoke` (D6).
