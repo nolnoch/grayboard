@@ -1,10 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { loadConfig } from "./config.ts";
+import { checkIdpConfig, loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
+  "GRAYBOARD_IDPS", "GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
@@ -145,6 +146,117 @@ describe("loadConfig", () => {
       expect(message).not.toContain("private-secret");
       expect(message).not.toContain("web-client");
     }
+  });
+
+  // #928 D6: the provider list and Okta's four variables.
+  function okta() {
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://example.okta.com";
+    process.env.GRAYBOARD_OKTA_CLIENT_ID = "okta-client";
+    process.env.GRAYBOARD_OKTA_CLIENT_SECRET = "okta-private";
+    process.env.GRAYBOARD_OKTA_ALLOWED_DOMAINS = "Example.com, corp.example.org";
+  }
+  const message = () => { try { loadConfig(); return ""; } catch (e) { return (e as Error).message; } };
+
+  test("GRAYBOARD_IDPS defaults to google alone: an existing deployment's env is unchanged", () => {
+    primary();
+    expect(loadConfig()).toMatchObject({ idps: ["google"], googleClientId: "desktop-client", googleClientSecret: "desktop-secret", orgDomain: "example.com" });
+    expect(loadConfig().okta).toBeUndefined();
+    process.env.GRAYBOARD_IDPS = "google";
+    expect(loadConfig().idps).toEqual(["google"]);
+  });
+
+  test("an Okta-only server needs neither Google's variables nor GRAYBOARD_ORG_DOMAIN", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(loadConfig()).toMatchObject({ idps: ["okta"], googleClientId: "", googleClientSecret: "", orgDomain: "",
+      okta: { issuer: "https://example.okta.com", clientId: "okta-client", clientSecret: "okta-private", allowedDomains: ["example.com", "corp.example.org"] } });
+    // Google's variables, set but unlisted, go unread.
+    primary();
+    expect(loadConfig()).toMatchObject({ googleClientId: "", googleClientSecret: "", orgDomain: "" });
+  });
+
+  test("Google and Okta together keep the listed order and need both providers' variables", () => {
+    process.env.GRAYBOARD_IDPS = "okta, google";
+    okta();
+    expect(message()).toBe("Required env var GOOGLE_OAUTH_CLIENT_ID is not set");
+    primary();
+    expect(loadConfig()).toMatchObject({ idps: ["okta", "google"], googleClientId: "desktop-client", okta: { clientId: "okta-client" } });
+    delete process.env.GRAYBOARD_ORG_DOMAIN;
+    expect(message()).toBe("Required env var GRAYBOARD_ORG_DOMAIN is not set");
+  });
+
+  test("an unknown, repeated or empty provider list refuses to start", () => {
+    primary();
+    for (const [raw, error] of [["", "empty entry"], [",", "empty entry"], ["google,", "empty entry"], ["azure", 'unknown provider "azure"'], ["Google", 'unknown provider "Google"'], ["google,google", "lists a provider twice"]]) {
+      process.env.GRAYBOARD_IDPS = raw;
+      expect(message()).toContain(error);
+    }
+  });
+
+  test("okta listed refuses to start without each of its four variables", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    for (const name of ["GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS"]) {
+      okta();
+      delete process.env[name];
+      expect(message()).toBe(`GRAYBOARD_IDPS lists okta, so ${name} is required`);
+      process.env[name] = "";
+      expect(message()).toBe(`GRAYBOARD_IDPS lists okta, so ${name} is required`);
+    }
+  });
+
+  test("checkIdpConfig on Config alone refuses Okta config with okta unlisted, and okta listed without its config", () => {
+    const okta = { issuer: "https://example.okta.com", clientId: "okta-client", clientSecret: "okta-private", allowedDomains: ["example.com"] };
+    const base = { devAuth: false, googleClientSecret: "" };
+    expect(() => checkIdpConfig({ ...base, idps: ["google"], okta })).toThrow("Okta is configured but GRAYBOARD_IDPS doesn't list okta");
+    expect(() => checkIdpConfig({ ...base, idps: ["okta"], okta: undefined })).toThrow("GRAYBOARD_IDPS lists okta without its configuration");
+    expect(() => checkIdpConfig({ ...base, idps: ["okta"], okta })).not.toThrow();
+  });
+
+  test("an Okta variable set while okta isn't listed refuses to start", () => {
+    primary();
+    for (const name of ["GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS"]) {
+      process.env[name] = "set";
+      expect(message()).toBe(`${name} set but GRAYBOARD_IDPS doesn't list okta: list it, or unset them`);
+      delete process.env[name];
+    }
+  });
+
+  test("the Okta issuer must be https, without a query, fragment or trailing slash, and not Google's", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    for (const issuer of ["http://example.okta.com", "https://example.okta.com/", "https://example.okta.com/oauth2/default/", "https://example.okta.com?x=1", "https://example.okta.com#f", "https://user:pw@example.okta.com", "example.okta.com", "not a url"]) {
+      process.env.GRAYBOARD_OKTA_ISSUER = issuer;
+      expect(message()).toContain("GRAYBOARD_OKTA_ISSUER must be an https URL");
+    }
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://accounts.google.com";
+    expect(message()).toBe("GRAYBOARD_OKTA_ISSUER can't be Google's issuer");
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://example.okta.com/oauth2/default";
+    expect(loadConfig().okta!.issuer).toBe("https://example.okta.com/oauth2/default");
+  });
+
+  test("a malformed Okta domain or credential refuses to start, without quoting the credential", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    for (const domains of ["example", "@example.com", "example.com,", "ex ample.com", "-example.com", "example.com/x", "you@example.com"]) {
+      okta();
+      process.env.GRAYBOARD_OKTA_ALLOWED_DOMAINS = domains;
+      expect(message()).toContain("GRAYBOARD_OKTA_ALLOWED_DOMAINS must be email domains");
+    }
+    for (const [id, secret] of [["okta client", "okta-private"], ["okta-client", "okta private"], ["okta-client", "x".repeat(4097)]]) {
+      okta();
+      process.env.GRAYBOARD_OKTA_CLIENT_ID = id!;
+      process.env.GRAYBOARD_OKTA_CLIENT_SECRET = secret!;
+      const text = message();
+      expect(text).toContain("must be nonempty credentials without whitespace");
+      expect(text).not.toContain("private");
+    }
+  });
+
+  test("dev auth refuses to start alongside the Okta client secret", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(message()).toContain("GRAYBOARD_DEV_AUTH=1 must not be set alongside");
+    expect(message()).not.toContain("okta-private");
   });
 
   test("dev auth rejects the independent MCP Google secret", () => {

@@ -1,4 +1,4 @@
-// The upstream identity-provider seam (#928, docs/future/okta-idp.md D1). The
+// The upstream identity-provider seam (#928, docs/server-oauth.md §1). The
 // OAuth authorization server (oauth.ts) owns everything that isn't
 // provider-specific: upstream state, the PKCE verifier, the nonce, the binding
 // cookie and the callback route. A provider builds its authorize URL and turns
@@ -7,6 +7,7 @@ import { writeAudit } from "./audit.ts";
 import type { Config } from "./config.ts";
 import type { Repo, User } from "./db.ts";
 import { googleProvider } from "./idp_google.ts";
+import { oidcProvider } from "./idp_oidc.ts";
 
 // issuer: half of the stored key, the provider's constant, never a token's `iss`.
 export type UpstreamIdentity = { issuer: string; subject: string; email: string; displayName: string | null };
@@ -15,8 +16,8 @@ export type AuthorizeInput = { redirectUri: string; state: string; nonce: string
 export type ExchangeInput = { code: string; verifier: string; redirectUri: string; nonce: string };
 
 export type IdentityProvider = {
-  id: string;        // "google": the callback path (/oauth/<id>/callback)
-  label: string;     // what a sign-in chooser would name it
+  id: string;        // "google", "okta": config, the callback path (/oauth/<id>/callback), audit detail
+  label: string;     // the chooser's link text
   issuer: string;    // a callback's `iss` parameter, when present, must equal it
   callbackParams: readonly string[];
   // Async: a provider may need discovery before it knows its endpoint.
@@ -33,11 +34,18 @@ export class DomainRefused extends Error {}
 
 export const callbackPath = (p: Pick<IdentityProvider, "id">) => `/oauth/${p.id}/callback`;
 
-// The providers a server signs in with when OAuthOptions.providers doesn't inject any: Google, with the client pair
-// the AS uses (mcpGoogle, else the primary).
+// The providers a server signs in with when OAuthOptions.providers doesn't inject any, built from Config alone in
+// GRAYBOARD_IDPS's order (#928 D6): Google with the client pair the AS uses (mcpGoogle, else the primary), Okta as
+// the generic OIDC provider. loadConfig has checked the list (checkIdpConfig); nothing is fetched here (D2).
 export function defaultProviders(config: Config): IdentityProvider[] {
-  const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
-  return [googleProvider({ ...googleClient, orgDomain: config.orgDomain })];
+  return (config.idps ?? ["google"]).map(id => {
+    if (id === "okta") {
+      if (!config.okta) throw new Error("GRAYBOARD_IDPS lists okta without its configuration");
+      return oidcProvider({ id: "okta", label: "Okta", ...config.okta });
+    }
+    const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
+    return googleProvider({ ...googleClient, orgDomain: config.orgDomain });
+  });
 }
 
 export type SignInProvider = Pick<IdentityProvider, "id" | "label" | "issuer">;

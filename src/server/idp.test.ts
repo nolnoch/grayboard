@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,8 @@ import { accessAudits } from "../../tests/support/audit.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { openDatabase, type Repo } from "./db.ts";
-import { idpSignIn, type SignInProvider } from "./idp.ts";
+import type { Config } from "./config.ts";
+import { callbackPath, defaultProviders, idpSignIn, type SignInProvider } from "./idp.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 
 const google: SignInProvider = { id: "google", label: "Google", issuer: GOOGLE_ISSUER };
@@ -44,4 +45,49 @@ test("idpSignIn refuses an email another provider holds, naming that provider an
   expect(accessAudits(db, "auth.subject_refused").map(r => [r.actor, r.detail])[0]).toEqual(
     ["a@example.com", { reason: "issuer_mismatch", holding_issuer: GOOGLE_ISSUER, provider: "okta", issuer: okta.issuer, client_id: "native" }]);
   expect(repo.users.findByEmail("a@example.com")).toMatchObject({ idp_issuer: GOOGLE_ISSUER, idp_subject: "s-1" });
+});
+
+// #928 D6/D10: the gap no integration test covers, Config to providers. Tests inject providers; a server builds them
+// here, so each provider's config must reach the right provider, in GRAYBOARD_IDPS's order.
+const OKTA_ISSUER = "https://example.okta.com/oauth2/default";
+const base = { googleClientId: "desktop-client", googleClientSecret: "desktop-secret", orgDomain: "example.com",
+  okta: { issuer: OKTA_ISSUER, clientId: "okta-client", clientSecret: "okta-private", allowedDomains: ["example.com"] } } as unknown as Config;
+const realFetch = globalThis.fetch;
+afterEach(() => { globalThis.fetch = realFetch; });
+
+test("defaultProviders is Google alone by default, on the MCP pair when set, else the primary", async () => {
+  const input = { redirectUri: "https://grayboard.example.com/oauth/google/callback", state: "s", nonce: "n", challenge: "c" };
+  for (const [config, clientId] of [[{ ...base, okta: undefined }, "desktop-client"], [{ ...base, okta: undefined, mcpGoogle: { clientId: "web-client", clientSecret: "web-secret" } }, "web-client"]] as const) {
+    const providers = defaultProviders(config as Config);
+    expect(providers.map(p => [p.id, p.label, p.issuer, callbackPath(p)])).toEqual([["google", "Google", GOOGLE_ISSUER, "/oauth/google/callback"]]);
+    const url = new URL(await providers[0]!.authorizeUrl(input));
+    expect([url.host, url.searchParams.get("client_id"), url.searchParams.get("hd")]).toEqual(["accounts.google.com", clientId, "example.com"]);
+  }
+});
+
+test("defaultProviders builds Okta from Config in the listed order, fetching nothing until first use, with its own client", async () => {
+  const fetched: string[] = [];
+  let tokenAuthorization: string | null = null;
+  globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+    const req = new Request(input, init);
+    fetched.push(req.url);
+    if (req.url === OKTA_ISSUER + "/.well-known/openid-configuration") return Response.json({ issuer: OKTA_ISSUER,
+      authorization_endpoint: OKTA_ISSUER + "/v1/authorize", token_endpoint: OKTA_ISSUER + "/v1/token", jwks_uri: OKTA_ISSUER + "/v1/keys",
+      userinfo_endpoint: OKTA_ISSUER + "/v1/userinfo", code_challenge_methods_supported: ["S256"], id_token_signing_alg_values_supported: ["RS256"] });
+    if (req.url === OKTA_ISSUER + "/v1/token") { tokenAuthorization = req.headers.get("authorization"); return Response.json({ error: "invalid_grant" }, { status: 400 }); }
+    throw new Error("unexpected request " + req.url);
+  }, { preconnect: realFetch.preconnect });
+
+  const providers = defaultProviders({ ...base, idps: ["okta", "google"] });
+  expect(providers.map(p => [p.id, p.label, p.issuer, callbackPath(p)])).toEqual([
+    ["okta", "Okta", OKTA_ISSUER, "/oauth/okta/callback"], ["google", "Google", GOOGLE_ISSUER, "/oauth/google/callback"]]);
+  expect(fetched).toEqual([]);
+  const okta = providers[0]!;
+  const url = new URL(await okta.authorizeUrl({ redirectUri: "https://grayboard.example.com/oauth/okta/callback", state: "s", nonce: "n", challenge: "c" }));
+  expect(url.origin + url.pathname).toBe(OKTA_ISSUER + "/v1/authorize");
+  expect(url.searchParams.get("client_id")).toBe("okta-client");
+  await expect(okta.exchange({ code: "c", verifier: "v", redirectUri: "https://grayboard.example.com/oauth/okta/callback", nonce: "n" })).rejects.toThrow("token");
+  expect(tokenAuthorization!).toBe("Basic " + Buffer.from("okta-client:okta-private").toString("base64"));
+  expect(defaultProviders({ ...base, idps: ["google", "okta"] }).map(p => p.id)).toEqual(["google", "okta"]);
+  expect(defaultProviders({ ...base, idps: ["okta"] }).map(p => p.id)).toEqual(["okta"]);
 });

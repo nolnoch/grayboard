@@ -1,4 +1,4 @@
-// A generic OpenID Connect provider behind the AS (#928, docs/future/okta-idp.md D2): Okta is its configuration.
+// A generic OpenID Connect provider behind the AS (#928, docs/architecture.md §3): Okta is its configuration.
 // Discovery is lazy and cached, never fetched at construction; the provider's own fetches refuse redirects, time out
 // and bound the body; JWKS is jose's, with each verification capped by an overall deadline. `exchange` returns only
 // after every check held (D1), the email's domain among them (D5).
