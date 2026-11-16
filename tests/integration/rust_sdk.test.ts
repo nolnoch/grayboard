@@ -1,5 +1,5 @@
 // The Rust SDK's example (sdk/rust/grayboard/examples/roundtrip.rs) against a
-// real server over HTTP, as a queue worker (#929 D7 stage 3): it binds, subscribes
+// real server over HTTP, as a queue worker (#929 stage 3; docs/sdk-rust.md §2): it binds, subscribes
 // to a queue board in push mode and opens its delivery stream; a TS hosted
 // session posts a work item and sends it a DM; the example takes both from the
 // stream, receipts them, replies in the item's thread and dm_acks the DM, then

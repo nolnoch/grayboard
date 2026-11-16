@@ -1,4 +1,4 @@
-//! The one error type every call returns (#929 D2).
+//! The one error type every call returns (#929; `docs/sdk-rust.md` §1).
 
 use std::time::Duration;
 

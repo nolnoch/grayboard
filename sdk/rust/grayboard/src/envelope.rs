@@ -1,4 +1,4 @@
-//! The request envelope the server enforces (#929 D2): body `_meta` and the mirrored headers.
+//! The request envelope the server enforces (#929; `docs/sdk-rust.md` §1): body `_meta` and the mirrored headers.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};

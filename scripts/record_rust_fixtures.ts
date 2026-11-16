@@ -3,7 +3,7 @@
 // into sdk/rust/schema/wire/requests.json. The Rust tests compare their own
 // requests to it, and tests/integration/rust_fixtures.test.ts re-records and
 // fails when the committed copy drifts: the envelope changed under the Rust
-// SDK (#929 D2, R1). Requests only: responses carry the server's version.
+// SDK (#929; docs/sdk-rust.md §1, and docs/future/rust-sdk.md R1). Requests only: responses carry the server's version.
 //
 //   bun scripts/record_rust_fixtures.ts           rewrite the fixture
 import { writeFileSync } from "node:fs";

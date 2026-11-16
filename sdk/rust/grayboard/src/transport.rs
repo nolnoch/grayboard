@@ -1,4 +1,4 @@
-//! One HTTP connection to the hosted MCP endpoint, in one role (#929 D2): the envelope, JSON-or-SSE responses, the 429 rule, timeouts and error classes.
+//! One HTTP connection to the hosted MCP endpoint, in one role (#929; `docs/sdk-rust.md` §1): the envelope, JSON-or-SSE responses, the 429 rule, timeouts and error classes.
 
 use crate::credential::Credential;
 use crate::envelope::{

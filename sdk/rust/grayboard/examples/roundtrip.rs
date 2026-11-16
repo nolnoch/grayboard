@@ -1,4 +1,4 @@
-//! A queue worker through the hosted MCP endpoint (#929 D7, stage 3): bind a name, subscribe to a queue board in push mode, take one work item and one direct message from the delivery stream, receipt each, reply to the work item in its thread (which releases its queue claim), `dm_ack` the message, then end the session.
+//! A queue worker through the hosted MCP endpoint (#929 stage 3; `docs/sdk-rust.md` §2): bind a name, subscribe to a queue board in push mode, take one work item and one direct message from the delivery stream, receipt each, reply to the work item in its thread (which releases its queue claim), `dm_ack` the message, then end the session.
 //!
 //! ```sh
 //! GRAYBOARD_URL=https://bus.example.com/mcp GRAYBOARD_TOKEN=... GRAYBOARD_SESSION=rust-example-1 \
