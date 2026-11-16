@@ -1,6 +1,6 @@
 // #807 P1b-4d: retention and the claim expiry timer write through the server's write queue (D4). One that starts
 // while another body holds the queue waits behind it, instead of opening a transaction beside it.
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +53,9 @@ test("#807: a server claim expiry timer's sweep waits behind another body holdin
   repo.aliases.create({ scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
   createBoard(db, "a@example.com/be", "e2e", "test");
   claim(db, "a@example.com/be", "soon", { board: "e2e", ttl_minutes: 0.001 });
+  // The old sync sweep would hit the queue's top-level guard and retry 5s later: a failure is a test failure.
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  cleanups.push(() => errors.mockRestore());
   const holder = hold(db);
   timer.arm();
   await Bun.sleep(150);
@@ -61,5 +64,6 @@ test("#807: a server claim expiry timer's sweep waits behind another body holdin
   expect(rows(db)).toEqual(["soon"]);
   holder.release();
   await holder.done;
-  await until(() => rows(db).length === 0, 5000, "the expired claim was swept");
+  await until(() => rows(db).length === 0, 2000, "the expired claim was swept");
+  expect(errors.mock.calls.map(c => c.map(String).join(" ")).filter(m => m.includes("claim expiry"))).toEqual([]);
 });

@@ -162,11 +162,13 @@ export class SlackBridge implements SlackLinker {
   /** Remove a user's link and their human identity. False if they had none. */
   // One transaction through the write queue (#807 D4); the human goes offline after it commits, so a rolled-back
   // unlink leaves it linked and attached.
-  unlink(userId: number): Promise<boolean> {
+  // `slackUser`: only that Slack account's link (the Slack `unlink` command), re-checked inside the write, since a
+  // relink to another account may have committed while it waited.
+  unlink(userId: number, slackUser?: string): Promise<boolean> {
     const { repo, db } = this.o;
     return repo.write(() => {
       const link = repo.slack.linkFor(userId);
-      if (!link) return false;
+      if (!link || (slackUser !== undefined && link.slack_user !== slackUser)) return false;
       repo.slack.unlink(userId);
       // Unread DMs to an identity nobody reads would only pile up; a later link
       // starts from the newest message (see linkUser).
@@ -415,7 +417,13 @@ export class SlackBridge implements SlackLinker {
         }), undefined, "Slack file audit"),
     });
     try {
-      ({ session } = await application.attachHuman(authed, sink));
+      // Checked again inside attachHuman's write: an unlink, relink, disable or stop may have committed while it
+      // waited in the queue.
+      ({ session } = await application.attachHuman(authed, sink, () => {
+        if (this.stopped) return "the Slack bridge stopped";
+        const now = repo.slack.linkFor(link.user_id);
+        return now && now.slack_user === link.slack_user && now.dm_channel === link.dm_channel ? null : "the Slack link changed";
+      }));
       this.linked.set(link.user_id, { link, session, relay });
       application.replay(session);
     } catch (e) {
@@ -453,8 +461,8 @@ export class SlackBridge implements SlackLinker {
       if (code) return this.linkUser(user, channel, ts, code[1]!);
       if (/^unlink$/i.test(text)) {
         const link = this.o.repo.slack.linkBySlackUser(user);
-        if (link) await this.unlink(link.user_id);
-        return this.say(channel, ts, link ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
+        const unlinked = link ? await this.unlink(link.user_id, user) : false;
+        return this.say(channel, ts, link && unlinked ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
       }
     }
     const link = this.o.repo.slack.linkBySlackUser(user);

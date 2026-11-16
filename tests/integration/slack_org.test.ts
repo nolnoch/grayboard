@@ -360,13 +360,22 @@ test("#807: an HTTP unlink while another body holds the write queue waits, then 
   await link(alice);
   const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
   const holder = holdQueue();
-  const unlinked = api(alice, "POST", "/api/slack/unlink");
-  await ticks(20);
+  const unlinked = srv.app.slack!.unlink(userId);
+  await ticks();
   expect(srv.app.repo.slack.linkFor(userId)).toBeDefined();
   holder.release();
   await holder.done;
-  expect((await unlinked).status).toBe(200);
+  expect(await unlinked).toBe(true);
   expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+});
+
+test("#807: an unlink for one Slack account leaves a link that moved to another account while it waited", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  expect(await srv.app.slack!.unlink(userId, "U0SOMEONEELSE")).toBe(false);
+  expect(srv.app.repo.slack.linkFor(userId)).toMatchObject({ slack_user: ALICE_SLACK });
+  expect(await srv.app.slack!.unlink(userId, ALICE_SLACK)).toBe(true);
 });
 
 test("#807: a rolled-back unlink leaves the link and its human online", async () => {

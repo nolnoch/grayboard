@@ -465,3 +465,11 @@ test("#807: a rolled-back attachHuman leaves the earlier bridge connection in pl
   expect(first.active).toBe(true);
   expect(application.inbox(first)).toBeDefined();
 });
+
+test("#807: attachHuman refuses inside its write when the bridge's check went stale, and registers nothing", async () => {
+  const first = (await application.attachHuman(alice, delivery())).session;
+  const rows = store.db.query("SELECT COUNT(*) AS n FROM binding_events").get();
+  await expect(application.attachHuman(alice, delivery(), () => "the Slack link changed")).rejects.toThrow("the Slack link changed");
+  expect(first.active).toBe(true);
+  expect(store.db.query("SELECT COUNT(*) AS n FROM binding_events").get()).toEqual(rows);
+});
