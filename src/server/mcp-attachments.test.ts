@@ -49,7 +49,7 @@ beforeEach(async () => {
   await seed(store.repo, () => store.repo.aliases.create({ scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email));
   gate = new UploadGate(1024, 1024);
   application = createApplication(store.repo, store.db);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: p => oauth.isAuthorized(p) });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r) => oauth.isAuthorized(p, r) });
   const principal = oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
   if (principal instanceof Response) throw new Error("fixture auth failed");
   await hosted.bind(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "attachment-root" }), { name: "be" });

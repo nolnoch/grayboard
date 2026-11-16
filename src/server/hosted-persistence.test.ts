@@ -1,3 +1,4 @@
+import type { Read } from "./store/tx.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,7 +26,7 @@ const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCO
 function open() {
   database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
   application = createApplication(database.repo, database.db);
-  const isAuthorized = (p: OAuthPrincipal) => database.repo.oauth.isGrantActive(database.repo.read, p.grantId, now);
+  const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.oauth.isGrantActive(r, p.grantId, now);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized });
   delivery = createDelivery(hosted, { isAuthorized });
 }

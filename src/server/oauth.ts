@@ -592,9 +592,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   });
   // A live access token and its user's email, by hash. Both reads are cached in the Repo on
   // authGeneration (#853), so the hot path skips the token-grant-user join, and share one read of it (#881).
-  function activeAccess(accessHash: string): { access: OAuthAccess; email: string } | undefined {
+  // `r`: the Tx of the body the check runs in (hosted's in-body checks, #998), read uncached; else the pool.
+  function activeAccess(accessHash: string, r: Read = repo.read): { access: OAuthAccess; email: string } | undefined {
     return repo.authRead(() => {
-      const access = repo.oauth.findActiveAccess(repo.read, accessHash, resource, [], now());
+      const access = repo.oauth.findActiveAccess(r, accessHash, resource, [], now());
       if (!access) return undefined;
       const email = repo.users.activeEmail(access.userId);
       return email === undefined ? undefined : { access, email };
@@ -626,9 +627,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         sourceKey: sourceKeyFor(access.clientId, clients), scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
     },
     isGrantActive(grantId: string): boolean { return !closed && repo.oauth.isGrantActive(repo.read, grantId, now()); },
-    isAuthorized(principal: OAuthPrincipal): boolean {
+    isAuthorized(principal: OAuthPrincipal, r?: Read): boolean {
       if (closed || principal.accessExpiry <= now()) return false;
-      const a = activeAccess(principal.accessHash)?.access;
+      const a = activeAccess(principal.accessHash, r)?.access;
       return !!a && principal.scopes.every(s => a.scopes.includes(s)) && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
     },
     close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); },

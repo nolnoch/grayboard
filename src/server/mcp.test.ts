@@ -1359,10 +1359,11 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
     expect(listed.isError).not.toBe(true);
     const rowReads = query.mock.calls.filter(([s]) => String(s) === "SELECT * FROM hosted_sessions WHERE session_id = ?").length;
     // Before #902: nine row reads (authorize's own, besides the exchange's and the tool's hosted gates), and the
-    // user check outside the grant check's generation read. Before #907: eight. Now five: the exchange's gate reads
-    // the row and settles it; the tool's gate checks the exchange's verdict still holds, fences in its transaction
-    // and touches the call's end. The bound instructions reuse the verdict's root, and the exchange skips its end touch.
-    expect(rowReads).toBe(5);
+    // user check outside the grant check's generation read. Before #907: eight; before #998: five. Now four: the
+    // exchange's gate reads the row and settles it; the tool's gate checks the exchange's verdict still holds and
+    // fences in its transaction. The bound instructions reuse the verdict's root, the exchange skips its end touch,
+    // and the call ends inside the touch window, so its end touch reads nothing.
+    expect(rowReads).toBe(4);
     expect({ pinned, unpinned }).toEqual({ pinned: 1, unpinned: 0 });
   } finally { query.mockRestore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
 });

@@ -134,7 +134,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
     return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorized(principal);
   } });
-  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: principal => oauth.isAuthorized(principal) });
+  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
   const delivery = createDelivery(hosted, { isAuthorized: principal => oauth.isAuthorized(principal), now, caps: caps.leases });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();

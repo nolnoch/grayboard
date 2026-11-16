@@ -83,6 +83,30 @@ test("#807 audit: withGate authorizes outside the transaction (the auth cache se
   } finally { service.close(); }
 });
 
+test("#998: an access check inside a hosted body reads on that body's Tx, one outside on the pool", async () => {
+  const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const service = createHostedSessions(application, { now: () => now, isAuthorized: (_p, r) => {
+    checks.push({ inTxn: database.db.inTransaction, handle: r === undefined || r === database.repo.read ? "pool" : "tx" });
+    return true;
+  } });
+  try {
+    await service.bind(principal, context("check-root"), { name: "check-peer", create: true });
+    await service.register(principal, context("check-root"), "check-child");
+    await service.run(principal, context("check-child"), "dm_send", (session, tx) => application.send(tx, session, "check-peer", "checked"));
+    // A register under another grant reattaches the root (attach), which checks again after its fence.
+    await service.register({ ...principal, grantId: "G2" }, context("check-root"), "check-child-2");
+    // A gate that waited behind another body checks again inside its own.
+    let release!: () => void;
+    const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
+    const call = service.whoami(principal, context("check-root"));
+    await Bun.sleep(0);
+    release();
+    await holder; await call;
+    expect(checks.filter(c => c.inTxn).length).toBeGreaterThan(2);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { service.close(); }
+});
+
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
   const invalidations: (string | null)[] = [];
@@ -1449,8 +1473,9 @@ test("#881: a request reads its row once and skips its own user's disabled read;
     const rowReads = () => count("SELECT * FROM hosted_sessions WHERE session_id = ?"), userReads = () => count("SELECT * FROM users WHERE id = ?");
     query.mockClear();
     await hosted.whoami(principal, root);
-    // withGate's before-gate read, settle's (rowFor reuses it) and touchAfter's; before #881, four and one user read.
-    expect(rowReads()).toBe(3);
+    // withGate's before-gate read and settle's (rowFor reuses it); the call ends inside the touch window, so its end
+    // opens no transaction (#998). Before #881, four and one user read; before #998, three.
+    expect(rowReads()).toBe(2);
     expect(userReads()).toBe(0);
     // Positive case: settle with no authorized user (the sweep's and mcp authorize's) still reads, and ends.
     await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]));
@@ -1562,6 +1587,24 @@ test("a call within the touch window leaves last_seen_at; one past it moves it, 
   expect(seen("root")).toBe(before);
   now += 1; await hosted.whoami(principal, context("root"));
   expect(seen("root")).toBe(before + 200);
+});
+
+test("a call's end touches a child whose own last_seen_at left the touch window while its root's hadn't, under either gate (#998)", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.register(principal, context("root"), "child");
+  const seen = (raw: string) => database.repo.hosted.get(database.repo.read, hostedId(raw))!.last_seen_at;
+  for (const mode of ["full", "prior"] as const) {
+    now += 60_000;
+    // The child last acted 4 s ago, its root just now: the call's start touches neither, and its end must touch the child.
+    await seed(database.repo, () => {
+      database.db.run("UPDATE hosted_sessions SET last_seen_at = ? WHERE session_id = ?", [now - 4_000, hostedId("child")]);
+      database.db.run("UPDATE hosted_sessions SET last_seen_at = ? WHERE session_id = ?", [now, hostedId("root")]);
+    });
+    const verdict = mode === "prior" ? (await hosted.snapshot(principal, context("child"), false)).verdict : undefined;
+    const start = now;
+    await hosted.run(principal, context("child"), "dm_send", (session, tx) => { now += 2_000; return application.send(tx, session, "be", `${mode} end`); }, undefined, verdict);
+    expect([mode, seen("child"), seen("root")]).toEqual([mode, now, start]);
+  }
 });
 
 test("a child's native tool call under its exchange's verdict coalesces its touches and its root's (#912)", async () => {
