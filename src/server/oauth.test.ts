@@ -486,6 +486,27 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
   } finally { log.mockRestore(); }
 });
 
+// #933: a listed client's document unavailable or invalid writes its CIMD row with the refusal's one decision, so
+// 1,000 token posts write at most the token_refusal burst; an unavailable post spends its address as a refusal.
+test("token posts naming a listed client whose document is down or invalid write at most the refusal burst of CIMD rows", async () => {
+  service.close(); config.oauthGlobalLimit = { burst: 5, perSec: 0.001 }; config.oauthLimit = { burst: 3, perSec: 0.001 };
+  const post = (key: string) => service.fetch(new Request(base + "/oauth/token", { method: "POST",
+    body: new URLSearchParams({ grant_type: "refresh_token", client_id: "https://client.example/client.json", refresh_token: random() }) }), { key }).then(r => r!.status);
+  service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => { throw new Error("upstream down"); } });
+  for (let i = 0; i < 1000; i++) expect(await post(`down-${i}`)).toBe(503);
+  expect(accessAudits(storage.db, "oauth.cimd_failed").map(a => a.detail)).toEqual(Array(5).fill({ category: "unavailable" }));
+  // Charged as a refusal: one address retrying is refused by its own bucket.
+  const statuses = [];
+  for (let i = 0; i < 4; i++) statuses.push(await post("retrying"));
+  expect(statuses).toEqual([503, 503, 503, 429]);
+
+  service.close(); clock += 10_000_000;
+  service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => "not a metadata document" });
+  for (let i = 0; i < 1000; i++) expect(await post(`invalid-${i}`)).toBe(401);
+  expect(accessAudits(storage.db, "oauth.cimd_refused").map(a => a.detail)).toEqual(Array(5).fill(null));
+  expect(storage.db.query("SELECT 1 FROM access_log WHERE action = 'oauth.request_refused'").all()).toHaveLength(5);
+});
+
 test("CIMD, domain and unexpected OAuth failures retain safe audit categories", async () => {
   service.close();
   service = makeService({ resolve: async () => [{ address: "8.8.8.8", family: 4 }], read: async () => { throw new Error("Bearer PRIVATE\n at f (/private/refresh-token.ts:1:1)"); } });
