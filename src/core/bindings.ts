@@ -97,6 +97,15 @@ export function tooManyHolds(held: string[]): string {
 export const DEFAULT_IDLE_SECONDS = 900;
 
 /**
+ * How often a local call moves an address's or session's last_seen, at most
+ * (#148 18, #894): each touch is a write, and a write waits out another
+ * process's write lock (busy_timeout, 5 s) even for a read-only call.
+ * Presence ages are minutes, the stale-recipient warning an hour and the
+ * child window DEFAULT_IDLE_SECONDS, so the lag doesn't show.
+ */
+export const TOUCH_EVERY_MS = 30_000;
+
+/**
  * How many child sessions (#523) one root may have at once, in both modes. A
  * hosted child's row ends at its subagent's end; a local child has no end of
  * its own, so it counts only while seen within DEFAULT_IDLE_SECONDS.

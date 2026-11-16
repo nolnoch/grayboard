@@ -14,7 +14,7 @@ import type { Database } from "bun:sqlite";
 import { ALIAS_SESSION_SQL, cleanFact, declareHuman, ensureAlias, humanHandles, idCollisionText, isHuman, registerId, setAliasMeta, setIdFacts, touchAlias, touchId, viewers, type AliasMetaSet, type IdSessionFacts } from "../core/boards.ts";
 import { coreAuditSink, writeCoreAudit } from "../core/audit.ts";
 import { CoreError } from "../core/errors.ts";
-import { aliasHeldText, childCapacity, childSessionId, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, DEFAULT_IDLE_SECONDS, MAX_CANDIDATES, MAX_CHILDREN, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
+import { aliasHeldText, childCapacity, childSessionId, continuityOf, dropHold, holdAlias, holdsOf, lastWasRelease, logBinding, closestNames, orderCandidates, primaryOf, tooManyHolds, unknownNameError, DEFAULT_IDLE_SECONDS, MAX_CANDIDATES, TOUCH_EVERY_MS, MAX_CHILDREN, MAX_HOLDS, type Candidate } from "../core/bindings.ts";
 import { listClaims } from "../core/claims.ts";
 import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
@@ -227,12 +227,13 @@ export function registerChild(db: Database, root: string, child: string, raw: st
  * The child sessions (#523) one root's process has seen inside the idle
  * window, by the harness's raw subagent id. `resolve` gives a raw id's child
  * ID at `now`: registered (registerChild, which caps them) on first sight or
- * once it went quiet, then touched. A child unseen past DEFAULT_IDLE_SECONDS
- * is forgotten, so a long session's finished subagents hold neither a place
- * nor memory.
+ * once it went quiet, then touched at most once per TOUCH_EVERY_MS, so a
+ * child's read-only call soon after its last takes no write lock (#894). A
+ * child unseen past DEFAULT_IDLE_SECONDS is forgotten, so a long session's
+ * finished subagents hold neither a place nor memory.
  */
 export class ChildSessions {
-  readonly #seen = new Map<string, { id: string; at: number }>();
+  readonly #seen = new Map<string, { id: string; at: number; touched: number }>();
   constructor(private readonly db: Database, private readonly root: string, private readonly rootKey: string) {}
   get size(): number {
     return this.#seen.size;
@@ -243,9 +244,15 @@ export class ChildSessions {
     if (child === undefined) {
       const id = childSessionId(this.rootKey, raw);
       registerChild(this.db, this.root, id, raw, now);
-      this.#seen.set(raw, (child = { id, at: now }));
-    } else child.at = now;
-    touchId(this.db, child.id, now);
+      this.#seen.set(raw, (child = { id, at: now, touched: now }));
+      touchId(this.db, id, now);
+      return id;
+    }
+    child.at = now;
+    if (now - child.touched >= TOUCH_EVERY_MS) {
+      touchId(this.db, child.id, now);
+      child.touched = now;
+    }
     return child.id;
   }
 }
@@ -484,15 +491,16 @@ const ORPHAN_WHERE = `ended_at IS NULL AND (
  * process is gone, and orphans (ORPHAN_WHERE). Tools-only processes (#284 S7)
  * and viewers (S9) are ended like any session but never returned: they own
  * no shell, take no name and can't be reached. The probe runs before the write lock; each
- * candidate is re-checked inside it.
+ * candidate is re-checked inside it. `end: false` only reads: the dead are
+ * left out of `alive` but not ended, so the call takes no write lock (#894).
  */
-export function liveSessions(db: Database): Ended & { alive: SessionRow[] } {
+export function liveSessions(db: Database, opts: { end?: boolean } = {}): Ended & { alive: SessionRow[] } {
   const rows = (db.prepare(SESSION_SQL).all() as RawSessionRow[]).map(sessionRow);
   const { alive: live, dead } = aliveRows(rows);
   const silent = new Set((db.prepare(`SELECT id FROM ids WHERE (delivery = 'none' OR viewer = 1) AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
   const alive = live.filter((r) => !silent.has(r.session_id));
   const orphans = db.prepare(`SELECT id FROM ids WHERE ${ORPHAN_WHERE}`).all() as { id: string }[];
-  if (!dead.length && !orphans.length) return { alive, ...nothingEnded() };
+  if (opts.end === false || (!dead.length && !orphans.length)) return { alive, ...nothingEnded() };
   testPause("end:before-txn");
   // Each candidate ends in its own transaction (#284 S3): one end that fails
   // is logged and audited, and leaves the others ended and this opener

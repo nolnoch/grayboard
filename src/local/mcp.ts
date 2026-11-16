@@ -14,7 +14,7 @@ import { boardNotification, dmNotification, fenceChannel, type Pending } from ".
 import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote, wrapperNote } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, TOUCH_EVERY_MS, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote, wrapperNote } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -1087,10 +1087,11 @@ async function liveHandles(self: string[], among?: string[]): Promise<(h: string
 }
 
 // Live sessions with no name yet, for peer_list, with the status each set as
-// its ID, delivering what ending the dead ones it found produced.
+// its ID.
 async function unboundPeers(): Promise<UnboundPeer[]> {
-  const { alive, ...ended } = liveSessions(db);
-  await deliverEnded(db, ended);
+  // A read: the dead sessions it skips are ended by the next open or bind,
+  // not here, so peer_list takes no write lock (#894).
+  const { alive } = liveSessions(db, { end: false });
   const unbound = alive.filter((r) => r.name === null);
   const statuses = new Map(
     (
@@ -1405,10 +1406,7 @@ async function unbind(a: Record<string, unknown>, signal: AbortSignal) {
 
 
 // A call's last_seen touches (#148 18), at most one per address per
-// TOUCH_EVERY_MS: each is a write, and a write waits out another process's
-// write lock (busy_timeout, 5 s) even for a read-only call. Presence ages are
-// minutes and the stale-recipient warning an hour, so the lag doesn't show.
-const TOUCH_EVERY_MS = 30_000;
+// TOUCH_EVERY_MS.
 // The board tools that only read, so a call needs no write lock at all.
 const READ_ONLY_BOARD_TOOLS = new Set(["board_list", "peer_list", "claim_list"]);
 const touchedAt = new Map<string, number>();
