@@ -12,6 +12,7 @@ import {
   type AttachmentFile, type AttachmentInfo, type AttachmentLimits,
 } from "../shared/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
+import { immediateTx, type WriteTx } from "./write_tx.ts";
 
 export type AttachmentRow = AttachmentInfo & {
   uploader: string;
@@ -47,11 +48,6 @@ export interface BlobStore {
   // Missing bytes are fine.
   delete(sha256: string): Promise<void>;
 }
-
-// Runs one write transaction. Local mode runs it now (immediateTx); the server queues it behind its other writes
-// (#807 D4), so a store, release or sweep awaits it. fn is synchronous: nothing awaits inside a transaction.
-export type WriteTx = <T>(fn: () => T) => T | Promise<T>;
-export const immediateTx = (db: Database): WriteTx => fn => db.transaction(fn).immediate();
 
 // Uploads and sweeps of one sha256 run one at a time in this process, so a
 // sweep can't delete bytes an upload has just put. A store other processes

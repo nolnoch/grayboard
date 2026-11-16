@@ -16,12 +16,11 @@ import {
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
-import { participant, type MessageRow, type Repo, type Sync } from "./db.ts";
+import { participant, queuedTx, type MessageRow, type Repo, type Sync } from "./db.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
-import { queuedTx } from "./attachments.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
   ALIAS_SESSION_SQL, HOLD_ORDER, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
@@ -214,13 +213,19 @@ type Hub = {
   boardChanged: (board: string) => void;
 };
 
+// A push its reader can no longer see, acknowledged as pendingFor finds it: posted through the write queue (#807 D4),
+// since the reads that find it run outside any transaction.
+const lostAck = (hub: Hub) => (handle: string, ref: PendingRef) => {
+  hub.repo.post(() => acknowledge(hub.db, handle, ref), undefined, "lost-visibility push ack");
+};
+
 // Send this session everything pending on boards, for any of its addresses,
 // that it hasn't been sent: a subscription taken as the ID while unbound and
 // the alias's own both deliver. all: also deferred pushes and digests (at
 // hello; see pendingFor).
-function drainBoards(session: ApplicationSession, db: CoreDb, all = false): void {
+function drainBoards(session: ApplicationSession, hub: Hub, all = false): void {
   for (const address of session.addresses) {
-    for (const item of pendingFor(db, address, { all })) {
+    for (const item of pendingFor(hub.db, address, { all, ack: lostAck(hub) })) {
       const key = pendingKey(refOf(item));
       const sent = session.inflight.get(key);
       if (sent) {
@@ -248,7 +253,7 @@ function drainDirect(hub: Hub, session: ApplicationSession, addresses: string[])
 function wake(hub: Hub, handles: string[]): void {
   afterCommit(hub.db, () => {
     for (const session of new Set(handles.map((h) => hub.registry.get(h)))) {
-      if (session?.active) drainBoards(session, hub.db, session.human);
+      if (session?.active) drainBoards(session, hub, session.human);
     }
   });
 }
@@ -503,7 +508,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Announces claims that lapse on their boards.
   // Armed from requests, it fires for every holder: detached, so its rows
   // don't carry the arming request's address (security audit F-19).
-  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged);
+  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged, queuedTx(repo));
   const expiry = { arm: () => detached(() => expiryTimer.arm()), stop: () => expiryTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
@@ -696,25 +701,33 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
 
   // The Slack bridge's in-process human (S16): no ID and no ids row.
   // It holds email/human and logs bind events under the literal `human`.
-  async function attachHuman(authed: AuthedUser, sink: DeliverySink): Promise<{ session: ApplicationSession; ok: HelloResult }> {
+  // Its alias, audit and binding row commit in one transaction through the write queue (#807 D4); the registry
+  // changes after the commit, so a rolled-back attach leaves an earlier connection in place. `current` runs inside
+  // that transaction: the bridge's checks went stale while the write waited (an unlink or stop queued ahead of it).
+  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: () => string | null): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
-    if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
-    if (!repo.aliases.find(addr)) {
-      repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
-      writeAudit(repo, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
-      onAliasCreated(db, repo, authed.user_id, addr);
-    }
-    const session = new ApplicationSession(authed, sink, true, true);
-    session.primary = addr;
-    session.addresses = [addr];
-    // A bridge connection never pongs: a newer one for the user replaces it.
-    const prev = hub.registry.get(addr);
-    if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
-    hub.sessions.add(session);
-    hub.registry.set(addr, session);
-    touchAlias(db, addr);
-    logBinding(db, HUMAN_NAME, addr, "bound");
-    return { session, ok: { id: HUMAN_NAME, ...helloOkFields(hub, authed) } };
+    return repo.write(() => {
+      if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
+      const stale = current?.();
+      if (stale) fail("unauthenticated", stale);
+      if (!repo.aliases.find(addr)) {
+        repo.aliases.create({ scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
+        writeAudit(repo, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
+        onAliasCreated(db, repo, authed.user_id, addr);
+      }
+      touchAlias(db, addr);
+      logBinding(db, HUMAN_NAME, addr, "bound");
+    }, () => {
+      const session = new ApplicationSession(authed, sink, true, true);
+      session.primary = addr;
+      session.addresses = [addr];
+      // A bridge connection never pongs: a newer one for the user replaces it.
+      const prev = hub.registry.get(addr);
+      if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
+      hub.sessions.add(session);
+      hub.registry.set(addr, session);
+      return { session, ok: { id: HUMAN_NAME, ...helloOkFields(hub, authed) } };
+    });
   }
 
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
@@ -999,7 +1012,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       afterCommit(db, () => {
         valid(session, true);
         drainDirect(hub, session, addresses ?? session.addresses);
-        drainBoards(session, db, true);
+        drainBoards(session, hub, true);
       });
     },
     send(
@@ -1037,7 +1050,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const seen = new Set<string>();
       const all: Pending[] = [];
       for (const a of session.addresses) {
-        for (const item of pendingFor(db, a, { all: true })) {
+        for (const item of pendingFor(db, a, { all: true, ack: lostAck(hub) })) {
           const key = pendingKey(refOf(item));
           if (!seen.has(key)) { seen.add(key); all.push(item); }
         }

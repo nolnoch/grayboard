@@ -1,18 +1,12 @@
 // Who may read an attachment on the server: the HTTP download route and the
 // Slack bridge's human identities ask the same question.
-import { attachmentReach, getAttachment, releaseUpload, storeAttachment, type AttachmentRow, type WriteTx } from "../core/attachments.ts";
+import { attachmentReach, getAttachment, releaseUpload, storeAttachment, type AttachmentRow } from "../core/attachments.ts";
 import type { CoreDb } from "../core/boards.ts";
 import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
-import { participant, type Repo, type Sync } from "./db.ts";
+import { participant, queuedTx, type Repo } from "./db.ts";
 import { addressSet } from "../core/bindings.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest } from "./policy.ts";
-
-// Core's attachment writes (store, release, blob sweep) through the server's write queue (#807 D4). Core's bodies
-// are synchronous, so the cast only restates that.
-export function queuedTx(repo: Repo): WriteTx {
-  return <T>(fn: () => T) => repo.write(fn as () => Sync<T>) as Promise<T>;
-}
 
 // The read request for attachment `idText`, judged by authorize(): `handle` may read it on a post on a board it can see,
 // on a direct message it sent or received, or its own unsent upload. A

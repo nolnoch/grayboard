@@ -15,6 +15,8 @@ export class FakeSlack {
   acks: string[] = [];
   opens = 0;
   failPosts = 0;
+  /** Called with each chat.postMessage body before it's answered. */
+  onPost: ((body: Record<string, any>) => void) | null = null;
   badAppToken = false;
   /** An error files.getUploadURLExternal answers with, e.g. "file_type_not_allowed". */
   refuseUploads: string | null = null;
@@ -66,6 +68,7 @@ export class FakeSlack {
           this.opens++;
           return Response.json({ ok: true, url: `ws://localhost:${this.server.port}/ws` });
         case "chat.postMessage":
+          this.onPost?.(body);
           if (this.failPosts > 0) {
             this.failPosts--;
             return new Response("unavailable", { status: 503 });

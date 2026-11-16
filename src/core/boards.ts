@@ -1498,7 +1498,9 @@ export const DIGEST_SQL = `SELECT s.board, s.cursor,
 // back only alongside a waking push, or with `all` (a session's first drain,
 // a drain that's delivering direct messages, or a human's session). Any
 // notification wakes an idle agent, and drains also run on liveness probes.
-export function pendingFor(db: Database, handle: string, opts: { all?: boolean } = {}): Pending[] {
+// `ack`: how a push the reader can no longer see is acknowledged (default: now, on db); the server posts it through
+// its write queue (#807 D4).
+export function pendingFor(db: Database, handle: string, opts: { all?: boolean; ack?: (handle: string, ref: PendingRef) => void } = {}): Pending[] {
   const a = access(db);
   const seen = new Map<string, boolean>();
   const visible = (name: string) => {
@@ -1525,7 +1527,7 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean }
   for (const { reason, wake, ...row } of pushes) {
     const p = showPost(row);
     if (visible(p.board)) out.push(wake ? { kind: "push", reason, post: p } : { kind: "push", reason, post: p, deferred: true });
-    else acknowledge(db, handle, { kind: "push", post_id: p.id });
+    else (opts.ack ?? ((h, r) => acknowledge(db, h, r)))(handle, { kind: "push", post_id: p.id });
   }
   if (!opts.all && !out.some((i) => i.kind === "push" && !i.deferred)) return [];
 

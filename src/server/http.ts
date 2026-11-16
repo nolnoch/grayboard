@@ -750,7 +750,7 @@ export async function handleHttp(
   }
   if (path === "/api/slack/link" && method === "POST") return json(slack!.newCode(authed));
   if (path === "/api/slack/unlink" && method === "POST") {
-    return slack!.unlink(authed.user_id) ? json({ ok: true }) : jsonErr("not_found", "you have no Slack link", 404);
+    return (await slack!.unlink(authed.user_id)) ? json({ ok: true }) : jsonErr("not_found", "you have no Slack link", 404);
   }
 
   if (path === "/api/teams" && method === "GET")  return teamList(authed, repo);

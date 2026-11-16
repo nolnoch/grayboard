@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import { ApplicationError } from "../../src/server/application.ts";
+import { writeAudit } from "../../src/server/audit.ts";
 import type { SendResult } from "../../src/shared/protocol.ts";
 import { createHash } from "node:crypto";
 
@@ -15,6 +16,7 @@ import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { queueFor } from "../../src/server/store/queue.ts";
 const DM = "D0ALICE";
 const ALICE_SLACK = "U0ALICE";
 
@@ -345,6 +347,138 @@ test("a thread reply reaches a human only as a DM could", async () => {
   await until(() => posted("now a teammate"));
   expect(posted("not a teammate")).toBe(false);
 }, 30_000);
+
+// #807 D4: an unlink is one transaction through the server's write queue, and the human goes offline only after it commits.
+function holdQueue(): { release: () => void; done: Promise<void> } {
+  let release!: () => void;
+  const done = queueFor(srv.app.db).run(() => new Promise<void>((r) => { release = r; }));
+  return { release, done };
+}
+const ticks = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+
+test("#807: an HTTP unlink while another body holds the write queue waits, then removes the link", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const holder = holdQueue();
+  const unlinked = srv.app.slack!.unlink(userId);
+  await ticks();
+  expect(srv.app.repo.slack.linkFor(userId)).toBeDefined();
+  holder.release();
+  await holder.done;
+  expect(await unlinked).toBe(true);
+  expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+});
+
+// #807 D4: a Slack user's tool call is one transaction through the write queue, as a hosted call is.
+test("#807: a Slack user's dm_send and board_post run inside a write-queue transaction", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  await be.call("board_create", { name: "e2e", purpose: "fixtures" });
+  const app = srv.app.application;
+  const { call, send } = app;
+  const seen: Record<string, boolean> = {};
+  const queued = () => srv.app.db.inTransaction && queueFor(srv.app.db).mine;
+  app.call = (s, n, a, p) => { seen[n] = queued(); return call.call(app, s, n, a, p); };
+  app.send = (s, to, body, o) => { seen.dm_send = queued(); return send.call(app, s, to, body, o); };
+  try {
+    slack.say("#e2e queued post");
+    slack.say("@be queued dm");
+    await until(() => "board_post" in seen && "dm_send" in seen, 5000, "both calls reached the application");
+  } finally { app.call = call; app.send = send; }
+  expect(seen).toEqual({ board_post: true, dm_send: true });
+});
+
+// A refusal's row (rowAfterRollback, application.ts) is written after the rollback that drops the call's other
+// writes (#452), as a hosted call's are: the stub refuses the way send does.
+test("#807: a Slack user's refused call keeps its refusal row", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  await hosted("alice@example.com", "be");
+  const app = srv.app.application;
+  const { send } = app;
+  app.send = (s) => {
+    const row = () => writeAudit(srv.app.repo, "delegation.refused", "alice@example.com", "be", {});
+    if (s.afterRollback) s.afterRollback(row); else row();
+    throw new ApplicationError("forbidden", "stub refusal");
+  };
+  try {
+    slack.say("@be refused");
+    await until(() => slack.posts().find((p) => p.markdown_text?.includes("stub refusal")), 5000, "the refusal reached Slack");
+  } finally { app.send = send; }
+  await until(() => accessAudits(srv.app.db, "delegation.refused").length === 1, 5000, "the refusal row was written");
+});
+
+// #807 D4: a delivered item's receipt and progress clear are one posted write: behind a held queue it waits, and
+// reads the progress written before it.
+test("#807: a Slack delivery receipt waits for the write queue, then stamps the message delivered", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const repo = srv.app.repo;
+  const { post } = repo;
+  const receipts: boolean[] = [];
+  repo.post = (fn, committed, what) => {
+    const now = (post as (...a: unknown[]) => boolean).call(repo, fn, committed, what);
+    if (what === "Slack receipt") receipts.push(now);
+    return now;
+  };
+  let holder: ReturnType<typeof holdQueue> | undefined;
+  // Held as Slack takes the post, so the progress write and the receipt both queue behind it.
+  slack.onPost = (body) => { if (!holder && String(body.markdown_text).includes("receipt fixture")) holder = holdQueue(); };
+  try {
+    const sent = await be.call<SendResult>("dm_send", { to: "human", body: "receipt fixture" });
+    await until(() => receipts.length > 0, 5000, "the relay posted the receipt");
+    expect(receipts).toEqual([false]);
+    const deliveredAt = () => (srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(sent.message_id) as { delivered_at: number | null }).delivered_at;
+    expect(deliveredAt()).toBeNull();
+    holder!.release();
+    await holder!.done;
+    await until(() => deliveredAt() !== null, 5000, "the receipt stamped the message delivered");
+  } finally { repo.post = post; slack.onPost = null; holder?.release(); }
+});
+
+test("#807: an unlink for one Slack account leaves a link that moved to another account while it waited", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  expect(await srv.app.slack!.unlink(userId, "U0SOMEONEELSE")).toBe(false);
+  expect(srv.app.repo.slack.linkFor(userId)).toMatchObject({ slack_user: ALICE_SLACK });
+  expect(await srv.app.slack!.unlink(userId, ALICE_SLACK)).toBe(true);
+});
+
+test("#807: a rolled-back unlink leaves the link and its human online", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const be = await hosted("alice@example.com", "be");
+  srv.app.db.run(`CREATE TRIGGER fail_unlink BEFORE INSERT ON access_log WHEN NEW.action = 'slack.unlinked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
+  const spy = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect((await api(alice, "POST", "/api/slack/unlink")).status).not.toBe(200);
+  } finally { spy.mockRestore(); }
+  expect(srv.app.repo.slack.linkFor(userId)).toBeDefined();
+  expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeDefined();
+  const sent = await be.call<SendResult>("dm_send", { to: "human", body: "still linked?" });
+  expect(sent.delivered_now).toBe(true);
+  await until(() => slack.posts().find((p) => p.markdown_text?.includes("still linked?")));
+});
+
+test("#807: a rolled-back link leaves no link, no human identity and nothing attached", async () => {
+  const alice = await login("alice@example.com");
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  srv.app.db.run(`CREATE TRIGGER fail_link BEFORE INSERT ON access_log WHEN NEW.action = 'slack.linked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
+  const spy = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const r = await api(alice, "POST", "/api/slack/link");
+    slack.say(`link ${r.body.code}`);
+    await until(() => spy.mock.calls.some((c) => c.map(String).join(" ").includes("audit refused")), 5000, "the link's failure was logged");
+  } finally { spy.mockRestore(); }
+  expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+  expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeUndefined();
+  expect((await api(alice, "GET", "/api/whoami")).body.identities).not.toContain("human");
+});
 
 test("thread replies while unlinked don't flood in at relink", async () => {
   const alice = await login("alice@example.com");
