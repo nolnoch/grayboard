@@ -1398,3 +1398,56 @@ async fn a_lease_naming_another_identity_once_reopens_and_serves() {
     assert_eq!(w.count("sub:delivery_open"), 2);
     assert_eq!(w.count("sub:whoami"), 2);
 }
+
+// Re-read after a reopen: an item out and never accepted that a short page no longer shows was withdrawn; its handle says so.
+#[tokio::test]
+async fn an_item_withdrawn_while_out_loses_its_handle_with_that_reason() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    let w = World::start(bus).await;
+    let mut stream = w.s().deliveries();
+    let d = next(&mut stream).await.unwrap();
+    {
+        let mut b = w.bus();
+        b.pending.clear();
+        b.close_streams();
+    }
+    w.until("the reopen's read", |b| ops_count(b, "read") == 2)
+        .await;
+    let why = tokio::time::timeout(Duration::from_secs(5), d.receipt())
+        .await
+        .expect("receipt() resolves");
+    assert!(lost_reason(why).contains("no longer has the item"));
+    assert_eq!(w.count("sub:delivery_receipt"), 0);
+}
+
+// Audit G: the re-read that confirms an accepted item keeps the items ahead of it, handed over after its receipt without another read.
+#[tokio::test]
+async fn a_re_read_keeps_the_items_ahead_of_the_accepted_item() {
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    bus.on("sub:delivery_receipt", |_, b| {
+        b.close_streams();
+        Reply::status(503, "gateway")
+    });
+    // No idle renew in the test: only the kept batch can hand the item ahead over.
+    let w = World::with(bus, |t| t.renew = Duration::from_secs(60)).await;
+    let mut stream = w.s().deliveries();
+    let d = next(&mut stream).await.unwrap();
+    w.bus().on("read", |req, b| {
+        let ahead = json!({"id": "push:5", "actionable": true, "event": {"kind": "board", "item": {"kind": "push", "post": {"id": 5}}}, "ownership": b.ownership, "bind_gen": b.bind_gen});
+        let mut items = vec![ahead];
+        items.extend(b.pending.iter().cloned().map(|mut i| {
+            i["ownership"] = json!(b.ownership);
+            i["bind_gen"] = json!(b.bind_gen);
+            i
+        }));
+        let text = json!({"items": items}).to_string();
+        Reply::result(req, json!({"contents": [{"uri": INBOX, "text": text}]}))
+    });
+    d.receipt().await.unwrap();
+    let reads = w.count("read");
+    assert_eq!(next(&mut stream).await.unwrap().id, "push:5");
+    assert_eq!(w.count("read"), reads, "handed over from the kept batch");
+    assert_eq!(w.count("sub:delivery_receipt"), 2);
+}

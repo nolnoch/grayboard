@@ -25,7 +25,7 @@ const PAGE: usize = 100;
 const ATTEMPT_LIMIT: u32 = 8;
 /// Failures in a row (not outages, not lease losses) that stop the stream.
 const FAILURE_LIMIT: u32 = 8;
-/// Lease losses outside an item, since the lease last proved healthy, that a reopen tolerates.
+/// Lease losses, since the lease last proved healthy, that a reopen tolerates.
 const RECOVERY_LIMIT: u32 = 3;
 /// Admission-throttled reopens before the stream stops with the transport's `RateLimited`.
 const THROTTLE_LIMIT: u32 = 8;
@@ -366,7 +366,7 @@ struct Task {
     attempts: HashMap<String, u32>,
     /// Failures in a row that aren't outages or lease losses; reset by a receipt.
     failures: u32,
-    /// Lease losses outside an item; reset by a healthy renew or receipt.
+    /// Lease losses; reset by a healthy renew or receipt.
     recoveries: u32,
     /// Admission-throttled reopens in a row; reset by a receipt.
     throttles: u32,
@@ -805,12 +805,16 @@ impl Task {
                         ),
                         // Not in the whole inbox: its receipt landed before the lease was lost (or, for an item never accepted, the server withdrew it).
                         None => {
-                            if let Some(Outstanding {
-                                held: Held::Receipting(Some(answer)),
-                                ..
-                            }) = self.outstanding.take()
-                            {
-                                let _ = answer.send(Ok(()));
+                            match self.outstanding.take() {
+                                Some(Outstanding {
+                                    held: Held::Receipting(Some(answer)),
+                                    ..
+                                }) => {
+                                    let _ = answer.send(Ok(()));
+                                }
+                                // Never accepted, so the server withdrew it: the handle can't receipt it.
+                                Some(o) => o.invalidate("the server no longer has the item issued"),
+                                None => {}
                             }
                             self.attempts.remove(&id);
                         }

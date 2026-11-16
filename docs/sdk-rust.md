@@ -3,7 +3,7 @@
 ```doc-meta
 owns: the as-built Rust client SDK for hosted MCP (#929): its transport and wire fixture, raw calls, the delivery stream and its rule table, typed bind/board_subscribe/board_post, the Stage 3 example
 invariants: the SDK speaks only modern MCP as raw JSON-RPC over HTTP; its requests equal hosted-core's recorded wire; only a body-driven 429 and one credential-replaced 401 retry; one delivery item is out at a time; a change to `controller.ts`'s delivery rules names its Rust counterpart; `delivery_release` ends the session, so delivery that goes on rebinds the remembered holds with `create: false`
-code-pointers: sdk/rust/grayboard/src/ (transport.rs, session.rs, delivery.rs, delivery_tests.rs, envelope.rs), sdk/rust/grayboard/examples/roundtrip.rs, sdk/rust/schema/, scripts/record_rust_fixtures.ts, tests/integration/rust_sdk.test.ts, rust_fixtures.test.ts, adapters/hosted-core/src/ (controller.ts, model.ts, wire.ts)
+code-pointers: sdk/rust/grayboard/src/ (transport.rs, session.rs, delivery.rs, delivery_tests.rs, envelope.rs), sdk/rust/grayboard/examples/roundtrip.rs, sdk/rust/schema/, scripts/record_rust_fixtures.ts, tests/integration/rust_sdk.test.ts, tests/integration/rust_fixtures.test.ts, adapters/hosted-core/src/ (controller.ts, model.ts, wire.ts)
 companions: server-hosted-mcp.md §2 (the server contract it is a client of), future/rust-sdk.md (the unbuilt steps 4 to 6), adapters-hosted.md (hosted core, the reference client)
 ```
 
