@@ -17,7 +17,7 @@ function fakeServer(): Fake {
     return new Response(null, { status: 404 });
   } });
   fake.issuer = `http://127.0.0.1:${server.port}`;
-  fake.meta = { issuer: fake.issuer, authorization_endpoint: fake.issuer + "/authorize", token_endpoint: fake.issuer + "/token", code_challenge_methods_supported: ["S256"] };
+  fake.meta = { issuer: fake.issuer, authorization_endpoint: fake.issuer + "/authorize", token_endpoint: fake.issuer + "/token", code_challenge_methods_supported: ["S256"], grayboard_cli_client: "grayboard-cli" };
   fake.stop = () => void server.stop(true);
   return fake;
 }
@@ -56,6 +56,13 @@ test("a callback carrying another state is answered 400 and ignored; the flow's 
   const open = browser([{ state: "someone-elses", error: "access_denied", iss: as.issuer }, { code: "the-code", iss: as.issuer }], statuses);
   expect(await loginThroughServer(as.issuer, open)).toBe("gbrd_v1_test");
   expect(statuses).toEqual([400, 200]);
+});
+
+test("a server whose metadata doesn't name grayboard-cli is refused as too old before the browser opens (#991)", async () => {
+  delete as.meta.grayboard_cli_client;
+  await expect(loginThroughServer(as.issuer, () => { throw new Error("the browser opened"); })).rejects.toThrow(`${as.issuer} is too old for this CLI's sign-in`);
+  as.meta.grayboard_cli_client = "grayboard-pi";
+  await expect(loginThroughServer(as.issuer, () => { throw new Error("the browser opened"); })).rejects.toThrow("too old");
 });
 
 test("metadata naming an endpoint on another origin is refused before the browser opens", async () => {

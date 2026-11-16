@@ -336,8 +336,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], scopes_supported: OAUTH_SCOPES,
       code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
       revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: cimdClients.size > 0, authorization_response_iss_parameter_supported: true,
-      // RFC 8414 §2 extension: an adapter tells an older server apart before it opens a browser (#429).
-      grayboard_builtin_clients: BUILTIN_CLIENT_IDS });
+      // RFC 8414 §2 extensions: an adapter (#429) or the CLI (#991) tells an older server apart before it opens a browser.
+      grayboard_builtin_clients: BUILTIN_CLIENT_IDS, grayboard_cli_client: CLI_CLIENT_ID });
     if (!path.startsWith("/oauth/")) return undefined;
     if (closed) return json({ error: "temporarily_unavailable" }, 503);
     const tokenRoute = req.method === "POST" && (path === "/oauth/token" || path === "/oauth/revoke");
