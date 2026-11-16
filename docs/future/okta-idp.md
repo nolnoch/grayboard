@@ -6,7 +6,7 @@ invariants: a user is found by (issuer, subject), never by email alone once any 
 code-pointers: src/server/auth.ts (verifyGoogleIdToken, exchangeGoogleCode, googleSignIn), src/server/oauth.ts (createOAuthServer: OAuthOptions.exchangeGoogle, the authorize and callback routes, flows/upstream), src/server/http.ts (authConfig, authExchange, devLogin, adminUnlinkIdp), src/server/db.ts (users.signIn, IdpSignIn, idx_users_idp_subject), src/server/config.ts (loadConfig, mcpGoogleConfig), src/server/oauth-config.ts (BUILTINS), src/server/audit.ts, src/cli/oauth_flow.ts, src/cli/cli.ts (login), tests/support/hosted_oauth.ts
 companions: ../architecture.md §3 and ../server-oauth.md §1 (take the as-built facts), postgres-server.md (the store `signIn` is written against), role-bindings.md R1 and service-principals.md (why neither keys on `idp_subject`), ../vision.md (principles 8, 12, 14), ../parity.md
 trigger: #928 scheduled (#807 Stage 3, decision A2): a pilot adopter's Okta-only users can't sign in. Steps 1 to 3 are worth building without it
-last-verified: 2026-11-16 (origin/master 3b6e2d94)
+last-verified: 2026-11-16 (origin/master 3b6e2d94; Okta behaviour against its documentation)
 ```
 
 ## Problem
@@ -23,7 +23,6 @@ Facts in the code that shape it:
 - **The injected `exchangeGoogle` returns an identity**, so every test that uses it skips token verification.
 - **Upstream flow state is process memory** (`flows`, `upstream`), with one callback path, one pinned `iss` and Google's callback parameter list.
 - **Audit actions are a closed union** (`src/server/audit.ts`), three of them named `oauth.google_*`.
-- **`jose` is already a dependency** (`^5.0.0`, Google's JWKS). In the installed 5.x, `createRemoteJWKSet` refetches on an unknown `kid` at most once per 30 s; `jwtVerify` requires `exp` only when asked (`requiredClaims`).
 
 ## Decisions
 
@@ -48,21 +47,20 @@ type IdentityProvider = {
 - **`oauth.ts` keeps what is not provider-specific**: upstream state, PKCE verifier, nonce, the binding cookie, `routeName` and the callback parameter allowlist (both derived from the provider list), and the rule that a callback's `iss` parameter, when present, equals `provider.issuer` before any state is consumed.
 - **Google is `src/server/idp_google.ts`**: today's `verifyGoogleIdToken` and `exchangeGoogleCode` moved unchanged, the same authorize parameters (`hd` included), `issuer` the constant `https://accounts.google.com` whichever of `GOOGLE_ISSUERS`' two spellings the token carried, or one `sub` would key two ways.
 - **`OAuthOptions.exchangeGoogle` becomes `OAuthOptions.providers`**, the same trusted injection. No alias for the old name (principle 12). Its call sites move to one `stubProvider(identity)` in `tests/support/`.
-- #930's IdP re-check adds a method here; not designed in this doc.
 - Rejected: a seam at the HTTP `fetch` level (tests would fake Google's real hosts).
 
 ### D2. The OIDC provider, which Okta configures
 
-`src/server/idp_oidc.ts` is generic OpenID Connect; Okta is its configuration (`id: "okta"`). Whether Entra (#123) is a second configuration is decided there.
+`src/server/idp_oidc.ts` is generic OpenID Connect; Okta is its configuration (`id: "okta"`).
 
 - **Discovery is lazy.** `<issuer>/.well-known/openid-configuration` is fetched on first use, cached an hour, a failure retried after 30 s, in-flight fetches coalesced. Never at startup: a restart during an IdP outage would otherwise take down every user's existing tokens and the other provider's sign-ins.
 - **Discovery checks**: its `issuer` equals the configured string exactly (no URL normalizing, as for the AS's own issuer); every endpoint is `https:` (D6's loopback exemption aside); `S256` is offered.
 - **Every fetch** refuses redirects, times out at 10 s and bounds the body.
-- **JWKS through `jose`'s `createRemoteJWKSet`** with its defaults. An unknown `kid` refetches once per cooldown, so key rotation needs no code. An ID token reaches the verifier only from the token endpoint over TLS, so an outsider can't force refetches.
+- **JWKS through `jose`'s `createRemoteJWKSet`** (already a dependency, for Google's keys) with its defaults. An unknown `kid` refetches once per cooldown, so key rotation needs no code. An ID token reaches the verifier only from the token endpoint over TLS, so an outsider can't force refetches.
 - **No new dependency and no `jose` major bump here** (the lock holds 5.x; the registry is on 6.x). The bump is its own PR. Rejected: `openid-client`, a second dependency for about 150 lines of discovery and exchange.
 - **ID-token checks** (`jwtVerify`): `issuer` exact; `audience` the client ID, with Google's `azp` rules; `algorithms` pinned to an asymmetric allowlist intersected with what discovery offers, never `none` or `HS*` (an HS256 token keyed by the client secret is the classic confusion); `requiredClaims` `exp`, `iat`, `sub`; a 60 s clock tolerance and a 10-minute `maxTokenAge` (the token is seconds old); nonce required, not optional as `verifyGoogleIdToken`'s is today; `sub` a nonempty string of bounded length, stored verbatim.
 - **Client authentication is `client_secret_basic`** with the ID and secret form-encoded before base64 (RFC 6749, section 2.3.1), plus PKCE. `private_key_jwt` waits for a caller (#126).
-- **Claims**: scope `openid email profile`; `sub`, `email`, `email_verified`, `name`. When the ID token carries no `email` (a "thin" token), the provider reads `userinfo` with the access token; userinfo's `sub` must equal the ID token's (OIDC Core, section 5.3.2), and `email` and `email_verified` come from the same document, never one from each. `email_verified` other than `true` is refused.
+- **Claims**: scope `openid email profile`; `sub`, `email`, `email_verified`, `name`. When the ID token lacks `email` or `email_verified`, the provider reads `userinfo` with the access token; userinfo's `sub` must equal the ID token's (OIDC Core, section 5.3.2), and `email` and `email_verified` come from the same document, never one from each. `email_verified` other than `true` is refused. For Okta this is the normal path: in the code flow its ID token carries `email` at most, and `email_verified` only comes from `userinfo`. Okta signs ID tokens with RS256 only and rotates keys about quarterly.
 
 ### D3. Identity is keyed by issuer and subject
 
@@ -71,6 +69,7 @@ type IdentityProvider = {
 - **Three row states**: issuer and subject (linked); issuer only (a pre-F-13 row, reserved for that issuer, D4); neither (dev login, or unlinked).
 - **Uniqueness**: `CREATE UNIQUE INDEX idx_users_idp_identity ON users(idp_issuer, idp_subject) WHERE idp_subject IS NOT NULL`. `idx_users_idp_subject` is dropped and its `CREATE` removed: a constraint that one `sub` is unique across issuers is false, and would turn a collision into a 500.
 - **`signIn(issuer, subject, email, displayName)`** stays one store method in one write transaction. On Postgres (postgres-server.md) the unique constraints (`users.email`, the index above) are the guarantee, not the reads before the write.
+- **Every users write runs inside `repo.write`** (the server's write queue, #807), after the exchange's await, as `authExchange` and the AS callback do today: `idpSignIn`, the session or browser-session row and their audit rows in one queued body. No provider touches `Repo`. A write outside the queue will be refused.
 - Rejected:
   - *A namespaced value in `idp_subject`* (`<issuer>|<sub>`): either bare values mean Google forever, and the reader that forgets the rule matches across issuers, or old values are rewritten, and a rolled-back binary then refuses every user as `subject_mismatch`.
   - *Null issuer read as Google, no stamp*: the same hazard in every query.
@@ -114,17 +113,16 @@ type IdentityProvider = {
 
 - **One provider: `/oauth/authorize` redirects upstream at once**, as today.
 - **Several, and no browser session: it answers a chooser page** (the same `html()` helper and CSP as consent), one link per provider to `/oauth/upstream?request=<id>&provider=<id>`. That route finds the flow through the binding cookie (`getFlow`), creates the upstream state, verifier and nonce there rather than at authorize, and redirects. Choosing again replaces the flow's upstream state and drops the old one from `upstream`.
-- **Each provider has its own callback, `/oauth/<id>/callback`**, and `f.upstream` records the provider. A callback whose path names another provider than the flow's is refused before the exchange. Separate redirect URIs plus provider-bound state are the mix-up defence; the callback's optional `iss` (D1) is not relied on, since an IdP may not send it.
+- **Each provider has its own callback, `/oauth/<id>/callback`**, and `f.upstream` records the provider. A callback whose path names another provider than the flow's is refused before the exchange. Separate redirect URIs plus provider-bound state are the mix-up defence; the callback's optional `iss` (D1) is not relied on: Okta's discovery doesn't advertise it.
 - `/oauth/google/callback` keeps its path: it is registered at Google in every deployment.
 - **The browser session stays provider-agnostic**: it names a user, and a live one skips upstream for any client, as today.
-- No provider hint from the client and no remembered choice: OAuth extension parameters stay ignored (server-oauth.md §1).
 
 ### D8. CLI login goes through the server's AS
 
 `grayboard login` becomes one more client of the AS, for every provider, and the direct flow (`runOAuthFlow` against Google, `authExchange`, `authConfig`) is deleted.
 
 - **Why not the direct flow per provider** (the CLI opens the IdP itself from a server-supplied template):
-  - Loopback redirect rules differ per IdP and are the IdP's to change; the AS already takes ephemeral loopback ports for its own clients.
+  - Okta compares redirect URIs as exact strings and allows no port wildcard, so a loopback listener would need fixed registered ports; the AS already takes ephemeral loopback ports for its own clients.
   - It needs a second app registration per provider (Google's Desktop client today).
   - The client builds the authorize URL, so there is no nonce, and provider logic ships in a binary that updates separately from the server.
   - Two paths means two sets of checks: today's CLI path already lacks the AS's email-domain check.
@@ -141,16 +139,15 @@ type IdentityProvider = {
 
 - `auth.subject_linked`, `auth.subject_refused` and `auth.subject_cleared` keep their names; each detail gains `provider` and `issuer`, and `auth.subject_refused` gains the reason `issuer_mismatch` with the holding issuer.
 - `oauth.google_denied`, `oauth.google_failed` and `oauth.google_authenticated` become `oauth.upstream_*` with `{provider}`: the union is closed, so a per-provider name can't be. Old rows age out at the audit retention; nothing maps them (principle 12).
-- A CLI sign-in keeps `auth.login`, with `provider` and `client_id`.
 
 ### D10. Testing
 
 - **`tests/support/fake_oidc.ts`, `startFakeOidc()`**, in the pattern of `startFakeAnthropic()`: a loopback server with discovery, JWKS, an authorize endpoint that redirects back with a code, a token endpoint that checks client authentication, the code's one use and the PKCE verifier, and userinfo.
 - **Bad tokens are minted, not stubbed**: a `next({...})` knob for the next ID token (another key's signature, `iss`, `aud`, `exp`, `iat`, `nonce`, `alg`, `kid`, `email_verified`, no `email`), a discovery document override, and `rotateKeys()`.
-- **Criterion 3 runs the real provider over HTTP** against the fake (`src/server/idp_oidc.test.ts`): bad signature, wrong issuer, wrong audience, expired, each its own test; plus wrong nonce, HS256 keyed by the client secret, unverified email, a domain off the list, discovery naming another issuer, userinfo with another `sub`, and a rotated key accepted after one refetch. A stub provider can't prove any of these.
+- **Criterion 3 runs the real provider over HTTP** against the fake (`src/server/idp_oidc.test.ts`): bad signature, wrong issuer, wrong audience, expired, each its own test; plus wrong nonce, HS256 keyed by the client secret, unverified email, a domain off the list, discovery naming another issuer, userinfo with another `sub`, and a rotated key accepted after one refetch.
 - **Criterion 1**: `tests/integration/oidc_login.test.ts` drives `hostedServer()` with the real OIDC provider aimed at the fake; `browse()` follows the upstream redirect instead of assuming a stub; a hosted MCP call with the resulting token works. With two providers, the chooser appears and each link reaches its IdP.
 - **Criterion 2**: steps 1 and 2 change `oauth.test.ts` and the hosted suites only where they name `exchangeGoogle`.
-- **Criterion 4**: `db.test.ts` for each D4 branch; one integration test both ways round (Google holds the email and Okta presents it; the reverse), asserting 403, no browser session, an `auth.subject_refused` row, and that `unlink-idp` then lets the second IdP in. Also: the same `sub` under two issuers is two users.
+- **Criterion 4**: `db.test.ts` for each D4 branch; one integration test both ways round (Google holds the email and Okta presents it; the reverse), asserting 403, no browser session, an `auth.subject_refused` row, and that `unlink-idp` then lets the second IdP in. Also: the same `sub` under two issuers is two users. Fixture rows are seeded through `tests/support/seed.ts` once #807's fixtures move there.
 - **Upgrade**: `tests/integration/upgrade.test.ts` and the upgrade matrix open release databases; add asserts that a v1.0.0 database (no `idp_subject`) and a post-F-13 one both come out stamped, and that a second open doesn't re-stamp a cleared row.
 - **Config**: `config.test.ts`, one case per refusal in D6. **CLI**: a `runCli()` login against `hostedServer()`, and a test that no other client can obtain `grayboard:login` (R3).
 - **Suites**: all of it is the root suite (`bun run test`). No e2e suite calls a real Okta; `hosted-live` and `hosted-public` stay on Google.
@@ -159,7 +156,7 @@ type IdentityProvider = {
 
 - `docs/architecture.md` §3 (the Login bullet): the provider seam, identity keying and linking, the "Google tokens are never stored" invariant reworded for any IdP, the CLI's sign-in through the AS.
 - `docs/server-oauth.md` §1: the upstream leg (per-provider callback, chooser, `iss` rule), the built-in `grayboard-cli` client and its scope, the single Google pair.
-- `docs/guide/server.md`: an Okta setup section (a Web app, its callback, the four variables), the one-Google-client setup, `unlink-idp`'s wording; `docs/guide/team.md`, `reference.md` and `troubleshooting.md` where they say Google. `install.sh`'s closing hint names the Google variables.
+- `docs/guide/server.md`: an Okta setup section (a Web app with PKCE required, its exact callback, the four variables), the one-Google-client setup, `unlink-idp`'s wording; `docs/guide/team.md`, `reference.md` and `troubleshooting.md` where they say Google. `install.sh`'s closing hint names the Google variables.
 - `docs/parity.md` row 9 (sign-in flow): no cell changes, since the provider is the server's and every hosted harness reaches the chooser in the same browser leg; local cells stay n/a. `docs/parity-access.md` §9 gains one line saying so.
 - `role-bindings.md` R1 and `service-principals.md` cite #928's keying; fix their wording if they still stand.
 
@@ -177,7 +174,7 @@ Steps 1 to 3 need no Okta and remove the second Google path; 3 can follow 5 only
 
 ## Open questions, with defaults
 
-1. Does Okta send `email_verified: true` for every user the pilot has (directory-sourced, federated)? Default: require `true`, no bypass flag; an operator whose org doesn't assert it fixes the claim at the IdP. Verify against Okta's documentation before step 5, with: whether its org authorization server returns a thin ID token (D2's userinfo path), and whether it sends a callback `iss`.
+1. Is Okta's `email_verified` `true` for every user the pilot has (directory-sourced, federated)? Okta's documentation doesn't say. Default: require `true`, no bypass flag; an operator whose org doesn't assert it fixes that at the IdP. Check with the pilot's org before step 5.
 2. May an admin pin which provider takes an unlinked account (`unlink-idp --provider`)? Default: no; both IdPs are the operator's, and the admin tells the person which to use.
 3. One person with both a Google and an Okta account? Default: no; one identity per user until someone needs a `user_identities` table.
 4. What is the CLI's code bound to? `/oauth/authorize` accepts only the MCP resource. Default: the CLI omits `resource`, the scope alone selects the session redemption, and the minted token is no more audience-bound than today's. Alternative: a second resource identifier for `/api`, requestable only by `grayboard-cli`.
