@@ -359,9 +359,10 @@ test("ChildSessions keeps only the children seen inside the idle window, refusin
 });
 
 // #894: a subagent's call soon after its last, and peer_list's read of the
-// live sessions with a dead one among them, take no write lock: another
-// process's held lock (past the 5 s busy timeout) neither stalls nor fails them.
-test("a known child's call and a non-ending liveSessions read write nothing under another process's lock", () => {
+// live sessions with a dead one among them, don't wait on another process's
+// write lock: the child's touch isn't due, and the reap is skipped at once
+// while the lock is held, then ends the dead session once it's free.
+test("a known child's call and a no-wait liveSessions read don't wait on another process's lock", () => {
   const path = join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db");
   const db = openLocalDb(path).db;
   const key = "cd".repeat(32);
@@ -372,15 +373,19 @@ test("a known child's call and a non-ending liveSessions read write nothing unde
   const children = new ChildSessions(db, root, key);
   const t0 = Date.now();
   const kid = children.resolve("sub-0", t0);
-  db.exec("PRAGMA busy_timeout = 200");
   const lock = new Database(path);
   lock.exec("BEGIN IMMEDIATE");
-  // An end that fails on the lock is logged here, so a write attempt shows.
+  // An end that fails on the lock is logged here, so a waiting attempt shows.
   const logged = spyOn(console, "error").mockImplementation(() => {});
   try {
+    db.exec("PRAGMA busy_timeout = 3000");
+    const started = performance.now();
     expect(children.resolve("sub-0", t0 + 1)).toBe(kid);
-    expect(liveSessions(db, { end: false })).toEqual({ alive: [expect.objectContaining({ session_id: root })], ended: [], wake: [] });
+    expect(liveSessions(db, { wait: false })).toEqual({ alive: [expect.objectContaining({ session_id: root })], ended: [], wake: [] });
+    expect(performance.now() - started).toBeLessThan(1500);
     expect(logged).not.toHaveBeenCalled();
+    expect(db.prepare(`PRAGMA busy_timeout`).get()).toEqual({ timeout: 3000 });
+    db.exec("PRAGMA busy_timeout = 200");
     // The touch that comes due, and an ending read, still write: they wait on the lock.
     expect(() => children.resolve("sub-0", t0 + TOUCH_EVERY_MS)).toThrow(/locked/);
     expect(liveSessions(db).ended).toEqual([]);
@@ -391,7 +396,7 @@ test("a known child's call and a non-ending liveSessions read write nothing unde
     lock.close();
   }
   expect(db.prepare(`SELECT ended_at FROM ids WHERE id = ?`).get(dead)).toEqual({ ended_at: null });
-  expect(liveSessions(db).ended).toEqual([dead]);
+  expect(liveSessions(db, { wait: false }).ended).toEqual([dead]);
 });
 
 // #523: a live root's children stay live; a child whose root is gone, ended

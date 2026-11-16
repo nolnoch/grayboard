@@ -1087,11 +1087,12 @@ async function liveHandles(self: string[], among?: string[]): Promise<(h: string
 }
 
 // Live sessions with no name yet, for peer_list, with the status each set as
-// its ID.
+// its ID, delivering what ending the dead ones it found produced.
 async function unboundPeers(): Promise<UnboundPeer[]> {
-  // A read: the dead sessions it skips are ended by the next open or bind,
-  // not here, so peer_list takes no write lock (#894).
-  const { alive } = liveSessions(db, { end: false });
+  // A read: it ends the dead it finds only while the write lock is free, so
+  // it never waits on another process's (#894).
+  const { alive, ...ended } = liveSessions(db, { wait: false });
+  await deliverEnded(db, ended);
   const unbound = alive.filter((r) => r.name === null);
   const statuses = new Map(
     (

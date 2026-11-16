@@ -419,8 +419,9 @@ test("9: a DM sent mid-unbind is queued for the name's next holder, never consum
 // #148 18: a call touches last_seen at most once per 30 s per address, so a
 // read-only call soon after another writes nothing and another process's held
 // write lock (past the 5 s busy timeout) doesn't stall or fail it. #894:
-// peer_list with a dead session on the bus leaves ending it to the next open,
-// so it doesn't try to write either (a failed end is logged on stderr).
+// peer_list with a dead session on the bus
+// ends it only while the write lock is free, so it doesn't wait either (a failed
+// end is logged on stderr); once the lock is free, the next peer_list ends it.
 test("read-only calls soon after another take no write lock, so a held lock doesn't stall them", async () => {
   const s = await session("fe");
   await session("be");
@@ -432,9 +433,12 @@ test("read-only calls soon after another take no write lock, so a held lock does
   const lock = new Database(join(dir, "bus.db"));
   lock.exec("BEGIN IMMEDIATE");
   try {
+    // The busy timeout is 5 s: three calls well inside it waited on nothing.
+    const started = performance.now();
     await s.call("claim_list", {});
     await s.call("peer_list", {});
     await s.call("board_list", {});
+    expect(performance.now() - started).toBeLessThan(3000);
   } finally {
     lock.exec("ROLLBACK");
     lock.close();
@@ -442,6 +446,8 @@ test("read-only calls soon after another take no write lock, so a held lock does
   expect(seen()).toEqual(before);
   expect(s.stderr()).not.toContain("ending dead session");
   expect(rows(`SELECT ended_at FROM ids WHERE id = ?`, goneId)).toEqual([{ ended_at: null }]);
+  await s.call("peer_list", {});
+  expect(rows<{ ended_at: number | null }>(`SELECT ended_at FROM ids WHERE id = ?`, goneId)[0]!.ended_at).not.toBeNull();
 }, 30_000);
 
 // #374 (the #284 PR 4 audit's A4 fix): an unbind whose release transaction

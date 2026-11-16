@@ -244,8 +244,8 @@ export class ChildSessions {
     if (child === undefined) {
       const id = childSessionId(this.rootKey, raw);
       registerChild(this.db, this.root, id, raw, now);
-      this.#seen.set(raw, (child = { id, at: now, touched: now }));
       touchId(this.db, id, now);
+      this.#seen.set(raw, { id, at: now, touched: now });
       return id;
     }
     child.at = now;
@@ -491,27 +491,36 @@ const ORPHAN_WHERE = `ended_at IS NULL AND (
  * process is gone, and orphans (ORPHAN_WHERE). Tools-only processes (#284 S7)
  * and viewers (S9) are ended like any session but never returned: they own
  * no shell, take no name and can't be reached. The probe runs before the write lock; each
- * candidate is re-checked inside it. `end: false` only reads: the dead are
- * left out of `alive` but not ended, so the call takes no write lock (#894).
+ * candidate is re-checked inside it. `wait: false` ends them only while no other
+ * process holds the write lock, skipping the rest at once, so a read-only
+ * caller never waits on one (#894).
  */
-export function liveSessions(db: Database, opts: { end?: boolean } = {}): Ended & { alive: SessionRow[] } {
+export function liveSessions(db: Database, opts: { wait?: boolean } = {}): Ended & { alive: SessionRow[] } {
   const rows = (db.prepare(SESSION_SQL).all() as RawSessionRow[]).map(sessionRow);
   const { alive: live, dead } = aliveRows(rows);
   const silent = new Set((db.prepare(`SELECT id FROM ids WHERE (delivery = 'none' OR viewer = 1) AND ended_at IS NULL`).all() as { id: string }[]).map((r) => r.id));
   const alive = live.filter((r) => !silent.has(r.session_id));
   const orphans = db.prepare(`SELECT id FROM ids WHERE ${ORPHAN_WHERE}`).all() as { id: string }[];
-  if (opts.end === false || (!dead.length && !orphans.length)) return { alive, ...nothingEnded() };
+  if (!dead.length && !orphans.length) return { alive, ...nothingEnded() };
   testPause("end:before-txn");
   // Each candidate ends in its own transaction (#284 S3): one end that fails
   // is logged and audited, and leaves the others ended and this opener
   // working, instead of failing every process that opens the bus.
   const ended: Ended = { ended: [], wake: [] };
+  // `wait: false` (#894) takes the write lock only if it's free: busy, the rest
+  // are left to the next caller, unlogged, since nothing failed.
+  let busy = false;
   const each = (id: string, run: (now: number) => Ended) => {
+    if (busy) return;
     try {
       const r = db.transaction(() => run(Date.now())).immediate();
       ended.ended.push(...r.ended);
       for (const h of r.wake) if (!ended.wake.includes(h)) ended.wake.push(h);
     } catch (err) {
+      if (opts.wait === false && (err as { code?: unknown }).code === "SQLITE_BUSY") {
+        busy = true;
+        return;
+      }
       console.error(`grayboard: ending dead session ${id} failed:`, err);
       try {
         writeCoreAudit(db, "id.end_failed", id, id, { error: String(err), by_pid: process.pid });
@@ -520,17 +529,24 @@ export function liveSessions(db: Database, opts: { end?: boolean } = {}): Ended 
       }
     }
   };
-  for (const r of dead) each(r.session_id, (now) => reap(db, [r], now));
-  for (const { id } of orphans) {
-    each(id, (now) => {
-      const out: Ended = { ended: [], wake: [] };
-      const row = db.prepare(`SELECT root_id FROM ids WHERE id = ? AND ${ORPHAN_WHERE}`).get(id) as { root_id: string | null } | null;
-      if (row) {
-        const why = row.root_id === null ? "its process row was removed by an older grayboard" : `its root ${row.root_id} ended`;
-        merge(out, id, end(db, id, why, now));
-      }
-      return out;
-    });
+  // The connection's timeout is set and restored with no await between: nothing else runs on it meanwhile.
+  const timeout = opts.wait === false ? (db.prepare(`PRAGMA busy_timeout`).get() as { timeout: number }).timeout : null;
+  if (timeout !== null) db.exec(`PRAGMA busy_timeout = 0`);
+  try {
+    for (const r of dead) each(r.session_id, (now) => reap(db, [r], now));
+    for (const { id } of orphans) {
+      each(id, (now) => {
+        const out: Ended = { ended: [], wake: [] };
+        const row = db.prepare(`SELECT root_id FROM ids WHERE id = ? AND ${ORPHAN_WHERE}`).get(id) as { root_id: string | null } | null;
+        if (row) {
+          const why = row.root_id === null ? "its process row was removed by an older grayboard" : `its root ${row.root_id} ended`;
+          merge(out, id, end(db, id, why, now));
+        }
+        return out;
+      });
+    }
+  } finally {
+    if (timeout !== null) db.exec(`PRAGMA busy_timeout = ${timeout}`);
   }
   return { alive, ...ended };
 }
