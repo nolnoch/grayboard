@@ -213,7 +213,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const routes = ["/oauth/authorize", "/oauth/upstream", "/oauth/token", "/oauth/revoke", ...providers.map(callbackPath), "/oauth/consent", "/oauth/complete"];
   const routeName = (path: string) => routes.includes(path) ? path : "/oauth/unknown";
   // Token and revocation posts have their own address bucket and are charged
-  // only when they present grant material and are refused (#283): a
+  // only when they present grant material and are refused, or their listed
+  // CIMD client's document is unavailable (#283, #933): a
   // cross-site form post reaches them, and must not lock an office NAT out of
   // token refresh. They never touch the global bucket (F-18, #931): refused
   // refreshes from a handful of addresses would otherwise drain it and block
@@ -563,16 +564,15 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       } catch (e) {
         if (!material) { if (e instanceof OAuthError) return refusal(e); throw e; }
         const refused = e instanceof OAuthError && e.status < 500;
-        // A listed client's document unavailable is charged as a refusal (#933): retrying posts spend their address.
+        // A listed client's document unavailable is charged as a refusal (#933): retrying posts spend their address,
+        // so an office NAT's clients retrying through a long outage can drain it for that address's other token posts.
         if (refused || e instanceof CimdUnavailable) spend(checks, path);
         if (refused || deferred.length) {
-          // One decision per refusal, after every await, for all its rows; the CIMD rows go with it.
-          if (!refusalRows.take("global", { path: routeName(path) }).ok) {
-            if (e instanceof OAuthError) return refusal(e);
-            if (e instanceof CimdUnavailable) return cimdUnavailable();
-            throw e;
-          }
-          for (const [action, detail] of deferred) writeAudit(repo, action, null, null, detail);
+          // One decision per refusal, after every await, for all its rows; the CIMD rows go with it. Only a refusal or
+          // an outage answers here without a row; any other error (the shutdown 503) keeps fetch's own row.
+          if (refusalRows.take("global", { path: routeName(path) }).ok) for (const [action, detail] of deferred) writeAudit(repo, action, null, null, detail);
+          else if (refused) return refusal(e as OAuthError);
+          else if (e instanceof CimdUnavailable) return cimdUnavailable();
         }
         throw e;
       }
