@@ -50,10 +50,13 @@ function trackCommits(db: Database): void {
       if (!(frames.length && ownsTx(db))) topLevel(db);
       const frame: CommitEffect[] = [];
       frames.push(frame);
+      // By identity, with any frame left above it (a savepoint its body started and didn't await, #999): the
+      // transaction or savepoint's end ends those too.
+      const drop = () => { const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i); };
       let value: T;
       try { value = invoke(...args); }
-      catch (error) { frames.pop(); throw error; }
-      frames.pop();
+      catch (error) { drop(); throw error; }
+      drop();
       // A released savepoint is not durable until its outer transaction commits.
       const parent = frames.at(-1);
       if (parent) parent.push(...frame);
@@ -114,13 +117,15 @@ export function openSavepoint(db: Database): Boundary {
   const frame: CommitEffect[] = [];
   frames.push(frame);
   let open = true;
-  // False when its transaction already ended (and dropped its frame): the savepoint went with it.
-  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i, 1); return i >= 0; };
+  // False when its transaction already ended (and dropped its frame): the savepoint went with it. Drops any frame
+  // left above it too: an inner savepoint still open ends with this one.
+  const pop = () => { open = false; const i = frames.lastIndexOf(frame); if (i >= 0) frames.splice(i); return i >= 0; };
   return {
     commit() {
       if (!open) throw new Error("savepoint already settled");
       if (!frames.includes(frame)) { open = false; throw new Error("savepoint outlived its transaction"); }
-      if (frames.at(-1) !== frame) throw new Error("savepoint commit out of order: an inner one is still open");
+      // Rolled back rather than left open: the caller's later writes and effects would otherwise land inside it.
+      if (frames.at(-1) !== frame) { this.rollback(); throw new Error("savepoint commit out of order: an inner one is still open"); }
       try { db.run(`RELEASE ${name}`); } catch (error) { this.rollback(); throw error; }
       pop();
       frames.at(-1)!.push(...frame);

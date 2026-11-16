@@ -19,9 +19,12 @@ export interface Tx extends Read {
   readonly [txBrand]: true;
   // Runs after the outermost COMMIT resolves, in registration order; never on rollback (of the transaction, or of a
   // savepoint the effect was registered in). Its synchronous part runs before the write queue's next body (D4).
+  // A savepoint its body didn't await (a D4 violation) is dropped with its effects when the transaction ends, though
+  // the writes it made before then commit.
   afterCommit(effect: () => void | Promise<void>): void;
   // A nested transaction: fn's writes and effects roll back alone when it throws or rejects. Awaitable on every
-  // store, so callers are written once for Postgres.
+  // store, so callers are written once for Postgres. Only an async write() body's Tx has it: a synchronous body
+  // (writeNow, post) can't await one, so its Tx refuses.
   savepoint<T>(fn: (tx: Tx) => T | Promise<T>): Promise<T>;
 }
 
@@ -32,6 +35,7 @@ class SqliteRead {
 // While a savepoint is open its Tx is the only live one: the parent's statements and effects would land inside the
 // savepoint (and roll back with it), and a second savepoint beside it would release out of order. Both throw.
 class SqliteTx extends SqliteRead {
+  constructor(db: Database, readonly nests = true) { super(db); }
   #live = true;
   #child: SqliteTx | undefined;
   // Closes its open savepoint's Tx too: a body that returned without awaiting one leaves nothing live behind it.
@@ -47,6 +51,7 @@ class SqliteTx extends SqliteRead {
   }
   async savepoint<T>(fn: (tx: Tx) => T | Promise<T>): Promise<T> {
     this.assertLive();
+    if (!this.nests) throw new Error("savepoint in a synchronous write body: only an async write() body can await one");
     const b = openSavepoint(this.db);
     const inner = new SqliteTx(this.db);
     this.#child = inner;
@@ -69,8 +74,11 @@ class SqliteTx extends SqliteRead {
 // The store's read handle outside any transaction.
 export function sqliteRead(db: Database): Read { return new SqliteRead(db) as unknown as Read; }
 
-// A transaction's handle for a body; the caller closes it when the transaction (or savepoint) settles.
-export function sqliteTx(db: Database): Tx & { close(): void } { return new SqliteTx(db) as unknown as Tx & { close(): void }; }
+// A transaction's handle for a body; the caller closes it when the transaction (or savepoint) settles. `nests`:
+// false for a synchronous body's, whose savepoint refuses.
+export function sqliteTx(db: Database, nests = true): Tx & { close(): void } {
+  return new SqliteTx(db, nests) as unknown as Tx & { close(): void };
+}
 
 // The connection a SQLite store function runs its statements on: refuses a closed `Tx`, and a handle from another
 // store.

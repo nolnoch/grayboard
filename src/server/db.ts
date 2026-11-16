@@ -121,10 +121,11 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
   }).then(box => box.out) as Promise<Awaited<R>>;
 }
 
-// fn's synchronous transaction body with its own Tx, closed when it returns or throws.
+// fn's synchronous transaction body with its own Tx, closed when it returns or throws. Its savepoint refuses: a
+// synchronous body can't await one, and an unawaited one would outlive the frame it opened in.
 function withTx<T>(db: Database, fn: (tx: Tx) => T): () => T {
   return () => {
-    const tx = sqliteTx(db);
+    const tx = sqliteTx(db, false);
     try { return fn(tx); } finally { tx.close(); }
   };
 }
