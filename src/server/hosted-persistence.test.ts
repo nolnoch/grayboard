@@ -13,6 +13,7 @@ import type { OAuthPrincipal } from "./oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 let dir: string, now: number;
 let database: ReturnType<typeof openDatabase>;
@@ -220,7 +221,7 @@ for (const operation of ["revoke", "bind"] as const) {
     const issued = await issue(), { principal } = issued;
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
     const lease = await delivery.open(principal, context(principal));
-    database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "must remain", null, false);
+    await seed(database.repo, () => database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "must remain", null, false));
     const batch = await delivery.pending(principal, context(principal), lease.capability);
     const receipt = hostedPause("hosted:receipt:before-txn", () => delivery.receipt(principal, context(principal), lease.capability, batch.map(item => item.id)), async () => {
       expect(external({ operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }).ok).toBe(true);
@@ -232,7 +233,7 @@ for (const operation of ["revoke", "bind"] as const) {
   test(`receipt lock precedes external ${operation}, consumes only the authorized batch`, async () => {
     const issued = await issue(), { principal } = issued;
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
-    const message = database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false);
+    const message = await seed(database.repo, () => database.repo.messages.insert("sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
     const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
     expect(results.every(result => result.ok)).toBe(true);
     expect(database.repo.cursors.directFor("you@example.com/fe")).toBe(message.id);
@@ -285,7 +286,7 @@ test("G2 ordinary writes do not attach, G1 revoke releases atomically including 
   await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
   await hosted.register(first.principal, context(first.principal), "child");
   await hosted.run(second.principal, context(second.principal), "peer_status", () => true);
-  database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
+  await seed(database.repo, () => database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now));
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "revoked" }]);
   expect(application.aliasHolderId("you@example.com/fe")).toBeNull();
@@ -313,10 +314,10 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.child_registered'").get()?.count).toBe(1);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.grant_attached'").get()?.count).toBe(1);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM access_log WHERE action='hosted.lease_closed'").get()?.count).toBe(1);
-  database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now);
+  await seed(database.repo, () => database.repo.oauth.revokeToken(hashToken(first.refreshToken), OPENCODE_CLIENT, now));
   expect(await hosted.whoami(second.principal, context(second.principal))).toHaveProperty("primary", "you@example.com/fe");
   expect(releases()).toEqual([]);
-  database.repo.users.setDisabled(second.authed.user_id, true);
+  await seed(database.repo, () => database.repo.users.setDisabled(second.authed.user_id, true));
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "disabled" }]);
   expect(application.aliasHolderId("you@example.com/fe")).toBeNull();
@@ -324,8 +325,10 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
 
 test("opening a pre-hosted SQLite schema adds tables without changing users, messages or OAuth", async () => {
   const first = await issue();
-  database.repo.aliases.create({ scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
-  const message = database.repo.messages.insert("you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
+  const message = await seed(database.repo, () => {
+    database.repo.aliases.create({ scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
+    return database.repo.messages.insert("you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
+  });
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
   close(); open();
   expect(database.repo.aliases.listForScope("person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);

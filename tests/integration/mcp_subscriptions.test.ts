@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { TestServer } from "../support/server.ts";
+import { seed } from "../support/seed.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { issueOAuth, type IssuedOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
@@ -168,11 +169,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const action of ["access", "ex
   await call(connection, "board_create", { name: "e2e", purpose: "fixtures" });
   await watch(connection, boardUri);
   await until(() => app.mcp.activeWatches === 1);
-  if (action === "access") app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+  if (action === "access") await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
   if (action === "expiry") clock += OAUTH_TTL.access;
-  if (action === "grant") app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock);
-  if (action === "disable") app.repo.users.setDisabled(grant.authed.user_id, true);
-  if (action === "admin") app.repo.sessions.revokeAllForUser(grant.authed.user_id);
+  if (action === "grant") await seed(app.repo, () => app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock));
+  if (action === "disable") await seed(app.repo, () => app.repo.users.setDisabled(grant.authed.user_id, true));
+  if (action === "admin") await seed(app.repo, () => app.repo.sessions.revokeAllForUser(grant.authed.user_id));
   await until(() => version === "2026-07-28" ? app.mcp.activeListens === 0 : app.mcp.activeGetStreams === 0);
   await expect(connection.client.readResource({ uri: boardUri })).rejects.toThrow();
 });
@@ -239,11 +240,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const kind of ["http", "sdk"] 
   } finally { resume(); app.mcp.delivery.open = original; }
 });
 
-function refresh(grant: IssuedOAuth, priorRefresh = grant.refreshToken) {
+async function refresh(grant: IssuedOAuth, priorRefresh = grant.refreshToken) {
   const token = randomBytes(32).toString("base64url"), refreshToken = randomBytes(32).toString("base64url"), now = Date.now();
-  expect(app.repo.oauth.rotateRefresh({ clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(priorRefresh), tokens: {
+  expect((await seed(app.repo, () => app.repo.oauth.rotateRefresh({ clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(priorRefresh), tokens: {
     ...grant.tokens, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
-  } }, now).status).toBe("ok");
+  } }, now))).status).toBe("ok");
   return { token, refreshToken };
 }
 
@@ -254,11 +255,11 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: current 
   await watch(c, boardUri);
   expect(app.mcp.activeWatches).toBe(1);
   const sid = c.transport.sessionId;
-  const rotated = refresh(grant);
+  const rotated = await refresh(grant);
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
   const resume = c.pauseGets();
   try {
-    app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+    await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
     expect(await c.client.subscribeResource({ uri: "grayboard://boards/next" })).toEqual({});
     await until(() => c.getHeaders.length === 2);
     expect(c.getHeaders[0]!.get("Authorization")).toBe(`Bearer ${grant.token}`);
@@ -288,9 +289,9 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   const grant = await issue(), c = await connect(grant.token, version);
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
   await watch(c, boardUri);
-  const rotated = refresh(grant);
+  const rotated = await refresh(grant);
   c.headers.set("Authorization", `Bearer ${rotated.token}`);
-  app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now());
+  await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, Date.now()));
   expect(await call(c, "whoami")).toMatchObject({ primary: "alice@example.com/be" });
   await until(() => app.mcp.activeWatches === 0);
   expect(app.mcp.activeLegacySessions).toBe(1);
@@ -318,14 +319,17 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membership loss and background storage fault close streams`, async () => {
   const grant = await issue();
-  const team = app.repo.teams.create("private", grant.authed.user_id);
-  app.repo.teams.addMember(team.id, grant.authed.user_id);
+  const team = await seed(app.repo, () => {
+    const t = app.repo.teams.create("private", grant.authed.user_id);
+    app.repo.teams.addMember(t.id, grant.authed.user_id);
+    return t;
+  });
   const c = await connect(grant.token, version);
   const other = await connect((await issue("bob@example.com")).token, version);
   await expect(watch(other, "grayboard://boards/private")).rejects.toThrow();
   await watch(c, "grayboard://boards/private");
   await until(() => app.mcp.activeWatches === 1);
-  app.repo.teams.removeMember(team.id, grant.authed.user_id);
+  await seed(app.repo, () => app.repo.teams.removeMember(team.id, grant.authed.user_id));
   await until(() => app.mcp.activeWatches === 0);
   expect(c.hints).toEqual([]); expect(other.hints).toEqual([]);
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });

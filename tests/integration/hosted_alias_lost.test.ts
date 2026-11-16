@@ -11,6 +11,7 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 import { bindingOf } from "../../adapters/hosted-core/src/model.ts";
 import { accessAudits } from "../support/audit.ts";
 import { HOSTED_CLIENT, type HostedSession } from "../support/hosted_session.ts";
+import { seed } from "../support/seed.ts";
 import { TestServer } from "../support/server.ts";
 
 const A = "alice@example.com";
@@ -179,7 +180,7 @@ test("a hold lost again before both readers took it is restated: the new reason,
 
   // A second loss of the same alias (lose's ON CONFLICT path) replaces the row and clears both readers' marks.
   const again = "eng/build was revoked again";
-  srv.app.repo.atomic(() => srv.app.repo.hosted.lose(rootId(b), { alias: "eng/build", reason: again, primary: false }, Date.now()));
+  await seed(srv.app.repo, () => srv.app.repo.hosted.lose(rootId(b), { alias: "eng/build", reason: again, primary: false }, Date.now()));
   expect(pending()).toBe(1);
   // The open now takes nothing: the restated row's report was cleared, so the Controller must see it again first.
   await b.subscriber.call("delivery_open");

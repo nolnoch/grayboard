@@ -14,6 +14,7 @@ import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { afterCommit } from "../core/sqlite.ts";
+import { seed } from "../../tests/support/seed.ts";
 
 const origin = "https://grayboard.example.com";
 let dir: string;
@@ -112,14 +113,14 @@ test("postcommit sink failure cannot fail or roll back a committed native messag
   } finally { log.mockRestore(); }
 });
 
-test("nested savepoint success waits for outer transaction commit; outer rollback discards payload and invalidation", () => {
+test("nested savepoint success waits for outer transaction commit; outer rollback discards payload and invalidation", async () => {
   let invalidations = 0;
   const unsubscribe = database.repo.hosted.subscribe(() => { invalidations++; });
   const id = context().id!;
   // The hub's view of the session (its live holder) changes only after a commit: reconcile closes it then.
   const closed = spyOn(application, "close");
   try {
-    expect(() => database.db.transaction(() => {
+    await expect(seed(database.repo, () => {
       database.repo.hosted.atomic(() => {
         application.send(recipient.session, "launcher", "rolled back nested");
         database.repo.hosted.end(context().id!, "closed", Date.now());
@@ -127,29 +128,29 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
       expect(closed).not.toHaveBeenCalled();
       expect(events).toEqual([]); expect(invalidations).toBe(0);
       throw new Error("outer rollback");
-    }).immediate()).toThrow("outer rollback");
+    })).rejects.toThrow("outer rollback");
     expect(events).toEqual([]); expect(invalidations).toBe(0);
     expect(closed).not.toHaveBeenCalled();
     expect(database.repo.hosted.get(context().id!)).toBeDefined();
     expect(application.history(recipient.session)).toEqual([]);
     // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
-    database.db.transaction(() => {
+    await seed(database.repo, () => {
       database.repo.hosted.atomic(() => { application.send(recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(id, Date.now()); });
       expect(events).toEqual([]); expect(invalidations).toBe(0);
-    }).exclusive();
+    });
     expect(events).toHaveLength(1); expect(invalidations).toBe(0);
-    database.db.transaction(() => {
+    await seed(database.repo, () => {
       database.repo.hosted.atomic(() => database.repo.hosted.end(id, "closed", Date.now()));
       expect(invalidations).toBe(0);
-    }).exclusive();
+    });
     expect(invalidations).toBe(1);
     expect(closed).toHaveBeenCalled();
   } finally { unsubscribe(); closed.mockRestore(); }
 });
 
-test("caught inner rollback discards only inner effects and preserves outer effect ordering", () => {
+test("caught inner rollback discards only inner effects and preserves outer effect ordering", async () => {
   const observed: string[] = [];
-  database.db.transaction(() => {
+  await seed(database.repo, () => {
     afterCommit(database.db, () => { observed.push("outer-first"); });
     expect(() => database.db.transaction(() => {
       application.send(recipient.session, "launcher", "inner ghost");
@@ -158,14 +159,16 @@ test("caught inner rollback discards only inner effects and preserves outer effe
     database.repo.hosted.atomic(() => application.send(recipient.session, "launcher", "outer durable"));
     afterCommit(database.db, () => { observed.push("outer-last"); });
     expect(events).toEqual([]);
-  })();
+  });
   expect(observed).toEqual(["outer-first", "outer-last"]);
   expect(events).toHaveLength(1); expect(application.history(recipient.session).map(message => message.body)).toEqual(["outer durable"]);
 });
 
 test("rolled-back board post neither publishes payload nor invalidates observers or inflight state", async () => {
-  application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-  application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+  await seed(database.repo, () => {
+    application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
+    application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+  });
   const observer = mock(() => {});
   application.observeBoard(recipient.session, "updates", { changed: observer });
   events.length = 0;
@@ -177,14 +180,14 @@ test("rolled-back board post neither publishes payload nor invalidates observers
   expect(events.some(event => event.kind === "board")).toBe(true); expect(observer).toHaveBeenCalled();
 });
 
-test("failed SQLite COMMIT discards queued payload and leaves the connection reusable", () => {
+test("failed SQLite COMMIT discards queued payload and leaves the connection reusable", async () => {
   database.db.exec("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_child(parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)");
-  expect(() => database.db.transaction(() => {
+  await expect(seed(database.repo, () => {
     application.send(recipient.session, "launcher", "commit must fail");
     database.db.run("INSERT INTO commit_child(parent) VALUES (1)");
-  }).immediate()).toThrow();
+  })).rejects.toThrow();
   expect(events).toEqual([]); expect(application.history(recipient.session)).toEqual([]);
-  database.db.transaction(() => { application.send(recipient.session, "launcher", "next commit succeeds"); })();
+  await seed(database.repo, () => { application.send(recipient.session, "launcher", "next commit succeeds"); });
   expect(events).toHaveLength(1);
 });
 
@@ -192,14 +195,16 @@ test("a failing postcommit effect does not suppress later effects or retain boar
   const log = spyOn(console, "error").mockImplementation(() => {});
   const observed: string[] = [];
   try {
-    database.repo.hosted.atomic(() => {
+    await seed(database.repo, () => {
       afterCommit(database.db, () => { throw new Error("first failed"); });
       afterCommit(database.db, async () => { throw new Error("async failed"); });
       afterCommit(database.db, () => { observed.push("last delivered"); });
     });
     expect(observed).toEqual(["last delivered"]);
-    application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
-    application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+    await seed(database.repo, () => {
+      application.call(recipient.session, "board_create", { name: "updates", purpose: "test" });
+      application.call(recipient.session, "board_subscribe", { board: "updates", mode: "push" });
+    });
     recipient.session.sink.deliver = () => { throw new Error("board sink failed"); };
     await mcp.sessions.run(principal, context(), "board_post", session => application.call(session, "board_post", { board: "updates", body: "durable post" }));
     expect(recipient.session.inflight.size).toBe(0);

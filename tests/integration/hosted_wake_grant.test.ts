@@ -9,6 +9,7 @@ import type { DeliveryEvent } from "../../src/server/application.ts";
 import { authorize } from "../../src/server/policy.ts";
 import { accessAudits } from "../support/audit.ts";
 import { board, direct } from "../support/events.ts";
+import { seed } from "../support/seed.ts";
 import { TestServer } from "../support/server.ts";
 
 const A = "alice@example.com";
@@ -180,7 +181,7 @@ test("the send result: an offline person alias says wakes:false; a team alias's 
   expect(toTeam.wakes).toBe(false);
   expect(toTeam.wake_note).not.toContain(B);
   // A team alias no one holds names no user: nothing said.
-  srv.app.repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "idle" }, A);
+  await seed(srv.app.repo, () => srv.app.repo.aliases.create({ scope_kind: "team", scope_ref: "eng", name: "idle" }, A));
   expect(await cfe.call<{ wakes?: false }>("dm_send", { to: "eng/idle", body: "anyone?" })).not.toHaveProperty("wakes");
   // A human reads it: reach is msg.send's call, not a wake.
   const bfe = await srv.hosted(B, "fe");

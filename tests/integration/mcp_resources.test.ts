@@ -16,6 +16,7 @@ import { type AppSession, signedIn } from "../support/app_session.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../src/shared/attachments.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { scratchDbPath } from "../support/scratch_db.ts";
+import { seed } from "../support/seed.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string, dir: string, clock: number;
@@ -203,8 +204,11 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   const grant = await issue();
   const alice = grant.authed.user_id;
   const bob = await issue("bob@example.com");
-  const team = app.repo.teams.create("private", alice);
-  app.repo.teams.addMember(team.id, alice);
+  const team = await seed(app.repo, () => {
+    const t = app.repo.teams.create("private", alice);
+    app.repo.teams.addMember(t.id, alice);
+    return t;
+  });
   const native = await connect(grant.token);
   const other = await connect(bob.token);
   for (let i = 0; i < 102; i++) value(await call(native.client, "board_create", { name: `page${String(i).padStart(3, "0")}`, purpose: "pagination" }));
@@ -222,7 +226,7 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   expect(peers.peers.find((p: { handle: string }) => p.handle === "alice@example.com/be")).toMatchObject({ online: false });
   expect(await read(native.client, "grayboard://boards/private")).toHaveProperty("posts");
   expect(app.db.query("SELECT * FROM subscriptions WHERE handle=?").all("alice@example.com/be")).toEqual(before);
-  app.repo.teams.removeMember(team.id, alice);
+  await seed(app.repo, () => app.repo.teams.removeMember(team.id, alice));
   await expect(read(native.client, "grayboard://boards/private")).rejects.toThrow("resource not found");
   expect((await native.client.listResources({ cursor: "page101" })).resources).toEqual([]);
   expect(app.mcp.activeLeases).toBe(0);
@@ -247,9 +251,12 @@ test("issued contiguous DM prefix receipts survive lost responses, but not out-o
 test("wire board receipts bind the issued snapshot and reject removed private-board membership", async () => {
   const alice = await issue();
   const bob = await issue("bob@example.com");
-  const team = app.repo.teams.create("private", alice.authed.user_id);
-  app.repo.teams.addMember(team.id, alice.authed.user_id);
-  app.repo.teams.addMember(team.id, bob.authed.user_id);
+  const team = await seed(app.repo, () => {
+    const t = app.repo.teams.create("private", alice.authed.user_id);
+    app.repo.teams.addMember(t.id, alice.authed.user_id);
+    app.repo.teams.addMember(t.id, bob.authed.user_id);
+    return t;
+  });
   const sender = await connect(alice.token);
   const reader = await connect(bob.token);
   const sub = await connect(bob.token, "2026-07-28", "subscriber");
@@ -267,11 +274,11 @@ test("wire board receipts bind the issued snapshot and reject removed private-bo
   expect(state.notified_id).toBe(issued.event.item.latest.id);
   expect(state.notified_id).toBeLessThan(latest.post_id);
   // Alice's mention wakes bob's agent only under a grant (#806).
-  app.repo.teams.setPolicy(team.id, "collaborative");
+  await seed(app.repo, () => app.repo.teams.setPolicy(team.id, "collaborative"));
   value(await call(sender.client, "board_post", { board: "private", body: "@bob@example.com/be private" }));
   const privateItem = (await read(sub.client, "grayboard://inbox")).items.find((i: { event: { kind: string; item?: { kind: string; post?: { board: string } } } }) => i.event.kind === "board" && i.event.item?.kind === "push" && i.event.item.post?.board === "private");
   expect(privateItem).toMatchObject({ actionable: true, event: { kind: "board", item: { kind: "push" } } });
-  app.repo.teams.removeMember(team.id, bob.authed.user_id);
+  await seed(app.repo, () => app.repo.teams.removeMember(team.id, bob.authed.user_id));
   expect((await call(sub.client, "delivery_receipt", { ids: [privateItem.id] })).isError).toBe(true);
   expect((await read(sub.client, "grayboard://inbox")).items.map((i: { id: string }) => i.id)).not.toContain(privateItem.id);
 });
@@ -281,11 +288,11 @@ test("fresh access of the same grant continues a lease; revoked access and repla
   const sub = await connect(grant.token, "2026-07-28", "subscriber");
   const lease = await open(sub.client, sub.headers);
   const token = randomBytes(32).toString("base64url");
-  const rotated = app.repo.oauth.rotateRefresh({ clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(grant.refreshToken), tokens: {
+  const rotated = await seed(app.repo, () => app.repo.oauth.rotateRefresh({ clientId: grant.binding.clientId, resource: grant.binding.resource, scopes: grant.binding.scopes, refreshHash: hashToken(grant.refreshToken), tokens: {
     ...grant.tokens, accessHash: hashToken(token), refreshHash: hashToken(randomBytes(32).toString("base64url")), accessExpiresAt: clock + OAUTH_TTL.access, refreshExpiresAt: clock + OAUTH_TTL.refresh,
-  } }, clock);
+  } }, clock));
   expect(rotated.status).toBe("ok");
-  app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+  await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
   await expect(read(sub.client, "grayboard://inbox")).rejects.toThrow();
   sub.headers.set("Authorization", `Bearer ${token}`);
   expect(value(await call(sub.client, "delivery_renew")).capability).toBe(lease.capability);
@@ -300,11 +307,11 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
   const grant = await issue();
   const sub = await connect(grant.token, "2026-07-28", "subscriber");
   await open(sub.client, sub.headers);
-  if (action === "access") app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock);
+  if (action === "access") await seed(app.repo, () => app.repo.oauth.revokeToken(grant.tokens.accessHash, grant.binding.clientId, clock));
   if (action === "expiry") clock += OAUTH_TTL.access;
-  if (action === "grant") app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock);
-  if (action === "disable") app.repo.users.setDisabled(grant.authed.user_id, true);
-  if (action === "admin") app.repo.sessions.revokeAllForUser(grant.authed.user_id);
+  if (action === "grant") await seed(app.repo, () => app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock));
+  if (action === "disable") await seed(app.repo, () => app.repo.users.setDisabled(grant.authed.user_id, true));
+  if (action === "admin") await seed(app.repo, () => app.repo.sessions.revokeAllForUser(grant.authed.user_id));
   await expect(sub.client.listResources()).rejects.toThrow();
   await expect(call(sub.client, "whoami")).rejects.toThrow();
   await expect(call(sub.client, "delivery_renew")).rejects.toThrow();
