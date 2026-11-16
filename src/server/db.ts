@@ -350,23 +350,23 @@ export interface Repo {
     prune(olderThanMs: number): void;
   };
   slack: {
-    links(): SlackLink[];
-    linkFor(userId: number): SlackLink | undefined;
-    linkBySlackUser(slackUser: string): SlackLink | undefined;
+    links(r: Read): SlackLink[];
+    linkFor(r: Read, userId: number): SlackLink | undefined;
+    linkBySlackUser(r: Read, slackUser: string): SlackLink | undefined;
     // Replaces the user's earlier link, if any.
-    link(userId: number, slackUser: string, dmChannel: string): void;
+    link(tx: Tx, userId: number, slackUser: string, dmChannel: string): void;
     // Also forgets the user's thread map.
-    unlink(userId: number): void;
-    thread(userId: number, kind: "dm" | "board", board: string | null, rootId: number): SlackThread | undefined;
-    threadByTs(userId: number, threadTs: string): SlackThread | undefined;
-    addThread(userId: number, t: SlackThread): void;
+    unlink(tx: Tx, userId: number): void;
+    thread(r: Read, userId: number, kind: "dm" | "board", board: string | null, rootId: number): SlackThread | undefined;
+    threadByTs(r: Read, userId: number, threadTs: string): SlackThread | undefined;
+    addThread(tx: Tx, userId: number, t: SlackThread): void;
     // Moves a thread's reply target forward, never back; a DM item's sender becomes its peer (#524).
-    advanceThread(userId: number, threadTs: string, id: number, peer?: string): void;
+    advanceThread(tx: Tx, userId: number, threadTs: string, id: number, peer?: string): void;
     // How far an outbound item got in Slack, keyed by its grayboard ref
     // ("dm:<message id>" or "post:<post id>"); cleared once it's done.
-    progress(userId: number, ref: string): unknown;
-    setProgress(userId: number, ref: string, progress: unknown): void;
-    clearProgress(userId: number, ref: string): void;
+    progress(r: Read, userId: number, ref: string): unknown;
+    setProgress(tx: Tx, userId: number, ref: string, progress: unknown): void;
+    clearProgress(tx: Tx, userId: number, ref: string): void;
   };
   writeReceipts: {
     // The receipt for (session, sender, fp) written after `since`.
@@ -1404,22 +1404,26 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     slack: {
-      links() {
+      links(r) {
+        const db = sqliteOf(r);
         return db.query<SlackLink, []>(
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id ORDER BY l.user_id",
         ).all();
       },
-      linkFor(userId) {
+      linkFor(r, userId) {
+        const db = sqliteOf(r);
         return db.query<SlackLink, [number]>(
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id WHERE l.user_id = ?",
         ).get(userId) ?? undefined;
       },
-      linkBySlackUser(slackUser) {
+      linkBySlackUser(r, slackUser) {
+        const db = sqliteOf(r);
         return db.query<SlackLink, [string]>(
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id WHERE l.slack_user = ?",
         ).get(slackUser) ?? undefined;
       },
-      link(userId, slackUser, dmChannel) {
+      link(tx, userId, slackUser, dmChannel) {
+        const db = sqliteOf(tx);
         db.transaction(() => {
           // Threads and progress live in the old account's DM; a new account starts fresh.
           for (const table of ["slack_threads", "slack_progress"]) {
@@ -1436,49 +1440,57 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           );
         })();
       },
-      unlink(userId) {
+      unlink(tx, userId) {
+        const db = sqliteOf(tx);
         db.transaction(() => {
           db.run("DELETE FROM slack_threads WHERE user_id = ?", [userId]);
           db.run("DELETE FROM slack_progress WHERE user_id = ?", [userId]);
           db.run("DELETE FROM slack_links WHERE user_id = ?", [userId]);
         })();
       },
-      thread(userId, kind, board, rootId) {
-        const r = db.query<SlackThread, [number, string, string, number]>(
+      thread(r, userId, kind, board, rootId) {
+        const db = sqliteOf(r);
+        const row = db.query<SlackThread, [number, string, string, number]>(
           "SELECT thread_ts, kind, board, root_id, peer, last_id FROM slack_threads WHERE user_id = ? AND kind = ? AND board = ? AND root_id = ?",
         ).get(userId, kind, board ?? "", rootId);
-        return r ? { ...r, board: r.board || null } : undefined;
+        return row ? { ...row, board: row.board || null } : undefined;
       },
-      threadByTs(userId, threadTs) {
-        const r = db.query<SlackThread, [number, string]>(
+      threadByTs(r, userId, threadTs) {
+        const db = sqliteOf(r);
+        const row = db.query<SlackThread, [number, string]>(
           "SELECT thread_ts, kind, board, root_id, peer, last_id FROM slack_threads WHERE user_id = ? AND thread_ts = ?",
         ).get(userId, threadTs);
-        return r ? { ...r, board: r.board || null } : undefined;
+        return row ? { ...row, board: row.board || null } : undefined;
       },
-      addThread(userId, t) {
+      addThread(tx, userId, t) {
+        const db = sqliteOf(tx);
         db.run(
           `INSERT OR IGNORE INTO slack_threads (user_id, thread_ts, kind, board, root_id, peer, last_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [userId, t.thread_ts, t.kind, t.board ?? "", t.root_id, t.peer, t.last_id],
         );
       },
-      advanceThread(userId, threadTs, id, peer) {
+      advanceThread(tx, userId, threadTs, id, peer) {
+        const db = sqliteOf(tx);
         db.run(
           "UPDATE slack_threads SET peer = CASE WHEN ? IS NOT NULL AND ? > last_id THEN ? ELSE peer END, last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?",
           [peer ?? null, id, peer ?? null, id, userId, threadTs],
         );
       },
-      progress(userId, ref) {
-        const r = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);
-        return r ? JSON.parse(r.progress) : undefined;
+      progress(r, userId, ref) {
+        const db = sqliteOf(r);
+        const row = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);
+        return row ? JSON.parse(row.progress) : undefined;
       },
-      setProgress(userId, ref, progress) {
+      setProgress(tx, userId, ref, progress) {
+        const db = sqliteOf(tx);
         db.run(
           `INSERT INTO slack_progress (user_id, ref, progress) VALUES (?, ?, ?)
            ON CONFLICT(user_id, ref) DO UPDATE SET progress = excluded.progress`,
           [userId, ref, JSON.stringify(progress)],
         );
       },
-      clearProgress(userId, ref) {
+      clearProgress(tx, userId, ref) {
+        const db = sqliteOf(tx);
         db.run("DELETE FROM slack_progress WHERE user_id = ? AND ref = ?", [userId, ref]);
       },
     },

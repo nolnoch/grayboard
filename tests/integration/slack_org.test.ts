@@ -364,11 +364,11 @@ test("#807: an HTTP unlink while another body holds the write queue waits, then 
   const holder = holdQueue();
   const unlinked = srv.app.slack!.unlink(userId);
   await ticks();
-  expect(srv.app.repo.slack.linkFor(userId)).toBeDefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeDefined();
   holder.release();
   await holder.done;
   expect(await unlinked).toBe(true);
-  expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeUndefined();
 });
 
 // #807 D4: a Slack user's tool call is one transaction through the write queue, as a hosted call is.
@@ -445,7 +445,7 @@ test("#807: an unlink for one Slack account leaves a link that moved to another 
   await link(alice);
   const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
   expect(await srv.app.slack!.unlink(userId, "U0SOMEONEELSE")).toBe(false);
-  expect(srv.app.repo.slack.linkFor(userId)).toMatchObject({ slack_user: ALICE_SLACK });
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toMatchObject({ slack_user: ALICE_SLACK });
   expect(await srv.app.slack!.unlink(userId, ALICE_SLACK)).toBe(true);
 });
 
@@ -459,7 +459,7 @@ test("#807: a rolled-back unlink leaves the link and its human online", async ()
   try {
     expect((await api(alice, "POST", "/api/slack/unlink")).status).not.toBe(200);
   } finally { spy.mockRestore(); }
-  expect(srv.app.repo.slack.linkFor(userId)).toBeDefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeDefined();
   expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeDefined();
   const sent = await be.call<SendResult>("dm_send", { to: "human", body: "still linked?" });
   expect(sent.delivered_now).toBe(true);
@@ -476,7 +476,7 @@ test("#807: a rolled-back link leaves no link, no human identity and nothing att
     slack.say(`link ${r.body.code}`);
     await until(() => spy.mock.calls.some((c) => c.map(String).join(" ").includes("audit refused")), 5000, "the link's failure was logged");
   } finally { spy.mockRestore(); }
-  expect(srv.app.repo.slack.linkFor(userId)).toBeUndefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeUndefined();
   expect(srv.app.repo.aliases.find("alice@example.com/human")).toBeUndefined();
   expect((await api(alice, "GET", "/api/whoami")).body.identities).not.toContain("human");
 });
@@ -719,7 +719,7 @@ test("a link code redeemed from a Slack account with another email is refused an
   const seen = slack.posts().length;
   slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
   await until(() => slack.posts().slice(seen).find((p) => p.channel === "D0MALLORY" && p.markdown_text?.includes("email isn't `alice@example.com`")));
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, srv.app.repo.users.findByEmail("alice@example.com")!.id)).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0MALLORY", { reason: "email_mismatch" }]]);
 
   // Used up: the right account can't redeem it after the refusal.
@@ -735,7 +735,7 @@ test("without the email scope, a link is refused with what the admin must add", 
   const r = await api(alice, "POST", "/api/slack/link");
   slack.say(`link ${r.body.code}`);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("users:read.email")));
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
 }, 30_000);
 
@@ -748,6 +748,6 @@ test("when Slack can't be reached to check the email, the link is refused with a
   slack.say(`link ${r.body.code}`);
   const reply = await until(() => slack.posts().find((p) => p.markdown_text?.includes("couldn't reach Slack")));
   expect(reply.markdown_text).not.toContain("users:read.email");
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);
