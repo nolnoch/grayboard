@@ -913,7 +913,7 @@ test("live disable/admin revoke, expiry, and database failures are not credentia
   await seed(storage.repo, () => storage.repo.users.setDisabled(np.authed.user_id, false));
   expect(service.isAuthorized(np)).toBe(false);
   const b = await issue(), t2 = await redeem(b), p2 = principal(t2);
-  await seed(storage.repo, () => storage.repo.sessions.revokeAllForUser(p2.authed.user_id)); expect(service.isAuthorized(p2)).toBe(false);
+  await seed(storage.repo, tx => storage.repo.sessions.revokeAllForUser(tx, p2.authed.user_id)); expect(service.isAuthorized(p2)).toBe(false);
   const c = await issue(), t3 = await redeem(c);
   storage.db.exec("CREATE TRIGGER reject_revoke BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT, 'injected'); END");
   const failed = await post("/oauth/revoke", { client_id: "native", token: t3.refresh_token });
@@ -1266,8 +1266,8 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
     expect(joins()).toBe(0); // warm: no token join while nothing has changed
     // A write inside a transaction that rolls back: false within it, true again after.
-    await expect(seed(storage.repo, () => {
-      storage.repo.sessions.revokeAllForUser(p.authed.user_id);
+    await expect(seed(storage.repo, tx => {
+      storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id);
       expect(service.isAuthorized(p)).toBe(false);
       throw new Error("roll back");
     })).rejects.toThrow("roll back");
@@ -1275,7 +1275,7 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     expect(joins()).toBeGreaterThan(0); // the read inside the transaction bypassed the cache, so the spy sees the join
     // Each committed way the access ends, against a warm entry.
     const ends: [string, (p: OAuthPrincipal) => unknown][] = [
-      ["revokeAllForUser", p => seed(storage.repo, () => storage.repo.sessions.revokeAllForUser(p.authed.user_id))],
+      ["revokeAllForUser", p => seed(storage.repo, tx => storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id))],
       ["disable", p => seed(storage.repo, () => storage.repo.users.setDisabled(p.authed.user_id, true))],
       ["another connection's grant revoke", p => { const other = new Database(config.dbPath); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
       ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
@@ -1398,7 +1398,7 @@ test("a login code redeems once for a CLI session token: no refresh, no expiry, 
   expect(token).toStartWith("gbrd_v1_");
   const authed = verifySessionToken(token, storage.repo, touches, 30);
   expect(authed).toMatchObject({ user_email: "you@example.com" });
-  expect(storage.repo.sessions.findById(authed!.session_id)).toMatchObject({ label: "grayboard-test", revoked_at: null });
+  expect(storage.repo.sessions.findById(storage.repo.read, authed!.session_id)).toMatchObject({ label: "grayboard-test", revoked_at: null });
   // Not an OAuth access token.
   expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }))).toBeInstanceOf(Response);
   expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
@@ -1422,7 +1422,7 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
     expect(again.status).toBe(400);
     expect(await again.json()).toEqual({ error: "invalid_grant" });
     expect(verifySessionToken(token, storage.repo, touches, 30)).toBeNull();
-    expect(storage.repo.sessions.findById(authed.session_id)!.revoked_at).not.toBeNull();
+    expect(storage.repo.sessions.findById(storage.repo.read, authed.session_id)!.revoked_at).not.toBeNull();
     expect(accessAudits(storage.db, "oauth.code_replay_revoked")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: CLI_CLIENT_ID, token_session: authed.session_id, level: "warning" } })]);
     // With its session revoked the spent code goes at the next sweep.
     await seed(storage.repo, () => storage.repo.oauth.cleanup(clock));

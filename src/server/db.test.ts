@@ -59,9 +59,9 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   const path = join(dir, "db.sqlite");
   const opts = { blobDir: join(dir, "blobs") };
   const old = openDatabase(path, opts);
-  const { user, session } = await seed(old.repo, () => {
+  const { user, session } = await seed(old.repo, tx => {
     const user = old.repo.users.upsertByEmail("you@example.com", "You");
-    const session = old.repo.sessions.create(user.id, "old-session-hash", "old client");
+    const session = old.repo.sessions.create(tx, user.id, "old-session-hash", "old client");
     old.repo.aliases.create({ scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
     old.repo.messages.insert("you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
     for (const table of ["oauth_tokens", "oauth_grants", "oauth_codes", "oauth_browsers", "oauth_requests"]) old.db.exec(`DROP TABLE ${table}`);
@@ -71,7 +71,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   const reopened = openDatabase(path, opts);
   try {
     expect(reopened.repo.users.findById(user.id)?.display_name).toBe("You");
-    expect(reopened.repo.sessions.findByTokenHash("old-session-hash")?.id).toBe(session.id);
+    expect(reopened.repo.sessions.findByTokenHash(reopened.repo.read, "old-session-hash")?.id).toBe(session.id);
     expect(reopened.repo.aliases.listForScope("person", user.email).map(i => i.name)).toEqual(["fe"]);
     expect(reopened.repo.messages.history(["you@example.com/fe"])[0]?.body).toBe("preserved");
     expect(reopened.repo.oauth.isGrantActive("missing", Date.now())).toBe(false);
@@ -190,17 +190,17 @@ describe("Repo", () => {
   });
 
   test("sessions: create, findByTokenHash, revoke", async () => {
-    const s = await seed(repo, () => {
+    const s = await seed(repo, tx => {
       const u = repo.users.upsertByEmail("wade@example.com", null);
-      return repo.sessions.create(u.id, "hash123", "test");
+      return repo.sessions.create(tx, u.id, "hash123", "test");
     });
-    const found = repo.sessions.findByTokenHash("hash123");
+    const found = repo.sessions.findByTokenHash(repo.read, "hash123");
     expect(found?.id).toBe(s.id);
-    await seed(repo, () => repo.sessions.revoke(s.id));
-    expect(repo.sessions.findByTokenHash("hash123")).toBeUndefined();
+    await seed(repo, tx => repo.sessions.revoke(tx, s.id));
+    expect(repo.sessions.findByTokenHash(repo.read, "hash123")).toBeUndefined();
     // By row, a revoked one still reads, with its revoked_at.
-    expect(repo.sessions.findById(s.id)?.revoked_at).not.toBeNull();
-    expect(repo.sessions.findById(s.id + 100)).toBeUndefined();
+    expect(repo.sessions.findById(repo.read, s.id)?.revoked_at).not.toBeNull();
+    expect(repo.sessions.findById(repo.read, s.id + 100)).toBeUndefined();
   });
 
   test("aliases: create, list, remove", async () => {
@@ -653,4 +653,31 @@ test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", as
   expect(repo.cursors.directFor(repo.read, "a@example.com/fe")).toBe(3);
   expect(repo.writeReceipts.find(repo.read, "s1", "a@example.com/fe", "f", 0)?.at).toBe(5);
   expect(repo.writeReceipts.find(repo.read, "s2", "a@example.com/fe", "g", 0)).toBeUndefined();
+});
+
+// #807 P1c-6: the sessions store runs on the handle it's given, as P1c-5's leaf stores do.
+test("#807 P1c-6: sessions run on the handle they're given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { kept, s, u } = await seed(repo, tx => {
+    const u = repo.users.upsertByEmail("a@example.com", null);
+    const s = repo.sessions.create(tx, u.id, "hash-a", "test");
+    repo.sessions.touch(tx, s.id, 7);
+    return { kept: tx, s, u };
+  });
+  expect(repo.sessions.findByTokenHash(repo.read, "hash-a")?.id).toBe(s.id);
+  expect(repo.sessions.findById(repo.read, s.id)?.last_used_at).toBe(7);
+  const settled = /used after its transaction settled/;
+  expect(() => repo.sessions.create(kept, u.id, "hash-b", "test")).toThrow(settled);
+  expect(() => repo.sessions.findByTokenHash(kept, "hash-a")).toThrow(settled);
+  expect(() => repo.sessions.findById(kept, s.id)).toThrow(settled);
+  expect(() => repo.sessions.revoke(kept, s.id)).toThrow(settled);
+  expect(() => repo.sessions.revokeAllForUser(kept, u.id)).toThrow(settled);
+  expect(() => repo.sessions.revokeDev(kept)).toThrow(settled);
+  expect(() => repo.sessions.touch(kept, s.id, 9)).toThrow(settled);
+  const foreign = {} as typeof repo.read;
+  expect(() => repo.sessions.findById(foreign, s.id)).toThrow("not a SQLite store handle");
+  const after = repo.sessions.findById(repo.read, s.id)!;
+  expect(after.revoked_at).toBeNull();
+  expect(after.last_used_at).toBe(7);
+  expect(repo.sessions.findByTokenHash(repo.read, "hash-b")).toBeUndefined();
 });

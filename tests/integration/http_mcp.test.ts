@@ -244,7 +244,7 @@ test("revocation is checked on subsequent calls, including legacy", async () => 
   for (const version of ["2026-07-28", "2025-11-25"]) {
     const token = await login("bob@example.com");
     const c = await connect(token, "be", version);
-    await seed(app.repo, () => app.repo.sessions.revokeAllForUser(app.repo.users.findByEmail("bob@example.com")!.id));
+    await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, app.repo.users.findByEmail("bob@example.com")!.id));
     await expect(c.listTools()).rejects.toThrow();
   }
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
@@ -285,7 +285,7 @@ test("live access, family, disable and admin revocation never reuse a cached pri
         await seed(app.repo, () => app.repo.users.setDisabled(issued.authed.user_id, true));
         await seed(app.repo, () => app.repo.users.setDisabled(issued.authed.user_id, false));
         break;
-      case "admin": await seed(app.repo, () => app.repo.sessions.revokeAllForUser(issued.authed.user_id)); break;
+      case "admin": await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, issued.authed.user_id)); break;
     }
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "revoked" } })).rejects.toThrow();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);

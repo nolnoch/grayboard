@@ -24,6 +24,6 @@ export function seed<T>(on: Pick<Repo, "write"> | Database, fn: (tx: Tx) => T): 
 // body), which can't await: the Repo's writeNow, which runs fn now on an idle queue and returns its value. It throws,
 // queueing nothing, when another body holds the queue or a transaction is open, rather than letting the write land
 // after the hook has returned.
-export function seedSync<T>(on: Pick<Repo, "writeNow">, fn: () => Sync<T>): T {
+export function seedSync<T>(on: Pick<Repo, "writeNow">, fn: (tx: Tx) => Sync<T>): T {
   return on.writeNow(fn);
 }

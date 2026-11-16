@@ -7,6 +7,7 @@ import {
 } from "./auth.ts";
 import { defaultProviders } from "./idp.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
+import type { Tx } from "./store/tx.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
@@ -111,12 +112,12 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
-  return repo.write(() => {
+  return repo.write(tx => {
     const user  = repo.users.upsertByEmail(email, null);
     const disabled = refuseDisabled(repo, user, { dev: true, ip: ip ?? undefined });
     if (disabled) return disabled;
     const raw   = mintToken();
-    repo.sessions.create(user.id, hashToken(raw), DEV_SESSION_LABEL);
+    repo.sessions.create(tx, user.id, hashToken(raw), DEV_SESSION_LABEL);
     writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
     return json({ session_token: raw, user_email: email, expires_at: null });
   });
@@ -143,8 +144,8 @@ export function signInRoute(method: string, path: string, config: Config): { cha
 }
 
 function authLogout(authed: AuthedUser, repo: Repo): Promise<Response> {
-  return repo.write(() => {
-    repo.sessions.revoke(authed.session_id);
+  return repo.write(tx => {
+    repo.sessions.revoke(tx, authed.session_id);
     writeAudit(repo, "auth.logout", authed.user_email, null, { token_session: authed.session_id });
     return json({ ok: true });
   });
@@ -596,10 +597,10 @@ async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, 
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   // The live sessions go after the commit: a rolled-back revoke leaves them up, as it leaves their tokens valid.
-  const target = await repo.write(() => {
+  const target = await repo.write((tx: Tx) => {
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
-    repo.sessions.revokeAllForUser(target.id);
+    repo.sessions.revokeAllForUser(tx, target.id);
     writeAudit(repo, "auth.session_revoked", authed.user_email, body.email);
     return target;
   }, target => { if (target) disconnectUser(target.id); return target; });

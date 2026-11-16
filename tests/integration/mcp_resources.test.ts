@@ -311,7 +311,7 @@ for (const action of ["access", "expiry", "grant", "disable", "admin"] as const)
   if (action === "expiry") clock += OAUTH_TTL.access;
   if (action === "grant") await seed(app.repo, () => app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock));
   if (action === "disable") await seed(app.repo, () => app.repo.users.setDisabled(grant.authed.user_id, true));
-  if (action === "admin") await seed(app.repo, () => app.repo.sessions.revokeAllForUser(grant.authed.user_id));
+  if (action === "admin") await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, grant.authed.user_id));
   await expect(sub.client.listResources()).rejects.toThrow();
   await expect(call(sub.client, "whoami")).rejects.toThrow();
   await expect(call(sub.client, "delivery_renew")).rejects.toThrow();

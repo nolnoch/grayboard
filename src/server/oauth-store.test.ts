@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, type Sync } from "./db.ts";
+import type { Tx } from "./store/tx.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";
 import { OAUTH_TTL, type OAuthAuthorization, type OAuthCode, type OAuthRequest, type OAuthTokenPair } from "./oauth-types.ts";
@@ -25,8 +26,8 @@ describe("OAuth domain store", () => {
   let code: OAuthCode;
   const sessionHash = h("browser-session");
   // The store's writes run in each connection's write queue, as a request's do.
-  const w1 = <T>(fn: () => Sync<T>) => seed(first.repo, fn);
-  const w2 = <T>(fn: () => Sync<T>) => seed(second.repo, fn);
+  const w1 = <T>(fn: (tx: Tx) => Sync<T>) => seed(first.repo, fn);
+  const w2 = <T>(fn: (tx: Tx) => Sync<T>) => seed(second.repo, fn);
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "grayboard-oauth-"));
     const opts = { blobDir: join(dir, "blobs") };
@@ -204,11 +205,11 @@ describe("OAuth domain store", () => {
   });
   test("admin revoke-all includes OAuth; single old-session logout and browser logout do not", async () => {
     const input = await issue();
-    const s = await w1(() => first.repo.sessions.create(userId, "old-hash", null));
-    await w1(() => first.repo.sessions.revoke(s.id));
+    const s = await w1(tx => first.repo.sessions.create(tx, userId, "old-hash", null));
+    await w1(tx => first.repo.sessions.revoke(tx, s.id));
     await w1(() => first.repo.oauth.revokeBrowserSession(sessionHash));
     expect(first.repo.oauth.isGrantActive(input.grantId, start)).toBe(true);
-    await w1(() => first.repo.sessions.revokeAllForUser(userId));
+    await w1(tx => first.repo.sessions.revokeAllForUser(tx, userId));
     expect(first.repo.oauth.isGrantActive(input.grantId, start)).toBe(false);
   });
   test("expiry caps, cleanup and retained spent refresh tombstones", async () => {
@@ -384,7 +385,7 @@ describe("OAuth domain store", () => {
     second.db.close();
     second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
     expect((await w2(() => second.repo.oauth.redeemCode(input, later))).status).toBe("replay");
-    await w1(() => first.repo.sessions.revokeAllForUser(userId));
+    await w1(tx => first.repo.sessions.revokeAllForUser(tx, userId));
     await w1(() => first.repo.users.setDisabled(userId, true));
     expect(first.db.query("SELECT grant_id FROM oauth_codes WHERE hash = ?").get(code.codeHash)).toEqual({ grant_id: input.grantId });
     expect((await w2(() => second.repo.oauth.redeemCode(input, input.grantExpiresAt))).status).toBe("not_found");
@@ -459,7 +460,7 @@ describe("OAuth domain store", () => {
     first.db.exec("CREATE TRIGGER fail_revoke BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT, 'storage failure'); END");
     await expect(w1(() => first.repo.oauth.revokeToken(input.tokens.refreshHash, binding.clientId, start))).rejects.toThrow("storage failure");
     expect(first.repo.oauth.isGrantActive(input.grantId, start)).toBe(true);
-    await expect(w1(() => first.repo.sessions.revokeAllForUser(userId))).rejects.toThrow("storage failure");
+    await expect(w1(tx => first.repo.sessions.revokeAllForUser(tx, userId))).rejects.toThrow("storage failure");
     await expect(w1(() => first.repo.users.setDisabled(userId, true))).rejects.toThrow("storage failure");
     expect(first.repo.users.findById(userId)?.disabled_at).toBeNull();
   });

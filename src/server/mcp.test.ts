@@ -458,8 +458,8 @@ for (const revoked of [false, true]) test(`authentication lost between HTTP pref
   const logs = spyOn(console, "error").mockImplementation(() => {});
   application.admitHosted = (...args) => {
     original(...args);
-    seedSync(store.repo, () => {
-      if (revoked) store.repo.sessions.revokeAllForUser(user.user_id);
+    seedSync(store.repo, tx => {
+      if (revoked) store.repo.sessions.revokeAllForUser(tx, user.user_id);
       else store.repo.users.setDisabled(user.user_id, true);
     });
   };
@@ -510,7 +510,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   try {
     const pending = client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } }).catch(e => e);
     await selection;
-    await seed(store.repo, () => store.repo.sessions.revokeAllForUser(user.user_id));
+    await seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id));
     release();
     await pending;
     expect(response!.status).toBe(401);
@@ -536,7 +536,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
   try {
     const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": version, ...(version === "2026-07-28" ? { "Mcp-Method": "tools/call", "Mcp-Name": "board_create" } : {}) }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params }) }));
     await selection;
-    await seed(store.repo, () => store.repo.sessions.revokeAllForUser(user.user_id));
+    await seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id));
     if (stop === "abort") abort.abort(); else await hosted.close();
     release();
     const response = await pending;
@@ -1385,7 +1385,7 @@ const aliceRoot = () => store.repo.hosted.all().find(r => !r.root_session_id && 
 const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][] = [
   ["access revoke", ({ time }) => seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(token), OPENCODE_CLIENT, time.now))],
   ["grant revoke", ({ time, grant }) => seed(store.repo, () => store.repo.oauth.revokeToken(hashToken(grant.refreshToken), OPENCODE_CLIENT, time.now))],
-  ["sign-out everywhere", () => seed(store.repo, () => store.repo.sessions.revokeAllForUser(user.user_id))],
+  ["sign-out everywhere", () => seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id))],
   ["disable", () => seed(store.repo, () => store.repo.users.setDisabled(user.user_id, true))],
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
   ["binding change", () => seed(store.repo, () => store.repo.hosted.atomic(() => { const r = aliceRoot(); store.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); }))],

@@ -173,7 +173,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const action of ["access", "ex
   if (action === "expiry") clock += OAUTH_TTL.access;
   if (action === "grant") await seed(app.repo, () => app.repo.oauth.revokeToken(hashToken(grant.refreshToken), grant.binding.clientId, clock));
   if (action === "disable") await seed(app.repo, () => app.repo.users.setDisabled(grant.authed.user_id, true));
-  if (action === "admin") await seed(app.repo, () => app.repo.sessions.revokeAllForUser(grant.authed.user_id));
+  if (action === "admin") await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, grant.authed.user_id));
   await until(() => version === "2026-07-28" ? app.mcp.activeListens === 0 : app.mcp.activeGetStreams === 0);
   await expect(connection.client.readResource({ uri: boardUri })).rejects.toThrow();
 });
