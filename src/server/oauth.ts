@@ -285,13 +285,23 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   };
   const returnToClient = (r: OAuthRequest, f: Flow, fields: Record<string, string>) => authorizationResponse(r.redirectUri, f.state, fields);
   // A fresh upstream state, verifier and nonce for this flow, bound to `provider` (#928 D7). Choosing again replaces
-  // the flow's earlier upstream state, which then completes nothing.
-  const toUpstream = async (id: string, f: Flow, provider: IdentityProvider): Promise<Response> => {
+  // the flow's earlier upstream state, which then completes nothing. A provider that can't build its URL (the OIDC
+  // provider's discovery failed) ends the flow back at the client as temporarily_unavailable, so a waiting
+  // `grayboard login` reports it; the log keeps the error's class.
+  const toUpstream = async (id: string, f: Flow, provider: IdentityProvider, redirectUri: string): Promise<Response> => {
     if (f.upstream) upstream.delete(f.upstream.stateHash);
     const upstreamState = random(), verifier = random(), nonce = random();
     f.upstream = { provider: provider.id, stateHash: hashToken(upstreamState), verifier, nonce };
     upstream.set(f.upstream.stateHash, id);
-    return redirect(await provider.authorizeUrl({ redirectUri: endpoint(callbackPath(provider)), state: upstreamState, nonce, challenge: challenge(verifier) }));
+    try {
+      return redirect(await provider.authorizeUrl({ redirectUri: endpoint(callbackPath(provider)), state: upstreamState, nonce, challenge: challenge(verifier) }));
+    } catch (e) {
+      hostedFailure("oauth.upstream", e);
+      writeAudit(repo, "oauth.upstream_failed", null, null, { client_id: f.client.clientId, provider: provider.id });
+      upstream.delete(f.upstream.stateHash);
+      flows.delete(hashToken(id));
+      return authorizationResponse(redirectUri, f.state, { error: "temporarily_unavailable" });
+    }
   };
   // Several providers and no browser session: one link per provider, in config order, to /oauth/upstream.
   const chooser = (id: string) => html(`<h1>Sign in to Grayboard</h1><ul>${providers.map(p =>
@@ -385,7 +395,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (c.session && repo.oauth.findBrowserSession(hashToken(c.session), t)) {
         response = redirect(endpoint("/oauth/consent") + "?request=" + id);
       } else if (providers.length === 1) {
-        response = await toUpstream(id, f, providers[0]!);
+        response = await toUpstream(id, f, providers[0]!, redirectUri);
       } else {
         response = chooser(id);
       }
@@ -399,8 +409,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const id = required(p, "request");
       const provider = providerById.get(required(p, "provider"));
       if (!provider) fail();
-      const { f } = getFlow(req, id);
-      return toUpstream(id, f, provider!);
+      const { f, r } = getFlow(req, id);
+      return toUpstream(id, f, provider!, r.redirectUri);
     }
     const provider = req.method === "GET" ? providerByCallback.get(path) : undefined;
     if (provider) {
@@ -426,12 +436,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(callbackPath(provider)) }); }
       catch (e) {
         // The provider checked the email's domain (D1, D5); its refusal is audited as such.
-        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.domain); }
+        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.domain); }
         // The log keeps the error's class, which names the failed stage for the OIDC provider (OidcDiscoveryError…).
         hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.upstream_failed", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider);
       }
       if (f.expiresAt <= now() || closed) fail();
-      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId }); return refuse(REFUSED.provider); }
+      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider); }
       const signedIn = await repo.write(() => idpSignIn(repo, provider, identity!, { client_id: r.clientId }, providers));
       // idpSignIn's text names only the person's email(s), the provider labels and the admin's unlink-idp remedy.
       if ("refused" in signedIn) return refuse(signedIn.refused);

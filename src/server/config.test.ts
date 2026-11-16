@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { loadConfig } from "./config.ts";
+import { checkIdpConfig, loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
@@ -202,6 +202,14 @@ describe("loadConfig", () => {
       process.env[name] = "";
       expect(message()).toBe(`GRAYBOARD_IDPS lists okta, so ${name} is required`);
     }
+  });
+
+  test("checkIdpConfig on Config alone refuses Okta config with okta unlisted, and okta listed without its config", () => {
+    const okta = { issuer: "https://example.okta.com", clientId: "okta-client", clientSecret: "okta-private", allowedDomains: ["example.com"] };
+    const base = { devAuth: false, googleClientSecret: "" };
+    expect(() => checkIdpConfig({ ...base, idps: ["google"], okta })).toThrow("Okta is configured but GRAYBOARD_IDPS doesn't list okta");
+    expect(() => checkIdpConfig({ ...base, idps: ["okta"], okta: undefined })).toThrow("GRAYBOARD_IDPS lists okta without its configuration");
+    expect(() => checkIdpConfig({ ...base, idps: ["okta"], okta })).not.toThrow();
   });
 
   test("an Okta variable set while okta isn't listed refuses to start", () => {

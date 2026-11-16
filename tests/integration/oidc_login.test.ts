@@ -178,9 +178,34 @@ test("an Okta refusal is audited under oauth.upstream_* with the provider, and i
   // An email outside the allowed domains keeps DomainRefused's handling: oauth.domain_refused, no failure row.
   fake.userinfo({ email: "you@other.example.org" });
   expect((await signIn(srv)).result).toBe(REFUSED.domain);
-  expect(accessAudits(srv.app.db, "oauth.domain_refused").map(r => r.detail)).toEqual([{ client_id: CLIENT }]);
+  expect(accessAudits(srv.app.db, "oauth.domain_refused").map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
   expect(accessAudits(srv.app.db, "oauth.upstream_failed")).toHaveLength(1);
   expect(browsers(srv)).toBe(0);
+});
+
+test("an IdP whose discovery fails sends the client temporarily_unavailable, not a 500, and logs the stage's class", async () => {
+  const { fake: down, srv } = await start(f => [okta(f)]);
+  down.stop();
+  fake = undefined;
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const browser = new Browser(), a = authorization(srv.issuer);
+    const res = await browser.request(a.url);
+    expect(res.status).toBe(303);
+    const to = new URL(res.headers.get("Location")!);
+    expect([to.origin + to.pathname, to.searchParams.get("error"), to.searchParams.get("state"), to.searchParams.get("iss")]).toEqual([a.redirectUri, "temporarily_unavailable", a.state, srv.issuer]);
+    expect(log.mock.calls.flat()).toContain('[grayboard] {"operation":"oauth.upstream","category":"failure","level":"error","class":"OidcDiscoveryError"}');
+  } finally { log.mockRestore(); }
+  expect(accessAudits(srv.app.db, "oauth.upstream_failed").map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
+});
+
+test("with two providers, a browser that already signed in skips the chooser and goes to consent", async () => {
+  const { srv } = await start(f => [google(), okta(f)]);
+  const { result, browser } = await signIn(srv, "okta");
+  expect(result).toBe("consent");
+  const again = await browser.request(authorization(srv.issuer).url);
+  expect(again.status).toBe(303);
+  expect(again.headers.get("Location")!).toStartWith(`${srv.issuer}/oauth/consent?request=`);
 });
 
 // #928 criterion 4, D4: issuer_mismatch both ways round, with the real OIDC provider on the Okta side.

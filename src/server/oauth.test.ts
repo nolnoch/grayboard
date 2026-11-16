@@ -275,6 +275,14 @@ test("a built-in client's non-loopback or other-path redirect is refused before 
   expect(exchanges).toBe(0);
 });
 
+test("a provider list that is empty, repeats an ID or has an ID unsafe in a path stops the OAuth server from starting", () => {
+  service.close();
+  const as = (id: string) => stubProvider({ email: "you@example.com", displayName: "You", subject: "s" }, undefined, { id });
+  for (const providers of [[], [as("google"), as("google")], [as("Okta")], [as("a/b")]])
+    expect(() => createOAuthServer(storage.repo, config, { providers })).toThrow("identity providers need distinct, path-safe IDs");
+  service = makeService();
+});
+
 test("an operator client reusing a built-in ID stops the OAuth server from starting", () => {
   service.close();
   for (const clientId of BUILTIN_CLIENT_IDS) {
