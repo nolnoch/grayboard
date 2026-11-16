@@ -119,7 +119,7 @@ test("Repo.write commits a transaction, rolls it back on a throw, and refuses in
   await expect(repo.write(() => { repo.users.upsertByEmail("b@example.com", null); throw new Error("boom"); })).rejects.toThrow("boom");
   expect(repo.users.findByEmail("b@example.com")).toBeUndefined();
   let nested: Promise<unknown> | undefined;
-  repo.atomic(() => { nested = repo.write(() => 1); });
+  await repo.write(() => { nested = repo.write(() => 1); });
   await expect(nested!).rejects.toThrow("nested code calls atomic");
 });
 
@@ -132,7 +132,6 @@ test("#807: writeNow runs its transaction now through an idle queue, and refuses
   expect(() => repo.writeNow(() => { repo.users.upsertByEmail("rolled@example.com", null); throw new Error("boom"); })).toThrow("boom");
   expect(repo.users.findByEmail("rolled@example.com")).toBeUndefined();
   expect(queueFor(db).held).toBe(false);
-  expect(() => repo.atomic(() => repo.writeNow(() => 1))).toThrow("writeNow inside an open transaction");
   let release!: () => void;
   const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
   expect(() => repo.writeNow(() => repo.users.upsertByEmail("held@example.com", null))).toThrow("writeNow while the write queue is held");
@@ -175,7 +174,7 @@ test("committed runs after its commit and before the queue's next body; a promis
   await holder;
 });
 
-test("a top-level transaction refuses while another body holds the queue; the holder's own code, after an await or in committed, opens one", async () => {
+test("a top-level transaction refuses unless its caller holds the queue; the holder's own code, after an await or in committed, opens one", async () => {
   const { db, repo } = open();
   let release!: () => void;
   let inside: string | undefined;
@@ -191,8 +190,16 @@ test("a top-level transaction refuses while another body holds the queue; the ho
   release();
   await holder;
   expect(inside).toBe("opened");
-  // Idle again: a direct transaction opens.
-  repo.atomic(() => repo.users.upsertByEmail("after@example.com", null));
+  // Idle again: a direct transaction, or an autocommit write, is still outside the queue (#807 P1b-4e).
+  expect(() => repo.atomic(() => repo.users.upsertByEmail("after@example.com", null))).toThrow("write outside the write queue");
+  expect(() => repo.users.upsertByEmail("after@example.com", null)).toThrow("write outside the write queue");
+  // A bare autocommit write, by a statement or by exec (db.run with no bindings); DDL stays open to tests.
+  expect(() => db.prepare("DELETE FROM users WHERE email = ?").run("holder@example.com")).toThrow("write outside the write queue");
+  expect(() => db.run("DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
+  expect(() => db.exec("DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
+  expect(repo.users.findByEmail("holder@example.com")).toBeDefined();
+  db.run("CREATE TEMP TRIGGER IF NOT EXISTS t_queue_test AFTER INSERT ON users BEGIN SELECT 1; END");
+  expect(repo.users.findByEmail("after@example.com")).toBeUndefined();
   // committed runs inside its body, so a write there (cancel's settle) opens.
   expect(await repo.write(() => 1, v => repo.atomic(() => { repo.users.upsertByEmail("committed@example.com", null); return v + 1; }))).toBe(2);
   expect(repo.users.findByEmail("committed@example.com")).toBeDefined();
@@ -304,4 +311,87 @@ test("writeAudit under another body's hold waits for it rather than writing into
   await holder;
   await queueFor(db).run(() => {});
   expect(repo.audit.last("hosted.stream_closed", "s-1")).toBeDefined();
+});
+
+// #807 P1b-4e: a write body may await. Its transaction stays open, and the queue held, across the await; meanwhile
+// every other task is outside it.
+test("an async write body keeps its transaction across awaits: others read committed state, their writes wait or are refused", async () => {
+  const { db, repo } = open();
+  const seen: string[] = [];
+  let resume!: () => void, entered!: () => void;
+  const paused = new Promise<void>(r => { resume = r; }), inside = new Promise<void>(r => { entered = r; });
+  const body = repo.write(async () => {
+    repo.users.upsertByEmail("async@example.com", null);
+    entered();
+    await paused;
+    // Resumed: still its own transaction. It reads its uncommitted row, a nested atomic is a savepoint in it, and
+    // an effect waits for the commit.
+    expect(repo.users.findByEmail("async@example.com")).toBeDefined();
+    repo.atomic(() => repo.users.upsertByEmail("nested@example.com", null));
+    afterCommit(db, () => { seen.push("holder committed"); });
+    expect(seen).toEqual(["other's effect"]);
+    return "done";
+  });
+  await inside;
+  expect(db.inTransaction).toBe(true);
+  // Another task reads committed state (the reader), not the holder's uncommitted row.
+  expect(repo.users.findByEmail("async@example.com")).toBeUndefined();
+  // Its autocommit write and its top-level transaction are refused; its effect runs now.
+  expect(() => repo.users.upsertByEmail("other@example.com", null)).toThrow("another body holds the write queue");
+  expect(() => repo.atomic(() => 1)).toThrow("another body holds the write queue");
+  afterCommit(db, () => { seen.push("other's effect"); });
+  expect(seen).toEqual(["other's effect"]);
+  // A queued write waits its turn and commits after the holder.
+  const waiting = repo.write(() => { seen.push("queued body"); return repo.users.upsertByEmail("queued@example.com", null); });
+  expect(seen).toEqual(["other's effect"]);
+  resume();
+  expect(await body).toBe("done");
+  await waiting;
+  expect(seen).toEqual(["other's effect", "holder committed", "queued body"]);
+  for (const who of ["async", "nested", "queued"]) expect(repo.users.findByEmail(`${who}@example.com`)).toBeDefined();
+  expect(repo.users.findByEmail("other@example.com")).toBeUndefined();
+  expect(db.inTransaction).toBe(false);
+  expect(queueFor(db).held).toBe(false);
+});
+
+test("an async write body that rejects after an await rolls back, drops its effects and releases the queue", async () => {
+  const { db, repo } = open();
+  const seen: string[] = [];
+  await expect(repo.write(async () => {
+    repo.users.upsertByEmail("gone@example.com", null);
+    afterCommit(db, () => { seen.push("effect"); });
+    await Promise.resolve();
+    repo.atomic(() => repo.users.upsertByEmail("gone-too@example.com", null));
+    throw new Error("late");
+  })).rejects.toThrow("late");
+  expect(repo.users.findByEmail("gone@example.com")).toBeUndefined();
+  expect(repo.users.findByEmail("gone-too@example.com")).toBeUndefined();
+  expect(seen).toEqual([]);
+  expect(db.inTransaction).toBe(false);
+  expect(queueFor(db).held).toBe(false);
+  // The queue goes on: the next body commits.
+  await repo.write(() => repo.users.upsertByEmail("next@example.com", null));
+  expect(repo.users.findByEmail("next@example.com")).toBeDefined();
+});
+
+test("a COMMIT that fails rolls the body back, drops its effects and releases the queue", async () => {
+  const { db, repo } = open();
+  // A deferred foreign key is checked at COMMIT, so the body runs clean and its COMMIT fails.
+  db.run("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)");
+  db.run("CREATE TABLE fk_child (p INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED)");
+  const seen: string[] = [];
+  for (const body of [() => 1, async () => { await Promise.resolve(); return 1; }]) {
+    await expect(repo.write((() => {
+      repo.users.upsertByEmail("orphaned@example.com", null);
+      db.query("INSERT INTO fk_child (p) VALUES (?)").run(99);
+      afterCommit(db, () => { seen.push("effect"); });
+      return body();
+    }) as () => Promise<number>)).rejects.toThrow(/FOREIGN KEY/);
+    expect(repo.users.findByEmail("orphaned@example.com")).toBeUndefined();
+    expect(seen).toEqual([]);
+    expect(db.inTransaction).toBe(false);
+    expect(queueFor(db).held).toBe(false);
+  }
+  await repo.write(() => repo.users.upsertByEmail("next@example.com", null));
+  expect(repo.users.findByEmail("next@example.com")).toBeDefined();
 });

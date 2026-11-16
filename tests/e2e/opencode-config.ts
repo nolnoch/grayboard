@@ -11,6 +11,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/r
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 import { createBoard, post, subscribe } from "../../src/core/boards.ts";
+import { seed } from "../support/seed.ts";
 import { stubProvider } from "../support/stub_provider.ts";
 
 const root = process.env.GRAYBOARD_GIT_TEST_ROOT!;
@@ -115,9 +116,11 @@ try {
   assert.equal(app.repo.aliases.find("you@example.com/be"), undefined);
   await rpc.enroll({ sessionID: session.id, name: "be", create: true }, { location });
   await wait(() => app.mcp.activeLeases, n => n === 1);
-  const board = createBoard(app.db, "you@example.com/be", "config-fixture", "Config fixture");
-  subscribe(app.db, "you@example.com/be", board.name, "digest");
-  post(app.db, "you@example.com/sim", board.name, "Nonactionable digest");
+  await seed(app.db, () => {
+    const board = createBoard(app.db, "you@example.com/be", "config-fixture", "Config fixture");
+    subscribe(app.db, "you@example.com/be", board.name, "digest");
+    post(app.db, "you@example.com/sim", board.name, "Nonactionable digest");
+  });
   await wait(() => receipts, n => n >= 1);
   assert.equal((await host.session.inbox.list({ sessionID: session.id })).length, 1);
   assert.equal(models, 0); assert.equal(google, 1); assert(cimd >= 1);
