@@ -102,9 +102,9 @@ test("a commit invalidates only the rows it changed; a touch or an empty commit 
   const unlisten = hosted.listen(changed => { invalidations.push(changed); });
   try {
     await seed(database.repo, () => database.repo.hosted.atomic(() => {}));
-    await seed(database.repo, () => database.repo.hosted.atomic(() => database.repo.hosted.touch(target.id, now)));
+    await seed(database.repo, tx => database.repo.hosted.atomic(() => database.repo.hosted.touch(tx, target.id, now)));
     expect(invalidations).toEqual([]);
-    await seed(database.repo, () => database.repo.hosted.atomic(() => database.repo.hosted.end(target.id, "closed", now)));
+    await seed(database.repo, tx => database.repo.hosted.atomic(() => database.repo.hosted.end(tx, target.id, "closed", now)));
     expect(invalidations).toEqual([target.id]);
     expect(application.holdsByOwner().size).toBe(3);
   } finally { unlisten(); }
@@ -187,8 +187,8 @@ test("global quota applies across users transactionally without creating an over
       const user = database.repo.users.upsertByEmail(tx, `user${userIndex}@example.com`, null);
       for (let i = 0; i < hosted.limits.user; i++) {
         const id = `seed-${userIndex}-${i}`;
-        const ownership = database.repo.hosted.start(id, user.id, OPENCODE_CLIENT, now);
-        database.repo.hosted.insert({ ...template, session_id: id, ownership_id: ownership, user_id: user.id });
+        const ownership = database.repo.hosted.start(tx, id, user.id, OPENCODE_CLIENT, now);
+        database.repo.hosted.insert(tx, { ...template, session_id: id, ownership_id: ownership, user_id: user.id });
       }
     }
   });
@@ -1455,7 +1455,7 @@ test("#881: a request reads its row once and skips its own user's disabled read;
     // Positive case: settle with no authorized user (the sweep's and mcp authorize's) still reads, and ends.
     await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]));
     query.mockClear();
-    await seed(database.repo, () => hosted.settle(root.id));
+    await seed(database.repo, tx => hosted.settle(tx, root.id));
     expect(userReads()).toBe(1);
     expect(database.repo.hosted.get(root.id)).toBeUndefined();
   } finally { query.mockRestore(); }
@@ -1499,14 +1499,14 @@ const windows: [string, (m: { root: string; child: string; other: string; name: 
   // The child alone goes idle: the root stays live (touched, its lease renewed), so a miss here is the child's.
   ["the child parked", async ({ root, child }) => { now += 900_001; await keepLive(root); hosted.sweep(); const row = database.repo.hosted.get(hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
   ["the root's lease lapsed", async ({ root }) => { await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, hostedId(root)])); }],
-  ["the root's generation moved", async ({ root }) => { await seed(database.repo, () => { const r = database.repo.hosted.get(hostedId(root))!; database.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); }); }],
+  ["the root's generation moved", async ({ root }) => { await seed(database.repo, tx => { const r = database.repo.hosted.get(hostedId(root))!; database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); }); }],
   ["the root ended and started again", async ({ root }) => { await hosted.end(principal, context(root)); await hosted.whoami(principal, context(root)); }],
   ["the child moved to another root", async ({ root, other, child }) => { await hosted.end(principal, context(root), hostedId(child)); await hosted.register(principal, context(other), child); }],
   ["the child's idle window passed", async ({ root, child }) => { now += 900_001; await keepLive(root); expect(database.repo.hosted.get(hostedId(child))).toBeDefined(); }],
 ];
 function keepLive(root: string) {
-  return seed(database.repo, () => {
-    database.repo.hosted.touch(hostedId(root), now);
+  return seed(database.repo, tx => {
+    database.repo.hosted.touch(tx, hostedId(root), now);
     database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ? AND lease_deadline IS NOT NULL", [now + 30_000, hostedId(root)]);
   });
 }
@@ -1571,7 +1571,7 @@ test("a child's native tool call under its exchange's verdict coalesces its touc
   const call = async () => {
     const { verdict } = await hosted.snapshot(principal, context("child"), false);
     const touches = spyOn(database.repo.hosted, "touch");
-    try { await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[0]); }
+    try { await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", `at ${now}`), undefined, verdict); return touches.mock.calls.map(c => c[1]); }
     finally { touches.mockRestore(); }
   };
   const start = [seen("root"), seen("child")];
@@ -1584,7 +1584,7 @@ test("a child's native tool call under its exchange's verdict coalesces its touc
   now += 5_000;
   const touches = spyOn(database.repo.hosted, "touch");
   await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", "late"), undefined, verdict);
-  const touched = touches.mock.calls.map(c => c[0]).sort();
+  const touched = touches.mock.calls.map(c => c[1]).sort();
   touches.mockRestore();
   expect(touched).toEqual([hostedId("child"), hostedId("root")].sort());
   expect([seen("root"), seen("child")]).toEqual([now, now]);

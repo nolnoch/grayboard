@@ -1334,9 +1334,9 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   await second.listen({ resourceSubscriptions: ["grayboard://boards/theirs"] });
   expect(hosted.activeListens).toBe(2);
   // A binding change committed outside any request of either session, so only the notice can reach the listens.
-  const rebind = (email: string) => seed(store.repo, () => store.repo.hosted.atomic(() => {
+  const rebind = (email: string) => seed(store.repo, tx => store.repo.hosted.atomic(() => {
     const row = store.repo.hosted.all().find(r => store.repo.users.findById(r.user_id)?.email === email)!;
-    store.repo.hosted.update({ ...row, bind_gen: row.bind_gen + 1 });
+    store.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 });
   }));
   await rebind("bob@example.com");
   await untilHosted(() => hosted.activeListens === 1);
@@ -1388,7 +1388,7 @@ const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][
   ["sign-out everywhere", () => seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id))],
   ["disable", () => seed(store.repo, tx => store.repo.users.setDisabled(tx, user.user_id, true))],
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
-  ["binding change", () => seed(store.repo, () => store.repo.hosted.atomic(() => { const r = aliceRoot(); store.repo.hosted.update({ ...r, bind_gen: r.bind_gen + 1 }); }))],
+  ["binding change", () => seed(store.repo, tx => store.repo.hosted.atomic(() => { const r = aliceRoot(); store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); }))],
 ];
 // Only the stream timer ticks (the hosted sweep would end an expired session's row itself), and the backstop sits
 // past the access TTL, so the expiry case reaches phase A's auth check with a fresh stamp.
@@ -1414,7 +1414,7 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   const f = await stampedListen();
   const root = aliceRoot().session_id;
   // The update's notice makes the next tick a full check, which stamps the new deadline.
-  await seed(store.repo, () => store.repo.hosted.atomic(() => { const r = aliceRoot(); store.repo.hosted.update({ ...r, lease_deadline: f.time.now + 5_000 }); }));
+  await seed(store.repo, tx => store.repo.hosted.atomic(() => { const r = aliceRoot(); store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); }));
   f.tick(); f.tick();
   expect(hosted.activeListens).toBe(1);
   f.time.now += 4_999; f.tick();

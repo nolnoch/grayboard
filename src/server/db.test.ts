@@ -792,3 +792,40 @@ test("#807 P1c-10: team writes run on the handle they're given", async () => {
   expect(repo.teams.listMembers(t.id)).toEqual([{ user_id: a.id, email: "a@example.com", role: "owner" }]);
   expect(repo.teams.findByName("ops")?.policy).toBe("open");
 });
+
+// #807 P1c-11: the hosted store's writes run on the handle they're given, as P1c-7's users writes do. The facade
+// resolves the handle before it reads any argument, so a kept Tx is refused whatever the rest of the call says.
+test("#807 P1c-11: hosted writes run on the handle they're given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const { kept, row } = await seed(repo, tx => {
+    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
+    const ownership = repo.hosted.start(tx, "root-1", u.id, "test", 1);
+    const row = { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
+      writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null };
+    repo.hosted.insert(tx, row);
+    return { kept: tx, row };
+  });
+  expect(repo.hosted.get("root-1")?.last_seen_at).toBe(1);
+  const settled = /used after its transaction settled/;
+  const h = repo.hosted, x = {} as never;
+  expect(() => h.park(kept, "root-1", 2)).toThrow(settled);
+  expect(() => h.unpark(kept, "root-1", "g", 2)).toThrow(settled);
+  expect(() => h.start(kept, "root-2", row.user_id, "test", 2)).toThrow(settled);
+  expect(() => h.insert(kept, { ...row, session_id: "root-2" })).toThrow(settled);
+  expect(() => h.update(kept, { ...row, last_seen_at: 9 })).toThrow(settled);
+  expect(() => h.touch(kept, "root-1", 9)).toThrow(settled);
+  expect(() => h.end(kept, "root-1", "closed", 9)).toThrow(settled);
+  expect(() => h.childEnd(kept, "root-1", 9, x)).toThrow(settled);
+  expect(() => h.lose(kept, "root-1", { alias: "a@example.com/fe", reason: "r", primary: true }, 9)).toThrow(settled);
+  expect(() => h.tellLost(kept, "root-1", 9)).toThrow(settled);
+  expect(() => h.reportLost(kept, "root-1", 9)).toThrow(settled);
+  expect(() => h.seeLost(kept, "root-1", 9)).toThrow(settled);
+  expect(() => h.forgetLost(kept, "root-1", "a@example.com/fe")).toThrow(settled);
+  expect(() => h.heartbeat(kept, 9)).toThrow(settled);
+  expect(() => h.touch({} as Tx, "root-1", 9)).toThrow("not a SQLite store handle");
+  expect(h.get("root-1")).toMatchObject({ last_seen_at: 1, parked_at: null });
+  expect(h.get("root-2")).toBeUndefined();
+  expect(h.owned("root-2")).toBe(false);
+  expect(h.lost("root-1", "agent")).toEqual([]);
+  expect(h.aliveAt()).toBeUndefined();
+});

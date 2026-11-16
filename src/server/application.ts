@@ -626,7 +626,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // One write (#807 P1b-4b): the uses are read, and revoked, in its transaction; live holders follow after the commit.
   // A caller's open transaction takes it in; a held queue makes it wait behind the holder.
   function recheckAliases(principal: string | null, by: string | null): void {
-    repo.post(() => {
+    repo.post(tx => {
       const revoked: (AliasUse & { reason: string })[] = [];
       for (const u of aliasUses(db, principal)) {
         const p = repo.principals.findByName(u.principal);
@@ -634,7 +634,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         const reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
         if (reason) revoked.push({ ...u, reason });
       }
-      return revokeAliases(revoked, by);
+      return revokeAliases(tx, revoked, by);
     }, ({ resync, ends }) => {
       // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
       // address set and registry entries follow the database, as a bind or unbind's do.
@@ -653,11 +653,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Inside recheckAliases's write body; returns what its commit hands on: the non-hosted holders to resync, the ends.
   // Each use is its own savepoint: one that throws rolls back alone, is logged and audited alias.revoke_failed, and
   // leaves the others revoked, so one bad row doesn't stop every revocation the server's sweep makes.
-  function revokeAliases(uses: (AliasUse & { reason: string })[], by: string | null): { resync: string[]; ends: Ends } {
+  function revokeAliases(tx: Tx, uses: (AliasUse & { reason: string })[], by: string | null): { resync: string[]; ends: Ends } {
     const ended: string[] = [], resync: string[] = [];
     if (!uses.length) return { resync, ends: { woken: new Set(), bounced: [] } };
     for (const u of uses) {
-      try { revokeUse(u, by, ended, resync); }
+      try { revokeUse(tx, u, by, ended, resync); }
       catch (e) {
         console.error(`[grayboard] revoking ${u.address} from session ${u.id} failed:`, e);
         writeAudit(repo, "alias.revoke_failed", by, u.address, { session: u.id, principal: u.principal, error: String(e) });
@@ -665,14 +665,14 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     }
     return { resync, ends: endIdsIn(ended, "revoked") };
   }
-  function revokeUse(u: AliasUse & { reason: string }, by: string | null, ended: string[], resync: string[]): void {
+  function revokeUse(tx: Tx, u: AliasUse & { reason: string }, by: string | null, ended: string[], resync: string[]): void {
     const { reason } = u;
     const hosted = repo.hosted.owned(u.id);
     if (!u.held) {
       // A hosted tools-only root ends its ownership, not an ID (hosted IDs are the store's).
       repo.atomic(() => {
         writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, writes_as: true, reason });
-        if (hosted) repo.hosted.end(u.id, "revoked", now());
+        if (hosted) repo.hosted.end(tx, u.id, "revoked", now());
       });
       if (!hosted) ended.push(u.id);
       return;
@@ -688,9 +688,9 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         const row = repo.hosted.get(u.id);
         if (row) {
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
-          repo.hosted.update({ ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(db, u.id).length ? row.lease_deadline : null });
+          repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(db, u.id).length ? row.lease_deadline : null });
           if (row.lease_deadline !== null) writeAudit(repo, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
-          repo.hosted.lose(u.id, { alias: u.address, reason, primary }, now());
+          repo.hosted.lose(tx, u.id, { alias: u.address, reason, primary }, now());
         }
       }
     };
