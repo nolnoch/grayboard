@@ -20,13 +20,16 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
-import { createGrayboard, factReader, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { createGrayboard, factReader, INSTRUCTIONS_BACKOFF_MS, INSTRUCTIONS_WAIT_MS, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
+import { piMarker } from "../../adapters/pi-family/entry-pi.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
-import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
+import { NotStarted, RootDelivery } from "../../adapters/hosted-core/src/root.ts";
+import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
+import { CallAborted, ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath, FileStorage, sessionPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
@@ -93,14 +96,14 @@ type Instance = {
   notices: { message: string; level: Level }[];
   records: DeliveryEntry[];
   tools(): NativeTool[];
-  call(tool: string, args?: Record<string, unknown>): Promise<CallToolResult>;
+  call(tool: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult>;
 };
 // `marker`, a function, is read live (omp's entry: the root as it is now).
 // `facts`: the harness's current model and effort (#364), read live.
 // `interactive`: the harness's mode outlives a browser round trip (tui, rpc).
 function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void, facts?: (sessionID: string) => SessionFacts | undefined, interactive = false): Instance {
   let tools: NativeTool[] = [];
-  let run: ((tool: string, args: Record<string, unknown>) => Promise<CallToolResult>) | undefined;
+  let run: ((tool: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<CallToolResult>) | undefined;
   const self: Instance = {
     deliveries: [], notices: [], records: [],
     ext: createGrayboard({
@@ -115,7 +118,7 @@ function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?
       ...(facts ? { facts } : {}),
     }),
     tools: () => tools,
-    call: (tool, args = {}) => run!(tool, args),
+    call: (tool, args = {}, signal) => run!(tool, args, signal),
   };
   instances.push(self);
   return self;
@@ -353,6 +356,22 @@ test("reload detaches, keeping the lease the reloaded instance resumes; quit rel
   expect(row("reload-1")!.ownership_id).not.toBe(leased.ownership_id);
 });
 
+// #438 item 26: the harness's abort reaches the hosted call, for a root and
+// for a child (whose path wraps it in the unattributed retry); an aborted
+// call throws instead of returning an error result for nobody to read.
+test("an aborted tool call throws CallAborted, for a root and a child", async () => {
+  const lead = instance();
+  await lead.ext.start({ id: "abort-root", reason: "startup" });
+  expect((await lead.call("bind", { name: "abort-lead", create: true })).isError).toBeUndefined();
+  await expect(lead.call("whoami", {}, AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+  const child = instance({ child: true, root: "abort-root" });
+  await child.ext.start({ id: "abort-child", reason: "startup" });
+  await expect(child.call("whoami", {}, AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+  // Neither abort broke anything: both still call.
+  expect(payload(await lead.call("whoami"))).toMatchObject({ primary: `${EMAIL}/abort-lead` });
+  expect((await child.call("whoami")).isError).toBeFalsy();
+});
+
 test("a marked child registers under its root before its first call, writes as the root's name, and ends on shutdown", async () => {
   const parent = await root("parent-1", "parent");
   const other = await root("other-1", "other");
@@ -550,10 +569,13 @@ test("a runner child with no parent session works as an unregistered session, wa
   await root("loner-next", "loner", {}, false);
 });
 
-test("a config.json URL the extension would refuse leaves it loading: start warns, and every tool call and status name the fix", async () => {
+test("a missing config.json, or a URL the extension would refuse, leaves it loading: start warns, and every tool call and status name the fix", async () => {
   const rule = `${join(stateDir, "config.json")} names a server URL that isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; run \`grayboard setup --server <url>\` with one that is`;
-  for (const url of ["http://10.0.0.5:8080/mcp", "https://grayboard.example/mcp?team=1"]) {
-    writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url }));
+  const unset = "grayboard is not set up for a server; run `grayboard setup --server <url>`";
+  const cases: [string | undefined, string][] = [["http://10.0.0.5:8080/mcp", rule], ["https://grayboard.example/mcp?team=1", rule], [undefined, unset]];
+  for (const [url, rule] of cases) {
+    if (url) writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url }));
+    else rmSync(join(stateDir, "config.json"), { force: true });
     const i = instance();
     await i.ext.start({ id: `noncanonical-${instances.length}`, reason: "startup" });
     expect(i.notices).toEqual([{ level: "warning", message: `grayboard: ${rule}` }]);
@@ -625,6 +647,76 @@ test("a resume whose rebind is refused says so at once and in the next tool resu
   expect(await again.ext.instructions()).toStartWith(`You are "${EMAIL}/rebinder" on grayboard.`);
 });
 
+// #438-25: a stalled or failing server neither holds every prompt nor fails silently.
+test("a model call waits at most INSTRUCTIONS_WAIT_MS for the instructions; a timeout or failure is said once, backs off, and a success clears it", async () => {
+  const r = await root("slow-s", "slow");
+  const real = RootDelivery.prototype.instructions;
+  let mode: "stall" | "late" | "fail" | "signed-out" | "starting" | "real" = "stall";
+  let land: (() => void) | undefined;
+  const fetch = spyOn(RootDelivery.prototype, "instructions").mockImplementation(function (this: RootDelivery) {
+    switch (mode) {
+      case "stall": return new Promise<never>(() => {});
+      case "late": return new Promise<string | undefined>(resolve => { land = () => resolve("late text"); });
+      case "fail": return Promise.reject(new Error("boom"));
+      case "signed-out": return Promise.reject(new Error("wrapped", { cause: new AccessExpired("pi", LOGIN_ACTION) }));
+      case "starting": return Promise.reject(new NotStarted());
+      case "real": return real.call(this);
+    }
+  });
+  const wall = Date.now;
+  let skew = 0;
+  const clock = spyOn(Date, "now").mockImplementation(() => wall() + skew);
+  const warning = (why: string) => ({ level: "warning" as Level, message: `grayboard: fetching the instructions ${why}, so they aren't refreshed; trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s or once a fetch answers` });
+  try {
+    r.notices.length = 0;
+    const began = performance.now();
+    expect(await r.ext.instructions()).toBeUndefined();
+    const waited = performance.now() - began;
+    expect(waited).toBeGreaterThanOrEqual(INSTRUCTIONS_WAIT_MS - 50);
+    expect(waited).toBeLessThan(INSTRUCTIONS_WAIT_MS + 1_500);
+    const slow = warning(`took longer than ${INSTRUCTIONS_WAIT_MS} ms`);
+    expect(r.notices).toEqual([slow]);
+
+    // Backing off: no fetch at all, so no wait.
+    expect(await r.ext.instructions()).toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    // Past the backoff a failure fetches again, unsaid while the streak lasts.
+    skew += INSTRUCTIONS_BACKOFF_MS + 1;
+    mode = "fail";
+    expect(await r.ext.instructions()).toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(r.notices).toEqual([slow]);
+
+    // A success ends the streak; the next failure is said again, with its cause.
+    skew += INSTRUCTIONS_BACKOFF_MS + 1;
+    mode = "real";
+    expect(await r.ext.instructions()).toStartWith(`You are "${EMAIL}/slow" on grayboard.`);
+    mode = "fail";
+    expect(await r.ext.instructions()).toBeUndefined();
+    expect(r.notices).toEqual([slow, warning("failed: boom")]);
+
+    // A timed-out fetch that then lands ends its backoff: the next call fetches at once.
+    skew += INSTRUCTIONS_BACKOFF_MS + 1;
+    mode = "late";
+    expect(await r.ext.instructions()).toBeUndefined();
+    land!();
+    mode = "real";
+    await until(async () => (await r.ext.instructions()) !== undefined);
+    expect(fetch).toHaveBeenCalledTimes(6);
+
+    // A sign-out and a root still starting are neither said nor backed off.
+    r.notices.length = 0;
+    for (const m of ["signed-out", "starting"] as const) {
+      mode = m;
+      expect(await r.ext.instructions()).toBeUndefined();
+    }
+    mode = "real";
+    expect(await r.ext.instructions()).toStartWith(`You are "${EMAIL}/slow" on grayboard.`);
+    expect(r.notices).toEqual([]);
+  } finally { fetch.mockRestore(); clock.mockRestore(); }
+});
+
 // #1020: a team the user left reads as missing (not_found), which a resume skips like a revoked name.
 test("a resume whose team name is refused because its user left the team skips that name and resumes the rest", async () => {
   const bob = await srv.login("bob@example.com");
@@ -651,7 +743,7 @@ test("a child's system-prompt instructions are its registered session's, even fe
   expect((await child.call("whoami")).isError).toBeUndefined();
 });
 
-test("a pause the Controller's run loop reaches on its own is said at once and in the next tool result", async () => {
+test("a pause the Controller's run loop reaches on its own is said at once and in the next tool result, and /grayboard resume restarts it", async () => {
   const a = await root("sink-a", "sinker");
   // The same session bound to another name outside this extension: the run
   // loop won't deliver under a binding it didn't make.
@@ -662,6 +754,15 @@ test("a pause the Controller's run loop reaches on its own is said at once and i
   await until(() => a.notices.length > 0, 10_000, "a notice");
   expect(a.notices).toEqual([{ level: "warning", message: paused }]);
   expect(texts(await a.call("whoami"))[0]).toBe(paused);
+  // /grayboard resume restarts the paused root: it runs again under its own name.
+  await a.ext.command("resume");
+  // It says "approved" before the command returns; whether delivery's later "active" also
+  // reaches the UI as a notice is timing-dependent, so status is the proof it's running again.
+  expect(a.notices.slice(1, 2)).toEqual([{ level: "info", message: "grayboard: approved: Bound sinker, switched; opening delivery" }]);
+  await until(async () => (await a.ext.status()).includes(`  sink-a (${EMAIL}/sinker, ${EMAIL}/switched): active,`), 5_000, "sink-a active as sinker, switched");
+  const resumed = texts(await a.call("whoami"));
+  expect(resumed).toHaveLength(1);
+  expect(JSON.parse(resumed[0]!)).toMatchObject({ primary: `${EMAIL}/sinker`, held: [`${EMAIL}/sinker`, `${EMAIL}/switched`] });
 });
 
 test("with the server down, /grayboard logout signs out but warns that its revoke is queued, and a failed /grayboard login names login, not resume", async () => {
@@ -1164,4 +1265,15 @@ test("factReader reads each fact on its own: a throwing effort keeps the model, 
   expect(read("s2", { model: () => { throw new Error("no model"); }, effort: () => null })).toEqual({ effort: null });
   expect(warned).toHaveLength(2);
   expect(read("s1", { model: () => null, effort: () => "high" })).toEqual({ model: null, effort: "high" });
+});
+
+// pi's entry reads its marker from pi-subagents' runner env (#438 item 20):
+// the names, a child with no parent session (unattributed), and a root.
+test("pi's marker: PI_SUBAGENT_CHILD=1 is a child of PI_SUBAGENT_PARENT_SESSION; anything else is a root", () => {
+  expect(piMarker({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_PARENT_SESSION: "parent-1" })).toEqual({ child: true, root: "parent-1" });
+  expect(piMarker({ PI_SUBAGENT_CHILD: "1" })).toEqual({ child: true });
+  expect(piMarker({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_PARENT_SESSION: "" })).toEqual({ child: true });
+  expect(piMarker({ PI_SUBAGENT_PARENT_SESSION: "parent-1" })).toEqual({ child: false });
+  expect(piMarker({ PI_SUBAGENT_CHILD: "0", PI_SUBAGENT_PARENT_SESSION: "parent-1" })).toEqual({ child: false });
+  expect(piMarker({})).toEqual({ child: false });
 });

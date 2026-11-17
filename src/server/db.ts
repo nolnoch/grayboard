@@ -380,8 +380,8 @@ export interface Repo {
     // Synchronous on every store (#807 P3 A6h): writeAudit and recordDecision call it at ~100 sites, many in
     // synchronous code inside a body. The row joins tx's transaction: it commits and rolls back with it (a savepoint's
     // with the savepoint), and `last` on the same tx sees it. A store whose statements are async (Postgres) buffers
-    // the row on tx and inserts the buffer inside the transaction before COMMIT, never after; its `last` searches the
-    // buffer, newest first, before the table.
+    // the row on tx and inserts the buffer inside the transaction before COMMIT, never after; its `last` answers the
+    // newest row by (at, id) across the buffer and the table.
     write(tx: Tx, row: AccessLogRow): void;
     // The most recent row for this action+target, for dedup windows and
     // "has this happened recently" checks. Undefined when none exists.

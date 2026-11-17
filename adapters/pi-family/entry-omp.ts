@@ -24,32 +24,16 @@ import { instructionHooks, modelName } from "./omp-instructions.ts";
 // mcp.json entry names them.
 const SERVER = "grayboard";
 const PREFIX = `mcp__${SERVER}_`;
-// How long a model call waits for the instructions before going out as omp
-// built it.
-const FETCH_WAIT_MS = 2_000;
-const LATE = Symbol("late");
 
 export default function grayboard(pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
   let current: Grayboard | undefined, currentId: string | undefined;
   let agent: ExtensionContext["agent"] | undefined;
   let disposed = false; // session_shutdown ran: no session starts after it
-  let slow = false; // a fetch outran FETCH_WAIT_MS; logged once until one doesn't
-
-  // The current instructions, or undefined when there are none or the server
-  // takes longer than FETCH_WAIT_MS (a partition, an outage): a model call
-  // never waits out a connect timeout for them.
-  const instructions = async (): Promise<string | undefined> => {
-    const fetching = current?.instructions();
-    if (!fetching) return undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<typeof LATE>(resolve => { timer = setTimeout(() => resolve(LATE), FETCH_WAIT_MS); });
-    const text = await Promise.race([fetching, late]).finally(() => clearTimeout(timer));
-    if (text !== LATE) { slow = false; return text; }
-    if (!slow) pi.logger.warn(`grayboard: the instructions took longer than ${FETCH_WAIT_MS} ms; model requests go out without refreshing them until the server answers in time`);
-    slow = true;
-    return undefined;
-  };
+  // The current instructions, or undefined when there are none; the
+  // extension bounds the fetch (INSTRUCTIONS_WAIT_MS), so a model call never
+  // waits out a connect timeout for them.
+  const instructions = async (): Promise<string | undefined> => current?.instructions();
 
   // On screen when there is one, else on stderr.
   const show = (message: string, level: Level) => {
@@ -93,7 +77,7 @@ export default function grayboard(pi: ExtensionAPI) {
           approval: "write",
           strict: false,
           loadMode: loadMode(tool),
-          execute: async (_id, params) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params))),
+          execute: async (_id, params, signal) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params), signal)),
         });
       }
     },

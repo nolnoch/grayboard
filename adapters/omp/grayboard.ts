@@ -587,7 +587,12 @@ export default function grayboard(pi: ExtensionAPI) {
     }
     shared.owner = pi;
     shared.ownerToken = randomUUID();
-    shared.verdict = secondGrayboard(ctx.cwd, own);
+    // An ACP session loads no on-disk MCP config: omp creates it with enableMCP
+    // false (main.ts createAcpSessionFactory, which names its agent "acp:<id>"),
+    // and its servers are the client's session/new mcpServers, applied after
+    // this hook, so a .mcp.json entry there would refuse a grayboard nothing
+    // runs beside (#559).
+    shared.verdict = ctx.agent.id.startsWith("acp:") ? Promise.resolve(undefined) : secondGrayboard(ctx.cwd, own);
     const refused = await shared.verdict;
     if (refused) return report(ctx, refused);
     register();

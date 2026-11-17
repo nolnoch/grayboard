@@ -183,7 +183,8 @@ abstract class Connection {
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
     }
   }
-  options() { return { signal: this.signal, timeout: 10_000 }; }
+  // `signal`: a caller's own abort (one tool call), on top of this wire's.
+  options(signal?: AbortSignal) { return { signal: signal ? AbortSignal.any([this.signal, signal]) : this.signal, timeout: 10_000 }; }
   async close() { await this.client.close(); }
 }
 
@@ -260,7 +261,7 @@ export class NativeWire extends Connection {
     return tools;
   }
   // The server's result untouched: content, structuredContent, isError, _meta.
-  async callTool(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options()));
+  async callTool(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal)));
   }
 }

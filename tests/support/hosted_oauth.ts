@@ -45,6 +45,21 @@ export function hostedServer(overrides: Partial<Config> = {}, email = "alice@exa
   }
 }
 
+// Every request that reaches `srv`'s token endpoint from now on, as its
+// grant_type in arrival order (#439 item 2: a count of refresh requests, not of
+// rotations). The HTTP router calls oauth.fetch through the object, so the
+// wrapper sees each request the auth gate passes on, a refused or failed one
+// included.
+export function tokenRequests(srv: TestServer): () => string[] {
+  const seen: string[] = [];
+  const oauth = srv.app.oauth, inner = oauth.fetch.bind(oauth);
+  oauth.fetch = async (req, context) => {
+    if (req.method === "POST" && new URL(req.url).pathname === "/oauth/token") seen.push(new URLSearchParams(await req.clone().text()).get("grant_type") ?? "");
+    return inner(req, context);
+  };
+  return () => [...seen];
+}
+
 // The chooser page's links, provider ID to URL, in page order (#928 D7).
 export function chooserLinks(page: string): [string, string][] {
   return [...page.matchAll(/href="([^"]+)"/g)].map(m => {

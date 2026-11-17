@@ -2,6 +2,7 @@
 // hook, so a hook doesn't pay for this module's imports (#551).
 import { Command } from "commander";
 import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync } from "node:fs";
+import { writeJsonFile } from "./json_file.ts";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { loginThroughServer } from "./oauth_flow.ts";
@@ -9,12 +10,14 @@ import { UPGRADE_REFUSAL } from "../shared/protocol.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro" };
+// The macro-built adapter texts, loaded only by the commands that write them (#438).
+type AdapterTexts = typeof import("./adapter_texts.ts");
+const adapterTexts = (): Promise<AdapterTexts> => import("./adapter_texts.ts");
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudeHooks, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
-import { piAgentDir } from "../shared/pi.ts";
+import { ompAgentDir, ompSetupRefusal, piSetupAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { hostedConfigPath, type HostedConfig } from "../../adapters/hosted-core/src/config.ts";
 
@@ -44,9 +47,14 @@ function handleApiError(e: unknown): never {
 
 // ── push adapters (omp, opencode, pi) ─────────────────────────────────────────────
 
-const OMP_DIR = join(homedir(), ".omp", "agent");
+const OMP_DIR = ompAgentDir();
 const OC_DIR  = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
-const PI_DIR  = piAgentDir();
+const PI_DIR  = piSetupAgentDir();
+// Set when omp's agent dir is one setup can't install in: shared with pi's,
+// where each would load the other's adapter from extensions/grayboard.ts, or
+// a relative default-profile PI_CODING_AGENT_DIR. Setup refuses omp's;
+// refresh leaves omp alone.
+const OMP_REFUSAL = ompSetupRefusal(process.env, homedir(), PI_DIR);
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
@@ -64,7 +72,7 @@ const OC_CONFIG: HarnessConfig = {
   section: "mcp",
   local: e => ({ ...e, enabled: false, environment: pushOff(e, "environment") }),
 };
-const OC_PLUGIN = { path: join(OC_DIR, "plugin", "grayboard.ts"), source: adapterSource("opencode") };
+const OC_PLUGIN = { path: join(OC_DIR, "plugin", "grayboard.ts") };
 
 // pi and omp have two adapters each, one per mode. Server: the hosted
 // extension (`.js`, a bundle of adapters/pi-family) talks to the server's
@@ -85,8 +93,9 @@ type PiFamily = {
   local: string;
   hosted: string;
   hostedConfig: string;
-  source: string;
-  bundle: string;
+  // The keys of its local and hosted texts in adapter_texts.ts.
+  source: keyof AdapterTexts;
+  bundle: keyof AdapterTexts;
 };
 const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | "bundle">): PiFamily => ({
   name, clientId: `grayboard-${name}`, stateDir: join(dir, "grayboard"),
@@ -95,19 +104,21 @@ const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | 
   local: join(dir, "extensions", "grayboard.ts"), hosted: join(dir, "extensions", "grayboard.js"), hostedConfig: hostedConfigPath(join(dir, "grayboard")),
   source: f.source, bundle: f.bundle,
 });
-const PI = piFamily("pi", PI_DIR, { source: adapterSource("pi"), bundle: adapterBundle("pi") });
-const OMP = piFamily("omp", OMP_DIR, { source: adapterBundle("omp", "local"), bundle: adapterBundle("omp") });
+const PI = piFamily("pi", PI_DIR, { source: "PI_LOCAL", bundle: "PI_HOSTED" });
+const OMP = piFamily("omp", OMP_DIR, { source: "OMP_LOCAL", bundle: "OMP_HOSTED" });
 
 /** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
 const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
 
-type FamilyInstall = { adapter: string; notes: string[] };
+type FamilyInstall = { adapter: string; notes: string[]; signIn: boolean };
 /**
  * Install the harness's adapter for the mode: `server` set → the hosted
  * extension; else the local adapter, with `entry` as the entry's command (or
  * the existing entry kept in its local shape). Leaving a hosted install's
  * server (local mode, or another server) signs the harness out of it first,
- * revoking its grant. Returns the adapter's path and what else changed.
+ * revoking its grant. Returns the adapter's path, what else changed, and
+ * whether the harness needs /grayboard login (a hosted install holding no
+ * grant for the server).
  * Throws, before any file changes, on a server URL the hosted extension would
  * refuse or an unparseable mcp.json or config.json; throws after the entry
  * check if the sign-out does (its grant store's lock), leaving the install
@@ -122,21 +133,22 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     try { url = canonicalEndpoint(hostedMcpUrl(server))?.href; } catch {}
     if (!url) throw new Error(`${h.name}'s hosted extension needs a canonical HTTPS (or loopback HTTP) server URL, without credentials, query or fragment, so nothing was changed for ${h.name}`);
   }
-  // The entry next: an unparseable mcp.json throws before any file changes.
+  // The texts, then the entry: a failed load (a macro, from source) or an
+  // unparseable mcp.json throws before any file changes.
+  const texts = await adapterTexts();
   const existing = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})[h.config.section]?.grayboard;
-  // `?.`: the file may hold JSON null.
-  const old = readConfig<{ url?: unknown }>(h.hostedConfig, {})?.url;
+  const old = readConfig<{ url?: unknown }>(h.hostedConfig, {}).url;
   if (typeof old === "string" && old !== url) {
     const note = await signOutPiFamily(h, old);
     if (note) notes.push(note);
   }
   if (url) {
     if (dropEntry(h.config)) notes.push(`Removed the grayboard entry from ${h.config.path} (the hosted extension needs none)`);
-    writeAdapter(h.hosted, h.bundle);
+    writeAdapter(h.hosted, texts[h.bundle]);
     rmSync(h.local, { force: true });
-    writeConfig(h.hostedConfig, { url } satisfies HostedConfig);
+    writeJsonFile(h.hostedConfig, { url } satisfies HostedConfig);
     notes.push(`Wrote ${h.hostedConfig}`);
-    return { adapter: h.hosted, notes };
+    return { adapter: h.hosted, notes, signIn: !(await piFamilyGrant(h, url)) };
   }
   // The local adapter reads its command from the entry, so one that's missing
   // (a server-mode install removed it, or the user did) is recreated with
@@ -145,13 +157,13 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
   if (putEntry(h.config, next)) {
     notes.push(next ? `Registered in ${h.config.path} (disabled: the extension serves the tools)` : `Disabled the grayboard entry in ${h.config.path} (the adapter serves the tools)`);
   }
-  writeAdapter(h.local, h.source);
+  writeAdapter(h.local, texts[h.source]);
   rmSync(h.hosted, { force: true });
   if (typeof old === "string") {
     rmSync(h.hostedConfig, { force: true });
     notes.push(`Removed ${h.hostedConfig}`);
   }
-  return { adapter: h.local, notes };
+  return { adapter: h.local, notes, signIn: false };
 }
 
 /**
@@ -163,11 +175,8 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
  */
 async function signOutPiFamily(h: PiFamily, resource: string): Promise<string | undefined> {
   let queued: string | undefined;
-  let login: Login;
-  try {
-    login = new Login({ resource, clientId: h.clientId, stateDir: h.stateDir, harness: h.name, loginAction: "run /grayboard login",
-      present: () => {}, notify: () => {}, diagnostic: r => { if (r.code === "revoke_queued") queued = r.message; } });
-  } catch { return undefined; } // not canonical: the extension never loaded with it, so never signed in
+  const login = piFamilyLogin(h, resource, r => { if (r.code === "revoke_queued") queued = r.message; });
+  if (!login) return undefined;
   const s = await login.read();
   if (!s?.refresh && !s?.revoke?.length) return undefined;
   await login.logout();
@@ -176,24 +185,41 @@ async function signOutPiFamily(h: PiFamily, resource: string): Promise<string | 
   return `Signed ${h.name} out of ${login.resource}; revoking its grant failed and stays queued for its next login there (${cause})`;
 }
 
+/** The harness's grant store for `resource`, or undefined for a URL the extension refuses (it never loaded with it, so never signed in). */
+function piFamilyLogin(h: PiFamily, resource: string, diagnostic: ConstructorParameters<typeof Login>[0]["diagnostic"] = () => {}): Login | undefined {
+  try {
+    return new Login({ resource, clientId: h.clientId, stateDir: h.stateDir, harness: h.name, loginAction: "run /grayboard login",
+      present: () => {}, notify: () => {}, diagnostic });
+  } catch { return undefined; }
+}
+
+/** Whether the harness holds a grant for `resource`; an unreadable store counts as none. */
+async function piFamilyGrant(h: PiFamily, resource: string): Promise<boolean> {
+  try { return !!(await piFamilyLogin(h, resource)?.read())?.refresh; } catch { return false; }
+}
+
 function writeAdapter(path: string, source: string): void {
   mkdirSync(dirname(path), { recursive: true });
   rmSync(path, { force: true }); // replace, never write through, an existing symlink
   writeFileSync(path, source);
 }
 
-/** A harness's JSON config, or `empty` when the file doesn't exist. Throws when it can't be parsed. */
+/**
+ * A harness's JSON config, or `empty` when the file doesn't exist or holds
+ * JSON null (nothing to keep). Throws when it can't be parsed, or holds an
+ * array or a scalar, which a rewrite would lose.
+ */
 function readConfig<T extends object>(path: string, empty: T): T {
   if (!existsSync(path)) return empty;
-  try { return JSON.parse(readFileSync(path, "utf8")); } catch (e) {
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(path, "utf8")); } catch (e) {
     throw new Error(`Can't parse ${path}: ${(e as Error).message}`);
   }
+  if (value === null) return empty;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error(`Can't parse ${path}: it holds a JSON ${Array.isArray(value) ? "array" : typeof value}, not an object`);
+  return value as T;
 }
 
-function writeConfig(path: string, cfg: object): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
-}
 
 /** Write `entry` (or reshape the existing one by `c.local`) as the harness's grayboard entry; true when the file changed. */
 function putEntry(c: HarnessConfig, entry?: Entry): boolean {
@@ -204,7 +230,7 @@ function putEntry(c: HarnessConfig, entry?: Entry): boolean {
   const next = c.local(base);
   if (JSON.stringify(next) === JSON.stringify(old)) return false;
   cfg[c.section] = { ...cfg[c.section], grayboard: next };
-  writeConfig(c.path, cfg);
+  writeJsonFile(c.path, cfg);
   return true;
 }
 
@@ -214,7 +240,7 @@ function dropEntry(c: HarnessConfig): boolean {
   if (!cfg[c.section]?.grayboard) return false;
   const { grayboard: _, ...rest } = cfg[c.section]!;
   cfg[c.section] = rest;
-  writeConfig(c.path, cfg);
+  writeJsonFile(c.path, cfg);
   return true;
 }
 
@@ -255,14 +281,14 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
         console.warn(`Warning: --force is clobbering mcpServers keys: ${keys.join(", ")}`);
       }
     }
-    writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
+    writeJsonFile(targetPath, { mcpServers: { grayboard: entry } });
     wrote("Wrote");
     return;
   }
 
   // Merge mode
   if (!existsSync(targetPath)) {
-    writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
+    writeJsonFile(targetPath, { mcpServers: { grayboard: entry } });
     wrote("Created");
     return;
   }
@@ -279,7 +305,7 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
     process.exit(1);
   }
   existing.mcpServers["grayboard"] = entry;
-  writeFileSync(targetPath, JSON.stringify(existing, null, 2) + "\n");
+  writeJsonFile(targetPath, existing);
   wrote("Updated");
 }
 
@@ -616,9 +642,9 @@ program
   .requiredOption("--config <path>", "Selected OpenCode JSON/JSONC file")
   .option("--migrate", "Explicitly migrate recognized Grayboard entries and back up owned adapters")
   .option("--dry-run", "Validate and report targeted changes without filesystem writes")
-  .action((opts: OpenCodeSetupOptions) => {
+  .action(async (opts: OpenCodeSetupOptions) => {
     try {
-      const result = setupOpenCode(opts, OC_PLUGIN.source);
+      const result = setupOpenCode(opts, (await adapterTexts()).OPENCODE);
       const config = result.changed ? (result.dryRun ? "config changes required" : "config changes applied") : "config unchanged";
       const adapters = result.adapters ? `; ${result.adapters} carried adapter${result.adapters === 1 ? "" : "s"} ${result.dryRun ? "to disable" : "disabled"}` : "";
       const migration = result.migrated ? (result.dryRun ? "; recognized migration required" : "; recognized migration") : "";
@@ -725,7 +751,10 @@ program
     let failed = false;
     const installHarness = async (h: PiFamily) => {
       let r: FamilyInstall;
-      try { r = await installPiFamily(h, server, { command, args }); } catch (e) {
+      try {
+        if (h === OMP && OMP_REFUSAL) throw new Error(OMP_REFUSAL);
+        r = await installPiFamily(h, server, { command, args });
+      } catch (e) {
         console.error((e as Error).message);
         failed = true;
         process.exitCode = 1;
@@ -733,7 +762,7 @@ program
       }
       for (const note of r.notes) console.log(note);
       console.log(`Installed ${r.adapter}`);
-      if (server) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
+      if (r.signIn) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
     };
     // 3. omp. Local: the bundled adapter runs grayboard, serves its tools and
     // delivers pushes to main. Server: the hosted extension against /mcp.
@@ -759,9 +788,10 @@ program
       return !guard.skip;
     };
     if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
-      if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
+      const { OPENCODE } = await adapterTexts();
+      if (!existsSync(OC_CONFIG.path)) writeJsonFile(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
+      writeAdapter(OC_PLUGIN.path, OPENCODE);
       console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${OC_PLUGIN.path}`);
     }
 
@@ -798,7 +828,7 @@ function undeliveredEntries(): string[] {
   const out: string[] = [];
   const present = (p: string) => { try { lstatSync(p); return true; } catch { return false; } };
   const harnesses: { name: string; config: HarnessConfig; env: string; adapters: string[] }[] = [
-    { name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] },
+    ...(OMP_REFUSAL ? [] : [{ name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] }]),
     { name: "opencode", config: OC_CONFIG, env: "environment", adapters: [OC_PLUGIN.path] },
     { name: "pi", config: PI.config, env: "env", adapters: [PI.local, PI.hosted] },
   ];
@@ -912,7 +942,7 @@ program
       const guard = opencodeShimGuard(OC_DIR);
       if (guard.warning) console.log(`[grayboard] ${guard.warning}`);
       if (!guard.skip) {
-        writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
+        writeAdapter(OC_PLUGIN.path, (await adapterTexts()).OPENCODE);
         console.log(`Refreshed ${OC_PLUGIN.path}`);
         try {
           if (putEntry(OC_CONFIG)) console.log(`Disabled the grayboard entry in ${OC_CONFIG.path} (the adapter serves the tools)`);
@@ -930,7 +960,7 @@ program
     // omp and pi: where either variant is installed (and neither is a
     // symlink), install the one the current mode uses.
     let server: string | undefined;
-    for (const h of [OMP, PI]) {
+    for (const h of OMP_REFUSAL ? [PI] : [OMP, PI]) {
       const paths = [h.local, h.hosted].filter(p => existsSync(p));
       if (paths.length === 0 || paths.some(p => lstatSync(p).isSymbolicLink())) continue;
       if (busMode() === "server") {
@@ -941,6 +971,7 @@ program
         const r = await installPiFamily(h, server);
         console.log(`Refreshed ${r.adapter}`);
         for (const note of r.notes) console.log(note);
+        if (r.signIn) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
       } catch (e) { adapterFailed(e); }
     }
     for (const w of undeliveredEntries()) console.log(`[grayboard] ${w}`);

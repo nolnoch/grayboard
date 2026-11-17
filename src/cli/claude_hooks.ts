@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { writeJsonFile } from "./json_file.ts";
 import { join } from "node:path";
 import { isExplicitIdentity } from "../shared/identity.ts";
 import { normalizeIdentityName } from "../shared/addressing.ts";
@@ -77,8 +78,7 @@ export function installClaudeHooks(argv: string[], path = claudeSettingsPath()):
   cfg.hooks = hooks;
   const text = JSON.stringify(cfg, null, 2) + "\n";
   if (text === before) return false;
-  mkdirSync(join(path, ".."), { recursive: true });
-  writeFileSync(path, text);
+  writeJsonFile(path, cfg);
   return true;
 }
 
@@ -92,7 +92,7 @@ export function removeClaudeHooks(path = claudeSettingsPath()): boolean {
   if (!found) return false;
   if (Object.keys(kept).length) cfg.hooks = kept;
   else delete cfg.hooks;
-  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+  writeJsonFile(path, cfg);
   return true;
 }
 
