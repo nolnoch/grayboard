@@ -27,12 +27,22 @@ export type HostedServer = TestServer & { issuer: string; resource: string };
 
 // `email` is who the stubbed upstream sign-in says the browser is; `providers` replaces that stub (#928: a real OIDC
 // provider aimed at startFakeOidc(), or several, for the chooser).
+// The free port can be taken between its probe and the server's bind, by another test file's server under the root
+// suite's --parallel (#1050): a bind that loses that race retries on a fresh port.
 export function hostedServer(overrides: Partial<Config> = {}, email = "alice@example.com", providers?: IdentityProvider[]): HostedServer {
-  const port = freePort();
-  const issuer = `http://127.0.0.1:${port}`;
-  const srv = new TestServer({ httpPort: port, publicUrl: issuer, hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [], ...overrides },
-    { hostname: "127.0.0.1", oauth: { providers: providers ?? [stubProvider(async () => ({ email, displayName: email.split("@")[0]!, subject: "google-" + email }))] } });
-  return Object.assign(srv, { issuer, resource: srv.app.oauth.resource });
+  for (let attempt = 1; ; attempt++) {
+    const port = freePort();
+    const issuer = `http://127.0.0.1:${port}`;
+    let srv: TestServer;
+    try {
+      srv = new TestServer({ httpPort: port, publicUrl: issuer, hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, oauthClients: [], ...overrides },
+        { hostname: "127.0.0.1", oauth: { providers: providers ?? [stubProvider(async () => ({ email, displayName: email.split("@")[0]!, subject: "google-" + email }))] } });
+    } catch (error) {
+      if (attempt < 5 && /EADDRINUSE|in use/i.test(`${(error as { code?: string }).code ?? ""} ${error}`)) continue;
+      throw error;
+    }
+    return Object.assign(srv, { issuer, resource: srv.app.oauth.resource });
+  }
 }
 
 // The chooser page's links, provider ID to URL, in page order (#928 D7).
