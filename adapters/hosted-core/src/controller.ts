@@ -541,6 +541,9 @@ export class Controller<E extends Enrollment = Enrollment> {
             : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained`
             : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
+          // The expiry came back from the server, so it's reachable again: ask the host to refresh now (#916),
+          // as the recovery does; the port acts at most once per expiry.
+          if (error instanceof AccessExpired && this.port.credential.refresh) await this.port.credential.refresh(e).catch(failure => this.failure("reopen", failure, r));
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
         }
@@ -714,7 +717,11 @@ export class Controller<E extends Enrollment = Enrollment> {
   private retryRestore(r: Root<E>) {
     const epoch = r.epoch;
     const retry = (async () => {
+      let expired = false;
       for (let attempt = 1; ; attempt++) {
+        // Outside the control queue, as the recovery's request is (#916).
+        if (expired && this.port.credential.refresh) await this.port.credential.refresh(r.e).catch(error => this.failure("restore", error, r));
+        expired = false;
         await this.wait(Math.min(8000, 250 * 2 ** attempt), this.closing.signal);
         const done = await this.serial(async () => {
           if (!this.restorable(r, epoch)) return true;
@@ -730,6 +737,7 @@ export class Controller<E extends Enrollment = Enrollment> {
             // (its issuer) was down couldn't be refreshed; wait for the host's.
             if (error instanceof AccessExpired && error.reason === "expired") {
               this.set(r, "retrying", `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "restore", failureCode(error));
+              expired = true;
               return false;
             }
             r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
