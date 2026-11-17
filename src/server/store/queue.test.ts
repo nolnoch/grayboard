@@ -12,7 +12,7 @@ import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 // Repo.atomic was exactly this).
 const txn = <T>(db: ReturnType<typeof open>["db"], fn: () => T): T => db.transaction(fn).immediate() as T;
 const open = () => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-// A user row written on the ambient connection, not a Tx (#807 P1c-7): the queue's own guards, which atomic and a
+// A user row written on the ambient connection, not a Tx (#807 P1c-7): the queue's own guards, which `txn` and a
 // bare statement go through, are what these tests exercise.
 const addUser = (db: ReturnType<typeof open>["db"], email: string) => { db.run("INSERT INTO users (email, created_at) VALUES (?, 0)", [email]); };
 import type { Tx } from "./tx.ts";
