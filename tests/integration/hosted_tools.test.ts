@@ -802,14 +802,15 @@ test("disable-user ends a hosted child and pushes its bounce to a live sender (#
   expect(await srv.app.repo.hosted.get(srv.app.repo.read, id)).toBeUndefined();
 });
 
-// #807 P3 A7i: the ends' after-commit half reads the bounces, then wakes and sweeps. A failed bounce read is logged
-// and the wake and the sweep still run: here the sweep takes an orphaned upload's bytes.
-test("#807 P3 A7i: an end whose bounce read fails still sweeps the freed upload bytes", async () => {
+// #807 P3 A7i: an end's bounces are read in its transaction and pushed at its commit, with no read after it, so no
+// newer message to the sender can be pushed first; the wake and the sweep follow (here the sweep takes an orphaned
+// upload's bytes).
+test("#807 P3 A7i: an end's bounces are pushed at its commit with no read after it, then the sweep runs", async () => {
   await restart({ admins: [C] });
   const admin = await login(C);
   await login(A);
   const be = await srv.hosted(A, "be");
-  await srv.connected(await login(B), "fe");
+  const fe = await srv.connected(await login(B), "fe");
   const { child, id } = await childOf(be, A, "reviewer-run");
   await Promise.all([be.drop(), child.drop()]);
   const orphan = "0".repeat(64);
@@ -818,15 +819,14 @@ test("#807 P3 A7i: an end whose bounce read fails still sweeps the freed upload 
       VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, 0)`).run(`${B}/fe`, id, Date.now());
     srv.app.db.prepare(`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (?, 1, ?)`).run(orphan, Date.now());
   });
-  const err = spyOn(console, "error");
-  const bounces = spyOn(srv.app.repo.messages, "bouncesFrom").mockRejectedValue(new Error("bounce read failed"));
+  const bounces = spyOn(srv.app.repo.messages, "bouncesFrom");
   const deleted = spyOn(srv.app.repo.blobs, "delete");
   try {
     expect((await api(admin, "POST", "/api/admin/disable-user", { email: A })).status).toBe(200);
+    expect((await fe.next(direct())).message).toMatchObject({ sender: id, kind: "bounce" });
     await until(() => deleted.mock.calls.some((c) => c[0] === orphan), 5000, "the sweep deleted the orphaned blob");
-    expect(bounces).toHaveBeenCalled();
-    expect(err.mock.calls.some((c) => String(c[0]).includes("delivering an end's bounces failed"))).toBe(true);
-  } finally { bounces.mockRestore(); deleted.mockRestore(); err.mockRestore(); }
+    expect(bounces).not.toHaveBeenCalled();
+  } finally { bounces.mockRestore(); deleted.mockRestore(); }
 });
 
 test("#523: a child's DM and post carry its ID as via in pushes, reads and board snapshots, and still do after it ends; its root's carry none", async () => {

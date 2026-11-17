@@ -6,9 +6,8 @@ import { seed } from "../../tests/support/seed.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase, queuedTx } from "./db.ts";
+import { openDatabase } from "./db.ts";
 import { releaseStored, storeUpload, sweepStoredBlobs } from "./attachments.ts";
-import { sweepBlobs } from "../core/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
 import { queueFor } from "./store/queue.ts";
 
@@ -66,7 +65,7 @@ test("#807: a server blob sweep's catalog delete waits behind another body holdi
   const del = repo.blobs.delete.bind(repo.blobs);
   repo.blobs.delete = async (s: string) => { await del(s); deleted = true; };
   const holder = hold(db);
-  const swept = sweepBlobs(db, repo.blobs, queuedTx(repo));
+  const swept = sweepStoredBlobs(repo);
   await until(() => deleted, 5000, "the sweep deleted the bytes");
   await ticks();
   expect(catalog(db)).toEqual([sha]);

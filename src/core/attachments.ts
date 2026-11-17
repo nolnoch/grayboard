@@ -81,7 +81,7 @@ export async function storeAttachment(
   blobs: BlobStore,
   uploader: string,
   file: AttachmentFile,
-  opts: { now?: number; quota?: UploadQuota; guard?: () => void; tx?: WriteTx } = {},
+  opts: { now?: number; quota?: UploadQuota; tx?: WriteTx } = {},
 ): Promise<AttachmentRow> {
   const now = opts.now ?? Date.now();
   const tx = opts.tx ?? immediateTx(db);
@@ -90,7 +90,6 @@ export async function storeAttachment(
   try {
     return await withBlob(sha256, async () => {
       const row = await tx((w) => {
-        opts.guard?.();
         const added = insertUpload(w, { sha256, filename: file.filename, type: file.type, size: file.data.length, uploader, quota: opts.quota, now });
         unnamed = added.pruned;
         return added.row;
@@ -300,15 +299,12 @@ function heldBlob(db: Database, principal: string, sha256: string, unbound: bool
 
 // Drops one of `from`'s unsent uploads, for a send that failed after
 // uploading. Null if it isn't theirs (any address of `from`, made by its user,
-// #367) or a message or post already carries it. guard: a hosted transfer's
-// binding check, run inside the delete's transaction.
+// #367) or a message or post already carries it.
 export async function releaseUpload(
-  db: Database, blobs: BlobStore, id: number, from: Uploader, guard?: () => void, tx: WriteTx = immediateTx(db),
+  db: Database, blobs: BlobStore, id: number, from: Uploader,
 ): Promise<AttachmentRow | null> {
-  const row = await tx((w) => {
-    guard?.();
-    return dropUnsentUploads(w, [id], from)[0] ?? null;
-  });
+  const tx = immediateTx(db);
+  const row = await tx((w) => dropUnsentUploads(w, [id], from)[0] ?? null);
   if (row) await sweepBlobs(db, blobs, tx);
   return row;
 }

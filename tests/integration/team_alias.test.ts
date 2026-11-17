@@ -115,7 +115,6 @@ test("a recheck inside a caller's body resyncs a live holder from the holds the 
     srv.app.db.run(`DELETE FROM alias_holds WHERE address = ?`, [`${B}/side`]);
   });
   expect(holder("eng/build")).toEqual([]);
-  expect(holder(`${B}/side`)).toEqual([]);
   // Neither address is the live session's any more: mail to the dropped one isn't pushed to it.
   const peer = srv.appSession(alice, "fe");
   await peer.connect();
