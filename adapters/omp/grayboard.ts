@@ -637,9 +637,10 @@ export default function grayboard(pi: ExtensionAPI) {
   // and omp drops its pushes. By tools: a server serving SIGNATURE (an HTTP
   // one too); this extension's own carry mcpServerName SERVER, and a
   // client server of that exact name loses every tool to omp's dedup
-  // (deduplicateMCPToolsByName keeps the extension's first). By process: a
-  // `grayboard mcp` under this omp outside the processes this extension
-  // started, which catches that exact-named one (ps, so not on Windows).
+  // (deduplicateMCPToolsByName keeps the first of an identical origin, the
+  // extension's). By process: a `grayboard mcp` omp started, directly or
+  // through a wrapper, outside the processes this extension started, which
+  // catches that exact-named one (ps, so not on Windows).
   const reportServedElsewhere = (ctx: ExtensionContext) => {
     const servers = new Map<string, { names: Set<string>; shadows: boolean }>();
     for (const t of pi.getAllTools()) {
@@ -658,25 +659,48 @@ export default function grayboard(pi: ExtensionAPI) {
       report(ctx, `grayboard: the MCP server "${server}" serves grayboard's tools beside this adapter's${clause}. Remove it (an ACP client's mcpServers, or omp's MCP config): this adapter already serves grayboard.`);
     }
     if (process.platform === "win32") return;
-    execFile("ps", ["-A", "-o", "pid=,ppid=,command="], { timeout: 5_000 }, (error, stdout) => {
-      if (error) return;
-      const rows = stdout.split("\n").map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
-        .filter((m): m is RegExpMatchArray => !!m).map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), argv: m[3]!.split(/\s+/) }));
-      // Descendants of this omp, not entering a process this extension started.
-      const mine = shared.spawned ?? new Set<number>();
-      const under: typeof rows = [];
-      for (let queue = [process.pid]; queue.length;) {
-        const parent = queue.shift()!;
-        for (const row of rows) {
-          if (row.ppid !== parent || mine.has(row.pid)) continue;
-          queue.push(row.pid);
-          under.push(row);
+    execFile("ps", ["-A", "-ww", "-o", "pid=,ppid=,command="], { timeout: 5_000, maxBuffer: 16 << 20 }, (error, stdout) => {
+      try {
+        if (error) {
+          if (!warned.has("ps")) pi.logger.warn(`grayboard: couldn't list processes to look for another grayboard under this omp (${error.message})`);
+          warned.add("ps");
+          return;
         }
-      }
-      for (const { pid, argv } of under) {
-        if (warned.has(`pid:${pid}`) || !runsGrayboard({ command: argv[0], args: argv.slice(1) }, own)) continue;
-        warned.add(`pid:${pid}`);
-        report(ctx, `grayboard: process ${pid} (${argv.join(" ")}) runs grayboard under this omp beside this adapter's: another bus session, whose pushes omp drops. Remove the MCP server that starts it (an ACP client's mcpServers, or omp's MCP config): this adapter already serves grayboard.`);
+        const rows = stdout.split("\n").map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+          .filter((m): m is RegExpMatchArray => !!m).map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), line: m[3]! }));
+        // ps joins argv with spaces; Linux keeps it NUL-separated.
+        const argvOf = (pid: number, line: string): string[] => {
+          try {
+            const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+            if (argv.at(-1) === "") argv.pop();
+            if (argv.length) return argv;
+          } catch { /* not Linux, or gone */ }
+          return line.split(/\s+/);
+        };
+        // omp's own children, past any wrapper, not entering a process this
+        // extension started: omp starts each stdio MCP server as its child, and
+        // what a harness the agent launched starts (pi's or Claude Code's own
+        // grayboard) sits under that harness, which isn't a wrapper.
+        const mine = shared.spawned ?? new Set<number>();
+        for (let queue = [process.pid]; queue.length;) {
+          const parent = queue.shift()!;
+          for (const { pid, ppid, line } of rows) {
+            if (ppid !== parent || mine.has(pid)) continue;
+            const argv = argvOf(pid, line);
+            const program = unwrap(argv);
+            if (!runsGrayboard({ command: argv[0], args: argv.slice(1) }, own)) {
+              if (program !== argv) queue.push(pid);
+              continue;
+            }
+            // One notice per server: its wrapper's descendants run the same one.
+            if (warned.has(`pid:${pid}`)) continue;
+            warned.add(`pid:${pid}`);
+            const shown = program.slice(0, program.indexOf("mcp") + 1).join(" ");
+            report(ctx, `grayboard: process ${pid} (${shown}) runs grayboard under this omp beside this adapter's: another bus session, whose pushes omp drops. Remove the MCP server that starts it (an ACP client's mcpServers, or omp's MCP config): this adapter already serves grayboard.`);
+          }
+        }
+      } catch (e) {
+        pi.logger.warn(`grayboard: looking for another grayboard under this omp failed (${(e as Error).message})`);
       }
     });
   };
