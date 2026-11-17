@@ -26,6 +26,15 @@ export interface Tx extends Read {
   // store, so callers are written once for Postgres. Only an async write() body's Tx has it: a synchronous body
   // (a post from the queue's holder) can't await one, so its Tx refuses.
   savepoint<T>(fn: (tx: Tx) => T | Promise<T>): Promise<T>;
+  // A hook run after the outermost body fulfils and before its COMMIT, on that transaction's root Tx, with the queue
+  // still held (#807 P3 A7g): reads there see the transaction's final state, its commit lands right after them, and
+  // no other body runs between. Once per `key` per transaction, in registration order; a hook may register another,
+  // which runs before COMMIT too. Registered in a savepoint, it's dropped when that savepoint rolls back (as an
+  // afterCommit effect is) unless the key was already registered outside it. A rejection rolls the transaction back
+  // and rejects the write with it. Postgres runs the same hooks before its COMMIT on the transaction's connection.
+  // Only a write() body's Tx has it: a synchronous body's (a post from the queue's holder) commits as it returns, so
+  // it refuses.
+  beforeCommit(key: object, hook: (tx: Tx) => Promise<void>): void;
 }
 
 class SqliteRead {
@@ -35,9 +44,14 @@ class SqliteRead {
 // While a savepoint is open its Tx is the only live one: the parent's statements and effects would land inside the
 // savepoint (and roll back with it), and a second savepoint beside it would release out of order. Both throw.
 class SqliteTx extends SqliteRead {
-  constructor(db: Database, readonly nests = true) { super(db); }
+  // `root`: the transaction's outermost Tx, which holds the beforeCommit hooks; a savepoint's Tx points at its parent's.
+  constructor(db: Database, readonly nests = true, root?: SqliteTx) { super(db); this.#root = root ?? this; }
   #live = true;
   #child: SqliteTx | undefined;
+  readonly #root: SqliteTx;
+  // On the root: the hooks by key, pending or run. On a savepoint's Tx: the keys it added, dropped if it rolls back.
+  readonly #hooks = new Map<object, ((tx: Tx) => Promise<void>) | undefined>();
+  readonly #added: object[] = [];
   // Closes its open savepoint's Tx too: a body that returned without awaiting one leaves nothing live behind it.
   close(): void { this.#live = false; this.#child?.close(); }
   get live(): boolean { return this.#live; }
@@ -53,7 +67,7 @@ class SqliteTx extends SqliteRead {
     this.assertLive();
     if (!this.nests) throw new Error("savepoint in a synchronous write body: only an async write() body can await one");
     const b = openSavepoint(this.db);
-    const inner = new SqliteTx(this.db);
+    const inner = new SqliteTx(this.db, true, this.#root);
     this.#child = inner;
     let value: T;
     try {
@@ -61,13 +75,34 @@ class SqliteTx extends SqliteRead {
     } catch (error) {
       inner.close();
       this.#child = undefined;
+      for (const key of inner.#added) this.#root.#hooks.delete(key);
       b.rollback();
       throw error;
     }
     inner.close();
     this.#child = undefined;
+    if (this !== this.#root) this.#added.push(...inner.#added);
     b.commit();
     return value;
+  }
+  beforeCommit(key: object, hook: (tx: Tx) => Promise<void>): void {
+    this.assertLive();
+    if (!this.nests) throw new Error("beforeCommit in a synchronous write body: it commits as it returns");
+    const hooks = this.#root.#hooks;
+    if (hooks.has(key)) return;
+    hooks.set(key, hook);
+    if (this !== this.#root) this.#added.push(key);
+  }
+  get hasBeforeCommit(): boolean { return [...this.#hooks.values()].some(h => h !== undefined); }
+  // The root's pending hooks, each once, until none is left: one a hook registers runs in the same pass.
+  async runBeforeCommit(): Promise<void> {
+    for (;;) {
+      const next = [...this.#hooks].find(([, h]) => h !== undefined);
+      if (!next) return;
+      const [key, hook] = next;
+      this.#hooks.set(key, undefined);
+      await hook!(this as unknown as Tx);
+    }
   }
 }
 
@@ -76,8 +111,9 @@ export function sqliteRead(db: Database): Read { return new SqliteRead(db) as un
 
 // A transaction's handle for a body; the caller closes it when the transaction (or savepoint) settles. `nests`:
 // false for a synchronous body's, whose savepoint refuses.
-export function sqliteTx(db: Database, nests = true): Tx & { close(): void } {
-  return new SqliteTx(db, nests) as unknown as Tx & { close(): void };
+export type RootTx = Tx & { close(): void; readonly hasBeforeCommit: boolean; runBeforeCommit(): Promise<void> };
+export function sqliteTx(db: Database, nests = true): RootTx {
+  return new SqliteTx(db, nests) as unknown as RootTx;
 }
 
 // Whether a handle is a transaction's: a function reached both inside a body and outside one writes on a `Tx` and

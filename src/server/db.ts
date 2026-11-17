@@ -130,9 +130,11 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
     const fail = (error: unknown): never => { tx.close(); b.rollback(); throw error; };
     let out: T | PromiseLike<T>;
     try { out = fn(tx); } catch (error) { return fail(error); }
-    if (!isThenable(out)) return settle(out as T);
+    if (!isThenable(out) && !tx.hasBeforeCommit) return settle(out as T);
     // Reactions attached here run as the holder (the queue's context follows them), so the commit is the writer's.
-    return Promise.resolve(out).then(settle, fail);
+    // The beforeCommit hooks run after the body fulfils, on its still-open Tx (#807 P3 A7g); a sync body that
+    // registered one goes this way too.
+    return Promise.resolve(out).then(async value => { await tx.runBeforeCommit(); return value; }).then(settle, fail);
   }
 }
 
