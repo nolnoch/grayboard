@@ -17,6 +17,7 @@ import {
 } from "../shared/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
 import { viaLabel } from "../shared/notifications.ts";
+import type { SendResult } from "../shared/protocol.ts";
 import type { Store, ThreadRow } from "./store.ts";
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 
@@ -550,13 +551,15 @@ export class Relay {
     );
     const where = row?.thread_ts ?? ts;
     if (!r.ok) return this.say(where, row ? threadBounce(r) ?? `⚠️ not sent: ${r.error}` : `⚠️ not sent: ${r.error}`);
-    const v = r.value as { message_id: number; delivered_now: boolean; recipient_last_seen?: string };
+    const v = r.value as Pick<SendResult, "message_id" | "delivered_now" | "recipient_last_seen" | "wakes" | "wake_note">;
     if (row) this.store.advance(row.thread_ts, v.message_id);
     if (v.delivered_now) await this.react(ts);
     else {
       const seen = v.recipient_last_seen ? ` (last seen ${v.recipient_last_seen})` : "";
       await this.say(where, `queued: ${to} is offline${seen}; it gets this when its next session starts.`);
     }
+    // Another user's agent no grant lets this person wake (#806): say so, or they wait on an agent that won't act.
+    if (v.wakes === false) await this.say(where, v.wake_note ?? `delivered as mail: ${to} won't act on it until its user does.`);
   }
 
   private async sendPost(board: string, text: string, files: Record<string, any>[], parent: number | undefined, ts: string, row: ThreadRow | null): Promise<void> {
