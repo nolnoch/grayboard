@@ -262,7 +262,8 @@ export interface Repo {
   // alias's scope owner, a team broadcast's team.
   resolver: Resolver;
   // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
-  // async Access (A7): `find` and `findAllByName` are Access-seam reads, and the rest feed the synchronous session builder.
+  // async Access (A7): `find` and `findAllByName` are Access-seam reads, `listForScope` and `seen` feed the synchronous
+  // session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
     create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Promise<Alias>;
