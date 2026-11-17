@@ -11,7 +11,7 @@ import { localAdapterExcludedScenario } from "../support/local_adapter_exclusion
 import { startPi } from "../support/pi.ts";
 import {
   piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
-  piForegroundChildScenario, piLocalCarryScenario, piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piLocalStopsReadingScenario, piUnboundScenario,
+  piExcludedForegroundChildScenario, piForegroundChildScenario, piLocalCarryScenario, piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piLocalStopsReadingScenario, piUnboundScenario,
 } from "../support/pi.ts";
 
 let dir: string;
@@ -35,6 +35,9 @@ for (const kind of ["keyed", "human", "runner"] as const) {
   test(`pi excluded local ${kind}: tools and /new retain excluded provenance (#195 audit 2)`, () =>
     localAdapterExcludedScenario(dir, kind, "mcp__grayboard__", (port, procs, identity, env) =>
       startPi(dir, port, procs, { identity, entry: { env: { BUS_PUSH: "off", ...env } } })), 90_000);
+}
+for (const kind of ["keyed", "human"] as const) {
+  test(`pi excluded local ${kind}: a foreground child starts as its own session, not the root's child (#897)`, () => piExcludedForegroundChildScenario(dir, kind), 90_000);
 }
 test("pi detached runner (#523 step 5): with no live parent it is its own session; with one it acts as the parent's child, writing as the parent's name with via, until a bind promotes it to its own session that receives, or the parent exits while it runs on", () => piRunnerScenario(dir), 180_000);
 test("pi foreground subagent (#557 3): a session the root's pi opens in-process with the grayboard extension, whose header names the root's file, acts as the root's child (its name, via, no second root) and ends at its shutdown; a header naming no live session and a /fork of the root are roots", () => piForegroundChildScenario(dir), 120_000);
