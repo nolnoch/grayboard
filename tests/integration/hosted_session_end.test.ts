@@ -14,6 +14,7 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { withMeta } from "../helpers/hosted.ts";
 import { scratchDbPath } from "../support/scratch_db.ts";
+import { hostedRowCount } from "../support/hosted_rows.ts";
 
 let app: ReturnType<typeof startServer>, dir: string, base: string;
 // The hosted clock runs `skew` ahead of the wall clock, so a test can pass the idle window (#566).
@@ -151,4 +152,26 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
   expect(await value(sleeper, "session_end")).toEqual({ ended: true });
   expect(app.repo.hosted.get(app.repo.read, child)).toBeUndefined();
   expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
+});
+
+// #1097: session_end under an ID the server no longer holds ends nothing and starts nothing: no row, no ownership, no
+// audit. An SDK client's connect (server/discover) admits its ID as any session start does, so over HTTP this is the
+// row ending between that connect and the call (here the server releases it); neither the call's exchange nor its
+// tool gate admits the ID again. The direct call covers the tool's gate for an ID never seen.
+test("session_end under an unknown ID writes nothing and reports ended: false", async () => {
+  const grant = await issue();
+  const stranger = await connect("2026-07-28", grant.token, "gone-before-end");
+  const [admitted] = app.repo.hosted.all(app.repo.read);
+  await app.mcp.sessions.release(admitted!.session_id, "closed");
+  expect(hostedRowCount(app.db)).toBe(0);
+  const audits = () => app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log").get()!.n;
+  const before = audits();
+  expect(await value(stranger, "session_end")).toEqual({ ended: false });
+  expect(hostedRowCount(app.db)).toBe(0);
+  expect(audits()).toBe(before);
+  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  expect(await app.mcp.sessions.end(principal, sessionContext(principal, { "ai.opencode/sessionID": "never-seen" }))).toEqual({ ended: false });
+  expect(hostedRowCount(app.db)).toBe(0);
+  expect(audits()).toBe(before);
 });
