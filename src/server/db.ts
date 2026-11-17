@@ -110,11 +110,16 @@ export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 // fn and committed run as the work of the request that called write(), or of none (#1042): a body that waited starts
 // from the releasing holder's context, whose request origin its audit rows would otherwise carry (F-19). Only the
 // origin is set: binding the whole context (AsyncResource.bind) would also restore the queue's holder token.
-function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
+// `thrown` sees a failure the body throws synchronously (BEGIN, fn, COMMIT, committed), before the promise rejects
+// with it: posted's idle queue throws it to its caller.
+function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R, thrown?: (error: unknown) => void): Promise<Awaited<R>> {
   const queue = queueFor(db);
   if (queue.mine && db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls atomic"));
   const o = requestOrigin();
-  return queue.run(() => o ? inRequest(o, body) : detached(body)).then(box => box.out) as Promise<Awaited<R>>;
+  const run = () => {
+    try { return o ? inRequest(o, body) : detached(body); } catch (error) { thrown?.(error); throw error; }
+  };
+  return queue.run(run).then(box => box.out) as Promise<Awaited<R>>;
   function body(): { out: R } | Promise<{ out: R }> {
     const b = openBoundary(db);
     const tx = sqliteTx(db);
@@ -205,12 +210,9 @@ function posted<T>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, given: ((va
     committed?.(value);
     return true;
   }
-  // An idle queue starts the body inside queued(): a synchronous body's failure is caught here and thrown as it was.
+  // An idle queue starts the body inside queued(): a synchronous failure (BEGIN, fn, COMMIT, committed) is thrown here.
   let now = true, ran = false, failed: { error: unknown } | undefined;
-  const caught = <A extends unknown[], R>(f: (...a: A) => R) => (...a: A): R => {
-    try { return f(...a); } catch (error) { if (now) failed = { error }; throw error; }
-  };
-  const done = queued(db, caught(fn), caught((value: T) => { committed?.(value); ran = true; }));
+  const done = queued(db, fn, (value: T) => { committed?.(value); ran = true; }, error => { if (now) failed = { error }; });
   now = false;
   if (failed) { done.catch(() => {}); throw failed.error; }
   done.catch(error => console.error(`[grayboard] ${what} failed:`, error));

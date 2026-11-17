@@ -250,6 +250,23 @@ test("post runs now on an idle queue, through it, and throws its error there", (
   expect(queueFor(db).held).toBe(false);
 });
 
+// #807 P3 A3: an idle-queue post's synchronous failures outside fn are thrown too, as queuedNow threw them.
+test("post on an idle queue throws a failed BEGIN and a throwing committed, once, without logging them", async () => {
+  const { db, repo } = open();
+  const logged: unknown[][] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  try {
+    db.run("BEGIN"); // outside the queue: the post's BEGIN IMMEDIATE fails
+    try { expect(() => repo.post(() => {}, undefined, "begin write")).toThrow(); } finally { db.run("ROLLBACK"); }
+    expect(queueFor(db).held).toBe(false);
+    expect(() => repo.post(tx => { repo.users.upsertByEmail(tx, "kept@example.com", null); }, () => { throw new Error("committed threw"); }, "committed write")).toThrow("committed threw");
+    expect(repo.users.findByEmail("kept@example.com")).toBeDefined();
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+  } finally { console.error = error; }
+  expect(logged.filter(a => String(a[0]).includes("begin write") || String(a[0]).includes("committed write"))).toEqual([]);
+});
+
 test("post waits behind another body's hold, lands after it, and outlives the holder's rollback", async () => {
   const { db, repo } = open();
   let release!: () => void;
