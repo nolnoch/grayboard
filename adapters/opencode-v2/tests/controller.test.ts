@@ -578,6 +578,20 @@ test("a native token that expires during an outage asks OpenCode to refresh once
     expect(o.controller.status().state).toBe("active");
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
+// The outage retry's refresh selects the native entry; a changed account drifts there, and that pause's record stands.
+test("a native account change found by the outage retry's refresh keeps the drift's pause, not a refresh failure (#916)", async () => {
+  const o = await outage();
+  try {
+    let down = true, armed = false;
+    // The retry's own token read resolves the stored credential first; the account changes just after it.
+    o.r.f.afterResolve(() => { if (armed) { armed = false; o.r.f.select("credential-two"); } });
+    o.r.observe(async operation => { if (operation === "connect" && down) { down = false; o.r.f.expire(); armed = true; throw new ServerUnreachable(new Error("down")); } });
+    o.stop();
+    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused");
+    await o.controller.close();
+    expect(o.controller.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "paused", message: expect.stringContaining("enroll again") });
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
 test("a closed subscription is not an outage: native expiry on every reconnect, even wrapped by the SDK, pauses once the rotation grace runs out", async () => {
   const o = await outage();
   try {
@@ -773,6 +787,19 @@ test("a token that expires during a restore's outage retry waits for the host's 
     expect(o.waits).toEqual([500, 1000]);
     expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "active", ownership: 1 });
     expect(o.calls().filter(c => c.name === "delivery_open").map(c => c.sessionID)).toEqual(["B"]);
+  } finally { await o.restarted.close(); await o.r.controller.close(); }
+});
+test("a native account change found by a restore's outage-retry refresh keeps the drift's pause (#916)", async () => {
+  let waited = 0, armed = false;
+  const o = await restoredDuringOutage(1, async (_restarted, r) => {
+    if (++waited !== 1) return;
+    r.f.expire(); armed = true;
+    r.f.afterResolve(() => { if (armed) { armed = false; r.f.select("credential-two"); } });
+  });
+  try {
+    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "paused");
+    await o.restarted.close();
+    expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "paused", message: expect.stringContaining("enroll again") });
   } finally { await o.restarted.close(); await o.r.controller.close(); }
 });
 test("a shutdown during a restore's outage retry ends it: nothing opens once the server is back (#424 6)", async () => {

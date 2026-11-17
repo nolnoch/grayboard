@@ -544,7 +544,8 @@ export class Controller<E extends Enrollment = Enrollment> {
           ready();
           // The expiry came back from the server, so it's reachable again: ask the host to refresh now,
           // as the recovery does; the port acts at most once per expiry.
-          if (error instanceof AccessExpired && this.port.credential.refresh) await this.port.credential.refresh(e).catch(failure => this.failure("reopen", failure, r));
+          // A failed request is recorded apart from the root (a drift's pause record must stand).
+          if (error instanceof AccessExpired && this.port.credential.refresh) await this.port.credential.refresh(e).catch(failure => this.failure("reopen", failure));
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
         }
@@ -721,7 +722,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       let expired = false;
       for (let attempt = 1; ; attempt++) {
         // Outside the control queue, as the recovery's request is (#916).
-        if (expired && this.port.credential.refresh) await this.port.credential.refresh(r.e).catch(error => this.failure("restore", error, r));
+        // A failed request is recorded apart from the root, as the recovery's is.
+        if (expired && this.restorable(r, epoch) && this.port.credential.refresh) await this.port.credential.refresh(r.e).catch(error => this.failure("restore", error));
         expired = false;
         await this.wait(Math.min(8000, 250 * 2 ** attempt), this.closing.signal);
         const done = await this.serial(async () => {
