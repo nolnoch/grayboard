@@ -464,4 +464,75 @@ describe("OAuth domain store", () => {
     await expect(w1(tx => first.repo.users.setDisabled(tx, userId, true))).rejects.toThrow("storage failure");
     expect(first.repo.users.findById(userId)?.disabled_at).toBeNull();
   });
+  // #807 P2-1 (D3): each single-use spend is one conditional statement. SQLite's single writer can't interleave two
+  // redeemers, so a trigger lands the other redeemer's spend between this one's read and its spend; the Postgres
+  // interleaving tests come with P3. Reverting a spend to an unconditional UPDATE makes each of these answer "ok".
+  const auditCount = (action: string) => first.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM access_log WHERE action = ?").get(action)!.n;
+  test("a code spent after its read answers as a replay, withdraws its grant and revokes the winner's", async () => {
+    const winner = await issue();
+    code = { ...code, codeHash: h("code-2") };
+    await issueCode();
+    first.db.exec(`CREATE TRIGGER steal AFTER INSERT ON oauth_grants BEGIN
+      UPDATE oauth_codes SET grant_id = '${winner.grantId}' WHERE hash = '${code.codeHash}'; END`);
+    const loser = redemption(pair(), "grant_loser_0123456789");
+    expect(await w1(tx => first.repo.oauth.redeemCode(tx, loser, start))).toEqual({ status: "replay" });
+    first.db.exec("DROP TRIGGER steal");
+    expect(first.db.query("SELECT id FROM oauth_grants").all()).toEqual([{ id: winner.grantId }]);
+    expect(first.repo.oauth.isGrantActive(first.repo.read, winner.grantId, start)).toBe(false);
+    expect(auditCount("oauth.code_replay_revoked")).toBe(1);
+    expect(auditCount("oauth.grant_issued")).toBe(1);
+  });
+  test("a code deleted after its read answers not_found and leaves no grant", async () => {
+    await issueCode();
+    first.db.exec(`CREATE TRIGGER gone AFTER INSERT ON oauth_grants BEGIN DELETE FROM oauth_codes WHERE hash = '${code.codeHash}'; END`);
+    expect(await w1(tx => first.repo.oauth.redeemCode(tx, redemption(), start))).toEqual({ status: "not_found" });
+    first.db.exec("DROP TRIGGER gone");
+    expect(first.db.query("SELECT id FROM oauth_grants").all()).toHaveLength(0);
+  });
+  test("a login code spent after its read answers as a replay, withdraws its session and revokes the winner's", async () => {
+    const login = { ...binding, scopes: ["grayboard:login"] };
+    request = { ...request, ...login };
+    code = { ...code, ...login };
+    await issueCode();
+    const won = await w1(tx => first.repo.sessions.create(tx, userId, h("winner-token"), null));
+    first.db.exec(`CREATE TRIGGER steal AFTER INSERT ON sessions WHEN NEW.id <> ${won.id} BEGIN
+      UPDATE oauth_codes SET session_id = ${won.id} WHERE hash = '${code.codeHash}'; END`);
+    const input = { ...login, codeHash: code.codeHash, tokenHash: h("loser-token"), label: null };
+    expect(await w1(tx => first.repo.oauth.redeemLoginCode(tx, input, start))).toEqual({ status: "replay" });
+    first.db.exec("DROP TRIGGER steal");
+    expect(first.db.query("SELECT id FROM sessions WHERE token_hash = ?").all(input.tokenHash)).toHaveLength(0);
+    expect(first.db.query<{ revoked_at: number | null }, [number]>("SELECT revoked_at FROM sessions WHERE id = ?").get(won.id)!.revoked_at).toBe(start);
+    expect(auditCount("oauth.code_replay_revoked")).toBe(1);
+    expect(auditCount("oauth.session_issued")).toBe(0);
+  });
+  test("a refresh token spent after its read answers as a replay; one revoked or expired after it answers invalid", async () => {
+    const input = await issue();
+    const presented = input.tokens.refreshHash;
+    const rotate = (tokens: OAuthTokenPair) => w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: presented, tokens }, start + 1));
+    const absent = (p: OAuthTokenPair) => expect(first.db.query("SELECT hash FROM oauth_tokens WHERE hash IN (?, ?)").all(p.accessHash, p.refreshHash)).toHaveLength(0);
+    first.db.exec(`CREATE TRIGGER revoke_presented AFTER INSERT ON oauth_tokens WHEN NEW.kind = 'refresh' BEGIN
+      UPDATE oauth_tokens SET revoked_at = ${start} WHERE hash = '${presented}'; END`);
+    const revoked = pair(start + 1);
+    expect(await rotate(revoked)).toEqual({ status: "invalid" });
+    first.db.exec("DROP TRIGGER revoke_presented");
+    absent(revoked);
+    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
+    await w1(() => { first.db.run("UPDATE oauth_tokens SET revoked_at = NULL WHERE hash = ?", [presented]); });
+    first.db.exec(`CREATE TRIGGER expire_presented AFTER INSERT ON oauth_tokens WHEN NEW.kind = 'refresh' BEGIN
+      UPDATE oauth_tokens SET expires_at = ${start} WHERE hash = '${presented}'; END`);
+    const expired = pair(start + 1);
+    expect(await rotate(expired)).toEqual({ status: "invalid" });
+    first.db.exec("DROP TRIGGER expire_presented");
+    absent(expired);
+    await w1(() => { first.db.run("UPDATE oauth_tokens SET expires_at = ? WHERE hash = ?", [start + OAUTH_TTL.refresh, presented]); });
+    first.db.exec(`CREATE TRIGGER steal AFTER INSERT ON oauth_tokens WHEN NEW.kind = 'refresh' BEGIN
+      UPDATE oauth_tokens SET spent_at = ${start} WHERE hash = '${presented}'; END`);
+    const loser = pair(start + 1);
+    expect(await rotate(loser)).toEqual({ status: "replay" });
+    first.db.exec("DROP TRIGGER steal");
+    absent(loser);
+    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
+    expect(auditCount("oauth.refresh_replay_revoked")).toBe(1);
+    expect(auditCount("oauth.refreshed")).toBe(0);
+  });
 });

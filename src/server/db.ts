@@ -86,6 +86,7 @@ export type WriteReceipt = {
   session: string; sender: string; fp: string; tool: string;
   ref_kind: "message" | "post"; ref_id: number; result_json: string; at: number;
 };
+export type WriteReceiptKey = Pick<WriteReceipt, "session" | "sender" | "fp">;
 
 // A message's columns as readers see them. sender_id (#284) is the sending
 // session's provenance, kept in the database and left out of reads and pushes;
@@ -408,6 +409,12 @@ export interface Repo {
   writeReceipts: {
     // The receipt for (session, sender, fp) written after `since`.
     find(r: Read, session: string, sender: string, fp: string, since: number): WriteReceipt | undefined;
+    // Takes (session, sender, fp) for a write about to run, as a placeholder the write's `upsert` fills in the same
+    // transaction; false when a receipt for it exists (D3: one statement, so of two identical calls one claims it).
+    claim(tx: Tx, key: WriteReceiptKey, tool: string, at: number): boolean;
+    // Takes over the receipt for `key` only while it still names `stale` (a row since retracted or pruned, #306);
+    // false when another call replaced it first.
+    reclaim(tx: Tx, key: WriteReceiptKey, stale: { ref_kind: "message" | "post"; ref_id: number }, at: number): boolean;
     // Replaces any receipt for the same (session, sender, fp).
     upsert(tx: Tx, r: WriteReceipt): void;
     // Whether the row a receipt names still exists (a retract or retention removes it).
@@ -1598,6 +1605,19 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           "SELECT * FROM write_receipts WHERE session = ? AND sender = ? AND fp = ? AND at > ?",
         ).get(session, sender, fp, since) ?? undefined;
       },
+      claim(tx, key, tool, at) {
+        // ref_id 0 names no row; ref_kind only satisfies the column's CHECK until `upsert` fills both.
+        return !!sqliteOf(tx).query<{ x: number }, [string, string, string, string, number]>(
+          `INSERT INTO write_receipts (session, sender, fp, tool, ref_kind, ref_id, result_json, at) VALUES (?, ?, ?, ?, 'message', 0, '', ?)
+           ON CONFLICT(session, sender, fp) DO NOTHING RETURNING 1 AS x`,
+        ).get(key.session, key.sender, key.fp, tool, at);
+      },
+      reclaim(tx, key, stale, at) {
+        return !!sqliteOf(tx).query<{ x: number }, [number, string, string, string, string, number]>(
+          `UPDATE write_receipts SET ref_id = 0, result_json = '', at = ?
+           WHERE session = ? AND sender = ? AND fp = ? AND ref_kind = ? AND ref_id = ? RETURNING 1 AS x`,
+        ).get(at, key.session, key.sender, key.fp, stale.ref_kind, stale.ref_id);
+      },
       upsert(tx, r) {
         sqliteOf(tx).run(
           `INSERT INTO write_receipts (session, sender, fp, tool, ref_kind, ref_id, result_json, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1752,6 +1772,28 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(c.userId);
     insertAudit(db, now, user?.email ?? null, action, null, JSON.stringify({ client_id: c.clientId, token_session: sessionId, ...detail }));
   };
+  // Spends a code by naming what it minted; false when another redeemer spent it first.
+  const spendCode = (column: "grant_id" | "session_id", minted: string | number, h: string) =>
+    !!db.query<{ hash: string }, [string | number, string]>(
+      `UPDATE oauth_codes SET ${column} = ? WHERE hash = ? AND grant_id IS NULL AND session_id IS NULL RETURNING hash`).get(minted, h);
+  // A replayed code revokes what it minted: the code leaked, so the grant or session may have too.
+  const grantCodeReplay = (id: string, now: number) => {
+    const g = grant(id);
+    if (!g || g.expiresAt <= now) return missing;
+    revokeGrant(g.id, now);
+    audit("oauth.code_replay_revoked", g, now, { level: "warning" });
+    return { status: "replay" } as const;
+  };
+  const loginCodeReplay = (c: OAuthCode, sessionId: number, now: number) => {
+    db.run("UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, sessionId]);
+    sessionAudit("oauth.code_replay_revoked", c, sessionId, now, { level: "warning" });
+    return { status: "replay" } as const;
+  };
+  const refreshReplay = (g: OAuthGrant, now: number) => {
+    revokeGrant(g.id, now);
+    audit("oauth.refresh_replay_revoked", g, now, { level: "warning" });
+    return { status: "replay" } as const;
+  };
   return {
     createRequest(input, now) {
       if (!authorization(input) || input.consentSessionHash !== null || ![input.requestHash, input.browserHash, input.csrfHash, input.stateHash].every(hash) ||
@@ -1778,8 +1820,10 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (!r || !b) return missing;
         if (r.browserHash !== browserHash || (r.consentSessionHash !== null && r.consentSessionHash !== sessionHash)) return invalid;
         const bound = { ...r, consentSessionHash: sessionHash };
-        db.run("UPDATE oauth_requests SET data = ? WHERE hash = ?", [JSON.stringify(bound), requestHash]);
-        return ok(bound);
+        // Binds once in one statement (D3): a binder racing another browser session for the request loses here.
+        const set = db.query<{ hash: string }, [string, string, string, string]>(`UPDATE oauth_requests SET data = ? WHERE hash = ?
+          AND coalesce(json_extract(data, '$.consentSessionHash'), ?) = ? RETURNING hash`).get(JSON.stringify(bound), requestHash, sessionHash, sessionHash);
+        return set ? ok(bound) : missing;
       }).immediate();
     },
     createBrowserSession(input, now, replaceHash) {
@@ -1806,7 +1850,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         const c = input.code;
         if (input.approve && (!sameAuthorization(r, c) || c.userId !== b.userId || !hash(c.codeHash) ||
             !deadline(c.createdAt, c.expiresAt, now, OAUTH_TTL.code))) return invalid;
-        db.run("DELETE FROM oauth_requests WHERE hash = ?", [input.requestHash]);
+        // The delete consumes the request (D3): of two concurrent decisions only one deletes a row.
+        if (!db.query<{ hash: string }, [string]>("DELETE FROM oauth_requests WHERE hash = ? RETURNING hash").get(input.requestHash)) return missing;
         if (!input.approve) return ok(null);
         db.run("INSERT INTO oauth_codes(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [c.codeHash, c.userId, c.expiresAt, JSON.stringify({ ...authorizationData(c),
           codeHash: c.codeHash, userId: c.userId, createdAt: c.createdAt, expiresAt: c.expiresAt })]);
@@ -1830,13 +1875,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         const { c, row } = p;
         // A login code, spent or not, never becomes a grant (#928 D8).
         if (row.session_id !== null || c.scopes.includes(LOGIN_SCOPE)) return invalid;
-        if (row.grant_id !== null) {
-          const g = grant(row.grant_id);
-          if (!g || g.expiresAt <= now) return missing;
-          revokeGrant(g.id, now);
-          audit("oauth.code_replay_revoked", g, now, { level: "warning" });
-          return { status: "replay" } as const;
-        }
+        if (row.grant_id !== null) return grantCodeReplay(row.grant_id, now);
         const unusable = usable(c, row, now);
         if (unusable) return unusable;
         if (!/^[A-Za-z0-9_-]{16,128}$/.test(input.grantId) ||
@@ -1845,7 +1884,14 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         const g: OAuthGrant = { id: input.grantId, userId: c.userId, clientId: c.clientId, resource: c.resource,
           scopes: c.scopes, createdAt: now, expiresAt: input.grantExpiresAt, revokedAt: null };
         db.run("INSERT INTO oauth_grants(id, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [g.id, g.userId, g.expiresAt, JSON.stringify(g)]);
-        db.run("UPDATE oauth_codes SET grant_id = ? WHERE hash = ?", [g.id, input.codeHash]);
+        // The statement that sets grant_id spends the code (D3), so of two concurrent redeemers one wins at any isolation
+        // level. The grant goes in first because grant_id references it; a loser withdraws it and answers as a replay, or
+        // not_found when the code or the winner's grant is gone.
+        if (!spendCode("grant_id", g.id, input.codeHash)) {
+          db.run("DELETE FROM oauth_grants WHERE id = ?", [g.id]);
+          const winner = codeRow(input.codeHash)?.grant_id;
+          return winner ? grantCodeReplay(winner, now) : missing;
+        }
         insertPair(input.tokens, g.id, now);
         audit("oauth.grant_issued", g, now);
         return ok({ grant: g, tokens: input.tokens });
@@ -1857,17 +1903,17 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if ("status" in p) return p;
         const { c, row } = p;
         if (row.grant_id !== null || !isLogin(c)) return invalid;
-        if (row.session_id !== null) {
-          // As a replayed grant code revokes its grant: the code leaked, so the session it minted may have too.
-          db.run("UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, row.session_id]);
-          sessionAudit("oauth.code_replay_revoked", c, row.session_id, now, { level: "warning" });
-          return { status: "replay" } as const;
-        }
+        if (row.session_id !== null) return loginCodeReplay(c, row.session_id, now);
         const unusable = usable(c, row, now);
         if (unusable) return unusable;
         if (!hash(input.tokenHash) || (input.label !== null && typeof input.label !== "string")) return invalid;
         const session = createSession(c.userId, input.tokenHash, input.label, now);
-        db.run("UPDATE oauth_codes SET session_id = ? WHERE hash = ?", [session.id, input.codeHash]);
+        // As redeemCode: setting session_id spends the code; a loser withdraws its session and answers as a replay (or not_found).
+        if (!spendCode("session_id", session.id, input.codeHash)) {
+          db.run("DELETE FROM sessions WHERE id = ?", [session.id]);
+          const winner = codeRow(input.codeHash)?.session_id;
+          return winner ? loginCodeReplay(c, winner, now) : missing;
+        }
         sessionAudit("oauth.session_issued", c, session.id, now);
         return ok({ sessionId: session.id, userId: c.userId });
       }).immediate();
@@ -1892,17 +1938,20 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
             !input.scopes.every(s => g.scopes.includes(s))) return invalid;
         if (!live(g, now)) return invalid;
         // A recognized ancestor revokes even after its sliding expiry; tombstones outlive it.
-        if (t.spent_at !== null) {
-          revokeGrant(g.id, now);
-          audit("oauth.refresh_replay_revoked", g, now, { level: "warning" });
-          return { status: "replay" } as const;
-        }
+        if (t.spent_at !== null) return refreshReplay(g, now);
         if (t.revoked_at !== null || t.expires_at <= now || !validPair(input.tokens, input, now, Number.MAX_SAFE_INTEGER) ||
             input.tokens.accessHash === input.refreshHash || input.tokens.refreshHash === input.refreshHash) return invalid;
         const tokens = { ...input.tokens, accessExpiresAt: Math.min(input.tokens.accessExpiresAt, g.expiresAt),
           refreshExpiresAt: Math.min(input.tokens.refreshExpiresAt, g.expiresAt) };
-        db.run("UPDATE oauth_tokens SET spent_at = ? WHERE hash = ?", [now, input.refreshHash]);
         insertPair(tokens, g.id, now);
+        // The statement that sets spent_at spends the token (D3): of two concurrent rotations one wins at any isolation
+        // level. The new pair goes in first, as a redeemed code's grant does; a loser withdraws it and re-reads the token.
+        const spent = db.query<{ hash: string }, [number, string, number]>(`UPDATE oauth_tokens SET spent_at = ?
+          WHERE hash = ? AND kind = 'refresh' AND spent_at IS NULL AND revoked_at IS NULL AND expires_at > ? RETURNING hash`).get(now, input.refreshHash, now);
+        if (!spent) {
+          db.run("DELETE FROM oauth_tokens WHERE hash IN (?, ?)", [tokens.accessHash, tokens.refreshHash]);
+          return token(input.refreshHash)?.spent_at != null ? refreshReplay(g, now) : invalid;
+        }
         audit("oauth.refreshed", g, now);
         return ok({ grant: g, tokens });
       }).immediate();

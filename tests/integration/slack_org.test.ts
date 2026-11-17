@@ -2,10 +2,9 @@
 // with a fake Slack, and agents as hosted MCP sessions (#282). Linking, the
 // human identity's round trip, who may reach it, and unlinking.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import type { ReadResult } from "../../src/core/boards.ts";
+import { subscribe, type ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import { ApplicationError } from "../../src/server/application.ts";
-import { writeAudit } from "../../src/server/audit.ts";
 import type { SendResult } from "../../src/shared/protocol.ts";
 import { createHash } from "node:crypto";
 
@@ -18,6 +17,7 @@ import { TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
 import { until } from "../support/until.ts";
 import { queueFor } from "../../src/server/store/queue.ts";
+import type { Relay, RelayStore } from "../../src/bridge/relay.ts";
 const DM = "D0ALICE";
 const ALICE_SLACK = "U0ALICE";
 
@@ -350,10 +350,14 @@ test("a thread reply reaches a human only as a DM could", async () => {
 }, 30_000);
 
 // #807 D4: an unlink is one transaction through the server's write queue, and the human goes offline only after it commits.
-function holdQueue(): { release: () => void; done: Promise<void> } {
-  let release!: () => void;
-  const done = queueFor(srv.app.db).run(() => new Promise<void>((r) => { release = r; }));
-  return { release, done };
+// `started`: once it holds the queue (a busy queue starts it later); a release before then frees it as it starts.
+function holdQueue(): { release: () => void; started: Promise<void>; done: Promise<void> } {
+  let released = false;
+  let free: (() => void) | undefined;
+  let begin!: () => void;
+  const started = new Promise<void>((r) => { begin = r; });
+  const done = queueFor(srv.app.db).run(() => new Promise<void>((r) => { begin(); if (released) r(); else free = r; }));
+  return { release: () => { released = true; free?.(); }, started, done };
 }
 const ticks = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
 
@@ -392,24 +396,124 @@ test("#807: a Slack user's dm_send and board_post run inside a write-queue trans
 });
 
 // A refusal's row (rowAfterRollback, application.ts) is written after the rollback that drops the call's other
-// writes (#452), as a hosted call's are: the stub refuses the way send does.
+// writes (#452), as a hosted call's are (#981): a real msg.send deny (policy.ts humanRule), the Slack human DMing
+// another person's human it isn't a teammate of.
 test("#807: a Slack user's refused call keeps its refusal row", async () => {
   const alice = await login("alice@example.com");
+  await login("bob@example.com");
   await link(alice);
-  await hosted("alice@example.com", "be");
-  const app = srv.app.application;
-  const { send } = app;
-  app.send = (_tx, s) => {
-    const row = () => writeAudit(srv.app.repo, "delegation.refused", "alice@example.com", "be", {});
-    if (s.afterRollback) s.afterRollback(row); else row();
-    throw new ApplicationError("forbidden", "stub refusal");
-  };
-  try {
-    slack.say("@be refused");
-    await until(() => slack.posts().find((p) => p.markdown_text?.includes("stub refusal")), 5000, "the refusal reached Slack");
-  } finally { app.send = send; }
-  await until(() => accessAudits(srv.app.db, "delegation.refused").length === 1, 5000, "the refusal row was written");
+  // bob's human, as his link would make it: without it the send is a missing identity, refused before policy.
+  const repo = srv.app.repo;
+  await seed(repo, tx => repo.aliases.create(tx, { scope_kind: "person", scope_ref: "bob@example.com", name: "human" }, "bob@example.com"));
+  const top = slack.say("@bob@example.com/human hello");
+  const reply = await until(() => slack.posts().find((p) => p.thread_ts === top.ts), 5000, "the refusal reached Slack");
+  expect(reply.markdown_text).toContain("reachable only by their teammates");
+  const rows = accessAudits(srv.app.db, "authz.decision");
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ actor: "alice@example.com", detail: { verb: "msg.send", allow: false, rule: "human.teammates", address: "alice@example.com/human" } });
 });
+
+// #981: the relay's dm_thread (dmRoot, for a reply that reaches the human) runs inside a write-queue transaction, as
+// dm_send does.
+test("#807: a Slack user's dm_thread runs inside a write-queue transaction", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const app = srv.app.application;
+  const { thread } = app;
+  const seen: boolean[] = [];
+  app.thread = (tx, s, id) => { seen.push(srv.app.db.inTransaction && queueFor(srv.app.db).mine); return thread.call(app, tx, s, id); };
+  try {
+    const root = await be.call<SendResult>("dm_send", { to: "human", body: "thread root" });
+    await until(() => posted("thread root"), 5000, "the root reached Slack");
+    await be.call("dm_send", { to: "human", body: "thread reply", parent_id: root.message_id });
+    await until(() => posted("thread reply"), 5000, "the reply reached Slack");
+  } finally { app.thread = thread; }
+  expect(seen.length).toBeGreaterThan(0);
+  expect(seen.every(Boolean)).toBe(true);
+});
+
+// Holds the write queue as the first repo.post named `what` is made, so that write queues behind the holder; each
+// such post's return (true: it ran at once) is pushed to `ran`.
+function holdAtPost(what: string): { ran: boolean[]; holder: () => ReturnType<typeof holdQueue> | undefined; restore: () => void } {
+  const repo = srv.app.repo;
+  const { post } = repo;
+  const ran: boolean[] = [];
+  let holder: ReturnType<typeof holdQueue> | undefined;
+  repo.post = (fn, committed, label) => {
+    if (label === what && !holder) holder = holdQueue();
+    const now = (post as (...a: unknown[]) => boolean).call(repo, fn, committed, label);
+    if (label === what) ran.push(now);
+    return now;
+  };
+  return { ran, holder: () => holder, restore: () => { repo.post = post; holder?.release(); } };
+}
+
+// The human's hello replay (application.replay, which slack.ts attach calls after its hello commits) drains outside
+// any body, so its posted writes wait for a held queue; a drain a commit's wake runs is the holder's and runs at once.
+// Disabling and enabling alice re-attaches her human (#981).
+async function reattach(root: string, hold: () => void): Promise<void> {
+  expect((await api(root, "POST", "/api/admin/disable-user", { email: "alice@example.com" })).status).toBe(200);
+  hold();
+  expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
+}
+
+// #981: a digest the Slack human is sent is acknowledged by a posted receipt (#807 D4, slack.ts sink): behind a held
+// queue it waits, then marks the digest sent.
+test("#807: a Slack digest receipt waits for the write queue, then marks the digest sent", async () => {
+  const [alice, , root] = await Promise.all(["alice", "bob", "root"].map((n) => login(`${n}@example.com`)));
+  await link(alice);
+  // Another user's agent: disabling alice also closes her own agents' connections.
+  const fe = await hosted("bob@example.com", "fe");
+  await fe.call("board_create", { name: "noise", purpose: "chatter" });
+  const repo = srv.app.repo;
+  const human = "alice@example.com/human";
+  await seed(repo, tx => subscribe(repo.coreOn(tx), human, "noise", "digest"));
+  // A digest-board post wakes nobody: the digest waits for the human's next drain.
+  const chatter = await fe.call<BoardPostResult>("board_post", { board: "noise", body: "chatter" });
+  const notified = () => (srv.app.db.prepare(`SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`).get(human) as { notified_id: number }).notified_id;
+  expect(notified()).toBeLessThan(chatter.post_id);
+  let hold: ReturnType<typeof holdAtPost> | undefined;
+  try {
+    await reattach(root, () => { hold = holdAtPost("Slack digest receipt"); });
+    await until(() => hold!.ran.length > 0, 5000, "the sink posted the digest receipt");
+    expect(hold!.ran).toEqual([false]);
+    await hold!.holder()!.started;
+    expect(notified()).toBeLessThan(chatter.post_id);
+    hold!.holder()!.release();
+    await hold!.holder()!.done;
+    await until(() => notified() === chatter.post_id, 5000, "the receipt marked the digest sent");
+  } finally { hold?.restore(); }
+  expect(posted("chatter")).toBe(false);
+}, 30_000);
+
+// #981: a push the human can no longer see is acknowledged as drainBoards finds it (lostAck, application.ts), posted
+// through the write queue (#807 D4): behind a held queue it waits, then stamps the outbox row.
+test("#807: a push the Slack human can no longer see is acked through the write queue", async () => {
+  const [alice, bob, root] = await Promise.all(["alice", "bob", "root"].map((n) => login(`${n}@example.com`)));
+  await link(alice);
+  const fe = await hosted("bob@example.com", "fe");
+  expect((await api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
+  await fe.call("board_create", { name: "ops-room", purpose: "ops only", team: "ops" });
+  const hidden = await fe.call<BoardPostResult>("board_post", { board: "ops-room", body: "not for alice" });
+  // A push alice's human can't see (she isn't in ops), as an undelivered mention left from before she lost the board would be.
+  const human = "alice@example.com/human";
+  const db = srv.app.db;
+  await seed(db, () => db.prepare(`INSERT INTO outbox (handle, post_id, reason) VALUES (?, ?, 'mention')`).run(human, hidden.post_id));
+  const deliveredAt = () => (db.prepare(`SELECT delivered_at FROM outbox WHERE handle = ? AND post_id = ?`).get(human, hidden.post_id) as { delivered_at: number | null }).delivered_at;
+  let hold: ReturnType<typeof holdAtPost> | undefined;
+  try {
+    await reattach(root, () => { hold = holdAtPost("lost-visibility push ack"); });
+    await until(() => hold!.ran.length > 0, 5000, "the drain posted the lost-visibility ack");
+    expect(hold!.ran).toEqual([false]);
+    await hold!.holder()!.started;
+    expect(deliveredAt()).toBeNull();
+    hold!.holder()!.release();
+    await hold!.holder()!.done;
+    await until(() => deliveredAt() !== null, 5000, "the ack stamped the push delivered");
+  } finally { hold?.restore(); }
+  expect(posted("not for alice")).toBe(false);
+}, 30_000);
 
 // #807 D4: a delivered item's receipt and progress clear are one posted write: behind a held queue it waits, and
 // reads the progress written before it.
@@ -827,3 +931,124 @@ test("when Slack can't be reached to check the email, the link is refused with a
   expect(srv.app.repo.slack.linkFor(srv.app.repo.read, srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);
+
+// #1062: the RelayStore's overlay of pending writes (#1016), driven at the store. The thread() overlay and the advance
+// projection sit on the outbound reply path, whose root lookup is itself a queued read, so FIFO commits the posted row
+// first today: they guard a Repo whose reads leave the queue, and no end-to-end path reaches them yet.
+// Relay.store is private: read through a cast.
+const attached = (userId: number) => {
+  const relay = (srv.app.slack as unknown as { linked: Map<number, { relay: Relay }> }).linked.get(userId)!.relay;
+  return { relay, store: (relay as unknown as { store: RelayStore }).store };
+};
+
+async function linkedAlice(): Promise<{ userId: number; relay: Relay; store: RelayStore }> {
+  await link(await login("alice@example.com"));
+  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  return { userId, ...attached(userId) };
+}
+
+test("#1062: a thread row and its advance, waiting in the write queue, read back as they will commit", async () => {
+  const { userId, store } = await linkedAlice();
+  const repo = srv.app.repo;
+  const committed = () => repo.slack.thread(repo.read, userId, "dm", null, 41);
+  const holder = holdQueue();
+  try {
+    store.addThread({ thread_ts: "1700000000.000100", kind: "dm", board: null, root_id: 41, peer: "alice@example.com/be", last_id: 41 });
+    expect(committed()).toBeUndefined();
+    // A second item in the just-opened thread finds the row, so it posts threaded.
+    expect(store.thread("dm", null, 41)).toMatchObject({ thread_ts: "1700000000.000100", peer: "alice@example.com/be", last_id: 41 });
+    // A newer item moves last_id and the peer; an older one moves neither.
+    store.advance("1700000000.000100", 45, "alice@example.com/fe");
+    store.advance("1700000000.000100", 43, "alice@example.com/sim");
+    const want = { thread_ts: "1700000000.000100", kind: "dm" as const, board: null, root_id: 41, peer: "alice@example.com/fe", last_id: 45 };
+    expect(store.thread("dm", null, 41)).toEqual(want);
+    expect(store.byTs("1700000000.000100")).toEqual(want);
+    expect(committed()).toBeUndefined();
+    holder.release();
+    await holder.done;
+    await until(() => committed()?.last_id === 45, 5000, "the thread row and its advances committed");
+    expect(committed()).toEqual(want);
+    expect(store.thread("dm", null, 41)).toEqual(want);
+  } finally { holder.release(); }
+});
+
+test("#1062: queued progress reads back as saved, and the receipt drops it", async () => {
+  const { userId, store } = await linkedAlice();
+  const repo = srv.app.repo;
+  const meta = { board: "e2e", post_id: "990001", from: "alice@example.com/be" };
+  const committed = () => repo.slack.progress(repo.read, userId, "post:990001");
+  const holder = holdQueue();
+  try {
+    const id = store.enqueue({ content: "progress fixture", meta });
+    const progress: Record<string, unknown> = { posted: true, error: null };
+    store.setProgress(id, progress);
+    // The relay keeps mutating its object after a save; the queued value is the one saved.
+    progress.told = true;
+    expect(store.progress(id)).toEqual({ posted: true, error: null });
+    // And a reader's copy is its own.
+    (store.progress(id) as Record<string, unknown>).posted = false;
+    expect(store.progress(id)).toEqual({ posted: true, error: null });
+    expect(committed()).toBeUndefined();
+    store.done(id, null);
+    expect(store.pending()).toEqual([]);
+    // The same item enqueued again before the receipt commits still reads the progress, so it isn't posted twice.
+    const again = store.enqueue({ content: "progress fixture", meta });
+    expect(store.progress(again)).toEqual({ posted: true, error: null });
+    holder.release();
+    await holder.done;
+    // The progress write's commit dropped the overlay; the receipt's cleared the row.
+    await until(() => store.progress(again) === undefined, 5000, "the queued progress committed and was cleared");
+    expect(committed()).toBeUndefined();
+  } finally { holder.release(); }
+});
+
+// End to end: a drain that fails after Slack took the post leaves the item in the outbox, and the next drain reads its
+// queued { posted: true } rather than posting it again.
+test("#1062: a redelivery while the item's progress waits in the write queue doesn't post it twice", async () => {
+  const { userId, relay, store } = await linkedAlice();
+  const be = await hosted("alice@example.com", "be");
+  const { done } = store;
+  let failed = false;
+  store.done = (id, error) => {
+    if (!failed) { failed = true; throw new Error("receipt fixture failure"); }
+    done(id, error);
+  };
+  let holder: ReturnType<typeof holdQueue> | undefined;
+  // Held as Slack takes the post, so the progress write queues behind it.
+  slack.onPost = (body) => { if (!holder && String(body.markdown_text).includes("redelivery fixture")) holder = holdQueue(); };
+  const count = () => slack.posts().filter((p) => p.markdown_text?.includes("redelivery fixture")).length;
+  try {
+    const sent = await be.call<SendResult>("dm_send", { to: "human", body: "redelivery fixture" });
+    await until(() => failed, 5000, "the first drain reached the receipt");
+    expect(store.pending()).toHaveLength(1);
+    // The redelivery must read the queued progress, not a committed row.
+    expect(holder).toBeDefined();
+    expect(srv.app.repo.slack.progress(srv.app.repo.read, userId, `dm:${sent.message_id}`)).toBeUndefined();
+    // A drain() while the failed one is still unwinding would only set its again flag.
+    await until(() => !(relay as unknown as { draining: boolean }).draining, 5000, "the failed drain ended");
+    await relay.drain();
+    expect(store.pending()).toEqual([]);
+    expect(count()).toBe(1);
+  } finally { store.done = done; slack.onPost = null; holder?.release(); await holder?.done; }
+});
+
+// A progress write that failed leaves its overlay entry (the relay did what it records); the receipt's commit drops it.
+test("#1062: the receipt drops the overlay of a progress write that failed", async () => {
+  const { userId, store } = await linkedAlice();
+  srv.app.db.run(`CREATE TRIGGER fail_progress BEFORE INSERT ON slack_progress BEGIN SELECT RAISE(ABORT, 'progress refused'); END`);
+  const meta = { board: "e2e", post_id: "990002", from: "alice@example.com/be" };
+  const errors = spyOn(console, "error");
+  const holder = holdQueue();
+  try {
+    const id = store.enqueue({ content: "failed progress fixture", meta });
+    store.setProgress(id, { posted: true, error: null });
+    store.done(id, null);
+    holder.release();
+    await holder.done;
+    // The progress write failed, so only the receipt's commit can drop its overlay.
+    const again = store.enqueue({ content: "failed progress fixture", meta });
+    await until(() => errors.mock.calls.some((c) => String(c[0]).includes("Slack progress failed")), 5000, "the progress write failed");
+    expect(srv.app.repo.slack.progress(srv.app.repo.read, userId, "post:990002")).toBeUndefined();
+    await until(() => store.progress(again) === undefined, 5000, "the receipt dropped the failed write's overlay");
+  } finally { holder.release(); errors.mockRestore(); }
+});

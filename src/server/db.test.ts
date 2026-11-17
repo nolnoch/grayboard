@@ -670,6 +670,8 @@ test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", as
   expect(() => repo.writeReceipts.refExists(kept, "message", 1)).toThrow(settled);
   expect(() => repo.writeReceipts.upsert(kept, { session: "s2", sender: "a@example.com/fe", fp: "g", tool: "dm_send", ref_kind: "message", ref_id: 2, result_json: "{}", at: 6 })).toThrow(settled);
   expect(() => repo.writeReceipts.pruneSession(kept, "s1", 10)).toThrow(settled);
+  expect(() => repo.writeReceipts.claim(kept, { session: "s3", sender: "a@example.com/fe", fp: "h" }, "dm_send", 7)).toThrow(settled);
+  expect(() => repo.writeReceipts.reclaim(kept, { session: "s1", sender: "a@example.com/fe", fp: "f" }, { ref_kind: "message", ref_id: 1 }, 7)).toThrow(settled);
   const foreign = {} as typeof repo.read;
   expect(() => repo.cursors.directFor(foreign, "a@example.com/fe")).toThrow("not a SQLite store handle");
   expect(() => repo.writeReceipts.refExists(foreign, "message", 1)).toThrow("not a SQLite store handle");
