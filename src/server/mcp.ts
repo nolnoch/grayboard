@@ -11,6 +11,7 @@ import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
 import { GRAYBOARD_ALIAS_LOST_META } from "../shared/session_meta.ts";
 import { ApplicationError, type Application, type ApplicationSession, type IdentityInfo } from "./application.ts";
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
+import { setRequestClient } from "./request_context.ts";
 import { createResources, parseBoardResourceUri } from "./resources.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, hostedChildInstruction, hostedUnboundInstruction, sessionContext, withoutFacts, type DeclaredDelivery, type SessionContext, type HostedSessions, type Verdict } from "./hosted.ts";
@@ -193,6 +194,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const role = hostedRole(request);
     const principal = oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) return refuse(principal);
+    setRequestClient(principal.clientId);
     const meta = exchanges.getStore()?.meta;
     // A malformed `_meta` field is the client's bug: refused with its own message and logged, so it's diagnosable.
     const metaRefusal = (reason: string, error: unknown): never => {
@@ -920,10 +922,8 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     ? { ...withNotices(result, [notice]), _meta: { ...result._meta, [GRAYBOARD_ALIAS_LOST_META]: true } } : result;
   // Every tool error carries its code in structuredContent (#806), as the subscriber role's do; the text, which
   // the agent reads, stays `error: <message>`.
-  const refusal = (e: unknown): CallToolResult => {
-    const message = e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
-    return { ...text(`error: ${message}`), structuredContent: domainData(e), isError: true };
-  };
+  const shown = (e: unknown) => e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
+  const refusal = (e: unknown): CallToolResult => ({ ...text(`error: ${shown(e)}`), structuredContent: domainData(e), isError: true });
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession, tx: Tx) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
@@ -940,10 +940,12 @@ function registerNativeTools(server: McpServer, application: Application, hosted
       return said(text(await timeTool("whoami", () => { const context = current(ctx); return hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }); })), notice);
     } catch (e) { report(e, "whoami"); return said(refusal(e), notice); }
   });
+  // The JSON text names the same code as structuredContent (#843): `internal_error` for a fault, `refused` for a core refusal.
   const bindRefusal = (e: unknown, tool: string) => {
     report(e, tool);
-    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden"].includes(e.code)) refuse(e.code);
-    return { ...text({ code: e instanceof ApplicationError ? e.code : "internal", message: e instanceof ApplicationError ? e.message : "internal error", ...(e instanceof ApplicationError ? e.extra : {}) }), structuredContent: domainData(e), isError: true };
+    if (e instanceof ApplicationError && ["identity_unknown", "alias_held", "bad_request", "forbidden", "not_found"].includes(e.code)) refuse(e.code);
+    const data = domainData(e);
+    return { ...text({ code: data.code, message: shown(e), ...(e instanceof ApplicationError && e.code !== "internal" ? e.extra : {}) }), structuredContent: data, isError: true };
   };
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
