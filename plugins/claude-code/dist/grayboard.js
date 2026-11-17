@@ -36254,6 +36254,7 @@ class ToolProxy {
 
 // adapters/hosted-core/src/client.ts
 var message = (error) => error?.message ?? String(error);
+var endFailedText = (id, error) => `couldn't end session ${id} on the server: ${message(error)}`;
 var DETAIL_MAX = 300;
 function failureText(error, hint) {
   const text = failureMessage(error, hint);
@@ -36309,7 +36310,7 @@ class HostedClient {
     try {
       await this.temporary(id, (wire) => wire.call("session_end"));
     } catch (error) {
-      this.options.log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
+      this.options.log(endFailedText(id, error), "warning");
     }
   }
   proxy(mode, o) {
