@@ -127,25 +127,6 @@ test("Repo.write commits a transaction, rolls it back on a throw, and refuses in
   await expect(nested!).rejects.toThrow("nested code calls atomic");
 });
 
-test("#807: writeNow runs its transaction now through an idle queue, and refuses while the queue is held or a transaction is open", async () => {
-  const { db, repo } = open();
-  const seen: string[] = [];
-  expect(repo.writeNow(tx => { repo.users.upsertByEmail(tx, "now@example.com", null); afterCommit(db, () => { seen.push("committed"); }); return 7; })).toBe(7);
-  expect(seen).toEqual(["committed"]);
-  expect(repo.users.findByEmail("now@example.com")).toBeDefined();
-  expect(() => repo.writeNow(tx => { repo.users.upsertByEmail(tx, "rolled@example.com", null); throw new Error("boom"); })).toThrow("boom");
-  expect(repo.users.findByEmail("rolled@example.com")).toBeUndefined();
-  expect(queueFor(db).held).toBe(false);
-  let release!: () => void;
-  const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
-  expect(() => repo.writeNow(tx => repo.users.upsertByEmail(tx, "held@example.com", null))).toThrow("writeNow while the write queue is held");
-  expect(() => repo.hosted.writeNow(() => 1)).toThrow("writeNow while the write queue is held");
-  release();
-  await holder;
-  expect(repo.users.findByEmail("held@example.com")).toBeUndefined();
-  expect(repo.hosted.writeNow(() => 2)).toBe(2);
-});
-
 test("the Repo and the hosted store share one queue, and a commit's effects flush before the next body", async () => {
   const { db, repo } = open();
   const seen: string[] = [];
@@ -250,7 +231,7 @@ test("post runs now on an idle queue, through it, and throws its error there", (
   expect(queueFor(db).held).toBe(false);
 });
 
-// #807 P3 A3: an idle-queue post's synchronous failures outside fn are thrown too, as queuedNow threw them.
+// #807 P3 A3: an idle-queue post's synchronous failures outside fn are thrown too, as the old writeNow threw them.
 test("post on an idle queue throws a failed BEGIN and a throwing committed, once, without logging them", async () => {
   const { db, repo } = open();
   const logged: unknown[][] = [];

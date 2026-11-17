@@ -24,7 +24,7 @@ export interface Tx extends Read {
   afterCommit(effect: () => void | Promise<void>): void;
   // A nested transaction: fn's writes and effects roll back alone when it throws or rejects. Awaitable on every
   // store, so callers are written once for Postgres. Only an async write() body's Tx has it: a synchronous body
-  // (writeNow, post) can't await one, so its Tx refuses.
+  // (a post from the queue's holder) can't await one, so its Tx refuses.
   savepoint<T>(fn: (tx: Tx) => T | Promise<T>): Promise<T>;
 }
 

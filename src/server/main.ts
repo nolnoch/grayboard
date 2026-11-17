@@ -11,7 +11,7 @@ if (process.argv.includes("--version")) {
 }
 
 const config = loadConfig();
-const { server, stop, metrics } = startServer(config);
+const { server, stop, metrics, ready } = startServer(config);
 
 // Handlers go in before the listening line: a supervisor (or test) that
 // signals on seeing it must reach shutdown, not the default kill (#422).
@@ -30,6 +30,14 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
+// The listening line means ready: the startup writes have committed and requests are served (#807 P3 A4).
+try {
+  await ready;
+} catch (e) {
+  console.error(`grayboard server: startup failed: ${(e as Error).stack ?? e}`);
+  await stop().catch(() => {});
+  process.exit(1);
+}
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
 // An unauthenticated listener: say where it bound, every start.
 console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${metrics.port}` : "off"}`);

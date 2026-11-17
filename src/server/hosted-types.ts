@@ -25,8 +25,6 @@ export interface HostedStore {
   // after the commit, before the queue's next body. fn may be async: `committed` gets its resolved value.
   write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
-  // write's transaction run now, for startup only (Repo.writeNow).
-  writeNow<T>(fn: (tx: Tx) => T): T;
   // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
   // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
   subscribe(fn: (changed: string | null) => void): () => void;
