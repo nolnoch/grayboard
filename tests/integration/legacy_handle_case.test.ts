@@ -6,7 +6,7 @@ import { afterEach, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { busRows } from "../support/local_bus.ts";
+import { busRows, pauseEnv, releasePause } from "../support/local_bus.ts";
 import { closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
@@ -76,4 +76,68 @@ test(`${FROM}'s Gray, then a v2 release's gray, then this tree started as Gray: 
   expect(inbox.unanswered.map((m: { body: string }) => m.body).sort()).toEqual(["from 1.x", "from 2.x", "to gray"]);
   expect(busRows(bus, `SELECT address FROM aliases WHERE lower(address) = 'gray'`)).toEqual([{ address: "gray" }]);
   expect(busRows<{ detail: string }>(bus, `SELECT detail FROM audit_log WHERE action = 'alias.case_moved'`).map((r) => JSON.parse(r.detail))).toEqual([{ from: "Gray", merged: true }]);
+}, 60_000);
+
+// #1189: another process's open merging into a live `gray` wakes it. Assumes a
+// case-sensitive filesystem (sock.Gray and sock.gray are distinct files), as on CI's Linux.
+test(`a ${FROM} DM to Gray while this tree's gray is live arrives at the next open`, async () => {
+  const bus = mkdtempSync(join(tmpdir(), "grayboard-case-"));
+  dirs.push(bus);
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  const gray = await localSession(bus, "Gray");
+  expect((await gray.call("whoami")).primary).toBe("gray");
+  // A 1.x pair still running: its `Gray` writes the old name again.
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  const be = await localSession(bus, "be", { bin: rel.cli });
+  await be.call("dm_send", { to: "Gray", body: "late" });
+  await stopSession(be.c);
+  expect(busRows(bus, `SELECT recipient FROM messages WHERE body = 'late'`)).toEqual([{ recipient: "Gray" }]);
+  expect(gray.pushes.find((p) => p.content === "late")).toBeUndefined();
+
+  await localSession(bus, "fe");
+  await until(() => gray.pushes.find((p) => p.content === "late"));
+  expect(busRows(bus, `SELECT recipient FROM messages WHERE body = 'late'`)).toEqual([{ recipient: "gray" }]);
+}, 60_000);
+
+// #1192: a 1.x DM to Gray sits below the 1.x DM to gray whose push is in
+// flight when another open merges Gray in, lowering gray's cursor to reach it;
+// marking the in-flight one must not move the cursor past the merged one, so
+// the drain still pushes it.
+test(`a ${FROM} DM merged in while a later DM's push is in flight is still pushed`, async () => {
+  const bus = mkdtempSync(join(tmpdir(), "grayboard-case-"));
+  dirs.push(bus);
+  const point = "drain:before-delivered";
+  const cursor = () => busRows<{ last_seen_id: number }>(bus, `SELECT last_seen_id FROM cursors WHERE reader = 'gray'`)[0]?.last_seen_id;
+  const body = (b: string) => busRows<{ id: number; recipient: string }>(bus, `SELECT id, recipient FROM messages WHERE body = ?`, b)[0];
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  // gray already has a cursor: one DM handed over before the scenario.
+  const first = await localSession(bus, "gray");
+  const fe = await localSession(bus, "fe");
+  await fe.call("dm_send", { to: "gray", body: "earlier" });
+  await until(() => first.pushes.find((p) => p.content === "earlier"));
+  await until(() => cursor() === body("earlier")!.id);
+  await stopSession(first.c);
+
+  const gray = await localSession(bus, "gray", { extra: pauseEnv(bus, point) });
+  expect((await gray.call("whoami")).primary).toBe("gray");
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  const be = await localSession(bus, "be", { bin: rel.cli });
+  await be.call("dm_send", { to: "Gray", body: "merged" });
+  await be.call("dm_send", { to: "gray", body: "inflight" });
+  await stopSession(be.c);
+  await until(() => gray.pushes.find((p) => p.content === "inflight"));
+  await until(() => gray.stderr().includes(`test pause hit: ${point}`));
+  expect(body("merged")).toMatchObject({ recipient: "Gray" });
+  expect(body("merged")!.id).toBeLessThan(body("inflight")!.id);
+
+  // This tree's open merges Gray in and lowers gray's cursor below `merged`.
+  await localSession(bus, "sim");
+  expect(body("merged")).toMatchObject({ recipient: "gray" });
+  expect(cursor()).toBeLessThan(body("merged")!.id);
+  releasePause(bus, point);
+  await until(() => gray.pushes.find((p) => p.content === "merged"), 10_000, "the merged DM pushed");
+  // A later DM pushed means the drain has passed everything under it.
+  await fe.call("dm_send", { to: "gray", body: "after" });
+  await until(() => gray.pushes.find((p) => p.content === "after"));
+  expect(gray.pushes.filter((p) => p.meta.from).map((p) => p.content)).toEqual(["inflight", "merged", "after"]);
 }, 60_000);

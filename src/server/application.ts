@@ -453,7 +453,8 @@ async function describeHolder(hub: Hub, r: Read, id: string, asker: string): Pro
 // `tx.savepoint`, so a binding row may be async (#807 P3 B1c).
 export type RefusalRow = (tx: Tx) => void | Promise<void>;
 // A row written where nothing awaits it (an audit or decision row, a streak or throttle row, one core's synchronous
-// `reach` emits): synchronous, so none floats a promise (#807 P3 B1c, R10).
+// `reach` emits): synchronous by convention, so none floats a promise (#807 P3 B1c, R10). The type doesn't refuse an
+// async function (TypeScript accepts one where `void` is returned): every producer must call only synchronous writers.
 export type SyncRow = (tx: Tx) => void;
 function rowAfterRollback(session: ApplicationSession, tx: Tx, write: SyncRow) {
   if (session.afterRollback) session.afterRollback(write); else write(tx);
@@ -672,17 +673,22 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     return repo.write(async tx => {
       const list = await ids(tx);
       return list.length ? endIdsIn(tx, list, why) : null;
-    }, ends => { if (ends) afterEnds(ends.woken, ends.bounced); }).then(() => {});
+    }, ends => { if (ends) afterEnds(ends.woken, ends.bounces); }).then(() => {});
   }
-  type Ends = { woken: Set<string>; bounced: { id: string; at: number }[] };
+  type Ends = { woken: Set<string>; bounces: MessageRow[] };
   // endIds's body, inside a write body: `tx` is that body's. Each end's savepoint runs on its own Tx.
   async function endIdsIn(tx: Tx, ids: string[], why: string): Promise<Ends> {
-    const woken = new Set<string>(), bounced: { id: string; at: number }[] = [];
+    const woken = new Set<string>(), bounces: MessageRow[] = [];
     for (const id of ids) {
       let ended;
       const at = now();
       try {
-        ended = await tx.savepoint(sp => endSession(repo.coreOn(sp), repo.mailOn(sp), id, { why, now: at, audit: serverAuditSink(repo, sp) }));
+        // The end's bounces are read in its savepoint, so they're pushed at the commit (#807 P3 A7i), before any
+        // newer message to their senders can commit; a failed read rolls back this end alone.
+        ended = await tx.savepoint(async sp => {
+          const end = endSession(repo.coreOn(sp), repo.mailOn(sp), id, { why, now: at, audit: serverAuditSink(repo, sp) });
+          return { ...end, bounces: end.ended ? await repo.messages.bouncesFrom(sp, id, at) : [] };
+        });
       } catch (e) {
         console.error(`[grayboard] ending session ${id} (${why}) failed:`, e);
         writeAudit(repo, tx, "id.end_failed", null, id, { why, error: String(e) });
@@ -691,41 +697,35 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // An end that found the session already ended sends nothing again.
       if (!ended.ended) continue;
       for (const h of ended.wake) woken.add(h);
-      bounced.push({ id, at });
+      bounces.push(...ended.bounces);
       if (ended.held.length) console.error(`[grayboard] session ${id} ended (${why}); released ${ended.held.join(", ")}`);
     }
-    return { woken, bounced };
+    return { woken, bounces };
   }
   // What follows ends, after their commit: a bounce goes to a live sender now, as a send does (a drain would
-  // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go.
-  // The bounce reads await (#807 P3 A7i), so this runs on after its caller returns, in the same order: bounces, then
-  // the wake and the sweep, which run even when a bounce read fails (its senders get the bounce on their next drain).
-  function afterEnds(woken: Set<string>, ends: { id: string; at: number }[]): void {
-    void (async () => {
-      try {
-        for (const { id, at } of ends) for (const b of await repo.messages.bouncesFrom(repo.read, id, at)) {
-          const to = hub.registry.get(b.recipient);
-          if (to) deliverDirect(to, b);
-        }
-      } catch (error) {
-        console.error("[grayboard] delivering an end's bounces failed:", error);
-      }
-      wake(hub, onCommit(repo.read), [...woken]);
-      void sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
-    })();
+  // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go. The
+  // bounces were read in the ends' transaction (#807 P3 A7i), so they're pushed at the commit, synchronously, before
+  // a newer message to their senders can be.
+  function afterEnds(woken: Set<string>, bounces: MessageRow[]): void {
+    for (const b of bounces) {
+      const to = hub.registry.get(b.recipient);
+      if (to) deliverDirect(to, b);
+    }
+    wake(hub, onCommit(repo.read), [...woken]);
+    void sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
   // after-commit half for every hosted commit, whichever path released it.
   const unsubscribeEnds = repo.hosted.subscribe(() => {
     const ended = repo.hosted.takeEnded();
-    if (ended.length) afterEnds(new Set(ended.flatMap((e) => e.wake)), ended);
+    if (ended.length) afterEnds(new Set(ended.flatMap((e) => e.wake)), ended.flatMap((e) => e.bounces));
   });
   // The WSS transport is gone (#282): no connection can come back for a
   // session a previous run left unended, because only a hello re-attached one.
   // End each at start, as the grace sweep would have: holds and claims
   // released, mail bounced. A hosted ID is the hosted store's to end.
   // The startup leftovers' ends (#807 P3 A1): the server's `ready` waits for them.
-  // The write is enqueued at construction, ahead of any other startup write, and reads the leftovers on its own Tx
+  // The write is enqueued at construction, ahead of every startup write but the dev-session revocation, and reads the leftovers on its own Tx
   // (#807 P3 B1b): a start with none commits an empty transaction.
   const ready = endIds(async (tx) => {
     const ids: string[] = [];
@@ -771,7 +771,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
       // address set and registry entries follow the database, as a bind or unbind's do.
       for (const id of resync) for (const s of hub.sessions) if (!s.human && s.sessionId === id) setHolds(hub, s, holds.get(id) ?? []);
-      afterEnds(ends.woken, ends.bounced);
+      afterEnds(ends.woken, ends.bounces);
     };
     if (isTx(h)) return body(h).then(value => { h.afterCommit(() => committed(value)); });
     return repo.write(body, committed).then(() => {}, error => console.error("[grayboard] alias recheck failed:", error));
@@ -789,7 +789,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // leaves the others revoked, so one bad row doesn't stop every revocation the server's sweep makes.
   async function revokeAliases(tx: Tx, uses: (AliasUse & { reason: string })[], by: string | null): Promise<{ resync: string[]; ends: Ends }> {
     const ended: string[] = [], resync: string[] = [];
-    if (!uses.length) return { resync, ends: { woken: new Set(), bounced: [] } };
+    if (!uses.length) return { resync, ends: { woken: new Set(), bounces: [] } };
     for (const u of uses) {
       try { await revokeUse(tx, u, by, ended, resync); }
       catch (e) {
@@ -961,7 +961,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // concurrent bind) refuses here, naming whoever has it now.
     if (!(await repo.bindings.take(tx, address, id, authed.user_email, now()))) {
       const now_ = await repo.bindings.holderOf(tx, address);
-      const who = now_ !== null ? await describeHolder(hub, tx, now_, authed.user_email) : `another user's session ${await repo.bindings.userOf(tx, address, authed.user_email)}`;
+      // On Postgres an unbind or end may commit between the take and these reads, leaving neither: "another session".
+      const user = now_ === null ? await repo.bindings.userOf(tx, address, authed.user_email) : null;
+      const who = now_ !== null ? await describeHolder(hub, tx, now_, authed.user_email) : user !== null ? `another user's session ${user}` : "another session";
       return await refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, now_ !== null ? { holder: who } : {});
     }
     await repo.bindings.log(tx, id, address, "bound", null);
