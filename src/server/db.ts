@@ -146,6 +146,21 @@ export function queuedTx(repo: Repo): WriteTx {
   return <T>(fn: (db: CoreDb) => T) => repo.write((tx: Tx) => fn(repo.coreOn(tx)) as Sync<T>) as Promise<T>;
 }
 
+// queuedTx, plus the core-shaped guard (`() => void`) core calls inside those bodies (attachment store and release):
+// it runs the server's `guard` on the body's own `Tx` (#1053), so the check reads the writer, not a second pool
+// connection. Bodies are synchronous and the queue runs one at a time, so one `body` slot serves them all.
+export function queuedGuardTx(repo: Repo, guard?: (r: Read) => void): { tx: WriteTx; guard?: () => void } {
+  let body: Tx | undefined;
+  const tx: WriteTx = <T>(fn: (db: CoreDb) => T) => repo.write((t: Tx) => {
+    body = t;
+    try { return fn(repo.coreOn(t)) as Sync<T>; } finally { body = undefined; }
+  }) as Promise<T>;
+  return { tx, guard: guard && (() => {
+    if (!body) throw new Error("an attachment guard ran outside its transaction body");
+    guard(body);
+  }) };
+}
+
 // A write at startup, before anything serves (a constructor's first sweep, #807 P1b-4): fn's transaction through the
 // write queue, run now, its value returned and its error thrown, as the synchronous transaction it was. It throws when
 // the queue is held: a request, timer or callback path awaits write() instead.

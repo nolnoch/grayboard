@@ -388,7 +388,7 @@ test("renew completes while a transfer holds the reader gate past the original d
   const started = new Promise<void>(resolve => { entered = resolve; });
   const held = new Promise<void>(resolve => { release = resolve; });
   const transfer = hosted.transfer(bob, context(bob), async (_session, guard) => {
-    entered(); await held; guard();
+    entered(); await held; guard(store.repo.read);
   });
   await started;
   try {

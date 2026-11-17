@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
+import { queueFor } from "./store/queue.ts";
 import { UploadGate } from "./uploads.ts";
 import { createApplication } from "./application.ts";
 import { createHostedSessions, sessionContext } from "./hosted.ts";
@@ -436,4 +437,30 @@ test("abort while reading and stop during blob put release resources", async () 
   resume.resolve(); await stopping;
   expect((await upload).status).toBe(503);
   expect(count()).toBe(0);
+});
+
+// #1053: the byte routes' guard runs inside the store, audit, download and release transactions too. Every read it
+// makes there goes through that body's own handle, never the pool: on Postgres a pool read would take a second
+// connection while the body holds one (D2) and miss the body's own rows.
+test("#1053: the guard's reads inside a transaction body use that body's handle, not the pool", async () => {
+  const queue = queueFor(store.db);
+  const inBody: { what: string; pool: boolean }[] = [];
+  const record = (what: string, fn: (...args: never[]) => unknown) => function (this: unknown, ...args: unknown[]) {
+    if (queue.mine) inBody.push({ what, pool: args[0] === store.repo.read });
+    return (fn as (...a: unknown[]) => unknown).apply(this, args);
+  };
+  const find = store.repo.aliases.find, get = store.repo.hosted.get, active = store.repo.oauth.findActiveAccess;
+  store.repo.aliases.find = record("aliases.find", find) as typeof find;
+  store.repo.hosted.get = record("hosted.get", get) as typeof get;
+  store.repo.oauth.findActiveAccess = record("findActiveAccess", active) as typeof active;
+  try {
+    const id = await uploaded();
+    expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
+    expect((await send(request("DELETE", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
+  } finally {
+    store.repo.aliases.find = find; store.repo.hosted.get = get; store.repo.oauth.findActiveAccess = active;
+  }
+  // Each of the three reads ran in a body (store, audit, download recheck, release), and none of them on the pool.
+  for (const what of ["aliases.find", "hosted.get", "findActiveAccess"]) expect(inBody.some(c => c.what === what)).toBe(true);
+  expect(inBody.filter(c => c.pool)).toEqual([]);
 });

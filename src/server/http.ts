@@ -6,7 +6,7 @@ import {
   mintToken, hashToken, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
 import { defaultProviders } from "./idp.ts";
-import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
+import { releaseStored, requestAttachment, storeUpload, type Guard } from "./attachments.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
@@ -305,7 +305,7 @@ function queryAs(url: URL, authed: AuthedUser, repo: Repo): string | Response {
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
-export async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, uploads: UploadGate, guard?: () => void, signal = req.signal): Promise<Response> {
+export async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, uploads: UploadGate, guard?: Guard, signal = req.signal): Promise<Response> {
   const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
@@ -322,15 +322,15 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
   try {
     // A declared length over the cap is refused before the body is read.
     new SizeTally(repo.attachmentLimits, 1).add(label, Number(declared));
-    guard?.();
+    guard?.(repo.read);
     release = await uploads.reserve(authed.user_email, Number(declared), signal);
-    guard?.();
+    guard?.(repo.read);
     const data = await readUploadBody(req, Number(declared), transferTimeoutMs(Number(declared)), guard ? signal : undefined);
-    guard?.();
+    guard?.(repo.read);
     if (guard && data.length !== Number(declared)) return refuse("bad_request", "the body is shorter than its Content-Length", 400);
     new SizeTally(repo.attachmentLimits, 1).add(label, data.length);
     const row = await storeUpload(repo, authed.user_email, handle, checkFile(label, rawName, data), {}, guard);
-    try { guard?.(); } catch (error) {
+    try { guard?.(repo.read); } catch (error) {
       await releaseStored(repo, authed.user_email, handle, row.id);
       throw error;
     }
@@ -352,7 +352,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
 
 // A download (`<id>?as=`), for the hosted byte route's GET: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
-export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: () => void): Promise<Response> {
+export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: Guard): Promise<Response> {
   const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   const read = requestAttachment(repo, repo.read, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
@@ -369,7 +369,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
     throw e;
   }
   return repo.write(tx => {
-  guard?.();
+  guard?.(tx);
   if (guard) {
     // A refusal here is a decision too (#851); the transaction returns, so its rows commit.
     const current = requestAttachment(repo, tx, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
@@ -390,12 +390,12 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
 
 // A release (`<id>?as=`), for the hosted byte route's DELETE: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
-export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: () => void): Promise<Response> {
+export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: Guard): Promise<Response> {
   const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
-  guard?.();
+  guard?.(repo.read);
   const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, authed.user_email, handle, Number(idStr), {}, guard) : null;
-  guard?.();
+  guard?.(repo.read);
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
   return json({ ok: true });
 }
