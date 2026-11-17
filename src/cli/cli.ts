@@ -14,7 +14,7 @@ import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudeHooks, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
-import { piAgentDir } from "../shared/pi.ts";
+import { ompAgentDir, piAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { hostedConfigPath, type HostedConfig } from "../../adapters/hosted-core/src/config.ts";
 
@@ -44,9 +44,15 @@ function handleApiError(e: unknown): never {
 
 // ── push adapters (omp, opencode, pi) ─────────────────────────────────────────────
 
-const OMP_DIR = join(homedir(), ".omp", "agent");
+const OMP_DIR = ompAgentDir();
 const OC_DIR  = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
 const PI_DIR  = piAgentDir();
+// omp honors PI_CODING_AGENT_DIR in its default profile, so with it set omp
+// and pi share one agent dir, where each would load the other's adapter
+// from extensions/grayboard.ts. Setup refuses omp's there; refresh leaves
+// the files to pi's.
+const OMP_SHARES_PI = resolve(OMP_DIR) === resolve(PI_DIR);
+const OMP_SHARED_REFUSAL = `omp's agent directory is pi's (${OMP_DIR}: omp reads PI_CODING_AGENT_DIR too), and pi would load omp's adapter from it, so nothing was changed for omp. Run omp under a profile (OMP_PROFILE) or without PI_CODING_AGENT_DIR, then rerun setup`;
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
@@ -725,7 +731,10 @@ program
     let failed = false;
     const installHarness = async (h: PiFamily) => {
       let r: FamilyInstall;
-      try { r = await installPiFamily(h, server, { command, args }); } catch (e) {
+      try {
+        if (h === OMP && OMP_SHARES_PI) throw new Error(OMP_SHARED_REFUSAL);
+        r = await installPiFamily(h, server, { command, args });
+      } catch (e) {
         console.error((e as Error).message);
         failed = true;
         process.exitCode = 1;
@@ -798,7 +807,7 @@ function undeliveredEntries(): string[] {
   const out: string[] = [];
   const present = (p: string) => { try { lstatSync(p); return true; } catch { return false; } };
   const harnesses: { name: string; config: HarnessConfig; env: string; adapters: string[] }[] = [
-    { name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] },
+    ...(OMP_SHARES_PI ? [] : [{ name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] }]),
     { name: "opencode", config: OC_CONFIG, env: "environment", adapters: [OC_PLUGIN.path] },
     { name: "pi", config: PI.config, env: "env", adapters: [PI.local, PI.hosted] },
   ];
@@ -930,7 +939,7 @@ program
     // omp and pi: where either variant is installed (and neither is a
     // symlink), install the one the current mode uses.
     let server: string | undefined;
-    for (const h of [OMP, PI]) {
+    for (const h of OMP_SHARES_PI ? [PI] : [OMP, PI]) {
       const paths = [h.local, h.hosted].filter(p => existsSync(p));
       if (paths.length === 0 || paths.some(p => lstatSync(p).isSymbolicLink())) continue;
       if (busMode() === "server") {

@@ -1,7 +1,8 @@
 // piAgentDir follows pi's own rule for PI_CODING_AGENT_DIR (#279 audit 14):
 // empty is unset, `~` expands, a file:// URL converts, anything else is as is.
 import { expect, test } from "bun:test";
-import { piAgentDir } from "./pi.ts";
+import { join } from "node:path";
+import { ompAgentDir, piAgentDir } from "./pi.ts";
 
 const HOME = "/home/you";
 
@@ -36,3 +37,52 @@ test("the local pi adapter's copy resolves every case as piAgentDir does (#437)"
     if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = saved;
   }
 });
+
+// ompAgentDir follows omp's getAgentDir() (#439): the omp adapters read it,
+// so setup must install there.
+test("ompAgentDir: the default is ~/.omp/agent; PI_CONFIG_DIR moves the root", () => {
+  expect(ompAgentDir({}, HOME)).toBe("/home/you/.omp/agent");
+  expect(ompAgentDir({ PI_CODING_AGENT_DIR: "" }, HOME)).toBe("/home/you/.omp/agent");
+  expect(ompAgentDir({ PI_CONFIG_DIR: ".omp-work" }, HOME)).toBe("/home/you/.omp-work/agent");
+});
+
+test("ompAgentDir: a named profile has its own agent dir and ignores PI_CODING_AGENT_DIR", () => {
+  expect(ompAgentDir({ OMP_PROFILE: "work" }, HOME)).toBe("/home/you/.omp/profiles/work/agent");
+  expect(ompAgentDir({ PI_PROFILE: "work" }, HOME)).toBe("/home/you/.omp/profiles/work/agent");
+  expect(ompAgentDir({ OMP_PROFILE: "work", PI_CODING_AGENT_DIR: "/srv/omp" }, HOME)).toBe("/home/you/.omp/profiles/work/agent");
+  // OMP_PROFILE wins over PI_PROFILE, and an empty or "default" one selects the default profile.
+  expect(ompAgentDir({ OMP_PROFILE: "a", PI_PROFILE: "b" }, HOME)).toBe("/home/you/.omp/profiles/a/agent");
+  expect(ompAgentDir({ OMP_PROFILE: "", PI_PROFILE: "b" }, HOME)).toBe("/home/you/.omp/agent");
+  expect(ompAgentDir({ OMP_PROFILE: "default" }, HOME)).toBe("/home/you/.omp/agent");
+  // An invalid name resolves as the default profile, as omp's module load does.
+  expect(ompAgentDir({ OMP_PROFILE: "Bad/Name" }, HOME)).toBe("/home/you/.omp/agent");
+  expect(ompAgentDir({ OMP_PROFILE: "con" }, HOME)).toBe("/home/you/.omp/agent");
+});
+
+test("ompAgentDir: the default profile honors PI_CODING_AGENT_DIR, path-resolved, unless it is PI_PROFILE's own dir", () => {
+  expect(ompAgentDir({ PI_CODING_AGENT_DIR: "/srv/omp" }, HOME)).toBe("/srv/omp");
+  // No `~` expansion: omp path.resolve()s it against the current directory.
+  expect(ompAgentDir({ PI_CODING_AGENT_DIR: "~/omp" }, HOME)).toBe(join(process.cwd(), "~/omp"));
+  // A parent omp's profile switch propagated PI_CODING_AGENT_DIR; OMP_PROFILE="" chose the default profile.
+  expect(ompAgentDir({ OMP_PROFILE: "", PI_PROFILE: "w", PI_CODING_AGENT_DIR: "/home/you/.omp/profiles/w/agent" }, HOME)).toBe("/home/you/.omp/agent");
+});
+
+// The rule above is a copy of omp's; this runs omp's own getAgentDir() (the
+// pinned @oh-my-pi/pi-utils) per case, so an omp upgrade that changes it fails here.
+test("ompAgentDir matches omp's getAgentDir() in every case", () => {
+  const cases: Record<string, string>[] = [
+    {}, { PI_CONFIG_DIR: ".omp-work" }, { OMP_PROFILE: "work" }, { PI_PROFILE: "work" },
+    { OMP_PROFILE: "work", PI_CODING_AGENT_DIR: "/srv/omp" }, { OMP_PROFILE: "a", PI_PROFILE: "b" }, { OMP_PROFILE: "", PI_PROFILE: "b" },
+    { OMP_PROFILE: "default" }, { OMP_PROFILE: "Bad/Name" }, { OMP_PROFILE: "con" }, { PI_CODING_AGENT_DIR: "/srv/omp" }, { PI_CODING_AGENT_DIR: "~/omp" },
+    { PI_CODING_AGENT_DIR: "rel/omp" }, { OMP_PROFILE: "", PI_PROFILE: "w", PI_CODING_AGENT_DIR: "/home/you/.omp/profiles/w/agent" },
+  ];
+  const keys = ["OMP_PROFILE", "PI_PROFILE", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"];
+  for (const c of cases) {
+    const env: Record<string, string | undefined> = { ...process.env, HOME };
+    for (const k of keys) delete env[k];
+    Object.assign(env, c);
+    const r = Bun.spawnSync([process.execPath, "-e", `import { getAgentDir } from "@oh-my-pi/pi-utils/dirs"; console.log(getAgentDir())`], { env, cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+    expect(r.exitCode, r.stderr.toString()).toBe(0);
+    expect([c, ompAgentDir(c, HOME)]).toEqual([c, r.stdout.toString().trim()]);
+  }
+}, 60_000);
