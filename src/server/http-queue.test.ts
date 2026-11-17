@@ -112,14 +112,16 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
 
 // #807 P1c-15c-1: the claim, identity and team routes reach core's helpers through `repo.coreOn(handle)`: their write
 // body's `Tx` inside it, the pool outside (the claim list). P3 B1a: and their binding reads through `repo.bindings`, the same way.
-test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's Tx", async () => {
+// P3 B5b1: the identity, team and Slack-free alias routes write boards through `repo.boards` and never reach core; only
+// the claim call (callBoardTool, B5b3) still does.
+test("#807 P1c-15c-1: claim, identity and team routes reach the store on their body's Tx", async () => {
   const srv = new TestServer();
   cleanups.push(() => srv.stop());
   const { repo, db } = srv.app;
   const you = await srv.login("you@example.com"), bob = await srv.login("bob@example.com");
   const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   let route = "";
-  const bindingSpies = [repo.bindings, repo.claims].flatMap(group => (Object.keys(group) as (keyof typeof group)[]).map(name => {
+  const bindingSpies = [repo.bindings, repo.claims, repo.boards].flatMap(group => (Object.keys(group) as (keyof typeof group)[]).map(name => {
     const own = (group[name] as (...a: unknown[]) => unknown).bind(group);
     return spyOn(group, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
       checks.push({ route, op: String(name), inTxn: db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
@@ -153,8 +155,17 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     await call("team add again", you, "POST", "/api/teams/core/add", { email: "bob@example.com" });
     await call("team leave", bob, "POST", "/api/teams/core/leave");
     const inBody = ["team create", "team add", "identity create", "claim call", "claim call as id", "identity delete", "team delete-alias", "team remove", "team leave"];
-    // Each in-body route reached core at least once, so the last check isn't vacuous for it.
+    // Each in-body route reached the store at least once, so the last check isn't vacuous for it.
     expect(inBody.filter(r => !checks.some(c => c.route === r && c.handle === "tx"))).toEqual([]);
+    // B5b1: core only under the claim call.
+    expect(checks.filter(c => c.op === "coreOn" && !c.route.startsWith("claim call")).map(c => c.route)).toEqual([]);
+    const boardOps = (r: string) => checks.filter(c => c.route === r && c.op in repo.boards).map(c => `${c.op}:${c.handle}`);
+    // The name's board check, then the board ensured twice (teamCreate's own and the join's).
+    expect(boardOps("team create")).toEqual(["get:tx", "ensure:tx", "ensure:tx"]);
+    // bob's alias follows the team board: its visibility read on the join's Tx, then the subscription.
+    expect(boardOps("team add")).toEqual(["ensure:tx", "isSubscribed:tx", "get:tx", "setSubscription:tx"]);
+    expect(boardOps("team remove")).toEqual(["unsubscribeScope:tx"]);
+    expect(boardOps("team leave")).toEqual(["unsubscribeScope:tx"]);
     // B2: the claim list reads through repo.claims, on the pool.
     expect(checks.some(c => c.route === "claim list" && c.op === "list" && c.handle === "pool")).toBe(true);
     // B1a: the ID branch's row, the alias-in-use checks and the claim's address set read on the body's Tx.
@@ -164,8 +175,8 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     const reads = (r: string) => checks.filter(c => c.route === r && c.op !== "coreOn" && c.op !== "nextExpiry").map(c => `${c.op}:${c.handle}`);
     expect(reads("claim call as id")).toEqual(["idRow:tx", "addressSet:tx"]);
     expect(reads("claim call")).toEqual(["userOf:tx", "addressSet:tx"]);
-    expect(reads("identity delete")).toEqual(["userOf:tx"]);
-    expect(reads("team delete-alias")).toEqual(["userOf:tx"]);
+    expect(reads("identity delete")).toEqual(["userOf:tx", "forget:tx"]);
+    expect(reads("team delete-alias")).toEqual(["userOf:tx", "forget:tx"]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { spy.mockRestore(); for (const s of bindingSpies) s.mockRestore(); }
 });
@@ -205,12 +216,12 @@ test("#807 P1c-15c-2: attachment routes and retention reach the store on their b
     route = "retention";
     await runRetention(repo, { ...srv.config, messageRetentionDays: 1, auditRetentionDays: 1 }, Date.now() + 30 * 86_400_000);
     // The download's reach reads through repo (P3 B5a1: an unsent upload names no post, so no repo.boards read);
-    // retention's coreOn body is its post prune; its ended-ID prune goes through repo.sessionEnd (P3 B4a).
+    // retention's post prune goes through repo.boards (P3 B5b1), its ended-ID prune through repo.sessionEnd (P3 B4a).
     const ops = (r: string) => checks.filter(c => c.route === r).map(c => `${c.op}:${c.handle}`);
     expect(ops("upload")).toEqual(["insertUpload:tx"]);
     expect(ops("download")).toEqual(["get:pool", "get:tx"]);
     expect(ops("release")).toEqual(["dropUnsent:tx", "unnamedBlobs:pool", "named:pool", "dropBlobEntry:tx"]);
-    expect(ops("retention")).toEqual(["coreOn:tx", "pruneEnded:tx", "pruneUnbound:tx", "unnamedBlobs:pool"]);
+    expect(ops("retention")).toEqual(["prunePosts:tx", "pruneEnded:tx", "pruneUnbound:tx", "unnamedBlobs:pool"]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { spy.mockRestore(); for (const s of groupSpies) s.mockRestore(); }
 });

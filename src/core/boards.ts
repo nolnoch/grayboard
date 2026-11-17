@@ -610,7 +610,11 @@ export function listBoards(db: Database, handles: string[] | BoardPredicate): Bo
 
 // mode "off" unsubscribes. New subscriptions start at the tip: no backlog.
 export function subscribe(db: Database, handle: string, boardInput: string, mode: SubMode | "off"): void {
-  const board = visibleBoard(db, handle, boardInput).name;
+  setSubscription(db, handle, visibleBoard(db, handle, boardInput).name, mode);
+}
+
+// subscribe's write, for a board the caller already judged visible to handle (the server's async BoardAccess).
+export function setSubscription(db: Database, handle: string, board: string, mode: SubMode | "off"): void {
   if (mode === "off") {
     db.prepare(`DELETE FROM subscriptions WHERE board = ? AND handle = ?`).run(board, handle);
     return;

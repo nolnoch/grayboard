@@ -9,7 +9,7 @@
 // app gets linked.
 import { randomInt } from "node:crypto";
 
-import { forgetHandle, markHuman, refOf } from "../core/boards.ts";
+import { refOf } from "../core/boards.ts";
 import { boardNotification, dmNotification } from "../shared/notifications.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
@@ -175,7 +175,7 @@ export class SlackBridge implements SlackLinker {
       // starts from the newest message (see linkUser).
       const handle = `${link.email}/${HUMAN_NAME}`;
       await repo.aliases.remove(tx, handle);
-      forgetHandle(repo.coreOn(tx), handle);
+      await repo.boards.forget(tx, handle);
       writeAudit(repo, tx, "slack.unlinked", link.email, link.slack_user);
       return true;
     }, unlinked => { if (unlinked) this.detach(userId); return unlinked; });
@@ -239,14 +239,14 @@ export class SlackBridge implements SlackLinker {
       const handle = `${user.email}/${HUMAN_NAME}`;
       if (!(await repo.aliases.find(tx, handle))) {
         // Start from now: drop what queued for an earlier link's alias.
-        forgetHandle(repo.coreOn(tx), handle);
+        await repo.boards.forget(tx, handle);
         await repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
         writeAudit(repo, tx, "alias.created", user.email, handle, { slack: true });
         await onAliasCreated(repo, tx, user.id, handle);
         const newest = (await repo.messages.history(tx, [handle], undefined, 1))[0];
         if (newest) await repo.cursors.advance(tx, handle, "direct", handle, newest.id);
       }
-      markHuman(repo.coreOn(tx), handle, true);
+      await repo.aliases.markHuman(tx, handle, true);
       writeAudit(repo, tx, "slack.linked", user.email, slackUser);
       return { moved, link: (await repo.slack.linkFor(tx, user.id))! };
     }, (r): Linked & { attached?: Promise<void> } => {
