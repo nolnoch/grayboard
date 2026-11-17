@@ -59,7 +59,7 @@ type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebSt
 type Checked = { row: HostedSession | undefined; root?: HostedSession };
 type Live = { context: Context; rows: Set<string>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isAuthorizedNow" | "isGrantActiveNow" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   let closed = false, posts = 0, busListeners = 0;
@@ -135,10 +135,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
   const resources = createResources(application, { caps: caps.watches, isAuthorized: (session, r) => {
     const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
-    return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorized(principal, r);
+    return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorizedNow(principal, r);
   } });
-  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
-  const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
+  // Resources, hosted and delivery check synchronously, inside bodies and "no await since" reuses that #807 P3 A7d re-audits.
+  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorizedNow(principal, r) });
+  const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorizedNow(principal, r), now, caps: caps.leases });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
@@ -187,15 +188,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // authorize's checks that read no hosted row: the request, the token and grant, the session and its user.
   function authCheck(context: Context, signal?: AbortSignal) {
     if (closed || context.request.signal.aborted || signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
-    application.repo.authRead(() => {
-      if (!oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
+    application.repo.authNow.read(() => {
+      if (!oauth.isAuthorizedNow(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
       application.revalidateSession(context.session, true);
     });
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
   async function select(request: Request, admit = true): Promise<Context> {
     const role = hostedRole(request);
-    const principal = oauth.authenticate(request, roleScopes(role));
+    const principal = await oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) return refuse(principal);
     setRequestClient(principal.clientId);
     const meta = exchanges.getStore()?.meta;
@@ -233,7 +234,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       }
       if (error instanceof ApplicationError && error.code === "rate_limited" && !exchange?.refusal) throw new ApplicationError("internal", "internal error");
       if (!closed && !request.signal.aborted && error instanceof ApplicationError && error.code === "unauthenticated") {
-        const refusal = oauth.authenticate(request, roleScopes(role));
+        const refusal = await oauth.authenticate(request, roleScopes(role));
         if (refusal instanceof Response) refuse(refusal);
         refuse(Response.json({ code: "unauthenticated", message: "invalid or missing token" }, { status: 401 }));
       }
@@ -251,11 +252,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (exchange) { exchange.principal = principal.authed.user_id; exchange.identity = context.session.identityName; exchange.session = context.session.sessionId; }
     try {
       if (closed || request.signal.aborted) throw new Error("MCP request is closed");
-      if (!oauth.isAuthorized(principal)) {
-        const refusal = oauth.authenticate(request, roleScopes(role));
+      if (!await oauth.isAuthorized(principal)) {
+        const refusal = await oauth.authenticate(request, roleScopes(role));
         if (refusal instanceof Response) refuse(refusal);
         throw new Error("unauthenticated");
       }
+      // Closed or cancelled while the check awaited: the context is finished below, never handed out.
+      if (closed || request.signal.aborted) throw new Error("MCP request is closed");
       return context;
     } catch (error) { context.finish(); throw error; }
   }
@@ -533,7 +536,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const exchange = exchanges.getStore()!;
     if (exchange.context) {
       if (closed || exchange.request.signal.aborted) throw new Error("MCP request is closed");
-      const principal = oauth.authenticate(exchange.request, roleScopes(exchange.context.role));
+      const principal = await oauth.authenticate(exchange.request, roleScopes(exchange.context.role));
+      if (closed || exchange.request.signal.aborted) throw new Error("MCP request is closed");
       if (principal instanceof Response) refuse(principal);
     }
     const context = exchange.context ??= await select(exchange.request);
@@ -609,15 +613,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const timer = setInterval(() => {
     for (const legacy of [...legacyDormant]) {
       try {
-        if (!oauth.isGrantActive(legacy.principal.grantId)) drop(legacy, "grant_ended");
+        if (!oauth.isGrantActiveNow(legacy.principal.grantId)) drop(legacy, "grant_ended");
         // An in-flight POST keeps its transport; idleness counts from dormancy or the last request, whichever is later.
         else if (legacy.posts === 0 && now() - Math.max(legacy.dormant!.since, legacy.lastUsed) >= 60_000) drop(legacy, "idle");
       } catch { drop(legacy, "failed", true); }
     }
     for (const legacy of [...legacyAll]) {
       try {
-        if (!oauth.isAuthorized(legacy.principal)) {
-          if (legacy.principal.accessExpiry <= now() && oauth.isGrantActive(legacy.principal.grantId)) sleep(legacy);
+        if (!oauth.isAuthorizedNow(legacy.principal)) {
+          if (legacy.principal.accessExpiry <= now() && oauth.isGrantActiveNow(legacy.principal.grantId)) sleep(legacy);
           else retire(legacy);
         } else if (!legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
       } catch { retire(legacy, true); }
@@ -631,7 +635,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const t = now();
     let gen: string | undefined;
     try {
-      gen = application.repo.authRead(() => {
+      gen = application.repo.authNow.read(() => {
         const gen = application.repo.authGeneration();
         for (const live of [...lives]) {
           if (live.stopped) continue;
@@ -723,7 +727,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       let principal: OAuthPrincipal;
       let postReservation: (() => void) | undefined;
       try {
-        const authenticated = oauth.authenticate(original, roleScopes(role));
+        const authenticated = await oauth.authenticate(original, roleScopes(role));
+        // Closed while the check awaited (#807 P3 A7c): the same answer as closed before it.
+        if (closed) return new Response("MCP endpoint is closed", { status: 503 });
         if (authenticated instanceof Response) return authenticated;
         principal = authenticated;
         boundary.principal = principal.authed.user_id;

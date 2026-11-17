@@ -29,8 +29,8 @@ export type OAuthTokenPair = OAuthBinding & {
 export type OAuthFailure = { status: "invalid" | "not_found" | "replay" | "capacity" };
 export type OAuthResult<T> = { status: "ok"; value: T } | OAuthFailure;
 // Writes take the body's `Tx`, reads a `Read` (#807 D2): the caller's `Tx` inside a write body, `repo.read` outside one.
-// Async but for the two auth hot-path reads (#807 P3 A6c), which go async with `Access` (A7): findActiveAccess sits
-// under authRead's cache (#853), and isGrantActive's callers (hosted MCP's live-session rechecks, src/server/mcp.ts) are sync.
+// Every method is async (#807 P3 A7c). The SQLite Repo also keeps synchronous forms of the two auth hot-path reads
+// (`Repo.authNow`) for the hosted MCP callers that are still synchronous until A7d.
 export interface OAuthStore {
   createRequest(tx: Tx, input: OAuthRequest, now: number): Promise<OAuthResult<OAuthRequest>>;
   findRequest(r: Read, requestHash: string, browserHash: string, now: number): Promise<OAuthRequest | undefined>;
@@ -54,8 +54,8 @@ export interface OAuthStore {
   // Requested TTLs are validated then clamped to the persisted absolute grant deadline; use returned deadlines.
   rotateRefresh(tx: Tx, input: OAuthBinding & { refreshHash: string; tokens: OAuthTokenPair }, now: number): Promise<OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>>;
   revokeToken(tx: Tx, tokenHash: string, clientId: string, now: number): Promise<void>;
-  findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;
-  isGrantActive(r: Read, grantId: string, now: number): boolean;
+  findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): Promise<OAuthAccess | undefined>;
+  isGrantActive(r: Read, grantId: string, now: number): Promise<boolean>;
   // Once per database and `key` (#429: builtin_clients; #928: builtin_clients_cli): revokes every unrevoked
   // grant, and drops every unredeemed code, under `clientIds`, audits each grant, then records the cutover under
   // `key` so grants those clients issue later survive restarts. Returns the grants revoked; 0 after the first run.

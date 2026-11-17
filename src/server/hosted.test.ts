@@ -522,7 +522,7 @@ test("the authenticated client selects the source key and harness; nothing else 
   try {
     const authenticate = async (clientId: string) => {
       const issued = await issueOAuth(database.repo, oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], now, clientId);
-      const p = oauth.authenticate(new Request(oauth.resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
+      const p = await oauth.authenticate(new Request(oauth.resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
       if (p instanceof Response) throw new Error("fixture authorization failed");
       return p;
     };

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader, HostedLost } from "./hosted-types.ts";
-import { testPause } from "../shared/testpause.ts";
+import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { queueFor } from "./store/queue.ts";
 import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -222,9 +222,17 @@ export interface Repo {
   // The store's read handle outside any transaction (#807 P1c): reads committed state.
   read: Read;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
-  // body (#881): one authorization's token and user reads share it. Inside the caller's own transaction, nested, or
-  // with no generation to read, it's plain fn().
-  authRead<T>(fn: () => Sync<T>): T;
+  // body (#881): one authorization's token and user reads share it, across its awaits (#807 P3 A7c). Inside the
+  // caller's own transaction, nested, or with no generation to read, it's plain fn().
+  authRead<T>(fn: () => T | Promise<T>): Promise<T>;
+  // authRead for a synchronous body, and the two auth hot-path reads in synchronous form, for the hosted MCP callers
+  // that stay synchronous until #807 P3 A7d (its authorization check, the stream timer, the attachment guard, and the
+  // resources, hosted-session and delivery authorization callbacks). They share the async forms' caches. SQLite only: a store with async statements has no such forms.
+  authNow: {
+    read<T>(fn: () => Sync<T>): T;
+    findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;
+    isGrantActive(r: Read, grantId: string, now: number): boolean;
+  };
   // The auth cache's generation: authRead's pinned one inside its body (and in work the body starts: the pin follows
   // the async task, #807 P3 A7b), else read now; undefined inside the caller's
   // own transaction. Another task's open transaction doesn't move it: it reflects commits only (#996). Equal values
@@ -945,7 +953,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     then(fn(...args), () => changed(id(...args)));
   const hosted = makeHostedStore(db);
   const { writesOn: _writesOn, ...hostedStore } = hosted;
-  const oauth = makeOAuthStore(hosted);
+  const { store: oauth, now: oauthNow } = makeOAuthStore(hosted);
   // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
   // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
   // on every cached auth read.
@@ -1009,32 +1017,61 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const accesses = new Map<string, OAuthAccess>();
   // Inside a transaction (authGeneration undefined) it reads on the caller's handle, uncached. The handle is
   // resolved first, so a kept Tx is refused on a cache hit too.
-  const findActiveAccess: OAuthStore["findActiveAccess"] = (r, h, resource, requiredScopes, now) => {
+  // The async form's read may await (#807 P3 A7c): a commit that lands meanwhile moves the generation, and the fill
+  // check then stores nothing, so a token revoked mid-read is never cached as live.
+  const scoped = (a: OAuthAccess | undefined, requiredScopes: string[]) => a && requiredScopes.every(s => a.scopes.includes(s)) ? a : undefined;
+  const fillAccess = (g: string, key: string, a: OAuthAccess | undefined) => {
+    const kept = fills(g, accessGeneration, () => accesses.clear());
+    if (kept === g) { accessGeneration = g; if (a) accesses.set(key, a); else accesses.delete(key); }
+  };
+  const heldAccess = (g: string, key: string, now: number) => {
+    const a = g === accessGeneration ? accesses.get(key) : undefined;
+    return a && now < a.expiresAt && now < a.grantExpiresAt ? a : undefined;
+  };
+  const findActiveAccessNow: Repo["authNow"]["findActiveAccess"] = (r, h, resource, requiredScopes, now) => {
+    sqliteOf(r);
+    const g = authGeneration();
+    if (g === undefined || !Array.isArray(requiredScopes)) return oauthNow.findActiveAccess(r, h, resource, requiredScopes, now);
+    const key = `${resource}\n${h}`;
+    let a = heldAccess(g, key, now);
+    if (!a) { a = oauthNow.findActiveAccess(r, h, resource, [], now); fillAccess(g, key, a); }
+    return scoped(a, requiredScopes);
+  };
+  const findActiveAccess: OAuthStore["findActiveAccess"] = async (r, h, resource, requiredScopes, now) => {
     sqliteOf(r);
     const g = authGeneration();
     if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(r, h, resource, requiredScopes, now);
     const key = `${resource}\n${h}`;
-    let a = g === accessGeneration ? accesses.get(key) : undefined;
-    if (!a || !(now < a.expiresAt && now < a.grantExpiresAt)) {
-      a = oauth.findActiveAccess(r, h, resource, [], now);
-      const kept = fills(g, accessGeneration, () => accesses.clear());
-      if (kept === g) { accessGeneration = g; if (a) accesses.set(key, a); else accesses.delete(key); }
-      if (!a) return undefined;
+    let a = heldAccess(g, key, now);
+    if (!a) {
+      a = await oauth.findActiveAccess(r, h, resource, [], now);
+      await testPauseAsync("auth:access:read");
+      fillAccess(g, key, a);
     }
-    const held = a;
-    return requiredScopes.every(s => held.scopes.includes(s)) ? held : undefined;
+    return scoped(a, requiredScopes);
   };
   return {
     now: clock,
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
     read: sqliteRead(db),
-    authRead<T>(fn: () => Sync<T>): T {
-      if (pinned() !== undefined || ownsTx(db)) return fn() as T;
+    async authRead<T>(fn: () => T | Promise<T>): Promise<T> {
+      if (pinned() !== undefined || ownsTx(db)) return fn();
       const g = readGeneration();
-      if (g === undefined) return fn() as T;
+      if (g === undefined) return fn();
       const p = { g, live: true };
-      try { return pin.run(p, fn) as T; } finally { p.live = false; }
+      try { return await pin.run(p, fn); } finally { p.live = false; }
+    },
+    authNow: {
+      read<T>(fn: () => Sync<T>): T {
+        if (pinned() !== undefined || ownsTx(db)) return fn() as T;
+        const g = readGeneration();
+        if (g === undefined) return fn() as T;
+        const p = { g, live: true };
+        try { return pin.run(p, fn) as T; } finally { p.live = false; }
+      },
+      findActiveAccess: findActiveAccessNow,
+      isGrantActive: oauthNow.isGrantActive,
     },
     authGeneration,
 
@@ -1676,7 +1713,8 @@ function insertSession(db: Database, userId: number, tokenHash: string, label: s
 // The OAuth store over its handle (#807 P1c-8): each method runs its statements on the connection its `Tx` or `Read`
 // names (sqliteOf refuses a settled Tx). The hosted sessions a revoked grant or disabled user ends go through the
 // hosted store bound to that same connection (P1c-11).
-function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
+// `now`: the two auth hot-path reads in synchronous form, for Repo.authNow (#807 P3 A7c).
+function makeOAuthStore(hosted: HostedStoreOf): { store: OAuthStore; now: Pick<Repo["authNow"], "findActiveAccess" | "isGrantActive"> } {
   const ops = new WeakMap<Database, OAuthOps>();
   const on = (h: Read): OAuthOps => {
     const db = sqliteOf(h);
@@ -1684,7 +1722,11 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     if (!o) ops.set(db, o = oauthOps(db, hosted));
     return o;
   };
-  return {
+  const now = {
+    findActiveAccess: (r: Read, ...a: Parameters<OAuthOps["findActiveAccess"]>) => on(r).findActiveAccess(...a),
+    isGrantActive: (r: Read, ...a: Parameters<OAuthOps["isGrantActive"]>) => on(r).isGrantActive(...a),
+  };
+  return { now, store: {
     createRequest: async (tx, ...a) => on(tx).createRequest(...a),
     findRequest: async (r, ...a) => on(r).findRequest(...a),
     bindRequestSession: async (tx, ...a) => on(tx).bindRequestSession(...a),
@@ -1698,11 +1740,11 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     findRefreshGrant: async (r, ...a) => on(r).findRefreshGrant(...a),
     rotateRefresh: async (tx, ...a) => on(tx).rotateRefresh(...a),
     revokeToken: async (tx, ...a) => on(tx).revokeToken(...a),
-    findActiveAccess: (r, ...a) => on(r).findActiveAccess(...a),
-    isGrantActive: (r, ...a) => on(r).isGrantActive(...a),
+    findActiveAccess: async (r, ...a) => now.findActiveAccess(r, ...a),
+    isGrantActive: async (r, ...a) => now.isGrantActive(r, ...a),
     revokePreBuiltinGrants: async (tx, ...a) => on(tx).revokePreBuiltinGrants(...a),
     cleanup: async (tx, ...a) => on(tx).cleanup(...a),
-  };
+  } };
 }
 
 // The store's methods without their handle, bound to one connection.

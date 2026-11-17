@@ -1,6 +1,7 @@
 // The auth cache's generation under a write body held open across an await (#996, #807 P1c-2): another task keys
 // its cache on committed state, never on the holder's uncommitted bump.
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import { sqliteOf, type Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { createHash } from "node:crypto";
 import { OAUTH_TTL, type OAuthAuthorization } from "./oauth-types.ts";
+import { hostedPause } from "../../tests/support/hosted-pause.ts";
 
 const open = (): Repo => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
 const gate = () => { let open!: () => void; const p = new Promise<void>(r => { open = r; }); return { p, open }; };
@@ -38,7 +40,7 @@ test("another task's generation stays the committed one while a holder's uncommi
   // Outside the holder's transaction: the committed generation, and the committed (enabled) user.
   expect(repo.authGeneration()).toBe(before);
   expect(repo.users.activeEmail(user.id)).toBe("a@example.com");
-  expect(repo.authRead(() => repo.authGeneration())).toBe(before);
+  expect(await repo.authRead(() => repo.authGeneration())).toBe(before);
   h.release();
   await h.done;
   expect(repo.authGeneration()).not.toBe(before);
@@ -77,7 +79,7 @@ test("a failed counter read leaves the generation undefined, never stale, until 
   const h = hold(repo, () => {});
   await h.wrote;
   expect(repo.authGeneration()).toBeUndefined();
-  expect(repo.authRead(() => repo.authGeneration())).toBeUndefined();
+  expect(await repo.authRead(() => repo.authGeneration())).toBeUndefined();
   h.release();
   await h.done;
   await repo.write(tx => { sqliteOf(tx).run("CREATE TEMP TABLE auth_generation(n INTEGER NOT NULL); INSERT INTO auth_generation(n) VALUES (7)"); });
@@ -124,10 +126,10 @@ test("work an authRead body starts reads afresh once the body is done: a disable
   const g0 = repo.authGeneration();
   const later = gate();
   // Boxed: authRead's body is synchronous until A7c; the continuation it starts runs after it, with its store.
-  const after = repo.authRead(() => {
+  const after = (await repo.authRead(() => {
     expect(repo.users.activeEmail(user.id)).toBe("p@example.com"); // fills the user cache at g0
     return { seen: later.p.then(() => ({ g: repo.authGeneration(), email: repo.users.activeEmail(user.id) })) };
-  }).seen;
+  })).seen;
   await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
   later.open();
   const seen = await after;
@@ -135,7 +137,7 @@ test("work an authRead body starts reads afresh once the body is done: a disable
   expect(seen.email).toBeUndefined();
 });
 
-test("work an authRead body starts reads afresh once the body is done: a revoked token isn't served from the cache", async () => {
+test("work an authRead body starts reads afresh once the body is done: a disabled user's token isn't served from the cache", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const user = await repo.write(tx => repo.users.upsertByEmail(tx, "p@example.com", null));
   // A disable revokes the user's grants and tokens too; the access cache must miss after it.
@@ -143,11 +145,73 @@ test("work an authRead body starts reads afresh once the body is done: a revoked
   const later = gate();
   const resource = "https://bus.example.com/mcp";
   const issued = await issueAccess(repo, user.id, resource, t);
-  const after = repo.authRead(() => {
-    expect(repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)).toBeDefined(); // fills the access cache
+  const after = (await repo.authRead(async () => {
+    expect(await repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)).toBeDefined(); // fills the access cache
     return { seen: later.p.then(() => repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)) };
-  }).seen;
+  })).seen;
   await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
   later.open();
   expect(await after).toBeUndefined();
+});
+
+// The access table reads under findActiveAccess's cache, counted.
+function accessReads() {
+  const query = spyOn(Database.prototype, "query");
+  return { count: () => query.mock.calls.filter(([sql]) => String(sql).includes("AS grant_expiry")).length, restore: () => query.mockRestore() };
+}
+
+// #807 P3 A7c: the async lookup's read can await, so a commit may land between the read and the fill. The fill is
+// keyed on the generation the lookup started under, which that commit moved: a token disabled mid-read is never
+// cached as live, and the next check reads it afresh and refuses.
+for (const end of ["disable", "revoke"] as const) test(`a ${end} committed while an access read is held is never cached: the next check refuses`, async () => {
+  const repo = open();
+  const user = await repo.write(tx => repo.users.upsertByEmail(tx, "r@example.com", null));
+  const t = repo.now();
+  const resource = "https://bus.example.com/mcp";
+  const issued = await issueAccess(repo, user.id, resource, t);
+  const g0 = repo.authGeneration();
+  const held = await hostedPause("auth:access:read",
+    () => repo.authRead(() => repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)),
+    () => repo.write(tx => end === "disable" ? repo.users.setDisabled(tx, user.id, true) : repo.oauth.revokeToken(tx, issued, "native", t)));
+  // The read ran before the end committed; its answer stands, linearized before it.
+  expect(held).toBeDefined();
+  expect(repo.authGeneration()).not.toBe(g0);
+  const reads = accessReads();
+  try {
+    expect(await repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)).toBeUndefined();
+    expect(reads.count()).toBe(1);
+  } finally { reads.restore(); }
+});
+
+// #807 P3 A7c: bodies pinned to different generations overlap across awaits. An older body's lookup bypasses the
+// cache a newer one keyed: it neither clears nor fills it, so the newer body's next lookup still hits.
+test("an older authRead body's lookup leaves a newer body's cache alone while both are open", async () => {
+  const repo = open();
+  const user = await repo.write(tx => repo.users.upsertByEmail(tx, "s@example.com", null));
+  const t = repo.now();
+  const resource = "https://bus.example.com/mcp", other = "https://other.example.com/mcp";
+  const issued = await issueAccess(repo, user.id, resource, t);
+  const older = gate(), newer = gate();
+  const g0 = repo.authGeneration();
+  const first = repo.authRead(async () => {
+    await older.p;
+    expect(repo.authGeneration()).toBe(g0);
+    await repo.oauth.findActiveAccess(repo.read, issued, other, [], t); // a miss under g0, after g1 keyed the cache
+    newer.open();
+  });
+  // Any auth-table commit moves the generation.
+  await repo.write(tx => repo.users.upsertByEmail(tx, "t@example.com", null));
+  const reads = accessReads();
+  try {
+    await repo.authRead(async () => {
+      expect(repo.authGeneration()).not.toBe(g0);
+      expect(await repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)).toBeDefined(); // fills at g1
+      older.open();
+      await newer.p;
+      expect(await repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)).toBeDefined();
+    });
+    await first;
+    // The newer body's fill, the older body's miss; the newer body's second lookup hit.
+    expect(reads.count()).toBe(2);
+  } finally { reads.restore(); }
 });

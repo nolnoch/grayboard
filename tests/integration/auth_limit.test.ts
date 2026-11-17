@@ -14,6 +14,7 @@ import { closeSessions } from "../support/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
 import { REFUSED_TOKEN_TTL_MS } from "../../src/server/auth_gate.ts";
+import { stubAuthRead } from "../support/auth_stub.ts";
 
 const A = "alice@example.com";
 const cleanup: (() => void)[] = [];
@@ -33,8 +34,7 @@ function serve(o: ConstructorParameters<typeof TestServer>[0] = {}) {
   const find = srv.app.repo.sessions.findByTokenHash.bind(srv.app.repo.sessions);
   srv.app.repo.sessions.findByTokenHash = (...a: Parameters<typeof find>) => (lookups++, find(...a));
   // The hosted MCP's access-token lookup too.
-  const access = srv.app.repo.oauth.findActiveAccess.bind(srv.app.repo.oauth);
-  srv.app.repo.oauth.findActiveAccess = (...a: Parameters<typeof access>) => (lookups++, access(...a));
+  const restoreFindActiveAccess = stubAuthRead(srv.app.repo, "findActiveAccess", access => (...a) => (lookups++, access(...a)));
   return { srv, clock, lookups: () => lookups };
 }
 

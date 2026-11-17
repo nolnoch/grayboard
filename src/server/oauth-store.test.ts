@@ -86,8 +86,8 @@ describe("OAuth domain store", () => {
     // connections would block the one JS thread on busy_timeout. The overlapping case is the two-process test.
     const results = [await w1(tx => first.repo.oauth.redeemCode(tx, input, start)), await w2(tx => second.repo.oauth.redeemCode(tx, { ...input, grantId: "grant_2222222222222222", tokens: pair() }, start))];
     expect(results.map(r => r.status).sort()).toEqual(["ok", "replay"]);
-    expect(first.repo.oauth.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start)).toBeUndefined();
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
+    expect(await first.repo.oauth.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start)).toBeUndefined();
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
   });
   test("forced overlapping refresh transactions cannot mint two live successors", async () => {
     const input = await issue();
@@ -101,12 +101,12 @@ describe("OAuth domain store", () => {
       await workers[0]!.wait("test pause hit: oauth:refresh:in-txn");
       workers[1]!.proc.stdin.end();
       await workers[1]!.wait("ROTATING");
-      expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
+      expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
       await Bun.write(release, "release");
       await Promise.all(workers.map(async w => { expect(await w.proc.exited).toBe(0); await w.done; }));
       expect(workers.map(w => JSON.parse(w.output().trim().split("\n").at(-1)!).status).sort()).toEqual(["ok", "replay"]);
-      expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
-      for (const replacement of replacements) expect(first.repo.oauth.findActiveAccess(first.repo.read, replacement.accessHash, binding.resource, binding.scopes, start + 1)).toBeUndefined();
+      expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
+      for (const replacement of replacements) expect(await first.repo.oauth.findActiveAccess(first.repo.read, replacement.accessHash, binding.resource, binding.scopes, start + 1)).toBeUndefined();
     } finally {
       await Bun.write(release, "release");
       for (const w of workers) { w.proc.kill(); await w.proc.exited; }
@@ -147,15 +147,15 @@ describe("OAuth domain store", () => {
     expect((await first.repo.oauth.findRefreshGrant(first.repo.read, input.tokens.refreshHash, binding.clientId, "wrong", start))).toBeUndefined();
     for (const change of [{ clientId: "foreign" }, { resource: "wrong" }, { scopes: ["grayboard:delivery"] }, { tokens: { ...next.tokens, resource: "wrong" } }, { tokens: { ...next.tokens, refreshHash: next.refreshHash } }]) {
       expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...next, ...change }, start + 1))).status).toBe("invalid");
-      expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
+      expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
     }
     expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, next, start + 1))).status).toBe("ok");
     const newest = { ...binding, refreshHash: next.tokens.refreshHash, tokens: pair(start + 2) };
     expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, newest, start + 2))).status).toBe("ok");
     expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...next, clientId: "foreign" }, start + 3))).status).toBe("invalid");
     expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...next, tokens: pair(start + 3) }, start + 3))).status).toBe("replay");
-    expect(second.repo.oauth.isGrantActive(second.repo.read, input.grantId, start + 3)).toBe(false);
-    for (const p of [input.tokens, next.tokens, newest.tokens]) expect(first.repo.oauth.findActiveAccess(first.repo.read, p.accessHash, binding.resource, [], start + 3)).toBeUndefined();
+    expect(await second.repo.oauth.isGrantActive(second.repo.read, input.grantId, start + 3)).toBe(false);
+    for (const p of [input.tokens, next.tokens, newest.tokens]) expect(await first.repo.oauth.findActiveAccess(first.repo.read, p.accessHash, binding.resource, [], start + 3)).toBeUndefined();
     expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: newest.tokens.refreshHash, tokens: pair(start + 4) }, start + 4))).status).toBe("invalid");
   });
   test("refresh failure rollback leaves current refresh live and no successor", async () => {
@@ -174,7 +174,7 @@ describe("OAuth domain store", () => {
     // connections would block the one JS thread on busy_timeout. The overlapping case is the two-process test.
     const results = [await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: a }, start + 1)), await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: b }, start + 1))];
     expect(results.map(r => r.status).sort()).toEqual(["ok", "replay"]);
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
   });
   test("revoke access is individual, refresh revokes grant, foreign/unknown inputs are inert", async () => {
     const input = await issue();
@@ -182,8 +182,8 @@ describe("OAuth domain store", () => {
     await w1(tx => o.revokeToken(tx, input.tokens.refreshHash, "foreign", start + 1));
     await w1(tx => o.revokeToken(tx, h("unknown"), binding.clientId, start + 1));
     await w1(tx => o.revokeToken(tx, input.tokens.accessHash, binding.clientId, start + 1));
-    expect(o.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
-    expect(o.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
+    expect(await o.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
+    expect(await o.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
     const next = pair(start + 1);
     expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: next }, start + 1))).status).toBe("ok");
     await w1(tx => o.revokeToken(tx, input.tokens.refreshHash, binding.clientId, start + 2));
@@ -194,28 +194,28 @@ describe("OAuth domain store", () => {
     const input = await issue();
     await w1(tx => first.repo.oauth.revokeToken(tx, input.tokens.refreshHash, binding.clientId, start + 1));
     expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: pair(start + 1) }, start + 1))).status).toBe("invalid");
-    expect(second.repo.oauth.isGrantActive(second.repo.read, input.grantId, start + 1)).toBe(false);
+    expect(await second.repo.oauth.isGrantActive(second.repo.read, input.grantId, start + 1)).toBe(false);
   });
   test("access verifies resource, scopes, user, expiry; disable/reenable cannot resurrect", async () => {
     const input = await issue();
     const o = first.repo.oauth;
-    expect(o.findActiveAccess(first.repo.read, input.tokens.accessHash, "wrong", [], start)).toBeUndefined();
-    expect(o.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, ["grayboard:delivery"], start)).toBeUndefined();
-    expect(o.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, [], input.tokens.accessExpiresAt)).toBeUndefined();
+    expect(await o.findActiveAccess(first.repo.read, input.tokens.accessHash, "wrong", [], start)).toBeUndefined();
+    expect(await o.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, ["grayboard:delivery"], start)).toBeUndefined();
+    expect(await o.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, [], input.tokens.accessExpiresAt)).toBeUndefined();
     await w1(tx => first.repo.users.setDisabled(tx, userId, true));
     expect((await o.findBrowserSession(first.repo.read, sessionHash, start))).toBeUndefined();
-    expect(o.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
+    expect(await o.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
     await w1(tx => first.repo.users.setDisabled(tx, userId, false));
-    expect(o.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
+    expect(await o.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
   });
   test("admin revoke-all includes OAuth; single old-session logout and browser logout do not", async () => {
     const input = await issue();
     const s = await seed(first.repo, tx => first.repo.sessions.create(tx, userId, "old-hash", null));
     await seed(first.repo, tx => first.repo.sessions.revoke(tx, s.id));
     await w1(tx => first.repo.oauth.revokeBrowserSession(tx, sessionHash));
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(true);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(true);
     await seed(first.repo, tx => first.repo.sessions.revokeAllForUser(tx, userId));
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
   });
   test("expiry caps, cleanup and retained spent refresh tombstones", async () => {
     const input = await issue();
@@ -240,7 +240,7 @@ describe("OAuth domain store", () => {
     if (result.status !== "ok") throw new Error("rotation failed");
     expect(result.value.tokens.accessExpiresAt).toBe(input.grantExpiresAt);
     expect(result.value.tokens.refreshExpiresAt).toBe(input.grantExpiresAt);
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, input.grantExpiresAt)).toBe(false);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, input.grantExpiresAt)).toBe(false);
   });
   test("state/session/code expiry boundaries and canonical scopes are enforced", async () => {
     expect((await w1(tx => first.repo.oauth.createRequest(tx, { ...request, scopes: ["z", "a"] }, start))).status).toBe("invalid");
@@ -278,7 +278,7 @@ describe("OAuth domain store", () => {
     const input = await issue();
     second.db.close();
     second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
-    expect(second.repo.oauth.findActiveAccess(second.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start)?.userId).toBe(userId);
+    expect((await second.repo.oauth.findActiveAccess(second.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start))?.userId).toBe(userId);
     const serialized = JSON.stringify(first.db.query("SELECT * FROM oauth_tokens").all());
     expect(serialized).toContain(input.tokens.refreshHash);
     expect(serialized).not.toContain(`refresh-${serial}\"`);
@@ -305,8 +305,8 @@ describe("OAuth domain store", () => {
     const codes = await race("redeemCode", [input, { ...input, grantId: "grant_second_22222222", tokens: pair() }]);
     expect(codes.map(r => r.status).sort()).toEqual(["ok", "replay"]);
     const codeWinner = codes.find(r => r.status === "ok").value;
-    expect(first.repo.oauth.isGrantActive(first.repo.read, codeWinner.grant.id, start + 1)).toBe(false);
-    expect(first.repo.oauth.findActiveAccess(first.repo.read, codeWinner.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, codeWinner.grant.id, start + 1)).toBe(false);
+    expect(await first.repo.oauth.findActiveAccess(first.repo.read, codeWinner.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
     expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: codeWinner.tokens.refreshHash, tokens: pair(start + 1) }, start + 1))).status).toBe("invalid");
     request = { ...request, requestHash: h("second-request") };
     code = { ...code, codeHash: h("second-code") };
@@ -320,7 +320,7 @@ describe("OAuth domain store", () => {
       { ...binding, refreshHash: winner.tokens.refreshHash, tokens: pair(start + 1) },
     ]);
     expect(rotations.map(r => r.status).sort()).toEqual(["ok", "replay"]);
-    expect(first.repo.oauth.isGrantActive(first.repo.read, winner.grant.id, start + 1)).toBe(false);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, winner.grant.id, start + 1)).toBe(false);
   });
   test("consent insert failure rolls back one-use request", async () => {
     await w1(tx => first.repo.oauth.createRequest(tx, request, start));
@@ -355,21 +355,21 @@ describe("OAuth domain store", () => {
     if (result.status !== "ok") throw new Error("narrow rotation failed");
     expect(result.value.grant.scopes).toEqual(full);
     expect(result.value.tokens.scopes).toEqual(["grayboard:tools"]);
-    expect(first.repo.oauth.findActiveAccess(first.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:delivery"], start + 1)).toBeUndefined();
-    expect(first.repo.oauth.findActiveAccess(first.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:tools"], start + 1)?.scopes).toEqual(["grayboard:tools"]);
+    expect(await first.repo.oauth.findActiveAccess(first.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:delivery"], start + 1)).toBeUndefined();
+    expect((await first.repo.oauth.findActiveAccess(first.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:tools"], start + 1))?.scopes).toEqual(["grayboard:tools"]);
     const original = (await first.repo.oauth.findRefreshGrant(first.repo.read, narrow.tokens.refreshHash, binding.clientId, binding.resource, start + 2))!;
     expect(original.scopes).toEqual(full);
     const other = { ...pair(start + 2), scopes: ["grayboard:delivery"] };
     expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, scopes: other.scopes, refreshHash: narrow.tokens.refreshHash, tokens: other }, start + 2))).status).toBe("ok");
-    expect(first.repo.oauth.findActiveAccess(first.repo.read, other.accessHash, binding.resource, ["grayboard:tools"], start + 2)).toBeUndefined();
+    expect(await first.repo.oauth.findActiveAccess(first.repo.read, other.accessHash, binding.resource, ["grayboard:tools"], start + 2)).toBeUndefined();
     // A service resolves an omitted scope from the full original refresh authorization.
     const defaults = (await first.repo.oauth.findRefreshGrant(first.repo.read, other.refreshHash, binding.clientId, binding.resource, start + 3))!;
     const restored = { ...pair(start + 3), scopes: defaults.scopes };
     expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...defaults, refreshHash: other.refreshHash, tokens: restored }, start + 3))).status).toBe("ok");
-    expect(first.repo.oauth.findActiveAccess(first.repo.read, restored.accessHash, binding.resource, full, start + 3)?.scopes).toEqual(full);
+    expect((await first.repo.oauth.findActiveAccess(first.repo.read, restored.accessHash, binding.resource, full, start + 3))?.scopes).toEqual(full);
     second.db.close();
     second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
-    expect(second.repo.oauth.findActiveAccess(second.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:delivery"], start + 3)).toBeUndefined();
+    expect(await second.repo.oauth.findActiveAccess(second.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:delivery"], start + 3)).toBeUndefined();
     expect((await second.repo.oauth.findRefreshGrant(second.repo.read, restored.refreshHash, binding.clientId, binding.resource, start + 3))?.scopes).toEqual(full);
   });
   test("code replay validates every binding before committing family revocation", async () => {
@@ -377,10 +377,10 @@ describe("OAuth domain store", () => {
     for (const changed of [{ clientId: "foreign" }, { resource: "wrong" }, { scopes: ["grayboard:delivery"] },
       { redirectUri: "https://evil.example/cb" }, { codeChallenge: "B".repeat(43) }, { codeHash: h("unknown") }]) {
       expect((await w2(tx => second.repo.oauth.redeemCode(tx, { ...input, ...changed }, start + 1))).status).not.toBe("ok");
-      expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
+      expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
     }
     expect((await w2(tx => second.repo.oauth.redeemCode(tx, input, start + 1))).status).toBe("replay");
-    expect(first.repo.oauth.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
+    expect(await first.repo.oauth.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
     expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: pair(start + 1) }, start + 1))).status).toBe("invalid");
   });
   test("spent code tombstones survive expiry, reopen, disable/admin revoke and cleanup until family cap", async () => {
@@ -406,7 +406,7 @@ describe("OAuth domain store", () => {
     first.db.exec("ALTER TABLE oauth_codes DROP COLUMN grant_id");
     first.db.exec("ALTER TABLE oauth_tokens DROP COLUMN access_scopes");
     second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
-    expect(second.repo.oauth.findActiveAccess(second.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start)?.scopes).toEqual(binding.scopes);
+    expect((await second.repo.oauth.findActiveAccess(second.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start))?.scopes).toEqual(binding.scopes);
     expect(second.db.query("SELECT access_scopes FROM oauth_tokens WHERE hash = ?").get(input.tokens.accessHash)).toEqual({ access_scopes: null });
     expect(second.db.query("PRAGMA table_info(oauth_codes)").all().some((c: any) => c.name === "grant_id")).toBe(true);
     expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: pair(start + 1) }, start + 1))).status).toBe("ok");
@@ -425,11 +425,11 @@ describe("OAuth domain store", () => {
     first.db.exec("CREATE TRIGGER fail_replay BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT, 'replay failure'); END");
     await expect(w2(tx => second.repo.oauth.redeemCode(tx, input, start + 2))).rejects.toThrow("replay failure");
     await expect(w2(tx => second.repo.oauth.rotateRefresh(tx, { ...next, tokens: pair(start + 2) }, start + 2))).rejects.toThrow("replay failure");
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 2)).toBe(true);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 2)).toBe(true);
     first.db.exec("DROP TRIGGER fail_replay");
     expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...next, tokens: pair(start + 2) }, start + 2))).status).toBe("replay");
     expect((await w2(tx => second.repo.oauth.redeemCode(tx, input, start + 2))).status).toBe("replay");
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 2)).toBe(false);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 2)).toBe(false);
     expect((await w2(tx => second.repo.oauth.redeemCode(tx, input, start + 2))).status).toBe("replay");
   });
   test("foreign writer contention fails closed in bounded time and retry succeeds after release", async () => {
@@ -450,7 +450,7 @@ describe("OAuth domain store", () => {
       const elapsed = performance.now() - began;
       expect(elapsed).toBeGreaterThanOrEqual(200);
       expect(elapsed).toBeLessThan(1000);
-      expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
+      expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
       expect(await child.exited).toBe(0);
       expect(await new Response(child.stderr).text()).toBe("");
       expect((await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: pair(start + 1) }, start + 1))).status).toBe("ok");
@@ -464,7 +464,7 @@ describe("OAuth domain store", () => {
     const input = await issue();
     first.db.exec("CREATE TRIGGER fail_revoke BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT, 'storage failure'); END");
     await expect(w1(tx => first.repo.oauth.revokeToken(tx, input.tokens.refreshHash, binding.clientId, start))).rejects.toThrow("storage failure");
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(true);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(true);
     await expect(seed(first.repo, tx => first.repo.sessions.revokeAllForUser(tx, userId))).rejects.toThrow("storage failure");
     await expect(w1(tx => first.repo.users.setDisabled(tx, userId, true))).rejects.toThrow("storage failure");
     expect(first.repo.users.findById(userId)?.disabled_at).toBeNull();
@@ -483,7 +483,7 @@ describe("OAuth domain store", () => {
     expect(await w1(tx => first.repo.oauth.redeemCode(tx, loser, start))).toEqual({ status: "replay" });
     first.db.exec("DROP TRIGGER steal");
     expect(first.db.query("SELECT id FROM oauth_grants").all()).toEqual([{ id: winner.grantId }]);
-    expect(first.repo.oauth.isGrantActive(first.repo.read, winner.grantId, start)).toBe(false);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, winner.grantId, start)).toBe(false);
     expect(auditCount("oauth.code_replay_revoked")).toBe(1);
     expect(auditCount("oauth.grant_issued")).toBe(1);
   });
@@ -521,7 +521,7 @@ describe("OAuth domain store", () => {
     expect(await rotate(revoked)).toEqual({ status: "invalid" });
     first.db.exec("DROP TRIGGER revoke_presented");
     absent(revoked);
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
     await w1(() => { first.db.run("UPDATE oauth_tokens SET revoked_at = NULL WHERE hash = ?", [presented]); });
     first.db.exec(`CREATE TRIGGER expire_presented AFTER INSERT ON oauth_tokens WHEN NEW.kind = 'refresh' BEGIN
       UPDATE oauth_tokens SET expires_at = ${start} WHERE hash = '${presented}'; END`);
@@ -536,7 +536,7 @@ describe("OAuth domain store", () => {
     expect(await rotate(loser)).toEqual({ status: "replay" });
     first.db.exec("DROP TRIGGER steal");
     absent(loser);
-    expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
     expect(auditCount("oauth.refresh_replay_revoked")).toBe(1);
     expect(auditCount("oauth.refreshed")).toBe(0);
   });

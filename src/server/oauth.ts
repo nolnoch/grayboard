@@ -619,13 +619,35 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // A live access token and its user's email, by hash. Both reads are cached in the Repo on
   // authGeneration (#853), so the hot path skips the token-grant-user join, and share one read of it (#881).
   // `r`: the Tx of the body the check runs in (hosted's in-body checks, #998), read uncached; else the pool.
-  function activeAccess(accessHash: string, r: Read = repo.read): { access: OAuthAccess; email: string } | undefined {
-    return repo.authRead(() => {
-      const access = repo.oauth.findActiveAccess(r, accessHash, resource, [], now());
-      if (!access) return undefined;
-      const email = repo.users.activeEmail(access.userId);
-      return email === undefined ? undefined : { access, email };
-    });
+  function activeAccess(accessHash: string, r: Read = repo.read): Promise<{ access: OAuthAccess; email: string } | undefined> {
+    return repo.authRead(async () => withEmail(await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
+  }
+  // The synchronous form, for the hosted MCP callers that stay synchronous until #807 P3 A7d (Repo.authNow).
+  function activeAccessNow(accessHash: string, r: Read = repo.read): { access: OAuthAccess; email: string } | undefined {
+    return repo.authNow.read(() => withEmail(repo.authNow.findActiveAccess(r, accessHash, resource, [], now())));
+  }
+  function withEmail(access: OAuthAccess | undefined): { access: OAuthAccess; email: string } | undefined {
+    if (!access) return undefined;
+    const email = repo.users.activeEmail(access.userId);
+    return email === undefined ? undefined : { access, email };
+  }
+  // A bearer header's token hash, or the refusal; the access lookup is the caller's, sync or async.
+  function bearer(req: Request, requiredScopes: string[]): string | Response {
+    if (requiredScopes.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s))) throw new Error("unknown required OAuth scope");
+    const u = new URL(req.url), auth = req.headers.get("authorization");
+    if (closed) return bearerError(401, "invalid_token", requiredScopes);
+    if (u.searchParams.has("access_token") || !auth || !/^Bearer [A-Za-z0-9_-]{43}$/i.test(auth)) return bearerError(401, auth ? "invalid_token" : undefined, requiredScopes);
+    return hashToken(auth.slice(7));
+  }
+  function principalOf(found: { access: OAuthAccess; email: string } | undefined, accessHash: string, requiredScopes: string[]): OAuthPrincipal | Response {
+    if (!found) return bearerError(401, "invalid_token", requiredScopes);
+    const { access, email } = found;
+    if (!requiredScopes.every(s => access.scopes.includes(s))) return bearerError(403, "insufficient_scope", requiredScopes);
+    return { authed: { user_id: access.userId, user_email: email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
+      sourceKey: sourceKeyFor(access.clientId, clients), scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
+  }
+  function authorizedBy(principal: OAuthPrincipal, a: OAuthAccess | undefined): boolean {
+    return !!a && principal.scopes.every(s => a.scopes.includes(s)) && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
   }
   return {
     // Settles once the startup revocations above have committed; the server serves nothing before it.
@@ -642,24 +664,30 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       }
     },
     // `r`: as activeAccess's, for a check inside a body (the hosted byte routes' guard, #1053).
-    authenticate(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): OAuthPrincipal | Response {
-      if (requiredScopes.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s))) throw new Error("unknown required OAuth scope");
-      const u = new URL(req.url), auth = req.headers.get("authorization");
+    async authenticate(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): Promise<OAuthPrincipal | Response> {
+      const accessHash = bearer(req, requiredScopes);
+      if (accessHash instanceof Response) return accessHash;
+      const access = await activeAccess(accessHash, r);
+      // Closed while the read awaited: refused as bearer() refuses before it.
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
-      if (u.searchParams.has("access_token") || !auth || !/^Bearer [A-Za-z0-9_-]{43}$/i.test(auth)) return bearerError(401, auth ? "invalid_token" : undefined, requiredScopes);
-      const accessHash = hashToken(auth.slice(7));
-      const found = activeAccess(accessHash, r);
-      if (!found) return bearerError(401, "invalid_token", requiredScopes);
-      const { access, email } = found;
-      if (!requiredScopes.every(s => access.scopes.includes(s))) return bearerError(403, "insufficient_scope", requiredScopes);
-      return { authed: { user_id: access.userId, user_email: email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
-        sourceKey: sourceKeyFor(access.clientId, clients), scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
+      return principalOf(access, accessHash, requiredScopes);
     },
-    isGrantActive(grantId: string): boolean { return !closed && repo.oauth.isGrantActive(repo.read, grantId, now()); },
-    isAuthorized(principal: OAuthPrincipal, r?: Read): boolean {
+    // authenticate's synchronous form, until #807 P3 A7d (activeAccessNow).
+    authenticateNow(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): OAuthPrincipal | Response {
+      const accessHash = bearer(req, requiredScopes);
+      if (accessHash instanceof Response) return accessHash;
+      return principalOf(activeAccessNow(accessHash, r), accessHash, requiredScopes);
+    },
+    async isGrantActive(grantId: string): Promise<boolean> { return !closed && await repo.oauth.isGrantActive(repo.read, grantId, now()) && !closed; },
+    isGrantActiveNow(grantId: string): boolean { return !closed && repo.authNow.isGrantActive(repo.read, grantId, now()); },
+    async isAuthorized(principal: OAuthPrincipal, r?: Read): Promise<boolean> {
       if (closed || principal.accessExpiry <= now()) return false;
-      const a = activeAccess(principal.accessHash, r)?.access;
-      return !!a && principal.scopes.every(s => a.scopes.includes(s)) && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;
+      const a = (await activeAccess(principal.accessHash, r))?.access;
+      return !closed && authorizedBy(principal, a);
+    },
+    isAuthorizedNow(principal: OAuthPrincipal, r?: Read): boolean {
+      if (closed || principal.accessExpiry <= now()) return false;
+      return authorizedBy(principal, activeAccessNow(principal.accessHash, r)?.access);
     },
     close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); },
   };

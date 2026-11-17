@@ -407,13 +407,13 @@ try {
     await rpc.enroll({ sessionID: s.id, name: "refresh", create: true }, { location });
     await wait(() => app.mcp.activeLeases, n => n === 1, "native refresh initial lease");
     const before = await ctx.integration.connection.resolve(selected); assert(before?.type === "oauth");
-    const principal = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } })); assert(!(principal instanceof Response));
+    const principal = await app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } })); assert(!(principal instanceof Response));
     await app.repo.write(tx => app.repo.oauth.revokeToken(tx, principal.accessHash, OPENCODE_CLIENT, Date.now()));
     await invoke(s.id, "whoami", {});
     await wait(() => refreshes, n => n === 1, "native MCP refresh after revoked access");
     const current = await ctx.integration.connection.resolve(selected); assert(current?.type === "oauth"); assert.notEqual(current.access, before.access);
-    assert(app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } })) instanceof Response);
-    const renewed = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + current.access } })); assert(!(renewed instanceof Response)); assert.equal(renewed.grantId, principal.grantId);
+    assert((await app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } }))) instanceof Response);
+    const renewed = await app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + current.access } })); assert(!(renewed instanceof Response)); assert.equal(renewed.grantId, principal.grantId);
     await rpc.enroll({ sessionID: s.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "same current native grant reopens receiving");
     const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/refresh", "Fresh native access after native-owned refresh", null, false)); app.application.wake(["you@example.com/refresh"]);
     await wait(() => app.repo.cursors.directFor(app.repo.read, "you@example.com/refresh"), n => n === message.id, "subscriber uses only fresh projected native access");
@@ -766,7 +766,7 @@ try {
   const stale = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/r4", "Old issued batch across native rebind", null, false)); app.application.wake(["you@example.com/r4"]);
   await staleEntered; const oldAdmission = admissions.at(-1)!, staleReceipts = receiptAttempts;
   const grant = await ctx.integration.connection.resolve(selected); assert(grant?.type === "oauth");
-  const principal = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
+  const principal = await app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
   await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": a.id }), { name: "final", create: true });
   held = false; release?.();
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "out-of-band real service rebind observed after old host admission");

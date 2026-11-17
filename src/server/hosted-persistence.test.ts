@@ -26,7 +26,7 @@ const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCO
 async function open() {
   database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
   application = createApplication(database.repo);
-  const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.oauth.isGrantActive(r, p.grantId, now);
+  const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.authNow.isGrantActive(r, p.grantId, now);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized });
 }
@@ -333,7 +333,7 @@ test("opening a pre-hosted SQLite schema adds tables without changing users, mes
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
   await close(); await open();
   expect(database.repo.aliases.listForScope(database.repo.read, "person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
-  expect(database.repo.oauth.isGrantActive(database.repo.read, first.grantId, now)).toBe(true);
+  expect(await database.repo.oauth.isGrantActive(database.repo.read, first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
   expect(hostedRowCount(database.db)).toBe(0);
   await hosted.bind(first.principal, context(first.principal), { name: "fe" });

@@ -10,6 +10,7 @@ import { hashToken } from "../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { randomBytes } from "node:crypto";
 import { sessionContext } from "../../src/server/hosted.ts";
+import { stubAuthRead } from "../support/auth_stub.ts";
 
 let srv: TestServer, app: TestServer["app"], base: string, clock: number;
 const clients: Client[] = [];
@@ -41,7 +42,7 @@ async function until(predicate: () => boolean) {
 }
 async function connect(token: string, version: string, role?: string, identity = "be") {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
-  const principal = app.oauth.authenticate(new Request(base + "/mcp", { headers }));
+  const principal = await app.oauth.authenticate(new Request(base + "/mcp", { headers }));
   if (principal instanceof Response) throw new Error("fixture authentication failed");
   const routing = sessionContext(principal, { "ai.opencode/sessionID": identity });
   const current = await app.mcp.sessions.whoami(principal, routing);
@@ -335,10 +336,9 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membershi
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
   await watch(c, boardUri);
   await until(() => app.mcp.activeWatches === 1);
-  const original = app.repo.oauth.findActiveAccess;
-  app.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM private_database"); };
+  const restoreFindActiveAccess = stubAuthRead(app.repo, "findActiveAccess", original => () => { throw new Error("SELECT secret FROM private_database"); });
   try { await until(() => app.mcp.activeWatches === 0); }
-  finally { app.repo.oauth.findActiveAccess = original; }
+  finally { restoreFindActiveAccess(); }
   expect(app.mcp.activeLeases).toBe(0);
   expect(await app.repo.cursors.directFor(app.repo.read, "alice@example.com/be")).toBe(0);
 });

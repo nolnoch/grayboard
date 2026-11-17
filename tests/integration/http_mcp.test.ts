@@ -9,6 +9,7 @@ import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-c
 import { GRAYBOARD_LAUNCHER_META } from "../../src/shared/session_meta.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { seed } from "../support/seed.ts";
+import { stubAuthRead } from "../support/auth_stub.ts";
 
 let srv: TestServer;
 let app: TestServer["app"];
@@ -321,7 +322,7 @@ test("shutdown closes MCP before OAuth and refuses subsequent authentication", a
   await app.stop();
   expect(closed).toBe(true);
   expect((await app.mcp.fetch(new Request(base + "/mcp"))).status).toBe(503);
-  const auth = app.oauth.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  const auth = await app.oauth.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
   expect(auth).toBeInstanceOf(Response);
   expect((auth as Response).status).toBe(401);
   app.oauth.close = original;
@@ -333,10 +334,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
   let boundary!: () => void;
   const authenticated = new Promise<void>(resolve => { boundary = resolve; });
   let checks = 0;
-  app.oauth.authenticate = (...args) => {
+  app.oauth.authenticate = async (...args) => {
     if (args[0].headers.get("Authorization") !== `Bearer ${issued.token}`) return original(...args);
     if (++checks === 2 && failure === "storage") throw new Error("SELECT secret FROM /private/oauth.sqlite");
-    const result = original(...args);
+    const result = await original(...args);
     if (checks === 1) { expect(result).not.toBeInstanceOf(Response); boundary(); }
     return result;
   };
@@ -370,14 +371,13 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
 
 test("production MCP storage errors are generic 500s, not invalid-token guesses", async () => {
   const token = await login();
-  const original = app.repo.oauth.findActiveAccess;
-  app.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); };
+  const restoreFindActiveAccess = stubAuthRead(app.repo, "findActiveAccess", original => () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); });
   try {
     const response = await fetch(`${base}/mcp`, { headers: { Authorization: `Bearer ${token}` } });
     expect(response.status).toBe(500);
     expect(response.headers.has("WWW-Authenticate")).toBe(false);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
-  } finally { app.repo.oauth.findActiveAccess = original; }
+  } finally { restoreFindActiveAccess(); }
   expect(app.repo.aliases.find(app.repo.read, "alice@example.com/unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });

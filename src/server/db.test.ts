@@ -77,7 +77,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
     expect((await reopened.repo.sessions.findByTokenHash(reopened.repo.read, "old-session-hash"))?.id).toBe(session.id);
     expect(reopened.repo.aliases.listForScope(reopened.repo.read, "person", user.email).map(i => i.name)).toEqual(["fe"]);
     expect(reopened.repo.messages.history(reopened.repo.read, ["you@example.com/fe"])[0]?.body).toBe("preserved");
-    expect(reopened.repo.oauth.isGrantActive(reopened.repo.read, "missing", Date.now())).toBe(false);
+    expect(await reopened.repo.oauth.isGrantActive(reopened.repo.read, "missing", Date.now())).toBe(false);
     expect(reopened.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'oauth_%'").all()).toHaveLength(5);
   } finally {
     reopened.db.close();
@@ -752,20 +752,20 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   await expect(o.findBrowserSession(kept, "s", 1)).rejects.toThrow(settled);
   await expect(o.findCodeScopes(kept, "c", "c", "r", "u", 1)).rejects.toThrow(settled);
   await expect(o.findRefreshGrant(kept, "h", "c", "r", 1)).rejects.toThrow(settled);
-  expect(() => o.findActiveAccess(kept, "h", "r", [], 1)).toThrow(settled);
-  expect(() => o.isGrantActive(kept, "g", 1)).toThrow(settled);
+  await expect(o.findActiveAccess(kept, "h", "r", [], 1)).rejects.toThrow(settled);
+  await expect(o.isGrantActive(kept, "g", 1)).rejects.toThrow(settled);
   await expect(o.revokeToken({} as Tx, "t", "c", 1)).rejects.toThrow("not a SQLite store handle");
   expect(notices).toBe(0);
   await seed(repo, tx => o.revokeToken(tx, "t", "c", 1));
   expect(notices).toBe(1);
   unsubscribe();
-  expect(o.isGrantActive(repo.read, "g", 1)).toBe(false);
+  expect(await o.isGrantActive(repo.read, "g", 1)).toBe(false);
   // A warm access cache still resolves the handle first.
   const issued = await issueOAuth(repo, "https://grayboard.example.com/mcp");
   const live = () => o.findActiveAccess(repo.read, hashToken(issued.token), issued.binding.resource, [], issued.now);
-  expect(live()).toBeDefined();
-  expect(live()).toBeDefined();
-  expect(() => o.findActiveAccess(kept, hashToken(issued.token), issued.binding.resource, [], issued.now)).toThrow(settled);
+  expect(await live()).toBeDefined();
+  expect(await live()).toBeDefined();
+  await expect(o.findActiveAccess(kept, hashToken(issued.token), issued.binding.resource, [], issued.now)).rejects.toThrow(settled);
 });
 
 // #807 P1c-9: the Slack store runs on the handle it's given, as P1c-6's sessions do.

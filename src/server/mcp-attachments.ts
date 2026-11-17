@@ -18,7 +18,7 @@ const privateResponse = (response: Response) => {
   return response;
 };
 
-export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
+export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "authenticateNow" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
   const origin = new URL(opts.trustedOrigin).origin;
   const paths = new Set(["/mcp/attachments", `${new URL(oauth.resource).pathname}/attachments`]);
   const pending = new Set<Promise<Response>>();
@@ -29,7 +29,7 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
     try {
       if (closed) return error("unavailable", "server closing", 503);
       if (!permitsOrigin(req.headers.get("Origin"), origin)) return error("forbidden", "invalid origin", 403);
-      const principal = oauth.authenticate(req, ["grayboard:tools"]);
+      const principal = await oauth.authenticate(req, ["grayboard:tools"]);
       if (principal instanceof Response) return principal;
       if (pending.size >= 128) { countRefusal("attachment_requests"); return error("unavailable", "too many attachment requests", 503); }
       if (url.hash || url.search.length > 2048 || /%(?![0-9a-f]{2})/i.test(url.search)) return error("bad_request", "invalid query", 400);
@@ -62,9 +62,10 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
         selected.searchParams.delete("identity");
         selected.searchParams.set("as", session.identityFull);
         // Every read on `r`, the handle of the context it runs in: the pool here, a body's own Tx inside one (#1053).
+        // Synchronous: it runs inside transaction bodies, which are synchronous until #807 P3 A7d.
         const guard = (r: Read) => {
           if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
-          const current = oauth.authenticate(req, ["grayboard:tools"], r);
+          const current = oauth.authenticateNow(req, ["grayboard:tools"], r);
           if (current instanceof Response) throw new Refusal(current);
           bindingGuard(r);
           if (!repo.aliases.find(r, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
