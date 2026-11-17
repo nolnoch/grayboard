@@ -21,18 +21,56 @@ type Root = { text?: string; fresh: boolean; generation: number; fetching?: Prom
 export const DEADLINE_MS = 2_000;
 const EXECUTE_LINE = "    Use tools from this server through `execute` under `tools[";
 
-// `text` with every grayboard entry rebuilt around `current`, exactly as
-// OpenCode's `entries()` writes one: the frame and its codemode line kept,
-// each instruction line indented four spaces. That indentation is why server
-// text can never write the `  </server>` line that closes the frame.
+// The lines that open OpenCode's core/mcp-guidance segment: its initial render,
+// and each of its "changed" renders that lists entries (@opencode/core 2.1.4,
+// src/mcp/instructions.ts).
+const MCP_SEGMENT = new Set([
+  "<mcp_instructions>",
+  "The available MCP server instructions have changed. This list supersedes the previous one.",
+  "New MCP server instructions are available in addition to those previously listed:",
+  "The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:",
+]);
+
+// The [start, stop) lines of a part's MCP instructions. OpenCode joins its
+// instruction sources with a blank line, the code-mode catalog first and MCP
+// instructions next, ahead of references, skills and project instruction
+// files (#538). The segment holds no blank line: `entries()` indents every
+// instruction line, an empty one too. So it runs from the first opening line
+// that starts a segment to the next blank line, and a project file or skill
+// that quotes a grayboard entry later in the part is never rewritten. The
+// search stops at the first project file (core/instructions renders each as
+// `Instructions from: <path>`), so a part with no MCP instructions is left
+// alone even where a file quotes a whole segment.
+function mcpSegment(lines: string[]): [number, number] | undefined {
+  let start = -1;
+  for (let i = 0; i < lines.length && start < 0; i++) {
+    if (i > 0 && lines[i - 1] !== "") continue;
+    if (lines[i]!.startsWith("Instructions from: ")) return undefined;
+    if (MCP_SEGMENT.has(lines[i]!)) start = i;
+  }
+  if (start < 0) return undefined;
+  const stop = lines.indexOf("", start + 1);
+  return [start, stop < 0 ? lines.length : stop];
+}
+
+// `text` with every grayboard entry in its MCP instructions rebuilt around
+// `current`, exactly as OpenCode's `entries()` writes one: the frame and its
+// codemode line kept, each instruction line indented four spaces. That
+// indentation is why server text can never write the `  </server>` line that
+// closes the frame, or the blank line that ends the segment. An `mcpName`
+// naming another server's entry never gets here: enrollment needs that
+// entry's grant to carry both Grayboard scopes (binding.ts).
 export function rebuild(text: string, mcpName: string, current: string): { plan: Plan; text: string } {
   const open = `  <server name="${mcpName}">`, close = "  </server>";
   const lines = text.split("\n");
+  const segment = mcpSegment(lines);
+  if (!segment) return { plan: "none", text };
+  const [start, stop] = segment;
   const out: string[] = [];
   let plan: Plan = "none";
   for (let i = 0; i < lines.length; i++) {
-    const end = lines[i] === open ? lines.indexOf(close, i + 1) : -1;
-    if (end < 0) { out.push(lines[i]!); continue; }
+    const end = i >= start && i < stop && lines[i] === open ? lines.indexOf(close, i + 1) : -1;
+    if (end < 0 || end >= stop) { out.push(lines[i]!); continue; }
     plan = "replace";
     out.push(open);
     if (lines[i + 1]?.startsWith(EXECUTE_LINE)) out.push(lines[i + 1]!);

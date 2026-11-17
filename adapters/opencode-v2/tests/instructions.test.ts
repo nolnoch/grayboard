@@ -34,6 +34,30 @@ test("rebuild replaces only grayboard's entry, keeps its frame and codemode line
   expect(rebuild(render(unbound).replaceAll('"grayboard"', '"bus"'), "bus", bound).plan).toBe("replace");
 });
 
+// OpenCode joins its instruction sources with a blank line: code-mode catalog,
+// MCP instructions, then references, skills and project instruction files.
+test("rebuild rewrites only the MCP instructions segment, never a project file or skill that quotes an entry (#538)", () => {
+  const catalog = "# Code Mode\n\nUse the `execute` tool.\n\n## Available tools\n\n- grayboard (12 tools)\n  - board_read(...) // Read a board";
+  const quoted = render(unbound).replace(unbound, "Quoted from a project file.");
+  const file = `Instructions from: /repo/AGENTS.md\nAn example of OpenCode's prompt:\n\n${quoted}`;
+  const prompt = (text: string) => [catalog, render(text), "Skill: review", file].join("\n\n");
+  expect(rebuild(prompt(unbound), "grayboard", bound)).toEqual({ plan: "replace", text: prompt(bound) });
+  // An empty instruction line is indented, so it doesn't end the segment.
+  expect(rebuild(prompt(`${unbound}\n\nMore.`), "grayboard", bound).text).toBe(prompt(bound));
+  // No MCP instructions (none visible): a quoted entry is left alone, even one opening a segment.
+  const noMcp = [catalog, file].join("\n\n");
+  expect(rebuild(noMcp, "grayboard", bound)).toEqual({ plan: "none", text: noMcp });
+  // An opening line inside another source's paragraph doesn't start a segment.
+  const inline = `Instructions from: /repo/AGENTS.md\n${quoted}`;
+  expect(rebuild(inline, "grayboard", bound).plan).toBe("none");
+  // Each "changed" render that lists entries opens a segment; a later quoted file is still left alone.
+  const replaced = (text: string) => `The available MCP server instructions have changed. This list supersedes the previous one.\n${render(text)}`;
+  expect(rebuild([replaced(unbound), file].join("\n\n"), "grayboard", bound).text).toBe([replaced(bound), file].join("\n\n"));
+  const entry = (text: string) => ['  <server name="grayboard">', execute, `    ${text}`, "  </server>"].join("\n");
+  const added = (text: string) => `New MCP server instructions are available in addition to those previously listed:\n${entry(text)}`;
+  expect(rebuild([added(unbound), file].join("\n\n"), "grayboard", bound).text).toBe([added(bound), file].join("\n\n"));
+});
+
 test("rewrite rebuilds the system prompt and persisted instructions-changed system messages, keeps cache hints, and never rejects", async () => {
   const system = [{ type: "text" as const, text: "agent prompt" }, { type: "text" as const, text: render(unbound), cache: { type: "ephemeral" } }];
   const changed = `The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:\n  <server name="grayboard">\n${execute}\n    ${unbound}\n  </server>`;
