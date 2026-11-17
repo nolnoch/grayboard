@@ -42,8 +42,10 @@ export type HostedHarness = {
   delivered?(model: FakeModel, ping: number, name: string): void;
   // Waits until a second process may start on the same agent dir.
   beforeSecondStart?(dir: string): Promise<unknown>;
-  // The logout notice and the paused status land after the commands return, so the scenario waits for them instead of asserting at once.
-  signOutLags: boolean;
+  // The logout notice lands after the prompt command returns, so the scenario waits for it instead of asserting at once.
+  logoutNoticeLags: boolean;
+  // A root may sit in `retrying` until its next reopen meets the sign-out (#606), so the scenario waits for the paused status.
+  pauseLags: boolean;
 };
 
 export type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: StartOpts): Pi };
@@ -81,7 +83,10 @@ export function withHosted(h: HostedHarness, dir: string, rules: Rule[], run: (h
   });
 }
 
-const loginNotice = (h: HostedHarness) => `grayboard: Signed out of grayboard in ${h.name}; run /grayboard login`;
+// A declaration, not a const: pi.ts and omp.ts call it while loading, inside an import cycle.
+export function loginNotice(harness: string): string {
+  return `grayboard: Signed out of grayboard in ${harness}; run /grayboard login`;
+}
 
 // /fork is a new root with its own lease that carries the name; /new carries
 // it too; /resume of the first session rebinds that session's remembered
@@ -187,14 +192,14 @@ export function hostedRefreshLogoutScenario(h: HostedHarness, dir: string): Prom
     const seenA = a.notices().length, seenB = b.notices().length;
     const loggedOut = `grayboard: signed out; every ${h.name} session on this server pauses until run /grayboard login`;
     await a.command({ type: "prompt", message: "/grayboard logout" });
-    if (h.signOutLags) await until(() => a.notices().slice(seenA).includes(loggedOut), 10_000, "the logout notice");
+    if (h.logoutNoticeLags) await until(() => a.notices().slice(seenA).includes(loggedOut), 10_000, "the logout notice");
     else expect(a.notices().slice(seenA)).toContain(loggedOut);
     await until(() => srv.app.mcp.activeLeases === 0, 15_000, "both leases dropped");
     expect(srv.app.db.query<{ revoked_at: number | null }, [string]>("SELECT revoked_at FROM oauth_grants WHERE id = ?").get(seeded.grantId)!.revoked_at).not.toBeNull();
-    await until(() => b.notices().slice(seenB).includes(loginNotice(h)), 15_000, "the login notice in the other process");
+    await until(() => b.notices().slice(seenB).includes(loginNotice(h.name)), 15_000, "the login notice in the other process");
     const paused = (status: string) => status.includes("\nsign-in: signed out (logged_out); run /grayboard login\n") && /: paused, /.test(status);
     // A root whose subscription closed first sits in `retrying` until its next reopen meets the sign-out (#606).
-    if (h.signOutLags) {
+    if (h.pauseLags) {
       for (const proc of [a, b]) await until(async () => {
         const status = await statusOf(proc);
         return paused(status) ? status : undefined;

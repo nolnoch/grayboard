@@ -24,7 +24,7 @@ import { accessAudits } from "./audit.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
-import { hostedCarryScenario, hostedRefreshLogoutScenario, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
+import { hostedCarryScenario, hostedRefreshLogoutScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
 
 type OmpPackage = { version: string; bin: { omp: string } };
 const OMP_PKG = join(ROOT, "node_modules/@oh-my-pi/pi-coding-agent/package.json");
@@ -36,7 +36,7 @@ const BUNDLE = adapterBundle("omp");
 const LOCAL_BUNDLE = adapterBundle("omp", "local");
 const OMP_CLIENT = "grayboard-omp";
 export const PREFIX = "mcp__grayboard_";
-const LOGIN_NOTICE = "grayboard: Signed out of grayboard in omp; run /grayboard login";
+const LOGIN_NOTICE = loginNotice("omp");
 const GRAYBOARD_TOOLS = hostTools(snapshotTools()).map((t) => PREFIX + t.name).sort();
 
 const agentDirOf = (dir: string) => join(dir, "omp-agent");
@@ -123,7 +123,7 @@ function expectInstructed(model: FakeModel, ping: number, name: string): void {
 function ompHarness(settings: Record<string, unknown> = {}, reasoning = false): HostedHarness {
   return {
     name: "omp", version: OMP.version, client: OMP_CLIENT, prefix: PREFIX,
-    stateDir: stateDirOf, install: (dir, srv, modelPort) => installHosted(dir, srv, modelPort, settings, reasoning), start: startHostedOmp, idle: (omp) => idle(omp),
+    stateDir: stateDirOf, install: (dir, srv, modelPort) => installHosted(dir, srv, modelPort, settings, reasoning), start: startHostedOmp, idle,
     stateTimeout: 30_000,
     onServerTimeout: 20_000,
     // /fork of the current session: the fork's file also holds the records it copied from the session it left (#504).
@@ -135,10 +135,10 @@ function ompHarness(settings: Record<string, unknown> = {}, reasoning = false): 
     delivered: expectInstructed,
     // omp creates agent.db without a transaction (ompDbReady): b starts once a has created it.
     beforeSecondStart: (dir) => until(() => ompDbReady(dir), 30_000, "omp agent.db created"),
-    // The logout notice lands after the prompt command returns, and a root
-    // whose subscription closed first sits in `retrying` until its next reopen
-    // meets the sign-out (#606), so both are waited for.
-    signOutLags: true,
+    // The logout notice lands after the prompt command returns.
+    logoutNoticeLags: true,
+    // A root whose subscription closed first sits in `retrying` until its next reopen meets the sign-out (#606).
+    pauseLags: true,
   };
 }
 const OMP_HARNESS = ompHarness();

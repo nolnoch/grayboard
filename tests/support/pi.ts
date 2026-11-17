@@ -28,7 +28,7 @@ import { runCli } from "./cli.ts";
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
-import { hostedCarryScenario, hostedRefreshLogoutScenario, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
+import { hostedCarryScenario, hostedRefreshLogoutScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
@@ -1134,7 +1134,7 @@ export function piLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?:
 const BUNDLE = adapterBundle("pi");
 const PI_CLIENT = "grayboard-pi";
 export const PEER = "bob@example.com/peer";
-const LOGIN_NOTICE = "grayboard: Signed out of grayboard in pi; run /grayboard login";
+const LOGIN_NOTICE = loginNotice("pi");
 const HELD = "another pi process holds delivery for this session";
 const GRAYBOARD_TOOLS = hostTools(snapshotTools()).map((t) => `mcp__grayboard__${t.name}`).sort();
 
@@ -1249,7 +1249,8 @@ const PI_HARNESS: HostedHarness = {
     await pi.command({ type: "fork", entryId: messages[0].entryId });
   },
   forkCopiesRecords: false,
-  signOutLags: false,
+  logoutNoticeLags: false,
+  pauseLags: false,
 };
 
 // After the user prompt `prompt` (the latest; <channel> deliveries aren't
