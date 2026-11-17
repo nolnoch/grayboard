@@ -886,8 +886,10 @@ test("a legacy session idle past access expiry sleeps without admission and resu
     { action: "hosted.legacy_rehydrated", target, dormant_ms: expect.any(Number), ref: rows[0]!.ref, grant: f.grant.grantId, client_id: OPENCODE_CLIENT },
   ]);
   expect(JSON.stringify(rows)).not.toContain(f.sid);
-  const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
-  expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired"]);
+  // The close row is a posted write, which may wait behind a body phase B started (#807 P3 A7d).
+  const closedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
+  await untilHosted(() => closedReasons().length >= 1);
+  expect(closedReasons()).toEqual(["access_expired"]);
   // The expected close is audited above, not logged as a stream failure (#494 item 10).
   expect(logged.mock.calls.filter(args => String(args[0]).includes("mcp.stream"))).toEqual([]);
   logged.mockRestore();
@@ -974,8 +976,10 @@ test("the dormant registry is bounded by the legacy limits", async () => {
   const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all();
   expect(refused.map(row => JSON.parse(row.detail).kind)).toEqual(["dormant"]);
   // The dropped session's GET still gets its close row.
-  const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
-  expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired", "access_expired"]);
+  // The close row is a posted write, which may wait behind a body phase B started (#807 P3 A7d).
+  const closedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
+  await untilHosted(() => closedReasons().length >= 2);
+  expect(closedReasons()).toEqual(["access_expired", "access_expired"]);
 });
 
 test("modern listen capacity is reserved and reusable after cancellation", async () => {
