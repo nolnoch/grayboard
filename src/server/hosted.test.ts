@@ -132,12 +132,12 @@ test("#998 audit: delivery's access check inside the renew, receipt and release 
 
 // #807 P1c-13: the alias reads and writes a hosted body makes (bind's lazy create and cap, alias_held's holder,
 // a tools-only root's writes_as, a send's peer, a create:false bind's unknown name, a bare name outside the sender's
-// scope, unbind's candidates) run on that body's Tx. Two pool reads in a body remain, named in
-// docs/future/postgres-server.md D8: access.ts's mention resolver (the Access seam, P3) and the attachment guard
-// (the attachment slice).
+// scope, unbind's candidates) run on that body's Tx. One pool read in a body remains, named in
+// docs/future/postgres-server.md D8: access.ts's mention resolver (the Access seam, P3); the attachment guard
+// moved to its body's handle in #1053.
 test("#807 P1c-13: alias reads inside hosted bodies run on that body's Tx", async () => {
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx"; site: string }[] = [];
-  const pooled = ["/access.ts:", "/mcp-attachments.ts:"];
+  const pooled = ["/access.ts:"];
   const spies = (["find", "countForScope", "listForScope", "findAllByName", "create", "remove"] as const).map(name => {
     const original = database.repo.aliases[name].bind(database.repo.aliases) as (...a: unknown[]) => unknown;
     return spyOn(database.repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
