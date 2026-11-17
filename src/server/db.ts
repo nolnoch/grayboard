@@ -279,27 +279,28 @@ export interface Repo {
     // Also deletes the alias's read points.
     remove(tx: Tx, address: string): Promise<void>;
   };
+  // The writes return promises (#807 P3 A6g); the reads stay synchronous until A7, as the alias reads do.
   teams: {
-    // Inserts the team's principal in the same transaction; throws
+    // Inserts the team's principal in the same transaction; rejects with
     // PrincipalTaken if another principal has the name.
-    create(tx: Tx, name: string, createdBy: number): Team;
+    create(tx: Tx, name: string, createdBy: number): Promise<Team>;
     findByName(name: string): Team | undefined;
     listForUser(userId: number): Team[];
     // Adds a member with an explicit role; an existing member is left as is
     // (false). Roles change through setRole.
-    addMember(tx: Tx, teamId: number, userId: number, role?: TeamRole): boolean;
-    // Both throw LastOwner rather than leave a team with members and no
+    addMember(tx: Tx, teamId: number, userId: number, role?: TeamRole): Promise<boolean>;
+    // Both reject with LastOwner rather than leave a team with members and no
     // owner (security audit F-02); the check and the write share one
     // transaction. A team that already has no owner isn't guarded.
-    removeMember(tx: Tx, teamId: number, userId: number): void;
+    removeMember(tx: Tx, teamId: number, userId: number): Promise<void>;
     // The member's previous role, or null when it isn't a member.
-    setRole(tx: Tx, teamId: number, userId: number, role: TeamRole): TeamRole | null;
+    setRole(tx: Tx, teamId: number, userId: number, role: TeamRole): Promise<TeamRole | null>;
     isOwner(teamId: number, userId: number): boolean;
     listMembers(teamId: number): { user_id: number; email: string; role: TeamRole }[];
     listMemberUserIds(teamId: number): number[];
     isMember(teamId: number, userId: number): boolean;
     // The previous policy, or null when the team is gone.
-    setPolicy(tx: Tx, teamId: number, policy: TeamPolicy): TeamPolicy | null;
+    setPolicy(tx: Tx, teamId: number, policy: TeamPolicy): Promise<TeamPolicy | null>;
     // Whether two users share a team whose policy is 'collaborative' or
     // 'delegating': the grant under which one's agents may wake the other's (#806).
     shareCollaborative(userA: number, userB: number): boolean;
@@ -1188,7 +1189,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     teams: {
-      create(tx, name, createdBy) {
+      async create(tx, name, createdBy) {
         const db = sqliteOf(tx);
         // No prior read (D3, #807 P2-3): the UNIQUE names decide, so a principal that lands between a caller's check
         // and this insert is still refused. A team's name is a principal's too, so either constraint means taken.
@@ -1215,21 +1216,21 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`,
         ).all(userId);
       },
-      addMember(tx, teamId, userId, role = "member") {
+      async addMember(tx, teamId, userId, role = "member") {
         const db = sqliteOf(tx);
         return db.run(
           "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at, role) VALUES (?, ?, ?, ?)",
           [teamId, userId, clock(), role],
         ).changes > 0;
       },
-      removeMember(tx, teamId, userId) {
+      async removeMember(tx, teamId, userId) {
         const db = sqliteOf(tx);
         db.transaction(() => {
           guardLastOwner(db, teamId, userId);
           db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
         })();
       },
-      setRole(tx, teamId, userId, role) {
+      async setRole(tx, teamId, userId, role) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           const row = db.query<{ owner: number }, [number, number]>(
@@ -1262,7 +1263,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           "SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?",
         ).get(teamId, userId);
       },
-      setPolicy(tx, teamId, policy) {
+      async setPolicy(tx, teamId, policy) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           const row = db.query<{ policy: string }, [number]>("SELECT policy FROM teams WHERE id = ?").get(teamId);

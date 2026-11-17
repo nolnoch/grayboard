@@ -983,9 +983,9 @@ test("ending a tools-only hosted root frees its alias for other users and restor
 });
 
 test("revoking one hosted hold releases only it, bumps the generation and closes the lease; the next whoami shows what is left (#451)", async () => {
-  const team = await seed(database.repo, (tx) => {
-    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
-    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
+  const team = await seed(database.repo, async (tx) => {
+    const t = await database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    await database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
@@ -1004,9 +1004,9 @@ test("revoking one hosted hold releases only it, bumps the generation and closes
 });
 
 test("an alias revoke issued while another body holds the write queue waits behind it, then revokes and closes the lease (#807 P1b-4b)", async () => {
-  const team = await seed(database.repo, (tx) => {
-    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
-    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
+  const team = await seed(database.repo, async (tx) => {
+    const t = await database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    await database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
@@ -1027,9 +1027,9 @@ test("an alias revoke issued while another body holds the write queue waits behi
 });
 
 test("one alias revoke that throws rolls back alone, audited alias.revoke_failed; the recheck's other revokes land (#807 P1b-4b)", async () => {
-  const team = await seed(database.repo, (tx) => {
-    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
-    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
+  const team = await seed(database.repo, async (tx) => {
+    const t = await database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    await database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   await hosted.bind(principal, context("root"), { name: "ops/lead", create: true });
@@ -1054,9 +1054,9 @@ test("one alias revoke that throws rolls back alone, audited alias.revoke_failed
 });
 
 test("a revoked tools-only hosted root's ownership ends, audited once: a later recheck finds nothing to revoke again (#454)", async () => {
-  const team = await seed(database.repo, (tx) => {
-    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
-    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
+  const team = await seed(database.repo, async (tx) => {
+    const t = await database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    await database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
@@ -1104,9 +1104,9 @@ test("a hosted root holding two names sends as either with as:, its ID too, and 
 });
 
 test("a root whose last hold is revoked or unbound has no lease, so the sweep leaves it owning instead of expiring it (#451)", async () => {
-  const team = await seed(database.repo, (tx) => {
-    const t = database.repo.teams.create(tx, "ops", principal.authed.user_id);
-    database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
+  const team = await seed(database.repo, async (tx) => {
+    const t = await database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    await database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
     return t;
   });
   const id = (raw: string) => (context(raw) as { id: string }).id;
