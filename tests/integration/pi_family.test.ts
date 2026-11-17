@@ -743,7 +743,7 @@ test("a child's system-prompt instructions are its registered session's, even fe
   expect((await child.call("whoami")).isError).toBeUndefined();
 });
 
-test("a pause the Controller's run loop reaches on its own is said at once and in the next tool result", async () => {
+test("a pause the Controller's run loop reaches on its own is said at once and in the next tool result, and /grayboard resume restarts it", async () => {
   const a = await root("sink-a", "sinker");
   // The same session bound to another name outside this extension: the run
   // loop won't deliver under a binding it didn't make.
@@ -754,6 +754,12 @@ test("a pause the Controller's run loop reaches on its own is said at once and i
   await until(() => a.notices.length > 0, 10_000, "a notice");
   expect(a.notices).toEqual([{ level: "warning", message: paused }]);
   expect(texts(await a.call("whoami"))[0]).toBe(paused);
+  // /grayboard resume restarts the paused root: it runs again under its own name.
+  await a.ext.command("resume");
+  expect(a.notices.at(-1)).toEqual({ level: "info", message: "grayboard: approved: Bound sinker, switched; opening delivery" });
+  const resumed = texts(await a.call("whoami"));
+  expect(resumed).toHaveLength(1);
+  expect(JSON.parse(resumed[0]!)).toMatchObject({ primary: `${EMAIL}/sinker`, held: [`${EMAIL}/sinker`, `${EMAIL}/switched`] });
 });
 
 test("with the server down, /grayboard logout signs out but warns that its revoke is queued, and a failed /grayboard login names login, not resume", async () => {

@@ -133,7 +133,9 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     try { url = canonicalEndpoint(hostedMcpUrl(server))?.href; } catch {}
     if (!url) throw new Error(`${h.name}'s hosted extension needs a canonical HTTPS (or loopback HTTP) server URL, without credentials, query or fragment, so nothing was changed for ${h.name}`);
   }
-  // The entry next: an unparseable mcp.json throws before any file changes.
+  // The texts, then the entry: a failed load (a macro, from source) or an
+  // unparseable mcp.json throws before any file changes.
+  const texts = await adapterTexts();
   const existing = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})[h.config.section]?.grayboard;
   const old = readConfig<{ url?: unknown }>(h.hostedConfig, {}).url;
   if (typeof old === "string" && old !== url) {
@@ -142,7 +144,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
   }
   if (url) {
     if (dropEntry(h.config)) notes.push(`Removed the grayboard entry from ${h.config.path} (the hosted extension needs none)`);
-    writeAdapter(h.hosted, (await adapterTexts())[h.bundle]);
+    writeAdapter(h.hosted, texts[h.bundle]);
     rmSync(h.local, { force: true });
     writeJsonFile(h.hostedConfig, { url } satisfies HostedConfig);
     notes.push(`Wrote ${h.hostedConfig}`);
@@ -155,7 +157,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
   if (putEntry(h.config, next)) {
     notes.push(next ? `Registered in ${h.config.path} (disabled: the extension serves the tools)` : `Disabled the grayboard entry in ${h.config.path} (the adapter serves the tools)`);
   }
-  writeAdapter(h.local, (await adapterTexts())[h.source]);
+  writeAdapter(h.local, texts[h.source]);
   rmSync(h.hosted, { force: true });
   if (typeof old === "string") {
     rmSync(h.hostedConfig, { force: true });
@@ -786,9 +788,10 @@ program
       return !guard.skip;
     };
     if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
+      const { OPENCODE } = await adapterTexts();
       if (!existsSync(OC_CONFIG.path)) writeJsonFile(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      writeAdapter(OC_PLUGIN.path, (await adapterTexts()).OPENCODE);
+      writeAdapter(OC_PLUGIN.path, OPENCODE);
       console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${OC_PLUGIN.path}`);
     }
 
