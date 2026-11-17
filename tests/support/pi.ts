@@ -1280,7 +1280,9 @@ export async function pingPong(srv: HostedServer, peer: Peer, name: string): Pro
 // The session file `file` records each of `pings` (DM ids, in order) admitted
 // under `root` and then receipted, and no message body in those records; it
 // never holds omp's hidden instructions message, which isn't persisted (#441).
-export async function expectDeliveryRecords(file: string, root: string, pings: number[], name: string): Promise<void> {
+// A /fork's file also holds the entries it copied from the session it left:
+// `copied` names that root and its DMs, recorded under it in the same way.
+export async function expectDeliveryRecords(file: string, root: string, pings: number[], name: string, copied?: { root: string; pings: number[] }): Promise<void> {
   type Entry = { event: "admitted"; root: string; itemId: string; stableID: string; wake: boolean } | { event: "receipted"; root: string; itemIds: string[] };
   type Line = { type: string; customType?: string; data?: Entry };
   const want = pings.map((p) => `direct:${p}`);
@@ -1295,14 +1297,17 @@ export async function expectDeliveryRecords(file: string, root: string, pings: n
     return want.every((id) => receipted.includes(id)) ? r : undefined;
   }, 15_000, `receipts for ${want.join(", ")} in ${file}`);
   expect(lines().filter((e) => e.customType === "grayboard-instructions")).toEqual([]);
-  const admitted = entries.filter((e) => e.event === "admitted");
-  expect(admitted.map((e) => e.itemId)).toEqual(want);
-  for (const e of entries) expect(e.root).toBe(root);
-  for (const e of admitted) expect(e).toMatchObject({ wake: true, stableID: expect.any(String) });
-  // Each receipt follows its admission.
-  for (const id of want) {
-    const at = entries.findIndex((e) => e.event === "admitted" && e.itemId === id);
-    expect(entries.findIndex((e) => e.event === "receipted" && e.itemIds.includes(id))).toBeGreaterThan(at);
+  expect([...new Set(entries.map((e) => e.root))]).toEqual(copied ? [copied.root, root] : [root]);
+  for (const [r, ids] of [[root, want], ...(copied ? [[copied.root, copied.pings.map((p) => `direct:${p}`)] as const] : [])] as const) {
+    const mine = entries.filter((e) => e.root === r);
+    const admitted = mine.filter((e) => e.event === "admitted");
+    expect(admitted.map((e) => e.itemId)).toEqual([...ids]);
+    for (const e of admitted) expect(e).toMatchObject({ wake: true, stableID: expect.any(String) });
+    // Each receipt follows its admission.
+    for (const id of ids) {
+      const at = mine.findIndex((e) => e.event === "admitted" && e.itemId === id);
+      expect(mine.findIndex((e) => e.event === "receipted" && e.itemIds.includes(id))).toBeGreaterThan(at);
+    }
   }
   expect(JSON.stringify(entries)).not.toContain(`ping ${name}`);
 }
@@ -1510,7 +1515,7 @@ export function piHostedCarryScenario(dir: string): Promise<void> {
     expect(piRow(srv, first.sessionId)).toBeUndefined();
     expect(ownershipEnded(srv, firstOwnership)).toBe(true);
     expect(piRow(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
-    await pingPong(srv, peer, "pi-carry");
+    const p2 = await pingPong(srv, peer, "pi-carry");
     await idle(pi);
 
     // /new carries it on.
@@ -1533,8 +1538,11 @@ export function piHostedCarryScenario(dir: string): Promise<void> {
     await idle(pi);
     expect(grayboardDescendants(pi.pid)).toEqual([]);
     // Each session's file records its deliveries: the first holds the DMs it
-    // received before the fork and after the resume, /new's the one it did.
+    // received before the fork and after the resume, the fork's and /new's
+    // the one each did.
     await expectDeliveryRecords(first.sessionFile, first.sessionId, [p1, p4], "pi-carry");
+    // The fork branched before the first prompt, so it copied none of the first's records.
+    await expectDeliveryRecords(forked.sessionFile, forked.sessionId, [p2], "pi-carry");
     await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], "pi-carry");
     await pi.quit();
   });

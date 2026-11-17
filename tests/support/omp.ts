@@ -994,7 +994,8 @@ export function ompHostedCarryScenario(dir: string): Promise<void> {
     expect(ompRow(srv, first.sessionId)).toBeUndefined();
     expect(ownershipEnded(srv, firstOwnership)).toBe(true);
     expect(ompRow(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
-    expectInstructed(model, await pingPong(srv, peer, "omp-carry"), "omp-carry");
+    const p2 = await pingPong(srv, peer, "omp-carry");
+    expectInstructed(model, p2, "omp-carry");
     await idle(omp);
 
     // /new carries it on.
@@ -1020,8 +1021,10 @@ export function ompHostedCarryScenario(dir: string): Promise<void> {
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
     // Each session's file records its deliveries: the first holds the DMs it
-    // received before the fork and after the resume, /new's the one it did.
+    // received before the fork and after the resume, /new's the one it did;
+    // the fork's holds its own and the first's records it copied (#504).
     await expectDeliveryRecords(first.sessionFile, first.sessionId, [p1, p4], "omp-carry");
+    await expectDeliveryRecords(forked.sessionFile, forked.sessionId, [p2], "omp-carry", { root: first.sessionId, pings: [p1] });
     await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], "omp-carry");
     await omp.quit();
     await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, first.sessionId), 10_000, "released on quit");
