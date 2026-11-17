@@ -156,12 +156,14 @@ export async function transactionRace(f: TransactionRace) {
           binding = oob.ok(root, "bind", { name: "be", create: true });
           await first.hit();
           assert(!f.calls.slice(mark).some(c => c.name === "delivery_open"), "The held owning call is the root's bind, not a plugin open");
-          const waiting = await server.trace("bindgate:wait");
+          const armed = f.calls.length, waiting = await server.trace("bindgate:wait");
           childCall = f.invoke(child, "dm_send", { to: "sender", body });
           // The plugin registers a new child as soon as it sees it, so the registration may already be on its
           // way when the child's call is made; either way it is sent after the held bind.
           await until(() => f.calls.slice(mark).some(c => c.name === "session_register" && c.session === root), "The child's registration is sent while the bind is held");
-          await waiting.hit();
+          // One sent before the trace was armed (the creation's instructions prefetch) may already wait at the
+          // gate untraced, and the call shares it (#567): the commit order below still proves it waited.
+          if (!f.calls.slice(mark, armed).some(c => c.name === "session_register" && c.session === root)) await waiting.hit();
         }
         assert.equal(row(child), null, "Nothing registered while the first is held");
         first.release();

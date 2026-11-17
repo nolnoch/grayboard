@@ -36735,10 +36735,12 @@ class Controller {
     const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call = (sessionID, c) => this.temporary(e, c, sessionID);
-    const known = r && this.registered.get(path.sessionID);
-    let done = known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
-    if (!done) {
-      const started = done = register2(call, { root: path.root, via: path.via, child: path.sessionID });
+    const shared = () => {
+      const known = r && this.registered.get(path.sessionID);
+      return known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
+    };
+    const start = () => {
+      const started = register2(call, { root: path.root, via: path.via, child: path.sessionID });
       if (r) {
         const entry = { r, epoch: r.epoch, ...r.lease ? { ownership: r.lease.ownership } : {}, settled: false, done: started };
         this.registered.set(path.sessionID, entry);
@@ -36752,12 +36754,25 @@ class Controller {
         if (this.registered.get(path.sessionID)?.done === started)
           this.registered.delete(path.sessionID);
       });
-    }
-    await done.catch((error) => {
+      return started;
+    };
+    let done = shared(), joined = !!done;
+    for (;; ) {
+      done ??= start();
+      const error = await done.then(() => {
+        return;
+      }, (error) => ({ error }));
+      if (!error)
+        break;
+      if (joined) {
+        joined = false;
+        done = shared();
+        continue;
+      }
       if (!fetch2)
-        this.failure("child_register", error, r);
-      throw error;
-    });
+        this.failure("child_register", error.error, r);
+      throw error.error;
+    }
     if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
       await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
       throw new AncestryError("Grayboard session ended during registration");

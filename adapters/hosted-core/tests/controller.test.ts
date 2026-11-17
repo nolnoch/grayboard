@@ -547,6 +547,28 @@ test.each(modes)("a child's calls and fetches share one registration until its r
   } finally { await r.controller.close(); }
 });
 
+// #567: a call that joined a registration in flight which then fails (an older request's deadline, spent at a held
+// bind gate) registers once on its own instead of failing with it.
+test.each(modes)("a call whose joined registration fails registers once on its own (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    let fail!: (error: Error) => void;
+    r.holdRegister(new Promise<void>((_, reject) => { fail = reject; }));
+    const fetching = r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true);
+    await until(() => r.named("session_register").length === 1);
+    const calling = r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    r.holdRegister();
+    fail(new Error("MCP request timed out"));
+    await expect(fetching).rejects.toThrow("timed out");
+    await calling;
+    expect(r.named("session_register")).toHaveLength(2);
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+  } finally { await r.controller.close(); }
+});
+
 // #567 audit: the server's end of a root's ownership (a lapsed lease, an idle sweep) deletes its child rows without
 // moving the root's epoch: a run loop that reopens under a new ownership invalidates the remembered registration,
 // as does a child call the server answers unbound.
