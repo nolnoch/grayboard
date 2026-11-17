@@ -460,6 +460,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const session = random();
       const created = await repo.write(tx => {
         const t = now();
+        // The flow may have lapsed while the sign-in and this write waited (#971): no session for a dead flow.
+        if (f.expiresAt <= t || closed) fail();
         return repo.oauth.createBrowserSession(tx, { sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
           c.session && hashToken(c.session));
       });
