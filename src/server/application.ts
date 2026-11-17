@@ -604,7 +604,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (to?.active) to.sink.deliver({ kind: "direct", message: showMessage(b) });
     }
     wake(hub, onCommit(repo.read), [...woken]);
-    void sweepBlobs(db, repo.blobs, queuedTx(repo));
+    void sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
   // after-commit half for every hosted commit, whichever path released it.
@@ -1318,7 +1318,8 @@ function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string | und
 
 // Checks a send and resolves its recipient, writing nothing; throws
 // ApplicationError. Its uploads may be any of the session's addresses' (S5).
-// `r`: the send's body, which a policy refusal's row is written on when no `afterRollback` takes it.
+// `r`: the send's body. A policy refusal's row, when no `afterRollback` takes it, runs on that body (its audit
+// write is still ambient until the audit slice).
 function prepareSend(
   hub: Hub, r: Tx, session: ApplicationSession, from: string, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
 ): PreparedSend {
