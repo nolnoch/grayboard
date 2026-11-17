@@ -1,7 +1,7 @@
 // #430: the harness-neutral Controller against a fake HostPort: no session
 // metadata, no tool list. Every case runs once with an adapter-owned grant
 // (`approval: null`) and once with a fake approval port.
-import { expect, test } from "bun:test";
+import { expect, setSystemTime, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
 import { Controller, type ControllerOptions } from "../src/controller.js";
 import { AccessExpired, Refusal, RefreshInProgress, same, type AccessReason, type Item } from "../src/model.js";
@@ -32,6 +32,8 @@ function runtime(mode: Mode) {
   let accessFault: AccessReason | undefined, checkSeesAccess = false;
   // The host's refresh requests (#661), and the addresses another session holds (a bind refuses alias_held).
   let refreshes = 0;
+  // The deadline each delivery_renew reports (#481), when a test sets one; check()'s own failure, when set.
+  let renewAt: (() => number) | undefined, checkFault: (() => Error) | undefined;
   const heldElsewhere = new Set<string>();
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
@@ -86,6 +88,7 @@ function runtime(mode: Mode) {
       if (name.startsWith("delivery_") && (!row?.capability || row.capability !== this.capability)) throw new LeaseUnavailable();
       if (name === "delivery_renew") {
         if (++renews > leaseLostAfter) throw new LeaseUnavailable();
+        if (renewAt) return { ok: true, expiresAt: renewAt() };
       }
       if (name === "delivery_receipt") {
         if (++receipts === receiptFault?.at) { receiptFault.then?.(); throw receiptFault.error(); }
@@ -110,6 +113,7 @@ function runtime(mode: Mode) {
     check: async e => {
       if (e.configuration.configHash !== `grant-${grant}`) throw new Refusal("binding", "Grant changed");
       if (checkSeesAccess && accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault);
+      if (checkFault) throw checkFault();
     },
     watch: async (_e, drift) => { watchers.add(drift); drifts.push(drift); return { dispose: async () => { watchers.delete(drift); } }; },
     token: async () => { if (accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault); return "access"; },
@@ -164,6 +168,10 @@ function runtime(mode: Mode) {
     expireAccess: (reason?: AccessReason) => { accessFault = reason; },
     // check() refuses with the access fault too, as a host whose check reads the token's expiry.
     checkSeesAccess: () => { checkSeesAccess = true; },
+    // Every delivery_renew reports `at()` as the lease's deadline.
+    renewExpiresAt: (at: () => number) => { renewAt = at; },
+    // check() throws `fault()` until called again without one.
+    failCheck: (fault?: () => Error) => { checkFault = fault; },
     // The nth delivery_receipt throws `error` once, after running `then`.
     failReceiptAt: (at: number, error: () => Error, then?: () => void) => { receiptFault = { at, error, ...(then ? { then } : {}) }; },
     // The lease lapses after the nth delivery_renew: every later renew and receipt finds no live lease (an
@@ -753,6 +761,21 @@ test.each(modes)("an `expired` access token the host never rotates pauses after 
     expect(r.named("delivery_open")).toHaveLength(1);
   } finally { await c.close(); await r.controller.close(); }
 });
+// #481: an expiry after a healthy subscription gets the whole grace: the subscription's own time (here a 1 s admit)
+// is no part of it, so the polls number as many as an expiry at the open's.
+test.each(modes)("an expiry after a long healthy subscription gets the full rotation grace (%s)", async mode => {
+  const r = runtime(mode), waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    r.holdAdmit(() => Bun.sleep(1000));
+    r.failReceiptAt(1, () => new AccessExpired("pi", "run /grayboard login", "expired"), () => r.expireAccess("expired"));
+    r.batches.set("R", [r.item("direct:1")]);
+    await c.enroll("R", ["be"], true);
+    await until(() => waits.some(ms => ms >= 1000), 10_000);
+    // GRACE less the stream close's own backoff: 20 polls.
+    expect(waits.slice(0, waits.findIndex(ms => ms >= 1000))).toEqual(GRACE.slice(1));
+  } finally { await c.close(); await r.controller.close(); }
+});
 // Pauses R on an expired token past the grace; `during(n)` runs at the nth recovery wait.
 async function expiredPause(mode: Mode, during: (n: number, r: ReturnType<typeof runtime>, c: Controller) => unknown, roots = ["R"]) {
   const r = runtime(mode), waits: number[] = [], states: { id: string; state: string; operation?: string; code?: string }[] = [];
@@ -945,6 +968,124 @@ test("a reload during the wait restores the root into the same wait, which a lat
       await until(() => o.r.root(restarted)?.state === "active");
       expect(polls).toBe(2);
       expect(o.r.root(restarted)).toMatchObject({ state: "active", held: ["you@example.com/be"] });
+    } finally { await restarted.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+
+// #481: the grace stops LEASE_MARGIN_MS (2 s) before the deadline the last renew reported, whatever the 10 s cap
+// leaves: a lease with less than that left gets no rotation polls, and the root goes straight to the refresh wait.
+test.each(modes)("a renew's deadline inside the lease margin ends the rotation grace at once (%s)", async mode => {
+  const r = runtime(mode), waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    // The open's deadline is 30 s out; the item's renew reports one 1 s out.
+    r.renewExpiresAt(() => Date.now() + 1_000);
+    r.batches.set("R", [r.item("direct:1")]);
+    await c.enroll("R", ["be"], true);
+    await until(() => r.batches.get("R")?.length === 0);
+    r.expireAccess("expired"); r.closeStream("R");
+    await until(() => r.root(c)?.message.startsWith("Access still expired after an hour") === true);
+    // The close's own backoff, then the refresh wait: none of the grace's 20 polls.
+    expect(waits).toEqual([500, ...RECOVERY]);
+    expect(r.root(c)).toMatchObject({ state: "paused", code: "native_access_expired" });
+  } finally { await c.close(); await r.controller.close(); }
+});
+// #481: an idle subscription's periodic renew (no item in flight) also moves the deadline the grace stops before.
+test.each(modes)("an idle renew's deadline inside the lease margin ends the rotation grace at once (%s)", async mode => {
+  const r = runtime(mode), waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active");
+    // The renew reports a deadline 1 s out in real time; the clock jumps past the 10 s renew interval to send it.
+    const deadline = Date.now() + 1_000;
+    r.renewExpiresAt(() => deadline);
+    setSystemTime(new Date(Date.now() + 11_000));
+    await until(() => r.named("delivery_renew").length === 1);
+    setSystemTime();
+    r.expireAccess("expired"); r.closeStream("R");
+    await until(() => r.root(c)?.message.startsWith("Access still expired after an hour") === true);
+    expect(waits).toEqual([500, ...RECOVERY]);
+  } finally { setSystemTime(); await c.close(); await r.controller.close(); }
+});
+// #481 item 14: a reload whose check fails for another cause after an expiry pause records that cause's code. A
+// failure that isn't a refusal is no pause: the restart after it checks again and resumes.
+test("a restore check that fails for a non-expiry cause after an expiry pause records its own code (#481)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    o.r.expireAccess(); o.r.failCheck(() => new Error("disk gone"));
+    const restarted = o.r.make({ wait: async () => {} });
+    try {
+      await restarted.restore();
+      expect(o.r.root(restarted)).toMatchObject({ state: "degraded", operation: "restore", code: "operation_failed" });
+    } finally { await restarted.close(); }
+    o.r.failCheck();
+    const again = o.r.make({ wait: async () => {} });
+    try {
+      await again.restore();
+      await until(() => o.r.root(again)?.state === "active");
+    } finally { await again.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// The same, for a refusal: another account's grant is the pause's cause, and a restart leaves it paused.
+test("a restore check refused after an expiry pause pauses with the refusal's code (#481)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    o.r.expireAccess(); o.r.failCheck(() => new Refusal("auth", "another account"));
+    const restarted = o.r.make({ wait: async () => {} });
+    try {
+      await restarted.restore();
+      expect(o.r.root(restarted)).toMatchObject({ state: "paused", operation: "restore" });
+    } finally { await restarted.close(); }
+    o.r.failCheck();
+    const again = o.r.make({ wait: async () => {} });
+    try {
+      await again.restore();
+      expect(o.r.root(again)?.state).toBe("paused");
+    } finally { await again.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+test("a restore that fails outside the expiry branches records a degraded root with the failure's code (#481)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    // The check passes; the prepare's rebind finds the name taken.
+    o.r.expireAccess(); o.r.rows.delete("R"); o.r.holdElsewhere("be");
+    const restarted = o.r.make({ wait: async () => {} });
+    try {
+      await restarted.restore();
+      await until(() => o.r.root(restarted)?.code === "alias_held");
+      expect(o.r.root(restarted)).toMatchObject({ state: "degraded", operation: "restore", code: "alias_held" });
+    } finally { await restarted.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// #481 item 15: a close during a restore's rotation poll ends the restore: no credential watch (which nothing would
+// dispose) and no prepare after it.
+test("a close during a restore's rotation wait refuses the retry: no watch, no prepare (#481)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    o.r.checkSeesAccess();
+    const calls = o.r.calls.length, watches = o.r.drifts.length;
+    let polls = 0;
+    const restarted: Controller = o.r.make({ wait: async (ms, signal) => {
+      if (ms !== 500) return;
+      // The first poll: the host shuts down, and the token rotates meanwhile.
+      if (++polls === 1) { o.r.expireAccess(); void restarted.close(); }
+      if (!signal?.aborted) await new Promise(resolve => signal?.addEventListener("abort", resolve, { once: true }));
+    } });
+    try {
+      await restarted.restore();
+      expect(polls).toBe(1);
+      expect(o.r.drifts).toHaveLength(watches);
+      expect(o.r.calls.slice(calls).map(c => c.name)).toEqual([]);
+      expect(o.r.root(restarted)?.state).not.toBe("active");
     } finally { await restarted.close(); }
   } finally { await o.c.close(); await o.r.controller.close(); }
 });

@@ -36579,10 +36579,21 @@ async function end(temporary, path) {
 
 // adapters/hosted-core/src/controller.ts
 var DRIFTED = "Grayboard credential changed";
+function graceLeft(grace) {
+  const lease = grace.lease?.();
+  return Math.min(ROTATION_GRACE_MS - grace.spent, lease ? lease.expiresAt - LEASE_MARGIN_MS - Date.now() : Infinity);
+}
+function renewed(lease, answer) {
+  const at = typeof answer === "object" && answer !== null ? answer.expiresAt : undefined;
+  if (typeof at === "number" && Number.isFinite(at))
+    lease.expiresAt = at;
+}
 var ADMITTED_LIMIT = 100;
 var LOOKUPS = 1024;
 var ROTATION_POLL_MS = 500;
 var ROTATION_GRACE_MS = 1e4;
+var LEASE_MARGIN_MS = 2000;
+var RENEW_MS = 1e4;
 var RECOVERY_FIRST_MS = 1000;
 var RECOVERY_MAX_MS = 30000;
 var RECOVERY_BUDGET_MS = 60 * 60000;
@@ -36852,7 +36863,7 @@ class Controller {
           });
           bound = true;
         }
-        await this.rotated({ ms: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
+        await this.rotated({ spent: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
         if (!this.drifted)
@@ -36879,7 +36890,7 @@ class Controller {
       await this.watch(r.e);
       this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
       try {
-        await this.rotated({ ms: 0 }, () => this.prepare(r, true));
+        await this.rotated({ spent: 0 }, () => this.prepare(r, true));
       } catch (caught) {
         const error = this.expired(caught);
         if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
@@ -37009,18 +37020,20 @@ class Controller {
     return started;
   }
   async run(r, e, epoch, signal, ready) {
-    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, rotation = 0, outage = false, inItem = false, reidentified = false;
+    let failures = 0, recoveries = 0, throttles = 0, unreachable = 0, outage = false, inItem = false, reidentified = false;
+    let grace = { spent: 0, lease: () => r.lease };
     let pendingItem;
     const attempts = new Map;
     while (!signal.aborted && failures < 8) {
       let wire;
+      const began = performance.now(), attempt = grace;
       try {
         await this.guard(r, epoch, signal);
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
         await this.guard(r, epoch, signal);
         const current = bindingOf(await wire.call("whoami"));
         outage = false;
-        rotation = 0;
+        grace = { spent: 0, lease: () => r.lease };
         await this.guard(r, epoch, signal);
         if (await this.dropLost(r, current)) {
           e = { ...e, held: r.e.held };
@@ -37066,7 +37079,7 @@ class Controller {
           closed = true;
           wake?.();
         });
-        let renewal = Date.now() + 1e4;
+        let renewal = Date.now() + RENEW_MS;
         try {
           while (!signal.aborted) {
             if (dirty) {
@@ -37083,7 +37096,7 @@ class Controller {
                   throw new Refusal("identity", "Issued batch does not match the immutable lease");
                 await this.guard(r, epoch, signal);
                 const key = `${item.ownership}:${item.bind_gen}:${item.id}`;
-                await wire.call("delivery_renew");
+                renewed(lease, await wire.call("delivery_renew"));
                 await this.guard(r, epoch, signal);
                 if (r.admitted.has(key))
                   return;
@@ -37118,8 +37131,8 @@ class Controller {
               throw new SubscriptionClosed;
             if (Date.now() >= renewal) {
               await this.guard(r, epoch, signal);
-              await wire.call("delivery_renew");
-              renewal = Date.now() + 1e4;
+              renewed(lease, await wire.call("delivery_renew"));
+              renewal = Date.now() + RENEW_MS;
               dirty = true;
               recoveries = 0;
               unreachable = 0;
@@ -37150,8 +37163,8 @@ class Controller {
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
         }
-        if (error instanceof AccessExpired && error.reason === "expired" && rotation < ROTATION_GRACE_MS) {
-          rotation += ROTATION_POLL_MS;
+        if (error instanceof AccessExpired && error.reason === "expired" && graceLeft(grace) > 0) {
+          grace.spent += (grace === attempt ? performance.now() - began : 0) + ROTATION_POLL_MS;
           this.set(r, "retrying", `Access expired; waiting for ${this.port.harness} to refresh it, approval retained`, "reopen", failureCode(error));
           ready();
           await this.wait(ROTATION_POLL_MS, signal);
@@ -37256,14 +37269,15 @@ class Controller {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
   }
-  async rotated(spent, call) {
+  async rotated(grace, call) {
     for (;; ) {
+      const began = performance.now();
       try {
         return await call();
       } catch (error) {
-        if (this.stopped || accessExpiry(error)?.reason !== "expired" || spent.ms >= ROTATION_GRACE_MS)
+        if (this.stopped || accessExpiry(error)?.reason !== "expired" || graceLeft(grace) <= 0)
           throw error;
-        spent.ms += ROTATION_POLL_MS;
+        grace.spent += performance.now() - began + ROTATION_POLL_MS;
         await this.wait(ROTATION_POLL_MS, this.closing.signal);
         if (this.stopped)
           throw error;
@@ -37277,7 +37291,7 @@ class Controller {
     });
     if (!this.port.approval)
       return;
-    const spent = { ms: 0 };
+    const grace = { spent: 0 };
     for (const saved of await this.port.approval.saved()) {
       const id = saved.sessionID;
       if (this.stopped)
@@ -37305,24 +37319,26 @@ class Controller {
         if (expired)
           this.set(r, "retrying", `Access expired before the restart; waiting for ${this.port.harness} to refresh it, approval retained`, "restore", "native_access_expired");
         try {
-          await this.rotated(spent, () => this.port.credential.check(e));
+          await this.rotated(grace, () => this.port.credential.check(e));
         } catch (error) {
           if (!expired)
             throw error;
           if (this.roots.get(id) !== r || r.paused || r.task)
             continue;
           const cause = this.expired(error);
+          if (!(cause instanceof Refusal))
+            throw error;
           r.paused = true;
           if (cause instanceof AccessExpired && cause.reason === "expired")
             this.awaitRefresh(r, "restore");
           else
-            this.set(r, "paused", failureMessage(cause, this.hint), "restore", cause instanceof Refusal ? failureCode(cause) : "native_access_expired");
+            this.set(r, "paused", failureMessage(cause, this.hint), "restore", failureCode(cause));
           continue;
         }
         if (this.roots.get(id) !== r)
           continue;
         await this.watch(e);
-        await this.rotated(spent, () => this.prepare(r, true, true));
+        await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
         if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
@@ -37334,7 +37350,7 @@ class Controller {
         } else if (r) {
           r.paused = true;
           await this.stop(r);
-          this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+          this.set(r, "degraded", `Saved root unavailable (${failureCode(error)}); approval retained, ${this.hint}`, "restore", failureCode(error));
         } else
           this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
       }
@@ -37509,7 +37525,7 @@ class Controller {
           if (output?.unbound === true && r.e.held?.length) {
             await this.stop(r);
             r.lease = undefined;
-            await this.rotated({ ms: 0 }, () => this.prepare(r, true));
+            await this.rotated({ spent: 0 }, () => this.prepare(r, true));
           }
           return;
         }
@@ -37524,7 +37540,7 @@ class Controller {
             await this.port.storage.set(`rememberedHeld:${r.e.sessionID}`, { approval: this.approvalKey(r.approval), held: [] });
           }
         }
-        await this.rotated({ ms: 0 }, () => this.prepare(r, false));
+        await this.rotated({ spent: 0 }, () => this.prepare(r, false));
       } catch (error) {
         if (!this.drifted)
           this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
