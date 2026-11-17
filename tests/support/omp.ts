@@ -1003,7 +1003,9 @@ function ompLog(dir: string): string {
 // its own runtime and agent id. The first session runs grayboard; the second
 // is refused, and so is its subagent, which would otherwise act as the first
 // session's names (#470). The first session's subagent, found through its
-// chain of parentIds, serves the tools as a child session.
+// chain of parentIds, serves the tools as a child session. An enabled
+// .mcp.json server that runs grayboard in the session's directory doesn't
+// refuse it: ACP sessions load no on-disk MCP config (#559).
 export function ompLocalAcpScenario(dir: string): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
@@ -1013,6 +1015,8 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
     try {
       installLocal(dir, model.port);
       peer = await localSession(dir, "peer");
+      // No grayboard runs at this command; omp's ACP sessions don't start it anyway.
+      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({ mcpServers: { bus: { command: join(dir, "missing", "grayboard"), args: ["mcp", "--mode", "local"] } } }));
       const acp = startAcpOmp(dir, procs);
       await acp.call("initialize", { protocolVersion: 1, clientCapabilities: {} });
       const { sessionId: first } = await acp.call<{ sessionId: string }>("session/new", { cwd: dir, mcpServers: [] });
