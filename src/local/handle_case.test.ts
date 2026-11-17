@@ -1,10 +1,11 @@
-// #216: a 1.x mixed-case handle moves to its lowercase name at open, where that name is free.
+// #216: a 1.x mixed-case handle moves to its lowercase name at open, merging into it where it exists.
 import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 
+import { lowercaseLegacyHandles } from "./handle_case.ts";
 import { openLocalDb } from "./open.ts";
 
 const dirs: string[] = [];
@@ -62,41 +63,101 @@ test("a 1.x mixed-case handle's rows move to its lowercase name, once", () => {
   again.close();
 });
 
-test("a lowercase name already taken leaves the old one, reported once", () => {
-  const path = legacyBus(["Gray", "gray"]);
+test("every address column moves", () => {
+  const path = legacyBus(["Gray"], (db) => {
+    const now = Date.now();
+    const post = (db.prepare(`SELECT id FROM posts WHERE author = 'Gray'`).get() as { id: number }).id;
+    const msg = (db.prepare(`SELECT id FROM messages WHERE recipient = 'Gray'`).get() as { id: number }).id;
+    db.prepare(`INSERT INTO boards (name, purpose, created_by, created_at, archived_at, archived_by) VALUES ('old', 'o', 'Gray', ?1, ?1, 'Gray')`).run(now);
+    db.prepare(`INSERT INTO outbox (handle, post_id, reason) VALUES ('Gray', ?, 'mention')`).run(post);
+    db.prepare(`INSERT INTO thread_mutes (handle, root_id) VALUES ('Gray', ?)`).run(post);
+    db.prepare(`INSERT INTO claim_watches (key, handle) VALUES ('ticket:x', 'Gray')`).run();
+    db.prepare(`INSERT INTO claim_events (key, handle, event, held_by, at) VALUES ('ticket:x', 'Gray', 'taken', 'Gray', ?)`).run(now);
+    db.prepare(`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES ('ab', 1, ?)`).run(now);
+    db.prepare(`INSERT INTO attachments (sha256, filename, type, size, uploader, message_id, created_at) VALUES ('ab', 'f', 'text/plain', 1, 'Gray', ?, ?)`).run(msg, now);
+    db.prepare(`INSERT INTO dm_acks (reader, message_id, acked_at) VALUES ('Gray', ?, ?)`).run(msg, now);
+    db.prepare(`INSERT INTO alias_holds (address, id, bound_at) VALUES ('Gray', 'id:x', ?)`).run(now);
+  });
+  const { db } = openLocalDb(path);
+  const columns = [
+    ["handles", "name"], ["aliases", "address"], ["aliases", "name"], ["alias_holds", "address"],
+    ["boards", "created_by"], ["boards", "archived_by"], ["posts", "author"],
+    ["subscriptions", "handle"], ["outbox", "handle"], ["thread_mutes", "handle"],
+    ["claims", "holder"], ["claim_watches", "handle"], ["claim_events", "handle"], ["claim_events", "held_by"],
+    ["attachments", "uploader"], ["messages", "sender"], ["messages", "recipient"],
+    ["cursors", "reader"], ["dm_acks", "reader"],
+  ];
+  const under = (h: string) => columns.map(([t, c]) => `${t}.${c}=${count(db, `SELECT COUNT(*) AS n FROM ${t} WHERE ${c} = ?`, h)}`);
+  expect(under("Gray")).toEqual(columns.map(([t, c]) => `${t}.${c}=0`));
+  expect(under("gray").filter((x) => x.endsWith("=0"))).toEqual([]);
+  db.close();
+});
+
+test("an existing lowercase name absorbs the old one; its own keyed rows win", () => {
+  const path = legacyBus(["Gray", "gray"], (db) => {
+    db.prepare(`UPDATE cursors SET last_seen_id = 9 WHERE reader = 'gray'`).run();
+    db.prepare(`UPDATE subscriptions SET mode = 'quiet' WHERE handle = 'gray'`).run();
+  });
+  const { db } = openLocalDb(path);
+  expect(rowsUnder(db, "Gray")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+  // One row per name where a key holds one; both names' DMs, claims and posts.
+  expect(rowsUnder(db, "gray")).toEqual([1, 1, 2, 2, 2, 1, 1, 2]);
+  expect(db.prepare(`SELECT last_seen_id FROM cursors WHERE reader = 'gray'`).get()).toEqual({ last_seen_id: 9 });
+  expect(db.prepare(`SELECT mode FROM subscriptions WHERE handle = 'gray'`).get()).toEqual({ mode: "quiet" });
+  expect(db.prepare(`SELECT detail FROM audit_log WHERE action = 'alias.case_moved'`).all().map((r: any) => JSON.parse(r.detail))).toEqual([{ from: "Gray", merged: true }]);
+  expect(audits(db, "alias.case_collision")).toEqual([]);
+  db.close();
+});
+
+test("a 1.x session writing the old name again after the move merges at the next open", () => {
+  const path = legacyBus(["Gray"]);
+  openLocalDb(path).db.close();
+  const { db: old } = openLocalDb(path);
+  old.prepare(`INSERT INTO handles (name, first_seen, last_seen) VALUES ('Gray', 1, 1)`).run();
+  old.prepare(`INSERT INTO messages (sender, recipient, body, created_at) VALUES ('be', 'Gray', 'later', 1)`).run();
+  old.close();
+  const { db } = openLocalDb(path);
+  expect(count(db, `SELECT COUNT(*) AS n FROM messages WHERE recipient = 'Gray'`)).toBe(0);
+  expect(count(db, `SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gray'`)).toBe(2);
+  expect(count(db, `SELECT COUNT(*) AS n FROM handles WHERE name = 'Gray'`)).toBe(0);
+  expect(audits(db, "alias.case_moved")).toEqual([["gray", "Gray"], ["gray", "Gray"]]);
+  expect(audits(db, "alias.case_collision")).toEqual([]);
+  db.close();
+});
+
+test("two spellings of one name: the most recently seen moves, the other merges into it", () => {
+  const path = legacyBus(["Gray", "GRAY"], (db) => {
+    db.prepare(`UPDATE handles SET last_seen = 1 WHERE name = 'GRAY'`).run();
+    db.prepare(`UPDATE aliases SET last_seen = 1 WHERE address = 'GRAY'`).run();
+  });
+  const { db } = openLocalDb(path);
+  expect(db.prepare(`SELECT detail FROM audit_log WHERE action = 'alias.case_moved' ORDER BY rowid`).all().map((r: any) => JSON.parse(r.detail)))
+    .toEqual([{ from: "Gray", merged: false }, { from: "GRAY", merged: true }]);
+  expect(rowsUnder(db, "Gray")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+  expect(rowsUnder(db, "GRAY")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+  expect(rowsUnder(db, "gray")).toEqual([1, 1, 2, 2, 2, 1, 1, 2]);
+  db.close();
+});
+
+test("a human and a non-human never merge: a collision, reported once", () => {
+  const path = legacyBus(["Alex", "alex"], (db) => db.prepare(`UPDATE handles SET human = 1 WHERE name = 'alex'`).run());
   for (let i = 0; i < 2; i++) {
     const { db } = openLocalDb(path);
-    expect(rowsUnder(db, "Gray")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
-    expect(rowsUnder(db, "gray")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
-    expect(audits(db, "alias.case_collision")).toEqual([["gray", "Gray"]]);
+    expect(rowsUnder(db, "Alex")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+    expect(rowsUnder(db, "alex")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+    expect(audits(db, "alias.case_collision")).toEqual([["alex", "Alex"]]);
+    expect(audits(db, "alias.case_moved")).toEqual([]);
     db.close();
   }
 });
 
-test("a lowercase name taken only in a keyed table is a collision too", () => {
-  const path = legacyBus(["Gray"], (db) => db.prepare(`INSERT INTO cursors (reader, last_seen_id) VALUES ('gray', 5)`).run());
-  const { db } = openLocalDb(path);
-  expect(rowsUnder(db, "Gray")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
-  expect(audits(db, "alias.case_collision")).toEqual([["gray", "Gray"]]);
-  expect(audits(db, "alias.case_moved")).toEqual([]);
-  db.close();
-});
-
-test("two spellings of one name: the first in byte order moves, the other collides", () => {
-  const path = legacyBus(["Gray", "GRAY"]);
-  const { db } = openLocalDb(path);
-  expect(audits(db, "alias.case_moved")).toEqual([["gray", "GRAY"]]);
-  expect(audits(db, "alias.case_collision")).toEqual([["gray", "Gray"]]);
-  expect(rowsUnder(db, "Gray")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
-  expect(rowsUnder(db, "gray")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
-  db.close();
-});
-
-test("a name the identity rule refuses stays as written", () => {
-  const path = legacyBus(["Gray Fox"]);
+test("a name invalid after lowercasing, or the reserved human, stays and is reported", () => {
+  const path = legacyBus(["Gray Fox", "Human"]);
   const { db } = openLocalDb(path);
   expect(rowsUnder(db, "Gray Fox")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
-  expect(count(db, `SELECT COUNT(*) AS n FROM audit_log WHERE action LIKE 'alias.case_%'`)).toBe(0);
+  expect(rowsUnder(db, "Human")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+  expect(audits(db, "alias.case_collision").sort()).toEqual([["gray fox", "Gray Fox"], ["human", "Human"]]);
+  expect(audits(db, "alias.case_moved")).toEqual([]);
   db.close();
 });
 
@@ -104,5 +165,18 @@ test("the human flag moves with its handle", () => {
   const path = legacyBus(["Alex"], (db) => db.prepare(`UPDATE handles SET human = 1 WHERE name = 'Alex'`).run());
   const { db } = openLocalDb(path);
   expect(db.prepare(`SELECT address, human FROM aliases WHERE human = 1`).all()).toEqual([{ address: "alex", human: 1 }]);
+  db.close();
+});
+
+test("a notice prints only once its move commits", () => {
+  const { db } = openLocalDb(legacyBus([]));
+  db.prepare(`INSERT INTO handles (name, first_seen, last_seen) VALUES ('Gray', 1, 1)`).run();
+  const lines: string[] = [];
+  expect(() => db.transaction(() => { lowercaseLegacyHandles(db, (l) => lines.push(l)); throw new Error("later step"); })()).toThrow("later step");
+  expect(lines).toEqual([]);
+  expect(count(db, `SELECT COUNT(*) AS n FROM handles WHERE name = 'Gray'`)).toBe(1);
+  db.transaction(() => lowercaseLegacyHandles(db, (l) => lines.push(l)))();
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain(`"Gray" is now "gray"`);
   db.close();
 });

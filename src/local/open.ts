@@ -154,7 +154,8 @@ function initLocalSchema(db: Database): void {
   initCoreSchema(db);
   // Every 1.x handle is an alias (#284), with its durable facts. Seeded on
   // every open, not once: a 1.x grayboard sharing this file may still add
-  // handles, and local mode never deletes an alias, so none comes back.
+  // handles. Local mode deletes an alias only where #216's case move merges
+  // a 1.x `Gray` into `gray`, and that step runs right after this one.
   db.exec(`
     INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_at, last_seen)
     SELECT name, 'person', NULL, name, human, queue_off, first_seen, last_seen FROM handles WHERE name NOT LIKE '~%';

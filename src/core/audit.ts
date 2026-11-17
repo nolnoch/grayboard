@@ -18,7 +18,8 @@
 // id.child_fallback and id.promoted, a runner child (#523 step 5) running
 // as its own session for want of a live root, and binding a name;
 // alias.case_moved and alias.case_collision, a 1.x mixed-case handle moved
-// to its lowercase name at open, or left for want of a free one (#216).
+// (or merged) into its lowercase name at open, or left where a merge would
+// change who the name is (#216).
 // Rows land in the shared audit_log table (core/schema.ts) and are pruned
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
