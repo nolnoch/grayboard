@@ -54,7 +54,7 @@ beforeEach(async () => {
   store = openDatabase(scratchDbPath(), { blobDir: dir });
   application = createApplication(store.repo);
   revoked = new Set();
-  resources = createResources(application, { isAuthorized: s => !revoked.has(s) });
+  resources = createResources(application, { isCurrent: () => true, isAuthorized: s => !revoked.has(s) });
   const user = async (email: string): Promise<AuthedUser> => {
     const u = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
     return { user_id: u.id, user_email: email, session_id: 0 };
@@ -431,7 +431,7 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
   resources.close();
   const failure = internal ? new ApplicationError("internal", "storage unavailable") : new Error("storage unavailable");
   let failed = false;
-  resources = createResources(application, { isAuthorized: () => {
+  resources = createResources(application, { isCurrent: () => true, isAuthorized: () => {
     if (failed && boundary === "grant") throw failure;
     return true;
   } });
@@ -465,7 +465,7 @@ for (const background of ["revalidate", "hint", "closed"] as const) test(`backgr
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   resources.close();
   let failed = false;
-  resources = createResources(application, { isAuthorized: () => {
+  resources = createResources(application, { isCurrent: () => true, isAuthorized: () => {
     if (failed) throw new Error("grant storage unavailable");
     return true;
   } });
@@ -537,7 +537,7 @@ test("configured watch caps admit past the defaults and refuse at the configured
   resources.close();
   application.stopExpiry();
   application = createApplication(store.repo, { observerCap: 1100 });
-  resources = createResources(application, { isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
+  resources = createResources(application, { isCurrent: () => true, isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
   const a = await select(alice);
   await call(a, "board_create", { name: "wide", purpose: "capacity" });
   for (let i = 0; i < 1100; i++) resources.watch(a, "grayboard://boards/wide", hooks(), true);
@@ -547,7 +547,7 @@ test("configured watch caps admit past the defaults and refuse at the configured
 
 test("#998 audit: list and read check access on the handle they read on, a body's Tx inside one", async () => {
   const handles: ("pool" | "tx")[] = [];
-  const checked = createResources(application, { isAuthorized: (_s, r) => { handles.push(r === undefined || r === store.repo.read ? "pool" : "tx"); return true; } });
+  const checked = createResources(application, { isCurrent: () => true, isAuthorized: (_s, r) => { handles.push(r === undefined || r === store.repo.read ? "pool" : "tx"); return true; } });
   const a = await select(alice);
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   await seed(store.repo, async tx => { await checked.list(tx, a); await checked.read(tx, a, boardResourceUri("e2e")); });
