@@ -18,7 +18,7 @@ import { SlackError, SlackWeb } from "../bridge/web.ts";
 import { releaseStored, requestAttachment, storeUpload } from "./attachments.ts";
 import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
-import type { Repo, SlackLink } from "./db.ts";
+import type { Repo, SlackLink, SlackThread } from "./db.ts";
 import { onAliasCreated } from "./teams.ts";
 import { ApplicationError, type Application, type ApplicationSession, type DeliverySink, type RefusalRow } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
@@ -320,20 +320,53 @@ export class SlackBridge implements SlackLinker {
       const m = outbox.get(id)?.meta ?? {};
       return m.board && m.post_id ? `post:${m.post_id}` : `dm:${m.message_id}`;
     };
+    // The store's writes are posted (#807 D4): RelayStore is sync, shared with the local bridge's store. A post waits
+    // behind another body's hold, and its reads go to committed state, so a read could miss the relay's own earlier
+    // write (#1016): a second item in a new thread posted unthreaded, a stale peer, a retry's stale progress. Until its
+    // last write commits, a row's value as those writes leave it is kept here, and reads take it first. An entry is
+    // dropped by the commit of the write that last set it; one whose write failed stays: the relay did what it records.
+    let seq = 0;
+    const pendingThreads = new Map<string, { row: SlackThread; seq: number }>();
+    const pendingProgress = new Map<string, { value: unknown; seq: number }>();
+    const threadByTs = (ts: string) => pendingThreads.get(ts)?.row ?? repo.slack.threadByTs(repo.read, link.user_id, ts);
+    const postThread = (row: SlackThread, write: (tx: Tx) => void, what: string) => {
+      const mine = ++seq;
+      pendingThreads.set(row.thread_ts, { row, seq: mine });
+      repo.post(write, () => { if (pendingThreads.get(row.thread_ts)?.seq === mine) pendingThreads.delete(row.thread_ts); }, what);
+    };
     const store: RelayStore = {
-      thread: (kind, board, root) => repo.slack.thread(repo.read, link.user_id, kind, board, root),
-      byTs: (ts) => repo.slack.threadByTs(repo.read, link.user_id, ts),
-      // The store's writes are posted (#807 D4): RelayStore is sync, shared with the local bridge's store. Under
-      // SQLite a post runs at once; it goes async with the async Repo (Postgres).
-      addThread: (row) => { repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row"); },
-      advance: (ts, id, peer) => { repo.post(tx => repo.slack.advanceThread(tx, link.user_id, ts, id, peer), undefined, "Slack thread advance"); },
+      thread: (kind, board, root) => {
+        for (const { row } of pendingThreads.values()) if (row.kind === kind && (row.board ?? null) === (board ?? null) && row.root_id === root) return row;
+        return repo.slack.thread(repo.read, link.user_id, kind, board, root);
+      },
+      byTs: threadByTs,
+      // INSERT OR IGNORE: a row already there stays as it is.
+      addThread: (row) => {
+        if (threadByTs(row.thread_ts)) { repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row"); return; }
+        postThread({ ...row, board: row.board ?? null }, tx => repo.slack.addThread(tx, link.user_id, row), "Slack thread row");
+      },
+      // As advanceThread's UPDATE: last_id only moves forward, and peer follows only a newer id.
+      advance: (ts, id, peer) => {
+        const write = (tx: Tx) => repo.slack.advanceThread(tx, link.user_id, ts, id, peer);
+        const row = threadByTs(ts);
+        if (!row) { repo.post(write, undefined, "Slack thread advance"); return; }
+        postThread({ ...row, peer: peer != null && id > row.last_id ? peer : row.peer, last_id: Math.max(row.last_id, id) }, write, "Slack thread advance");
+      },
       enqueue: (params) => {
         outbox.set(++next, params as ChannelParams);
         return next;
       },
       pending: () => [...outbox].map(([id, p]) => ({ id, params: JSON.stringify(p) })),
-      progress: (id) => repo.slack.progress(repo.read, link.user_id, ref(id)),
-      setProgress: (id, progress) => { const r = ref(id); repo.post(tx => repo.slack.setProgress(tx, link.user_id, r, progress), undefined, "Slack progress"); },
+      progress: (id) => {
+        const r = ref(id), pending = pendingProgress.get(r);
+        return pending ? structuredClone(pending.value) : repo.slack.progress(repo.read, link.user_id, r);
+      },
+      setProgress: (id, progress) => {
+        // A copy: the relay keeps mutating its progress object after saving it, as the stored JSON doesn't see.
+        const r = ref(id), mine = ++seq, value = structuredClone(progress);
+        pendingProgress.set(r, { value, seq: mine });
+        repo.post(tx => repo.slack.setProgress(tx, link.user_id, r, value), () => { if (pendingProgress.get(r)?.seq === mine) pendingProgress.delete(r); }, "Slack progress");
+      },
       done: (id) => {
         const p = outbox.get(id);
         const m = p?.meta ?? {};
@@ -350,7 +383,7 @@ export class SlackBridge implements SlackLinker {
           if (m.board && m.post_id) application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
           else if (m.message_id) application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
           repo.slack.clearProgress(tx, link.user_id, r);
-        }, () => { outbox.delete(id); }, "Slack receipt");
+        }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt");
         if (!now) outbox.delete(id);
       },
     };

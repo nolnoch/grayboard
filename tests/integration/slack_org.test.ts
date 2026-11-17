@@ -440,6 +440,37 @@ test("#807: a Slack delivery receipt waits for the write queue, then stamps the 
   } finally { repo.post = post; slack.onPost = null; holder?.release(); }
 });
 
+// #1016: the relay's thread row is a posted write. A Slack reply that arrives while the row waits in the write queue
+// reads it from the store's pending writes, so it reaches the agent rather than being refused as an unconnected thread.
+test("#1016: a Slack reply in a thread whose row waits in the write queue reaches the agent", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  let holder: ReturnType<typeof holdQueue> | undefined;
+  // Held as Slack takes the post, so the thread row queues behind it.
+  slack.onPost = (body) => { if (!holder && String(body.markdown_text).includes("thread fixture")) holder = holdQueue(); };
+  try {
+    const q = await be.call<SendResult>("dm_send", { to: "human", body: "thread fixture" });
+    const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("thread fixture") && slack.postTs.has(p)), 5000, "Slack answered the post");
+    const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+    expect(srv.app.repo.slack.threadByTs(srv.app.repo.read, userId, tsOf(top))).toBeUndefined();
+    // The reply's dm_send queues behind the hold too: its write is the sign the relay read the thread's row.
+    const repo = srv.app.repo, { write } = repo;
+    let writes = 0;
+    repo.write = ((...a: Parameters<typeof write>) => { writes++; return write.apply(repo, a); }) as typeof write;
+    const seen = slack.posts().length;
+    try {
+      slack.say("queued reply", { thread_ts: tsOf(top) });
+      await until(() => writes > 0 || slack.posts().length > seen, 5000, "the relay took the reply");
+    } finally { repo.write = write; }
+    holder!.release();
+    await holder!.done;
+    const got = (await be.next(direct((m) => m.body === "queued reply"), 5000)).event.message;
+    expect(got).toMatchObject({ sender: "alice@example.com/human", parent_id: q.message_id });
+    expect(slack.posts().slice(seen).map((p) => p.markdown_text)).not.toContainEqual(expect.stringContaining("isn't connected"));
+  } finally { slack.onPost = null; holder?.release(); }
+});
+
 test("#807: an unlink for one Slack account leaves a link that moved to another account while it waited", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
