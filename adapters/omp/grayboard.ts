@@ -57,6 +57,18 @@ const QUIT_KILL_MS = 400;
 const RESTART_DELAYS_MS = [0, 1_000, 5_000];
 const STABLE_MS = 60_000;
 
+// A tool call's wait for the grayboard process (a transition, a restart's
+// backoff, initialization) ends at the call's abort, as pi's does (#559): a
+// wedged or backing-off process mustn't hold the call until it recovers.
+function abortable<T>(wait: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return wait;
+  if (signal.aborted) return Promise.reject(new Error("aborted"));
+  const waiter = Promise.withResolvers<T>();
+  const onAbort = () => waiter.reject(new Error("aborted"));
+  signal.addEventListener("abort", onAbort, { once: true });
+  return Promise.race([wait, waiter.promise]).finally(() => signal.removeEventListener("abort", onAbort));
+}
+
 // A subagent serves grayboard's tools only for the top-level session that runs
 // the grayboard process. One omp process can run several top-level sessions
 // (ACP), each with its own runtime and agent id; a subagent of another would
@@ -357,14 +369,14 @@ export default function grayboard(pi: ExtensionAPI) {
     return transition;
   };
 
-  const currentChild = async (): Promise<Child> => {
+  const currentChild = async (signal?: AbortSignal): Promise<Child> => {
     for (;;) {
       const transition = shared.transition;
-      try { await transition; } catch (error) { if (transition === shared.transition) throw error; }
-      if (!shared.child && shared.restart) await shared.restart;
+      try { await abortable(transition ?? Promise.resolve(), signal); } catch (error) { if (signal?.aborted || transition === shared.transition) throw error; }
+      if (!shared.child && shared.restart) await abortable(shared.restart, signal);
       const c = shared.child;
       if (!c) throw new Error(shared.exitReason ?? "grayboard: no grayboard process runs in this omp process");
-      await c.ready;
+      await abortable(c.ready, signal);
       if (c === shared.child && transition === shared.transition) return c;
     }
   };
@@ -528,7 +540,7 @@ export default function grayboard(pi: ExtensionAPI) {
           do {
             selection = shared.selected;
             transition = shared.transition;
-            c = await currentChild();
+            c = await currentChild(signal);
           } while (selection !== shared.selected || transition !== shared.transition || c !== shared.child);
           if ((!sub && shared.owner !== pi) || (sub && !ownersSubagent(ctx.agent.parentId))) throw new Error(NOT_OWNERS);
           if (!sub && selection?.id !== ctx.sessionManager.getSessionId()) throw new Error("grayboard: the selected omp conversation changed before this call");

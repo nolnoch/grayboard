@@ -66,7 +66,9 @@ export function taskFanout(n: number, trigger: RegExp, child: (i: number) => Rep
 
 export type FakeModel = { port: number; requests: Recorded<ChatRequest>[]; unhandled: Recorded<string>[]; stop: () => void };
 
-export function startFakeModel(rules: Rule[]): FakeModel {
+// `hold`: a reply waits for the promise it returns for that request, so a
+// test can act after a turn's hooks ran and before its tool call executes.
+export function startFakeModel(rules: Rule[], { hold }: { hold?: (req: ChatRequest) => Promise<void> | undefined } = {}): FakeModel {
   const requests: Recorded<ChatRequest>[] = [];
   const unhandled: Recorded<string>[] = [];
   const server = Bun.serve({
@@ -80,6 +82,7 @@ export function startFakeModel(rules: Rule[]): FakeModel {
       }
       const body = (await req.json()) as ChatRequest;
       requests.push({ method: req.method, path, body });
+      await hold?.(body);
       const reply = rules.reduce<Reply | undefined>((r, rule) => r ?? rule(body), undefined) ?? { text: "nothing to do" };
       return "text" in reply
         ? sse({ content: reply.text }, "stop")
