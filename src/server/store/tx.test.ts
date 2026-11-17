@@ -278,6 +278,7 @@ test("repo.read inside the caller's own transaction is refused; the body's Tx, o
     expect(rows(tx)).toEqual(["a"]);
     await tick();
     expect(() => rows(repo.read)).toThrow(refusal);
+    expect(() => repo.aliases.find(repo.read, "x@example.com/be")).toThrow(refusal);
   });
   // (c) Another task, while a body holding the transaction awaits: committed state, no throw.
   let release!: () => void;
