@@ -74,6 +74,13 @@ export const RESUME_HINT = "run /grayboard resume";
 // A tool call that failed: the call itself is what to retry.
 const RETRY_HINT = "call the tool again";
 const SOURCE = "grayboard";
+// How long a model call waits for the instructions before going out without
+// them, and how long after a timeout or failure it skips the fetch: a server
+// that accepts connections and stalls would otherwise hold every prompt for
+// the connect timeout (#438-25).
+export const INSTRUCTIONS_WAIT_MS = 2_000;
+export const INSTRUCTIONS_BACKOFF_MS = 30_000;
+const LATE = Symbol("late");
 
 // A tool's arguments and MCP result as both entries' tools take and return
 // them: text and image blocks, and an error said in text when the server
@@ -469,14 +476,37 @@ export function createGrayboard(h: Harness): Grayboard {
   // System-prompt section: the server's instructions for this session. A
   // child registers first: the text an unregistered session gets tells it to
   // bind, which the server refuses a child.
+  // Bounded by INSTRUCTIONS_WAIT_MS; a timeout or failure is said once until a
+  // fetch succeeds, and starts INSTRUCTIONS_BACKOFF_MS without fetching. A
+  // sign-out is said by the sign-in path, so it is neither said here nor
+  // backed off: the first call after a login fetches.
+  let quietUntil = 0;
+  let failing = false;
   const instructions = async (): Promise<string | undefined> => {
-    if (!session) return undefined;
-    try {
+    if (!session || Date.now() < quietUntil) return undefined;
+    const s = session;
+    const fetching = (async () => {
       if (root) return await root.instructions();
       if (!proxy) return undefined;
-      if (role.kind === "child") await enlist(role, session.id);
-      return await proxy.instructions(session.id);
-    } catch { return undefined; }
+      if (role.kind === "child") await enlist(role, s.id);
+      return await proxy.instructions(s.id);
+    })();
+    fetching.catch(() => {}); // a fetch that outlives the deadline settles unobserved
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<typeof LATE>(resolve => { timer = setTimeout(() => resolve(LATE), INSTRUCTIONS_WAIT_MS); });
+    let why: string;
+    try {
+      const text = await Promise.race([fetching, late]);
+      if (text !== LATE) { failing = false; return text; }
+      why = `took longer than ${INSTRUCTIONS_WAIT_MS} ms`;
+    } catch (error) {
+      if (error instanceof AccessExpired) return undefined;
+      why = `failed: ${message(error)}`;
+    } finally { clearTimeout(timer); }
+    quietUntil = Date.now() + INSTRUCTIONS_BACKOFF_MS;
+    if (!failing) log(`fetching the instructions ${why}; model requests go out without them, trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s`, "warning");
+    failing = true;
+    return undefined;
   };
 
   // ---- /grayboard ----
