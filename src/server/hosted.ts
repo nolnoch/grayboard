@@ -7,7 +7,8 @@ import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
-import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
+import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
+import type { AuthedUser } from "./auth.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
 import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
@@ -240,6 +241,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (root) await admitChild(tx, root, own);
   }
   const holders = new Map<string, { row: HostedSession; session: ApplicationSession }>();
+  // A named row's facts as its transaction commits (readHolder): its row and holds, and what a new holder's build
+  // reads when the current holder doesn't match (null: the row's user is gone).
+  type HolderFacts = { row?: HostedSession; held: string[]; build?: { authed: AuthedUser; facts: BuildFacts } | null };
   const listeners = new Set<(changed: string | null) => void>();
   let stopped = false;
   const gate = (id: string) => {
@@ -362,46 +366,102 @@ export function createHostedSessions(application: Application, options: { now?: 
   // Whether the root holds a name or writes as one; a root with neither reads and nothing else.
   const named = (root: HostedSession, held = application.hostedHolds(repo.read, root.session_id)) => held.length > 0 || root.writes_as !== null;
   // A root that holds a name has a holder session, rebuilt when its ownership or generation changes. `changed`:
-  // the one row a commit changed (#399); null (startup, the backstop timer, a grant or user change) checks every
-  // root.
+  // the one row a commit changed (#399), with `facts` read on its committing transaction just before COMMIT
+  // (#807 P3 A7g1, readHolder); null (startup, the backstop timer, a grant or user change) checks every root, in a
+  // queued transaction of its own (requestFull).
   // The listeners run even when a holder rebuild throws: the stream timer's stamps go stale only through them (#899).
-  function reconcile(changed: string | null = null) {
-    try { rebuild(changed); } finally { for (const listener of listeners) listener(changed); }
-  }
-  function rebuild(changed: string | null) {
-    if (changed !== null) {
-      const row = store.get(repo.read, changed), holder = holders.get(changed);
-      const held = row && !row.root_session_id && row.parked_at === null ? application.hostedHolds(repo.read, changed) : [];
-      if (holder && (!row || !held.length || row.ownership_id !== holder.row.ownership_id || row.bind_gen !== holder.row.bind_gen)) {
-        application.close(holder.session);
-        holders.delete(changed);
+  // For null they run now, before the full pass's read: they never waited on it. The promise is the full pass's.
+  function reconcile(changed: string | null = null, facts?: HolderFacts): Promise<void> {
+    let full: Promise<void> | undefined;
+    try {
+      if (changed === null) full = requestFull();
+      else if (!stopped) {
+        if (facts) applyNamed(changed, facts);
+        else full = requestFull(); // a synchronous body's commit, or a failed facts read
       }
-      // policyNow's sync user read (#807 P3 A7u2): rebuild runs from an afterCommit observer; A7g moves it.
-      const user = row && held.length && !holders.has(changed) ? repo.policyNow.userById(row.user_id) : undefined;
-      if (row && user) holders.set(changed, { row, session: application.hostedSession(repo.read, { user_id: user.id, user_email: user.email, session_id: 0 }, changed, held, null, row, quietSink).session });
-      return;
+    } finally { for (const listener of listeners) listener(changed); }
+    return full ?? Promise.resolve();
+  }
+  const authedOf = (user: { id: number; email: string }): AuthedUser => ({ user_id: user.id, user_email: user.email, session_id: 0 });
+  const matches = (row: HostedSession, holder: { row: HostedSession } | undefined) =>
+    !!holder && row.ownership_id === holder.row.ownership_id && row.bind_gen === holder.row.bind_gen;
+  // A row's facts on the committing Tx, in its beforeCommit hook (db.ts readFacts). `holders` is read here, before
+  // COMMIT, and applied after it, sound because it changes only in an apply (an afterCommit flush or the full pass's
+  // `committed`, both run by the write queue's holder) and in close(): from this hook through COMMIT to the flush
+  // the queue stays held, so only close() can come between, and the apply checks `stopped`. A matching holder needs
+  // no build, so a renew reads only the row and its holds. `build` null: the row's user is gone.
+  async function readHolder(tx: Tx, id: string): Promise<HolderFacts> {
+    const row = store.get(tx, id);
+    const held = row && !row.root_session_id && row.parked_at === null ? application.hostedHolds(tx, id) : [];
+    if (!row || !held.length || matches(row, holders.get(id))) return { row, held };
+    const user = await repo.users.findById(tx, row.user_id);
+    if (!user) return { row, held, build: null };
+    const authed = authedOf(user);
+    return { row, held, build: { authed, facts: await application.hostedBuildFacts(tx, authed, id, { holds: held, writesAs: null, suggested: row.suggested, root: null }) } };
+  }
+  function applyNamed(id: string, { row, held, build }: HolderFacts) {
+    const holder = holders.get(id);
+    if (holder && (!row || !held.length || !matches(row, holder))) {
+      application.close(holder.session);
+      holders.delete(id);
     }
-    const held = application.holdsByOwner();
-    const rows = store.all(repo.read).filter(r => !r.root_session_id && held.has(r.session_id));
+    if (!row || !held.length || holders.has(id) || build === null) return;
+    // Only close() can change `holders` between the read and here, and it stops the apply first: defensive.
+    if (!build) { console.error(`hosted ${id}: holder facts read without a build; reconciling every root`); void requestFull().catch(e => hostedFailure("hosted.reconcile", e)); return; }
+    holders.set(id, { row, session: application.hostedBuild(build.authed, id, held, null, row, quietSink, build.facts).session });
+  }
+  // The full pass: one queued transaction reads every root and the builds it needs, and `committed` applies them
+  // before the queue's next body, so no commit lands between the read and the apply. Coalesced: a request while one
+  // is queued and not yet started shares it; one that arrives once it has started (its read may be stale) queues
+  // another.
+  let fullQueued: { promise?: Promise<void> } | undefined;
+  function requestFull(): Promise<void> {
+    if (stopped) return Promise.resolve();
+    if (fullQueued?.promise) return fullQueued.promise;
+    const mine: { promise?: Promise<void> } = {};
+    fullQueued = mine;
+    // Cleared again when it settles: a write refused before its body starts (a failed BEGIN) must not leave every
+    // later request sharing its rejection.
+    mine.promise = store.write(async tx => {
+      if (fullQueued === mine) fullQueued = undefined;
+      return readAll(tx);
+    }, applyAll).finally(() => { if (fullQueued === mine) fullQueued = undefined; });
+    return mine.promise;
+  }
+  async function readAll(tx: Tx) {
+    const held = application.holdsByOwner(tx);
+    const rows = store.all(tx).filter(r => !r.root_session_id && held.has(r.session_id));
+    const builds = new Map<string, { authed: AuthedUser; facts: BuildFacts }>();
+    for (const row of rows) {
+      if (matches(row, holders.get(row.session_id))) continue;
+      const user = await repo.users.findById(tx, row.user_id);
+      if (!user) continue;
+      const authed = authedOf(user);
+      builds.set(row.session_id, { authed, facts: await application.hostedBuildFacts(tx, authed, row.session_id, { holds: held.get(row.session_id)!, writesAs: null, suggested: row.suggested, root: null }) });
+    }
+    await testPauseAsync("hosted:reconcile:read");
+    return { held, rows, builds };
+  }
+  function applyAll({ held, rows, builds }: Awaited<ReturnType<typeof readAll>>) {
+    if (stopped) return;
     const live = new Map(rows.map(r => [r.session_id, r]));
     for (const [id, holder] of holders) {
       const row = live.get(id);
-      if (!row || row.ownership_id !== holder.row.ownership_id || row.bind_gen !== holder.row.bind_gen) {
+      if (!row || !matches(row, holder)) {
         application.close(holder.session);
         holders.delete(id);
       }
     }
     for (const row of rows) if (!holders.has(row.session_id)) {
-      const user = repo.policyNow.userById(row.user_id);
-      if (!user) continue;
-      const { session } = application.hostedSession(repo.read, { user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row, quietSink);
-      holders.set(row.session_id, { row, session });
+      const build = builds.get(row.session_id);
+      if (!build) continue; // its user is gone
+      holders.set(row.session_id, { row, session: application.hostedBuild(build.authed, row.session_id, held.get(row.session_id)!, null, row, quietSink, build.facts).session });
     }
   }
   // The sweep finds its rows by query (#399); a request settles only its own (`settle`). `full`: the idle and
   // disabled passes too, which the timer runs every IDLE_EVERY ticks (the idle window is minutes, and
   // setDisabled ends a disabled user's rows itself, so that pass is a backstop). A test's injected clock calls
-  // it directly. The commits tell reconcile which rows changed.
+  // it directly. The commits tell reconcile which rows changed, and their facts are read on the committing transaction.
   // Through the write queue (startup's first sweep too, which the server's `ready` waits for before anything serves,
   // #807 P3 A4). `nested`: inside the caller's transaction (a capacity refusal's re-sweep), on `outer`, that
   // transaction's Tx.
@@ -644,11 +704,11 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   // `held`: the root's holds, when the caller read them for this row with no await since (#902).
   // `known`: row's root, when the caller just read it.
-  function snapshot(p: OAuthPrincipal, row?: HostedSession, held?: string[], known?: HostedSession) {
+  async function snapshot(p: OAuthPrincipal, row?: HostedSession, held?: string[], known?: HostedSession) {
     const root = row ? known ?? rootOf(repo.read, row) : undefined;
     // A child acts under its root's addresses, and its writes carry its own ID as `via` (#523).
     const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
-    return { ...application.hostedSession(repo.read, p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(repo.read, root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
+    return { ...await application.hostedSession(repo.read, p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(repo.read, root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
   // The rows are read after the token check's await, back to back with none between them.
   async function fence(r: Read, p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
@@ -686,6 +746,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     get refusalRowsLost() { return refusalRowsLost; },
     // Bound sessions this process holds a name for: O(1), for the metrics scrape (#805).
     get holderCount() { return holders.size; },
+    // A root's holder session's stamp, for tests.
+    holder(id: string) { const h = holders.get(id); return h && { ownership: h.row.ownership_id, generation: h.row.bind_gen }; },
     now,
     leaseTtl,
     gate,
@@ -714,7 +776,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async snapshot(p: OAuthPrincipal, context: SessionContext, endTouch = true, create = true) {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(repo.read, row) : undefined;
-        return { ...snapshot(p, row, undefined, root), verdict: row && root ? { row, root } as Verdict : undefined };
+        return { ...await snapshot(p, row, undefined, root), verdict: row && root ? { row, root } as Verdict : undefined };
       }, false, true, endTouch, create);
     },
     // `told` (a native tool call): gets the alias_lost notice, if any, for the result. `prior`: its exchange's
@@ -729,7 +791,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
           throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
         }
-        const selected = snapshot(p, row, held, root);
+        const selected = await snapshot(p, row, held, root);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
         try {
@@ -751,7 +813,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(repo.read, row) : undefined;
         if (!(root && named(root))) throw new ApplicationError("unbound", "attachments require a bound source session");
-        const selected = snapshot(p, row);
+        const selected = await snapshot(p, row);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
         // fence only reads, its row reads back to back with no await after its token check's, so no transaction:
@@ -827,7 +889,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (other && !other.root_session_id && ((other.lease_deadline !== null && other.lease_deadline <= now()) || (other.lease_deadline === null && idleAt(other)))) {
           await store.end(tx, other.session_id, other.lease_deadline === null ? "idle" : "expired", now());
         }
-        const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
+        const selected = await application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
           const ok = await application.bindNow(tx, selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) });
@@ -862,7 +924,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async unbind(p: OAuthPrincipal, context: SessionContext, args: { name: string }, declared?: DeclaredDelivery) {
       const result = await service.owning(p, context, async (row, defer, tx) => {
         const before = application.hostedHolds(tx, row.session_id);
-        const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
+        const selected = await application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
           const ok = await application.unbind(tx, selected.session, args.name);
@@ -977,8 +1039,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   let unsubscribe = () => {};
   const ready = creditDowntime().then(() => {
     if (stopped) return;
-    unsubscribe = store.subscribe(reconcile);
-    return sweep(true).then(() => { if (!stopped) reconcile(); });
+    unsubscribe = store.subscribe<HolderFacts>((changed, facts) => { void reconcile(changed, facts).catch(e => hostedFailure("hosted.reconcile", e)); }, readHolder);
+    return sweep(true).then(() => requestFull());
   });
   let beat = now(), tick = 0, sweeping = false, fullDue = false;
   const timer = setInterval(() => {
@@ -992,7 +1054,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       sweep(full).catch(e => hostedFailure("hosted.sweep", e)).finally(() => { sweeping = false; });
     }
     // The backstop: holds can change outside the hosted store's commits (#399).
-    if (tick % RECONCILE_EVERY === 0) try { reconcile(); } catch (e) { hostedFailure("hosted.reconcile", e); }
+    if (tick % RECONCILE_EVERY === 0) try { reconcile().catch(e => hostedFailure("hosted.reconcile", e)); } catch (e) { hostedFailure("hosted.reconcile", e); }
     const t = now();
     if (t - beat >= HEARTBEAT_MS || t < beat) {
       const last = beat;

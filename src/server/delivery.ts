@@ -127,10 +127,22 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, async (row, _defer, tx) => {
-        if (!application.hostedHolds(tx, row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
+        const holds = application.hostedHolds(tx, row.session_id);
+        if (!holds.length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
         await hosted.seeLost(tx, p, row);
-        previous = bySession.get(row.session_id);
-        if (previous && matches(previous, row)) { previous.context = openOptions.context ?? true; return previous; }
+        const reuse = () => {
+          previous = bySession.get(row.session_id);
+          if (!previous || !matches(previous, row)) return undefined;
+          previous.context = openOptions.context ?? true;
+          return previous;
+        };
+        const kept = reuse();
+        if (kept) return kept;
+        // The session's facts on this transaction (#807 P3 A7g1), so `committed` builds it without reading. The
+        // lease map is read again after the await: a close can change it meanwhile (D4's exception).
+        const facts = await application.hostedBuildFacts(tx, p.authed, row.session_id, { holds, writesAs: null, suggested: row.suggested, root: null });
+        const again = reuse();
+        if (again) return again;
         // A lease this open replaces (another grant's) frees its slot here, not after the check; a
         // session is one user's, so that slot is this user's.
         const replaced = previous ? 1 : 0;
@@ -138,16 +150,16 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const expiresAt = now() + ttl;
         await store.update(tx, { ...row, lease_deadline: expiresAt, last_seen_at: now() });
         await hosted.audit(tx, row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null, ...(openOptions.context === false ? { context: false } : {}) });
-        return { row, expiresAt };
+        return { row, expiresAt, holds, facts };
       }, result => {
         if ("capability" in result) return opened(result, false, hooks);
         if (previous) finish(previous);
-        const { row, expiresAt } = result;
+        const { row, expiresAt, holds, facts } = result;
         let lease!: Lease;
-        const selected = application.hostedSession(pool, p.authed, row.session_id, application.hostedHolds(pool, row.session_id), null, row, {
+        const selected = application.hostedBuild(p.authed, row.session_id, holds, null, row, {
           deliver() { if (lease && matches(lease, store.get(pool, lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
           closed() { if (lease) finish(lease); },
-        }, true);
+        }, facts, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
           ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false,
           context: openOptions.context ?? true };

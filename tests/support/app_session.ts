@@ -190,7 +190,7 @@ export class AppSession {
           : null;
         await this.application.hostedRegister(tx, authed, id, this.opts.harness ?? "test", writesAs, why => later(w => this.application.hostedCollided(w, authed, id, why)));
         if (this.opts.launcher && writesAs === null) await this.application.hostedDeclareLauncher(tx, authed, id, { ownership: 0, client_id: "test" });
-        return this.application.hostedSession(tx, authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
+        return await this.application.hostedSession(tx, authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
       }));
     } catch (e) {
       await this.flushRefusal(rows);

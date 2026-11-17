@@ -304,9 +304,9 @@ test("unbound hosted reads never use the human address and still list and read b
   const principalOf = store.repo.policyNow.principalOf.bind(store.repo.policyNow);
   store.repo.policyNow.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
-  const unregistered = application.hostedSession(store.repo.read, alice, "id:0000000000000", [], null, null, delivery()).session;
+  const unregistered = (await application.hostedSession(store.repo.read, alice, "id:0000000000000", [], null, null, delivery())).session;
   await seed(store.repo, tx => application.hostedRegister(tx, alice, "id:1111111111111", "opencode"));
-  const registered = application.hostedSession(store.repo.read, alice, "id:1111111111111", [], null, null, delivery()).session;
+  const registered = (await application.hostedSession(store.repo.read, alice, "id:1111111111111", [], null, null, delivery())).session;
   for (const session of [unregistered, registered]) {
     expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).toContain("e2e");
     expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).not.toContain("secret");
@@ -324,9 +324,9 @@ test("unbound hosted reads never use the human address and still list and read b
 
 test("a hosted session whose hello facts throw is left unregistered (#385 item 9)", async () => {
   const pushed: unknown[] = [];
-  const teams = spyOn(store.repo.policyNow, "teamsOf").mockImplementation(() => { throw new Error("db gone"); });
+  const teams = spyOn(store.repo.teams, "listForUser").mockImplementation(() => Promise.reject(new Error("db gone")));
   try {
-    expect(() => application.hostedSession(store.repo.read, alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).toThrow("db gone");
+    await expect(application.hostedSession(store.repo.read, alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).rejects.toThrow("db gone");
   } finally { teams.mockRestore(); }
   // An unheld "be": a DM to it is pushed only to a session the hub routes it to.
   await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com"));
@@ -346,7 +346,7 @@ test("unbound hosted sessions cannot use named operations or persist synthetic h
       writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null,
     });
   });
-  const { session, info } = application.hostedSession(store.repo.read, alice, "hosted-unbound", [], null, null, delivery());
+  const { session, info } = await application.hostedSession(store.repo.read, alice, "hosted-unbound", [], null, null, delivery());
   expect(session.writerId).toBeUndefined();
   expect(info.candidates).toEqual([]);
   expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email)).toEqual([]);
@@ -380,7 +380,7 @@ test("hold sessions block binding and candidates without push or online presence
   const owner = await connect(alice, "held", { push: false, hold: true, key: "hold-secret" });
   await owner.call("peer_status", { text: "working" });
   const tools = await connect(alice, "held", { push: false });
-  const observer = application.hostedSession(store.repo.read, alice, "hosted-observer", [], null, null, delivery()).session;
+  const observer = (await application.hostedSession(store.repo.read, alice, "hosted-observer", [], null, null, delivery())).session;
   expect(((await seed(store.repo, tx => application.call(tx, observer, "peer_list", { include_offline: true }))) as { peers: unknown[] }).peers).toMatchObject([{ online: false }]);
   expect(tools.session.toolsOnly).toBe(true);
   expect(tools.session.holds).toEqual([]);

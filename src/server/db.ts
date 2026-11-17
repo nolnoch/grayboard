@@ -301,10 +301,9 @@ export interface Repo {
   };
   // Policy's reads (and resolveMention's alias reads), synchronously on the SQLite connection (#807 P3 A7e1): the
   // loader authorizeNow drives, and the core Access seam's, until #807 B makes them async. Inside the caller's own
-  // transaction they read its writes. principalOf is principals.of. teamsOf serves helloOkFields, which the
-  // synchronous hostedSession reaches; userById the hosted service's synchronous rebuild (#807 P3 A7u2, until A7g).
-  // SQLite only: a Postgres Repo won't have it. policy.test.ts ratchets its callers.
-  policyNow: PolicyReadsSync & AccessReadsSync & { teamsOf(userId: number): Team[]; userById(userId: number): User | undefined };
+  // transaction they read its writes. principalOf is principals.of. SQLite only: a Postgres Repo won't have it.
+  // policy.test.ts ratchets its callers.
+  policyNow: PolicyReadsSync & AccessReadsSync;
   // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
   // async Access (A7): `listForScope` and `seen` feed the synchronous session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
   aliases: {
@@ -433,8 +432,8 @@ export interface Repo {
   };
   slack: {
     links(r: Read): Promise<SlackLink[]>;
-    // Synchronous for now (#807 P3 A6b): helloOkFields reads it in application.hostedSession, whose callers (hosted
-    // reconcile, the delivery lease's committed callback) are synchronous, and core's delegation fallback calls it.
+    // Synchronous for now (#807 P3 A6b): core's delegation fallback calls it. application.helloFacts reads it on the
+    // caller's handle.
     linkFor(r: Read, userId: number): SlackLink | undefined;
     linkBySlackUser(r: Read, slackUser: string): Promise<SlackLink | undefined>;
     // Replaces the user's earlier link, if any.
@@ -978,16 +977,56 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     c.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
   // Each changed row tells the observers after its transaction commits (#399); a rollback drops the notice with
   // the change. `null`: any row may have changed (a grant or a user), so observers check every one.
-  const observers = new Set<(changed: string | null) => void>();
-  const changed = (id: string | null) => afterCommit(db, () => { for (const fn of observers) { try { fn(id); } catch (error) { console.error("hosted invalidation failed", error); } } });
+  // An observer with `read` gets each named row's facts too, read on the committing transaction's root Tx in a
+  // beforeCommit hook (#807 P3 A7g1): the row's state as it commits, not as it was when the op ran. `pending` and
+  // `facts` are per observer, not per transaction, because the write queue runs one body at a time and holds itself
+  // from the hook through COMMIT to the notices' flush: no other transaction's marks or notices land in between. A
+  // mark deletes its id's facts first, so a notice never sees an earlier transaction's; a notice without facts (a
+  // synchronous body's Tx, which refuses the hook, or a failed read) is the observer's to handle.
+  type Observer = {
+    fn: (changed: string | null, facts?: unknown) => void;
+    read?: (tx: Tx, id: string) => Promise<unknown>;
+    pending: Set<string>;
+    facts: Map<string, unknown>;
+  };
+  const observers = new Set<Observer>();
+  const changed = (id: string | null) => afterCommit(db, () => {
+    for (const o of observers) {
+      try { o.fn(id, id === null ? undefined : o.facts.get(id)); } catch (error) { console.error("hosted invalidation failed", error); }
+    }
+  });
+  // Queues `id`'s facts read on `tx`'s transaction. Each read runs in its own savepoint and a failure is logged and
+  // leaves no facts, so a failed read never fails the commit (on Postgres an unsavepointed failure would abort it).
+  const readFacts = (tx: Tx, id: string) => {
+    for (const o of observers) {
+      const read = o.read;
+      if (!read) continue;
+      o.facts.delete(id);
+      o.pending.add(id);
+      try {
+        tx.beforeCommit(o, async root => {
+          const ids = [...o.pending];
+          o.pending.clear();
+          for (const each of ids) {
+            try { o.facts.set(each, await root.savepoint(t => read(t, each))); }
+            catch (error) { console.error("hosted facts read failed", error); }
+          }
+          // After this transaction's notices (registered before the hook ran): the facts served their flush.
+          try { root.afterCommit(() => { for (const each of ids) o.facts.delete(each); }); }
+          catch (error) { console.error("hosted facts clear failed", error); }
+        });
+      } catch { o.pending.delete(id); /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
+    }
+  };
   // An async op's notice waits for it to fulfil (#807 P3 A6c): one that rejects changed nothing, as a sync throw didn't.
   const then = <R>(value: R, notify: () => void): R => {
     if (!isThenable(value)) { notify(); return value; }
     return Promise.resolve(value).then(v => { notify(); return v; }) as R;
   };
   const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => then(fn(...args), () => changed(null));
-  const marks = <A extends unknown[], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R =>
-    then(fn(...args), () => changed(id(...args)));
+  // Every marked op takes its Tx first.
+  const marks = <A extends [Tx, ...unknown[]], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R =>
+    then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); changed(at); });
   const hosted = makeHostedStore(db);
   const { writesOn: _writesOn, ...hostedStore } = hosted;
   const oauth = makeOAuthStore(hosted);
@@ -1149,7 +1188,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, row) => row.session_id),
       end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
-      subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
+      subscribe(fn, read) {
+        const o: Observer = { fn: fn as Observer["fn"], read, pending: new Set(), facts: new Map() };
+        observers.add(o);
+        return () => { observers.delete(o); };
+      } },
     users: {
       async upsertByEmail(tx, email, displayName) {
         return upsertUser(sqliteOf(tx), email, displayName, clock());
@@ -1273,8 +1316,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       shareCollaborative: (userA, userB) => shareCollaborative(db, userA, userB),
       shareDelegating: (userA, userB) => shareDelegating(db, userA, userB),
       userByEmail: email => userByEmail(db, email),
-      teamsOf: userId => teamsOf(db, userId),
-      userById: userId => userById(db, userId),
       alias: address => aliasAt(db, address),
       aliasesNamed: name => aliasesNamed(db, name),
     },
