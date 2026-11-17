@@ -94,3 +94,31 @@ test("an auth-table write that commits without a tracked boundary still moves th
   await repo.write(() => {}, () => { sqliteOf(repo.read).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [user.id]); });
   expect(repo.authGeneration()).not.toBe(before);
 });
+
+// #807 P3 A7b: authRead's pin is per async task. Work its body starts keeps the body's generation after a commit moves
+// it; a lookup under that stale pin reads uncached and neither fills nor clears the cache a newer lookup keyed.
+test("a stale pin keeps its own generation, and its lookups neither fill nor clear the newer cache", async () => {
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const user = await repo.write(tx => repo.users.upsertByEmail(tx, "p@example.com", null));
+  let userReads = 0;
+  const query = db.query.bind(db);
+  db.query = ((sql: string) => { if (sql === "SELECT * FROM users WHERE id = ?") userReads++; return query(sql); }) as typeof db.query;
+  let resume!: () => void;
+  const g0 = repo.authGeneration();
+  // Boxed: authRead's body is synchronous until A7c; the continuation it starts runs later, under its pin.
+  const stale = repo.authRead(() => ({ later: new Promise<void>(r => { resume = r; }).then(() => ({ g: repo.authGeneration(), email: repo.users.activeEmail(user.id) })) })).later;
+  await repo.write(tx => repo.users.upsertByEmail(tx, "q@example.com", null));
+  const g1 = repo.authGeneration();
+  expect(g1).not.toBe(g0);
+  expect(repo.users.activeEmail(user.id)).toBe("p@example.com");
+  const filled = userReads;
+  expect(repo.users.activeEmail(user.id)).toBe("p@example.com");
+  expect(userReads).toBe(filled);
+  resume();
+  const seen = await stale;
+  expect(seen).toEqual({ g: g0, email: "p@example.com" });
+  expect(userReads).toBe(filled + 1);
+  // The newer cache survived the stale lookup.
+  expect(repo.users.activeEmail(user.id)).toBe("p@example.com");
+  expect(userReads).toBe(filled + 1);
+});
