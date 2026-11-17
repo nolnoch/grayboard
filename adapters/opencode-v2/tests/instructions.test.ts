@@ -145,6 +145,18 @@ test("watchRoots invalidates a root when its state, holds or ownership change, n
   expect(changed).toEqual(["R", "R", "R", "R", "B", "B"]);
 });
 
+test("watchRoots keeps at most its limit of shapes, the oldest going first (#538)", () => {
+  const changed: string[] = [];
+  const sink = watchRoots(() => {}, id => { changed.push(id); }, 2);
+  const rec = (sessionID: string) => sink({ state: "active", message: "", sessionID } as Parameters<Parameters<typeof watchRoots>[0]>[0]);
+  // An ended root's own end record lands after its forget, so only the bound keeps the map small.
+  rec("A"); rec("B"); rec("A"); rec("C");
+  expect(changed).toEqual(["A", "B", "C"]);
+  // B was the oldest: its shape went, so its next record is news; A and C are still known.
+  rec("A"); rec("B"); rec("C");
+  expect(changed).toEqual(["A", "B", "C", "B", "C"]);
+});
+
 test("the native fetcher names the root on a native connection with the launcher declaration and no delivery, and the controller reports bind and unbind", async () => {
   const f = fixture(), metadata = new Map<string, Record<string, unknown>>();
   const ctx = {
@@ -177,10 +189,14 @@ test("the native fetcher names the root on a native connection with the launcher
     for (const tool of ["grayboard_bind", "grayboard_unbind", "grayboard_whoami", "other_bind"]) await controller.after({ sessionID: "R", tool, id: "c", status: "error" });
     expect(changed).toEqual(["R", "R"]);
     // A fetch wire that fails to close is recorded, not swallowed (#538).
-    const closeFailed = spyOn(controller, "fetchCloseFailure");
+    // It names no session, so watchRoots never reads it as the root's change and refetches.
+    const failure = spyOn(controller as unknown as { failure: (...args: unknown[]) => void }, "failure");
     close.mockRejectedValueOnce(new Error("close failed"));
+    changed.length = 0;
     expect(await fetch("R", new AbortController().signal)).toBe(bound);
-    await until(() => closeFailed.mock.calls.length === 1, "the close failure");
+    await until(() => failure.mock.calls.length === 1, "the close failure");
+    expect(failure.mock.calls[0]).toEqual(["wire_close", new Error("close failed")]);
+    expect(changed).toEqual([]);
   } finally {
     await controller.close();
     instructions.mockRestore(); connect.mockRestore(); close.mockRestore();

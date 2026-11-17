@@ -200,13 +200,19 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
 
 // A root's record whose state, holds or ownership changed: what its server
 // instructions describe may have changed with it (#531).
-// `forget` drops an ended root's last shape (#538).
-export function watchRoots(sink: DiagnosticSink, changed: (sessionID: string) => void): DiagnosticSink & { forget(sessionID: string): void } {
+// `forget` drops an ended session's last shape (#538), but an ended root's own
+// end record (and a later drift's pause) lands after it, so the map is also
+// bounded, least recently recorded first: an evicted root's next record only refetches.
+export function watchRoots(sink: DiagnosticSink, changed: (sessionID: string) => void, limit = FACTS_LIMIT): DiagnosticSink & { forget(sessionID: string): void } {
   const seen = new Map<string, string>();
   return Object.assign((record: Parameters<DiagnosticSink>[0]) => {
     if (record.sessionID && record.operation !== "instructions") {
       const shape = JSON.stringify([record.state, record.held ?? [], record.ownership ?? null]);
-      if (seen.get(record.sessionID) !== shape) { seen.set(record.sessionID, shape); changed(record.sessionID); }
+      const news = seen.get(record.sessionID) !== shape;
+      // Least recently recorded first: a live root's every record keeps it.
+      seen.delete(record.sessionID); seen.set(record.sessionID, shape);
+      if (seen.size > limit) seen.delete(seen.keys().next().value!);
+      if (news) changed(record.sessionID);
     }
     return sink(record);
   }, { forget: (sessionID: string) => { seen.delete(sessionID); } });

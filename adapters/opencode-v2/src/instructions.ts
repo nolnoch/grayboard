@@ -58,11 +58,12 @@ function signedOut(error: unknown): boolean {
 // a root passes on to its subagents. One fetch in flight per session; one that
 // ends after an invalidation fetches again. The retained adapters' cache is
 // hosted-core's `HostedProxy.instructions`/`forget` (adapters/hosted-core/src/proxy.ts),
-// which this one deliberately differs from (#538): it keeps the last text after a
-// transient failure (OpenCode's prompt already carries the unbound text, so none is
-// worse than stale), and it learns of a binding change from the Controller's
-// diagnostics (watchRoots in lifecycle.ts) rather than from bind/unbind results
-// and `alias_lost`, as `RootDelivery` does (adapters/hosted-core/src/root.ts).
+// which keeps no text after a failure; this one keeps the last text (OpenCode's
+// prompt already carries the unbound text, so none is worse than stale, #538).
+// The proxy invalidates on a bind/unbind result or `alias_lost`, and
+// `RootDelivery`'s sink (adapters/hosted-core/src/root.ts) on a Controller record
+// whose state or holds changed; this one does both, through the Controller's
+// `bindingChanged` and `watchRoots` (lifecycle.ts), which also watches ownership.
 // `signedOut` is the Controller's classification (core/controller.ts) narrowed
 // to "drop the text": change one, check the other.
 export class RootInstructions {
