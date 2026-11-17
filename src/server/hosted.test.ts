@@ -304,6 +304,28 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
   } finally { spy.mockRestore(); }
 });
 
+// #807 P3 B4a: a send to an `id:` address asks `repo.sessionEnd.refusal` on the send's Tx (the send side of an end's
+// race, D3), not core's check over `coreOn`.
+test("#807 P3 B4a: a send to an id: address checks deliverability through repo.sessionEnd on its Tx", async () => {
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const log = (op: string, h: unknown) => checks.push({ op, inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
+  const group = database.repo.sessionEnd;
+  const own = group.refusal.bind(group);
+  const refusal = spyOn(group, "refusal").mockImplementation(((h: never, id: string) => { log("refusal", h); return own(h, id); }) as never);
+  const original = database.repo.coreOn.bind(database.repo);
+  const core = spyOn(database.repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => { log("coreOn", h); return original(h); }) as never);
+  const a = context("b4a-a"), b = context("b4a-b");
+  try {
+    await hosted.bind(principal, a, { name: "b4aa", create: true });
+    await hosted.bind(principal, b, { name: "b4ab", create: true });
+    const to = await hosted.run(principal, b, "dm_history", session => session.sessionId);
+    expect(to.startsWith("id:")).toBe(true);
+    const mark = checks.length;
+    await hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, to, "to an ID", {}));
+    expect(checks.slice(mark).map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["refusal:tx:true"]);
+  } finally { refusal.mockRestore(); core.mockRestore(); }
+});
+
 // #807 P3 B1a: the holds, session-row and presence reads go through `repo.bindings` on the caller's handle: a body's
 // `Tx` inside one (bind's checks, the send's last-seen, peer_list's unbound roots, the inbox), the pool outside (an
 // unbound session's candidates, read by whoami).
