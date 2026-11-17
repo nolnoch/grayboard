@@ -435,18 +435,20 @@ test("#807: a Slack user's dm_thread runs inside a write-queue transaction", asy
 
 // Holds the write queue as the first repo.post named `what` is made, so that write queues behind the holder; each
 // such post's return (true: it ran at once) is pushed to `ran`.
-function holdAtPost(what: string): { ran: boolean[]; holder: () => ReturnType<typeof holdQueue> | undefined; restore: () => void } {
-  const repo = srv.app.repo;
-  const { post } = repo;
-  const ran: boolean[] = [];
+// Holds the write queue as `handle`'s drain reads `postId` among its pushes, before the drain can queue anything for
+// it; logs every repo.boards.acknowledge.
+function holdAtPushRead(handle: string, postId: number): { acks: string[]; holder: () => ReturnType<typeof holdQueue> | undefined; restore: () => void } {
+  const boards = srv.app.repo.boards;
+  const { pendingPushes, acknowledge } = boards;
+  const acks: string[] = [];
   let holder: ReturnType<typeof holdQueue> | undefined;
-  repo.post = (fn, committed, label) => {
-    if (label === what && !holder) holder = holdQueue();
-    const now = (post as (...a: unknown[]) => boolean).call(repo, fn, committed, label);
-    if (label === what) ran.push(now);
-    return now;
+  boards.pendingPushes = async (r, h) => {
+    const rows = await pendingPushes.call(boards, r, h);
+    if (h === handle && !holder && rows.some((row) => row.post.id === postId)) holder = holdQueue();
+    return rows;
   };
-  return { ran, holder: () => holder, restore: () => { repo.post = post; holder?.release(); } };
+  boards.acknowledge = (tx, h, ref) => { acks.push(h); return acknowledge.call(boards, tx, h, ref); };
+  return { acks, holder: () => holder, restore: () => { boards.pendingPushes = pendingPushes; boards.acknowledge = acknowledge; holder?.release(); } };
 }
 
 // The human's hello replay (application.replay, which slack.ts attach calls after its hello commits) drains outside
@@ -499,8 +501,8 @@ test("#807: a Slack digest drained by a mention's wake, from the queue's holder,
   expect(posted("chatter")).toBe(false);
 }, 30_000);
 
-// #981: a push the human can no longer see is acknowledged as drainBoards finds it (lostAck, application.ts), posted
-// through the write queue (#807 D4): behind a held queue it waits, then stamps the outbox row.
+// #981: a push the human can no longer see is acknowledged as drainBoards finds it (lostAck, application.ts), queued
+// on the write queue (#807 D4, B5a1): behind a held queue it waits, then stamps the outbox row.
 test("#807: a push the Slack human can no longer see is acked through the write queue", async () => {
   const [alice, bob, root] = await Promise.all(["alice", "bob", "root"].map((n) => login(`${n}@example.com`)));
   await link(alice);
@@ -513,16 +515,19 @@ test("#807: a push the Slack human can no longer see is acked through the write 
   const db = srv.app.db;
   await seed(db, () => db.prepare(`INSERT INTO outbox (handle, post_id, reason) VALUES (?, ?, 'mention')`).run(human, hidden.post_id));
   const deliveredAt = () => (db.prepare(`SELECT delivered_at FROM outbox WHERE handle = ? AND post_id = ?`).get(human, hidden.post_id) as { delivered_at: number | null }).delivered_at;
-  let hold: ReturnType<typeof holdAtPost> | undefined;
+  let hold: ReturnType<typeof holdAtPushRead> | undefined;
   try {
-    await reattach(root, () => { hold = holdAtPost("lost-visibility push ack"); });
-    await until(() => hold!.ran.length > 0, 5000, "the drain posted the lost-visibility ack");
-    expect(hold!.ran).toEqual([false]);
+    await reattach(root, () => { hold = holdAtPushRead(human, hidden.post_id); });
+    await until(() => hold!.holder() !== undefined, 5000, "the drain read the hidden push");
     await hold!.holder()!.started;
+    // The drain queued the ack (B5a1: repo.write, never inline in its read): it waits behind the held queue.
+    await ticks();
+    expect(hold!.acks).toEqual([]);
     expect(deliveredAt()).toBeNull();
     hold!.holder()!.release();
     await hold!.holder()!.done;
     await until(() => deliveredAt() !== null, 5000, "the ack stamped the push delivered");
+    expect(hold!.acks).toEqual([human]);
   } finally { hold?.restore(); }
   expect(posted("not for alice")).toBe(false);
 }, 30_000);
