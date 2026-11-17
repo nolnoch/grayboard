@@ -18,6 +18,7 @@ import { createBoard, post, subscribe } from "../core/boards.ts";
 import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { until } from "../../tests/support/until.ts";
 const meta = { "ai.opencode/sessionID": "resource-root" };
 
 let store: ReturnType<typeof openDatabase>, application: ReturnType<typeof createApplication>;
@@ -294,6 +295,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: resource and cont
 
 for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["list", "read"] as const) for (const boundary of ["grant", "session"] as const) test(`${version}: resource ${method} extra ${boundary} storage check preserves internal-error provenance`, async () => {
   const client = await connect(version, "native");
+  // A legacy client opens its GET stream in the background; its checks must not take the counted fault (#807 P3 A7c).
+  if (version !== "2026-07-28") await until(() => hosted.activeGetStreams === 1, 1000);
   const validate = application.revalidateSession;
   let accessChecks = 0, sessionChecks = 0;
   const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", findAccess => (...args) => {

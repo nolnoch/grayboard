@@ -413,6 +413,8 @@ for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: selection 
   let last!: Response;
   // POSTs only: a legacy client's GET stream may answer after a later POST (#807 P3 A6e2).
   const client = await connect(version, async (response, request) => { if (request.method === "POST") last = response.clone(); });
+  // The legacy client opens its GET stream after initialize; it must select before the faulty snapshot goes in (#807 P3 A7c).
+  if (version !== "2026-07-28") await untilHosted(() => hosted.activeGetStreams === 1);
   const logs = spyOn(console, "error").mockImplementation(() => {});
   const original = hosted.sessions.snapshot;
   try {
@@ -563,22 +565,23 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
 
 test("actual access revocation between factory and dispatch prevents mutation", async () => {
   const client = await connect();
-  const original = oauth.isAuthorized;
+  const original = oauth.isAuthorized, originalNow = oauth.isAuthorizedNow;
   let checks = 0;
   // The revoke answers with a promise (#807 P3 A6c), so seedSync's post would queue it; seed runs it now on the idle
   // queue, and it commits a few microtasks later, before the dispatch's check. Awaited below, so a failure shows.
   let revoking: Promise<void> | undefined;
-  oauth.isAuthorized = principal => {
-    const valid = original(principal);
+  const revokeOnFirst = (principal: OAuthPrincipal) => {
     if (++checks === 1) revoking = seed(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
-    return valid;
   };
+  // Selection checks through the async form, dispatch through the synchronous one (#807 P3 A7c): either may be first.
+  oauth.isAuthorized = async principal => { const valid = await original(principal); revokeOnFirst(principal); return valid; };
+  oauth.isAuthorizedNow = principal => { const valid = originalNow(principal); revokeOnFirst(principal); return valid; };
   try {
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } })).rejects.toThrow("invalid_token");
     await revoking;
     expect(checks).toBeGreaterThanOrEqual(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
-  } finally { oauth.isAuthorized = original; }
+  } finally { oauth.isAuthorized = original; oauth.isAuthorizedNow = originalNow; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
@@ -1363,9 +1366,10 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
   const { Database } = await import("bun:sqlite");
   const client = await connect();
   await client.callTool({ name: "board_list", arguments: {} });
-  const authRead = store.repo.authRead, validate = application.revalidateSession;
+  // The exchange's authorization check reads through the synchronous form until #807 P3 A7d.
+  const authRead = store.repo.authNow.read, validate = application.revalidateSession;
   let depth = 0, pinned = 0, unpinned = 0;
-  store.repo.authRead = fn => { depth++; try { return authRead(fn); } finally { depth--; } };
+  store.repo.authNow.read = fn => { depth++; try { return authRead(fn); } finally { depth--; } };
   application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; validate(session, allowUnbound); };
   const query = spyOn(Database.prototype, "query");
   try {
@@ -1379,7 +1383,7 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
     // and the call ends inside the touch window, so its end touch reads nothing.
     expect(rowReads).toBe(4);
     expect({ pinned, unpinned }).toEqual({ pinned: 1, unpinned: 0 });
-  } finally { query.mockRestore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
+  } finally { query.mockRestore(); store.repo.authNow.read = authRead; application.revalidateSession = validate; }
 });
 
 // #899: the stream timer re-reads a live's hosted rows only when they could have changed. A listen checked once
