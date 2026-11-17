@@ -82,7 +82,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
       authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
     };
     const disconnected: number[] = [];
-    const hooks = { disconnectUser: (id: number) => { disconnected.push(id); }, accessChanged: () => {} };
+    const hooks = { disconnectUser: (id: number) => { disconnected.push(id); }, accessChanged: async () => {} };
     const call = (path: string, body: unknown, token?: string) => handleHttp(
       new Request(`http://localhost${path}`, { method: "POST", body: JSON.stringify(body), headers: token ? { Authorization: `Bearer ${token}` } : {} }),
       repo, config, touches, () => {}, undefined, hooks, "127.0.0.1");

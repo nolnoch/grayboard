@@ -478,7 +478,7 @@ function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, co
 const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
 
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: SessionHooks): Promise<Response> {
-  return repo.write((tx) => {
+  return repo.write(async (tx) => {
     const team = memberTeam(tx, teamName, authed, repo);
     if (!team) return notFound();
     try {
@@ -488,7 +488,7 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: S
       throw e;
     }
     onTeamLeft(repo, tx, team, authed.user_email);
-    sessions.accessChanged(tx, authed.user_email, authed.user_email);
+    await sessions.accessChanged(tx, authed.user_email, authed.user_email);
     writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
     return json({ ok: true });
   });
@@ -529,7 +529,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
 
 async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config, sessions: SessionHooks): Promise<Response> {
   const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
-  return repo.write((tx) => {
+  return repo.write(async (tx) => {
     const managed = ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const { team } = managed;
@@ -546,7 +546,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       throw e;
     }
     onTeamLeft(repo, tx, team, email);
-    sessions.accessChanged(tx, email, authed.user_email);
+    await sessions.accessChanged(tx, email, authed.user_email);
     writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
     return json({ ok: true });
   });
@@ -676,7 +676,7 @@ async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, conf
 export type SessionHooks = {
   disconnectUser: (userId: number) => void;
   // principal: a principal's name; its sessions' aliases are re-checked.
-  accessChanged: (h: Read, principal: string, by: string) => void;
+  accessChanged: (h: Read, principal: string, by: string) => Promise<void>;
 };
 
 export async function handleHttp(

@@ -989,7 +989,7 @@ test("revoking one hosted hold releases only it, bumps the generation and closes
   const lease = await delivery.open(principal, context("root"));
   const before = database.repo.hosted.get(database.repo.read, (context("root") as { id: string }).id)!;
   await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
-  application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
+  await application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
   const after = database.repo.hosted.get(database.repo.read, before.session_id)!;
   expect(after.bind_gen).toBeGreaterThan(before.bind_gen);
   expect(after.ownership_id).toBe(before.ownership_id);
@@ -1011,12 +1011,12 @@ test("an alias revoke issued while another body holds the write queue waits behi
   await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
   let release!: () => void;
   const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
-  application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
+  const revoking = application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
   expect(database.repo.hosted.get(database.repo.read, before.session_id)!.bind_gen).toBe(before.bind_gen);
   expect(delivery.activeLeaseCount).toBe(1);
   release();
   await holder;
-  await queueFor(database.db).run(() => {});
+  await revoking;
   expect(database.repo.hosted.get(database.repo.read, before.session_id)!.bind_gen).toBeGreaterThan(before.bind_gen);
   expect(delivery.activeLeaseCount).toBe(0);
   expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'alias.revoked'").get()).toEqual({ n: 1 });
@@ -1037,7 +1037,7 @@ test("one alias revoke that throws rolls back alone, audited alias.revoke_failed
   let calls = 0;
   const spy = spyOn(database.repo.hosted, "lose").mockImplementation((...args) => { if (calls++ === 0) throw new Error("bad row"); return lose(...args); });
   const error = spyOn(console, "error").mockImplementation(() => {});
-  try { application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com"); }
+  try { await application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com"); }
   finally { spy.mockRestore(); error.mockRestore(); }
   const audits = (action: string) => database.db.query("SELECT target FROM access_log WHERE action = ?").all(action) as { target: string }[];
   expect(audits("alias.revoked")).toHaveLength(1);
@@ -1063,7 +1063,7 @@ test("a revoked tools-only hosted root's ownership ends, audited once: a later r
   const before = database.repo.hosted.get(database.repo.read, id)!;
   const audits = () => database.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked'").all().map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
   await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
-  application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
+  await application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
   const revoked = [{ actor: "admin@example.com", target: "ops/lead", detail: { session: id, principal: "you@example.com", writes_as: true, reason: expect.any(String) } }];
   expect(audits()).toEqual(revoked);
   expect(database.repo.hosted.get(database.repo.read, id)).toBeUndefined();
@@ -1071,7 +1071,7 @@ test("a revoked tools-only hosted root's ownership ends, audited once: a later r
   expect(database.db.query("SELECT writes_as FROM ids WHERE id = ?").get(id)).toEqual({ writes_as: null });
   expect(aliasUser(database.db, "ops/lead")).toBeNull();
   // Both rechecks, the principal's and the server's sweep, find the use gone.
-  application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
+  await application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
   application.revalidate();
   expect(audits()).toEqual(revoked);
 });
@@ -1112,7 +1112,7 @@ test("a root whose last hold is revoked or unbound has no lease, so the sweep le
   await delivery.open(principal, context("unbound"));
   await hosted.unbind(principal, context("unbound"), { name: "fe" });
   await seed(database.repo, (tx) => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
-  application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
+  await application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
   expect(delivery.activeLeaseCount).toBe(0);
   for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(database.repo.read, id(raw))).toMatchObject({ lease_deadline: null });
   now += 300_000; // past any lease, short of the idle window
