@@ -808,7 +808,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const before = application.hostedHolds(tx, row.session_id);
         // A hosted contender idle past the window, or whose lease lapsed, ends and frees the alias; a live one
         // refuses the bind (application.bindNow sees its hold).
-        const address = application.bindAddress(p.authed, normalized.name);
+        const address = await application.bindAddress(tx, p.authed, normalized.name);
         const holder = address ? application.aliasHolderId(tx, address) : null;
         const other = holder && holder !== row.session_id ? store.get(tx, holder) : undefined;
         if (other && !other.root_session_id && ((other.lease_deadline !== null && other.lease_deadline <= now()) || (other.lease_deadline === null && idleAt(other)))) {
@@ -852,7 +852,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
-          const ok = application.unbind(tx, selected.session, args.name);
+          const ok = await application.unbind(tx, selected.session, args.name);
           if (ok.released) {
             // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
             await store.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: ok.held.length ? row.lease_deadline : null });

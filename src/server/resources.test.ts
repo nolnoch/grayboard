@@ -435,10 +435,15 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
     if (failed && boundary === "grant") throw failure;
     return true;
   } });
-  const validate = application.revalidateSession;
+  // A checked watch's session check reads nothing (revalidateNow, #807 P3 A7u1); the others read the user too.
+  const validate = application.revalidateSession, validateNow = application.revalidateNow;
   application.revalidateSession = session => {
     if (failed && boundary === "session") throw failure;
-    validate(session);
+    return validate(session);
+  };
+  application.revalidateNow = session => {
+    if (failed && boundary === "session") throw failure;
+    validateNow(session);
   };
   const uri = boardResourceUri("e2e"), h = hooks();
   const watch = resources.watch(b, uri, h, true);
@@ -451,7 +456,7 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
     }
     expect(h.counts).toEqual({ changed: 0, closed: 0 });
     expect(await store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
-  } finally { failed = false; application.revalidateSession = validate; }
+  } finally { failed = false; application.revalidateSession = validate; application.revalidateNow = validateNow; }
   await call(a, "board_post", { board: "e2e", body: "healthy" });
   expect(h.counts).toEqual({ changed: 1, closed: 0 });
   expect((await resources.read(store.repo.read, b, uri)).posts.map(p => p.body)).toEqual(["healthy"]);

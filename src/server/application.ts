@@ -20,7 +20,7 @@ import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
-import { authorizeNow, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
+import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
@@ -31,7 +31,7 @@ import {
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
 import { countRefusal } from "./metrics.ts";
-import { ownScope, type Principal } from "../core/resolver.ts";
+import type { Principal } from "../core/resolver.ts";
 import { assertDeliverableId, coreRefusalCode, endSession, Undeliverable } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs, type Uploader } from "../core/attachments.ts";
@@ -383,19 +383,19 @@ type Target =
   | { address: string; scope: AliasScope & { scope_ref: string } }
   | { code: ErrorCode; error: string; address?: string; authz?: { req: AuthzRequest; d: Decision } };
 
-function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
+// `r`: the caller's handle (a body's `Tx`); the scope's principal and the decision read on it.
+async function bindTarget(hub: Hub, r: Read, authed: AuthedUser, input: string): Promise<Target> {
   const { repo } = hub;
   const p = addressParts(input);
   if (!p || p.kind === "id" || p.kind === "team") {
     return { code: "bad_request", error: `"${input}" isn't an alias: a name (a-z 0-9 _ -, 1-32 chars), or scope/name` };
   }
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
+  // aliasScope asks for a principal scope's kind only, and only for this address's scope: read it first.
+  const owner = p.kind === "alias" && p.scopeKind === "principal" ? (await repo.principals.findByName(r, p.scope))?.kind : undefined;
   let scope: AliasScope;
   try {
-    scope = aliasScope(address, (k) => {
-      const kind = repo.policyNow.principalByName(k)?.kind;
-      return kind === "team" || kind === "service" ? kind : null;
-    });
+    scope = aliasScope(address, () => (owner === "team" || owner === "service" ? owner : null));
   } catch (e) {
     // The reserved name refuses alike in a team that exists and one that doesn't (#1020).
     if (e instanceof CoreError && p.name === HUMAN_NAME) return { code: "forbidden", error: HUMAN_RESERVED, address };
@@ -404,7 +404,7 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
   }
   const t = { ...scope, scope_ref: scope.scope_ref! };
   const req: AuthzRequest = { verb: "alias.bind", principal: userPrincipal(authed), scope: t, name: scope.name };
-  const d = authorizeNow(repo, {}, req);
+  const d = await authorize(repo, r, {}, req);
   if (!d.allow && d.rule === "alias.human_reserved") return { code: "forbidden", error: HUMAN_RESERVED, address, authz: { req, d } };
   // A team reads as missing to a non-member (#1020): the refusal aliasScope gives a scope nobody owns.
   if (!d.allow && d.rule === "scope.team_member") return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
@@ -416,7 +416,7 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
 // the user who named it. Callers are inside a transaction, whose Tx is `tx`.
 async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: Exclude<Target, { error: string }>, session: string): Promise<void> {
   const { repo } = hub;
-  if (repo.aliases.find(tx, address)) return;
+  if ((await repo.aliases.find(tx, address))) return;
   await repo.aliases.create(tx, scope, authed.user_email);
   writeAudit(repo, tx, "alias.created", authed.user_email, address, { lazy: true, session });
   await onAliasCreated(repo, tx, authed.user_id, address);
@@ -538,7 +538,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   function observerLive(observer: Observer): boolean {
     if (!observers.has(observer)) return false;
     try {
-      valid(observer.session);
+      validNow(observer.session);
       if (observer.session.addresses.some((a) => canSeeBoard(repo.coreOn(repo.read), a, observer.board))) return true;
     } catch {}
     removeObserver(observer);
@@ -590,8 +590,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     close(session, h);
     session.sink.closed(error);
   }
-  // `h`: the handle the caller holds; inside a body its `Tx`, so a disabled user's terminate writes its rows there.
-  function valid(session: ApplicationSession, allowUnbound = false, h: Read = repo.read) {
+  // The session open and current; a closed one is refused with why.
+  function stillOpen(session: ApplicationSession) {
     if (!session.active || !hub.sessions.has(session)) {
       // A superseded bridge connection is told so, a revoked tools-only
       // one why it may not write as its alias (S9); any other closed session
@@ -601,7 +601,22 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (why?.code === "forbidden") throw why;
       fail("unauthenticated", "session is closed");
     }
-    if (repo.users.isDisabled(session.authed.user_id)) {
+  }
+  // `valid`'s checks that read nothing (#807 P3 A7u1), for a sync caller downstream of a token check that refused a
+  // disabled user with no await since, or of one that rechecks (the board observers' `changed` hook).
+  function validNow(session: ApplicationSession, allowUnbound = false) {
+    stillOpen(session);
+    if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
+  }
+  // `h`: the handle the caller holds; inside a body its `Tx`, so a disabled user's terminate writes its rows there.
+  // The user read awaits (#807 P3 A7u1; async from A7u2): a close, detach or terminate that lands meanwhile changes
+  // the session outside the write queue, so it's checked again after, and the caller goes on with no await between.
+  async function valid(session: ApplicationSession, allowUnbound = false, h: Read = repo.read): Promise<void> {
+    stillOpen(session);
+    const disabled = repo.users.isDisabled(session.authed.user_id);
+    await testPauseAsync("valid:user:read");
+    stillOpen(session);
+    if (disabled) {
       terminate(session, new ApplicationError("unauthenticated", "an admin signed this user out"), h);
       fail("unauthenticated", "an admin signed this user out");
     }
@@ -678,12 +693,19 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // Its promise settles once the revocations are written: in the caller's body (which awaits it: its savepoints are
   // awaited), or, outside one, committed through the queue; a failure there is logged, not rejected.
   function recheckAliases(principal: string | null, by: string | null, h: Read = repo.read): Promise<void> {
-    const body = (tx: Tx) => {
+    const body = async (tx: Tx) => {
       const revoked: (AliasUse & { reason: string })[] = [];
+      // One decision per (principal, scope): the sweep holds the write queue while it reads.
+      const reasons = new Map<string, string | null>();
       for (const u of aliasUses(repo.coreOn(tx), principal)) {
-        const p = repo.policyNow.principalByName(u.principal);
-        const d = p ? authorizeNow(repo, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
-        const reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
+        const key = JSON.stringify([u.principal, u.scope_kind, u.scope_ref]);
+        let reason = reasons.get(key);
+        if (reason === undefined) {
+          const p = await repo.principals.findByName(tx, u.principal);
+          const d = p ? await authorize(repo, tx, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
+          reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
+          reasons.set(key, reason);
+        }
         if (reason) revoked.push({ ...u, reason });
       }
       return revokeAliases(tx, revoked, by);
@@ -764,11 +786,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = current?.(tx);
       if (stale) fail("unauthenticated", stale);
-      if (!repo.aliases.find(tx, addr)) {
+      if (!(await repo.aliases.find(tx, addr))) {
         await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
         writeAudit(repo, tx, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
         await onAliasCreated(repo, tx, authed.user_id, addr);
       }
+      // Again after the awaits (#807 P3 A7f3 audit): a stop outside the write queue lands meanwhile; the throw rolls the create back.
+      const late = current?.(tx);
+      if (late) fail("unauthenticated", late);
       touchAlias(repo.coreOn(tx), addr);
       logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "bound");
     }, () => {
@@ -792,7 +817,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
   async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
-    valid(session, true, tx);
+    await valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
@@ -804,12 +829,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     let t: Take;
     try { t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAt = undefined; }
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
-    const target = bindTarget(hub, authed, m.alias);
+    const target = await bindTarget(hub, tx, authed, m.alias);
+    await testPauseAsync("bind:target:decided");
     if ("error" in target) {
       if (target.address) { const a = target.address; rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, a, "refused", target.error)); }
       if (target.authz) { const { req, d } = target.authz; rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, target.address), req, d)); }
       return fail(target.code, target.error);
     }
+    // The session may have been terminated (a disable's revalidate) while the decision awaited (#807 P3 A7f2, H-B); a
+    // refused target's rows are written first, as every deny's is.
+    await valid(session, true, tx);
     const { address, scope } = target;
     const refuse = (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): never => {
       rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, address, "refused", detail));
@@ -834,7 +863,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // A typo would otherwise create a fresh alias, and the DMs queued for the
     // intended one would never arrive.
-    if (m.create === false && !repo.aliases.find(tx, address)) {
+    if (m.create === false && !(await repo.aliases.find(tx, address))) {
       const known = closestNames(scope.name, repo.aliases.listForScope(tx, scope.scope_kind, scope.scope_ref).map((a) => a.name).filter((n) => n !== HUMAN_NAME));
       const message = unknownNameError(scope.name, known);
       return refuse("identity_unknown", message, message, { known });
@@ -860,11 +889,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // A new name past its scope's cap (#347); checked here, not in the
     // transaction below, so the refused binding event stays.
-    const capped = repo.aliases.find(tx, address) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+    const capped = (await repo.aliases.find(tx, address)) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
     if (capped) return refuse("bad_request", capped, capped);
 
     // No savepoint (#807 P3 A1): a throw here fails the bind, and every caller's transaction rolls back with it.
     await createLazily(hub, tx, authed, target, id);
+    await testPauseAsync("bind:alias:created");
+    // Again after the create's await: no hold for a session terminated meanwhile.
+    await valid(session, true, tx);
     holdAlias(repo.coreOn(tx), address, id, now());
     logBinding(repo.coreOn(tx), id, address, "bound", null);
     if (meta) setAliasMeta(repo.coreOn(tx), address, meta, id, audit, authed.user_email);
@@ -882,8 +914,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // leaves this session (setHolds), so that holder is pushed it. An alias
   // the session doesn't hold answers ok with released: false.
   // `tx`: the body the unbind runs in.
-  function unbind(tx: Tx, session: ApplicationSession, alias: string): UnbindResult {
-    valid(session, true, tx);
+  async function unbind(tx: Tx, session: ApplicationSession, alias: string): Promise<UnbindResult> {
+    await valid(session, true, tx);
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it unbinds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it unbinds nothing");
     const id = session.sessionId;
@@ -1004,7 +1036,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // `tx`: the body the request's row is written in.
     async hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: RefusalRow) => void): Promise<string> {
       const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(repo.coreOn(tx), id, address, "refused", detail); };
-      const target = bindTarget(hub, authed, raw);
+      const target = await bindTarget(hub, tx, authed, raw);
       if ("error" in target) {
         if (target.address) note(target.address, target.error);
         if (target.authz) {
@@ -1021,7 +1053,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
       if (create) {
-        const capped = repo.aliases.find(tx, target.address) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+        const capped = (await repo.aliases.find(tx, target.address)) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
         if (capped) {
           note(target.address, capped);
           return fail("bad_request", capped);
@@ -1032,8 +1064,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // The address a bind of `alias` would take, or undefined when bind will refuse it
     // (bindNow says why): the hosted service clears a stale contender for it first.
-    bindAddress(authed: AuthedUser, alias: string): string | undefined {
-      const target = bindTarget(hub, authed, alias);
+    async bindAddress(r: Read, authed: AuthedUser, alias: string): Promise<string | undefined> {
+      const target = await bindTarget(hub, r, authed, alias);
       return "error" in target ? undefined : target.address;
     },
     aliasHolderId(r: Read, address: string): string | null { return holderOf(repo.coreOn(r), address); },
@@ -1058,11 +1090,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     unbind,
     close,
     revalidateSession: valid,
+    revalidateNow: validNow,
     // Everything owed to a push session, after its hello's answer: direct
     // messages and board items for `addresses` (every address by default; a
     // bind's alias after its answer).
     async replay(session: ApplicationSession, addresses?: string[]) {
-      valid(session, true);
+      await valid(session, true);
       if (session.readOnly || !session.push) return;
       // Called after the hello's or bind's commit, outside any body, so the drain runs now; awaited, so the replay
       // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
@@ -1070,7 +1103,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         await drainDirect(hub, session, addresses ?? session.addresses);
         // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
         if (!session.active) return;
-        valid(session, true);
+        await valid(session, true);
         drainBoards(session, hub, true);
       } catch (error) { console.error("postcommit effect failed", error); }
     },
@@ -1081,29 +1114,29 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       body: string,
       options: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
     ) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       return handleDelegate(hub, tx, session, request);
     },
     async history(r: Read, session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
-      valid(session, false, r);
+      await valid(session, false, r);
       return handleHistory(hub, r, session, options.peer, options.limit, options.before_id);
     },
     async thread(r: Read, session: ApplicationSession, id: number) {
-      valid(session, false, r);
+      await valid(session, false, r);
       return handleThread(r, session, id, repo);
     },
     async inbox(r: Read, session: ApplicationSession, days?: number) {
-      valid(session, false, r);
+      await valid(session, false, r);
       childState(session, "dm_inbox");
       return handleInbox(hub, r, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
-      valid(session, false, r);
+      await valid(session, false, r);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = await Promise.all(session.addresses.map(async (a) => ({ type: "direct" as const, ref: a, since: await repo.cursors.get(r, a, "direct", a) })));
       const messages = repo.messages.unreadSince(r, streams).slice(0, limit);
@@ -1117,7 +1150,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       }
       const boards = all.slice(0, limit - messages.length);
       // A digest's latest post never wakes, so it carries other_user only.
-      const marks = writerMarks(repo, r, session, messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
+      const marks = await writerMarks(repo, r, session, messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
       return [
         ...messages.map((m): DeliveryEvent => ({ kind: "direct", message: { ...showMessage(m), ...marks.message(m.id) } })),
         ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push"
@@ -1126,14 +1159,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       ];
     },
     async boardCatalog(r: Read, session: ApplicationSession, after?: string) {
-      valid(session, true, r);
+      await valid(session, true, r);
       return boardCatalog(repo.coreOn(r), session.readOnly ? seer(repo, session) : session.primary, after);
     },
     async boardSnapshot(r: Read, session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
-      valid(session, true, r);
+      await valid(session, true, r);
       // A resource read is a read like board_read, and carries its marks (#825).
       const snap = snapshot(repo.coreOn(r), reader(r, session, board), board, options);
-      const marks = writerMarks(repo, r, session, [], snap.posts.map((p) => p.id));
+      const marks = await writerMarks(repo, r, session, [], snap.posts.map((p) => p.id));
       return { ...snap, posts: snap.posts.map((p) => ({ ...p, ...marks.post(p.id) })) };
     },
     // O(1), for the metrics scrape (#805).
@@ -1141,7 +1174,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Keys in the observer indexes: a board or session with no observers left has none (#831).
     get observerIndexKeys() { return { boards: observersByBoard.size, sessions: observersBySession.size }; },
     observeBoard(session: ApplicationSession, boardInput: string, hooks: BoardObserver): () => void {
-      valid(session);
+      validNow(session);
       const board = normalizeBoard(boardInput);
       // Snapshot performs the same concealed access check as content reads.
       snapshot(repo.coreOn(repo.read), reader(repo.read, session, board), board, { limit: 1 });
@@ -1151,21 +1184,21 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       return () => removeObserver(observer);
     },
     canReceiveBoard(r: Read, session: ApplicationSession, board: string) {
-      valid(session, false, r);
+      validNow(session);
       const core = repo.coreOn(r);
       return session.addresses.some((a) => canSeeBoard(core, a, board));
     },
     // handed: false is a give-up (Slack refused the message): the cursor
     // moves so it isn't retried, but nothing reached the harness to stamp.
     async receiptDirect(tx: Tx, session: ApplicationSession, ids: number[], opts: { handed: boolean } = { handed: true }) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       await handleAck(tx, session, ids, repo, opts.handed ? now() : null);
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
     // each address acks it.
-    receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
-      valid(session, false, tx);
+    async receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
+      await valid(session, false, tx);
       for (const r of refs) {
         for (const a of session.addresses) acknowledge(repo.coreOn(tx), a, r);
         tx.afterCommit(() => { session.inflight.delete(pendingKey(r)); });
@@ -1174,7 +1207,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Acked as the address the row names (S8): receivedUnacked and
     // sentPending match a.reader = m.recipient, or m.sender.
     async acknowledgeDm(tx: Tx, session: ApplicationSession, id: number) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       childState(session, "dm_ack");
       const m = repo.messages.getById(tx, id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
@@ -1185,11 +1218,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       await repo.messages.ack(tx, reader, m.id);
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       return await handleRetract(hub, tx, session, id);
     },
     async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
-      valid(session, UNBOUND_READS.has(tool), tx);
+      await valid(session, UNBOUND_READS.has(tool), tx);
       // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
       try { return await handleCall(hub, tx, session, tool, args, publish); }
       finally { tx.afterCommit(() => expiry.arm()); }
@@ -1320,23 +1353,33 @@ type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
 // `viewer` (the session's ID, else `from`) is whose sight the not-found
 // suggestions follow (#348), as peer_list's: the session's user, not the
 // address it acts as.
-function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: string = from): Peer {
+async function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: string = from): Promise<Peer> {
   const p = addressParts(input);
   if (!p) fail("bad_request", `invalid address "${input}": expected "id:…", "scope/name" or "team:name"`);
   if (p.kind !== "bare") return p;
-  const scope = ownScope(repo.policyNow, from);
+  // core's ownScope, on the caller's handle: an alias's own scope, or the principal an ID acts for.
+  const fa = addressParts(from);
+  const scope = fa?.kind === "alias" ? fa.scope : fa?.kind === "id" ? (await repo.principals.of(r, from))?.name ?? null : null;
   const own = scope ? addressParts(`${scope}/${p.name}`) : null;
-  if (own?.kind === "alias" && repo.aliases.find(r, own.address)) return own;
+  if (own?.kind === "alias" && (await repo.aliases.find(r, own.address))) return own;
   if (p.name === HUMAN_NAME) {
     // A bare "human" is always your own (addressing.ts HUMAN_NAME), never the
     // one alias anyone has with the name: another user's is reached by its
     // full handle, as peer_list shows it.
     fail("not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
   }
-  const vp = repo.policyNow.principalOf(viewer);
-  const all = repo.aliases.findAllByName(r, p.name)
-    .filter((a) => vp !== null && authorizeNow(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow)
-    .map((i) => i.address).sort();
+  const vp = await repo.principals.of(r, viewer);
+  // One decision per scope.
+  const sees = new Map<string, boolean>();
+  const all: string[] = [];
+  for (const a of (await repo.aliases.findAllByName(r, p.name))) {
+    if (vp === null) break;
+    const key = JSON.stringify([a.scope_kind, a.scope_ref]);
+    let ok = sees.get(key);
+    if (ok === undefined) sees.set(key, ok = (await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } })).allow);
+    if (ok) all.push(a.address);
+  }
+  all.sort();
   const which = all.length ? `"${p.name}" isn't in your scope; name it in full: ${all.join(", ")}` : `no identity is named "${p.name}"`;
   return fail("not_found", `${which}; peer_list shows exact handles`);
 }
@@ -1344,11 +1387,11 @@ function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: s
 // Whether `address` is a team's alias that `viewer` (a session ID, else the acting address) may not see exists: to
 // anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014). Only a team's: a
 // service's agents take mail from anyone in the org (vision.md principle 9).
-function teamAliasHidden(repo: Repo, r: Read, viewer: string, address: string): boolean {
-  const a = repo.aliases.find(r, address);
+async function teamAliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
+  const a = await repo.aliases.find(r, address);
   if (a?.scope_kind !== "team" || a.scope_ref === null) return false;
-  const vp = repo.policyNow.principalOf(viewer);
-  return vp === null || !authorizeNow(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } }).allow;
+  const vp = await repo.principals.of(r, viewer);
+  return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } })).allow;
 }
 
 // A send checked and resolved, ready to write: `from` the address it goes
@@ -1376,9 +1419,9 @@ function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string | und
 // ApplicationError. Its uploads may be any of the session's addresses' (S5).
 // `r`: the send's body. A policy refusal's row, when no `afterRollback` takes it, runs on that body (its audit
 // write is still ambient until the audit slice).
-function prepareSend(
+async function prepareSend(
   hub: Hub, r: Tx, session: ApplicationSession, from: string, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
-): PreparedSend {
+): Promise<PreparedSend> {
   const { repo } = hub;
   let ids: number[];
   let digests: string[];
@@ -1391,7 +1434,7 @@ function prepareSend(
     throw e;
   }
 
-  const to = resolvePeer(repo, r, from, recipientStr, session.sessionId || from);
+  const to = await resolvePeer(repo, r, from, recipientStr, session.sessionId || from);
   if (to.kind === "team") fail("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
   // A team's alias the sender may not see reads as one nobody has (#1014), unless this replies in a thread with it:
@@ -1401,11 +1444,11 @@ function prepareSend(
     const parent = repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   };
-  if (to.kind === "alias" && (!repo.aliases.find(r, to.address) || (teamAliasHidden(repo, r, session.sessionId || from, to.address) && !replyingTo(to.address)))) {
+  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !replyingTo(to.address)))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
-  const decision = authorizeNow(repo, { humanReach: hub.humanReach }, req);
+  const decision = await authorize(repo, r, { humanReach: hub.humanReach }, req);
   if (!decision.allow) {
     rowAfterRollback(session, r, w => recordDecision(repo, w, sessionActor(session, from), req, decision));
     fail(decision.code, decision.reason);
@@ -1424,8 +1467,9 @@ function prepareSend(
 
 // Writes the message and builds its result. Runs inside the caller's
 // transaction; whether the recipient is live is read here, inside the
-// queued body. The registry changes only in queued bodies or afterCommit
-// (D4), so the result says what deliverSend does after the commit.
+// queued body. Binds change the registry only in queued bodies or afterCommit (D4), but a session's close
+// (a request's end, the bridge's detach, a revalidate's terminate) changes it at once, outside the queue: so the
+// recipient is read again after the wake decision's await, and the result says what deliverSend would do then.
 async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend): Promise<Written<SendResult> & { msg: MessageRow }> {
   const { repo, registry } = hub;
   let msg: MessageRow;
@@ -1442,9 +1486,15 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
     ...(p.from !== session.primary ? { sent_as: p.from } : {}),
   };
   const seen = lastSeen(repo.coreOn(tx), p.to);
+  const decided = await unwoken(repo, tx, session, registry.get(p.to), p.to);
+  await testPauseAsync("send:wake:decided");
+  // Read after the await (#807 P3 A7f2, H-A): a wake note about a holder that closed meanwhile is dropped.
   const live = registry.get(p.to);
-  const payload: SendResult = live?.active
-    ? { message_id: msg.id, delivered_now: true, ...f, ...unwoken(repo, tx, session, live, p.to) }
+  // Snapshot with `live`: wakeUser may await an alias read (#807 P3 A7f3), and the payload must describe one instant.
+  const liveActive = live?.active;
+  const wake = (await wakeUser(repo, tx, live, p.to)) === decided.user ? decided.fields : {};
+  const payload: SendResult = liveActive
+    ? { message_id: msg.id, delivered_now: true, ...f, ...wake }
     : {
         message_id: msg.id,
         delivered_now: false,
@@ -1452,7 +1502,7 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
         ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
         undelivered_from_you: repo.messages.undeliveredFrom(tx, session.addresses).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
-        ...unwoken(repo, tx, session, live, p.to),
+        ...wake,
       };
   for (const a of msg.attachments ?? []) {
     writeAudit(repo, tx, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: msg.sender, message_id: msg.id, recipient: msg.recipient });
@@ -1460,6 +1510,15 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
   return { payload, ref: { kind: "message", id: msg.id }, msg };
 }
 
+// The user a wake is judged against: `live`'s, else a person alias's; undefined says nothing.
+async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to: string): Promise<string | undefined> {
+  if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return undefined;
+  if (live) return live.authed.user_email;
+  const a = await repo.aliases.find(r, to);
+  return a?.scope_kind === "person" ? a.scope_ref ?? undefined : undefined;
+}
+
+// `user`: whom the decision was about, so the caller can drop it when the holder changed during the await.
 // Security audit F-03 (#806): `wakes: false` and why, when the recipient is
 // known to be another user whom no grant lets this sender wake, so the sender
 // doesn't wait on an agent that won't act. Known: the user of the session
@@ -1467,16 +1526,15 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
 // alias or an ID with no live holder says nothing, as does a human (a person
 // reads it; msg.send already decided reach). Each pull decides again
 // (pending()), so this reflects the grant at send time, not a promise.
-function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: ApplicationSession | undefined, to: string): { wakes?: false; wake_note?: string } {
-  if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return {};
-  const toUser = live?.authed.user_email ?? (() => { const a = repo.aliases.find(r, to); return a?.scope_kind === "person" ? a.scope_ref : undefined; })();
-  if (toUser === undefined) return {};
-  const decision = authorizeNow(repo, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
-  if (decision.allow) return {};
+async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: ApplicationSession | undefined, to: string): Promise<{ user: string | undefined; fields: { wakes?: false; wake_note?: string } }> {
+  const toUser = await wakeUser(repo, r, live, to);
+  if (toUser === undefined) return { user: undefined, fields: {} };
+  const decision = await authorize(repo, r, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
+  if (decision.allow) return { user: toUser, fields: {} };
   // Named only when the address already names them (a person alias): a team
   // alias's or an ID's holder is a handle, not a user (security audit F-12).
   const whose = to.startsWith(`${toUser}/`) ? `${toUser}'s agent` : "its holder (another user's agent)";
-  return { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` };
+  return { user: toUser, fields: { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` } };
 }
 
 // Only after the outermost commit, never on a replay.
@@ -1494,7 +1552,7 @@ function deliverSend(hub: Hub, msg: MessageRow): void {
 // write and recheck run in a savepoint, on its Tx (the caller's refuses statements while it's open).
 async function writeOnce<W extends Written>(
   hub: Hub, tx: Tx, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: (sp: Tx) => W | Promise<W>,
-  recheck?: (stored: W["payload"], sp: Tx) => void,
+  recheck?: (stored: W["payload"], sp: Tx) => void | Promise<void>,
 ): Promise<DedupOutcome<W>> {
   const { repo } = hub;
   if (session.human) return { fresh: await tx.savepoint(write) };
@@ -1515,7 +1573,7 @@ async function writeOnce<W extends Written>(
 async function handleSend(
   hub: Hub, tx: Tx, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean, as: string | undefined,
 ): Promise<SendResult> {
-  const p = prepareSend(hub, tx, session, sendAs(hub, tx, session, as, parentId), recipient, body, parentId, pending, ids);
+  const p = await prepareSend(hub, tx, session, sendAs(hub, tx, session, as, parentId), recipient, body, parentId, pending, ids);
   // Keyed by what the server resolved, so two spellings of one call collide.
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
   const out = await writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, sp => writeSend(hub, sp, session, p));
@@ -1543,7 +1601,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
-      to = resolvePeer(repo, tx, session.primary, m.to, session.sessionId || session.primary).address;
+      to = (await resolvePeer(repo, tx, session.primary, m.to, session.sessionId || session.primary)).address;
     } catch (e) {
       // An unresolvable `to` is a refusal, and it's audited as one (#184 review 4).
       if (e instanceof ApplicationError) refused({ reason: e.message, to: m.to });
@@ -1578,25 +1636,32 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   // refuse it by name; a replay's recheck refuses it, since the stored
   // request's grant can't be judged against a holder that isn't there
   // (security audit of #878).
-  const reach = (h: Tx) => (to: string, recheck = false): DelegateReach => {
+  // Decided before core asks (#807 P3 A7f2): core's resolveDelegation is synchronous and calls `reach` only for the
+  // explicit `to`, which is resolved before it runs. The deny row is returned, not written, so it's emitted only when
+  // core asks (after its own field checks), as before.
+  type Reach = { result: DelegateReach; row?: RefusalRow };
+  const reachDecision = async (h: Tx, to: string, recheck = false): Promise<Reach> => {
     // A team's alias this session may not see reads as one nobody has (#1014), before any grant is judged. A replay
     // named it while it could: it says why it can't be replayed, not that the name never connected.
-    if (teamAliasHidden(repo, h, session.sessionId || session.primary, to)) {
-      return { refused: recheck ? `"${to}" is a team's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) };
+    if (await teamAliasHidden(repo, h, session.sessionId || session.primary, to)) {
+      return { result: { refused: recheck ? `"${to}" is a team's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) } };
     }
     // On a replay, a person's human is that person's, though no session holds it (the Slack bridge's connection has
     // none), so a human-fallback delegation is rechecked rather than refused as unheld (#1030). A fresh call naming a
     // human keeps reading as own, and routing refuses it as no launcher.
     const t = recheck ? addressParts(to) : null;
     const owner = t?.kind === "alias" && t.name === HUMAN_NAME && t.scopeKind === "person" ? t.scope : addressUser(repo.coreOn(h), to);
-    if (owner === undefined && recheck) return { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` };
-    if (owner === undefined || owner === authed.user_email) return { ok: "own" };
-    if (owner === null) return { refused: crossUserRefusal(to) };
+    if (owner === undefined && recheck) return { result: { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` } };
+    if (owner === undefined || owner === authed.user_email) return { result: { ok: "own" } };
+    if (owner === null) return { result: { refused: crossUserRefusal(to) } };
     const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
-    const decision = authorizeNow(repo, {}, req);
-    if (decision.allow) return { ok: "granted" };
-    rowAfterRollback(session, h, w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }));
-    return { refused: crossUserRefusal(to) };
+    const decision = await authorize(repo, h, {}, req);
+    if (decision.allow) return { result: { ok: "granted" } };
+    return { result: { refused: crossUserRefusal(to) }, row: w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }) };
+  };
+  const emit = (h: Tx, r: Reach): DelegateReach => {
+    if (r.row) rowAfterRollback(session, h, r.row);
+    return r.result;
   };
   try {
     out = await writeOnce(hub, tx, session, "delegate", session.primary, args, m.resend === true, [], async sp => {
@@ -1605,9 +1670,14 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
       // The user's bucket, not the address's (#252): the row names the session that tripped it.
       const t = hub.delegateLimiter.check(authed.user_email, { requester: session.primary, session_id: session.sessionId, ...byChild });
       if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
-      const d = resolveDelegation(repo.coreOn(sp), session.primary, authed.user_email, { ...m, to }, online, humanReachable(sp), (h) => session.addresses.includes(h), open(sp), hub.delegateOpenCap, reach(sp));
+      const pre = to === undefined ? undefined : await reachDecision(sp, to);
+      const reach = (t: string): DelegateReach => {
+        if (pre === undefined || t !== to) throw new Error(`delegate: reach for an address not decided first ("${t}")`);
+        return emit(sp, pre);
+      };
+      const d = resolveDelegation(repo.coreOn(sp), session.primary, authed.user_email, { ...m, to }, online, humanReachable(sp), (h) => session.addresses.includes(h), open(sp), hub.delegateOpenCap, reach);
       picked = d.to;
-      const w = await writeSend(hub, sp, session, prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
+      const w = await writeSend(hub, sp, session, await prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
       writeAudit(repo, sp, "delegation.requested", authed.user_email, d.to, {
         requester: session.primary,
@@ -1617,7 +1687,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
       });
       hub.delegateLimiter.spend(authed.user_email);
       return { payload, ref: w.ref, msg: w.msg };
-    }, (stored, sp) => {
+    }, async (stored, sp) => {
       // A replay names the launcher the first call picked: the checks a
       // fresh call makes of a named target that are authority, not routing,
       // run again on it, so a replay never outlives a revocation (#393 1,
@@ -1629,10 +1699,10 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
       const hint = m.to === undefined ? ` This repeat was not sent: your first call auto-picked "${stored.to}"; to delegate again with a fresh pick, call with resend: true.` : "";
       // The grant is authority: one revoked (the team's policy, membership, or
       // the alias's holder) since the first call refuses the replay (#256).
-      const r = reach(sp)(stored.to, true);
+      const r = emit(sp, await reachDecision(sp, stored.to, true));
       if ("refused" in r) throw new CoreError(r.refused + hint);
       const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
-      const decision = authorizeNow(repo, { humanReach: hub.humanReach }, req);
+      const decision = await authorize(repo, sp, { humanReach: hub.humanReach }, req);
       if (!decision.allow) {
         rowAfterRollback(session, sp, w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision));
         fail(decision.code, decision.reason + hint);
@@ -1684,7 +1754,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   return {};
 }
 
-function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): unknown {
+async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): Promise<unknown> {
   const { repo } = hub;
   if (!isBoardTool(tool)) fail("bad_request", `unknown tool: ${tool}`);
   childState(session, tool);
@@ -1719,7 +1789,7 @@ function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string,
   // board_read's posts carry the writer marks every read path does (#825).
   if (tool === "board_read") {
     const r = outcome.result as ReadResult;
-    const marks = writerMarks(hub.repo, tx, session, [], r.posts.map((p) => p.id));
+    const marks = await writerMarks(hub.repo, tx, session, [], r.posts.map((p) => p.id));
     outcome = { ...outcome, result: { ...r, posts: r.posts.map((p) => ({ ...p, ...marks.post(p.id) })) } };
   }
   // A hosted session with no name answers peer_list as its ID, but is nobody (#402).
@@ -1789,17 +1859,21 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
 // session's user (#256): the mark a launcher acts on, which a plain dm_send
 // carrying a delegation header can't earn.
 type WriterMark = { other_user?: true; ungranted?: true; delegated?: true };
-function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageIds: number[], postIds: number[]) {
+// Decided up front (#807 P3 A7f2), one await per (verb, writer): msg.wake for every foreign writer, delegate.to for
+// the writers of delegation requests; the marks are then read synchronously.
+async function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageIds: number[], postIds: number[]) {
   const writers = repo.messages.writerUsers(r, messageIds, postIds);
   const me = session.authed.user_email;
   const decided = new Map<string, boolean>();
-  const may = (verb: "msg.wake" | "delegate.to", user: string) => {
+  const settle = async (verb: "msg.wake" | "delegate.to", user: string) => {
     const key = `${verb} ${user}`;
-    if (!decided.has(key)) decided.set(key, authorizeNow(repo, {}, { verb, from_user: user, to_user: me }).allow);
-    return decided.get(key)!;
+    if (!decided.has(key)) decided.set(key, (await authorize(repo, r, {}, { verb, from_user: user, to_user: me })).allow);
   };
+  const may = (verb: "msg.wake" | "delegate.to", user: string) => decided.get(`${verb} ${user}`)!;
   const foreign = messageIds.filter((id) => { const u = writers.messages.get(id); return u !== undefined && u !== me; });
   const delegations = foreign.length ? repo.messages.delegationIds(r, foreign) : new Set<number>();
+  for (const u of new Set([...writers.messages.values(), ...writers.posts.values()])) if (u !== undefined && u !== me) await settle("msg.wake", u);
+  for (const id of delegations) await settle("delegate.to", writers.messages.get(id)!);
   const mark = (user: string | undefined, judged: boolean): WriterMark =>
     user === undefined || user === me ? {} : { other_user: true, ...(judged && !may("msg.wake", user) ? { ungranted: true as const } : {}) };
   return {
@@ -1819,7 +1893,7 @@ async function handleHistory(hub: Hub, r: Read, session: ApplicationSession, pee
   } catch (e) {
     return fail("bad_request", (e as Error).message);
   }
-  const peerFull = peer ? resolvePeer(repo, r, session.primary, peer, session.sessionId || session.primary).address : undefined;
+  const peerFull = peer ? (await resolvePeer(repo, r, session.primary, peer, session.sessionId || session.primary)).address : undefined;
   const mine = session.addresses;
   // Newest `lim` before beforeId, shown oldest first as in local mode.
   const rows = repo.messages.history(r, mine, peerFull, lim, beforeId).reverse();
@@ -1830,11 +1904,11 @@ async function handleHistory(hub: Hub, r: Read, session: ApplicationSession, pee
   const messages = rows.map((m) =>
     sent(m) ? { ...m, delivered: m.delivered_at !== null || cursors.get(m.recipient)! >= m.id } : m,
   );
-  const marks = writerMarks(repo, r, session, messages.map((m) => m.id), []);
+  const marks = await writerMarks(repo, r, session, messages.map((m) => m.id), []);
   return messages.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
 }
 
-function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days: number | undefined): InboxResult {
+async function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days: number | undefined): Promise<InboxResult> {
   const { repo } = hub;
   const mine = session.addresses;
   let since: number;
@@ -1849,7 +1923,7 @@ function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days: numbe
     const seen = lastSeen(repo.coreOn(r), u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(hub.now() - seen)} ago` } : {}) };
   });
-  const marks = writerMarks(repo, r, session, owed.map((m) => m.id), []);
+  const marks = await writerMarks(repo, r, session, owed.map((m) => m.id), []);
   return {
     unanswered: owed.map((m) => ({ ...m, ...marks.message(m.id) })),
     ...(promises.length ? { promised: promises } : {}),
@@ -1857,11 +1931,11 @@ function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days: numbe
   };
 }
 
-function handleThread(r: Read, session: ApplicationSession, messageId: number, repo: Repo): DirectMessage[] {
+async function handleThread(r: Read, session: ApplicationSession, messageId: number, repo: Repo): Promise<DirectMessage[]> {
   const mine = (m: MessageRow | undefined): m is MessageRow => participant(m, session.addresses);
   if (!mine(repo.messages.getById(r, messageId))) fail("not_found", `message ${messageId} not found`);
   const rows = repo.messages.thread(r, messageId).filter(mine);
-  const marks = writerMarks(repo, r, session, rows.map((m) => m.id), []);
+  const marks = await writerMarks(repo, r, session, rows.map((m) => m.id), []);
   return rows.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
 }
 

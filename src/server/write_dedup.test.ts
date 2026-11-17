@@ -276,4 +276,13 @@ describe("dedupWrite", () => {
     const rd = await dedup(2_000, d, deleg);
     expect("replay" in rd && rd.replay.note).toMatch(/^already delegated to a@example\.com\/lx at .* as message \d+; this repeat was not sent\./);
   });
+
+  // The recheck is an async policy decision (#807 P3 A7f2): its refusal must land before the replay goes out.
+  test("a replay's recheck that rejects refuses the replay and writes no request.replayed row", async () => {
+    await dedup(1_000, call(), send());
+    const refused = seed(repo, tx => dedupWrite(repo, tx, 2_000, call(), send(), () => {}, async () => { await Promise.resolve(); throw new Error("grant revoked"); }));
+    await expect(refused).rejects.toThrow("grant revoked");
+    expect(audits("request.replayed")).toEqual([]);
+    expect(count("SELECT COUNT(*) AS n FROM messages")).toBe(1);
+  });
 });

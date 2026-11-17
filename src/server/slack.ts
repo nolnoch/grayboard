@@ -236,7 +236,7 @@ export class SlackBridge implements SlackLinker {
       const moved = previous && previous.slack_user !== slackUser ? previous : undefined;
       if (moved) writeAudit(repo, tx, "slack.relinked", user.email, slackUser, { from: moved.slack_user });
       const handle = `${user.email}/${HUMAN_NAME}`;
-      if (!repo.aliases.find(tx, handle)) {
+      if (!(await repo.aliases.find(tx, handle))) {
         // Start from now: drop what queued for an earlier link's alias.
         forgetHandle(repo.coreOn(tx), handle);
         await repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
@@ -306,7 +306,12 @@ export class SlackBridge implements SlackLinker {
         // address (security audit F-19).
         if (m.kind === "direct") detached(() => relay.notify(dmNotification(m.message)));
         else if (m.item.kind === "digest") {
-          try { repo.post(tx => application.receiptBoards(tx, session, [refOf(m.item)]), undefined, "Slack digest receipt"); } catch {}
+          // A queued write, not a post (#807 P3 A7u1): receiptBoards is async, and this sink also runs from the write
+          // queue's holder (a commit's wake drains the human's digests), where an async post throws. A refusal (the
+          // human detached meanwhile) is expected; anything else is logged.
+          void repo.write(tx => application.receiptBoards(tx, session, [refOf(m.item)])).catch(error => {
+            if (!(error instanceof ApplicationError)) console.error("[grayboard] Slack digest receipt failed:", error);
+          });
         }
         else detached(() => relay.notify(boardNotification(m.item)));
       },
@@ -392,7 +397,7 @@ export class SlackBridge implements SlackLinker {
           // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
           // delivered (#470). Read in the body, after the progress writes queued before it.
           const posted = (await repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
-          if (m.board && m.post_id) application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
+          if (m.board && m.post_id) await application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
           else if (m.message_id) await application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
           await repo.slack.clearProgress(tx, link.user_id, r);
         }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt");

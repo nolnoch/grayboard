@@ -205,7 +205,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (cancelled()) throw new ApplicationError("unauthenticated", "request cancelled");
     await application.repo.authRead(async () => {
       if (!await oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
-      application.revalidateSession(context.session, true);
+      await application.revalidateSession(context.session, true);
     });
     if (cancelled()) throw new ApplicationError("unauthenticated", "request cancelled");
   }
@@ -216,7 +216,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const ok = oauth.peekAuthorized(context.principal, peek);
     if (ok === undefined) return undefined;
     if (!ok) throw new ApplicationError("unauthenticated", "unauthenticated");
-    application.revalidateSession(context.session, true);
+    // Sync (#807 P3 A7u1): peekAuthorized's cached user answered for a disabled one.
+    application.revalidateNow(context.session, true);
     return true;
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).

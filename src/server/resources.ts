@@ -62,27 +62,30 @@ export function createResources(application: Application, options: ResourceOptio
     try { finish(watch); } catch (e) { hostedFailure("resources.finish", e); }
   }
   const unauthenticated = (error: unknown) => error instanceof ApplicationError && error.code === "unauthenticated";
-  // The checks that read no token: not stopped, the session current, its user and binding (revalidateSession).
-  function current(session: ApplicationSession, allowUnbound = false, r?: Read): boolean {
+  // The checks that read nothing: not stopped, the session current and its binding (revalidateNow; its user is
+  // `authorized`'s, or the checked watch's caller's, #807 P3 A7u1).
+  function current(session: ApplicationSession, allowUnbound = false): boolean {
     try {
       if (stopped || !options.isCurrent(session)) return false;
-      application.revalidateSession(session, allowUnbound, r);
+      application.revalidateNow(session, allowUnbound);
       return true;
     } catch (error) {
       if (unauthenticated(error)) return false;
       throw error;
     }
   }
-  // The token check, then `current` after its await: a stop or a session change that landed meanwhile refuses
-  // (#807 P3 A7d2c). A failed read rejects, never authorizes.
+  // The token check and the session's user check, then `current` after their awaits: a stop or a session change that
+  // landed meanwhile refuses (#807 P3 A7d2c, A7u1). A failed read rejects, never authorizes.
   async function authorized(session: ApplicationSession, allowUnbound = false, r?: Read): Promise<boolean> {
     try {
       if (stopped || !await options.isAuthorized(session, r)) return false;
+      if (stopped || !options.isCurrent(session)) return false;
+      await application.revalidateSession(session, allowUnbound, r);
     } catch (error) {
       if (unauthenticated(error)) return false;
       throw error;
     }
-    return current(session, allowUnbound, r);
+    return current(session, allowUnbound);
   }
   function refuse(session: ApplicationSession): never {
     for (const watch of [...bySession.get(session) ?? []]) finishQuietly(watch);

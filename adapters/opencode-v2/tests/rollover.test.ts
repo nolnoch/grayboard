@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { OpenCodeController } from "../src/lifecycle.js";
 import { fixture } from "./native-fixture.js";
-import { until } from "../../../tests/support/until.ts";
+import { until } from "./until.ts";
 import { startServer } from "../../../src/server/app.ts";
 import { hashToken } from "../../../src/server/auth.ts";
 import { OAUTH_TTL } from "../../../src/server/oauth-types.ts";

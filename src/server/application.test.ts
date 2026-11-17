@@ -316,7 +316,7 @@ test("unbound hosted reads never use the human address and still list and read b
   expect(((await seed(store.repo, tx => application.call(tx, registered, "board_list", {}))) as { name: string }[]).map(b => b.name)).toContain("e2e");
   expect(((await seed(store.repo, tx => application.call(tx, registered, "board_read", { board: "e2e" }))) as { posts: { body: string }[] }).posts.map(p => p.body)).toEqual(["hello"]);
   expect(asked.filter(a => a.endsWith("/human"))).toEqual([]);
-  expect(store.repo.aliases.find(store.repo.read, "alice@example.com/human")).toBeUndefined();
+  expect(await store.repo.aliases.find(store.repo.read, "alice@example.com/human")).toBeUndefined();
   expect(store.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE handle LIKE '%/human'").get()).toEqual({ n: 0 });
   application.close(owner);
   application.close(bobBe);
@@ -460,7 +460,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
   // A close leaves its hold (#451).
   expect(store.db.query("SELECT id FROM alias_holds WHERE address = ?").get(first.session.identityFull)).toEqual({ id: first.id });
   await expect(connect(bob, "other", { key: "first-session" })).rejects.toMatchObject({ code: "id_collision" });
-  expect(store.repo.aliases.find(store.repo.read, `${bob.user_email}/other`)).toBeUndefined();
+  expect(await store.repo.aliases.find(store.repo.read, `${bob.user_email}/other`)).toBeUndefined();
 });
 
 test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
@@ -486,7 +486,7 @@ test("#807: attachHuman while another body holds the write queue waits, then bin
   const attached = application.attachHuman(alice, delivery());
   for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
   expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([]);
-  expect(store.repo.aliases.find(store.repo.read, "alice@example.com/human")).toBeUndefined();
+  expect(await store.repo.aliases.find(store.repo.read, "alice@example.com/human")).toBeUndefined();
   release();
   await done;
   expect((await attached).session.human).toBe(true);
