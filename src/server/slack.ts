@@ -86,7 +86,7 @@ export class SlackBridge implements SlackLinker {
   /** Connect to Slack and bring every linked user's human online. */
   async start(): Promise<void> {
     const me = await this.web.call<{ user_id: string; team?: string }>("auth.test");
-    for (const link of this.o.repo.slack.links(this.o.repo.read)) await this.attach(link);
+    for (const link of await this.o.repo.slack.links(this.o.repo.read)) await this.attach(link);
     this.socket = new SocketMode({
       open: async () => (await this.app.call<{ url: string }>("apps.connections.open")).url,
       onEvent: (payload) => this.onEvent(payload),
@@ -126,10 +126,11 @@ export class SlackBridge implements SlackLinker {
     // disabled user's human is offline by admin action, not the bridge's
     // death, so their row is skipped.
     // One posted write (#807 D4): stop() is sync, called from startup's catch and Slack's close; the dedup read
-    // and the insert share its transaction.
+    // and the insert share its transaction. Its body awaits the links read (#807 P3 A6b), so it commits after stop()
+    // returns, even on an idle queue; a write queued after it (a session's bind draining the notice) waits for it.
     const { repo } = this.o;
-    repo.post(tx => {
-      for (const link of repo.slack.links(tx)) {
+    repo.post(async tx => {
+      for (const link of await repo.slack.links(tx)) {
         const user = repo.users.findById(link.user_id);
         if (!user || user.disabled_at !== null) continue;
         const target = `${link.email}/${HUMAN_NAME}`;
@@ -166,10 +167,10 @@ export class SlackBridge implements SlackLinker {
   // relink to another account may have committed while it waited.
   unlink(userId: number, slackUser?: string): Promise<boolean> {
     const { repo } = this.o;
-    return repo.write((tx: Tx): boolean => {
+    return repo.write(async (tx: Tx): Promise<boolean> => {
       const link = repo.slack.linkFor(tx, userId);
       if (!link || (slackUser !== undefined && link.slack_user !== slackUser)) return false;
-      repo.slack.unlink(tx, userId);
+      await repo.slack.unlink(tx, userId);
       // Unread DMs to an identity nobody reads would only pile up; a later link
       // starts from the newest message (see linkUser).
       const handle = `${link.email}/${HUMAN_NAME}`;
@@ -202,7 +203,7 @@ export class SlackBridge implements SlackLinker {
     this.tries.delete(slackUser);
     const user = repo.users.findById(entry.userId);
     if (!user) return;
-    const other = repo.slack.linkBySlackUser(repo.read, slackUser);
+    const other = await repo.slack.linkBySlackUser(repo.read, slackUser);
     if (other && other.user_id !== user.id) {
       return this.say(channel, ts, `This Slack account is linked to \`${other.email}\`. Send \`unlink\` first.`);
     }
@@ -228,10 +229,10 @@ export class SlackBridge implements SlackLinker {
     // without its link.
     type Linked = { taken: SlackLink } | { moved: SlackLink | undefined; link: SlackLink };
     const done = await repo.write(async (tx: Tx): Promise<Linked> => {
-      const taken = repo.slack.linkBySlackUser(tx, slackUser);
+      const taken = await repo.slack.linkBySlackUser(tx, slackUser);
       if (taken && taken.user_id !== user.id) return { taken };
       const previous = repo.slack.linkFor(tx, user.id);
-      repo.slack.link(tx, user.id, slackUser, channel);
+      await repo.slack.link(tx, user.id, slackUser, channel);
       const moved = previous && previous.slack_user !== slackUser ? previous : undefined;
       if (moved) writeAudit(repo, tx, "slack.relinked", user.email, slackUser, { from: moved.slack_user });
       const handle = `${user.email}/${HUMAN_NAME}`;
@@ -330,8 +331,13 @@ export class SlackBridge implements SlackLinker {
     let seq = 0;
     const pendingThreads = new Map<string, { row: SlackThread; seq: number }>();
     const pendingProgress = new Map<string, { value: unknown; seq: number }>();
-    const threadByTs = (ts: string) => pendingThreads.get(ts)?.row ?? repo.slack.threadByTs(repo.read, link.user_id, ts);
-    const postThread = (row: SlackThread, write: (tx: Tx) => void, what: string) => {
+    // The committed row is read with an await (#807 P3 A6b): the overlay is looked at again after it, so a row
+    // another call set meanwhile wins, and the overlay's read and its update below stay one synchronous step.
+    const threadByTs = async (ts: string): Promise<SlackThread | undefined> => {
+      const committed = pendingThreads.has(ts) ? undefined : await repo.slack.threadByTs(repo.read, link.user_id, ts);
+      return pendingThreads.get(ts)?.row ?? committed;
+    };
+    const postThread = (row: SlackThread, write: (tx: Tx) => Promise<void>, what: string) => {
       const mine = ++seq;
       pendingThreads.set(row.thread_ts, { row, seq: mine });
       repo.post(write, () => { if (pendingThreads.get(row.thread_ts)?.seq === mine) pendingThreads.delete(row.thread_ts); }, what);
@@ -343,14 +349,14 @@ export class SlackBridge implements SlackLinker {
       },
       byTs: threadByTs,
       // INSERT OR IGNORE: a row already there stays as it is.
-      addThread: (row) => {
-        if (threadByTs(row.thread_ts)) { repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row"); return; }
+      addThread: async (row) => {
+        if (await threadByTs(row.thread_ts)) { repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row"); return; }
         postThread({ ...row, board: row.board ?? null }, tx => repo.slack.addThread(tx, link.user_id, row), "Slack thread row");
       },
       // As advanceThread's UPDATE: last_id only moves forward, and peer follows only a newer id.
-      advance: (ts, id, peer) => {
+      advance: async (ts, id, peer) => {
         const write = (tx: Tx) => repo.slack.advanceThread(tx, link.user_id, ts, id, peer);
-        const row = threadByTs(ts);
+        const row = await threadByTs(ts);
         if (!row) { repo.post(write, undefined, "Slack thread advance"); return; }
         postThread({ ...row, peer: peer != null && id > row.last_id ? peer : row.peer, last_id: Math.max(row.last_id, id) }, write, "Slack thread advance");
       },
@@ -381,10 +387,10 @@ export class SlackBridge implements SlackLinker {
         const now = repo.post(async tx => {
           // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
           // delivered (#470). Read in the body, after the progress writes queued before it.
-          const posted = (repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
+          const posted = (await repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
           if (m.board && m.post_id) application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
           else if (m.message_id) await application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
-          repo.slack.clearProgress(tx, link.user_id, r);
+          await repo.slack.clearProgress(tx, link.user_id, r);
         }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt");
         if (!now) outbox.delete(id);
       },
@@ -523,12 +529,12 @@ export class SlackBridge implements SlackLinker {
       const code = /^link\s+([a-z0-9]{4,16})$/i.exec(text);
       if (code) return this.linkUser(user, channel, ts, code[1]!);
       if (/^unlink$/i.test(text)) {
-        const link = this.o.repo.slack.linkBySlackUser(this.o.repo.read, user);
+        const link = await this.o.repo.slack.linkBySlackUser(this.o.repo.read, user);
         const unlinked = link ? await this.unlink(link.user_id, user) : false;
         return this.say(channel, ts, link && unlinked ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
       }
     }
-    const link = this.o.repo.slack.linkBySlackUser(this.o.repo.read, user);
+    const link = await this.o.repo.slack.linkBySlackUser(this.o.repo.read, user);
     const l = link && this.linked.get(link.user_id);
     if (!l) return this.say(channel, threaded ? String(e.thread_ts) : ts, link ? "Your link is offline; the server log says why." : NOT_LINKED);
     await l.relay.onEvent(payload);

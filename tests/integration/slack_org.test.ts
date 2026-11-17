@@ -557,7 +557,7 @@ test("#1016: a Slack reply in a thread whose row waits in the write queue reache
     const q = await be.call<SendResult>("dm_send", { to: "human", body: "thread fixture" });
     const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("thread fixture") && slack.postTs.has(p)), 5000, "Slack answered the post");
     const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
-    expect(srv.app.repo.slack.threadByTs(srv.app.repo.read, userId, tsOf(top))).toBeUndefined();
+    expect(await srv.app.repo.slack.threadByTs(srv.app.repo.read, userId, tsOf(top))).toBeUndefined();
     // The reply's dm_send queues behind the hold too: a write the Slack bridge starts is the sign the relay read the
     // thread's row. Its bus call reaches repo.write before any await, so the bridge is on the stack.
     const repo = srv.app.repo, { write } = repo;
@@ -750,6 +750,9 @@ test("a bridge that fails at boot records its death for its linked users, via th
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: "http://127.0.0.1:1/api/",
   });
   await boot.start().catch((e) => boot.stop({ fatal: true, detail: `not started: ${(e as Error).message}` }));
+  // stop()'s posted write awaits the links read (#807 P3 A6b), so it commits after stop() returns: a write queued
+  // behind it runs once it has.
+  await srv.app.repo.write(() => {});
 
   const row = srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human");
   expect(row).toBeDefined();
@@ -781,6 +784,8 @@ test("a fatal stop with no linked users writes nothing user-facing", async () =>
     await down.app.slackReady;
     // The start failure is fatal, but with zero linked users there is nobody
     // to tell and no user-facing row to write: the notify loop never runs.
+    // Its posted write commits after stop() returns (#807 P3 A6b): a write queued behind it runs once it has.
+    await down.app.repo.write(() => {});
     const rows = down.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped'").get() as { n: number };
     expect(rows.n).toBe(0);
   } finally {
@@ -982,22 +987,22 @@ test("#1062: a thread row and its advance, waiting in the write queue, read back
   const committed = () => repo.slack.thread(repo.read, userId, "dm", null, 41);
   const holder = holdQueue();
   try {
-    store.addThread({ thread_ts: "1700000000.000100", kind: "dm", board: null, root_id: 41, peer: "alice@example.com/be", last_id: 41 });
-    expect(committed()).toBeUndefined();
+    await store.addThread({ thread_ts: "1700000000.000100", kind: "dm", board: null, root_id: 41, peer: "alice@example.com/be", last_id: 41 });
+    expect(await committed()).toBeUndefined();
     // A second item in the just-opened thread finds the row, so it posts threaded.
-    expect(store.thread("dm", null, 41)).toMatchObject({ thread_ts: "1700000000.000100", peer: "alice@example.com/be", last_id: 41 });
+    expect(await store.thread("dm", null, 41)).toMatchObject({ thread_ts: "1700000000.000100", peer: "alice@example.com/be", last_id: 41 });
     // A newer item moves last_id and the peer; an older one moves neither.
-    store.advance("1700000000.000100", 45, "alice@example.com/fe");
-    store.advance("1700000000.000100", 43, "alice@example.com/sim");
+    await store.advance("1700000000.000100", 45, "alice@example.com/fe");
+    await store.advance("1700000000.000100", 43, "alice@example.com/sim");
     const want = { thread_ts: "1700000000.000100", kind: "dm" as const, board: null, root_id: 41, peer: "alice@example.com/fe", last_id: 45 };
-    expect(store.thread("dm", null, 41)).toEqual(want);
-    expect(store.byTs("1700000000.000100")).toEqual(want);
-    expect(committed()).toBeUndefined();
+    expect(await store.thread("dm", null, 41)).toEqual(want);
+    expect(await store.byTs("1700000000.000100")).toEqual(want);
+    expect(await committed()).toBeUndefined();
     holder.release();
     await holder.done;
-    await until(() => committed()?.last_id === 45, 5000, "the thread row and its advances committed");
-    expect(committed()).toEqual(want);
-    expect(store.thread("dm", null, 41)).toEqual(want);
+    await until(async () => (await committed())?.last_id === 45, 5000, "the thread row and its advances committed");
+    expect(await committed()).toEqual(want);
+    expect(await store.thread("dm", null, 41)).toEqual(want);
   } finally { holder.release(); }
 });
 
@@ -1017,7 +1022,7 @@ test("#1062: queued progress reads back as saved, and the receipt drops it", asy
     // And a reader's copy is its own.
     (store.progress(id) as Record<string, unknown>).posted = false;
     expect(store.progress(id)).toEqual({ posted: true, error: null });
-    expect(committed()).toBeUndefined();
+    expect(await committed()).toBeUndefined();
     store.done(id, null);
     expect(store.pending()).toEqual([]);
     // The same item enqueued again before the receipt commits still reads the progress, so it isn't posted twice.
@@ -1026,8 +1031,8 @@ test("#1062: queued progress reads back as saved, and the receipt drops it", asy
     holder.release();
     await holder.done;
     // The progress write's commit dropped the overlay; the receipt's cleared the row.
-    await until(() => store.progress(again) === undefined, 5000, "the queued progress committed and was cleared");
-    expect(committed()).toBeUndefined();
+    await until(async () => (await store.progress(again)) === undefined, 5000, "the queued progress committed and was cleared");
+    expect(await committed()).toBeUndefined();
   } finally { holder.release(); }
 });
 
@@ -1052,7 +1057,7 @@ test("#1062: a redelivery while the item's progress waits in the write queue doe
     expect(store.pending()).toHaveLength(1);
     // The redelivery must read the queued progress, not a committed row.
     expect(holder).toBeDefined();
-    expect(srv.app.repo.slack.progress(srv.app.repo.read, userId, `dm:${sent.message_id}`)).toBeUndefined();
+    expect(await srv.app.repo.slack.progress(srv.app.repo.read, userId, `dm:${sent.message_id}`)).toBeUndefined();
     // A drain() while the failed one is still unwinding would only set its again flag.
     await until(() => !(relay as unknown as { draining: boolean }).draining, 5000, "the failed drain ended");
     await relay.drain();
@@ -1077,8 +1082,8 @@ test("#1062: the receipt drops the overlay of a progress write that failed", asy
     // The progress write failed, so only the receipt's commit can drop its overlay.
     const again = store.enqueue({ content: "failed progress fixture", meta });
     await until(() => errors.mock.calls.some((c) => String(c[0]).includes("Slack progress failed")), 5000, "the progress write failed");
-    expect(srv.app.repo.slack.progress(srv.app.repo.read, userId, "post:990002")).toBeUndefined();
-    await until(() => store.progress(again) === undefined, 5000, "the receipt dropped the failed write's overlay");
+    expect(await srv.app.repo.slack.progress(srv.app.repo.read, userId, "post:990002")).toBeUndefined();
+    await until(async () => (await store.progress(again)) === undefined, 5000, "the receipt dropped the failed write's overlay");
   } finally { holder.release(); errors.mockRestore(); }
 });
 
