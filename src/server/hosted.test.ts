@@ -46,18 +46,34 @@ beforeEach(async () => {
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
 
 test("#807: behind a write backlog longer than a tick, the timer keeps one sweep queued, not one per tick", async () => {
-  const expired = spyOn(database.repo.hosted, "expired");
-  let release!: () => void;
-  const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
-  const before = expired.mock.calls.length;
-  await Bun.sleep(1_100); // four or more 250 ms ticks while the queue is held
-  expect(expired.mock.calls.length).toBe(before);
-  release();
-  await holder;
-  await until(() => expired.mock.calls.length > before);
-  // The one queued sweep ran; at most one more tick's has started since.
-  expect(expired.mock.calls.length - before).toBeLessThanOrEqual(2);
-  expired.mockRestore();
+  // The service's timer, driven by hand: each call is one tick, so the test needs no wall clock (#961).
+  hosted.close();
+  const real = setInterval;
+  let tick!: () => void;
+  const interval = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) => {
+    if (ms !== 250) return real(fn, ms, ...args);
+    tick = fn;
+    return real(() => {}, 1 << 30);
+  }) as unknown as typeof setInterval);
+  try { hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); } finally { interval.mockRestore(); }
+  const store = database.repo.hosted;
+  const expired = spyOn(store, "expired");
+  try {
+    let release!: () => void;
+    const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
+    const before = expired.mock.calls.length;
+    for (let i = 0; i < 4; i++) tick();
+    expect(expired.mock.calls.length).toBe(before);
+    release();
+    await holder;
+    // FIFO: a write queued now runs after every sweep the ticks queued.
+    await store.write(() => {});
+    expect(expired.mock.calls.length - before).toBe(1);
+    // The guard clears once the sweep settles: the next tick queues another.
+    tick();
+    await store.write(() => {});
+    expect(expired.mock.calls.length - before).toBe(2);
+  } finally { expired.mockRestore(); }
 });
 
 test("#807 audit: withGate authorizes outside the transaction (the auth cache serves it) and again inside only after waiting in the queue", async () => {
@@ -883,6 +899,32 @@ test("a refusal row whose write after the rollback fails is counted, and the ref
     expect(hosted.refusalRowsLost).toBe(1);
     expect(quiet.mock.calls.some(([line]) => String(line).includes('"operation":"hosted.refusal_row"'))).toBe(true);
   } finally { write.mockRestore(); quiet.mockRestore(); }
+});
+
+test("refusal rows whose queued write fails as a whole are all counted lost, once (#961)", async () => {
+  const store = database.repo.hosted;
+  const { write, atomic } = store;
+  let rows = 0;
+  // flushQueued's body runs in a real transaction: each row fails on its own, then the whole write is refused, so a
+  // row counted both ways would count twice.
+  const writes = spyOn(store, "write").mockImplementation(((fn: (tx: unknown) => unknown, ...rest: unknown[]) => {
+    if (!new Error().stack?.includes("flushQueued")) return (write as (...a: unknown[]) => unknown).call(store, fn, ...rest);
+    return (write as (...a: unknown[]) => unknown).call(store, (tx: unknown) => {
+      const each = spyOn(store, "atomic").mockImplementation(() => { rows++; throw new Error("row refused"); });
+      try { fn(tx); } finally { each.mockRestore(); }
+      throw new Error("commit refused");
+    });
+  }) as typeof write);
+  const quiet = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    // The reserved name, a policy refusal: its binding row and its decision row, two rows in one flush.
+    await expect(hosted.bind(principal, context("root"), { name: "human", create: true })).rejects.toHaveProperty("code", "forbidden");
+    expect(rows).toBe(2);
+    expect(hosted.refusalRowsLost).toBe(2);
+    expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused'").all()).toHaveLength(0);
+    // One diagnostic per failed row, and one for the refused write.
+    expect(quiet.mock.calls.filter(([line]) => String(line).includes('"operation":"hosted.refusal_row"'))).toHaveLength(3);
+  } finally { writes.mockRestore(); quiet.mockRestore(); expect(store.atomic).toBe(atomic); }
 });
 
 test("ending a tools-only hosted root frees its alias for other users and restores writes_as when the same ID starts again (#451)", async () => {

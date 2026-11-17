@@ -400,7 +400,7 @@ export class Relay {
     const what = x.kind === "dm" ? `your message ${x.id}` : `your post ${x.id} on #${x.board}`;
     const body = `[Slack bridge] Files on ${what} didn't reach Slack, so the human hasn't seen them: ${listRefused(refused)}. The text did reach them.`;
     const r = await this.bus.call("dm_send", { to: x.from, body, ...(x.kind === "dm" ? { parent_id: x.id } : {}) });
-    if (!r.ok) this.log(`slack: couldn't tell ${x.from} its files didn't reach Slack: ${r.error}`);
+    if (!r.ok) this.log(`slack: couldn't tell ${x.from} its files didn't reach Slack: ${r.code ? `${r.code}: ` : ""}${r.error}`);
   }
 
   // Notifications carry parent_id, not the root; key the map on the root so a
