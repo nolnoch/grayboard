@@ -17,7 +17,7 @@ import {
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, queuedTx, type MessageRow, type Repo, type Sync } from "./db.ts";
-import { afterCommitOf, type Read, type Tx } from "./store/tx.ts";
+import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
@@ -203,10 +203,10 @@ type Hub = {
   helloLimiter: RateLimiter;
   // delegate's per-user bucket and the launcher cap (#252). A streak's
   // rows go to delegateRows while a delegate call runs, to be written where
-  // its outcome keeps them; otherwise (a sweep) at once.
+  // its outcome keeps them, on that call's `Tx`; otherwise (a sweep, outside any body) posted.
   delegateLimit: RateLimit;
   delegateLimiter: RateLimiter;
-  delegateRows: (() => void)[] | undefined;
+  delegateRows: RefusalRow[] | undefined;
   delegateOpenCap: number;
   aliasScopeCap: number;
   now: () => number;
@@ -218,10 +218,11 @@ type Hub = {
 type Commit = (effect: () => void | Promise<void>) => void;
 const onCommit = (h: Read): Commit => (effect) => afterCommitOf(h, effect);
 
-// A push its reader can no longer see, acknowledged as pendingFor finds it: posted through the write queue (#807 D4),
-// since the reads that find it run outside any transaction.
-const lostAck = (hub: Hub) => (handle: string, ref: PendingRef) => {
-  hub.repo.post(tx => acknowledge(hub.repo.coreOn(tx), handle, ref), undefined, "lost-visibility push ack");
+// A push its reader can no longer see, acknowledged as pendingFor finds it, on `h`: inside a body (a delivery
+// receipt's `pending`) on its `Tx`; outside one (a drain, a lease's pull) posted through the write queue (#807 D4).
+const lostAck = (hub: Hub, h: Read) => (handle: string, ref: PendingRef) => {
+  const write = (tx: Tx) => acknowledge(hub.repo.coreOn(tx), handle, ref);
+  if (isTx(h)) write(h); else hub.repo.post(write, undefined, "lost-visibility push ack");
 };
 
 // Send this session everything pending on boards, for any of its addresses,
@@ -230,7 +231,7 @@ const lostAck = (hub: Hub) => (handle: string, ref: PendingRef) => {
 // hello; see pendingFor).
 function drainBoards(session: ApplicationSession, hub: Hub, all = false): void {
   for (const address of session.addresses) {
-    for (const item of pendingFor(hub.repo.coreOn(hub.repo.read), address, { all, ack: lostAck(hub) })) {
+    for (const item of pendingFor(hub.repo.coreOn(hub.repo.read), address, { all, ack: lostAck(hub, hub.repo.read) })) {
       const key = pendingKey(refOf(item));
       const sent = session.inflight.get(key);
       if (sent) {
@@ -294,9 +295,9 @@ const uploaderOf = (s: ApplicationSession): Uploader => ({ addresses: s.addresse
 
 // The audit log keeps an undelivered bridge death owed across restarts.
 // Selection reads and records delivery synchronously, so only one agent gets it.
-function owedBridgeNotice(repo: Repo, email: string): string | undefined {
+function owedBridgeNotice(repo: Repo, tx: Tx, email: string): string | undefined {
   const target = `${email}/${HUMAN_NAME}`;
-  const stop = repo.audit.last("bridge.stopped", target);
+  const stop = repo.audit.last(tx, "bridge.stopped", target);
   if (!stop) return undefined;
   let detail: { reason?: string; at?: string; suppressed?: boolean };
   try {
@@ -305,9 +306,9 @@ function owedBridgeNotice(repo: Repo, email: string): string | undefined {
     return undefined;
   }
   if (detail.suppressed || !detail.at || !detail.reason) return undefined;
-  const notified = repo.audit.last("bridge.notified", target);
+  const notified = repo.audit.last(tx, "bridge.notified", target);
   if (notified && notified.at >= stop.at) return undefined;
-  writeAudit(repo, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
+  writeAudit(repo, tx, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
   return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
 }
 
@@ -379,7 +380,7 @@ function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: 
   const { repo } = hub;
   if (repo.aliases.find(tx, address)) return;
   repo.aliases.create(tx, scope, authed.user_email);
-  writeAudit(repo, "alias.created", authed.user_email, address, { lazy: true, session });
+  writeAudit(repo, tx, "alias.created", authed.user_email, address, { lazy: true, session });
   onAliasCreated(repo, tx, authed.user_id, address);
 }
 
@@ -411,11 +412,15 @@ function sessionActor(session: ApplicationSession, address?: string): Actor {
 export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
   // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
-  // is the session's `afterRollback`, and a streak's audit row, written there where a commit keeps it, is handed
-  // to it as well, to be written again if the transaction rolls back. A refused take always rolls it back.
-  let streakAfterRollback: ((write: () => void) => void) | undefined;
-  const streakRow = (write: () => void) => { write(); streakAfterRollback?.(write); };
-  const delegateRow = (write: () => void) => { if (hub.delegateRows) hub.delegateRows.push(write); else write(); };
+  // holds the bind's `Tx` and the session's `afterRollback`; a streak's audit row is written on that `Tx`, where a
+  // commit keeps it, and handed to `afterRollback` as well, to be written again if the transaction rolls back. A
+  // refused take always rolls it back. Outside a bind (a sweep, outside any body) the row is posted.
+  let streakAt: { tx: Tx; afterRollback?: (write: RefusalRow) => void } | undefined;
+  const streakRow = (write: RefusalRow) => {
+    if (!streakAt) { repo.post(write, undefined, "bind rate-limit row"); return; }
+    write(streakAt.tx); streakAt.afterRollback?.(write);
+  };
+  const delegateRow = (write: RefusalRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else repo.post(write, undefined, "delegation throttle row"); };
   const hub: Hub = {
     repo,
     registry: new Map(),
@@ -429,11 +434,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     helloLimiter: new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
       start: (email, ctx, retryAfterMs) => {
         console.error(`[grayboard] rate-limiting hellos from ${email}`);
-        streakRow(() => writeAudit(repo, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
+        streakRow(w => writeAudit(repo, w, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
       },
       end: (email, refused) => {
         console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
-        streakRow(() => writeAudit(repo, "bind.rate_limit_ended", email, null, { refused }));
+        streakRow(w => writeAudit(repo, w, "bind.rate_limit_ended", email, null, { refused }));
       },
     }, opts.now),
     delegateLimit: opts.delegateLimit ?? DELEGATE_LIMIT,
@@ -441,8 +446,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // one bucket and a fresh session can't reset it; capped like the
     // hosted-request limiter's keys would be by users.
     delegateLimiter: new RateLimiter(opts.delegateLimit ?? DELEGATE_LIMIT, {
-      start: (email, ctx, retryAfterMs) => delegateRow(() => writeAudit(repo, "delegation.throttled", email, email, { ...ctx, retry_after_ms: retryAfterMs })),
-      end: (email, refused) => delegateRow(() => writeAudit(repo, "delegation.throttle_ended", null, email, { refused })),
+      start: (email, ctx, retryAfterMs) => delegateRow(w => writeAudit(repo, w, "delegation.throttled", email, email, { ...ctx, retry_after_ms: retryAfterMs })),
+      end: (email, refused) => delegateRow(w => writeAudit(repo, w, "delegation.throttle_ended", null, email, { refused })),
     }, opts.now, 10_000),
     delegateRows: undefined,
     delegateOpenCap: opts.delegateOpenCap ?? DELEGATE_OPEN_CAP,
@@ -461,11 +466,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const hostedLimiter = (bucket: "native" | "subscriber", limit: RateLimit) => new RateLimiter(limit, {
     start: (email, _ctx, retryAfterMs) => {
       console.error(`[grayboard] rate-limiting hosted ${bucket} requests from ${email}`);
-      writeAudit(repo, "hosted.rate_limited", email, null, { bucket, retry_after_ms: retryAfterMs });
+      writeAudit(repo, repo.read, "hosted.rate_limited", email, null, { bucket, retry_after_ms: retryAfterMs });
     },
     end: (email, refused) => {
       console.error(`[grayboard] hosted ${bucket} requests from ${email} no longer rate-limited; ${refused} refused`);
-      writeAudit(repo, "hosted.rate_limit_ended", email, null, { bucket, refused });
+      writeAudit(repo, repo.read, "hosted.rate_limit_ended", email, null, { bucket, refused });
     },
   }, opts.now);
   const hostedRequestLimiter = hostedLimiter("native", opts.hostedRequestLimit ?? DEFAULT_HOSTED_REQUEST_LIMIT);
@@ -516,7 +521,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   function detach(session: ApplicationSession): void {
     for (const a of session.addresses) if (hub.registry.get(a) === session) hub.registry.delete(a);
   }
-  function close(session: ApplicationSession, _why = "connection closed") {
+  // `h`: the body the close runs in (bind's and unbind's `finally`), whose `Tx` takes its rows; else the rows are posted.
+  function close(session: ApplicationSession, h: Read = repo.read) {
+    const write = (row: (tx: Tx) => void, what: string) => { if (isTx(h)) row(h); else repo.post(row, undefined, what); };
     if (!session.active) return;
     session.active = false;
     hub.sessions.delete(session);
@@ -525,7 +532,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const addr = session.primary;
       if (addr && hub.registry.get(addr) === session) {
         hub.registry.delete(addr);
-        repo.post(tx => logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "released", "connection closed"), undefined, "human release row");
+        write(tx => logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "released", "connection closed"), "human release row");
       }
       return;
     }
@@ -533,19 +540,20 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
     const id = session.sessionId;
     detach(session);
-    // Close runs from sync finally blocks and commit callbacks: the touch is posted, not awaited (#807 P1b-4b).
+    // Close runs from sync finally blocks and commit callbacks: the touch is written on `h` or posted, not awaited (#807 P1b-4b).
     const writer = session.writerId;
-    if (writer) repo.post(tx => touchId(repo.coreOn(tx), writer), undefined, "last-seen touch");
+    if (writer) write(tx => touchId(repo.coreOn(tx), writer), "last-seen touch");
   }
   // The server closes the session: it leaves the hub, and its transport is
-  // told why and closes.
-  function terminate(session: ApplicationSession, error: ApplicationError) {
+  // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
+  function terminate(session: ApplicationSession, error: ApplicationError, h: Read = repo.read) {
     detach(session);
     session.closedBy = error;
-    close(session);
+    close(session, h);
     session.sink.closed(error);
   }
-  function valid(session: ApplicationSession, allowUnbound = false) {
+  // `h`: the handle the caller holds; inside a body its `Tx`, so a disabled user's terminate writes its rows there.
+  function valid(session: ApplicationSession, allowUnbound = false, h: Read = repo.read) {
     if (!session.active || !hub.sessions.has(session)) {
       // A superseded bridge connection is told so, a revoked tools-only
       // one why it may not write as its alias (S9); any other closed session
@@ -556,7 +564,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       fail("unauthenticated", "session is closed");
     }
     if (repo.users.isDisabled(session.authed.user_id)) {
-      terminate(session, new ApplicationError("unauthenticated", "an admin signed this user out"));
+      terminate(session, new ApplicationError("unauthenticated", "an admin signed this user out"), h);
       fail("unauthenticated", "an admin signed this user out");
     }
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
@@ -583,10 +591,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       let ended;
       const at = now();
       try {
-        ended = repo.atomic(() => endSession(repo.coreOn(tx), repo.mailOn(tx), id, { why, now: at, audit: serverAuditSink(repo) }));
+        ended = repo.atomic(() => endSession(repo.coreOn(tx), repo.mailOn(tx), id, { why, now: at, audit: serverAuditSink(repo, tx) }));
       } catch (e) {
         console.error(`[grayboard] ending session ${id} (${why}) failed:`, e);
-        writeAudit(repo, "id.end_failed", null, id, { why, error: String(e) });
+        writeAudit(repo, tx, "id.end_failed", null, id, { why, error: String(e) });
         continue;
       }
       // An end that found the session already ended sends nothing again.
@@ -624,9 +632,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // team removal, the principal's own leave), or null for the server's own
   // sweep; the revocations' audit actor.
   // One write (#807 P1b-4b): the uses are read, and revoked, in its transaction; live holders follow after the commit.
-  // A caller's open transaction takes it in; a held queue makes it wait behind the holder.
-  function recheckAliases(principal: string | null, by: string | null): void {
-    repo.post(tx => {
+  // `h`: a caller's body `Tx` takes it in (a team leave or removal); outside any body it's posted, and a held queue
+  // makes it wait behind the holder.
+  function recheckAliases(principal: string | null, by: string | null, h: Read = repo.read): void {
+    const body = (tx: Tx) => {
       const revoked: (AliasUse & { reason: string })[] = [];
       for (const u of aliasUses(repo.coreOn(tx), principal)) {
         const p = repo.principals.findByName(u.principal);
@@ -635,12 +644,15 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         if (reason) revoked.push({ ...u, reason });
       }
       return revokeAliases(tx, revoked, by);
-    }, ({ resync, ends }) => {
+    };
+    const committed = ({ resync, ends }: ReturnType<typeof revokeAliases>) => {
       // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
       // address set and registry entries follow the database, as a bind or unbind's do.
       for (const id of resync) for (const s of hub.sessions) if (!s.human && s.sessionId === id) setHolds(hub, s, holdsOf(repo.coreOn(repo.read), id));
       afterEnds(ends.woken, ends.bounced);
-    }, "alias recheck");
+    };
+    if (isTx(h)) { const value = body(h); h.afterCommit(() => committed(value)); return; }
+    repo.post(body, committed, "alias recheck");
   }
   // Takes aliases from sessions whose principals may no longer act in their
   // scopes (S9). A holder keeps its ID and its other holds: only the revoked
@@ -660,7 +672,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       try { revokeUse(tx, u, by, ended, resync); }
       catch (e) {
         console.error(`[grayboard] revoking ${u.address} from session ${u.id} failed:`, e);
-        writeAudit(repo, "alias.revoke_failed", by, u.address, { session: u.id, principal: u.principal, error: String(e) });
+        writeAudit(repo, tx, "alias.revoke_failed", by, u.address, { session: u.id, principal: u.principal, error: String(e) });
       }
     }
     return { resync, ends: endIdsIn(tx, ended, "revoked") };
@@ -671,7 +683,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (!u.held) {
       // A hosted tools-only root ends its ownership, not an ID (hosted IDs are the store's).
       repo.atomic(() => {
-        writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, writes_as: true, reason });
+        writeAudit(repo, tx, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, writes_as: true, reason });
         if (hosted) repo.hosted.end(tx, u.id, "revoked", now());
       });
       if (!hosted) ended.push(u.id);
@@ -683,13 +695,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const primary = hosted && holdsOf(repo.coreOn(tx), u.id)[0] === u.address;
       dropHold(repo.coreOn(tx), u.address, u.id);
       logBinding(repo.coreOn(tx), u.id, u.address, "released", `access revoked: ${reason}`);
-      writeAudit(repo, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
+      writeAudit(repo, tx, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
       if (hosted) {
         const row = repo.hosted.get(tx, u.id);
         if (row) {
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
           repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(repo.coreOn(tx), u.id).length ? row.lease_deadline : null });
-          if (row.lease_deadline !== null) writeAudit(repo, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
+          if (row.lease_deadline !== null) writeAudit(repo, tx, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
           repo.hosted.lose(tx, u.id, { alias: u.address, reason, primary }, now());
         }
       }
@@ -714,7 +726,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (stale) fail("unauthenticated", stale);
       if (!repo.aliases.find(tx, addr)) {
         repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
-        writeAudit(repo, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
+        writeAudit(repo, tx, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
         onAliasCreated(repo, tx, authed.user_id, addr);
       }
       touchAlias(repo.coreOn(tx), addr);
@@ -739,7 +751,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
   function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): BindResult {
-    valid(session, true);
+    valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
@@ -747,14 +759,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Lazy creation is here, after the bind limit: an unlimited create loop
     // would mint aliases without bound. Taken before the held check, so a
     // re-bind loop spends it too.
-    streakAfterRollback = session.afterRollback;
+    streakAt = { tx, afterRollback: session.afterRollback };
     let t: Take;
-    try { t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAfterRollback = undefined; }
+    try { t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAt = undefined; }
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
     const target = bindTarget(hub, authed, m.alias);
     if ("error" in target) {
       if (target.address) { const a = target.address; rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, a, "refused", target.error)); }
-      if (target.authz) { const { req, d } = target.authz; rowAfterRollback(session, tx, () => recordDecision(repo, sessionActor(session, target.address), req, d)); }
+      if (target.authz) { const { req, d } = target.authz; rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, target.address), req, d)); }
       return fail(target.code, target.error);
     }
     const { address, scope } = target;
@@ -769,7 +781,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (e instanceof CoreError) return refuse("bad_request", e.message, e.message);
       throw e;
     }
-    const audit = serverAuditSink(repo);
+    const audit = serverAuditSink(repo, tx);
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
       if (meta) repo.atomic(() => setAliasMeta(repo.coreOn(tx), address, meta, id, audit, authed.user_email));
@@ -820,7 +832,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
 
     setHolds(hub, session, holdsOf(repo.coreOn(tx), id));
     // The first bind of a user's session after the bridge died carries the death notice, once.
-    const owed = owedBridgeNotice(repo, authed.user_email);
+    const owed = owedBridgeNotice(repo, tx, authed.user_email);
     const notices = noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
@@ -831,7 +843,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // the session doesn't hold answers ok with released: false.
   // `tx`: the body the unbind runs in.
   function unbind(tx: Tx, session: ApplicationSession, alias: string): UnbindResult {
-    valid(session, true);
+    valid(session, true, tx);
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it unbinds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it unbinds nothing");
     const id = session.sessionId;
@@ -904,7 +916,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const prior = idRow(repo.coreOn(tx), id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
-        if (collided) collided(why); else writeAudit(repo, "id.collision", authed.user_email, id, { why });
+        if (collided) collided(why); else writeAudit(repo, tx, "id.collision", authed.user_email, id, { why });
         fail("id_collision", idCollisionText(id, why));
       }
       // A tools-only root's writes_as is registered here (A4): aliasUser, aliasUses and
@@ -913,7 +925,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         repo.atomic(() => {
           const model = cleanFact(facts?.model), effort = cleanFact(facts?.effort);
           registerId(repo.coreOn(tx), { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
-          writeAudit(repo, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+          writeAudit(repo, tx, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
         });
       }
       else {
@@ -923,13 +935,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
           const endedAt = prior.ended_at;
           repo.atomic(() => {
             repo.hosted.reopenId(tx, id);
-            writeAudit(repo, "id.reopened", authed.user_email, id, { ended_at: endedAt, harness });
+            writeAudit(repo, tx, "id.reopened", authed.user_email, id, { ended_at: endedAt, harness });
           });
         }
         touchId(repo.coreOn(tx), id);
         // A new ownership of the same ID reports its own model and effort: what the last one reported is stale.
         const changed = setIdFacts(repo.coreOn(tx), id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
-        if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
+        if (changed) writeAudit(repo, tx, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
         if (writesAs !== null) repo.hosted.restateWritesAs(tx, id, writesAs);
       }
@@ -938,13 +950,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // it), turned on by whichever of its requests declares first and audited as a local session's is, once.
     // `detail`: which ownership and client turned it on, now that a later request can (#520).
     hostedDeclareLauncher(tx: Tx, authed: AuthedUser, id: string, detail: { ownership: number; client_id: string }) {
-      if (repo.hosted.declareLauncher(tx, id)) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
+      if (repo.hosted.declareLauncher(tx, id)) writeAudit(repo, tx, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
     // before and after, only when one changed. Absent fields keep the stored value; an empty one clears it (#558).
     hostedFacts(tx: Tx, authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
       const changed = setIdFacts(repo.coreOn(tx), id, facts);
-      if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "request" });
+      if (changed) writeAudit(repo, tx, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "request" });
     },
     // A tools-only declaration's alias, resolved and checked: a name the
     // principal may act in, never one another user's session uses (S7, S8); it may share the
@@ -959,8 +971,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         if (target.address) note(target.address, target.error);
         if (target.authz) {
           const { req, d } = target.authz;
-          const row = () => recordDecision(repo, { user: authed.user_email, address: target.address, session: id }, req, d);
-          if (later) later(row); else row();
+          const row: RefusalRow = w => recordDecision(repo, w, { user: authed.user_email, address: target.address, session: id }, req, d);
+          if (later) later(row); else row(tx);
         }
         return fail(target.code, target.error);
       }
@@ -1004,7 +1016,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     attachHuman,
     bindNow,
     hostedRefused(tx: Tx, id: string, address: string, detail: string) { logBinding(repo.coreOn(tx), id, address, "refused", detail); },
-    hostedCollided(authed: AuthedUser, id: string, why: string) { writeAudit(repo, "id.collision", authed.user_email, id, { why }); },
+    hostedCollided(h: Read, authed: AuthedUser, id: string, why: string) { writeAudit(repo, h, "id.collision", authed.user_email, id, { why }); },
     unbind,
     close,
     revalidateSession: valid,
@@ -1028,36 +1040,36 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       body: string,
       options: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
     ) {
-      valid(session);
+      valid(session, false, tx);
       return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
-      valid(session);
+      valid(session, false, tx);
       return handleDelegate(hub, tx, session, request);
     },
     async history(r: Read, session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
-      valid(session);
+      valid(session, false, r);
       return handleHistory(hub, r, session, options.peer, options.limit, options.before_id);
     },
     async thread(r: Read, session: ApplicationSession, id: number) {
-      valid(session);
+      valid(session, false, r);
       return handleThread(r, session, id, repo);
     },
     async inbox(r: Read, session: ApplicationSession, days?: number) {
-      valid(session);
+      valid(session, false, r);
       childState(session, "dm_inbox");
       return handleInbox(hub, r, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
-      valid(session);
+      valid(session, false, r);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(r, a, "direct", a) }));
       const messages = repo.messages.unreadSince(r, streams).slice(0, limit);
       const seen = new Set<string>();
       const all: Pending[] = [];
       for (const a of session.addresses) {
-        for (const item of pendingFor(repo.coreOn(r), a, { all: true, ack: lostAck(hub) })) {
+        for (const item of pendingFor(repo.coreOn(r), a, { all: true, ack: lostAck(hub, r) })) {
           const key = pendingKey(refOf(item));
           if (!seen.has(key)) { seen.add(key); all.push(item); }
         }
@@ -1073,11 +1085,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       ];
     },
     async boardCatalog(r: Read, session: ApplicationSession, after?: string) {
-      valid(session, true);
+      valid(session, true, r);
       return boardCatalog(repo.coreOn(r), session.readOnly ? seer(repo, session) : session.primary, after);
     },
     async boardSnapshot(r: Read, session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
-      valid(session, true);
+      valid(session, true, r);
       // A resource read is a read like board_read, and carries its marks (#825).
       const snap = snapshot(repo.coreOn(r), reader(r, session, board), board, options);
       const marks = writerMarks(repo, r, session, [], snap.posts.map((p) => p.id));
@@ -1098,21 +1110,21 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       return () => removeObserver(observer);
     },
     canReceiveBoard(r: Read, session: ApplicationSession, board: string) {
-      valid(session);
+      valid(session, false, r);
       const core = repo.coreOn(r);
       return session.addresses.some((a) => canSeeBoard(core, a, board));
     },
     // handed: false is a give-up (Slack refused the message): the cursor
     // moves so it isn't retried, but nothing reached the harness to stamp.
     receiptDirect(tx: Tx, session: ApplicationSession, ids: number[], opts: { handed: boolean } = { handed: true }) {
-      valid(session);
+      valid(session, false, tx);
       handleAck(tx, session, ids, repo, opts.handed ? now() : null);
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
     // each address acks it.
     receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
-      valid(session);
+      valid(session, false, tx);
       for (const r of refs) {
         for (const a of session.addresses) acknowledge(repo.coreOn(tx), a, r);
         tx.afterCommit(() => { session.inflight.delete(pendingKey(r)); });
@@ -1121,7 +1133,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Acked as the address the row names (S8): receivedUnacked and
     // sentPending match a.reader = m.recipient, or m.sender.
     async acknowledgeDm(tx: Tx, session: ApplicationSession, id: number) {
-      valid(session);
+      valid(session, false, tx);
       childState(session, "dm_ack");
       const m = repo.messages.getById(tx, id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
@@ -1132,11 +1144,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       repo.messages.ack(tx, reader, m.id);
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
-      valid(session);
+      valid(session, false, tx);
       return handleRetract(hub, tx, session, id);
     },
     async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
-      valid(session, UNBOUND_READS.has(tool));
+      valid(session, UNBOUND_READS.has(tool), tx);
       // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
       try { return handleCall(hub, tx, session, tool, args, publish); }
       finally { tx.afterCommit(() => expiry.arm()); }
@@ -1157,7 +1169,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // What a principal may act in changed (S9): a team leave or removal now,
     // #270's grants later. Its sessions stop acting as aliases it lost now,
     // not when they next bind.
-    accessChanged(principal: string, by: string) { recheckAliases(principal, by); },
+    accessChanged(h: Read, principal: string, by: string) { recheckAliases(principal, by, h); },
     // Catches a user disabled with no server route to say so (a database
     // reset, an operator edit), and an alias its session's principal may no
     // longer act as (S9's backstop to accessChanged).
@@ -1352,7 +1364,7 @@ function prepareSend(
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
   const decision = authorize(repo, { humanReach: hub.humanReach }, req);
   if (!decision.allow) {
-    rowAfterRollback(session, r, () => recordDecision(repo, sessionActor(session, from), req, decision));
+    rowAfterRollback(session, r, w => recordDecision(repo, w, sessionActor(session, from), req, decision));
     fail(decision.code, decision.reason);
   }
 
@@ -1399,7 +1411,7 @@ function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSen
         ...unwoken(repo, tx, session, live, p.to),
       };
   for (const a of msg.attachments ?? []) {
-    writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: msg.sender, message_id: msg.id, recipient: msg.recipient });
+    writeAudit(repo, tx, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: msg.sender, message_id: msg.id, recipient: msg.recipient });
   }
   return { payload, ref: { kind: "message", id: msg.id }, msg };
 }
@@ -1446,7 +1458,7 @@ function writeOnce<W extends Written>(
     tool, session: session.sessionId, sender, actor: authed.user_email, transport: session.transport, args, resend,
   }, write, () => {
     for (const row of dropUnsentUploads(hub.repo.coreOn(tx), uploads, uploaderOf(session))) {
-      writeAudit(repo, "attachment.released", authed.user_email, `attachment:${row.id}`, {
+      writeAudit(repo, tx, "attachment.released", authed.user_email, `attachment:${row.id}`, {
         identity: row.uploader, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
       });
     }
@@ -1482,7 +1494,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   const { authed } = session;
   // The audit rows name the child that called, beside the routing `via` (#523).
   const byChild = session.via === undefined ? {} : { child: session.via };
-  const refused = (detail: Record<string, unknown>) => rowAfterRollback(session, tx, () => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
+  const refused = (detail: Record<string, unknown>) => rowAfterRollback(session, tx, w => writeAudit(repo, w, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
@@ -1508,7 +1520,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   // call: written inside the dedup transaction they'd roll back with it, so
   // they're written after it. A refusal's decision rows go to the session's
   // afterRollback, which every queued caller sets (hosted run, Slack inWrite).
-  const rows: (() => void)[] = [];
+  const rows: RefusalRow[] = [];
   hub.delegateRows = rows;
   // Whether this user may name `to`'s launcher (#256): its own user's, or
   // another's under a shared 'delegating' team (policy.ts delegate.to). The
@@ -1537,7 +1549,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
     const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
     const decision = authorize(repo, {}, req);
     if (decision.allow) return { ok: "granted" };
-    rowAfterRollback(session, tx, () => recordDecision(repo, sessionActor(session, session.primary), req, decision, { launcher: to }));
+    rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }));
     return { refused: crossUserRefusal(to) };
   };
   try {
@@ -1551,7 +1563,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
       picked = d.to;
       const w = writeSend(hub, tx, session, prepareSend(hub, tx, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
-      writeAudit(repo, "delegation.requested", authed.user_email, d.to, {
+      writeAudit(repo, tx, "delegation.requested", authed.user_email, d.to, {
         requester: session.primary,
         via: d.humanFallback ? "human_fallback" : m.to !== undefined ? "explicit" : "auto",
         message_id: w.msg.id,
@@ -1576,7 +1588,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
       const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
       const decision = authorize(repo, { humanReach: hub.humanReach }, req);
       if (!decision.allow) {
-        rowAfterRollback(session, tx, () => recordDecision(repo, sessionActor(session, session.primary), req, decision));
+        rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision));
         fail(decision.code, decision.reason + hint);
       }
     });
@@ -1597,7 +1609,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   }
   hub.delegateRows = undefined;
   // Committed with the write: kept, and written again should hosted's outer transaction roll back.
-  for (const row of rows) { row(); session.afterRollback?.(row); }
+  for (const row of rows) { row(tx); session.afterRollback?.(row); }
   if ("replay" in out) return out.replay;
   tx.afterCommit(() => {
     testPause("write:after-commit");
@@ -1614,7 +1626,7 @@ function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number
   const mine = session.addresses;
   const m = repo.messages.getById(tx, id);
   if (!m) {
-    const done = repo.audit.last("message.retracted", `message:${id}`);
+    const done = repo.audit.last(tx, "message.retracted", `message:${id}`);
     const by = done?.detail ? (JSON.parse(done.detail) as { sender?: string }).sender : undefined;
     if (done && by !== undefined && mine.includes(by)) return { note: alreadyRetracted(done.at) };
   }
@@ -1694,7 +1706,7 @@ function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: stri
     out = writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, () => {
       const o = callBoardTool(repo.coreOn(tx), me, "board_post", postArgs, ctx);
       const r = o.result as BoardPostResult;
-      for (const a of r.attachments ?? []) writeAudit(repo, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
+      for (const a of r.attachments ?? []) writeAudit(repo, tx, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
       return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };
     });
   } catch (e) {

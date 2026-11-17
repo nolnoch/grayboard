@@ -94,9 +94,9 @@ export function isJsonRequest(req: Request): boolean {
 
 // A disabled user gets no dev-login token (security audit F-14); the AS refuses
 // one at its callback (oauth.user_refused) and at a code's redemption.
-function refuseDisabled(repo: Repo, user: User, detail: Record<string, unknown>): Response | null {
+function refuseDisabled(repo: Repo, h: Read, user: User, detail: Record<string, unknown>): Response | null {
   if (user.disabled_at === null) return null;
-  writeAudit(repo, "auth.user_refused", user.email, null, detail);
+  writeAudit(repo, h, "auth.user_refused", user.email, null, detail);
   return jsonErr("forbidden", "this account is disabled; ask a grayboard admin to run admin enable-user", 403);
 }
 
@@ -105,7 +105,7 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
   // server listens on every interface, and a proxy forwards to it. Only a
   // client on this host may sign in as anyone (security audit F-04).
   if (!ip || !isLoopbackIp(ip)) {
-    writeAudit(repo, "auth.dev_login_refused", null, null, { ip: ip ?? undefined });
+    writeAudit(repo, repo.read, "auth.dev_login_refused", null, null, { ip: ip ?? undefined });
     return jsonErr("forbidden", "dev sign-in answers only clients on the server's own host", 403);
   }
   const body = await parseBody<{ email: string }>(req);
@@ -114,11 +114,11 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
   return repo.write(tx => {
     const user  = repo.users.upsertByEmail(tx, email, null);
-    const disabled = refuseDisabled(repo, user, { dev: true, ip: ip ?? undefined });
+    const disabled = refuseDisabled(repo, tx, user, { dev: true, ip: ip ?? undefined });
     if (disabled) return disabled;
     const raw   = mintToken();
     repo.sessions.create(tx, user.id, hashToken(raw), DEV_SESSION_LABEL);
-    writeAudit(repo, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
+    writeAudit(repo, tx, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
     return json({ session_token: raw, user_email: email, expires_at: null });
   });
 }
@@ -146,7 +146,7 @@ export function signInRoute(method: string, path: string, config: Config): { cha
 function authLogout(authed: AuthedUser, repo: Repo): Promise<Response> {
   return repo.write(tx => {
     repo.sessions.revoke(tx, authed.session_id);
-    writeAudit(repo, "auth.logout", authed.user_email, null, { token_session: authed.session_id });
+    writeAudit(repo, tx, "auth.logout", authed.user_email, null, { token_session: authed.session_id });
     return json({ ok: true });
   });
 }
@@ -191,7 +191,7 @@ function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUse
     const req: AuthzRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
     const d = authorize(repo, {}, req);
     if (!d.allow) {
-      recordDecision(repo, { user: authed.user_email }, req, d);
+      recordDecision(repo, r, { user: authed.user_email }, req, d);
       return forbidden(d.reason);
     }
     return p.address;
@@ -202,7 +202,7 @@ function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUse
   const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
   const d = authorize(repo, {}, req);
   if (!d.allow) {
-    recordDecision(repo, { user: authed.user_email, address }, req, d);
+    recordDecision(repo, r, { user: authed.user_email, address }, req, d);
     if (d.rule === "alias.human_reserved") return forbidden(humanReason);
     // A team reads as missing to a non-member (#1020), as a scope nobody owns.
     if (d.rule === "scope.ownerless" || d.rule === "scope.team_member") return forbidden(`you can't act as "${address}": no principal owns its scope`);
@@ -267,7 +267,7 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, conf
     const capped = aliasCapRefusal(repo, tx, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
     if (capped) return badRequest(capped);
     const identity = repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
-    writeAudit(repo, "alias.created", authed.user_email, identity.address);
+    writeAudit(repo, tx, "alias.created", authed.user_email, identity.address);
     onAliasCreated(repo, tx, authed.user_id, identity.address);
     return json({ name: identity.name, created_at: identity.created_at }, 201);
   });
@@ -285,7 +285,7 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response 
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or bind it elsewhere, first"), 409);
     repo.aliases.remove(tx, existing.address);
     forgetHandle(repo.coreOn(tx), existing.address);
-    writeAudit(repo, "alias.deleted", authed.user_email, existing.address);
+    writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address);
     return json({ ok: true });
   });
 }
@@ -315,7 +315,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
   const declared = req.headers.get("content-length");
   if (declared === null || !/^\d{1,15}$/.test(declared)) return jsonErr("length_required", "an upload needs a Content-Length", 411);
   const refuse = (code: string, message: string, status: number) => {
-    writeAudit(repo, "attachment.upload_refused", authed.user_email, null, { identity: handle, filename: sanitizeFilename(rawName), size: Number(declared), reason: message });
+    writeAudit(repo, repo.read, "attachment.upload_refused", authed.user_email, null, { identity: handle, filename: sanitizeFilename(rawName), size: Number(declared), reason: message });
     return jsonErr(code, message, status);
   };
   let release = () => {};
@@ -341,7 +341,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
     if (e instanceof CoreError) return refuse("bad_request", e.message, 400);
     // A fault (disk full, unwritable blob dir, the client gone mid-wait): the
     // audit keeps it, the server's error handler answers a bare 500.
-    writeAudit(repo, "attachment.upload_failed", authed.user_email, null, { identity: handle, filename: sanitizeFilename(rawName), size: Number(declared), error: (e as Error).message });
+    writeAudit(repo, repo.read, "attachment.upload_failed", authed.user_email, null, { identity: handle, filename: sanitizeFilename(rawName), size: Number(declared), error: (e as Error).message });
     throw e;
   } finally {
     try {
@@ -363,7 +363,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   try {
     data = new Uint8Array(await repo.blobs.get(row.sha256));
   } catch (e) {
-    writeAudit(repo, "attachment.download_failed", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256, error: (e as Error).message });
+    writeAudit(repo, repo.read, "attachment.download_failed", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256, error: (e as Error).message });
     // Swept between the read check and the read: the file is gone, as a 404 says.
     if (e instanceof BlobMissing) return jsonErr("not_found", `attachment ${row.id}'s bytes are gone`, 404);
     throw e;
@@ -375,7 +375,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
     const current = requestAttachment(repo, tx, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
     if ("refused" in current || current.row.sha256 !== row.sha256) return notFound();
   }
-  writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
+  writeAudit(repo, tx, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
   return new Response(data, {
     headers: {
       "Content-Type": row.type,
@@ -425,8 +425,8 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
     repo.teams.addMember(tx, team.id, authed.user_id, "owner");
     ensureTeamBoard(repo, tx, team, authed.user_email);
     onTeamJoined(repo, tx, team, authed.user_email);
-    writeAudit(repo, "team.created", authed.user_email, name);
-    writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
+    writeAudit(repo, tx, "team.created", authed.user_email, name);
+    writeAudit(repo, tx, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
     return json({ name: team.name, created_at: team.created_at }, 201);
   });
 }
@@ -438,11 +438,11 @@ function teamJoin(): Response {
 
 // A team the caller isn't in reads as not found, like its board; an admin
 // can't leave a team it isn't in. A refusal is recorded (policy.ts).
-function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | null {
+function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): Team | null {
   const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
   const d = authorize(repo, {}, req);
   if (!d.allow) {
-    recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+    recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
     return null;
   }
   return req.team!;
@@ -451,11 +451,11 @@ function memberTeam(teamName: string, authed: AuthedUser, repo: Repo): Team | nu
 // Members read their team's roster; admins can read any team's. as_admin
 // marks the audit row when an admin isn't a member. A denial is recorded
 // (policy.ts), and reads as not found.
-function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
+function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
   const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
   const d = authorize(repo, { admins: config.admins }, req);
   if (!d.allow) {
-    recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+    recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
     return null;
   }
   return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
@@ -467,10 +467,10 @@ function managedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: C
 // team names the creator lost). as_admin marks an admin acting without
 // owning. A non-member still reads not found; a member who isn't an owner
 // is refused, naming who can. Every decision is recorded (policy.ts).
-function ownedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
+function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
   const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
   const d = authorize(repo, { admins: config.admins }, req);
-  recordDecision(repo, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+  recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
   if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
   return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
 }
@@ -479,7 +479,7 @@ const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409
 
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: SessionHooks): Promise<Response> {
   return repo.write((tx) => {
-    const team = memberTeam(teamName, authed, repo);
+    const team = memberTeam(tx, teamName, authed, repo);
     if (!team) return notFound();
     try {
       repo.teams.removeMember(tx, team.id, authed.user_id);
@@ -488,8 +488,8 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: S
       throw e;
     }
     onTeamLeft(repo, tx, team, authed.user_email);
-    sessions.accessChanged(authed.user_email, authed.user_email);
-    writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
+    sessions.accessChanged(tx, authed.user_email, authed.user_email);
+    writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
     return json({ ok: true });
   });
 }
@@ -499,7 +499,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
   // demoted while a slow body trickles in must not act on a stale check.
   const body = await parseBody<{ email: string; role?: unknown }>(req);
   return repo.write((tx) => {
-    const managed = ownedTeam(teamName, authed, repo, config);
+    const managed = ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const { team } = managed;
     if (!body?.email) return badRequest("email required");
@@ -510,7 +510,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
     if (repo.teams.addMember(tx, team.id, user.id, role ?? "member")) {
       onTeamJoined(repo, tx, team, email);
-      writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
+      writeAudit(repo, tx, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
       return json({ ok: true });
     }
     // Already a member: a role changes only when one is asked for.
@@ -522,7 +522,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
     }
-    if (from !== null && from !== role) writeAudit(repo, "team.role_changed", authed.user_email, team.name, { member: email, role, from, ...managed.audit });
+    if (from !== null && from !== role) writeAudit(repo, tx, "team.role_changed", authed.user_email, team.name, { member: email, role, from, ...managed.audit });
     return json({ ok: true });
   });
 }
@@ -530,7 +530,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
 async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config, sessions: SessionHooks): Promise<Response> {
   const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
   return repo.write((tx) => {
-    const managed = ownedTeam(teamName, authed, repo, config);
+    const managed = ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const { team } = managed;
     if (!body?.email) return badRequest("email required");
@@ -546,8 +546,8 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       throw e;
     }
     onTeamLeft(repo, tx, team, email);
-    sessions.accessChanged(email, authed.user_email);
-    writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
+    sessions.accessChanged(tx, email, authed.user_email);
+    writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
     return json({ ok: true });
   });
 }
@@ -559,13 +559,13 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
 async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ policy?: unknown }>(req);
   return repo.write((tx) => {
-    const managed = ownedTeam(teamName, authed, repo, config);
+    const managed = ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const policy = body?.policy;
     if (typeof policy !== "string" || !(TEAM_POLICIES as readonly string[]).includes(policy)) return badRequest(`policy must be one of ${TEAM_POLICIES.map(p => `"${p}"`).join(", ")}`);
     const from = repo.teams.setPolicy(tx, managed.team.id, policy as TeamPolicy);
     if (from === null) return notFound();
-    if (from !== policy) writeAudit(repo, "team.policy_set", authed.user_email, managed.team.name, { from, to: policy, ...managed.audit });
+    if (from !== policy) writeAudit(repo, tx, "team.policy_set", authed.user_email, managed.team.name, { from, to: policy, ...managed.audit });
     return json({ ok: true, team: managed.team.name, policy, previous: from });
   });
 }
@@ -578,7 +578,7 @@ async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, re
 async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ name?: unknown }>(req); // before the ownership check, as in teamAdd
   return repo.write(tx => {
-    const managed = ownedTeam(teamName, authed, repo, config);
+    const managed = ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
     const name = body.name.toLowerCase();
@@ -590,13 +590,13 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
     repo.aliases.remove(tx, existing.address);
     forgetHandle(repo.coreOn(tx), existing.address);
-    writeAudit(repo, "alias.deleted", authed.user_email, existing.address, { team: managed.team.name, ...managed.audit });
+    writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address, { team: managed.team.name, ...managed.audit });
     return json({ ok: true, deleted: existing.address });
   });
 }
 
 function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Response {
-  const managed = managedTeam(teamName, authed, repo, config);
+  const managed = managedTeam(repo.read, teamName, authed, repo, config);
   if (!managed) return notFound();
   return json(repo.teams.listMembers(managed.team.id));
 }
@@ -613,7 +613,7 @@ async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, 
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
     repo.sessions.revokeAllForUser(tx, target.id);
-    writeAudit(repo, "auth.session_revoked", authed.user_email, body.email);
+    writeAudit(repo, tx, "auth.session_revoked", authed.user_email, body.email);
     return target;
   }, target => { if (target) disconnectUser(target.id); return target; });
   return target ? json({ ok: true }) : notFound();
@@ -628,7 +628,7 @@ async function adminDisableUser(
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
     repo.users.setDisabled(tx, target.id, true);
-    writeAudit(repo, "auth.user_disabled", authed.user_email, body.email);
+    writeAudit(repo, tx, "auth.user_disabled", authed.user_email, body.email);
     return target;
   }, target => { if (target) disconnectUser(target.id); return target; });
   if (!target) return notFound();
@@ -643,7 +643,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
     repo.users.setDisabled(tx, target.id, false);
-    writeAudit(repo, "auth.user_enabled", authed.user_email, body.email);
+    writeAudit(repo, tx, "auth.user_enabled", authed.user_email, body.email);
     return target;
   });
   if (!target) return notFound();
@@ -662,7 +662,7 @@ async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, conf
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return notFound();
     repo.users.clearSubject(tx, target.id);
-    writeAudit(repo, "auth.subject_cleared", authed.user_email, target.email, {
+    writeAudit(repo, tx, "auth.subject_cleared", authed.user_email, target.email, {
       had_subject: target.idp_subject !== null, provider: defaultProviders(config).find(p => p.issuer === target.idp_issuer)?.id ?? null, issuer: target.idp_issuer });
     return json({ ok: true });
   });
@@ -676,7 +676,7 @@ async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, conf
 export type SessionHooks = {
   disconnectUser: (userId: number) => void;
   // principal: a principal's name; its sessions' aliases are re-checked.
-  accessChanged: (principal: string, by: string) => void;
+  accessChanged: (h: Read, principal: string, by: string) => void;
 };
 
 export async function handleHttp(
@@ -741,7 +741,7 @@ export async function handleHttp(
   if (path.startsWith("/api/admin/")) {
     const req: AuthzRequest = { verb: "admin", email: authed.user_email };
     const decision = authorize(repo, { admins: config.admins }, req);
-    recordDecision(repo, { user: authed.user_email }, req, decision, { route: path });
+    recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
     if (!decision.allow) return forbidden(decision.reason);
   }
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);

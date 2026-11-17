@@ -16,6 +16,9 @@ const EXPIRY_SKEW_MS = 5_000;
 // A native call whose after hook never came (a host that drops it) stops
 // counting as in flight this long after it began.
 const CALL_STALE_MS = 10 * 60_000;
+// How long a native call waits out a reconnect (#917) before it goes ahead anyway: a reload that never settles
+// mustn't hang the agent's call.
+const RECONNECT_WAIT_MS = 30_000;
 // OpenCode's catalog timeout when the entry sets none (`core/dist/mcp/client.js`).
 const CATALOG_TIMEOUT_MS = 30_000;
 // OpenCode's native MCP grant as the Controller's credential: the plugin reads
@@ -30,7 +33,24 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
   private nudged?: string;
   private flips = 0;
   private nudge?: Promise<{ dispose(): Promise<void> }>;
-  calling(id: string) { this.calls.set(id, Date.now()); }
+  // A native call waits out a reconnect in progress (#917): one that started
+  // mid-reconnect would reach an entry OpenCode has stopped. It counts as in
+  // flight first, so no new reconnect starts while it waits or after.
+  // Says whether it waited, and whether the wait ran out with the reload unfinished.
+  async calling(id: string): Promise<"none" | "waited" | "timeout"> {
+    this.calls.set(id, Date.now());
+    const deadline = Date.now() + RECONNECT_WAIT_MS;
+    let waited = false;
+    for (let r; (r = this.reconnecting); ) {
+      if (Date.now() >= deadline) return "timeout";
+      waited = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([r, new Promise<void>(done => { timer = setTimeout(done, deadline - Date.now()); })]);
+      clearTimeout(timer);
+    }
+    return waited ? "waited" : "none";
+  }
+  private reconnecting?: Promise<void>;
   called(id: string) { this.calls.delete(id); }
   private endpoint(c: ReturnType<MCPEditor["get"]>) {
     if (!c || c.type !== "remote" || c.oauth === false || c.disabled) return;
@@ -139,9 +159,15 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     const credential = await this.ctx.integration.connection.resolve(selected.connection);
     if (credential?.type !== "oauth" || credential.expires > Date.now()) return false;
     const key = `${selected.connectionID}:${credential.expires}`;
-    if (this.nudged === key || this.busy()) return false;
+    if (this.nudged === key || this.busy() || this.reconnecting) return false;
     this.nudged = key;
     this.flips++;
+    const reconnect = this.reconnect();
+    this.reconnecting = reconnect.then(() => {}, () => {});
+    try { await reconnect; } finally { this.reconnecting = undefined; }
+    return true;
+  }
+  private async reconnect() {
     this.nudge ??= this.ctx.mcp.transform(editor => {
       if (this.flips % 2 === 0) return;
       editor.update(this.name, c => {
@@ -150,7 +176,6 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     });
     await this.nudge;
     await this.ctx.mcp.reload();
-    return true;
   }
   private busy() {
     const now = Date.now();

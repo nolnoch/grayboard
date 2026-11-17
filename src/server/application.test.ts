@@ -234,6 +234,19 @@ test("reserved human authority is a separate trusted method, never a selected cl
   await expect(application.inbox(store.repo.read, human)).rejects.toThrow("an admin signed this user out");
 });
 
+// #807 P3 A3: a disabled user's session terminated inside a body writes its close rows on the body's Tx (post refuses
+// inside a transaction): its last-seen touch joins the body, its sink is told why, and the caller gets the sign-out.
+test("a session terminated inside a write body closes on its Tx and tells its sink", async () => {
+  const a = await connect(alice, "be");
+  const closed = spyOn(a.session.sink, "closed");
+  expect(a.session.writerId).toBeTruthy();
+  await seed(store.repo, tx => store.repo.users.setDisabled(tx, alice.user_id, true));
+  await expect(store.repo.write(tx => application.receiptDirect(tx, a.session, []))).rejects.toThrow("an admin signed this user out");
+  expect(a.session.active).toBe(false);
+  expect(closed).toHaveBeenCalledTimes(1);
+  expect(String(closed.mock.calls[0]![0])).toContain("an admin signed this user out");
+});
+
 test("board delivery is typed, replayable and acknowledged separately", async () => {
   const a = await connect(alice, "be");
   const b = await connect(bob, "fe", { key: "bob-key" });

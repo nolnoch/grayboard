@@ -13,8 +13,8 @@ export function pruneMessages(repo: Repo, tx: Tx, cutoffMs: number): void {
   repo.messages.prune(tx, cutoffMs);
 }
 
-export function pruneAudit(repo: Repo, cutoffMs: number): void {
-  repo.audit.prune(cutoffMs);
+export function pruneAudit(repo: Repo, tx: Tx, cutoffMs: number): void {
+  repo.audit.prune(tx, cutoffMs);
 }
 
 function msUntilMidnightUTC(): number {
@@ -51,7 +51,7 @@ export async function runRetention(repo: Repo, config: Config, now = Date.now(),
     // Ended sessions' rows share it too (#328): a keyed one leaves a
     // tombstone, so its key coming back is audited as reused.
     await repo.write(tx => pruneEndedIds(repo.coreOn(tx), now - config.messageRetentionDays * 86_400_000, now));
-    await repo.write(() => pruneAudit(repo, now - config.auditRetentionDays * 86_400_000));
+    await repo.write((tx) => pruneAudit(repo, tx, now - config.auditRetentionDays * 86_400_000));
     await repo.write(tx => pruneUnbound(repo.coreOn(tx), now - UNBOUND_TTL_MS));
     await repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS));
   } catch (e) {

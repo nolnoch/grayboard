@@ -194,6 +194,24 @@ test("a keyed attach records the new child's model and effort", async () => {
   expect(audits()).toHaveLength(2);
 });
 
+// #1075: a keyed root's restart under a new harness conversation (pi's /new)
+// records the new id, which its subagents find it by; none keeps the old.
+test("a keyed attach records the new child's harness session", async () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const id = "id:0123456789abe";
+  const self = thisSession(id, { pid: process.pid, proc_start: procStart(process.pid) ?? null, rule: "env" });
+  registerSession(db, self, { harnessSession: "conv-1" });
+  const harness = () => (db.prepare(`SELECT harness_session FROM ids WHERE id = ?`).get(id) as { harness_session: string | null }).harness_session;
+  const restart = () => db.prepare(`UPDATE bindings SET attached_pid = 999999, attached_start = NULL WHERE session_id = ?`).run(id);
+
+  restart();
+  expect(await attachSession(db, self, false, undefined, undefined, "conv-2")).toMatchObject({ ok: true });
+  expect(harness()).toBe("conv-2");
+  restart();
+  expect(await attachSession(db, self, false)).toMatchObject({ ok: true });
+  expect(harness()).toBe("conv-2");
+});
+
 // #210: a retry loop refused for the same reason is one row with a count.
 test("a session's identical refusals within the window share a row; anything else inserts", () => {
   const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;

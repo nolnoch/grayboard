@@ -65,20 +65,20 @@ export function idpSignIn(
   const audited = { provider: provider.id, issuer: provider.issuer, ...detail };
   const fix = (email: string) => `an admin runs grayboard admin unlink-idp --email ${email}`;
   if (r.status === "issuer_mismatch") {
-    writeAudit(repo, "auth.subject_refused", identity.email, null, { reason: r.status, holding_issuer: r.issuer, ...audited });
+    writeAudit(repo, tx, "auth.subject_refused", identity.email, null, { reason: r.status, holding_issuer: r.issuer, ...audited });
     // An unlisted holder isn't named by its issuer: this text reaches whichever client started the sign-in,
     // and the audit row above keeps the issuer.
     const holder = known.find(p => p.issuer === r.issuer)?.label;
     return { refused: `${identity.email} is linked to ${holder ? `a ${holder}` : "another provider's"} account, not ${provider.label}. If this ${provider.label} account should have it, ${fix(identity.email)}` };
   }
   if (r.status === "subject_mismatch") {
-    writeAudit(repo, "auth.subject_refused", identity.email, null, { reason: r.status, ...audited });
+    writeAudit(repo, tx, "auth.subject_refused", identity.email, null, { reason: r.status, ...audited });
     return { refused: `${identity.email} is linked to a different ${provider.label} account. If this account should have it, ${fix(identity.email)}` };
   }
   if (r.status === "email_changed") {
-    writeAudit(repo, "auth.subject_refused", r.user.email, null, { reason: r.status, email: identity.email, ...audited });
+    writeAudit(repo, tx, "auth.subject_refused", r.user.email, null, { reason: r.status, email: identity.email, ...audited });
     return { refused: `this ${provider.label} account belongs to grayboard user ${r.user.email} but now reports ${identity.email}. To sign in as ${identity.email} (a new account), ${fix(r.user.email)}` };
   }
-  if (r.status === "ok" && r.linked) writeAudit(repo, "auth.subject_linked", r.user.email, null, audited);
+  if (r.status === "ok" && r.linked) writeAudit(repo, tx, "auth.subject_linked", r.user.email, null, audited);
   return { user: r.user };
 }

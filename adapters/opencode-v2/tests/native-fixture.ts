@@ -17,12 +17,14 @@ export function fixture() {
     return e;
   };
   let applied = config, reloads = 0;
+  // holdReload(): the next reload waits until `release`; `reached` resolves when it starts waiting.
+  let gate: (() => Promise<void>) | undefined;
   const reload = () => { const e = editor(); for (const observer of observers) observer(e); applied = e.draft; };
   const ctx = {
     mcp: {
       transform: async (callback: (editor: Editor) => void) => { observers.add(callback); callback(editor()); return { dispose: async () => { observers.delete(callback); } }; },
       list: async () => ({ data: [{ name: "grayboard", integrationID: "native-integration" }] }),
-      reload: async () => { reloads++; reload(); },
+      reload: async () => { await gate?.(); reloads++; reload(); },
     },
     integration: {
       get: async () => ({ data: { connections: [{ type: "credential", id, status }] } }),
@@ -35,7 +37,12 @@ export function fixture() {
   } as unknown as Context;
   const binding = new Binding(ctx, "grayboard", () => { drifts++; });
   // `rotate`: the host stores a new access token, expiring `ms` from now (OpenCode's own refresh).
-  return { ctx, binding, config, metadata, reload, storage, get applied() { return applied; }, get reloads() { return reloads; }, get transforms() { return observers.size; }, get resolutions() { return resolutions; }, get drifts() { return drifts; }, select: (value: string) => { id = value; }, status: (value?: string) => { status = value; }, access: (value: string) => { access = value; }, expire: () => { expires = 0; }, rotate: (value: string, ms = 60_000) => { access = value; expires = Date.now() + ms; }, afterResolve: (callback: () => void) => { afterResolve = callback; } };
+  return { ctx, binding, config, metadata, reload, storage, get applied() { return applied; }, get reloads() { return reloads; }, get transforms() { return observers.size; }, get resolutions() { return resolutions; }, get drifts() { return drifts; }, select: (value: string) => { id = value; }, status: (value?: string) => { status = value; }, access: (value: string) => { access = value; }, expire: () => { expires = 0; }, rotate: (value: string, ms = 60_000) => { access = value; expires = Date.now() + ms; }, afterResolve: (callback: () => void) => { afterResolve = callback; }, holdReload: () => {
+    let release!: () => void, reached!: () => void;
+    const held = new Promise<void>(r => { release = r; }), started = new Promise<void>(r => { reached = r; });
+    gate = async () => { gate = undefined; reached(); await held; };
+    return { release, reached: started };
+  } };
 }
 
 // Polls a condition for up to a second.
