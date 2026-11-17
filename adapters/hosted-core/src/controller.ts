@@ -62,8 +62,6 @@ const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
 // for an hour of waits: after that the pause stands until a reload's restore. The outage retries (run loop and
 // restore) ask the host the same way once the server answers with the expiry, and keep their own backoff (#916).
 const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
-// A saved root restore couldn't prepare while the server was down (#424 6).
-const UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
 const UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
@@ -329,7 +327,15 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.watch(r.e);
     this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
     try { await this.rotated({ ms: 0 }, () => this.prepare(r, true)); }
-    catch (error) { if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error))); }
+    catch (caught) {
+      const error = this.expired(caught);
+      // A host that restarted during a server outage (an upgrade) resumes its root here: retry it on the
+      // outage backoff, as a saved root's restore does, rather than leave it dark until the next start (#895).
+      if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+        this.retrying(r, error);
+        this.retryRestore(r);
+      } else if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+    }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
   }); }
@@ -696,7 +702,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
         if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
-          this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+          this.retrying(r, error);
           this.retryRestore(r);
         } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
           // The token expired between the check and the prepare: the same wait (#661).
@@ -706,14 +712,23 @@ export class Controller<E extends Enrollment = Enrollment> {
       }
     }
   }
+  // A restore's or resume's prepare that found the server unreachable, or another
+  // process holding the token refresh (#424 6, #895): retrying. Only an approval
+  // host has a saved approval to retain, or a restore to speak of.
+  private retrying(r: Root<E>, error: ServerUnreachable | RefreshInProgress) {
+    const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying`
+      : `Server unreachable at ${this.port.approval ? "restore" : "resume"}; retrying`;
+    this.set(r, "retrying", this.port.approval ? `${text}, approval retained` : text, "restore", failureCode(error));
+  }
   // A saved root a retry may still prepare: nothing (a stop, pause, drift,
   // shutdown, native bind, resume or session end) has taken it since `epoch`.
   private restorable(r: Root<E>, epoch: number) {
     return !this.stopped && !this.drifted && !this.ending.has(r.e.sessionID) && !r.paused && !r.task && r.epoch === epoch && this.roots.get(r.e.sessionID) === r;
   }
-  // A saved root whose restore found the server unreachable (a host restarted
-  // during a server upgrade) retries its prepare on the run loop's outage
-  // backoff, without limit, instead of pausing until the next reload (#424 6).
+  // A saved root whose restore, or a root whose resume, found the server
+  // unreachable (a host restarted during a server upgrade) retries its prepare
+  // on the run loop's outage backoff, without limit, instead of pausing until
+  // the next reload or start (#424 6, #895).
   // Each attempt runs in the control queue, as resume's does; anything that
   // takes the root meanwhile ends the retry, and close ends its wait.
   private retryRestore(r: Root<E>) {
@@ -735,7 +750,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           } catch (caught) {
             const error = this.expired(caught);
             if (!this.restorable(r, epoch)) return true;
-            if (error instanceof ServerUnreachable) { this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error)); return false; }
+            if (error instanceof ServerUnreachable || error instanceof RefreshInProgress) { this.retrying(r, error); return false; }
             // As in the run loop's outage: a token that expired while the server
             // (its issuer) was down couldn't be refreshed; ask the host before the next try.
             if (error instanceof AccessExpired && error.reason === "expired") {
@@ -743,7 +758,10 @@ export class Controller<E extends Enrollment = Enrollment> {
               expired = true;
               return false;
             }
-            r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+            // A resumed root with no saved approval (pi, omp, Claude Code) ends as its
+            // resume would have without the outage: unpaused, with the cause (#895).
+            if (!this.port.approval) this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+            else { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
             return true;
           }
         });
