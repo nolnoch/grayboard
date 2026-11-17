@@ -3,7 +3,7 @@
 // are generators that yield each storage read they need (#807 P3 A7e): one set of
 // rule bodies, driven by `authorize` over the store's reads on the caller's
 // handle, synchronously over `repo.policyNow` by `authorizeNow` (the SQLite-only
-// loader, until #807 A7f/B), or with no reads at all by `decidePure`.
+// loader, for the callers that can't await yet: #807 A7f2, A7g, B), or with no reads at all by `decidePure`.
 // The caller that owns a requested act records its decision with
 // `recordDecision` (an `authz.decision` row: every deny, and the allows of
 // team management and admin routes); filter checks (board visibility, mention

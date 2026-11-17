@@ -6,7 +6,11 @@ import { expect, test } from "bun:test";
 import { Glob } from "bun";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { decidePure, type PureRequest } from "./policy.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
+import { openDatabase } from "./db.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 
 const ROOT = join(import.meta.dir, "..", "..");
 const HELPERS = /\b(canSend|mayActIn|canAdmin|reachesHuman|canReadAttachment|attachmentReach)\b/;
@@ -26,16 +30,16 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
 // outside tests is a caller #807 A7f/B must convert to the async `authorize`, so their count only falls. The table is
 // exact: a new use fails until it's argued for, and a removed one fails until its row is lowered, so a freed slot
 // can't be reused. A7e3 raised application.ts, http.ts and teams.ts once: the store's team, principal and user reads
-// went async, and their synchronous callers that can't await yet (team guards, helloOkFields, onAliasCreated, bindTarget,
-// recheckAliases, healthz, the roster beside its guard) moved to policyNow. policy.ts counts its drivers' `decide(`.
+// went async, and their synchronous callers that couldn't await yet moved to policyNow. A7f1 moved http.ts's team
+// guards, roster, claim list and act-as check, and teams.ts's onAliasCreated, to `authorize` and the store's reads;
+// http.ts keeps healthz's probe. policy.ts counts its drivers' `decide(`.
 const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
   "src/server/access.ts": 16,
   "src/server/application.ts": 16,
   "src/server/db.ts": 2,
-  "src/server/http.ts": 12,
+  "src/server/http.ts": 1,
   "src/server/policy.ts": 9,
-  "src/server/teams.ts": 2,
 };
 
 test("the synchronous policy loader gains no callers", () => {
@@ -54,4 +58,23 @@ test("decidePure refuses a verb whose rule reads storage", () => {
   const reading = { verb: "scope.act", principal: p, scope: { scope_kind: "team", scope_ref: "eng" } } as unknown as PureRequest;
   expect(() => decidePure({}, reading)).toThrow("scope.act asked for a storage read (principalByName)");
   expect(decidePure({ admins: ["a@example.com"] }, { verb: "admin", email: "a@example.com" })).toEqual({ allow: true, rule: "admin.env" });
+});
+
+// recordDecision stays synchronous (#807 P3 A7f1): its deny limiter points the audit writer at the caller's handle
+// (`suppressedOn`) for the duration of one call, so an await inside it would leave that pointer set for whatever
+// runs meanwhile. Callers await their decision first, then record it.
+test("recordDecision returns nothing, not a promise", async () => {
+  const blobDir = mkdtempSync(join(tmpdir(), "gb-blobs-"));
+  const { repo, db } = openDatabase(scratchDbPath(), { blobDir });
+  try {
+    const req: PureRequest = { verb: "admin", email: "a@example.com" };
+    const results = await repo.write(async tx => [
+      recordDecision(repo, tx, { user: "a@example.com" }, req, decidePure({}, req)),
+      recordDecision(repo, tx, { user: "a@example.com" }, req, decidePure({ admins: ["a@example.com"] }, req)),
+    ]);
+    expect(results).toEqual([undefined, undefined]);
+  } finally {
+    db.close();
+    rmSync(blobDir, { recursive: true, force: true });
+  }
 });
