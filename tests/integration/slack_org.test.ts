@@ -500,6 +500,28 @@ test("#807 P1c-13: link and unlink read and write the human alias on their body'
   expect(checks).toEqual([{ op: "find", inTxn: true, handle: "tx" }, { op: "create", inTxn: true, handle: "tx" }, { op: "remove", inTxn: true, handle: "tx" }]);
 });
 
+// #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's
+// message read run on their body's Tx.
+test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx", async () => {
+  const repo = srv.app.repo;
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const spies = (["history", "getById"] as const).map((name) => {
+    const original = repo.messages[name].bind(repo.messages) as (...a: unknown[]) => unknown;
+    return spyOn(repo.messages, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await login("alice@example.com");
+    await link(alice);
+    const be = await hosted("alice@example.com", "be");
+    await be.call<SendResult>("dm_send", { to: "human", body: "receipt check" });
+    await until(() => checks.some((c) => c.op === "getById"));
+  } finally { for (const spy of spies) spy.mockRestore(); }
+  expect(checks).toEqual([{ op: "history", inTxn: true, handle: "tx" }, { op: "getById", inTxn: true, handle: "tx" }]);
+});
+
 test("thread replies while unlinked don't flood in at relink", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
