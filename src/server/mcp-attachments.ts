@@ -65,7 +65,7 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
           const current = oauth.authenticate(req, ["grayboard:tools"]);
           if (current instanceof Response) throw new Refusal(current);
           bindingGuard();
-          // On the pool, inside the attachment routes' bodies too, until the attachment slice (D8).
+          // On the pool, inside the attachment routes' bodies too, until #1053 passes the guard its body's handle (D8).
           if (!repo.aliases.find(repo.read, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
         guard();

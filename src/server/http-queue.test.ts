@@ -154,8 +154,8 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
 });
 
 // #807 P1c-15c-2: the attachment routes and retention reach core's helpers through `repo.coreOn(handle)`: a write
-// body's `Tx` inside it (the upload's guard and audit, the release's writes, retention's prunes), the pool outside
-// (the download's access check, the release's lookup, the blob sweep).
+// body's `Tx` inside it (core's store and release transactions through `queuedTx`, the guarded download's recheck,
+// retention's prunes), the pool outside (the download's first access check, the blob sweep).
 test("#807 P1c-15c-2: attachment routes and retention reach core on their body's Tx, the pool outside one", async () => {
   const srv = new TestServer();
   cleanups.push(() => srv.stop());
@@ -174,12 +174,13 @@ test("#807 P1c-15c-2: attachment routes and retention reach core on their body's
     const up = await srv.uploadAs(you, "agent", "a.txt", "hello");
     expect(up.status).toBe(201);
     route = "download";
-    expect((await srv.downloadAs(you, "agent", up.body.id as number)).status).toBe(200);
+    // A guard makes the download recheck access inside its write body, on that body's Tx.
+    expect((await srv.downloadAs(you, "agent", up.body.id as number, () => {})).status).toBe(200);
     route = "release";
     expect((await srv.releaseAs(you, "agent", up.body.id as number)).status).toBe(200);
     route = "retention";
     await runRetention(repo, { ...srv.config, messageRetentionDays: 1, auditRetentionDays: 1 }, Date.now() + 30 * 86_400_000);
-    const want = { upload: ["tx"], download: ["pool"], release: ["pool", "tx"], retention: ["pool", "tx"] } as Record<string, string[]>;
+    const want = { upload: ["tx"], download: ["pool", "tx"], release: ["pool", "tx"], retention: ["pool", "tx"] } as Record<string, string[]>;
     // Each route reached core on each handle it should, so the last check isn't vacuous for it.
     expect(Object.entries(want).flatMap(([r, hs]) => hs.filter(h => !checks.some(c => c.route === r && c.handle === h)).map(h => `${r}:${h}`))).toEqual([]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);

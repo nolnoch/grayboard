@@ -75,3 +75,12 @@ test("#807: a server blob sweep's catalog delete waits behind another body holdi
   expect(await swept).toBe(1);
   expect(catalog(db)).toEqual([]);
 });
+
+// #965: an upload whose `attachment.uploaded` audit row fails is released, guarded or not (the Slack bridge's uploads
+// pass no guard): no bytes stay that no audit row records.
+test("#965: an unguarded upload whose audit row fails is released and rejects", async () => {
+  const { db, repo } = setup();
+  db.run(`CREATE TRIGGER fail_upload_audit BEFORE INSERT ON access_log WHEN NEW.action = 'attachment.uploaded' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
+  await expect(storeUpload(repo, "you@example.com", "be", file("hello"))).rejects.toThrow("audit refused");
+  expect(rows(db)).toEqual([]);
+});

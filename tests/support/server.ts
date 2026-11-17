@@ -89,8 +89,8 @@ export class TestServer {
     return { status: r.status, body: (await r.json()) as Record<string, any> };
   }
 
-  async downloadAs(token: string, identity: string, id: number): Promise<{ status: number }> {
-    const r = await attachmentDownload(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo);
+  async downloadAs(token: string, identity: string, id: number, guard?: () => void): Promise<{ status: number }> {
+    const r = await attachmentDownload(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo, guard);
     await r.body?.cancel();
     return { status: r.status };
   }
