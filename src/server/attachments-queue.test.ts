@@ -84,3 +84,42 @@ test("#965: an unguarded upload whose audit row fails is released and rejects", 
   await expect(storeUpload(repo, "you@example.com", "be", file("hello"))).rejects.toThrow("audit refused");
   expect(rows(db)).toEqual([]);
 });
+
+// #974: an upload's cleanup writes go through the write queue too: the row delete after a failed blob put, and the
+// release after a refused guard. Each is held here as it starts, and waits for the holder.
+test("#974: a failed blob put's row delete waits behind another body holding the write queue", async () => {
+  const { db, repo } = setup();
+  let holder: ReturnType<typeof hold> | undefined;
+  repo.blobs.put = async () => { holder = hold(db); throw new Error("disk full"); };
+  const stored = storeUpload(repo, "you@example.com", "be", file("hello"));
+  await until(() => holder, 5000, "the put failed");
+  await ticks();
+  expect(rows(db)).toHaveLength(1);
+  holder!.release();
+  await holder!.done;
+  await expect(stored).rejects.toThrow("disk full");
+  expect(rows(db)).toEqual([]);
+});
+
+test("#974: an upload whose guard refuses is released through the write queue", async () => {
+  const { db, repo } = setup();
+  let calls = 0, started = false;
+  let holder: ReturnType<typeof hold> | undefined;
+  // The guard runs in the store's insert, then in the audit write: refused there, with a hold queued behind that
+  // write, and so ahead of the release.
+  const guard = () => {
+    if (++calls !== 2) return;
+    let release!: () => void;
+    const done = queueFor(db).run(() => { started = true; return new Promise<void>(r => { release = r; }); });
+    holder = { release: () => release(), done };
+    throw new Error("revoked");
+  };
+  const stored = storeUpload(repo, "you@example.com", "be", file("hello"), {}, guard);
+  await until(() => started, 5000, "the hold behind the refused write began");
+  await ticks();
+  expect(rows(db)).toHaveLength(1);
+  holder!.release();
+  await holder!.done;
+  await expect(stored).rejects.toThrow("revoked");
+  expect(rows(db)).toEqual([]);
+});
