@@ -13,7 +13,7 @@ import { openSqlite } from "../core/sqlite.ts";
 import { conversationSnapshot, liveSessions, type Ended, type SessionRow } from "./binding.ts";
 import { ATTACHMENT_BYTES_SQL } from "./blobs.ts";
 import { privateDbFiles, privateDir } from "./perms.ts";
-import { lowercaseLegacyHandles } from "./handle_case.ts";
+import { lowercaseLegacyHandles, takeCaseWakes } from "./handle_case.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
   return refuseForbiddenBus(env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`);
@@ -62,6 +62,7 @@ export function openLocalDb(path = localDbPath()): { db: Database; ended: Ended;
   // auto_vacuum must precede the first page write, so it takes only on a new bus (#148).
   const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", initLocalSchema);
   const { alive, ...ended } = liveSessions(db);
+  ended.wake.push(...takeCaseWakes(db));
   return { db, ended, live: alive };
 }
 
