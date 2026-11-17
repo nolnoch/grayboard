@@ -114,7 +114,7 @@ export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 // with it: posted's idle queue throws it to its caller.
 function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R, thrown?: (error: unknown) => void): Promise<Awaited<R>> {
   const queue = queueFor(db);
-  if (queue.mine && db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls atomic"));
+  if (queue.mine && db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
   const o = requestOrigin();
   const run = () => {
     try { return o ? inRequest(o, body) : detached(body); } catch (error) { thrown?.(error); throw error; }
@@ -205,11 +205,9 @@ function posted<T>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, given: ((va
 export interface Repo {
   // The server's clock, for rows written outside the Repo too (writeAudit).
   now(): number;
-  // Runs fn in one IMMEDIATE transaction, or a savepoint inside an open one.
-  atomic<T>(fn: () => Sync<T>): T;
   // Runs fn in one IMMEDIATE transaction through the server's write queue (store/queue.ts): the form for a
   // transaction's outermost caller. Inside an open transaction it refuses, since a nested body can't wait for
-  // the queue its own transaction holds; nested code calls atomic. `committed(value)` runs after the commit, before
+  // the queue its own transaction holds; nested code calls its Tx's `savepoint`. `committed(value)` runs after the commit, before
   // the queue's next body: in-memory state the transaction's readers see changes there, not after the await.
   // fn may be async: its transaction stays open across its awaits, other tasks' writes waiting behind it (P1b-4e).
   // fn gets the transaction's Tx (#807 P1c), live until fn settles; a store function it calls writes through it.
@@ -983,9 +981,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   };
   return {
     now: clock,
-    atomic<T>(fn: () => Sync<T>): T {
-      return db.transaction(fn).immediate() as T;
-    },
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
     read: sqliteRead(db),
@@ -2050,7 +2045,6 @@ function makeHostedStore(db: Database): HostedStoreOf {
   const on = (tx: Tx): HostedWrites => writesOn(sqliteOf(tx));
   const store: HostedStoreOf = {
     writesOn,
-    atomic: fn => db.transaction(fn).immediate(),
     write: (fn, committed) => queued(db, fn, committed),
     subscribe: () => () => {},
     get: (r, id) => hostedRow(sqliteOf(r), id),

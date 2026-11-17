@@ -88,7 +88,7 @@ export class AppSession {
   constructor(
     private readonly application: Application,
     // A handler that writes runs in a queued body, as hosted `run` holds the write queue around it (#807 P1b-4f).
-    private readonly repo: Pick<Repo, "write" | "atomic" | "read">,
+    private readonly repo: Pick<Repo, "write" | "read">,
     private readonly authed: AuthedUser,
     // The alias to bind after connecting; null stays an unbound session.
     private readonly identity: string | null,
@@ -123,9 +123,9 @@ export class AppSession {
   // fails is logged and the rest still land, so the caller's ApplicationError is what it rethrows.
   private async flushRefusal(rows: RefusalRow[]): Promise<void> {
     if (!rows.length) return;
-    await seed(this.repo, tx => {
+    await seed(this.repo, async tx => {
       for (const w of rows) {
-        try { this.repo.atomic(() => w(tx)); } catch (failure) { console.error("[app_session] refusal row failed:", failure); }
+        try { await tx.savepoint(w); } catch (failure) { console.error("[app_session] refusal row failed:", failure); }
       }
     }).catch(failure => console.error("[app_session] refusal rows failed:", failure));
   }

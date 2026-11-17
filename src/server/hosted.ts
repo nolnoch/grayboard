@@ -410,7 +410,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     };
     if (mode === "queued") return store.write(body);
     if (!outer) throw new Error("a nested sweep runs in its caller's transaction: pass its Tx");
-    store.atomic(() => body(outer));
+    // No savepoint of its own (#807 P3 A1b): its only caller (`full`, under admission) runs inside withGate's rowFor
+    // savepoint, and a throw here rolls that back whole, as a refusal rolls this sweep back.
+    body(outer);
     return Promise.resolve();
   }
   function park(tx: Tx, row: HostedSession, parkedUnder: Set<string>) {
@@ -434,27 +436,26 @@ export function createHostedSessions(application: Application, options: { now?: 
   // undefined when it wrote, so the caller reads again.
   function settle(tx: Tx, id: string, authed?: number): { row: HostedSession | undefined } | undefined {
     if (stopped) return undefined;
-    return store.atomic(() => {
-      const row = store.get(tx, id);
-      if (!row) return { row };
-      const root = row.root_session_id ? store.get(tx, row.root_session_id) : row;
-      let ended = false;
-      if (root && !root.root_session_id) {
-        const t = now();
-        if (root.user_id !== authed && repo.users.isDisabled(root.user_id)) { store.end(tx, root.session_id, "disabled", t); ended = true; }
-        else if (root.lease_deadline !== null && root.lease_deadline <= t) { store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
-        else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(tx, root.session_id).length) { store.end(tx, root.session_id, "idle", t); ended = true; }
-      }
-      // A root's end may have ended this child with it.
-      const child = !row.root_session_id ? undefined : ended ? store.get(tx, row.session_id) : row;
-      if (child && child.parked_at === null && idleAt(child)) {
-        const parkedUnder = new Set<string>();
-        park(tx, child, parkedUnder);
-        evictParked(tx, parkedUnder);
-        return undefined;
-      }
-      return ended ? undefined : { row };
-    });
+    // No savepoint of its own (#807 P3 A1b): its caller's write body doesn't catch, so a throw fails that whole body.
+    const row = store.get(tx, id);
+    if (!row) return { row };
+    const root = row.root_session_id ? store.get(tx, row.root_session_id) : row;
+    let ended = false;
+    if (root && !root.root_session_id) {
+      const t = now();
+      if (root.user_id !== authed && repo.users.isDisabled(root.user_id)) { store.end(tx, root.session_id, "disabled", t); ended = true; }
+      else if (root.lease_deadline !== null && root.lease_deadline <= t) { store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
+      else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(tx, root.session_id).length) { store.end(tx, root.session_id, "idle", t); ended = true; }
+    }
+    // A root's end may have ended this child with it.
+    const child = !row.root_session_id ? undefined : ended ? store.get(tx, row.session_id) : row;
+    if (child && child.parked_at === null && idleAt(child)) {
+      const parkedUnder = new Set<string>();
+      park(tx, child, parkedUnder);
+      evictParked(tx, parkedUnder);
+      return undefined;
+    }
+    return ended ? undefined : { row };
   }
   // The lease and idle clocks stop while the server is down (#423). A root
   // whose lease was still live at the last heartbeat gets its deadline pushed
@@ -500,9 +501,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     return {
       defer: (write: RefusalRow) => { rows.push(write); },
       // Inside a write body (`withGate`'s settle body, whose own savepoint rolled back): written on its `tx`.
-      flush(tx: Tx) {
+      async flush(tx: Tx) {
         for (const write of rows.splice(0)) {
-          try { store.atomic(() => write(tx)); } catch (failure) { refusalRowsLost++; hostedFailure("hosted.refusal_row", failure); }
+          try { await tx.savepoint(write); } catch (failure) { refusalRowsLost++; hostedFailure("hosted.refusal_row", failure); }
         }
       },
       // After a rejected write: the rows go through the queue in a body of their own (#807).
@@ -511,10 +512,10 @@ export function createHostedSessions(application: Application, options: { now?: 
         const pending = rows.splice(0);
         let failed = 0;
         try {
-          await store.write(tx => {
+          await store.write(async tx => {
             failed = 0;
             for (const write of pending) {
-              try { store.atomic(() => write(tx)); } catch (failure) { failed++; hostedFailure("hosted.refusal_row", failure); }
+              try { await tx.savepoint(write); } catch (failure) { failed++; hostedFailure("hosted.refusal_row", failure); }
             }
           });
           refusalRowsLost += failed;
@@ -541,12 +542,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.
-        const pending = store.write(tx => {
+        const pending = store.write(async tx => {
           if (waited) authorized(p, tx);
           // authorized(p) passed with no await since: settle skips p's own disabled read (#881).
           const settled = settle(tx, context.id, p.authed.user_id);
-          try { return { row: store.atomic(() => { const r = rowFor(tx, p, context, later.defer, true, wake, declare, settled)!; return { r, seen: touch(tx, r) }; }) }; }
-          catch (error) { later.flush(tx); return { error }; }
+          try { return { row: await tx.savepoint(sp => { const r = rowFor(sp, p, context, later.defer, true, wake, declare, settled)!; return { r, seen: touch(sp, r) }; }) }; }
+          catch (error) { await later.flush(tx); return { error }; }
         });
         waited = true;
         const selected = await pending;

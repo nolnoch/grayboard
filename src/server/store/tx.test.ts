@@ -214,12 +214,12 @@ test("a post body run from a write's committed callback gets a Tx closed after i
   expect(rows(repo.read)).toEqual(["after"]);
 });
 
-test("an unawaited savepoint started inside atomic doesn't strand the atomic's frame (#999 audit A)", async () => {
+test("an unawaited savepoint started inside a nested synchronous transaction doesn't strand its frame (#999 audit A)", async () => {
   const repo = await open();
   const seen: string[] = [];
   let settled: Promise<unknown> = Promise.resolve();
   await repo.write(async tx => {
-    repo.atomic(() => { settled = tx.savepoint(async sp => { put(sp, "sp"); await tick(); }).catch(e => e); });
+    sqliteOf(tx).transaction(() => { settled = tx.savepoint(async sp => { put(sp, "sp"); await tick(); }).catch(e => e); }).immediate();
     await settled;
     tx.afterCommit(() => { seen.push("outer"); });
   });
