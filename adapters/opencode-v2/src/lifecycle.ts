@@ -185,8 +185,13 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
       const path = await controller.childRoot(sessionID);
       e = path && controller.enrollment(path.root);
       if (!path || !e) return;
-      await controller.enlist(path, false);
+      await controller.enlist(path, true);
     }
+    // A session (or its root) that ended since the lookup or the registration: an `initialize` landing after its
+    // end would start an ownership for its key that only the idle sweep ends (#567). `forget` aborts `signal`.
+    const root = controller.routes.get(sessionID)?.root ?? sessionID;
+    // A root paused meanwhile: its release ended the rows an `initialize` would start again (#567).
+    if (signal.aborted || controller.routes.isEnded(sessionID) || controller.routes.isEnded(root) || !controller.enrollment(root)) return;
     const port = controller.port, enrollment = e;
     let current: string | undefined;
     const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client, ...(launcher ? { launcher: true as const } : {}), ...(port.facts ? { facts: (id: string) => port.facts!(id) } : {}), ...(port.suggested ? { suggested: (id: string) => port.suggested!(id) } : {}) }, {

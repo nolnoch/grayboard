@@ -73,17 +73,26 @@ class SqliteTx extends SqliteRead {
     try {
       value = await fn(inner as unknown as Tx);
     } catch (error) {
-      inner.close();
-      this.#child = undefined;
-      for (const key of inner.#added) this.#root.#hooks.delete(key);
+      this.#settle(inner, false);
       b.rollback();
       throw error;
     }
+    try { b.commit(); } catch (error) { this.#settle(inner, false); throw error; }
+    this.#settle(inner, true);
+    return value;
+  }
+  // A settled savepoint's hook keys follow its frame (#1182 audit): kept, they move to this Tx (and so drop with an
+  // enclosing rollback) only once its RELEASE succeeded; dropped, they leave the root. Keys a still-open descendant
+  // (one the body didn't await, D4) registered drop either way, as its afterCommit effects do.
+  #settle(inner: SqliteTx, kept: boolean): void {
+    const open: object[] = [];
+    for (let t = inner.#child; t; t = t.#child) open.push(...t.#added);
     inner.close();
     this.#child = undefined;
-    if (this !== this.#root) this.#added.push(...inner.#added);
-    b.commit();
-    return value;
+    const hooks = this.#root.#hooks;
+    for (const key of open) hooks.delete(key);
+    if (!kept) for (const key of inner.#added) hooks.delete(key);
+    else if (this !== this.#root) this.#added.push(...inner.#added);
   }
   beforeCommit(key: object, hook: (tx: Tx) => Promise<void>): void {
     this.assertLive();
