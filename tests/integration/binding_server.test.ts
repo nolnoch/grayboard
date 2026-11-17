@@ -10,7 +10,6 @@ import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { idAddress } from "../../src/core/bindings.ts";
-import { endSession } from "../../src/core/session_end.ts";
 import { refusal } from "../support/app_session.ts";
 import type { AppSession, AppSessionOptions } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";

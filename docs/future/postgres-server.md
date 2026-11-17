@@ -48,6 +48,7 @@ Each read-then-write invariant becomes one statement or a lock on a row the inva
 | Principal names unique across users, teams and services (`teams.create`) | `principals.name` is already `UNIQUE`; the store relies on it and on `teams.name` (a team's name is a principal's too, and its insert runs first) instead of a prior read, and `23505` on either constraint maps to `PrincipalTaken` |
 | Count caps: alias cap per scope, OAuth request capacity, attachment quota per user, hosted `full()` | `SELECT ... FOR UPDATE` on the parent row (the scope, the user, the server's capacity row), then count and insert. The global caps (OAuth request capacity, browser sessions, hosted `full()`) have no parent row today: P3 adds the capacity row to the schema |
 | A team keeps an owner (`guardLastOwner`) | `FOR UPDATE` on the team row, then count owners |
+| An ID ends once, and a send to it either lands in the end's bounces or is refused (`repo.sessionEnd.end`, `repo.sessionEnd.refusal`) | the end first `SELECT ... FROM ids WHERE id = $1 FOR UPDATE` (or `UPDATE ... WHERE ended_at IS NULL RETURNING`), so a second ender finds it ended; the send's deliverability read takes `FOR SHARE` on the recipient's `ids` row, so the end waits for an in-flight send and its unread read sees that message, and a later send sees `ended_at` |
 
 `MAX_HOLDS` counts a session's in-memory `holds`, so the write queue covers it until Stage 4 moves holds out of process.
 
