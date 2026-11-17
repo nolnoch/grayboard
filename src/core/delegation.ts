@@ -56,7 +56,7 @@ export function isLauncher(db: Database, handle: string): boolean {
 
 // Whether `to` names an address that has had a session: a roster alias, or
 // a session ID with a row.
-function everConnected(db: Database, to: string): boolean {
+export function everConnected(db: Database, to: string): boolean {
   if (addressParts(to)?.kind === "id") return !!db.prepare(`SELECT 1 FROM ids WHERE id = ?`).get(to);
   return rosterHandles(db).includes(to);
 }
@@ -75,11 +75,7 @@ export type DelegateReach = { ok: "own" | "granted" } | { refused: string };
 // open cap, so a teammate's loop can't lock its owner out of their own launcher (#256).
 export const grantedCap = (cap: number): number => Math.max(1, Math.floor(cap / 2));
 
-// The default reach, and the only one locally (one user per bus): own user or refused.
-export const ownUserReach = (db: Database, principal: string | null) => (to: string): DelegateReach =>
-  sameUser(principal, to, db) ? { ok: "own" } : { refused: crossUserRefusal(to) };
-
-// Whether `candidate` is in the requester's own user. The user is the
+// Whether a candidate address is in the requester's own user, given the user behind it (`addressUser`). The user is the
 // authenticated principal, never an address's spelling: a team alias
 // (`eng/sim`) is shared by every member, so a prefix test would let Alice's
 // `eng/sim` reach Bob's `eng/launcher` (security audit F-01). An ID's user
@@ -88,10 +84,7 @@ export const ownUserReach = (db: Database, principal: string | null) => (to: str
 // launcher list reads it). Locally every principal is null: one user per
 // bus. No session behind the candidate: not another user's; the roster and
 // launcher checks refuse it as unknown.
-export function sameUser(principal: string | null, candidate: string, db: Database): boolean {
-  const user = addressUser(db, candidate);
-  return user === undefined || user === principal;
-}
+const userMatches = (principal: string | null, user: string | null | undefined): boolean => user === undefined || user === principal;
 
 // The user behind an address, by the rule above: an ID's principal, an
 // alias's holder's (or last holder's); undefined with no session behind it.
@@ -167,12 +160,12 @@ function optField(raw: unknown, name: string, max: number): string | undefined {
 // last_seen row isn't reachability); locally, having connected at least
 // once (the bridge is woken by the socket). null when there isn't one.
 function humanFallbackHandle(
-  db: Database,
+  facts: DelegationFacts,
   requester: string,
   principal: string | null,
   reachable: (h: string) => boolean,
 ): string | null {
-  const candidates = principal !== null ? [formatDirectAddress(principal, HUMAN_NAME)] : humanHandles(db);
+  const candidates = principal !== null ? [formatDirectAddress(principal, HUMAN_NAME)] : facts.humanHandles();
   for (const h of candidates) {
     if (h !== requester && reachable(h)) return h;
   }
@@ -181,14 +174,49 @@ function humanFallbackHandle(
 
 export type Delegation = { to: string; body: string; humanFallback?: true };
 
+// What the decision reads of the store (#807 P3 B4b): core's own SQL locally (dbFacts, asked lazily, as before),
+// read first on a server, whose store can't answer synchronously (repo.delegation.facts).
+export interface DelegationFacts {
+  // The auto-pick's candidates, in pick order (launchers).
+  launchers(): string[];
+  // The user behind an address (addressUser).
+  userOf(address: string): string | null | undefined;
+  // Whether `to` has had a session (everConnected), and is a launcher's (isLauncher).
+  everConnected(to: string): boolean;
+  isLauncher(to: string): boolean;
+  // The human fallback's local reads: the declared humans and their last-seen. A server asks neither (its principal
+  // is set and it passes humanReachable).
+  humanHandles(): string[];
+  lastSeen(handle: string): number | null;
+}
+
+// Core's reads on `db`, each when the decision asks.
+export function dbFacts(db: Database): DelegationFacts {
+  return {
+    launchers: () => launchers(db),
+    userOf: (a) => addressUser(db, a),
+    everConnected: (to) => everConnected(db, to),
+    isLauncher: (to) => isLauncher(db, to),
+    humanHandles: () => humanHandles(db),
+    lastSeen: (h) => lastSeen(db, h),
+  };
+}
+
 // Resolve the launcher and build the payload. Explicit `to` must be in the
 // requester's own user, or granted (`reach`, #256), and a live launcher; without one, the first live
 // launcher (by name) of the requester's user takes it — rotation across
 // launchers is a follow-up. No live launcher: the request surfaces to the
 // requester's human instead (the issue's degrade path), if that human is
 // reachable; errors name the undo.
-export function resolveDelegation(
-  db: Database,
+export function resolveDelegation(db: Database, ...rest: DecisionArgs): Delegation {
+  return resolveDelegationWith(dbFacts(db), ...rest);
+}
+
+type DecisionArgs = Parameters<typeof resolveDelegationWith> extends [DelegationFacts, ...infer R] ? R : never;
+
+// The decision over `facts` (#807 P3 B4b): resolveDelegation's, which a server runs over facts it read first.
+export function resolveDelegationWith(
+  facts: DelegationFacts,
   requester: string,
   // The requester's signed-in user (its email) on a server; null locally.
   principal: string | null,
@@ -200,7 +228,7 @@ export function resolveDelegation(
   // A launcher's open delegation requests, against the cap (#252).
   open: (handle: string) => number = () => 0,
   cap: number = DELEGATE_OPEN_CAP,
-  reach: (to: string) => DelegateReach = ownUserReach(db, principal),
+  reach: (to: string) => DelegateReach = (to) => userMatches(principal, facts.userOf(to)) ? { ok: "own" } : { refused: crossUserRefusal(to) },
 ): Delegation {
   const persona = field(args.persona, "persona", MAX_PERSONA_CHARS);
   const task = field(args.task, "task", MAX_TASK_CHARS, true);
@@ -212,8 +240,8 @@ export function resolveDelegation(
     const to = args.to.trim();
     const r = reach(to);
     if ("refused" in r) throw new CoreError(r.refused);
-    if (!everConnected(db, to)) throw new CoreError(neverConnected(to));
-    if (!isLauncher(db, to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
+    if (!facts.everConnected(to)) throw new CoreError(neverConnected(to));
+    if (!facts.isLauncher(to)) throw new CoreError(`"${to}" isn't a launcher session (it starts one with BUS_LAUNCHER=1)`);
     if (self(to)) throw new CoreError(`"${to}" is this session's own address; a session can't delegate to itself`);
     if (!online(to)) throw new CoreError(`"${to}" is a launcher but offline; peer_list shows who's live`);
     if (r.ok === "granted" && open(to) >= grantedCap(cap)) throw new CoreError(`"${to}" has ${open(to)} open delegation requests it hasn't taken; another user's request is refused once it holds ${grantedCap(cap)}, half its cap, so its own user keeps the rest (#256); retry once it replies in one's thread`);
@@ -221,14 +249,14 @@ export function resolveDelegation(
     return { to, body: delegationBody(brief) };
   }
 
-  const live = launchers(db).filter((h) => sameUser(principal, h, db) && !self(h) && online(h));
+  const live = facts.launchers().filter((h) => userMatches(principal, facts.userOf(h)) && !self(h) && online(h));
   const free = live.find((h) => open(h) < cap);
   if (free !== undefined) return { to: free, body: delegationBody(brief) };
   // Every live launcher is full: refused, not degraded to the human. The
   // fallback would hand a loop's flood to a person (Slack) instead.
   if (live.length) throw new CoreError(`every live launcher of yours has ${cap} open delegation requests it hasn't taken (the cap, #252); retry once one replies in a request's thread, or start another launcher`);
 
-  const human = humanFallbackHandle(db, requester, principal, (h) => (humanReachable ? humanReachable(h) : lastSeen(db, h) !== null));
+  const human = humanFallbackHandle(facts, requester, principal, (h) => (humanReachable ? humanReachable(h) : facts.lastSeen(h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };
   throw new CoreError("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human to fall back to; start one or pass to");
 }

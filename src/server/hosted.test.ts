@@ -212,7 +212,7 @@ function spyMessageReads() {
   });
   const spies = [
     ...spy(database.repo.messages, ["getById", "writerUsers", "delegationIds", "bouncesFrom", "history", "thread", "unreadSince",
-      "queuedTo", "undeliveredFrom", "receivedUnacked", "sentPending", "openDelegations"] as const),
+      "queuedTo", "undeliveredFrom", "receivedUnacked", "sentPending"] as const),
     ...spy(database.repo.aliases, ["seen"] as const),
   ];
   return { checks, restore: () => { for (const s of spies) s.mockRestore(); } };
