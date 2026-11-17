@@ -33,8 +33,8 @@ const rows = (db: { query: (s: string) => { all: () => unknown[] } }) => (db.que
 
 test("#807: retention while another body holds the write queue waits, then prunes", async () => {
   const { db, repo } = setup();
-  const m = await seed(repo, tx => {
-    const inserted = repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
+  const m = await seed(repo, async tx => {
+    const inserted = await repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
     db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [inserted.id]);
     return inserted;
   });
@@ -55,7 +55,7 @@ test("#807: a server claim expiry timer's sweep waits behind another body holdin
   cleanups.push(() => timer.stop());
   await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
+    await repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
     createBoard(db, "a@example.com/be", "e2e", "test");
     claim(db, "a@example.com/be", "soon", { board: "e2e", ttl_minutes: 0.001 });
   });

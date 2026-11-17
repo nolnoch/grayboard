@@ -6,7 +6,7 @@
 // changes nothing for pi, and leaving a hosted install's server signs the
 // harness out of it, revoking its grant.
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
@@ -301,6 +301,77 @@ test("setup refuses omp's adapter for a relative or ~ PI_CODING_AGENT_DIR in the
     expect(existsSync(join(f.root, value))).toBe(false);
   }
 }, 120_000);
+// #439: an mcp.json holding JSON null has nothing to keep, so setup writes
+// the entry into it; one holding an array or a scalar would be lost, so setup
+// refuses and leaves it alone.
+test("setup writes into an mcp.json holding JSON null and refuses one holding an array", () => {
+  const f = fixture();
+  mkdirSync(f.dir, { recursive: true });
+  writeFileSync(f.paths.mcp, "null");
+  f.run("setup", "--local", "-y");
+  expectLocal(f);
+
+  for (const [text, kind] of [["[1]", "array"], ["5", "number"]]) {
+    writeFileSync(f.paths.mcp, text);
+    const r = f.exec(["setup", "--local", "-y"]);
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain(`Can't parse ${f.paths.mcp}: it holds a JSON ${kind}, not an object`);
+    expect(readFileSync(f.paths.mcp, "utf8")).toBe(text);
+  }
+}, 60_000);
+
+// #439: the rewrite is a temp file renamed over the config, so it must land
+// at a symlink's target (the link stays), keep the file's mode (0664, which
+// the test's umask 022 would narrow), and leave no temp file behind.
+test("setup rewrites a symlinked mcp.json at its target, keeping the link and the mode", () => {
+  const f = fixture();
+  const dotfiles = join(f.root, "dotfiles");
+  mkdirSync(dotfiles);
+  mkdirSync(f.dir, { recursive: true });
+  const target = join(dotfiles, "mcp.json");
+  writeFileSync(target, JSON.stringify({ mcpServers: { other: { command: "x" } } }));
+  chmodSync(target, 0o664);
+  symlinkSync(target, f.paths.mcp);
+  const umask = process.umask(0o022);
+  try { f.run("setup", "--local", "-y"); } finally { process.umask(umask); }
+  expect(lstatSync(f.paths.mcp).isSymbolicLink()).toBe(true);
+  expectLocal(f);
+  expect(JSON.parse(readFileSync(target, "utf8")).mcpServers.other).toEqual({ command: "x" });
+  expect(lstatSync(target).mode & 0o777).toBe(0o664);
+  expect(readdirSync(dotfiles)).toEqual(["mcp.json"]);
+  expect(readdirSync(f.dir).filter(n => n.endsWith(".tmp"))).toEqual([]);
+}, 60_000);
+
+// A dangling link is a dotfiles target not yet made: the write creates the
+// target, as an in-place write through the link did, never replacing the link.
+test("setup writes a dangling symlinked mcp.json's target, keeping the link", () => {
+  const f = fixture();
+  const dotfiles = join(f.root, "dotfiles");
+  mkdirSync(dotfiles);
+  mkdirSync(f.dir, { recursive: true });
+  symlinkSync(join("..", "dotfiles", "mcp.json"), join(dotfiles, "hop"));
+  symlinkSync(join(dotfiles, "hop"), f.paths.mcp);
+  f.run("setup", "--local", "-y");
+  expect(lstatSync(f.paths.mcp).isSymbolicLink()).toBe(true);
+  expect(lstatSync(join(dotfiles, "hop")).isSymbolicLink()).toBe(true);
+  expect(lstatSync(join(dotfiles, "mcp.json")).isFile()).toBe(true);
+  expectLocal(f);
+}, 60_000);
+
+// A config the user can't write is refused, as an in-place write was, though
+// the rename only needs the directory. Root may write any file.
+test.skipIf(process.getuid?.() === 0)("setup refuses an mcp.json the user can't write and leaves it alone", () => {
+  const f = fixture();
+  mkdirSync(f.dir, { recursive: true });
+  const text = JSON.stringify({ mcpServers: { other: { command: "x" } } });
+  writeFileSync(f.paths.mcp, text);
+  chmodSync(f.paths.mcp, 0o444);
+  const r = f.exec(["setup", "--local", "-y"]);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stderr).toContain("EACCES");
+  expect(readFileSync(f.paths.mcp, "utf8")).toBe(text);
+  expect(lstatSync(f.paths.mcp).mode & 0o777).toBe(0o444);
+}, 60_000);
 
 test("setup upgrades an existing raw local omp adapter in place to the bundle", () => {
   const f = fixture("omp");

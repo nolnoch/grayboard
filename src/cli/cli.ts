@@ -2,6 +2,7 @@
 // hook, so a hook doesn't pay for this module's imports (#551).
 import { Command } from "commander";
 import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync } from "node:fs";
+import { writeJsonFile } from "./json_file.ts";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { loginThroughServer } from "./oauth_flow.ts";
@@ -129,8 +130,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
   }
   // The entry next: an unparseable mcp.json throws before any file changes.
   const existing = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})[h.config.section]?.grayboard;
-  // `?.`: the file may hold JSON null.
-  const old = readConfig<{ url?: unknown }>(h.hostedConfig, {})?.url;
+  const old = readConfig<{ url?: unknown }>(h.hostedConfig, {}).url;
   if (typeof old === "string" && old !== url) {
     const note = await signOutPiFamily(h, old);
     if (note) notes.push(note);
@@ -139,7 +139,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     if (dropEntry(h.config)) notes.push(`Removed the grayboard entry from ${h.config.path} (the hosted extension needs none)`);
     writeAdapter(h.hosted, h.bundle);
     rmSync(h.local, { force: true });
-    writeConfig(h.hostedConfig, { url } satisfies HostedConfig);
+    writeJsonFile(h.hostedConfig, { url } satisfies HostedConfig);
     notes.push(`Wrote ${h.hostedConfig}`);
     return { adapter: h.hosted, notes };
   }
@@ -187,18 +187,22 @@ function writeAdapter(path: string, source: string): void {
   writeFileSync(path, source);
 }
 
-/** A harness's JSON config, or `empty` when the file doesn't exist. Throws when it can't be parsed. */
+/**
+ * A harness's JSON config, or `empty` when the file doesn't exist or holds
+ * JSON null (nothing to keep). Throws when it can't be parsed, or holds an
+ * array or a scalar, which a rewrite would lose.
+ */
 function readConfig<T extends object>(path: string, empty: T): T {
   if (!existsSync(path)) return empty;
-  try { return JSON.parse(readFileSync(path, "utf8")); } catch (e) {
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(path, "utf8")); } catch (e) {
     throw new Error(`Can't parse ${path}: ${(e as Error).message}`);
   }
+  if (value === null) return empty;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error(`Can't parse ${path}: it holds a JSON ${Array.isArray(value) ? "array" : typeof value}, not an object`);
+  return value as T;
 }
 
-function writeConfig(path: string, cfg: object): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
-}
 
 /** Write `entry` (or reshape the existing one by `c.local`) as the harness's grayboard entry; true when the file changed. */
 function putEntry(c: HarnessConfig, entry?: Entry): boolean {
@@ -209,7 +213,7 @@ function putEntry(c: HarnessConfig, entry?: Entry): boolean {
   const next = c.local(base);
   if (JSON.stringify(next) === JSON.stringify(old)) return false;
   cfg[c.section] = { ...cfg[c.section], grayboard: next };
-  writeConfig(c.path, cfg);
+  writeJsonFile(c.path, cfg);
   return true;
 }
 
@@ -219,7 +223,7 @@ function dropEntry(c: HarnessConfig): boolean {
   if (!cfg[c.section]?.grayboard) return false;
   const { grayboard: _, ...rest } = cfg[c.section]!;
   cfg[c.section] = rest;
-  writeConfig(c.path, cfg);
+  writeJsonFile(c.path, cfg);
   return true;
 }
 
@@ -260,14 +264,14 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
         console.warn(`Warning: --force is clobbering mcpServers keys: ${keys.join(", ")}`);
       }
     }
-    writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
+    writeJsonFile(targetPath, { mcpServers: { grayboard: entry } });
     wrote("Wrote");
     return;
   }
 
   // Merge mode
   if (!existsSync(targetPath)) {
-    writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
+    writeJsonFile(targetPath, { mcpServers: { grayboard: entry } });
     wrote("Created");
     return;
   }
@@ -284,7 +288,7 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
     process.exit(1);
   }
   existing.mcpServers["grayboard"] = entry;
-  writeFileSync(targetPath, JSON.stringify(existing, null, 2) + "\n");
+  writeJsonFile(targetPath, existing);
   wrote("Updated");
 }
 
@@ -767,7 +771,7 @@ program
       return !guard.skip;
     };
     if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
-      if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
+      if (!existsSync(OC_CONFIG.path)) writeJsonFile(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
       console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${OC_PLUGIN.path}`);

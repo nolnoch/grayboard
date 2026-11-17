@@ -45,10 +45,10 @@ describe("retention pruning", () => {
 
   test("pruneMessages keeps replies whose parent aged out", async () => {
     const { db, repo: r } = open();
-    const { root, reply } = await seed(r, tx => {
-      const root = r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
+    const { root, reply } = await seed(r, async tx => {
+      const root = await r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
       db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [root.id]);
-      return { root, reply: r.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
+      return { root, reply: await r.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
     });
     await expect(seed(r, tx => pruneMessages(r, tx, 1))).resolves.toBeUndefined(); // used to fail the parent_id foreign key
     expect(r.messages.getById(r.read, root.id)).toBeUndefined();
@@ -65,8 +65,8 @@ describe("retention pruning", () => {
     const oldFile = await up("a@example.com/fe");
     const old = await seed(r, tx => r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null, false, { ids: [oldFile], uploader: from }, null));
     const keptFile = await up("a@example.com/fe");
-    const kept = await seed(r, tx => {
-      const kept = r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [keptFile], uploader: from }, null);
+    const kept = await seed(r, async tx => {
+      const kept = await r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [keptFile], uploader: from }, null);
       db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
       return kept;
     });
@@ -86,7 +86,7 @@ describe("retention pruning", () => {
     // A board reads as missing to an address no principal owns (#284).
     await seed(r, async tx => {
       await r.users.upsertByEmail(tx, "a@example.com", null);
-      r.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
+      await r.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
       createBoard(db, "a@example.com/be", "e2e", "test");
       post(db, "a@example.com/be", "e2e", "old");
       db.run("UPDATE posts SET created_at = 0");

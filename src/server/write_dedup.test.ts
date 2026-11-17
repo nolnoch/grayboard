@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { openDatabase, type Repo, type Sync } from "./db.ts";
+import { openDatabase, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { runRetention } from "./retention.ts";
 import { dedupWrite, fingerprint, type DedupCall, type DedupOutcome, type Written } from "./write_dedup.ts";
@@ -73,12 +73,12 @@ describe("dedupWrite", () => {
     tool: "dm_send", session: "s1", sender: SENDER, actor: "a@example.com", transport: "bridge",
     args: { to: "b@example.com/fe", body: "hi" }, resend: false, ...over,
   });
-  const send = (body = "hi") => (tx: Tx) => {
-    const m = repo.messages.insert(tx, SENDER, "user", "b@example.com/fe", body, null);
+  const send = (body = "hi") => async (tx: Tx) => {
+    const m = await repo.messages.insert(tx, SENDER, "user", "b@example.com/fe", body, null);
     return { payload: { message_id: m.id, delivered_now: false }, ref: { kind: "message" as const, id: m.id } };
   };
   // A tool call's dedup, inside a queued body as the application's handlers run it.
-  const dedup = <W extends Written>(now: number, c: DedupCall, write: (tx: Tx) => Sync<W>) =>
+  const dedup = <W extends Written>(now: number, c: DedupCall, write: (tx: Tx) => W | Promise<W>) =>
     seed(repo, tx => dedupWrite(repo, tx, now, c, write)) as Promise<DedupOutcome<W>>;
   const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
   const audits = (action: string) => db.prepare("SELECT target, actor, detail FROM access_log WHERE action = ?").all(action) as { target: string; actor: string; detail: string }[];
@@ -87,7 +87,7 @@ describe("dedupWrite", () => {
     const first = await dedup(1_000, call(), send());
     if (!("fresh" in first)) throw new Error("expected a fresh write");
     const id = first.fresh.payload.message_id;
-    const again = await dedup(2_000, call(), (): ReturnType<ReturnType<typeof send>> => {
+    const again = await dedup(2_000, call(), (): Awaited<ReturnType<ReturnType<typeof send>>> => {
       throw new Error("must not run");
     });
     expect(again).toEqual({
@@ -173,14 +173,14 @@ describe("dedupWrite", () => {
     let winner = 0;
     // The other call's write and receipt land between this call's read of the stale receipt and its takeover.
     receipts.reclaim = async (tx, key, stale, at) => {
-      const w = send("hi")(tx);
+      const w = await send("hi")(tx);
       winner = w.ref.id;
       await receipts.upsert(tx, { ...key, tool: "dm_send", ref_kind: "message", ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at });
       return reclaim(tx, key, stale, at);
     };
     let again: Awaited<ReturnType<typeof dedup>>;
     try {
-      again = await dedup(2_000, call(), (): ReturnType<ReturnType<typeof send>> => { throw new Error("must not run"); });
+      again = await dedup(2_000, call(), (): Awaited<ReturnType<ReturnType<typeof send>>> => { throw new Error("must not run"); });
     } finally {
       receipts.reclaim = reclaim;
     }
@@ -268,8 +268,8 @@ describe("dedupWrite", () => {
     expect("replay" in r && r.replay.note).toBe(`already posted to #e2e at ${new Date(1_000).toISOString()} as post 7; this repeat was not posted. To send it again on purpose, call with resend: true.`);
 
     const d = call({ tool: "delegate", args: { to: null, persona: "p", task: "t" } });
-    const deleg = (tx: Tx) => {
-      const w = send("delegation")(tx);
+    const deleg = async (tx: Tx) => {
+      const w = await send("delegation")(tx);
       return { ...w, payload: { ...w.payload, to: "a@example.com/lx" } };
     };
     await dedup(1_000, d, deleg);

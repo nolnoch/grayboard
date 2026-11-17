@@ -261,10 +261,12 @@ export interface Repo {
   // Who an address acts for (#284 S12): an ID's registering user, an
   // alias's scope owner, a team broadcast's team.
   resolver: Resolver;
-  // Names in scopes, keyed by address.
+  // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
+  // async Access (A7): `find` and `findAllByName` are Access-seam reads, `listForScope` and `seen` feed the synchronous
+  // session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
-    create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
+    create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Promise<Alias>;
     find(r: Read, address: string): Alias | undefined;
     listForScope(r: Read, kind: ScopeKind, ref: string): Alias[];
     // The scope's names less the Slack link's human, for the cap (#347).
@@ -275,7 +277,7 @@ export interface Repo {
     // session that holds or last held it (ALIAS_SESSION_SQL); unused ones are absent.
     seen(r: Read, addresses: string[]): Map<string, { last_seen: number; cwd: string | null; place: string | null }>;
     // Also deletes the alias's read points.
-    remove(tx: Tx, address: string): void;
+    remove(tx: Tx, address: string): Promise<void>;
   };
   teams: {
     // Inserts the team's principal in the same transaction; throws
@@ -305,6 +307,7 @@ export interface Repo {
     // under which one's session may delegate to the other's launcher (#256).
     shareDelegating(userA: number, userB: number): boolean;
   };
+  // The writes return promises (#807 P3 A6d2); the reads stay synchronous until A7, as the alias reads do.
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
@@ -317,7 +320,7 @@ export interface Repo {
     insert(
       tx: Tx, sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
       files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null,
-    ): MessageRow;
+    ): Promise<MessageRow>;
     // The writer's signed-in user of each message and post that has one
     // recorded (rows from before F-10, bounces and system posts have none).
     writerUsers(r: Read, messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
@@ -342,17 +345,17 @@ export interface Repo {
     receivedUnacked(r: Read, readers: string[], since: number): MessageRow[];
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(r: Read, senders: string[], since: number): MessageRow[];
-    ack(tx: Tx, reader: string, id: number): void;
+    ack(tx: Tx, reader: string, id: number): Promise<void>;
     // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
     openDelegations(r: Read, launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
-    markDelivered(tx: Tx, id: number, at: number): void;
+    markDelivered(tx: Tx, id: number, at: number): Promise<void>;
     // Deletes a direct message from sender that's past the recipient's cursor
     // and has no reply. False if any of that doesn't hold. Audited as
     // message.retracted in the delete's transaction (#306), as local's
     // retractMessage is, so every caller writes the row a repeat is answered from.
-    retract(tx: Tx, sender: string, id: number, by: { actor: string | null; session: string | null }): boolean;
-    prune(tx: Tx, olderThanMs: number): void;
+    retract(tx: Tx, sender: string, id: number, by: { actor: string | null; session: string | null }): Promise<boolean>;
+    prune(tx: Tx, olderThanMs: number): Promise<void>;
   };
   // An ended session's mail, as core endSession reaches it (#284 decision 4), on the body's `Tx` (#807 P1c-14):
   // core's MailPort names no handle, so the port is bound to the connection the `Tx` resolves to.
@@ -1143,7 +1146,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     aliases: {
-      create(tx, scope, createdBy) {
+      async create(tx, scope, createdBy) {
         const db = sqliteOf(tx);
         const { scope_kind, scope_ref, name } = scope;
         return db.query<Alias, [string, string, string, string, string, number]>(
@@ -1174,7 +1177,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).all(JSON.stringify(addresses));
         return new Map(rows.map(({ address, ...facts }) => [address, facts]));
       },
-      remove(tx, address) {
+      async remove(tx, address) {
         const db = sqliteOf(tx);
         db.transaction(() => {
           db.run("DELETE FROM mailbox_cursors WHERE address = ?", [address]);
@@ -1276,7 +1279,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
+      async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null]>(
@@ -1405,13 +1408,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         const c = sqliteOf(r);
         return countOpenDelegations(c, "access_log", launcher, since);
       },
-      ack(tx, reader, id) {
+      async ack(tx, reader, id) {
         sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
       },
-      markDelivered(tx, id, at) {
+      async markDelivered(tx, id, at) {
         sqliteOf(tx).run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
       },
-      retract(tx, sender, id, by) {
+      async retract(tx, sender, id, by) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           const retractable = db.query<{ recipient: string }, [number, string]>(
@@ -1425,7 +1428,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return true;
         })();
       },
-      prune(tx, olderThanMs) {
+      async prune(tx, olderThanMs) {
         const db = sqliteOf(tx);
         // Replies outlive pruned parents as roots; parent_id is a foreign key.
         db.transaction(() => {

@@ -16,7 +16,7 @@ import {
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
-import { participant, queuedTx, type MessageRow, type Repo, type Sync } from "./db.ts";
+import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -413,10 +413,10 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
 
 // An alias a bind or a writes_as names is created on first use (S9), by
 // the user who named it. Callers are inside a transaction, whose Tx is `tx`.
-function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: Exclude<Target, { error: string }>, session: string): void {
+async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: Exclude<Target, { error: string }>, session: string): Promise<void> {
   const { repo } = hub;
   if (repo.aliases.find(tx, address)) return;
-  repo.aliases.create(tx, scope, authed.user_email);
+  await repo.aliases.create(tx, scope, authed.user_email);
   writeAudit(repo, tx, "alias.created", authed.user_email, address, { lazy: true, session });
   onAliasCreated(repo, tx, authed.user_id, address);
 }
@@ -759,12 +759,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // that transaction: the bridge's checks went stale while the write waited (an unlink or stop queued ahead of it).
   async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
-    return repo.write(tx => {
+    return repo.write(async tx => {
       if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = current?.(tx);
       if (stale) fail("unauthenticated", stale);
       if (!repo.aliases.find(tx, addr)) {
-        repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
+        await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
         writeAudit(repo, tx, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
         onAliasCreated(repo, tx, authed.user_id, addr);
       }
@@ -789,7 +789,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
-  function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): BindResult {
+  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
     valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
@@ -862,7 +862,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (capped) return refuse("bad_request", capped, capped);
 
     // No savepoint (#807 P3 A1): a throw here fails the bind, and every caller's transaction rolls back with it.
-    createLazily(hub, tx, authed, target, id);
+    await createLazily(hub, tx, authed, target, id);
     holdAlias(repo.coreOn(tx), address, id, now());
     logBinding(repo.coreOn(tx), id, address, "bound", null);
     if (meta) setAliasMeta(repo.coreOn(tx), address, meta, id, audit, authed.user_email);
@@ -1000,7 +1000,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // `refused`: as `collided` above, for the refused binding row (`hostedRefused`).
     // `later`: where a policy refusal's decision row goes, for the same reason (hosted's `later`).
     // `tx`: the body the request's row is written in.
-    hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: RefusalRow) => void): string {
+    async hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: RefusalRow) => void): Promise<string> {
       const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(repo.coreOn(tx), id, address, "refused", detail); };
       const target = bindTarget(hub, authed, raw);
       if ("error" in target) {
@@ -1024,7 +1024,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
           note(target.address, capped);
           return fail("bad_request", capped);
         }
-        createLazily(hub, tx, authed, target, id);
+        await createLazily(hub, tx, authed, target, id);
       }
       return target.address;
     },
@@ -1180,7 +1180,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         : m.pending && mine.includes(m.sender) ? m.sender
         : null;
       if (!m || reader === null) fail("not_found", `no message ${id} to you or pending from you; dm_inbox lists them`);
-      repo.messages.ack(tx, reader, m.id);
+      await repo.messages.ack(tx, reader, m.id);
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
       valid(session, false, tx);
@@ -1421,14 +1421,15 @@ function prepareSend(
 }
 
 // Writes the message and builds its result. Runs inside the caller's
-// transaction; whether the recipient is live is read here, with nothing
-// awaited before deliverSend pushes, so the result says what happens.
-function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend): Written<SendResult> & { msg: MessageRow } {
+// transaction; whether the recipient is live is read here, inside the
+// queued body. The registry changes only in queued bodies or afterCommit
+// (D4), so the result says what deliverSend does after the commit.
+async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend): Promise<Written<SendResult> & { msg: MessageRow }> {
   const { repo, registry } = hub;
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(repo.coreOn(tx), p.to);
-    msg = repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
+    msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1490,7 +1491,7 @@ function deliverSend(hub: Hub, msg: MessageRow): void {
 // afresh, and nothing will bind them), audited like any release.
 // write and recheck run in a savepoint, on its Tx (the caller's refuses statements while it's open).
 async function writeOnce<W extends Written>(
-  hub: Hub, tx: Tx, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: (sp: Tx) => Sync<W>,
+  hub: Hub, tx: Tx, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: (sp: Tx) => W | Promise<W>,
   recheck?: (stored: W["payload"], sp: Tx) => void,
 ): Promise<DedupOutcome<W>> {
   const { repo } = hub;
@@ -1596,7 +1597,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
     return { refused: crossUserRefusal(to) };
   };
   try {
-    out = await writeOnce(hub, tx, session, "delegate", session.primary, args, m.resend === true, [], sp => {
+    out = await writeOnce(hub, tx, session, "delegate", session.primary, args, m.resend === true, [], async sp => {
       // Checked and spent in here, so a dedup replay is neither charged nor
       // refused; resend writes again, so it's charged (#252).
       // The user's bucket, not the address's (#252): the row names the session that tripped it.
@@ -1604,7 +1605,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
       if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
       const d = resolveDelegation(repo.coreOn(sp), session.primary, authed.user_email, { ...m, to }, online, humanReachable(sp), (h) => session.addresses.includes(h), open(sp), hub.delegateOpenCap, reach(sp));
       picked = d.to;
-      const w = writeSend(hub, sp, session, prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
+      const w = await writeSend(hub, sp, session, prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
       writeAudit(repo, sp, "delegation.requested", authed.user_email, d.to, {
         requester: session.primary,
@@ -1676,7 +1677,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || (await repo.cursors.directFor(tx, m.recipient)) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  if (!repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
+  if (!(await repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId }))) return fail("bad_request", retractRefusal.replied(id));
   tx.afterCommit(async () => { await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo)); });
   return {};
 }
@@ -1869,7 +1870,7 @@ async function handleAck(tx: Tx, session: ApplicationSession, messageIds: number
   for (const msgId of messageIds) {
     const msg = repo.messages.getById(tx, msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
-    if (at !== null) repo.messages.markDelivered(tx, msgId, at);
+    if (at !== null) await repo.messages.markDelivered(tx, msgId, at);
     await repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
   }
 }

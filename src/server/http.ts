@@ -261,12 +261,12 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, conf
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid identity name");
   if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
-  return repo.write(tx => {
+  return repo.write(async tx => {
     const existing = repo.aliases.find(tx, `${authed.user_email}/${name}`);
     if (existing) return conflict(`identity "${name}" already exists`);
     const capped = aliasCapRefusal(repo, tx, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
     if (capped) return badRequest(capped);
-    const identity = repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
+    const identity = await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
     writeAudit(repo, tx, "alias.created", authed.user_email, identity.address);
     onAliasCreated(repo, tx, authed.user_id, identity.address);
     return json({ name: identity.name, created_at: identity.created_at }, 201);
@@ -276,14 +276,14 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, conf
 function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response | Promise<Response> {
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
-  return repo.write(tx => {
+  return repo.write(async tx => {
     const existing = repo.aliases.find(tx, `${authed.user_email}/${name}`);
     if (!existing) return notFound();
     // Its holds and writers would outlive it: a second session could then bind
     // the name while the first still acts as it.
     const user = aliasUser(repo.coreOn(tx), existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or bind it elsewhere, first"), 409);
-    repo.aliases.remove(tx, existing.address);
+    await repo.aliases.remove(tx, existing.address);
     forgetHandle(repo.coreOn(tx), existing.address);
     writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address);
     return json({ ok: true });
@@ -577,7 +577,7 @@ async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, re
 // binds the name again.
 async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ name?: unknown }>(req); // before the ownership check, as in teamAdd
-  return repo.write(tx => {
+  return repo.write(async tx => {
     const managed = ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
@@ -588,7 +588,7 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
     if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
     const user = aliasUser(repo.coreOn(tx), existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
-    repo.aliases.remove(tx, existing.address);
+    await repo.aliases.remove(tx, existing.address);
     forgetHandle(repo.coreOn(tx), existing.address);
     writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address, { team: managed.team.name, ...managed.audit });
     return json({ ok: true, deleted: existing.address });

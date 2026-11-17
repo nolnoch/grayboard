@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dropCalled, dropSignIn, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
+import { dropCalled, dropSignIn, factReader, HOOK_ERROR, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
 import { SIGN_IN_FLOW_MS } from "./signin.ts";
 import { procStart } from "./proc.ts";
+import { pauseEnv, releasePause } from "../../tests/support/local_bus.ts";
+import { until } from "../../tests/support/until.ts";
 
 let base: string;
 const pid = process.pid;
@@ -241,6 +243,94 @@ describe("facts (#545)", () => {
     expect(facts()).toEqual({ model: "claude-opus-5-5" });
     expect(said).toEqual([]);
   });
+
+  test("a fact-writing hook that fails leaves its reason, which the reader says; the next success removes it (#561)", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    const dir = sessionDir(base, pid);
+    // A directory where the effort goes: the write fails, and the hook still never throws.
+    mkdirSync(join(dir, "effort", "x"), { recursive: true });
+    expect(() => hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "high" } }, true)).not.toThrow();
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    expect(said.map(s => s.split(":")[0])).toEqual(["effort", "hook"]);
+    expect(said[1]).toStartWith("hook: pre-tool-use: ");
+    // Without the temporary's pid: every hook is a new process, and a lasting failure must read the same.
+    expect(said[1]).toContain("effort.tmp");
+    expect(said[1]).not.toMatch(/\.tmp\.\d/);
+    // A hook that wrote no fact neither clears it (a subagent's call, an invalid one, a /clear without a model)...
+    hook("pre-tool-use", { tool_use_id: id(7), agent_id: "sub-1" }, true);
+    hook("pre-tool-use", { tool_use_id: "bad id" }, true);
+    hook("model-switch", { to_model: "" }, true);
+    hook("session-start", { source: "clear" }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(true);
+    // ...nor fails one: a subagent's record that can't be written is the reader's missing-record error.
+    const before = readFileSync(join(dir, HOOK_ERROR), "utf8");
+    mkdirSync(join(dir, id(8), "x"), { recursive: true });
+    hook("pre-tool-use", { tool_use_id: id(8), agent_id: "sub-1" }, true);
+    expect(readFileSync(join(dir, HOOK_ERROR), "utf8")).toBe(before);
+    rmSync(join(dir, "effort"), { recursive: true });
+    hook("pre-tool-use", { tool_use_id: id(2), effort: { level: "high" } }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(false);
+    said.length = 0;
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "high" });
+    expect(said).toEqual([]);
+    // A model switch's failed write is said too, and a startup SessionStart's success clears it.
+    mkdirSync(join(dir, "model.tmp." + process.pid, "x"), { recursive: true });
+    hook("model-switch", { to_model: "claude-haiku-4-5" }, true);
+    expect(readFileSync(join(dir, HOOK_ERROR), "utf8")).toStartWith("model-switch: ");
+    rmSync(join(dir, "model.tmp." + process.pid), { recursive: true });
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(false);
+  });
+
+  test("the reader folds a hook-error's control characters (#561)", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    writeFileSync(join(sessionDir(base, pid), HOOK_ERROR), "pre-tool-use: \x1b[31mred\u009b2J\nnext");
+    facts();
+    expect(said).toEqual(["hook: pre-tool-use:  [31mred 2J next"]);
+  });
+
+  test("the plugin's reader says a problem once, and again only after a read without it (#561)", () => {
+    const out: string[] = [];
+    let problems: [Parameters<Parameters<typeof readFacts>[3]>[0], string][] = [["effort", "bad"], ["hook", "pre-tool-use: full"]];
+    let other = false;
+    const read = factReader(bad => { if (other) return undefined; for (const [what, error] of problems) bad(what, error); return {}; }, text => out.push(text));
+    read(); read();
+    expect(out).toEqual(["the server gets no effort for this session: bad", "a grayboard hook failed, so the server may show a stale model or effort: pre-tool-use: full"]);
+    // Another process's dir reads nothing: no news, so nothing re-arms.
+    problems = []; other = true; read(); other = false;
+    problems = [["effort", "bad"]]; read();
+    expect(out).toHaveLength(2);
+    // Fixed, then broken again: said again; a new hook failure is its own.
+    problems = []; read();
+    problems = [["effort", "bad"], ["hook", "model-switch: full"]]; read();
+    expect(out.slice(2)).toEqual(["the server gets no effort for this session: bad", "a grayboard hook failed, so the server may show a stale model or effort: model-switch: full"]);
+  });
+
+  // #561 item 7: a root call's hook still running when a confirmed /model switch
+  // lands would write the old model's effort after the switch dropped it.
+  for (const [what, effort] of [["a level", { level: "max" }], ["none", undefined]] as const) {
+    test(`a root call's effort (${what}) that a model switch overtook drops itself`, async () => {
+      hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+      hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "low" } }, true);
+      const point = "hook-root-effort";
+      const input = JSON.stringify({ tool_use_id: id(2), ...(effort ? { effort } : {}) });
+      const child = Bun.spawn(["bun", "-e", `import { runHook } from ${JSON.stringify(join(import.meta.dir, "claude_agents.ts"))}; runHook("pre-tool-use", process.argv[1], { base: process.env.GB_BASE, env: process.env, hosted: true });`, input], {
+        env: { ...process.env, ...env, ...pauseEnv(base, point), GB_BASE: base }, stderr: "pipe", stdout: "ignore",
+      });
+      let err = "";
+      void (async () => { for await (const chunk of child.stderr) err += new TextDecoder().decode(chunk); })();
+      await until(() => err.includes(`test pause hit: ${point}`), 10_000, "the root call's hook reaching its effort write");
+      expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "low" });
+      hook("model-switch", { from_model: "claude-opus-5-5", to_model: "claude-haiku-4-5" }, true);
+      releasePause(base, point);
+      expect(await child.exited).toBe(0);
+      // Unknown, not the old model's effort: the next root call names the new model's.
+      expect(facts()).toEqual({ model: "claude-haiku-4-5" });
+      hook("pre-tool-use", { tool_use_id: id(3), effort: { level: "high" } }, true);
+      expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
+      expect(said).toEqual([]);
+    });
+  }
 
   test("a subagent's effort and malformed values write nothing", () => {
     hook("session-start", { model: "claude-opus-5-5" }, true);
