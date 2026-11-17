@@ -260,15 +260,24 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): Promis
   }
   const d: NonNullable<ApplicationSession["boardDrain"]> = { rerun: true, all, acked: new Set(), done: Promise.resolve() };
   session.boardDrain = d;
+  // A run that fails doesn't end the drain: a rerun asked for meanwhile still runs, and the callers waiting see the
+  // last run's failure, if that one failed too.
   d.done = (async () => {
+    let failure: { error: unknown } | undefined;
     try {
       while (d.rerun && session.active) {
         const runAll = d.all;
         d.rerun = false;
         d.all = false;
-        await drainBoardsOnce(session, hub, runAll, d.acked);
+        try { await drainBoardsOnce(session, hub, runAll, d.acked); failure = undefined; }
+        catch (error) {
+          failure = { error };
+          // An `all` run that failed is owed again if another run follows.
+          d.all ||= runAll;
+        }
       }
     } finally { session.boardDrain = null; }
+    if (failure) throw failure.error;
   })();
   return d.done;
 }
@@ -276,9 +285,10 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): Promis
 async function drainBoardsOnce(session: ApplicationSession, hub: Hub, all: boolean, acked: Set<string>): Promise<void> {
   for (const address of [...session.addresses]) {
     const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address));
-    await testPauseAsync("server:boards:after-read");
-    // Unbound or closed while the read awaited: the holds change dropped this address's in-flight items.
-    if (!session.active || !session.addresses.includes(address)) continue;
+    // Closed while the read awaited: nothing more to send. Unbound from this address: the holds change dropped its
+    // in-flight items.
+    if (!session.active) return;
+    if (!session.addresses.includes(address)) continue;
     for (const item of items) {
       const ref = refOf(item);
       if (acked.has(ackKey(ref))) continue;
@@ -1279,7 +1289,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       childState(session, "dm_inbox");
       return handleInbox(hub, r, session, days);
     },
-    // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
+    // Reads retain durable cursors; pendingOf still cleans inaccessible outbox rows.
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
       await valid(session, false, r);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");

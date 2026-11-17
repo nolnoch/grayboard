@@ -75,3 +75,44 @@ async function heldDrain(receiptFirst: boolean) {
 
 test("a receipt then a post committed while a board drain is held after its read: each push once, in id order", () => heldDrain(true));
 test("a post then a receipt committed while a board drain is held after its read: each push once, in id order", () => heldDrain(false));
+
+// A drain run whose read fails doesn't end the drain: a wake that asked it for another run meanwhile still gets one,
+// so the post that woke it, and the one the failed run had read, arrive without waiting for a later wake.
+test("a board drain whose read fails still runs the rerun a post asked for meanwhile", async () => {
+  const alice = await srv.login(A);
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBeLessThan(300);
+  const a = await srv.hosted(A, "be");
+  const s = await srv.connected(alice, "sim");
+  const pushes = () => s.events.filter(board()).map(e => postOf((e as BoardEvent).item).id);
+  await a.call("board_post", { board: "eng", body: "@sim one" });
+  await until(() => pushes().length === 1, 5000, "p1 was pushed");
+
+  const boards = srv.app.repo.boards;
+  const read = boards.pendingPushes;
+  let armed = true, held = false;
+  let release!: () => void;
+  const released = new Promise<void>(r => { release = r; });
+  boards.pendingPushes = async (r, handle) => {
+    if (armed && handle.includes("sim")) {
+      armed = false;
+      held = true;
+      await released;
+      throw new Error("injected read failure");
+    }
+    return read.call(boards, r, handle);
+  };
+  const errors = console.error;
+  console.error = () => {};
+  try {
+    await a.call("board_post", { board: "eng", body: "@sim two" });
+    await until(() => held, 5000, "a board drain held in its read");
+    await a.call("board_post", { board: "eng", body: "@sim three" });
+    release();
+    await until(() => pushes().length >= 3, 5000, "p2 and p3 were pushed after the failed run");
+    expect(new Set(pushes()).size).toBe(3);
+  } finally {
+    boards.pendingPushes = read;
+    console.error = errors;
+    release();
+  }
+});
