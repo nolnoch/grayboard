@@ -379,9 +379,9 @@ test("one reconciliation invalidates listeners once, not once per root", async (
   const invalidations: (string | null)[] = [];
   const unlisten = hosted.listen(changed => { invalidations.push(changed); });
   try {
-    hosted.reconcile();
+    await hosted.reconcile();
     expect(invalidations).toEqual([null]);
-    expect(application.holdsByOwner().size).toBe(4);
+    expect(application.holdsByOwner(database.repo.read).size).toBe(4);
   } finally { unlisten(); }
 });
 
@@ -397,7 +397,7 @@ test("a commit invalidates only the rows it changed; a touch or an empty commit 
     expect(invalidations).toEqual([]);
     await seed(database.repo, tx => tx.savepoint(sp => database.repo.hosted.end(sp, target.id, "closed", now)));
     expect(invalidations).toEqual([target.id]);
-    expect(application.holdsByOwner().size).toBe(3);
+    expect(application.holdsByOwner(database.repo.read).size).toBe(3);
   } finally { unlisten(); }
 });
 
@@ -410,7 +410,7 @@ test("startup opens no holder session for a root its first sweep ends (#424 item
   // The lease lapsed while the server was still up: no credit, and the startup sweep ends the root.
   await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, root.id]));
   now += 5 * 60_000;
-  const opened = spyOn(application, "hostedSession");
+  const opened = spyOn(application, "hostedBuild");
   try {
     hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
     expect(database.repo.hosted.get(database.repo.read, root.id)).toBeUndefined();
@@ -810,7 +810,7 @@ test("pending holds the reader gate while rebind waits; stale receipt cannot mov
     binding = hosted.bind(principal, context("root"), { name: "be", create: true }).then(value => { finished = true; return value; });
     await Promise.resolve(); await Promise.resolve();
     expect(finished).toBe(false);
-    expect([...application.holdsByOwner().values()].flat().map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["fe"]);
+    expect([...application.holdsByOwner(database.repo.read).values()].flat().map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["fe"]);
   });
   await binding;
   expect(issued).toHaveLength(1);
@@ -867,7 +867,7 @@ test("a hosted root holds several names: bind adds, unbind releases one and prom
   expect(await hosted.unbind(principal, context("root"), { name: "fe" })).toMatchObject({ content: [{ text: 'not holding "fe"' }] });
   await hosted.unbind(principal, context("root"), { name: "be" });
   await hosted.unbind(principal, context("root"), { name: "ce" });
-  expect(application.holdsByOwner().size).toBe(0);
+  expect(application.holdsByOwner(database.repo.read).size).toBe(0);
   const unbound = await hosted.whoami(principal, context("root"));
   expect(unbound).toMatchObject({ held: [], ownership: first.ownership });
   await expect(hosted.run(principal, context("root"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
@@ -879,9 +879,9 @@ const at = (name: string) => `you@example.com/${name}`;
 test("ending a hosted root releases every hold in one transaction and audits each release (#451)", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   await hosted.bind(principal, context("root"), { name: "be", create: true });
-  expect(application.holdsByOwner().size).toBe(1);
+  expect(application.holdsByOwner(database.repo.read).size).toBe(1);
   await hosted.end(principal, context("root"));
-  expect(application.holdsByOwner().size).toBe(0);
+  expect(application.holdsByOwner(database.repo.read).size).toBe(0);
   expect(hostedRowCount(database.db)).toBe(0);
   expect(database.db.query("SELECT count(*) AS n FROM alias_holds").get()).toEqual({ n: 0 });
   // Another session can take either name at once.
