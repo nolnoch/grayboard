@@ -359,6 +359,67 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
   });
 }
 
+// #439 item 3: a nested task run. main's subagent (fake-child-0) runs its own
+// task (fake-child-1), blocking on it: omp detaches each task as a background
+// job by default ("Spawned agent"), and async.enabled off makes the task call
+// wait, the nesting this scenario is about. A child registers at its first
+// grayboard call: the grandchild sends and holds open (a bash gate) while
+// fake-child-0 waits unregistered, under main's root with fake-child-0's
+// session as `via`; released, the grandchild's run ends it, then fake-child-0
+// sends, registering under the same root with no intermediates, and ends with
+// its run. Each write is its own child's.
+export function ompHostedNestedScenario(dir: string): Promise<void> {
+  const gate = join(dir, "go");
+  const nested = { tool: "task", args: { context: "nested", tasks: [{ name: "FakeChild1", task: "You are fake-child-1.", solutionSpace: "scripted" }] } };
+  return withHosted(dir, [
+    scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-nest", create: true } }]),
+    ...taskFanout(1, /^nest$/, (i) => i === 0
+      ? [nested, { tool: `${PREFIX}dm_send`, args: { to: PEER, body: "middle" } }]
+      : [{ tool: `${PREFIX}dm_send`, args: { to: PEER, body: "inner" } }, { tool: "bash", args: { command: `while [ ! -f ${gate} ]; do sleep 0.1; done` } }]),
+  ], async ({ srv, start }) => {
+    await seedGrant(srv, stateDirOf(dir), OMP_CLIENT);
+    const omp = start();
+    const { sessionId } = await omp.command({ type: "get_state" }, 30_000);
+    await omp.command({ type: "prompt", message: "bind" });
+    await until(() => leasedAs(srv, sessionId, "omp-nest"), 30_000, "omp-nest holds the lease");
+    await idle(omp);
+    const root = serverId(srv, sessionId)!;
+
+    await omp.command({ type: "prompt", message: "nest" });
+    const registered = () => audits(srv, "hosted.child_registered");
+    const sends = () => audits(srv, "hosted.write").filter((a) => a.detail.tool === "dm_send");
+    const [inner] = await until(() => registered().length === 1 && sends().length === 1 ? registered() : undefined, 60_000, "the grandchild's registration and send");
+    expect(inner!.target).toBe(root);
+    expect(inner!.detail.via).toHaveLength(1);
+    const parentSession = (inner!.detail.via as string[])[0];
+    expect([sessionId, inner!.detail.source_session_id]).not.toContain(parentSession);
+    const grandchild = inner!.detail.child as string;
+    expect(sends()[0]!.target).toBe(grandchild);
+    expect(liveChildren(srv, root)).toEqual([grandchild]);
+
+    // Released, the grandchild's run ends it; fake-child-0 then sends as itself.
+    writeFileSync(gate, "");
+    const [, middle] = await until(() => registered().length === 2 ? registered() : undefined, 30_000, "fake-child-0's registration");
+    expect(middle!.target).toBe(root);
+    expect(middle!.detail).toMatchObject({ source_session_id: parentSession, via: [] });
+    const child = middle!.detail.child as string;
+    expect(child).not.toBe(grandchild);
+    const writes = await until(() => sends().length === 2 ? sends() : undefined, 30_000, "fake-child-0's send");
+    expect(writes.map((w) => w.target)).toEqual([grandchild, child]);
+    for (const w of writes) expect(w.detail).toMatchObject({ root, held: ["alice@example.com/omp-nest"] });
+    expect(srv.app.db.query<{ body: string; sender: string }, []>("SELECT body, sender FROM messages WHERE body IN ('inner', 'middle') ORDER BY id").all())
+      .toEqual([{ body: "inner", sender: "alice@example.com/omp-nest" }, { body: "middle", sender: "alice@example.com/omp-nest" }]);
+
+    await until(() => audits(srv, "hosted.child_released").length === 2, 30_000, "both children released");
+    expect(audits(srv, "hosted.child_released").map((r) => [r.target, r.detail.child])).toEqual([[root, grandchild], [root, child]]);
+    expect(liveChildren(srv, root)).toEqual([]);
+    await idle(omp);
+    expect(grayboardDescendants(omp.pid)).toEqual([]);
+    await omp.quit();
+    await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, sessionId), 10_000, "released on quit");
+  }, { async: { enabled: false } });
+}
+
 // Local mode, as `grayboard setup` leaves omp: the adapter
 // (adapterBundle("omp", "local")) at <agentDir>/extensions/grayboard.ts and the
 // disabled grayboard entry in <agentDir>/mcp.json it reads its command from;
