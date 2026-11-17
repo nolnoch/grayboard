@@ -11,8 +11,9 @@ import { CoreError } from "../core/errors.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
 import { undeliverableId } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import { authorizeNow, type ActScope, type HumanReach } from "./policy.ts";
+import { authorize, authorizeNow, type ActScope, type HumanReach } from "./policy.ts";
 import type { Repo } from "./db.ts";
+import type { Read, Tx } from "./store/tx.ts";
 
 function teamOf(scope: string | null): string | null {
   return scope?.startsWith("team:") ? scope.slice(5) : null;
@@ -125,6 +126,185 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
 
     ownerOf(address) {
       const p = repo.policyNow.principalOf(address);
+      return p?.kind === "user" ? p.name : null;
+    },
+  };
+}
+
+// ── async board access (#807 P3 B5a0) ────────────────────────────────────────
+// serverAccess's decisions with every read on the caller's handle: a write body's `Tx` sees the body's own rows (a
+// member just added, D2), `repo.read` committed state. Core's synchronous `Access` stays for the paths still in core;
+// the server's board ports (B5a1-B5b3) take this instead. The batch forms answer what core asks once per recipient
+// or scope (post's subscribers, who's rows): canSeeMany, visibleTo and the scope tables with one decision per distinct
+// principal or scope, mayReachMany per distinct address; resolveMentions still decides per token.
+
+// An alias scope as a map key: seesAliasScopes' and seesAliasMetaScopes' answers are keyed by it.
+export type AliasScopeOf = Omit<AliasScope, "name">;
+export const scopeKey = (s: AliasScopeOf): string => JSON.stringify([s.scope_kind, s.scope_ref]);
+
+// core's ownScope on the caller's handle: an alias's own scope, or the principal an ID acts for; null for anything
+// else. A bare name means this scope's alias of that name.
+export async function ownScopeOn(repo: Repo, r: Read, address: string): Promise<string | null> {
+  const a = addressParts(address);
+  if (a?.kind === "alias") return a.scope;
+  return a?.kind === "id" ? (await repo.principals.of(r, address))?.name ?? null : null;
+}
+
+export interface BoardAccess {
+  canSee(r: Read, handle: string, board: Board): Promise<boolean>;
+  // Of `handles`, those that may see `board`: one decision per distinct principal.
+  canSeeMany(r: Read, handles: string[], board: Board): Promise<Set<string>>;
+  // Of `boards`, the names a viewer (an address, or a principal already read) may see; none for an address with no
+  // principal.
+  visibleTo(r: Read, viewer: string | Principal, boards: Board[]): Promise<Set<string>>;
+  checkCreate(r: Read, handle: string, scope: string | null): Promise<string | null>;
+  // Takes a Tx: an @id: is judged by repo.sessionEnd.refusal, the send side of an end's race (D3).
+  resolveMention(tx: Tx, token: string, author: string, board: Board, strict: boolean, viewer?: string): Promise<string | null>;
+  // core's resolveMentions over tokens already parsed (mentionTokens): a token resolves when its handle may see the board.
+  resolveMentions(tx: Tx, tokens: string[], author: string, board: Board, strict: boolean, viewer: string): Promise<{ handles: string[]; unresolved: string[] }>;
+  mayReach(r: Read, from: string, to: string): Promise<boolean>;
+  mayReachMany(r: Read, from: string, tos: string[]): Promise<Set<string>>;
+  seesAlias(r: Read, handle: string, scope: AliasScopeOf): Promise<boolean>;
+  // Per scopeKey: one decision per distinct scope, the viewer's principal read once.
+  seesAliasScopes(r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>>;
+  seesAliasMeta(r: Read, handle: string, scope: AliasScopeOf): Promise<boolean>;
+  seesAliasMetaScopes(r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>>;
+  sameUser(r: Read, human: string, address: string): Promise<boolean>;
+  ownerOf(r: Read, address: string): Promise<string | null>;
+}
+
+export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardAccess {
+  const actsIn = async (r: Read, p: Principal, scope: ActScope) => (await authorize(repo, r, {}, { verb: "scope.act", principal: p, scope })).allow;
+  const reaches = async (r: Read, from: string, to: string) => (await authorize(repo, r, { humanReach }, { verb: "human.reach", from, to })).allow;
+  // principalCanSee's rule.
+  const principalSees = async (r: Read, p: Principal, board: Board): Promise<boolean> => {
+    if (board.scope === null) return true;
+    const team = teamOf(board.scope);
+    if (team === null) return false;
+    return p.kind === "team" ? p.name === team : actsIn(r, p, { scope_kind: "team", scope_ref: team });
+  };
+  const canSeeMany = async (r: Read, handles: string[], board: Board): Promise<Set<string>> => {
+    const out = new Set<string>();
+    const byPrincipal = new Map<string, boolean>();
+    for (const h of new Set(handles)) {
+      const p = await repo.principals.of(r, h);
+      if (p === null) continue;
+      const k = `${p.kind}\0${p.name}`;
+      let v = byPrincipal.get(k);
+      if (v === undefined) byPrincipal.set(k, v = await principalSees(r, p, board));
+      if (v) out.add(h);
+    }
+    return out;
+  };
+  const canSee = async (r: Read, handle: string, board: Board) => (await canSeeMany(r, [handle], board)).has(handle);
+  // seesAlias's rule for a principal already read: a person's names are the open directory.
+  const seesAliasOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> => {
+    if (scope.scope_kind === "person") return true;
+    if (p === null || scope.scope_ref === null) return false;
+    return (await authorize(repo, r, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
+  };
+  const seesMetaOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> =>
+    p !== null && scope.scope_ref !== null && actsIn(r, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
+  const byScope = (rule: (r: Read, p: Principal | null, s: AliasScopeOf) => Promise<boolean>) =>
+    async (r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>> => {
+      const out = new Map<string, boolean>();
+      if (!scopes.length) return out;
+      const p = await repo.principals.of(r, viewer);
+      for (const s of scopes) {
+        const k = scopeKey(s);
+        if (!out.has(k)) out.set(k, await rule(r, p, s));
+      }
+      return out;
+    };
+
+  const resolveMention = async (tx: Tx, token: string, author: string, board: Board, strict: boolean, viewer: string = author): Promise<string | null> => {
+    const t = addressParts(token);
+    if (!t || t.kind === "team") return null;
+    if (t.kind === "id") {
+      const why = await repo.sessionEnd.refusal(tx, t.address);
+      if (why && strict) throw why;
+      return why ? null : t.address;
+    }
+    const reach = async (h: string) => (await canSee(tx, h, board)) && reaches(tx, author, h);
+    if (t.kind === "alias") return (await repo.aliases.find(tx, t.address)) && (await reach(t.address)) ? t.address : null;
+    const scope = await ownScopeOn(repo, tx, author);
+    const own = scope ? `${scope}/${t.name}` : null;
+    if (own && (await repo.aliases.find(tx, own))) return own;
+    if (t.name === HUMAN_NAME) return null;
+    if (!strict) return null;
+    // Only names the posting session may see exist (#348).
+    const named = await repo.aliases.findAllByName(tx, t.name);
+    const seen = await byScope(seesAliasOf)(tx, viewer, named);
+    const roster: string[] = [];
+    for (const a of named) if (seen.get(scopeKey(a)) && (await reach(a.address))) roster.push(a.address);
+    if (roster.length) throw new CoreError(`@${t.name} isn't in your scope; name it in full: ${roster.join(", ")}`);
+    return null;
+  };
+
+  return {
+    canSee,
+    canSeeMany,
+
+    async visibleTo(r, viewer, boards) {
+      const p = typeof viewer === "string" ? await repo.principals.of(r, viewer) : viewer;
+      const out = new Set<string>();
+      if (p === null) return out;
+      const byScope = new Map<string | null, boolean>();
+      for (const b of boards) {
+        let v = byScope.get(b.scope);
+        if (v === undefined) byScope.set(b.scope, v = await principalSees(r, p, b));
+        if (v) out.add(b.name);
+      }
+      return out;
+    },
+
+    async checkCreate(r, handle, scope) {
+      if (scope === null) return null;
+      const team = teamOf(scope);
+      if (team === null) return `invalid board scope "${scope}"`;
+      // A team reads as missing to a non-member (#1020): one refusal for both.
+      const missing = `no such team "${team}"`;
+      if (!(await repo.teams.findByName(r, team))) return missing;
+      const p = await repo.principals.of(r, handle);
+      if (p === null) return missing;
+      const inTeam = p.kind === "team" ? p.name === team : await actsIn(r, p, { scope_kind: "team", scope_ref: team });
+      return inTeam ? null : missing;
+    },
+
+    resolveMention,
+
+    async resolveMentions(tx, tokens, author, board, strict, viewer) {
+      const handles = new Set<string>();
+      const unresolved: string[] = [];
+      for (const t of tokens) {
+        const h = await resolveMention(tx, t, author, board, strict, viewer);
+        if (h && (await canSee(tx, h, board))) handles.add(h);
+        else unresolved.push(t);
+      }
+      return { handles: [...handles], unresolved };
+    },
+
+    mayReach: reaches,
+
+    async mayReachMany(r, from, tos) {
+      const out = new Set<string>();
+      for (const to of new Set(tos)) if (await reaches(r, from, to)) out.add(to);
+      return out;
+    },
+
+    seesAlias: async (r, handle, scope) => seesAliasOf(r, scope.scope_kind === "person" ? null : await repo.principals.of(r, handle), scope),
+    seesAliasScopes: byScope(seesAliasOf),
+    seesAliasMeta: async (r, handle, scope) => seesMetaOf(r, await repo.principals.of(r, handle), scope),
+    seesAliasMetaScopes: byScope(seesMetaOf),
+
+    // A human archives only boards its own user's addresses created (#848).
+    async sameUser(r, human, address) {
+      const h = await repo.principals.of(r, human), a = await repo.principals.of(r, address);
+      return h?.kind === "user" && a?.kind === "user" && h.name === a.name;
+    },
+
+    async ownerOf(r, address) {
+      const p = await repo.principals.of(r, address);
       return p?.kind === "user" ? p.name : null;
     },
   };

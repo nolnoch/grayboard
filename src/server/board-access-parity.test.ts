@@ -1,0 +1,152 @@
+// The async board access (#807 P3 B5a0) gives serverAccess's answers: every method and branch, on the store's read
+// handle and inside a write body, against the sync seam core still calls; and its reads go on the handle it's given,
+// so a body sees its own uncommitted rows and not its rollback.
+import { describe, test, expect, beforeEach } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { idAddress } from "../core/bindings.ts";
+import { registerId, type Board, type CoreDb } from "../core/boards.ts";
+import type { Principal } from "../core/resolver.ts";
+import { boardAccess, principalCanSee, scopeKey, serverAccess, type AliasScopeOf } from "./access.ts";
+import { openDatabase, type Repo } from "./db.ts";
+import type { Read, Tx } from "./store/tx.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed } from "../../tests/support/seed.ts";
+
+const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
+const team = (ref: string, name: string) => ({ scope_kind: "team" as const, scope_ref: ref, name });
+const board = (name: string, scope: string | null): Board => ({ name, purpose: "", scope, created_by: "x", created_at: 0 });
+
+const BOARDS = [board("general", null), board("eng", "team:eng"), board("ops", "team:ops"), board("odd", "weird")];
+const WADE_ID = idAddress("a".repeat(64));
+const ENDED_ID = idAddress("b".repeat(64));
+const W = "wade@example.com", B = "bob@example.com", E = "eve@example.com", D = "dan@example.com";
+const HANDLES = [`${W}/be`, `${B}/be`, `${B}/qa`, `${E}/be`, `${D}/be`, "eng/deploy", "ops/deploy", "team:eng", WADE_ID, ENDED_ID, "nobody@example.com/be", "be", ""];
+const SCOPES: AliasScopeOf[] = [
+  { scope_kind: "person", scope_ref: W }, { scope_kind: "person", scope_ref: null }, { scope_kind: "team", scope_ref: "eng" },
+  { scope_kind: "team", scope_ref: "ops" }, { scope_kind: "team", scope_ref: "nope" }, { scope_kind: "team", scope_ref: null },
+  { scope_kind: "service", scope_ref: "svc" },
+];
+const TOKENS = [`${B}/qa`, `${B}/human`, `${D}/human`, "eng/deploy", "be", "qa", "deploy", "human", "team:eng", WADE_ID, ENDED_ID, idAddress("f".repeat(64)), "nope", "!!", "eng/ghost", `${B}/ghost`];
+const AUTHORS = [`${W}/be`, `${B}/be`, `${E}/be`, `${D}/be`, WADE_ID, "eng/deploy", "eng/other"];
+
+let repo: Repo;
+let db: CoreDb;
+
+beforeEach(async () => {
+  ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
+  await seed(repo, async tx => {
+    const [wade, bob, eve] = [await repo.users.upsertByEmail(tx, W, null), await repo.users.upsertByEmail(tx, B, null), await repo.users.upsertByEmail(tx, E, null)];
+    await repo.users.upsertByEmail(tx, D, null);
+    const eng = await repo.teams.create(tx, "eng", wade.id);
+    await repo.teams.addMember(tx, eng.id, wade.id, "owner");
+    await repo.teams.addMember(tx, eng.id, bob.id);
+    await repo.teams.setPolicy(tx, eng.id, "collaborative");
+    const ops = await repo.teams.create(tx, "ops", eve.id);
+    await repo.teams.addMember(tx, ops.id, eve.id, "owner");
+    await repo.teams.addMember(tx, ops.id, wade.id);
+    await repo.teams.setPolicy(tx, ops.id, "delegating");
+    for (const [email, name] of [[W, "be"], [B, "be"], [B, "qa"], [B, "human"], [E, "be"], [D, "be"], [D, "human"]] as const) await repo.aliases.create(tx, person(email, name), email);
+    await repo.aliases.create(tx, team("eng", "deploy"), W);
+    await repo.aliases.create(tx, team("ops", "deploy"), E);
+    registerId(repo.coreOn(tx), { id: WADE_ID, principal: W, launcher: false });
+    registerId(repo.coreOn(tx), { id: ENDED_ID, principal: B, launcher: false });
+  });
+  await seed(repo, tx => repo.sessionEnd.end(tx, ENDED_ID, { why: "test", now: 5 }));
+});
+
+// A call's outcome, a throw as its message, so a refusal compares by text.
+const outcome = <T>(f: () => T): { value: T } | { error: string } => {
+  try { return { value: f() }; } catch (e) { return { error: (e as Error).message }; }
+};
+const outcomeAsync = async <T>(f: () => Promise<T>): Promise<{ value: T } | { error: string }> => {
+  try { return { value: await f() }; } catch (e) { return { error: (e as Error).message }; }
+};
+const sorted = (s: Set<string>) => [...s].sort();
+
+// Every row: [label, the sync answer, the async answer on handle r]. Run on the read handle and inside a body.
+async function rows(r: Read, tx: Tx | null, humanReach: "team" | "all"): Promise<[string, unknown, unknown][]> {
+  const sync = serverAccess(repo, db, humanReach), async = boardAccess(repo, humanReach);
+  const out: [string, unknown, unknown][] = [];
+  for (const b of BOARDS) {
+    const each = HANDLES.filter(h => sync.canSee(h, b));
+    for (const h of HANDLES) out.push([`canSee ${h} ${b.name}`, sync.canSee(h, b), await async.canSee(r, h, b)]);
+    out.push([`canSeeMany ${b.name}`, each.sort(), sorted(await async.canSeeMany(r, HANDLES, b))]);
+  }
+  // A principal viewer (the read-only seer) against principalCanSee; a service principal sees only unscoped boards.
+  const principals: Principal[] = [{ kind: "user", name: W }, { kind: "user", name: D }, { kind: "team", name: "ops" }, { kind: "service", name: "svc" }];
+  for (const v of [...HANDLES, ...principals]) {
+    const want = BOARDS.filter(b => typeof v === "string" ? sync.canSee(v, b) : principalCanSee(repo, v, b)).map(b => b.name).sort();
+    out.push([`visibleTo ${typeof v === "string" ? v : `${v.kind}:${v.name}`}`, want, sorted(await async.visibleTo(r, v, BOARDS))]);
+  }
+  for (const h of HANDLES) {
+    for (const scope of [null, "team:eng", "team:ops", "team:nope", "weird"]) out.push([`checkCreate ${h} ${scope}`, sync.checkCreate(h, scope), await async.checkCreate(r, h, scope)]);
+    for (const s of SCOPES) {
+      out.push([`seesAlias ${h} ${scopeKey(s)}`, sync.seesAlias!(h, s), await async.seesAlias(r, h, s)]);
+      out.push([`seesAliasMeta ${h} ${scopeKey(s)}`, sync.seesAliasMeta(h, s), await async.seesAliasMeta(r, h, s)]);
+    }
+    out.push([`seesAliasScopes ${h}`, Object.fromEntries(SCOPES.map(s => [scopeKey(s), sync.seesAlias!(h, s)])), Object.fromEntries(await async.seesAliasScopes(r, h, SCOPES))]);
+    out.push([`seesAliasMetaScopes ${h}`, Object.fromEntries(SCOPES.map(s => [scopeKey(s), sync.seesAliasMeta(h, s)])), Object.fromEntries(await async.seesAliasMetaScopes(r, h, SCOPES))]);
+    out.push([`ownerOf ${h}`, sync.ownerOf!(h), await async.ownerOf(r, h)]);
+    for (const a of HANDLES) out.push([`sameUser ${h} ${a}`, sync.sameUser!(h, a), await async.sameUser(r, h, a)]);
+  }
+  for (const from of AUTHORS) {
+    const tos = [...HANDLES, `${B}/human`, `${D}/human`];
+    for (const to of tos) out.push([`mayReach ${from} ${to}`, sync.mayReach!(from, to), await async.mayReach(r, from, to)]);
+    out.push([`mayReachMany ${from}`, tos.filter(t => sync.mayReach!(from, t)).sort(), sorted(await async.mayReachMany(r, from, tos))]);
+  }
+  if (tx === null) return out;
+  // resolveMention judges an @id: on a Tx: inside the body only.
+  for (const author of AUTHORS) for (const b of BOARDS.slice(0, 3)) for (const strict of [true, false]) for (const viewer of [author, WADE_ID]) {
+    for (const t of TOKENS) {
+      out.push([`resolveMention ${t} ${author} ${b.name} ${strict} ${viewer}`, outcome(() => sync.resolveMention(t, author, b, strict, viewer)), await outcomeAsync(() => async.resolveMention(tx, t, author, b, strict, viewer))]);
+    }
+    // core's resolveMentions loop over the sync seam.
+    const want = outcome(() => {
+      const handles = new Set<string>(), unresolved: string[] = [];
+      for (const t of TOKENS) { const h = sync.resolveMention(t, author, b, strict, viewer); if (h && sync.canSee(h, b)) handles.add(h); else unresolved.push(t); }
+      return { handles: [...handles], unresolved };
+    });
+    out.push([`resolveMentions ${author} ${b.name} ${strict} ${viewer}`, want, await outcomeAsync(() => async.resolveMentions(tx, TOKENS, author, b, strict, viewer))]);
+  }
+  return out;
+}
+
+const diverging = (rs: [string, unknown, unknown][]) => rs.filter(([, s, a]) => JSON.stringify(s) !== JSON.stringify(a)).map(([l, s, a]) => ({ l, s, a }));
+
+describe("boardAccess agrees with serverAccess", () => {
+  for (const humanReach of ["team", "all"] as const) {
+    test(`on the read handle and inside a body (humanReach ${humanReach})`, async () => {
+      const outside = await rows(repo.read, null, humanReach);
+      expect(outside.length).toBeGreaterThan(500);
+      expect(diverging(outside)).toEqual([]);
+      const inside = await repo.write(tx => rows(tx, tx, humanReach));
+      expect(diverging(inside)).toEqual([]);
+      // The fixture reaches every answer: some rows allow and some refuse, and resolveMention resolves and refuses.
+      const values = new Set(inside.map(([, s]) => JSON.stringify(s)));
+      for (const v of ["true", "false", "null"]) expect(values.has(v)).toBe(true);
+      expect(inside.some(([l, s]) => l.startsWith("resolveMention ") && JSON.stringify(s).includes("isn't in your scope"))).toBe(true);
+      expect(inside.some(([l, s]) => l.startsWith("resolveMention ") && JSON.stringify(s).includes("id_ended"))).toBe(true);
+    }, 60_000);
+  }
+});
+
+test("its reads go on the handle it's given: a body sees its own membership, not its rollback", async () => {
+  const a = boardAccess(repo), sync = serverAccess(repo, db);
+  const eng = BOARDS[1]!, dan = `${D}/be`;
+  const rolled = repo.write(async tx => {
+    await repo.teams.addMember(tx, (await repo.teams.findByName(tx, "eng"))!.id, (await repo.users.findByEmail(tx, D))!.id);
+    expect([sync.canSee(dan, eng), await a.canSee(tx, dan, eng), sorted(await a.canSeeMany(tx, [dan], eng)), sorted(await a.visibleTo(tx, dan, BOARDS))]).toEqual([true, true, [dan], ["eng", "general"]]);
+    expect(await a.checkCreate(tx, dan, "team:eng")).toBeNull();
+    expect((await a.seesAliasScopes(tx, dan, [{ scope_kind: "team", scope_ref: "eng" }])).get(scopeKey({ scope_kind: "team", scope_ref: "eng" }))).toBe(true);
+    expect(await a.resolveMention(tx, "eng/deploy", dan, eng, true)).toBe("eng/deploy");
+    throw new Error("roll back");
+  });
+  await expect(rolled).rejects.toThrow("roll back");
+  expect([sync.canSee(dan, eng), await a.canSee(repo.read, dan, eng), await a.checkCreate(repo.read, dan, "team:eng")]).toEqual([false, false, `no such team "eng"`]);
+  // A kept Tx is refused by any method that reads on it.
+  const kept = await repo.write(async tx => tx);
+  await expect(a.canSeeMany(kept, [dan], eng)).rejects.toThrow(/used after its transaction settled/);
+  await expect(a.resolveMention(kept, WADE_ID, dan, eng, true)).rejects.toThrow(/used after its transaction settled/);
+});

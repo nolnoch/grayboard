@@ -40,7 +40,7 @@ import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
-import { principalCanSee } from "./access.ts";
+import { ownScopeOn, principalCanSee } from "./access.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -1457,9 +1457,7 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
   const p = addressParts(input);
   if (!p) fail("bad_request", `invalid address "${input}": expected "id:…", "scope/name" or "team:name"`);
   if (p.kind !== "bare") return p;
-  // core's ownScope, on the caller's handle: an alias's own scope, or the principal an ID acts for.
-  const fa = addressParts(from);
-  const scope = fa?.kind === "alias" ? fa.scope : fa?.kind === "id" ? (await repo.principals.of(r, from))?.name ?? null : null;
+  const scope = await ownScopeOn(repo, r, from);
   const own = scope ? addressParts(`${scope}/${p.name}`) : null;
   if (own?.kind === "alias" && (await repo.aliases.find(r, own.address))) return own;
   if (p.name === HUMAN_NAME) {
