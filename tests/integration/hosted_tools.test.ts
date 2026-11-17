@@ -22,6 +22,7 @@ import { HostedToolError, type HostedSession } from "../support/hosted_session.t
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { seed } from "../support/seed.ts";
+import { queueFor } from "../../src/server/store/queue.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -648,6 +649,37 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   expect(over.status).toBe(413);
   expect(over.body.message).toMatch(/unsent uploads would exceed 50MB/);
   expect((await upload(c, "theirs.txt", "x")).status).toBe(201);
+});
+
+// #974: the sweep after a retract deletes the freed blob's catalog row through the write queue (#807 D4): while
+// another body holds the queue the row stays, and it goes once that body ends.
+test("#974: a retract's blob sweep waits behind another body holding the write queue", async () => {
+  await login(A);
+  const bob = await login(B);
+  await api(bob, "POST", "/api/identities", { name: "fe" });
+  const a = await srv.hosted(A, "be");
+  const note = await upload(a, "note.txt", "retract me");
+  const sha = String(note.body.sha256);
+  const queued = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "oops", attachment_ids: [note.body.id] });
+  expect(queued.delivered_now).toBe(false);
+  const blobs = srv.app.repo.blobs, del = blobs.delete;
+  let release: (() => void) | undefined;
+  let held: Promise<void> | undefined;
+  // Held once the sweep has deleted the bytes, so its catalog delete is the next write to queue.
+  blobs.delete = async (s: string) => {
+    await del.call(blobs, s);
+    if (s === sha && !held) held = queueFor(srv.app.db).run(() => new Promise<void>((r) => { release = r; }));
+  };
+  const catalogued = () => Boolean(srv.app.db.prepare(`SELECT 1 FROM attachment_blobs WHERE sha256 = ?`).get(sha));
+  try {
+    await a.call("dm_retract", { message_id: queued.message_id });
+    await until(() => held !== undefined, 5000, "the sweep deleted the retracted DM's bytes");
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+    expect(catalogued()).toBe(true);
+    release!();
+    await held;
+    await until(() => !catalogued(), 5000, "the sweep's catalog delete ran after the hold");
+  } finally { blobs.delete = del; release?.(); }
 });
 
 test("a server's own attachment limits: sent at initialize, enforced per file, per message and on unsent uploads", async () => {
