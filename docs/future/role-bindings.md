@@ -3,7 +3,7 @@
 ```doc-meta
 owns: the design of runtime role bindings on the server (#927): the `role_bindings` table, the roles `org_admin`, `team_owner` and `service_invoke`, the policy rules that read it, the admin role routes and CLI
 invariants: authority is "a row exists", read on every decision, never cached (principle 11); `GRAYBOARD_ADMINS` emails are `org_admin` with no row and are never written to the table; principal and scope are `principals.id` foreign keys, never an email or a name; every binding deletion (revoke, member removal) goes through the store's revoke and writes a `role.revoked` row carrying the whole binding; a grant or revoke re-checks the granter's authority in its own write; a team owner is a member of that team; a rule name is a closed set and the binding id travels beside it; `org_admin` adds no messaging or directory power
-code-pointers: src/server/policy.ts (authorize, recordDecision, isAdmin, canAdmin), src/server/http.ts (the /api/admin gate, ownedTeam, managedTeam, teamAdd), src/server/db.ts (principals, team_members, OWNER_SQL, guardLastOwner, seedSchema), src/server/audit.ts, src/server/config.ts (admins), src/cli/cli.ts (adminCmd, teamCmd), tests/integration/authz_decision.test.ts
+code-pointers: src/server/policy.ts (decide, authorizeNow, decidePure, recordDecision, isAdmin, canAdmin), src/server/http.ts (the /api/admin gate, ownedTeam, managedTeam, teamAdd), src/server/db.ts (principals, team_members, OWNER_SQL, guardLastOwner, seedSchema), src/server/audit.ts, src/server/config.ts (admins), src/cli/cli.ts (adminCmd, teamCmd), tests/integration/authz_decision.test.ts
 companions: postgres-server.md (the storage interface this is written against: D2, D3, D5, D7), ../server-access.md (the authorization seam and teams, which take the as-built facts), ../vision.md (principles 4, 8, 9, 11, 12, 13), ../parity.md (the row the build adds)
 trigger: Postgres P1c merged (`Repo` methods async, #807 Stage 3); #270's `service.invoke` builds on this
 last-verified: 2026-11-15
@@ -17,7 +17,7 @@ Facts in the code that shape it:
 
 - **Team ownership already exists.** `team_members.role` (`owner`/`member`, security audit F-02) decides `team.manage` under rule `team.owner`; owners appoint owners with `team add --role owner`; `guardLastOwner` protects the last one; a null role reads as owner for the team's creator (`OWNER_SQL`). #927's `team_owner` names the same thing.
 - **Callers compare rule strings.** `managedTeam` and `ownedTeam` (`src/server/http.ts`) set `as_admin` from `d.rule === "admin.env"`.
-- **The `admin` verb carries only an email**, and `canAdmin` calls `authorize` with no `Repo`.
+- **The `admin` verb carries only an email**, and `canAdmin` calls `decidePure` with no `Repo`.
 - **Every role decision is on a CLI HTTP route.** Admin and team verbs are decided only in `src/server/http.ts`; no hosted MCP tool call reads a role today.
 - **`principals` already spans the kinds.** Every user and team has a row (inserted with it, and seeded on open); `kind = 'service'` is reserved for #270, whose service principals are also `users` rows (#284 decision 5). Foreign keys are enforced (`PRAGMA foreign_keys = ON`).
 - **`access_log` is pruned** at the audit retention window; `authz.decision` rows go with it.

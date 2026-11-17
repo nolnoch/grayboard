@@ -22,15 +22,17 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
   expect(offenders).toEqual([]);
 });
 
-// The synchronous loader is SQLite-only (#807 P3 A7e1): every `authorizeNow(` and `.policyNow` outside tests is a
-// caller #807 A7f/B must convert to the async `authorize`, so their count only falls. A file's count may drop (lower
-// its row here); a new use fails until it's argued for.
-const SYNC_TWIN = /authorizeNow\(|\.policyNow\b/g;
+// The synchronous loader is SQLite-only (#807 P3 A7e1): every `authorizeNow`, `policyNow` and hand-driven `decide(`
+// outside tests is a caller #807 A7f/B must convert to the async `authorize`, so their count only falls. The table is
+// exact: a new use fails until it's argued for, and a removed one fails until its row is lowered, so a freed slot
+// can't be reused.
+const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
-  "src/server/access.ts": 15,
-  "src/server/application.ts": 12,
-  "src/server/http.ts": 6,
-  "src/server/policy.ts": 5,
+  "src/server/access.ts": 16,
+  "src/server/application.ts": 13,
+  "src/server/db.ts": 2,
+  "src/server/http.ts": 7,
+  "src/server/policy.ts": 8,
 };
 
 test("the synchronous policy loader gains no callers", () => {
@@ -41,8 +43,7 @@ test("the synchronous policy loader gains no callers", () => {
     const n = code.match(SYNC_TWIN)?.length ?? 0;
     if (n) counts[file] = n;
   }
-  const over = Object.entries(counts).filter(([f, n]) => n > (SYNC_TWIN_CEILING[f] ?? 0)).map(([f, n]) => `${f}: ${n} > ${SYNC_TWIN_CEILING[f] ?? 0}`);
-  expect(over).toEqual([]);
+  expect(counts).toEqual(SYNC_TWIN_CEILING);
 });
 
 test("decidePure refuses a verb whose rule reads storage", () => {
