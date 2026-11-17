@@ -8,7 +8,7 @@ import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed,
 import { DEFAULT_HOSTED_CAPS } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
-import { testPause } from "../shared/testpause.ts";
+import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
 import {
@@ -267,7 +267,9 @@ async function drainDirect(hub: Hub, session: ApplicationSession, addresses: str
   d.runs++;
   const run = d.chain.then(async () => {
     const streams = await Promise.all(addresses.map(async (a) => ({ type: "direct" as const, ref: a, since: await hub.repo.cursors.get(hub.repo.read, a, "direct", a) })));
-    for (const message of hub.repo.messages.unreadSince(hub.repo.read, streams)) {
+    const unread = hub.repo.messages.unreadSince(hub.repo.read, streams);
+    await testPauseAsync("server:drain:after-read");
+    for (const message of unread) {
       if (!session.active) return;
       d.sent.add(message.id);
       session.sink.deliver({ kind: "direct", message: showMessage(message) });
@@ -279,7 +281,12 @@ async function drainDirect(hub: Hub, session: ApplicationSession, addresses: str
   } finally {
     if (--d.runs === 0) {
       session.draining = null;
-      for (const m of d.held.sort((a, b) => a.id - b.id)) if (!d.sent.has(m.id)) deliverDirect(session, m);
+      // Each on its own, as drainBoards delivers: one that throws leaves the rest delivered (it stays unacked).
+      for (const m of d.held.sort((a, b) => a.id - b.id)) {
+        if (d.sent.has(m.id)) continue;
+        try { deliverDirect(session, m); }
+        catch (error) { console.error("held direct delivery failed", error); }
+      }
     }
   }
 }
@@ -1059,6 +1066,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
       try {
         await drainDirect(hub, session, addresses ?? session.addresses);
+        // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
+        if (!session.active) return;
         valid(session, true);
         drainBoards(session, hub, true);
       } catch (error) { console.error("postcommit effect failed", error); }

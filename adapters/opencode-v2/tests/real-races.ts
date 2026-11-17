@@ -142,6 +142,6 @@ export async function realRace(f: {
       for (const r of audits(app.db, "hosted.stale_capability")) assert.deepEqual(r, { id: r.id, actor: "you@example.com", target: session, detail: { client_id: OPENCODE_CLIENT } });
       assert(audits(app.db, "hosted.stale_capability")[0]!.id > rebound.id, "Refused only after the rebind closed the lease");
     }
-    console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
+    console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
   } finally { g.holding = false; release(); f.expiryContinuation.release(); }
 }
