@@ -20,7 +20,7 @@ import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { listClaims } from "../core/claims.ts";
-import { addressSet, aliasHeldText, aliasUser, idRow } from "../core/bindings.ts";
+import { aliasHeldText } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
@@ -192,7 +192,7 @@ async function ownAddress(r: Read, input: string | null | undefined, authed: Aut
   if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
   // Security audit F-01 (#851): every policy refusal below is an `authz.decision` row.
   if (p.kind === "id") {
-    const row = idRow(repo.coreOn(r), p.address);
+    const row = await repo.bindings.idRow(r, p.address);
     const req: PureRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
     const d = decidePure({}, req);
     if (!d.allow) {
@@ -218,7 +218,7 @@ async function ownAddress(r: Read, input: string | null | undefined, authed: Aut
   }
   // An alias in use by another user's session is exclusive (#284 S8, decided);
   // the caller's own sessions' uses aren't refused (a tools-only sidecar, #182).
-  const other = aliasUser(repo.coreOn(r), address, authed.user_email);
+  const other = await repo.bindings.userOf(r, address, authed.user_email);
   if (other) return jsonErr("alias_held", aliasHeldText(address, `another user's session ${other}`, "act as another name"), 409);
   return address;
 }
@@ -235,11 +235,11 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, wake: (ha
     const handle = await ownAddress(tx, body.as, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
     if (handle instanceof Response) return handle;
     if (args.as !== undefined) return badRequest("name the address to act as in as, not args.as");
+    // As the session the address is or is held by: its claims under any of
+    // its addresses are its own here (#360). Read before the synchronous tool (#807 P3 B1a).
+    const addresses = await repo.bindings.addressSet(tx, handle, authed.user_email);
     try {
-      // As the session the address is or is held by: its claims under any of
-      // its addresses are its own here (#360).
-      const core = repo.coreOn(tx);
-      return callBoardTool(core, handle, tool, args, { addresses: addressSet(core, handle, authed.user_email), user: authed.user_email });
+      return callBoardTool(repo.coreOn(tx), handle, tool, args, { addresses, user: authed.user_email });
     } catch (e) {
       if (e instanceof CoreError) return badRequest(e.message);
       throw e;
@@ -286,7 +286,7 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response 
     if (!existing) return notFound();
     // Its holds and writers would outlive it: a second session could then bind
     // the name while the first still acts as it.
-    const user = aliasUser(repo.coreOn(tx), existing.address);
+    const user = await repo.bindings.userOf(tx, existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or bind it elsewhere, first"), 409);
     await repo.aliases.remove(tx, existing.address);
     forgetHandle(repo.coreOn(tx), existing.address);
@@ -591,7 +591,7 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
     if (!isValidIdentityName(name)) return badRequest("invalid name");
     const existing = await repo.aliases.find(tx, `${managed.team.name}/${name}`);
     if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
-    const user = aliasUser(repo.coreOn(tx), existing.address);
+    const user = await repo.bindings.userOf(tx, existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
     await repo.aliases.remove(tx, existing.address);
     forgetHandle(repo.coreOn(tx), existing.address);

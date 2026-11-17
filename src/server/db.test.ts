@@ -7,6 +7,8 @@ import { Glob } from "bun";
 import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { holdAlias } from "../core/bindings.ts";
+import { registerId } from "../core/boards.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { hashToken } from "./auth.ts";
@@ -1026,4 +1028,54 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
   expect((await m.sentPending(r, [peer], 0)).map(x => x.id)).toEqual([root.id]);
   expect(m.openDelegations(r, id, 0)).toBe(0);
   expect((await repo.aliases.seen(r, [peer, "b@example.com/none"]))).toEqual(new Map([[peer, { last_seen: 1000, cwd: null, place: null }]]));
+});
+
+test("#807 P3 B1a: the bindings reads run on the handle they're given; the batched ones keep HOLD_ORDER and leave misses out", async () => {
+  const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const [s1, s2, idle] = ["id:0000000000001", "id:0000000000002", "id:0000000000003"];
+  const [fe, be, ops] = ["b@example.com/fe", "b@example.com/be", "b@example.com/ops"];
+  const b = repo.bindings;
+  const kept = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "b@example.com", null);
+    for (const n of ["fe", "be", "ops"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
+    const core = repo.coreOn(tx);
+    for (const id of [s1, s2, idle]) registerId(core, { id, principal: "b@example.com", launcher: false });
+    // s1's be is bound after its fe, and in the same millisecond: HOLD_ORDER keeps fe first.
+    holdAlias(core, fe, s1, 500);
+    holdAlias(core, be, s1, 500);
+    holdAlias(core, ops, s2, 100);
+    db.run("UPDATE ids SET status = 'busy', status_at = 7, last_seen = 900 WHERE id = ?", [s2]);
+    db.run("UPDATE aliases SET last_seen = 1000 WHERE address = ?", [fe]);
+    // Inside the body that wrote them, on its Tx.
+    expect(await b.holdsOf(tx, s1)).toEqual([fe, be]);
+    expect(await b.holderOf(tx, ops)).toBe(s2);
+    return tx;
+  });
+  const settled = /used after its transaction settled/;
+  await expect(b.holdsOf(kept, s1)).rejects.toThrow(settled);
+  await expect(b.holdsOfMany(kept, [s1])).rejects.toThrow(settled);
+  await expect(b.holderOf(kept, fe)).rejects.toThrow(settled);
+  await expect(b.holdersOf(kept, [fe])).rejects.toThrow(settled);
+  await expect(b.userOf(kept, fe)).rejects.toThrow(settled);
+  await expect(b.addressSet(kept, fe, "b@example.com")).rejects.toThrow(settled);
+  await expect(b.idRow(kept, s1)).rejects.toThrow(settled);
+  await expect(b.unendedIds(kept)).rejects.toThrow(settled);
+  await expect(b.idStatuses(kept, [s2])).rejects.toThrow(settled);
+  await expect(b.aliasUses(kept, null)).rejects.toThrow(settled);
+  await expect(b.lastSeen(kept, [fe])).rejects.toThrow(settled);
+  await expect(b.holdsOf({} as Tx, s1)).rejects.toThrow("not a SQLite store handle");
+  const r = repo.read;
+  expect(await b.holdsOfMany(r, [s1, s2, idle])).toEqual(new Map([[s1, [fe, be]], [s2, [ops]], [idle, []]]));
+  expect(await b.holdersOf(r, [fe, ops, "b@example.com/none"])).toEqual(new Map([[fe, s1], [ops, s2]]));
+  expect(await b.userOf(r, fe)).toBe(s1);
+  expect(await b.userOf(r, fe, "b@example.com")).toBeNull();
+  expect(await b.addressSet(r, be, "b@example.com")).toEqual([be, fe, s1]);
+  expect(await b.addressSet(r, be, "c@example.com")).toEqual([be]);
+  expect((await b.idRow(r, s1))?.principal).toBe("b@example.com");
+  expect(await b.idRow(r, "id:000000000000Z")).toBeUndefined();
+  expect((await b.unendedIds(r)).sort()).toEqual([s1, s2, idle]);
+  expect(await b.idStatuses(r, [s1, s2])).toEqual(new Map([[s2, { status: "busy", status_at: 7 }]]));
+  expect((await b.aliasUses(r, "b@example.com")).map(u => u.address).sort()).toEqual([be, fe, ops]);
+  // An alias's and a session's last-seen, a repeat once, a never-seen alias absent (an ids row always has one).
+  expect(await b.lastSeen(r, [fe, s2, fe, be])).toEqual(new Map([[fe, 1000], [s2, 900]]));
 });

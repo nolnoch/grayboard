@@ -911,7 +911,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // A hosted contender idle past the window, or whose lease lapsed, ends and frees the alias; a live one
         // refuses the bind (application.bindNow sees its hold).
         const address = await application.bindAddress(tx, p.authed, normalized.name);
-        const holder = address ? application.aliasHolderId(tx, address) : null;
+        const holder = address ? await application.aliasHolderId(tx, address) : null;
         const other = holder && holder !== row.session_id ? await store.get(tx, holder) : undefined;
         if (other && !other.root_session_id && ((other.lease_deadline !== null && other.lease_deadline <= now()) || (other.lease_deadline === null && idleAt(other)))) {
           await store.end(tx, other.session_id, other.lease_deadline === null ? "idle" : "expired", now());

@@ -5,7 +5,6 @@ import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
 import { participant, queuedGuardTx, queuedTx, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
-import { addressSet } from "../core/bindings.ts";
 import { decidePure, recordDecision, type Actor, type PureRequest } from "./policy.ts";
 
 // The read request for attachment `idText`, judged by policy.ts decidePure(): `handle` may read it on a post on a board it can see,
@@ -20,7 +19,7 @@ async function readRequest(repo: Repo, r: Read, handle: string, idText: string, 
   const db = repo.coreOn(r);
   const id = Number(idText);
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
-  const addresses = addressSet(db, handle, principal);
+  const addresses = await repo.bindings.addressSet(r, handle, principal);
   const carrier = row?.message_id != null ? await repo.messages.getById(r, row.message_id) : undefined;
   const dmVisible = (messageId: number) => {
     if (messageId !== row?.message_id) throw new Error(`readRequest: message ${messageId} is not the attachment's carrier`);

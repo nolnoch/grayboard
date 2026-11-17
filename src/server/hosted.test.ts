@@ -304,6 +304,35 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
   } finally { spy.mockRestore(); }
 });
 
+// #807 P3 B1a: the holds, session-row and presence reads go through `repo.bindings` on the caller's handle: a body's
+// `Tx` inside one (bind's checks, the send's last-seen, peer_list's unbound roots, the inbox), the pool outside (an
+// unbound session's candidates, read by whoami).
+test("#807 P3 B1a: binding reads inside hosted bodies run on that body's Tx, outside on the pool", async () => {
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const store = database.repo.bindings;
+  const spies = (Object.keys(store) as (keyof typeof store)[]).map(name => {
+    const original = (store[name] as (...a: unknown[]) => unknown).bind(store);
+    return spyOn(store, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push({ op: name, inTxn: database.db.inTransaction, handle: r === database.repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  const a = context("b1a-a"), b = context("b1a-b"), idle = context("b1a-idle");
+  try {
+    await hosted.bind(principal, a, { name: "b1a", create: true });
+    await hosted.bind(principal, b, { name: "b1b", create: true });
+    await hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, "b1b", "question", { pending: true }));
+    await hosted.run(principal, b, "dm_inbox", (session, tx) => application.inbox(tx, session));
+    await hosted.run(principal, idle, "peer_list", (session, tx) => application.call(tx, session, "peer_list", {}));
+    const inBody = new Set(checks.filter(c => c.inTxn).map(c => c.op));
+    for (const op of ["holderOf", "userOf", "idRow", "lastSeen", "holdsOfMany", "idStatuses"]) expect(inBody).toContain(op);
+    const outside = checks.length;
+    await hosted.whoami(principal, idle);
+    expect(checks.slice(outside).filter(c => c.op === "holdersOf").map(c => `${c.handle}:${c.inTxn}`)).toEqual(["pool:false"]);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { for (const s of spies) s.mockRestore(); }
+});
+
 // #807 P1c-15b-2: the rest of application.ts leaves `db`. A refusal's deferred row is written on the `Tx` of the body
 // that flushes it; bind's place, unbind, a request's facts and a receipt's board check run on their body's `Tx`.
 test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on a body's Tx", async () => {
@@ -834,8 +863,8 @@ test("bind publishes its new hold before the after-commit pause and the first ho
   await sender.connect();
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     await sender.send("you@example.com/fe", "not for be");
-    expect(application.aliasHolderId(application.repo.read, "you@example.com/fe")).not.toBeNull();
-    expect(application.aliasHolderId(application.repo.read, "you@example.com/be")).toBe(application.aliasHolderId(application.repo.read, "you@example.com/fe"));
+    expect(await application.aliasHolderId(application.repo.read, "you@example.com/fe")).not.toBeNull();
+    expect(await application.aliasHolderId(application.repo.read, "you@example.com/be")).toBe(await application.aliasHolderId(application.repo.read, "you@example.com/fe"));
   });
   const lease = await delivery.open(principal, context("root"));
   expect(await delivery.pending(principal, context("root"), lease.capability)).toHaveLength(1);
