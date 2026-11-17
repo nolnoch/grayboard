@@ -331,7 +331,15 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.watch(r.e);
     this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
     try { await this.rotated({ ms: 0 }, () => this.prepare(r, true)); }
-    catch (error) { if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error))); }
+    catch (caught) {
+      const error = this.expired(caught);
+      // A host that restarted during a server outage (an upgrade) resumes its root here: retry it on the
+      // outage backoff, as a saved root's restore does, rather than leave it dark until the next start (#895).
+      if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+        this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+        this.retryRestore(r);
+      } else if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+    }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
   }); }
@@ -713,9 +721,10 @@ export class Controller<E extends Enrollment = Enrollment> {
   private restorable(r: Root<E>, epoch: number) {
     return !this.stopped && !this.drifted && !this.ending.has(r.e.sessionID) && !r.paused && !r.task && r.epoch === epoch && this.roots.get(r.e.sessionID) === r;
   }
-  // A saved root whose restore found the server unreachable (a host restarted
-  // during a server upgrade) retries its prepare on the run loop's outage
-  // backoff, without limit, instead of pausing until the next reload (#424 6).
+  // A saved root whose restore, or a root whose resume, found the server
+  // unreachable (a host restarted during a server upgrade) retries its prepare
+  // on the run loop's outage backoff, without limit, instead of pausing until
+  // the next reload or start (#424 6, #895).
   // Each attempt runs in the control queue, as resume's does; anything that
   // takes the root meanwhile ends the retry, and close ends its wait.
   private retryRestore(r: Root<E>) {

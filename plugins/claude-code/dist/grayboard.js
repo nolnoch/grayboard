@@ -36836,9 +36836,13 @@ class Controller {
       this.set(r, "approved", held?.length ? `Resuming ${this.names(r.e)}` : "Root approved; bind a name to receive deliveries");
       try {
         await this.rotated({ ms: 0 }, () => this.prepare(r, true));
-      } catch (error) {
-        if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "enroll", failureCode(this.expired(error)));
+      } catch (caught) {
+        const error = this.expired(caught);
+        if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+          this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+          this.retryRestore(r);
+        } else if (!this.drifted)
+          this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
       }
       await this.diagnostics.flush();
       return { ...r.status, roots: this.status().roots };

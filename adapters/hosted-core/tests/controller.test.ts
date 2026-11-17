@@ -245,6 +245,50 @@ test.each(modes)("resume rebinds the remembered name with create:false after a r
   } finally { await restarted.close(); }
 });
 
+// #895: pi, omp and Claude Code resume a root at every start; a host restarted during a server outage (an
+// upgrade) retries it on the outage backoff, as a saved root's restore does (#424 6), rather than staying dark.
+test.each(modes)("a resume during a server outage retries on the outage backoff, never pausing, and rebinds the remembered name (#895, %s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  // Every prepare's whoami finds the server down until the second wait.
+  const down = Promise.reject(new ServerUnreachable(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })));
+  down.catch(() => {});
+  r.holdPrepare(down);
+  const waits: number[] = [], states: (string | undefined)[] = [];
+  const restarted: Controller = r.make({ wait: async ms => {
+    waits.push(ms); states.push(r.root(restarted)?.state);
+    if (waits.length === 2) r.holdPrepare(Promise.resolve());
+  } });
+  const binds = r.named("bind").length;
+  try {
+    await restarted.resume("R");
+    expect(r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "server_unreachable" });
+    await until(() => r.root(restarted)?.state === "active");
+    expect(waits).toEqual([500, 1000]);
+    expect(states).toEqual(["retrying", "retrying"]);
+    expect(r.named("bind").slice(binds).map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/work" }]);
+  } finally { await restarted.close(); }
+});
+test.each(modes)("a close during a resume's outage retry ends it: nothing prepares after it (#895, %s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  const down = Promise.reject(new ServerUnreachable(new Error("down")));
+  down.catch(() => {});
+  r.holdPrepare(down);
+  let waited = 0;
+  const restarted: Controller = r.make({ wait: async (_ms, signal) => { waited++; await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); } });
+  await restarted.resume("R");
+  await until(() => waited === 1);
+  const whoamis = r.named("whoami").length;
+  await restarted.close();
+  expect(r.named("whoami").length).toBe(whoamis);
+  expect(waited).toBe(1);
+});
 test.each(modes)("resume rebinds only the remembered holds the server lost, and skips one it now refuses (%s)", async mode => {
   const r = runtime(mode);
   await r.controller.enroll("R", ["be", "fe"], true);
