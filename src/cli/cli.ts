@@ -1,8 +1,8 @@
 // The grayboard CLI. Loaded by main.ts (the entry) for every command but a
 // hook, so a hook doesn't pay for this module's imports (#551).
 import { Command } from "commander";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync, readlinkSync, statSync, accessSync, constants, openSync, fchmodSync, fchownSync, writeSync, fsyncSync, closeSync, renameSync, type Stats } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync } from "node:fs";
+import { writeJsonFile } from "./json_file.ts";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { loginThroughServer } from "./oauth_flow.ts";
@@ -134,7 +134,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     if (dropEntry(h.config)) notes.push(`Removed the grayboard entry from ${h.config.path} (the hosted extension needs none)`);
     writeAdapter(h.hosted, h.bundle);
     rmSync(h.local, { force: true });
-    writeConfig(h.hostedConfig, { url } satisfies HostedConfig);
+    writeJsonFile(h.hostedConfig, { url } satisfies HostedConfig);
     notes.push(`Wrote ${h.hostedConfig}`);
     return { adapter: h.hosted, notes };
   }
@@ -198,50 +198,6 @@ function readConfig<T extends object>(path: string, empty: T): T {
   return value as T;
 }
 
-/** The file a write to `path` lands in: its symlinks followed, a dangling one's target included. */
-function writeTarget(path: string): string {
-  let target = path;
-  for (let hops = 0; hops < 40; hops++) {
-    try { if (!lstatSync(target).isSymbolicLink()) return target; } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") return target;
-      throw e;
-    }
-    target = resolve(dirname(target), readlinkSync(target));
-  }
-  throw new Error(`Can't write ${path}: too many levels of symbolic links`);
-}
-
-/**
- * Replace a harness's JSON config atomically (#439): a temp file beside it,
- * synced, then renamed over it, so a crash leaves the old file or the new
- * one, never a truncated one. A symlinked config, dangling or not, is
- * written at its target, keeping the link. An existing file keeps its mode
- * and, where this user may set them, its owner and group; one this user
- * can't write is refused, as an in-place write would be. A hard-linked
- * config is split from its other links.
- */
-function writeConfig(path: string, cfg: object): void {
-  const target = writeTarget(path);
-  let old: Stats | undefined;
-  try { old = statSync(target); } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-  }
-  if (old) accessSync(target, constants.W_OK);
-  mkdirSync(dirname(target), { recursive: true });
-  const temp = `${target}.grayboard-${process.pid}-${randomUUID()}.tmp`;
-  const fd = openSync(temp, "wx", old ? old.mode & 0o7777 : 0o666);
-  try {
-    try {
-      if (old) {
-        try { fchownSync(fd, old.uid, old.gid); } catch {} // only root may give a file away
-        fchmodSync(fd, old.mode & 0o7777); // after chown, which clears setuid bits; the umask may have narrowed it
-      }
-      writeSync(fd, JSON.stringify(cfg, null, 2) + "\n");
-      fsyncSync(fd);
-    } finally { closeSync(fd); }
-    renameSync(temp, target);
-  } catch (e) { rmSync(temp, { force: true }); throw e; }
-}
 
 /** Write `entry` (or reshape the existing one by `c.local`) as the harness's grayboard entry; true when the file changed. */
 function putEntry(c: HarnessConfig, entry?: Entry): boolean {
@@ -252,7 +208,7 @@ function putEntry(c: HarnessConfig, entry?: Entry): boolean {
   const next = c.local(base);
   if (JSON.stringify(next) === JSON.stringify(old)) return false;
   cfg[c.section] = { ...cfg[c.section], grayboard: next };
-  writeConfig(c.path, cfg);
+  writeJsonFile(c.path, cfg);
   return true;
 }
 
@@ -262,7 +218,7 @@ function dropEntry(c: HarnessConfig): boolean {
   if (!cfg[c.section]?.grayboard) return false;
   const { grayboard: _, ...rest } = cfg[c.section]!;
   cfg[c.section] = rest;
-  writeConfig(c.path, cfg);
+  writeJsonFile(c.path, cfg);
   return true;
 }
 
@@ -303,14 +259,14 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
         console.warn(`Warning: --force is clobbering mcpServers keys: ${keys.join(", ")}`);
       }
     }
-    writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
+    writeJsonFile(targetPath, { mcpServers: { grayboard: entry } });
     wrote("Wrote");
     return;
   }
 
   // Merge mode
   if (!existsSync(targetPath)) {
-    writeFileSync(targetPath, JSON.stringify({ mcpServers: { grayboard: entry } }, null, 2) + "\n");
+    writeJsonFile(targetPath, { mcpServers: { grayboard: entry } });
     wrote("Created");
     return;
   }
@@ -327,7 +283,7 @@ function writeMcpJson(targetPath: string, identityName: string, force: boolean):
     process.exit(1);
   }
   existing.mcpServers["grayboard"] = entry;
-  writeFileSync(targetPath, JSON.stringify(existing, null, 2) + "\n");
+  writeJsonFile(targetPath, existing);
   wrote("Updated");
 }
 
@@ -807,7 +763,7 @@ program
       return !guard.skip;
     };
     if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
-      if (!existsSync(OC_CONFIG.path)) writeConfig(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
+      if (!existsSync(OC_CONFIG.path)) writeJsonFile(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
       writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
       console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${OC_PLUGIN.path}`);
