@@ -282,6 +282,9 @@ test("a mention of a session's other alias, or its ID, gives that session its on
   const r = post(db, "be", "work", "@alpha take this", null, said);
   release(db, "alpha", claimKey(r.post.id), "pass");
   expect(takes(claimKey(r.post.id))).toEqual(["alpha"]);
+  // Its `[unclaimed]` reply counts one holder, not the holder and its lane.
+  const reply = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).get(r.post.id) as { body: string };
+  expect(reply.body).toContain("its one lane passed");
   const r2 = post(db, "be", "work", `@${ID} and this`, null, said);
   sweepExpired(db, Date.now() + 31 * 60_000);
   expect(takes(claimKey(r2.post.id))).toEqual([ID]);

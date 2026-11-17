@@ -856,9 +856,10 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   const laneOf = db.prepare(
     `SELECT COALESCE(${primaryHoldSql("COALESCE((SELECT id FROM alias_holds WHERE address = ?1), ?1)")}, ?1) AS lane`,
   );
+  const takers = held.size; // the `[unclaimed]` reply counts who held it, not their lanes twice
   for (const h of [...held]) held.add((laneOf.get(h) as { lane: string }).lane);
   const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => !held.has(h));
-  if (!lane) return { board: b.name, postId: p.id, held: held.size };
+  if (!lane) return { board: b.name, postId: p.id, held: takers };
   claimQueuePost(db, b.name, p, lane, now, { note: REDELIVERED_NOTE });
   return { lane };
 }
