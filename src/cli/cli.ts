@@ -15,7 +15,7 @@ import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudeHooks, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
 import { canonicalEndpoint } from "../shared/endpoint.ts";
-import { piAgentDir } from "../shared/pi.ts";
+import { ompAgentDir, ompSetupRefusal, piSetupAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { hostedConfigPath, type HostedConfig } from "../../adapters/hosted-core/src/config.ts";
 
@@ -45,9 +45,14 @@ function handleApiError(e: unknown): never {
 
 // ── push adapters (omp, opencode, pi) ─────────────────────────────────────────────
 
-const OMP_DIR = join(homedir(), ".omp", "agent");
+const OMP_DIR = ompAgentDir();
 const OC_DIR  = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
-const PI_DIR  = piAgentDir();
+const PI_DIR  = piSetupAgentDir();
+// Set when omp's agent dir is one setup can't install in: shared with pi's,
+// where each would load the other's adapter from extensions/grayboard.ts, or
+// a relative default-profile PI_CODING_AGENT_DIR. Setup refuses omp's;
+// refresh leaves omp alone.
+const OMP_REFUSAL = ompSetupRefusal(process.env, homedir(), PI_DIR);
 
 // Adapter files carry this binary's source (inlined at build time), so
 // `update` rewrites them from the new binary.
@@ -729,7 +734,10 @@ program
     let failed = false;
     const installHarness = async (h: PiFamily) => {
       let r: FamilyInstall;
-      try { r = await installPiFamily(h, server, { command, args }); } catch (e) {
+      try {
+        if (h === OMP && OMP_REFUSAL) throw new Error(OMP_REFUSAL);
+        r = await installPiFamily(h, server, { command, args });
+      } catch (e) {
         console.error((e as Error).message);
         failed = true;
         process.exitCode = 1;
@@ -802,7 +810,7 @@ function undeliveredEntries(): string[] {
   const out: string[] = [];
   const present = (p: string) => { try { lstatSync(p); return true; } catch { return false; } };
   const harnesses: { name: string; config: HarnessConfig; env: string; adapters: string[] }[] = [
-    { name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] },
+    ...(OMP_REFUSAL ? [] : [{ name: "omp", config: OMP.config, env: "env", adapters: [OMP.local, OMP.hosted] }]),
     { name: "opencode", config: OC_CONFIG, env: "environment", adapters: [OC_PLUGIN.path] },
     { name: "pi", config: PI.config, env: "env", adapters: [PI.local, PI.hosted] },
   ];
@@ -934,7 +942,7 @@ program
     // omp and pi: where either variant is installed (and neither is a
     // symlink), install the one the current mode uses.
     let server: string | undefined;
-    for (const h of [OMP, PI]) {
+    for (const h of OMP_REFUSAL ? [PI] : [OMP, PI]) {
       const paths = [h.local, h.hosted].filter(p => existsSync(p));
       if (paths.length === 0 || paths.some(p => lstatSync(p).isSymbolicLink())) continue;
       if (busMode() === "server") {

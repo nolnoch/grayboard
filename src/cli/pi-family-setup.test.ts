@@ -31,12 +31,14 @@ function fixture(h: Harness = "pi") {
   mkdirSync(join(root, "bin"));
   writeFileSync(join(root, "bin", h), "#!/bin/sh\nexit 0\n");
   chmodSync(join(root, "bin", h), 0o755);
-  // pi's agentDir comes from PI_CODING_AGENT_DIR; the CLI puts omp's at ~/.omp/agent.
+  // pi's agentDir comes from PI_CODING_AGENT_DIR, set only for pi: omp
+  // honors it too (#439), so an omp run without it uses ~/.omp/agent.
   const pi = join(root, "pi");
   const dir = h === "pi" ? pi : join(root, ".omp", "agent");
   const paths = { local: join(dir, "extensions", "grayboard.ts"), hosted: join(dir, "extensions", "grayboard.js"), mcp: join(dir, "mcp.json"), config: join(dir, "grayboard", "config.json") };
-  const exec = (args: string[], piDir = pi) => {
-    const env = { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, "config"), GRAYBOARD_CREDENTIALS: join(root, "credentials"), PI_CODING_AGENT_DIR: piDir,
+  const exec = (args: string[], piDir: string | undefined = h === "pi" ? pi : undefined, extra: Record<string, string> = {}) => {
+    const env = { ...process.env, OMP_PROFILE: undefined, PI_PROFILE: undefined, PI_CONFIG_DIR: undefined, ...extra,
+      HOME: root, XDG_CONFIG_HOME: join(root, "config"), GRAYBOARD_CREDENTIALS: join(root, "credentials"), PI_CODING_AGENT_DIR: piDir,
       PATH: join(root, "bin"), GRAYBOARD_TOKEN: undefined, GRAYBOARD_SERVER: undefined, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" };
     const r = Bun.spawnSync([process.execPath, cli, ...args], { cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
@@ -222,6 +224,83 @@ test("refresh-adapters migrates an omp local install's enabled entry to the disa
   expect(f.run("refresh-adapters")).not.toContain("Disabled the grayboard entry");
 }, 60_000);
 
+// #439: setup installs omp's adapter where omp's getAgentDir() points: a
+// named profile has its own agent dir.
+test("setup installs omp's adapter in an OMP_PROFILE's agent dir", () => {
+  const f = fixture("omp");
+  const dir = join(f.root, ".omp", "profiles", "work", "agent");
+  const r = f.exec(["setup", "--local", "-y"], undefined, { OMP_PROFILE: "work" });
+  expect(r.exitCode, r.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8")).mcpServers.grayboard).toEqual(localEntry);
+  expect(existsSync(f.dir)).toBe(false);
+}, 60_000);
+
+// With PI_CODING_AGENT_DIR set, omp's default profile uses pi's agent dir,
+// where each harness would load the other's adapter: setup refuses omp's and
+// still installs pi's; refresh-adapters leaves the files to pi.
+test("setup refuses omp's adapter in an agent dir it shares with pi; refresh leaves it to pi", () => {
+  const f = fixture("omp");
+  writeFileSync(join(f.root, "bin", "pi"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(f.root, "bin", "pi"), 0o755);
+  const shared = join(f.root, "shared");
+  const setup = f.exec(["setup", "--local", "-y"], shared);
+  expect(setup.exitCode).toBe(1);
+  expect(setup.stderr).toContain(`omp's agent directory is pi's (${shared}: omp reads PI_CODING_AGENT_DIR too)`);
+  expect(setup.stderr).toContain("OMP_PROFILE=<name> grayboard setup");
+  expect(readFileSync(join(shared, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+  expect(existsSync(f.dir)).toBe(false);
+  const refresh = f.exec(["refresh-adapters"], shared);
+  expect(refresh.exitCode, refresh.stderr).toBe(0);
+  expect(refresh.stdout).toBe(`Refreshed ${join(shared, "extensions", "grayboard.ts")}\n`);
+  expect(refresh.stderr).not.toContain("omp's");
+  expect(readFileSync(join(shared, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+}, 60_000);
+
+// In a shared dir only pi's entry is checked: an enabled push-on entry with
+// no adapter warns once, as pi, never as omp.
+test("refresh-adapters in an agent dir omp shares with pi warns about an undelivered entry once, as pi's", () => {
+  const f = fixture("omp");
+  const shared = join(f.root, "shared");
+  mkdirSync(shared, { recursive: true });
+  writeFileSync(join(shared, "mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: "grayboard", args: ["mcp"] } } }));
+  const r = f.exec(["refresh-adapters"], shared);
+  expect(r.exitCode, r.stderr).toBe(0);
+  const warnings = r.stdout.split("\n").filter(l => l.includes("no grayboard adapter is installed"));
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toStartWith("[grayboard] pi: ");
+}, 60_000);
+
+// omp's named profile exports its agent dir as PI_CODING_AGENT_DIR to every
+// child (setProfile), so `grayboard` run from omp's bash sees omp's dir there:
+// it's omp's, and pi's stays its default.
+test("setup and refresh-adapters run inside an omp profile session keep omp's adapter in the profile dir and pi's in its default", () => {
+  const f = fixture("omp");
+  writeFileSync(join(f.root, "bin", "pi"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(f.root, "bin", "pi"), 0o755);
+  const dir = join(f.root, ".omp", "profiles", "work", "agent");
+  const pi = join(f.root, ".pi", "agent");
+  const setup = f.exec(["setup", "--local", "-y"], dir, { OMP_PROFILE: "work" });
+  expect(setup.exitCode, setup.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(readFileSync(join(pi, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+  const refresh = f.exec(["refresh-adapters"], dir, { OMP_PROFILE: "work" });
+  expect(refresh.exitCode, refresh.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(readFileSync(join(pi, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+}, 60_000);
+
+// omp path-resolves a relative default-profile PI_CODING_AGENT_DIR against
+// its own start directory, so setup can't know the dir and refuses.
+test("setup refuses omp's adapter for a relative or ~ PI_CODING_AGENT_DIR in the default profile", () => {
+  for (const value of ["~/omp", "rel/omp"]) {
+    const f = fixture("omp");
+    const r = f.exec(["setup", "--local", "-y"], value);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain(`omp resolves PI_CODING_AGENT_DIR (${value}) against the directory omp starts in`);
+    expect(existsSync(join(f.root, value))).toBe(false);
+  }
+}, 120_000);
 // #439: an mcp.json holding JSON null has nothing to keep, so setup writes
 // the entry into it; one holding an array or a scalar would be lost, so setup
 // refuses and leaves it alone.
