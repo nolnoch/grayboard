@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { EFFORT_META, LAUNCHER_META, MODEL_META, NativeWire, SUGGESTED_META, ServerUnreachable, type Wire } from "../src/core/wire.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import type { RecordStatus } from "../src/core/diagnostics.js";
-import { fixture, until } from "./native-fixture.js";
+import { fixture } from "./native-fixture.js";
+import { until } from "./until.ts";
 
 // OpenCode's `entries()` (core/mcp-guidance, @opencode/core 2.1.4) for a codemode server and a plain one.
 const execute = '    Use tools from this server through `execute` under `tools["grayboard"]`.';
@@ -256,7 +257,7 @@ test("the native fetcher names the root on a native connection with the launcher
     close.mockRejectedValueOnce(new Error("close failed"));
     changed.length = 0;
     expect(await fetch("R", new AbortController().signal)).toBe(bound);
-    await until(() => failure.mock.calls.length === 1, "the close failure");
+    await until(() => failure.mock.calls.length === 1, 5000, "the close failure");
     expect(failure.mock.calls[0]).toEqual(["wire_close", new Error("close failed")]);
     expect(changed).toEqual([]);
   } finally {
@@ -458,7 +459,7 @@ test("setup prefetches a subagent's text when it's created, its context hook rew
   const fetched: string[] = [];
   const cleanup = await setup(ctx, () => {}, () => {}, async id => { fetched.push(id); return id === "C" ? "child text" : bound; });
   try {
-    await until(() => fetched.includes("C"));
+    await until(() => fetched.includes("C"), 1000);
     const system = [{ type: "text", text: "agent" }, { type: "text", text: render(unbound) }];
     await hook!({ sessionID: "C", system, messages: [] });
     expect(system[1]!.text).toBe(render("child text"));
@@ -468,7 +469,7 @@ test("setup prefetches a subagent's text when it's created, its context hook rew
     expect(fetched).toEqual(["C"]);
     // A deleted subagent's text goes; a session reusing the ID would fetch afresh.
     remove();
-    await until(() => forgot.mock.calls.some(([id]) => id === "C"));
+    await until(() => forgot.mock.calls.some(([id]) => id === "C"), 1000);
     await hook!({ sessionID: "C", system: [{ type: "text", text: render(unbound) }], messages: [] });
     expect(fetched).toEqual(["C", "C"]);
   } finally {

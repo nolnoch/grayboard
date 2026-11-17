@@ -150,6 +150,8 @@ export function initCoreSchema(db: Database): void {
       at          INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_claim_events_at ON claim_events(at);
+    -- A queue board's rotation reads each lane's latest delivery (#221).
+    CREATE INDEX IF NOT EXISTS idx_claim_events_take ON claim_events(board, handle, at) WHERE event = 'take';
 
     -- Which session held which name, and when (#182): the join between a
     -- session's run metadata and a name. event: bound, moved (a rebind;
