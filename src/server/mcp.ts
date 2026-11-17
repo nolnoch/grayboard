@@ -322,7 +322,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       return cap;
     }
     const board = parseBoardResourceUri(uri);
-    if (!application.canReceiveBoard(context.session, board)) throw new ApplicationError("not_found", "resource not found");
+    if (!application.canReceiveBoard(application.repo.read, context.session, board)) throw new ApplicationError("not_found", "resource not found");
     return null;
   }
   // One authorize for the live's every uri: watchable and describe reuse its row (#853).
@@ -390,7 +390,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           // Access rotation alone preserves registrations that remain visible.
           for (const uri of live.uris.keys()) {
             try {
-              if (!application.canReceiveBoard(context.session, parseBoardResourceUri(uri))) legacy.subscriptions.delete(uri);
+              if (!application.canReceiveBoard(application.repo.read, context.session, parseBoardResourceUri(uri))) legacy.subscriptions.delete(uri);
             } catch (e) { hostedFailure("mcp.stream", e); }
           }
         }

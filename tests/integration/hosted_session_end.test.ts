@@ -80,12 +80,12 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: root ends actual 
   }
   expect(await value(root, "session_end", { session: first.child })).toEqual({ ended: true });
   expect(app.repo.hosted.get(app.repo.read, first.child)).toBeUndefined();
-  expect(app.application.hostedHolds(first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+  expect(app.application.hostedHolds(app.application.repo.read, first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
   expect(app.repo.hosted.get(app.repo.read, sibling.child)?.root_session_id).toBe(first.root);
   const siblingClient = await connect(version, grant.token, "sibling");
   expect(await value(siblingClient, "session_end")).toEqual({ ended: true });
   expect(app.repo.hosted.get(app.repo.read, sibling.child)).toBeUndefined();
-  expect(app.application.hostedHolds(first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+  expect(app.application.hostedHolds(app.application.repo.read, first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
   expect(await value(root, "session_end")).toEqual({ ended: true });
   expect(app.repo.hosted.get(app.repo.read, first.root)).toBeUndefined();
   expect(app.repo.hosted.get(app.repo.read, other.root)).toBeDefined();
@@ -109,7 +109,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child e
   const replacement = await value(root, "session_register", { child: "replacement" });
   expect(replacement.child).toMatch(SESSION_ID);
   expect(count()).toBe(128);
-  expect(app.application.hostedHolds(first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
+  expect(app.application.hostedHolds(app.application.repo.read, first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
 });
 
 // #566: a root past MAX_CHILDREN registrations keeps registering once its earlier children idle past the window,

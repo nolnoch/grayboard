@@ -83,7 +83,7 @@ test("forced bind/bind overlap on one name gives it one holder (#387 item 23)", 
   const results = await overlap({ operation: "bind", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:bind:in-txn");
   expect(results[0]).toMatchObject({ ok: true });
   expect(results[1]).toMatchObject({ ok: false });
-  const holders = database.repo.hosted.all(database.repo.read).filter(row => application.hostedHolds(row.session_id).map(short).includes("fe"));
+  const holders = database.repo.hosted.all(database.repo.read).filter(row => application.hostedHolds(application.repo.read, row.session_id).map(short).includes("fe"));
   expect(holders).toHaveLength(1);
   expect(holders[0]?.source_session_id).toBe("root");
 }, 15_000);
@@ -95,7 +95,7 @@ test("forced release/bind overlap hands the name to the contender only after the
   expect(results.every(result => result.ok)).toBe(true);
   const rows = database.repo.hosted.all(database.repo.read);
   expect(rows.map(row => row.source_session_id)).toEqual(["other"]);
-  expect(application.hostedHolds(rows[0]!.session_id).map(short)).toEqual(["fe"]);
+  expect(application.hostedHolds(application.repo.read, rows[0]!.session_id).map(short)).toEqual(["fe"]);
   expect(releases()).toHaveLength(1);
 }, 15_000);
 
@@ -117,7 +117,7 @@ test("forced expiry/rebind overlap releases only the expired ownership", async (
   const rows = database.repo.hosted.all(database.repo.read);
   expect(rows).toHaveLength(1);
   expect(rows[0]?.ownership_id).not.toBe(lease.ownership);
-  expect(application.hostedHolds(rows[0]!.session_id).map(short)).toEqual(["fe"]);
+  expect(application.hostedHolds(application.repo.read, rows[0]!.session_id).map(short)).toEqual(["fe"]);
   expect(releases()).toEqual([{ detail: "expired" }]);
 }, 15_000);
 
@@ -151,7 +151,7 @@ for (const owning of ["bind", "open", "register"] as const) {
     const fresh = database.repo.hosted.get(database.repo.read, id)!;
     expect(fresh.ownership_id).not.toBe(old.ownership_id);
     expect(fresh.grant_id).toBe(first.grantId);
-    expect(application.hostedHolds(fresh.session_id).map(short)).toEqual(change === "convert" ? [] : ["be"]);
+    expect(application.hostedHolds(application.repo.read, fresh.session_id).map(short)).toEqual(change === "convert" ? [] : ["be"]);
     expect(database.repo.aliases.find(database.repo.read, `${p.authed.user_email}/new`)).toBeUndefined();
     expect(database.repo.hosted.all(database.repo.read).some(row => row.source_session_id === "new-child")).toBe(false);
     expect(delivery.activeLeaseCount).toBe(0);
@@ -290,7 +290,7 @@ test("G2 ordinary writes do not attach, G1 revoke releases atomically including 
   await seed(database.repo, tx => database.repo.oauth.revokeToken(tx, hashToken(first.refreshToken), OPENCODE_CLIENT, now));
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "revoked" }]);
-  expect(application.aliasHolderId("you@example.com/fe")).toBeNull();
+  expect(application.aliasHolderId(application.repo.read, "you@example.com/fe")).toBeNull();
   await hosted.bind(second.principal, context(second.principal), { name: "fe" });
   expect(await hosted.whoami(second.principal, context(second.principal, "child"))).toHaveProperty("unbound", true);
 });
@@ -321,7 +321,7 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
   await seed(database.repo, tx => database.repo.users.setDisabled(tx, second.authed.user_id, true));
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "disabled" }]);
-  expect(application.aliasHolderId("you@example.com/fe")).toBeNull();
+  expect(application.aliasHolderId(application.repo.read, "you@example.com/fe")).toBeNull();
 });
 
 test("opening a pre-hosted SQLite schema adds tables without changing users, messages or OAuth", async () => {
@@ -349,9 +349,9 @@ test("a database a v2.x release wrote, with a hosted root bound under its single
   close(); open();
   expect(database.db.query("SELECT name FROM hosted_sessions").get()).toEqual({ name: null });
   expect(database.db.query("SELECT 1 AS x FROM sqlite_master WHERE name = 'idx_hosted_name'").get()).toBeNull();
-  expect(application.hostedHolds(id)).toEqual(["you@example.com/fe"]);
+  expect(application.hostedHolds(application.repo.read, id)).toEqual(["you@example.com/fe"]);
   expect(await hosted.whoami(first.principal, context(first.principal))).toMatchObject({ held: ["you@example.com/fe"], primary: "you@example.com/fe" });
   // A second open changes nothing.
   close(); open();
-  expect(application.hostedHolds(id)).toEqual(["you@example.com/fe"]);
+  expect(application.hostedHolds(application.repo.read, id)).toEqual(["you@example.com/fe"]);
 });

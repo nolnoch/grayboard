@@ -118,7 +118,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, (row, _defer, tx) => {
-        if (!application.hostedHolds(row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
+        if (!application.hostedHolds(tx, row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
         hosted.seeLost(tx, p, row);
         previous = bySession.get(row.session_id);
         if (previous && matches(previous, row)) { previous.context = openOptions.context ?? true; return previous; }
@@ -135,7 +135,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (previous) finish(previous);
         const { row, expiresAt } = result;
         let lease!: Lease;
-        const selected = application.hostedSession(pool, p.authed, row.session_id, application.hostedHolds(row.session_id), null, row, {
+        const selected = application.hostedSession(pool, p.authed, row.session_id, application.hostedHolds(pool, row.session_id), null, row, {
           deliver() { if (lease && matches(lease, store.get(pool, lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
           closed() { if (lease) finish(lease); },
         }, true);
@@ -205,7 +205,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           for (const id of ids) {
             const issued = lease.issued.get(id), r: Acked = issued ? { ...issued.item, board: boardOf(issued.item) } : lease.acknowledged.get(id) ?? stale(p, context, capability);
             if (r.ownership !== row.ownership_id || r.bind_gen !== row.bind_gen || (r.address !== undefined && !lease.session.addresses.includes(r.address))) stale(p, context, capability);
-            if (r.board !== undefined && !application.canReceiveBoard(lease.session, r.board)) stale(p, context, capability);
+            if (r.board !== undefined && !application.canReceiveBoard(tx, lease.session, r.board)) stale(p, context, capability);
             if (issued) records.push(issued);
           }
           const direct = records.filter(r => r.item.event.kind === "direct");

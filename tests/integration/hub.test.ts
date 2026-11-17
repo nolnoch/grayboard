@@ -124,13 +124,13 @@ test("peer_list shows where the session runs; a reconnect on its key keeps the s
 
   const key = "c1".repeat(32);
   const first = await srv.connected(alice, "be", { key });
-  await seed(srv.app.repo, () => srv.app.application.hostedPlace(first.id, "api worktree stream \n on stream"));
+  await seed(srv.app.repo, tx => srv.app.application.hostedPlace(tx, first.id, "api worktree stream \n on stream"));
   await first.call("peer_status", { text: "soaking" });
   expect(await be()).toMatchObject({ where: "api worktree stream on stream", status: "soaking" });
 
   first.close();
   const resumed = await srv.connected(alice, "be", { key });
-  await seed(srv.app.repo, () => srv.app.application.hostedPlace(resumed.id, "api worktree stream on main"));
+  await seed(srv.app.repo, tx => srv.app.application.hostedPlace(tx, resumed.id, "api worktree stream on main"));
   expect(await be()).toMatchObject({ where: "api worktree stream on main", status: "soaking" });
 
   await resumed.unbind("be");

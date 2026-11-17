@@ -151,7 +151,8 @@ export class ApplicationSession {
   // `run`, #452): a refusal's audit row is handed to it, to be written after
   // the transaction unwinds, because writing it inside would roll it back with
   // the refused call. Unset, the row is written at once.
-  afterRollback?: (write: () => void) => void;
+  // A row takes the `Tx` of the body that writes it (#807 P1c-15b-2).
+  afterRollback?: (write: RefusalRow) => void;
   constructor(
     readonly authed: AuthedUser,
     readonly sink: DeliverySink,
@@ -193,7 +194,6 @@ function notify(callback?: () => void | Promise<void>) {
 
 type Hub = {
   repo: Repo;
-  db: CoreDb;
   // address -> the session pushes go to: a push session's ID and its bound
   // aliases, a Slack bridge human's email/human, a hosted lease's name.
   registry: Map<string, ApplicationSession>;
@@ -395,10 +395,11 @@ function describeHolder(hub: Hub, r: Read, id: string, asker: string): string {
   return `the session ${id}${place ? `, in ${place}` : ""}`;
 }
 
-// A refusal's row, written now, or by the session's `afterRollback` when the call runs inside a transaction
-// the refusal's throw rolls back (#452, #467).
-function rowAfterRollback(session: ApplicationSession, write: () => void) {
-  if (session.afterRollback) session.afterRollback(write); else write();
+// A refusal's row, written by the session's `afterRollback` when the call runs inside a transaction the refusal's
+// throw rolls back (#452, #467), or now on `tx`, the body the call runs in.
+export type RefusalRow = (tx: Tx) => void;
+function rowAfterRollback(session: ApplicationSession, tx: Tx, write: RefusalRow) {
+  if (session.afterRollback) session.afterRollback(write); else write(tx);
 }
 
 // Who asked, for a decision row (policy.ts): the session's user, the address
@@ -417,7 +418,6 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   const delegateRow = (write: () => void) => { if (hub.delegateRows) hub.delegateRows.push(write); else write(); };
   const hub: Hub = {
     repo,
-    db,
     registry: new Map(),
     sessions: new Set(),
     humanReach: opts.humanReach ?? "team",
@@ -752,13 +752,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
     const target = bindTarget(hub, authed, m.alias);
     if ("error" in target) {
-      if (target.address) { const a = target.address; rowAfterRollback(session, () => logBinding(db, id, a, "refused", target.error)); }
-      if (target.authz) { const { req, d } = target.authz; rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, target.address), req, d)); }
+      if (target.address) { const a = target.address; rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, a, "refused", target.error)); }
+      if (target.authz) { const { req, d } = target.authz; rowAfterRollback(session, tx, () => recordDecision(repo, sessionActor(session, target.address), req, d)); }
       return fail(target.code, target.error);
     }
     const { address, scope } = target;
     const refuse = (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): never => {
-      rowAfterRollback(session, () => logBinding(db, id, address, "refused", detail));
+      rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, address, "refused", detail));
       return fail(code, message, extra);
     };
     let meta: AliasMetaSet | undefined;
@@ -828,7 +828,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // stay with the alias, for its next holder; a board item in flight for it
   // leaves this session (setHolds), so that holder is pushed it. An alias
   // the session doesn't hold answers ok with released: false.
-  function unbind(session: ApplicationSession, alias: string): UnbindResult {
+  // `tx`: the body the unbind runs in.
+  function unbind(tx: Tx, session: ApplicationSession, alias: string): UnbindResult {
     valid(session, true);
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it unbinds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it unbinds nothing");
@@ -837,13 +838,14 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     if (!p || p.kind === "id" || p.kind === "team") fail("bad_request", `"${alias}" isn't an alias: a name, or scope/name`);
     const address = p.kind === "bare" ? `${session.authed.user_email}/${p.name}` : p.address;
     if (!session.holds.includes(address)) return { alias: address, released: false, held: [...session.holds] };
+    const core = repo.coreOn(tx);
     repo.atomic(() => {
-      dropHold(db, address, id);
-      logBinding(db, id, address, "released", "unbind");
-      touchAlias(db, address);
+      dropHold(core, address, id);
+      logBinding(core, id, address, "released", "unbind");
+      touchAlias(core, address);
     });
     setHolds(hub, session, session.holds.filter((a) => a !== address));
-    const left = listClaims(db).filter((c) => c.holder === address).map((c) => c.key);
+    const left = listClaims(core).filter((c) => c.holder === address).map((c) => c.key);
     return { alias: address, released: true, held: [...session.holds], ...(left.length ? { left } : {}) };
   }
 
@@ -853,7 +855,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
     hostedCandidates(r: Read, authed: AuthedUser, suggested: string | null) { return candidates(hub, r, authed, suggested); },
     // The aliases a hosted root holds, oldest first: alias_holds is their only truth (#451).
-    hostedHolds(id: string): string[] { return holdsOf(db, id); },
+    hostedHolds(r: Read, id: string): string[] { return holdsOf(repo.coreOn(r), id); },
     // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing.
     // Otherwise the session holds `holds`, reads as them and its
     // ID, and writes as the oldest; none held reads and nothing else (readOnly). `row`: the hosted root's
@@ -939,8 +941,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
     // before and after, only when one changed. Absent fields keep the stored value; an empty one clears it (#558).
-    hostedFacts(authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
-      const changed = setIdFacts(db, id, facts);
+    hostedFacts(tx: Tx, authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
+      const changed = setIdFacts(repo.coreOn(tx), id, facts);
       if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "request" });
     },
     // A tools-only declaration's alias, resolved and checked: a name the
@@ -949,8 +951,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // `refused`: as `collided` above, for the refused binding row (`hostedRefused`).
     // `later`: where a policy refusal's decision row goes, for the same reason (hosted's `later`).
     // `tx`: the body the request's row is written in.
-    hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: () => void) => void): string {
-      const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(db, id, address, "refused", detail); };
+    hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: RefusalRow) => void): string {
+      const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(repo.coreOn(tx), id, address, "refused", detail); };
       const target = bindTarget(hub, authed, raw);
       if ("error" in target) {
         if (target.address) note(target.address, target.error);
@@ -983,7 +985,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const target = bindTarget(hub, authed, alias);
       return "error" in target ? undefined : target.address;
     },
-    aliasHolderId(address: string): string | null { return holderOf(db, address); },
+    aliasHolderId(r: Read, address: string): string | null { return holderOf(repo.coreOn(r), address); },
     // Every session's holds, oldest first, for the hosted sweep and reconcile.
     holdsByOwner(): Map<string, string[]> {
       const byOwner = new Map<string, string[]>();
@@ -996,11 +998,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Whether the session's ownership declared a launcher (#473, #520): what its instruction text follows, since the
     // stored flag, not the current request's `_meta`, decides whether it receives delegation requests.
     hostedLauncher(id: string): boolean { return repo.hosted.launcher(repo.read, id); },
-    hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
+    hostedPlace(tx: Tx, id: string, place: string | null) { setPlace(repo.coreOn(tx), id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
     bindNow,
-    hostedRefused(id: string, address: string, detail: string) { logBinding(db, id, address, "refused", detail); },
+    hostedRefused(tx: Tx, id: string, address: string, detail: string) { logBinding(repo.coreOn(tx), id, address, "refused", detail); },
     hostedCollided(authed: AuthedUser, id: string, why: string) { writeAudit(repo, "id.collision", authed.user_email, id, { why }); },
     unbind,
     close,
@@ -1094,9 +1096,10 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       addObserver(observer);
       return () => removeObserver(observer);
     },
-    canReceiveBoard(session: ApplicationSession, board: string) {
+    canReceiveBoard(r: Read, session: ApplicationSession, board: string) {
       valid(session);
-      return session.addresses.some((a) => canSeeBoard(db, a, board));
+      const core = repo.coreOn(r);
+      return session.addresses.some((a) => canSeeBoard(core, a, board));
     },
     // handed: false is a give-up (Slack refused the message): the cursor
     // moves so it isn't retried, but nothing reached the harness to stamp.
@@ -1315,8 +1318,9 @@ function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string | und
 
 // Checks a send and resolves its recipient, writing nothing; throws
 // ApplicationError. Its uploads may be any of the session's addresses' (S5).
+// `r`: the send's body, which a policy refusal's row is written on when no `afterRollback` takes it.
 function prepareSend(
-  hub: Hub, r: Read, session: ApplicationSession, from: string, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
+  hub: Hub, r: Tx, session: ApplicationSession, from: string, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
 ): PreparedSend {
   const { repo } = hub;
   let ids: number[];
@@ -1346,7 +1350,7 @@ function prepareSend(
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
   const decision = authorize(repo, { humanReach: hub.humanReach }, req);
   if (!decision.allow) {
-    rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, from), req, decision));
+    rowAfterRollback(session, r, () => recordDecision(repo, sessionActor(session, from), req, decision));
     fail(decision.code, decision.reason);
   }
 
@@ -1445,7 +1449,7 @@ function writeOnce<W extends Written>(
       });
     }
   }, recheck);
-  if ("replay" in out && uploads.length > 0) tx.afterCommit(async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
+  if ("replay" in out && uploads.length > 0) tx.afterCommit(async () => { await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo)); });
   return out;
 }
 
@@ -1476,7 +1480,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   const { authed } = session;
   // The audit rows name the child that called, beside the routing `via` (#523).
   const byChild = session.via === undefined ? {} : { child: session.via };
-  const refused = (detail: Record<string, unknown>) => rowAfterRollback(session, () => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
+  const refused = (detail: Record<string, unknown>) => rowAfterRollback(session, tx, () => writeAudit(repo, "delegation.refused", authed.user_email, session.primary, { ...detail, ...byChild }));
   let to: string | undefined;
   if (m.to !== undefined) {
     try {
@@ -1527,7 +1531,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
     const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
     const decision = authorize(repo, {}, req);
     if (decision.allow) return { ok: "granted" };
-    rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, session.primary), req, decision, { launcher: to }));
+    rowAfterRollback(session, tx, () => recordDecision(repo, sessionActor(session, session.primary), req, decision, { launcher: to }));
     return { refused: crossUserRefusal(to) };
   };
   try {
@@ -1566,13 +1570,13 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
       const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
       const decision = authorize(repo, { humanReach: hub.humanReach }, req);
       if (!decision.allow) {
-        rowAfterRollback(session, () => recordDecision(repo, sessionActor(session, session.primary), req, decision));
+        rowAfterRollback(session, tx, () => recordDecision(repo, sessionActor(session, session.primary), req, decision));
         fail(decision.code, decision.reason + hint);
       }
     });
   } catch (e) {
     hub.delegateRows = undefined;
-    for (const row of rows) rowAfterRollback(session, row);
+    for (const row of rows) rowAfterRollback(session, tx, row);
     // Written after the rollback (hosted defers it past its outer transaction), so the refusal's row stays.
     if (e instanceof CoreError) {
       refused({ reason: e.message, to: m.to ?? picked });
@@ -1612,7 +1616,7 @@ function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(tx, m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (!repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
-  tx.afterCommit(async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
+  tx.afterCommit(async () => { await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo)); });
   return {};
 }
 

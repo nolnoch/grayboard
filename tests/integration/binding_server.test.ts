@@ -707,7 +707,7 @@ test("the bridge's human connection binds and unbinds nothing", async () => {
   expect(ok).toMatchObject({ id: "human" });
   const human = `${A}/human`;
   const refused = async (f: () => unknown) => { try { await f(); } catch (e) { return { code: (e as any).code, message: (e as Error).message }; } return undefined; };
-  expect(await refused(() => srv.app.application.unbind(session, human))).toEqual({ code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it unbinds nothing` });
+  expect(await refused(() => seed(srv.app.repo, tx => srv.app.application.unbind(tx, session, human)))).toEqual({ code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it unbinds nothing` });
   expect(await refused(() => seed(srv.app.repo, tx => srv.app.application.bindNow(tx, session, { alias: "fe", create: true })))).toEqual({ code: "bad_request", message: `the Slack bridge's connection is its user's "human"; it binds nothing` });
   // Still the human: a DM to it is pushed to this connection.
   const be = await connect("be");

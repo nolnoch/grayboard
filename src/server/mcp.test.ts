@@ -174,7 +174,7 @@ for (const mapped of [true, false]) test(`#410: unbound tool reads judge visibil
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: tools-only contexts preserve live owner and its status`, async () => {
   const owner = new AppSession(application, store.repo, user, "fe");
   await owner.connect();
-  await seed(store.repo, () => application.hostedPlace(owner.id, "owner")); // the place hello's `where` set
+  await seed(store.repo, tx => application.hostedPlace(tx, owner.id, "owner")); // the place hello's `where` set
   const events = owner.events;
   await owner.call("peer_status", { text: "working" });
   const client = await connect(version);

@@ -20,7 +20,7 @@ import { writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { Repo, SlackLink } from "./db.ts";
 import { onAliasCreated } from "./teams.ts";
-import { ApplicationError, type Application, type ApplicationSession, type DeliverySink } from "./application.ts";
+import { ApplicationError, type Application, type ApplicationSession, type DeliverySink, type RefusalRow } from "./application.ts";
 import { CoreError } from "../core/errors.ts";
 import { failureDiagnostic } from "./diagnostics.ts";
 import { detached } from "./request_context.ts";
@@ -361,7 +361,7 @@ export class SlackBridge implements SlackLinker {
     // Bodies hold the write queue one at a time, so the shared session's afterRollback is set only inside one, and
     // cleared once fn (an application operation, async since #807 P1c-3) settles.
     const inWrite = async <T>(fn: (tx: Tx) => Promise<T>): Promise<T> => {
-      const rows: Array<() => void> = [];
+      const rows: RefusalRow[] = [];
       try {
         return await repo.write(async tx => {
           rows.length = 0;
@@ -370,9 +370,9 @@ export class SlackBridge implements SlackLinker {
         }) as T;
       } catch (error) {
         if (rows.length) {
-          await repo.write(() => {
+          await repo.write(tx => {
             for (const write of rows) {
-              try { repo.atomic(write); } catch (failure) { console.error("[grayboard slack] refusal row failed:", failure); }
+              try { repo.atomic(() => write(tx)); } catch (failure) { console.error("[grayboard slack] refusal row failed:", failure); }
             }
           }).catch(failure => console.error("[grayboard slack] refusal rows failed:", failure));
         }
