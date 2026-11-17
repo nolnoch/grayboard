@@ -5,7 +5,7 @@
 //
 // A `Tx` is live only while its transaction is open: used after its body settles (a timer or un-awaited promise the
 // body started, D4) it throws rather than write into whichever transaction is open by then.
-import { afterCommit, openSavepoint } from "../../core/sqlite.ts";
+import { afterCommit, openSavepoint, ownsTx } from "../../core/sqlite.ts";
 
 // The connection, opaque here so this file stays off bun:sqlite (db.test.ts: the Repo facade is the Postgres seam).
 type Database = Parameters<typeof openSavepoint>[0];
@@ -85,10 +85,14 @@ export function sqliteTx(db: Database, nests = true): Tx & { close(): void } {
 export function isTx(h: Read): h is Tx { return h instanceof SqliteTx; }
 
 // The connection a SQLite store function runs its statements on: refuses a closed `Tx`, and a handle from another
-// store.
+// store. It also refuses the store's `Read` from the task that holds the connection's open transaction (#807 P3 A7e2,
+// D2): SQLite routes that read to the writer, so it would see the body's uncommitted rows, which a Postgres pool read
+// never does. Such a caller passes its body's `Tx`. Another task's `Read`, while the holder awaits, reads committed
+// state as before; so do a commit's `committed` callback and `afterCommit` effects, which run after it closes.
 export function sqliteOf(r: Read): Database {
   if (!(r instanceof SqliteRead)) throw new Error("not a SQLite store handle");
   if (r instanceof SqliteTx) r.assertLive();
+  else if (ownsTx(r.db)) throw new Error("repo.read inside the caller's own transaction: pass the body's Tx (#807 D2)");
   return r.db;
 }
 

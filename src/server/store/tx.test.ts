@@ -261,3 +261,45 @@ test("a savepoint committing with an inner one still open rolls back instead of 
   expect(seen).toEqual(["after"]);
   expect(rows(repo.read)).toEqual(["after"]);
 });
+
+// #807 P3 A7e2 (D2): SQLite routes a holder's `repo.read` to the writer, where it reads the body's own uncommitted
+// rows; a Postgres pool read never would. The holder passes its Tx; every other task's read is committed state.
+test("repo.read inside the caller's own transaction is refused; the body's Tx, other tasks and post-commit reads aren't", async () => {
+  const repo = await open();
+  const refusal = "repo.read inside the caller's own transaction";
+  // Outside any body: reads committed state.
+  expect(rows(repo.read)).toEqual([]);
+  // (a) In a body: the store read and the core handle on repo.read throw; the Tx reads the body's rows.
+  await repo.write(async tx => {
+    put(tx, "a");
+    expect(() => rows(repo.read)).toThrow(refusal);
+    expect(() => repo.coreOn(repo.read)).toThrow(refusal);
+    expect(() => repo.aliases.find(repo.read, "x@example.com/be")).toThrow(refusal);
+    expect(rows(tx)).toEqual(["a"]);
+    await tick();
+    expect(() => rows(repo.read)).toThrow(refusal);
+  });
+  // (c) Another task, while a body holding the transaction awaits: committed state, no throw.
+  let release!: () => void;
+  const held = new Promise<void>(r => { release = r; });
+  let entered!: () => void;
+  const inBody = new Promise<void>(r => { entered = r; });
+  const body = repo.write(async tx => { put(tx, "b"); entered(); await held; });
+  await inBody;
+  expect(rows(repo.read)).toEqual(["a"]);
+  release();
+  await body;
+  // (d) The committed callback and the Tx's afterCommit run after the close: repo.read reads the commit.
+  const seen: string[][] = [];
+  await repo.write(tx => { put(tx, "c"); tx.afterCommit(() => { seen.push(rows(repo.read)); }); }, () => { seen.push(rows(repo.read)); });
+  expect(seen).toEqual([["a", "b", "c"], ["a", "b", "c"]]);
+  // (e) A timer the body starts, firing while its transaction is still open, is the holder's task: refused.
+  let timerError: unknown;
+  await repo.write(async tx => {
+    put(tx, "d");
+    const fired = new Promise<void>(r => setTimeout(() => { try { rows(repo.read); } catch (e) { timerError = e; } r(); }, 0));
+    await fired;
+  });
+  expect(String(timerError)).toContain(refusal);
+  expect(rows(repo.read)).toEqual(["a", "b", "c", "d"]);
+});
