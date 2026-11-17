@@ -140,6 +140,10 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     if (!r) return;
     this.record({ state: r.status.state, message: r.status.message, operation: "instructions", sessionID, ...(r.e.held?.length ? { held: r.e.held } : {}), ...(r.lease ? { ownership: r.lease.ownership } : {}), code: failureCode(error) });
   }
+  // An instructions fetch's wire that failed to close, recorded as the
+  // Controller's temporary wires are but with no session ID: on a root's record
+  // it would read as the root's change (watchRoots) and fetch again (#538).
+  fetchCloseFailure(error: unknown) { this.failure("wire_close", error); }
   async observe(type: string, data: unknown) {
     if (this.stopped) return;
     if (type === "session.created") {
@@ -190,21 +194,22 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
       onUnauthorized: async () => controller.binding.unauthorized(enrollment, current ?? ""),
     }, signal, sessionID);
     try { await wire.connect(); return wire.instructions(); }
-    finally { void wire.close().catch(() => {}); }
+    finally { void wire.close().catch(error => controller.fetchCloseFailure(error)); }
   };
 }
 
 // A root's record whose state, holds or ownership changed: what its server
 // instructions describe may have changed with it (#531).
-export function watchRoots(sink: DiagnosticSink, changed: (sessionID: string) => void): DiagnosticSink {
+// `forget` drops an ended root's last shape (#538).
+export function watchRoots(sink: DiagnosticSink, changed: (sessionID: string) => void): DiagnosticSink & { forget(sessionID: string): void } {
   const seen = new Map<string, string>();
-  return record => {
+  return Object.assign((record: Parameters<DiagnosticSink>[0]) => {
     if (record.sessionID && record.operation !== "instructions") {
       const shape = JSON.stringify([record.state, record.held ?? [], record.ownership ?? null]);
       if (seen.get(record.sessionID) !== shape) { seen.set(record.sessionID, shape); changed(record.sessionID); }
     }
     return sink(record);
-  };
+  }, { forget: (sessionID: string) => { seen.delete(sessionID); } });
 }
 
 export type Debug = (message: string, fields: Record<string, unknown>) => void;
@@ -217,11 +222,12 @@ export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = (
     launcher: ctx.options.launcher === true,
   };
   let instructions: RootInstructions | undefined;
-  const controller = new OpenCodeController(ctx, options, undefined, undefined, watchRoots(sink, id => instructions?.invalidate(id)));
+  const watched = watchRoots(sink, id => instructions?.invalidate(id));
+  const controller = new OpenCodeController(ctx, options, undefined, undefined, watched);
   // A subagent's failure lands on its root's record.
   instructions = new RootInstructions(fetcher ?? nativeFetcher(controller), (sessionID, error, root) => controller.instructionsFailure(root ?? sessionID, error));
   controller.bindingChanged = id => instructions?.invalidate(id);
-  controller.sessionEnded = id => instructions?.forget(id);
+  controller.sessionEnded = id => { instructions?.forget(id); watched.forget(id); };
   controller.childCreated = path => { void instructions?.current(path.sessionID, path.root); };
   // Every primary request of an enrolled root, or of a subagent under one, carries
   // its current instructions; other sessions' go as built.

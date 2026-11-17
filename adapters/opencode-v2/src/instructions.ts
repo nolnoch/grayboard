@@ -13,7 +13,8 @@ import { InsufficientScope } from "./core/wire.js";
 export type Fetcher = (sessionID: string, signal: AbortSignal) => Promise<string | undefined>;
 export type Plan = "none" | "replace";
 // `root` is set for a subagent: the root it writes as, whose changes refresh it.
-type Root = { text?: string; fresh: boolean; generation: number; fetching?: Promise<void>; reported: boolean; root?: string };
+// `abort` stops its fetch once the entry is forgotten.
+type Root = { text?: string; fresh: boolean; generation: number; fetching?: Promise<void>; reported: boolean; root?: string; abort: AbortController };
 
 // OpenCode puts no timeout on the hook and a rejected hook fails the step; a
 // fetch that outruns this still fills the cache for the next request.
@@ -69,8 +70,14 @@ export class RootInstructions {
   invalidate(sessionID: string) {
     for (const [id, r] of this.roots) if (id === sessionID || r.root === sessionID) { r.fresh = false; r.generation++; }
   }
-  forget(sessionID: string) { this.invalidate(sessionID); this.roots.delete(sessionID); }
+  // An ended or unenrolled session's entry goes, with its subagents': a fetch
+  // still running for one is aborted rather than left beside the next (#538).
+  forget(sessionID: string) {
+    for (const [id, r] of this.roots) if (id === sessionID || r.root === sessionID) { r.abort.abort(); this.roots.delete(id); }
+  }
   close() { this.closing.abort(); this.roots.clear(); }
+  // Sessions with an entry, for tests.
+  get size() { return this.roots.size; }
   // What the root's next request carries: fresh text, the last fetched (a
   // refetch running, or the last one failed), or none.
   state(sessionID: string): "fresh" | "stale" | "none" {
@@ -83,7 +90,7 @@ export class RootInstructions {
     if (this.closing.signal.aborted) return;
     let r = this.roots.get(sessionID);
     if (r && r.root !== root) { this.forget(sessionID); r = undefined; }
-    if (!r) { r = { fresh: false, generation: 0, reported: false, ...(root ? { root } : {}) }; this.roots.set(sessionID, r); }
+    if (!r) { r = { fresh: false, generation: 0, reported: false, ...(root ? { root } : {}), abort: new AbortController() }; this.roots.set(sessionID, r); }
     if (r.fresh) return r.text;
     const fetching = r.fetching ?? this.start(sessionID, r);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -96,7 +103,7 @@ export class RootInstructions {
       for (;;) {
         const generation = r.generation;
         try {
-          const text = await this.fetch(sessionID, this.closing.signal);
+          const text = await this.fetch(sessionID, AbortSignal.any([this.closing.signal, r.abort.signal]));
           if (this.roots.get(sessionID) !== r || this.closing.signal.aborted) return;
           r.text = text; r.reported = false;
           if (generation === r.generation) { r.fresh = true; return; }
