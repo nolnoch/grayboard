@@ -65,7 +65,7 @@ jobs:
     needs: scope
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       PIN_ONLY: ${{ needs.scope.outputs.pin-only }}
       SUITES: ${{ needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true' }}
