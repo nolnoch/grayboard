@@ -11,6 +11,7 @@ import { holdAlias } from "../core/bindings.ts";
 import { createBoard, post, registerId, subscribe, touchAlias } from "../core/boards.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { onTeamJoined } from "./teams.ts";
 import { hashToken } from "./auth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 
@@ -1198,7 +1199,14 @@ test("#807 P3 B5b1: repo.boards writes run on the Tx they're given and roll back
   await expect(b.forget(kept, be)).rejects.toThrow(settled);
   await expect(b.prunePosts(kept, 0)).rejects.toThrow(settled);
   await expect(repo.aliases.markHuman(kept, be, true)).rejects.toThrow(settled);
-  await expect(b.ensure({} as Tx, "hall", "p", null, be)).rejects.toThrow("not a SQLite store handle");
+  const stranger = /not a SQLite store handle/;
+  await expect(b.ensure({} as Tx, "hall", "p", null, be)).rejects.toThrow(stranger);
+  await expect(b.isSubscribed({} as Tx, be, "hall")).rejects.toThrow(stranger);
+  await expect(b.setSubscription({} as Tx, be, "hall", "push")).rejects.toThrow(stranger);
+  await expect(b.unsubscribeScope({} as Tx, be, "team:x")).rejects.toThrow(stranger);
+  await expect(b.forget({} as Tx, be)).rejects.toThrow(stranger);
+  await expect(b.prunePosts({} as Tx, 0)).rejects.toThrow(stranger);
+  await expect(repo.aliases.markHuman({} as Tx, be, true)).rejects.toThrow(stranger);
   const human = async () => db.query<{ human: number | null }, [string]>("SELECT human FROM aliases WHERE address = ?").get(fe)?.human ?? null;
   await expect(seed(repo, async tx => {
     expect(await b.ensure(tx, "hall", "p", "team:x", be)).toBe(true);
@@ -1238,6 +1246,23 @@ test("#807 P3 B5b1: repo.boards writes run on the Tx they're given and roll back
   expect(await b.post(repo.read, id)).toBeUndefined();
   await seed(repo, tx => repo.aliases.markHuman(tx, fe, false));
   expect(await human()).toBeFalsy();
+});
+
+// #807 P3 B5b1: a team's follow judges the board for the alias before subscribing it, as core's subscribe did: an
+// alias whose user isn't a member is refused as for a missing board, and its body rolls back.
+test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board", async () => {
+  const { repo } = fresh();
+  const team = await seed(repo, async tx => {
+    const a = await repo.users.upsertByEmail(tx, "a@example.com", null);
+    await repo.users.upsertByEmail(tx, "b@example.com", null);
+    await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
+    const team = await repo.teams.create(tx, "crew", a.id);
+    await repo.teams.addMember(tx, team.id, a.id, "owner");
+    return team;
+  });
+  await expect(seed(repo, tx => onTeamJoined(repo, tx, team, "b@example.com"))).rejects.toThrow("no such board #crew; see board_list");
+  expect(await repo.boards.get(repo.read, "crew")).toBeUndefined();
+  expect(await repo.boards.isSubscribed(repo.read, "b@example.com/be", "crew")).toBe(false);
 });
 
 // #807 P3 B4b: repo.delegation reads on the handle it's given, and its facts answer only what they read: a question

@@ -96,7 +96,7 @@ test("private board visibility is checked again after reading the blob", async (
     const team = await app.repo.teams.create(tx, "private", alice.authed.user_id);
     await app.repo.teams.addMember(tx, team.id, alice.authed.user_id);
     await app.repo.teams.addMember(tx, team.id, bob.authed.user_id);
-    ensureTeamBoard(app.repo, tx, team, "alice@example.com");
+    await ensureTeamBoard(app.repo, tx, team, "alice@example.com");
     await onTeamJoined(app.repo, tx, team, "alice@example.com");
     await onTeamJoined(app.repo, tx, team, "bob@example.com");
     return team;
