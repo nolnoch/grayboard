@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse } from "jsonc-parser";
@@ -105,6 +105,35 @@ test("selected config symlinks and dangling symlinks refuse without target mutat
     expect(lstatSync(f.config).isSymbolicLink()).toBe(true);
     if (!dangling) expect(readFileSync(target, "utf8")).toBe('{}\n');
   }
+});
+
+test("a hard-linked config refuses a write (dry run too) and stays linked; an unchanged one passes", () => {
+  const f = fixture();
+  const other = join(f.root, "dotfiles.jsonc");
+  writeFileSync(f.config, '{ // mine\n}\n');
+  linkSync(f.config, other);
+  const before = readdirSync(f.root).sort();
+  for (const dryRun of [false, true]) expect(() => f.run({ dryRun })).toThrow("other hard links");
+  expect(readdirSync(f.root).sort()).toEqual(before);
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(other, "utf8")).toBe('{ // mine\n}\n');
+  rmSync(other);
+  f.run();
+  const text = readFileSync(f.config, "utf8");
+  linkSync(f.config, other);
+  expect(f.run()).toEqual({ changed: false, migrated: false, dryRun: false });
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(f.config, "utf8")).toBe(text);
+});
+
+test("a hard link made during setup refuses the replace and leaves no temp file", () => {
+  const f = fixture();
+  const other = join(f.root, "dotfiles.jsonc");
+  writeFileSync(f.config, '{}\n');
+  expect(() => setupOpenCode(f.opts, source, () => linkSync(f.config, other))).toThrow("Config changed during setup");
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(f.config, "utf8")).toBe('{}\n');
+  expect(readdirSync(f.root).sort()).toEqual(["dotfiles.jsonc", "installed-plugin", "opencode.jsonc"]);
 });
 
 test("sibling conflict/malformed/symlink config refuses; unrelated sibling stays byte-exact", () => {
