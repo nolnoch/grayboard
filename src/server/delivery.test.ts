@@ -49,7 +49,7 @@ test("stale receipt audit survives rollback exactly once without committing any 
   await send();
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id, "direct:99999"])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   const rows = store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action = 'hosted.stale_capability'").all();
   expect(rows).toHaveLength(1);
   expect(rows[0]!.actor).toBe(bob.authed.user_email);
@@ -149,10 +149,10 @@ test("reads repeat without admission; receipt and dm_ack remain distinct", async
   const pending = await delivery.pending(bob, context(bob), lease.capability);
   expect(pending.map(p => p.id)).toEqual([`direct:${first}`, `direct:${second}`]);
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual(pending);
-  expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   await delivery.receipt(bob, context(bob), lease.capability, pending.map(p => p.id));
   await delivery.receipt(bob, context(bob), lease.capability, pending.map(p => p.id));
-  expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(second);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(second);
   expect((await sender.inbox()).promised).toHaveLength(1);
 });
 
@@ -163,9 +163,9 @@ test("only an issued contiguous direct prefix advances MAX cursor, ignoring glob
   await send("second");
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[1]!.id])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id, "direct:99999"])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
   await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
   await delivery.receipt(bob, context(bob), lease.capability, items.map(i => i.id));
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
@@ -181,7 +181,7 @@ test("foreign principal, grant, session, and unissued receipt have no authority"
   }
   items[0]!.id = "direct:99999";
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
 });
 
 test("renew is fenced and extends sticky deadline, reopening is idempotent", async () => {
@@ -267,7 +267,7 @@ test("receipt storage failure rolls back direct admission and keeps the issued b
   application.receiptBoards = () => { throw new Error("injected receipt rollback"); };
   try {
     await expect(delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id))).rejects.toThrow("injected receipt rollback");
-    expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
+    expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
     expect(delivery.describe(bob, context(bob), lease.capability).capability).toBe(lease.capability);
   } finally { application.receiptBoards = original; }
   await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
@@ -342,9 +342,9 @@ test("one lease admits more than 1000 deliveries with bounded idempotent receipt
     await delivery.receipt(bob, context(bob), lease.capability, latest);
     await delivery.receipt(bob, context(bob), lease.capability, latest);
   }
-  const cursor = store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe");
+  const cursor = await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe");
   await expect(delivery.receipt(bob, context(bob), lease.capability, [firstId])).rejects.toHaveProperty("code", "not_found");
-  expect(store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(cursor);
+  expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(cursor);
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
   expect((await delivery.open(bob, context(bob))).capability).toBe(lease.capability);
   expect(delivery.activeLeaseCount).toBe(1);

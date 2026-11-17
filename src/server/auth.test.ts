@@ -48,11 +48,11 @@ describe("verifySessionToken", () => {
 
   test("valid token returns authed user", async () => {
     const raw = mintToken();
-    await seed(repo, tx => {
+    await seed(repo, async tx => {
       const u = repo.users.upsertByEmail(tx, "wade@example.com", null);
-      repo.sessions.create(tx, u.id, hashToken(raw), null);
+      await repo.sessions.create(tx, u.id, hashToken(raw), null);
     });
-    const authed = verifySessionToken(raw, repo, touches, 0);
+    const authed = await verifySessionToken(raw, repo, touches, 0);
     expect(authed).not.toBeNull();
     expect(authed!.user_email).toBe("wade@example.com");
   });
@@ -65,55 +65,55 @@ describe("verifySessionToken", () => {
     const day = 86_400_000;
     const idle = (days: number) => seed(repo, tx => repo.sessions.touch(tx, s.id, repo.now() - days * day));
     await idle(29);
-    expect(verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
     await idle(31);
-    expect(verifySessionToken(raw, repo, touches, 30)).toBeNull();
-    expect(verifySessionToken(raw, repo, touches, 0)).not.toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 30)).toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 0)).not.toBeNull();
     // Age doesn't count: a year-old token used yesterday works.
-    await seed(repo, tx => {
+    await seed(repo, async tx => {
       db.run("UPDATE sessions SET created_at = ? WHERE id = ?", [repo.now() - 365 * day, s.id]);
-      repo.sessions.touch(tx, s.id, repo.now() - day);
+      await repo.sessions.touch(tx, s.id, repo.now() - day);
     });
-    expect(verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 30)).not.toBeNull();
   });
 
-  test("missing token returns null", () => {
-    expect(verifySessionToken("gbrd_v1_nonexistent", repo, touches, 0)).toBeNull();
+  test("missing token returns null", async () => {
+    expect(await verifySessionToken("gbrd_v1_nonexistent", repo, touches, 0)).toBeNull();
   });
 
   test("revoked token returns null", async () => {
     const raw = mintToken();
-    await seed(repo, tx => {
+    await seed(repo, async tx => {
       const u = repo.users.upsertByEmail(tx, "wade@example.com", null);
-      const s = repo.sessions.create(tx, u.id, hashToken(raw), null);
-      repo.sessions.revoke(tx, s.id);
+      const s = await repo.sessions.create(tx, u.id, hashToken(raw), null);
+      await repo.sessions.revoke(tx, s.id);
     });
-    expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 0)).toBeNull();
   });
 
   test("disabled user returns null", async () => {
     const raw = mintToken();
-    await seed(repo, tx => {
+    await seed(repo, async tx => {
       const u = repo.users.upsertByEmail(tx, "wade@example.com", null);
-      repo.sessions.create(tx, u.id, hashToken(raw), null);
+      await repo.sessions.create(tx, u.id, hashToken(raw), null);
       repo.users.setDisabled(tx, u.id, true);
     });
-    expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 0)).toBeNull();
   });
 
   // Security audit F-14: disable revokes the token, so enable doesn't revive it.
   test("re-enabled user's old token stays revoked; a new one works", async () => {
     const raw = mintToken();
-    const u = await seed(repo, tx => {
+    const u = await seed(repo, async tx => {
       const u = repo.users.upsertByEmail(tx, "wade@example.com", null);
-      repo.sessions.create(tx, u.id, hashToken(raw), null);
+      await repo.sessions.create(tx, u.id, hashToken(raw), null);
       repo.users.setDisabled(tx, u.id, true);
       repo.users.setDisabled(tx, u.id, false);
       return u;
     });
-    expect(verifySessionToken(raw, repo, touches, 0)).toBeNull();
+    expect(await verifySessionToken(raw, repo, touches, 0)).toBeNull();
     const fresh = mintToken();
     await seed(repo, tx => repo.sessions.create(tx, u.id, hashToken(fresh), null));
-    expect(verifySessionToken(fresh, repo, touches, 0)).not.toBeNull();
+    expect(await verifySessionToken(fresh, repo, touches, 0)).not.toBeNull();
   });
 });

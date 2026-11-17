@@ -1387,7 +1387,7 @@ export function piHostedScenario(dir: string): Promise<void> {
     // receipt moves pi-task's cursor past it.
     const asked = model.requests.length;
     const ping = await pingPong(srv, peer, "pi-task");
-    await until(() => srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/pi-task") >= ping, 15_000, "the receipt advances the cursor");
+    await until(async () => (await srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/pi-task")) >= ping, 15_000, "the receipt advances the cursor");
     await idle(pi);
     const woken = model.requests[asked]!.body;
     expect(messageText(woken.messages.at(-1)!)).toStartWith(`<channel source="grayboard" message_id="${ping}" from="${PEER}"`);

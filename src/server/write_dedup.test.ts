@@ -155,12 +155,12 @@ describe("dedupWrite", () => {
   // receipt where Postgres could, and the two-transaction tests come with P3.
   test("the receipt is claimed before the write runs", async () => {
     const fp = fingerprint("dm_send", "s1", SENDER, call().args);
-    let seen: unknown;
+    let seen: Promise<unknown> | undefined;
     await dedup(1_000, call(), tx => {
       seen = repo.writeReceipts.find(tx, "s1", SENDER, fp, 0);
       return send()(tx);
     });
-    expect(seen).toMatchObject({ ref_id: 0, at: 1_000 });
+    expect(await seen).toMatchObject({ ref_id: 0, at: 1_000 });
     expect(await seed(repo, tx => repo.writeReceipts.claim(tx, { session: "s1", sender: SENDER, fp }, "dm_send", 2_000))).toBe(false);
   });
 
@@ -172,10 +172,10 @@ describe("dedupWrite", () => {
     const reclaim = receipts.reclaim;
     let winner = 0;
     // The other call's write and receipt land between this call's read of the stale receipt and its takeover.
-    receipts.reclaim = (tx, key, stale, at) => {
+    receipts.reclaim = async (tx, key, stale, at) => {
       const w = send("hi")(tx);
       winner = w.ref.id;
-      receipts.upsert(tx, { ...key, tool: "dm_send", ref_kind: "message", ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at });
+      await receipts.upsert(tx, { ...key, tool: "dm_send", ref_kind: "message", ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at });
       return reclaim(tx, key, stale, at);
     };
     let again: Awaited<ReturnType<typeof dedup>>;
@@ -195,10 +195,10 @@ describe("dedupWrite", () => {
     const claim = receipts.claim;
     let landed = false;
     // Another call's receipt, stamped before this call's window, commits between this call's prune and its claim.
-    receipts.claim = (tx, key, tool, at) => {
+    receipts.claim = async (tx, key, tool, at) => {
       if (!landed) {
         landed = true;
-        receipts.upsert(tx, { ...key, tool, ref_kind: "message", ref_id: 99, result_json: "{}", at: at - WRITE_DEDUP_WINDOW_MS - 1 });
+        await receipts.upsert(tx, { ...key, tool, ref_kind: "message", ref_id: 99, result_json: "{}", at: at - WRITE_DEDUP_WINDOW_MS - 1 });
       }
       return claim(tx, key, tool, at);
     };
@@ -216,8 +216,8 @@ describe("dedupWrite", () => {
     const receipts = repo.writeReceipts;
     const { claim, find } = receipts;
     let claims = 0;
-    receipts.claim = () => { claims++; return false; };
-    receipts.find = () => undefined;
+    receipts.claim = async () => { claims++; return false; };
+    receipts.find = async () => undefined;
     try {
       await expect(dedup(1_000, call(), send())).rejects.toThrow(/kept changing under this call; retry it/);
     } finally {

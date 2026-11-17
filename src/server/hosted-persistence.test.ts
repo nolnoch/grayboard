@@ -228,7 +228,7 @@ for (const operation of ["revoke", "bind"] as const) {
       expect(external({ operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }).ok).toBe(true);
     });
     await expect(receipt).rejects.toHaveProperty("code", "not_found");
-    expect(database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
+    expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
   });
 
   test(`receipt lock precedes external ${operation}, consumes only the authorized batch`, async () => {
@@ -237,7 +237,7 @@ for (const operation of ["revoke", "bind"] as const) {
     const message = await seed(database.repo, tx => database.repo.messages.insert(tx, "sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
     const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
     expect(results.every(result => result.ok)).toBe(true);
-    expect(database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(message.id);
+    expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(message.id);
   }, 15_000);
 }
 

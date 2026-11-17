@@ -1300,8 +1300,8 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
     expect(joins()).toBe(0); // warm: no token join while nothing has changed
     // A write inside a transaction that rolls back: false within it, true again after.
-    await expect(seed(storage.repo, tx => {
-      storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id);
+    await expect(seed(storage.repo, async tx => {
+      await storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id);
       expect(service.isAuthorized(p)).toBe(false);
       throw new Error("roll back");
     })).rejects.toThrow("roll back");
@@ -1432,9 +1432,9 @@ test("a login code redeems once for a CLI session token: no refresh, no expiry, 
   expect(body).toMatchObject({ token_type: "Bearer", scope: LOGIN_SCOPE });
   const token = body.access_token as string;
   expect(token).toStartWith("gbrd_v1_");
-  const authed = verifySessionToken(token, storage.repo, touches, 30);
+  const authed = await verifySessionToken(token, storage.repo, touches, 30);
   expect(authed).toMatchObject({ user_email: "you@example.com" });
-  expect(storage.repo.sessions.findById(storage.repo.read, authed!.session_id)).toMatchObject({ label: "grayboard-test", revoked_at: null });
+  expect(await storage.repo.sessions.findById(storage.repo.read, authed!.session_id)).toMatchObject({ label: "grayboard-test", revoked_at: null });
   // Not an OAuth access token.
   expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }))).toBeInstanceOf(Response);
   expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
@@ -1449,7 +1449,7 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
     const a = await cliCode();
     const first = await post("/oauth/token", cliTokenParams(a));
     const token = (await first.json() as { access_token: string }).access_token;
-    const authed = verifySessionToken(token, storage.repo, touches, 30)!;
+    const authed = (await verifySessionToken(token, storage.repo, touches, 30))!;
     expect(authed).not.toBeNull();
     // Kept past its expiry while the session lives, so a late replay is still caught.
     clock += OAUTH_TTL.code + 1;
@@ -1457,8 +1457,8 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
     const again = await post("/oauth/token", cliTokenParams(a));
     expect(again.status).toBe(400);
     expect(await again.json()).toEqual({ error: "invalid_grant" });
-    expect(verifySessionToken(token, storage.repo, touches, 30)).toBeNull();
-    expect(storage.repo.sessions.findById(storage.repo.read, authed.session_id)!.revoked_at).not.toBeNull();
+    expect(await verifySessionToken(token, storage.repo, touches, 30)).toBeNull();
+    expect((await storage.repo.sessions.findById(storage.repo.read, authed.session_id))!.revoked_at).not.toBeNull();
     expect(accessAudits(storage.db, "oauth.code_replay_revoked")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: CLI_CLIENT_ID, token_session: authed.session_id, level: "warning" } })]);
     // With its session revoked the spent code goes at the next sweep.
     await seed(storage.repo, tx => storage.repo.oauth.cleanup(tx, clock));

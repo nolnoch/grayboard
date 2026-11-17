@@ -60,10 +60,9 @@ export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
 
 // An AppSession of the server `app`, signed in with the session token
 // `token` as an API request resolves it; connect() it. The caller closes it.
+// The token is read now; connect() rejects when it didn't authenticate.
 export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-  const authed = verifySessionToken(token, app.repo, app.touches, 0);
-  if (!authed) throw new Error("appSession: the token doesn't authenticate");
-  return new AppSession(app.application, app.repo, authed, identity, opts);
+  return new AppSession(app.application, app.repo, verifySessionToken(token, app.repo, app.touches, 0), identity, opts);
 }
 
 // The ApplicationError `p` (a connect, a bind, a call) is refused with.
@@ -89,7 +88,8 @@ export class AppSession {
     private readonly application: Application,
     // A handler that writes runs in a queued body, as hosted `run` holds the write queue around it (#807 P1b-4f).
     private readonly repo: Pick<Repo, "write" | "read">,
-    private readonly authed: AuthedUser,
+    // A token's sign-in may still be resolving (signedIn): connect() awaits it.
+    private readonly authed: AuthedUser | Promise<AuthedUser | null>,
     // The alias to bind after connecting; null stays an unbound session.
     private readonly identity: string | null,
     private readonly opts: AppSessionOptions = {},
@@ -175,6 +175,8 @@ export class AppSession {
   // with the ApplicationError that refused either.
   async connect(): Promise<AppConnected> {
     if (this.session || this.closed) throw new Error(`${this.label}: connect() runs once, before close()`);
+    const authed = await this.authed;
+    if (!authed) throw new Error("appSession: the token doesn't authenticate");
     const toolsOnly = this.opts.push === false && this.opts.hold !== true;
     const id = idAddress(this.key);
     let info: IdentityInfo;
@@ -183,11 +185,11 @@ export class AppSession {
     try {
       ({ session: this.session, info } = await seed(this.repo, tx => {
         const writesAs = toolsOnly && this.identity !== null
-          ? this.application.hostedWritesAs(tx, this.authed, id, this.identity, true, (address, detail) => later(w => this.application.hostedRefused(w, id, address, detail)), later)
+          ? this.application.hostedWritesAs(tx, authed, id, this.identity, true, (address, detail) => later(w => this.application.hostedRefused(w, id, address, detail)), later)
           : null;
-        this.application.hostedRegister(tx, this.authed, id, this.opts.harness ?? "test", writesAs, why => later(w => this.application.hostedCollided(w, this.authed, id, why)));
-        if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(tx, this.authed, id, { ownership: 0, client_id: "test" });
-        return this.application.hostedSession(tx, this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
+        this.application.hostedRegister(tx, authed, id, this.opts.harness ?? "test", writesAs, why => later(w => this.application.hostedCollided(w, authed, id, why)));
+        if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(tx, authed, id, { ownership: 0, client_id: "test" });
+        return this.application.hostedSession(tx, authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
       }));
     } catch (e) {
       await this.flushRefusal(rows);
@@ -261,7 +263,7 @@ export class AppSession {
 
   async ack(ids: number[]): Promise<void> {
     const session = this.live();
-    await this.write(session, tx => { this.application.receiptDirect(tx, session, ids); });
+    await this.write(session, tx => this.application.receiptDirect(tx, session, ids));
   }
 
   async boardAck(refs: PendingRef[]): Promise<void> {
