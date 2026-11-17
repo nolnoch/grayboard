@@ -26,7 +26,8 @@ import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
-import { RootDelivery } from "../../adapters/hosted-core/src/root.ts";
+import { NotStarted, RootDelivery } from "../../adapters/hosted-core/src/root.ts";
+import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath, FileStorage, sessionPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -630,13 +631,22 @@ test("a resume whose rebind is refused says so at once and in the next tool resu
 test("a model call waits at most INSTRUCTIONS_WAIT_MS for the instructions; a timeout or failure is said once, backs off, and a success clears it", async () => {
   const r = await root("slow-s", "slow");
   const real = RootDelivery.prototype.instructions;
-  let mode: "stall" | "fail" | "real" = "stall";
+  let mode: "stall" | "late" | "fail" | "signed-out" | "starting" | "real" = "stall";
+  let land: (() => void) | undefined;
   const fetch = spyOn(RootDelivery.prototype, "instructions").mockImplementation(function (this: RootDelivery) {
-    return mode === "stall" ? new Promise<never>(() => {}) : mode === "fail" ? Promise.reject(new Error("boom")) : real.call(this);
+    switch (mode) {
+      case "stall": return new Promise<never>(() => {});
+      case "late": return new Promise<string | undefined>(resolve => { land = () => resolve("late text"); });
+      case "fail": return Promise.reject(new Error("boom"));
+      case "signed-out": return Promise.reject(new Error("wrapped", { cause: new AccessExpired("pi", LOGIN_ACTION) }));
+      case "starting": return Promise.reject(new NotStarted());
+      case "real": return real.call(this);
+    }
   });
   const wall = Date.now;
   let skew = 0;
   const clock = spyOn(Date, "now").mockImplementation(() => wall() + skew);
+  const warning = (why: string) => ({ level: "warning" as Level, message: `grayboard: fetching the instructions ${why}, so they aren't refreshed; trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s or once a fetch answers` });
   try {
     r.notices.length = 0;
     const began = performance.now();
@@ -644,8 +654,8 @@ test("a model call waits at most INSTRUCTIONS_WAIT_MS for the instructions; a ti
     const waited = performance.now() - began;
     expect(waited).toBeGreaterThanOrEqual(INSTRUCTIONS_WAIT_MS - 50);
     expect(waited).toBeLessThan(INSTRUCTIONS_WAIT_MS + 1_500);
-    const said = { level: "warning" as Level, message: `grayboard: fetching the instructions took longer than ${INSTRUCTIONS_WAIT_MS} ms; model requests go out without them, trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s` };
-    expect(r.notices).toEqual([said]);
+    const slow = warning(`took longer than ${INSTRUCTIONS_WAIT_MS} ms`);
+    expect(r.notices).toEqual([slow]);
 
     // Backing off: no fetch at all, so no wait.
     expect(await r.ext.instructions()).toBeUndefined();
@@ -656,7 +666,7 @@ test("a model call waits at most INSTRUCTIONS_WAIT_MS for the instructions; a ti
     mode = "fail";
     expect(await r.ext.instructions()).toBeUndefined();
     expect(fetch).toHaveBeenCalledTimes(2);
-    expect(r.notices).toEqual([said]);
+    expect(r.notices).toEqual([slow]);
 
     // A success ends the streak; the next failure is said again, with its cause.
     skew += INSTRUCTIONS_BACKOFF_MS + 1;
@@ -664,7 +674,26 @@ test("a model call waits at most INSTRUCTIONS_WAIT_MS for the instructions; a ti
     expect(await r.ext.instructions()).toStartWith(`You are "${EMAIL}/slow" on grayboard.`);
     mode = "fail";
     expect(await r.ext.instructions()).toBeUndefined();
-    expect(r.notices).toEqual([said, { level: "warning", message: `grayboard: fetching the instructions failed: boom; model requests go out without them, trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s` }]);
+    expect(r.notices).toEqual([slow, warning("failed: boom")]);
+
+    // A timed-out fetch that then lands ends its backoff: the next call fetches at once.
+    skew += INSTRUCTIONS_BACKOFF_MS + 1;
+    mode = "late";
+    expect(await r.ext.instructions()).toBeUndefined();
+    land!();
+    mode = "real";
+    await until(async () => (await r.ext.instructions()) !== undefined);
+    expect(fetch).toHaveBeenCalledTimes(6);
+
+    // A sign-out and a root still starting are neither said nor backed off.
+    r.notices.length = 0;
+    for (const m of ["signed-out", "starting"] as const) {
+      mode = m;
+      expect(await r.ext.instructions()).toBeUndefined();
+    }
+    mode = "real";
+    expect(await r.ext.instructions()).toStartWith(`You are "${EMAIL}/slow" on grayboard.`);
+    expect(r.notices).toEqual([]);
   } finally { fetch.mockRestore(); clock.mockRestore(); }
 });
 

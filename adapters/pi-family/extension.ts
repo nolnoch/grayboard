@@ -26,9 +26,9 @@ import * as signIns from "../hosted-core/src/offer.ts";
 import type { Flow, Last, Origin, Outcome, SignInState } from "../hosted-core/src/offer.ts";
 import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
-import { failure, hostTools, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { failure, hostTools, signOutCause, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
 import { outputOf } from "../hosted-core/src/results.ts";
-import { RootDelivery } from "../hosted-core/src/root.ts";
+import { NotStarted, RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
 import { configuredIdentity, describeLocation, sessionIdentity } from "../../src/shared/identity.ts";
 
@@ -477,9 +477,10 @@ export function createGrayboard(h: Harness): Grayboard {
   // child registers first: the text an unregistered session gets tells it to
   // bind, which the server refuses a child.
   // Bounded by INSTRUCTIONS_WAIT_MS; a timeout or failure is said once until a
-  // fetch succeeds, and starts INSTRUCTIONS_BACKOFF_MS without fetching. A
-  // sign-out is said by the sign-in path, so it is neither said here nor
-  // backed off: the first call after a login fetches.
+  // fetch succeeds, and starts INSTRUCTIONS_BACKOFF_MS without fetching, which
+  // a timed-out fetch that then lands ends (its text is cached). A sign-out
+  // (the sign-in path says it; the first call after a login fetches), a root
+  // still starting, and a shutdown are neither said nor backed off.
   let quietUntil = 0;
   let failing = false;
   const instructions = async (): Promise<string | undefined> => {
@@ -500,11 +501,14 @@ export function createGrayboard(h: Harness): Grayboard {
       if (text !== LATE) { failing = false; return text; }
       why = `took longer than ${INSTRUCTIONS_WAIT_MS} ms`;
     } catch (error) {
-      if (error instanceof AccessExpired) return undefined;
+      if (closed || signOutCause(error) || error instanceof NotStarted) return undefined;
       why = `failed: ${message(error)}`;
     } finally { clearTimeout(timer); }
-    quietUntil = Date.now() + INSTRUCTIONS_BACKOFF_MS;
-    if (!failing) log(`fetching the instructions ${why}; model requests go out without them, trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s`, "warning");
+    if (closed) return undefined;
+    const until = quietUntil = Date.now() + INSTRUCTIONS_BACKOFF_MS;
+    // Late but answered: the backoff it started ends.
+    fetching.then(() => { if (quietUntil === until) { quietUntil = 0; failing = false; } }, () => {});
+    if (!failing) log(`fetching the instructions ${why}, so they aren't refreshed; trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s or once a fetch answers`, "warning");
     failing = true;
     return undefined;
   };
