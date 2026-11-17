@@ -109,8 +109,8 @@ type FamilyInstall = { adapter: string; notes: string[]; signIn: boolean };
  * the existing entry kept in its local shape). Leaving a hosted install's
  * server (local mode, or another server) signs the harness out of it first,
  * revoking its grant. Returns the adapter's path, what else changed, and
- * whether the harness now needs /grayboard login (a hosted install whose
- * server changed: new, or migrated from local or another server).
+ * whether the harness needs /grayboard login (a hosted install holding no
+ * grant for the server).
  * Throws, before any file changes, on a server URL the hosted extension would
  * refuse or an unparseable mcp.json or config.json; throws after the entry
  * check if the sign-out does (its grant store's lock), leaving the install
@@ -138,7 +138,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     rmSync(h.local, { force: true });
     writeJsonFile(h.hostedConfig, { url } satisfies HostedConfig);
     notes.push(`Wrote ${h.hostedConfig}`);
-    return { adapter: h.hosted, notes, signIn: old !== url };
+    return { adapter: h.hosted, notes, signIn: !(await piFamilyGrant(h, url)) };
   }
   // The local adapter reads its command from the entry, so one that's missing
   // (a server-mode install removed it, or the user did) is recreated with
@@ -165,17 +165,27 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
  */
 async function signOutPiFamily(h: PiFamily, resource: string): Promise<string | undefined> {
   let queued: string | undefined;
-  let login: Login;
-  try {
-    login = new Login({ resource, clientId: h.clientId, stateDir: h.stateDir, harness: h.name, loginAction: "run /grayboard login",
-      present: () => {}, notify: () => {}, diagnostic: r => { if (r.code === "revoke_queued") queued = r.message; } });
-  } catch { return undefined; } // not canonical: the extension never loaded with it, so never signed in
+  const login = piFamilyLogin(h, resource, r => { if (r.code === "revoke_queued") queued = r.message; });
+  if (!login) return undefined;
   const s = await login.read();
   if (!s?.refresh && !s?.revoke?.length) return undefined;
   await login.logout();
   if (queued === undefined) return `Signed ${h.name} out of ${login.resource} and revoked its grant`;
   const cause = /\(([^()]*)\)$/.exec(queued)?.[1] ?? queued;
   return `Signed ${h.name} out of ${login.resource}; revoking its grant failed and stays queued for its next login there (${cause})`;
+}
+
+/** The harness's grant store for `resource`, or undefined for a URL the extension refuses (it never loaded with it, so never signed in). */
+function piFamilyLogin(h: PiFamily, resource: string, diagnostic: ConstructorParameters<typeof Login>[0]["diagnostic"] = () => {}): Login | undefined {
+  try {
+    return new Login({ resource, clientId: h.clientId, stateDir: h.stateDir, harness: h.name, loginAction: "run /grayboard login",
+      present: () => {}, notify: () => {}, diagnostic });
+  } catch { return undefined; }
+}
+
+/** Whether the harness holds a grant for `resource`; an unreadable store counts as none. */
+async function piFamilyGrant(h: PiFamily, resource: string): Promise<boolean> {
+  try { return !!(await piFamilyLogin(h, resource)?.read())?.refresh; } catch { return false; }
 }
 
 function writeAdapter(path: string, source: string): void {
@@ -739,7 +749,7 @@ program
       }
       for (const note of r.notes) console.log(note);
       console.log(`Installed ${r.adapter}`);
-      if (server) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
+      if (r.signIn) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
     };
     // 3. omp. Local: the bundled adapter runs grayboard, serves its tools and
     // delivers pushes to main. Server: the hosted extension against /mcp.
