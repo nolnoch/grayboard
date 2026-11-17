@@ -2,7 +2,7 @@
 // empty is unset, `~` expands, a file:// URL converts, anything else is as is.
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { ompAgentDir, piAgentDir } from "./pi.ts";
+import { ompAgentDir, ompSetupRefusal, piAgentDir, piSetupAgentDir } from "./pi.ts";
 
 const HOME = "/home/you";
 
@@ -81,8 +81,26 @@ test("ompAgentDir matches omp's getAgentDir() in every case", () => {
     const env: Record<string, string | undefined> = { ...process.env, HOME };
     for (const k of keys) delete env[k];
     Object.assign(env, c);
-    const r = Bun.spawnSync([process.execPath, "-e", `import { getAgentDir } from "@oh-my-pi/pi-utils/dirs"; console.log(getAgentDir())`], { env, cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+    const r = Bun.spawnSync([process.execPath, "--no-env-file", "-e", `import { getAgentDir } from "@oh-my-pi/pi-utils/dirs"; console.log(getAgentDir())`], { env, cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
     expect(r.exitCode, r.stderr.toString()).toBe(0);
     expect([c, ompAgentDir(c, HOME)]).toEqual([c, r.stdout.toString().trim()]);
   }
 }, 60_000);
+
+test("piSetupAgentDir: an omp profile's own exported PI_CODING_AGENT_DIR is omp's, so pi's is its default", () => {
+  expect(piSetupAgentDir({ OMP_PROFILE: "work", PI_CODING_AGENT_DIR: "/home/you/.omp/profiles/work/agent" }, HOME)).toBe("/home/you/.pi/agent");
+  expect(piSetupAgentDir({ PI_PROFILE: "work", PI_CODING_AGENT_DIR: "/home/you/.omp/profiles/work/agent" }, HOME)).toBe("/home/you/.pi/agent");
+  // Any other value is the user's pi setting.
+  expect(piSetupAgentDir({ OMP_PROFILE: "work", PI_CODING_AGENT_DIR: "/srv/pi" }, HOME)).toBe("/srv/pi");
+  expect(piSetupAgentDir({ PI_CODING_AGENT_DIR: "/home/you/.omp/profiles/work/agent" }, HOME)).toBe("/home/you/.omp/profiles/work/agent");
+});
+
+test("ompSetupRefusal names the cause: a relative default-profile override, a shared PI_CODING_AGENT_DIR, or PI_CONFIG_DIR", () => {
+  expect(ompSetupRefusal({}, HOME)).toBeUndefined();
+  expect(ompSetupRefusal({ OMP_PROFILE: "work", PI_CODING_AGENT_DIR: "/home/you/.omp/profiles/work/agent" }, HOME)).toBeUndefined();
+  expect(ompSetupRefusal({ OMP_PROFILE: "work", PI_CODING_AGENT_DIR: "rel" }, HOME)).toBeUndefined();
+  expect(ompSetupRefusal({ PI_CODING_AGENT_DIR: "~/x" }, HOME)).toStartWith("omp resolves PI_CODING_AGENT_DIR (~/x) against the directory omp starts in");
+  expect(ompSetupRefusal({ PI_CODING_AGENT_DIR: "file:///x" }, HOME)).toStartWith("omp resolves PI_CODING_AGENT_DIR (file:///x)");
+  expect(ompSetupRefusal({ PI_CODING_AGENT_DIR: "/srv/a" }, HOME)).toStartWith("omp's agent directory is pi's (/srv/a: omp reads PI_CODING_AGENT_DIR too)");
+  expect(ompSetupRefusal({ PI_CONFIG_DIR: ".pi" }, HOME)).toStartWith("omp's agent directory is pi's (/home/you/.pi/agent: PI_CONFIG_DIR=.pi puts omp's root where pi's is)");
+});

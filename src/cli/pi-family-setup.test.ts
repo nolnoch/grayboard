@@ -247,6 +247,7 @@ test("setup refuses omp's adapter in an agent dir it shares with pi; refresh lea
   const setup = f.exec(["setup", "--local", "-y"], shared);
   expect(setup.exitCode).toBe(1);
   expect(setup.stderr).toContain(`omp's agent directory is pi's (${shared}: omp reads PI_CODING_AGENT_DIR too)`);
+  expect(setup.stderr).toContain("OMP_PROFILE=<name> grayboard setup");
   expect(readFileSync(join(shared, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
   expect(existsSync(f.dir)).toBe(false);
   const refresh = f.exec(["refresh-adapters"], shared);
@@ -255,6 +256,51 @@ test("setup refuses omp's adapter in an agent dir it shares with pi; refresh lea
   expect(refresh.stderr).not.toContain("omp's");
   expect(readFileSync(join(shared, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
 }, 60_000);
+
+// In a shared dir only pi's entry is checked: an enabled push-on entry with
+// no adapter warns once, as pi, never as omp.
+test("refresh-adapters in an agent dir omp shares with pi warns about an undelivered entry once, as pi's", () => {
+  const f = fixture("omp");
+  const shared = join(f.root, "shared");
+  mkdirSync(shared, { recursive: true });
+  writeFileSync(join(shared, "mcp.json"), JSON.stringify({ mcpServers: { grayboard: { command: "grayboard", args: ["mcp"] } } }));
+  const r = f.exec(["refresh-adapters"], shared);
+  expect(r.exitCode, r.stderr).toBe(0);
+  const warnings = r.stdout.split("\n").filter(l => l.includes("no grayboard adapter is installed"));
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toStartWith("[grayboard] pi: ");
+}, 60_000);
+
+// omp's named profile exports its agent dir as PI_CODING_AGENT_DIR to every
+// child (setProfile), so `grayboard` run from omp's bash sees omp's dir there:
+// it's omp's, and pi's stays its default.
+test("setup and refresh-adapters run inside an omp profile session keep omp's adapter in the profile dir and pi's in its default", () => {
+  const f = fixture("omp");
+  writeFileSync(join(f.root, "bin", "pi"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(f.root, "bin", "pi"), 0o755);
+  const dir = join(f.root, ".omp", "profiles", "work", "agent");
+  const pi = join(f.root, ".pi", "agent");
+  const setup = f.exec(["setup", "--local", "-y"], dir, { OMP_PROFILE: "work" });
+  expect(setup.exitCode, setup.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(readFileSync(join(pi, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+  const refresh = f.exec(["refresh-adapters"], dir, { OMP_PROFILE: "work" });
+  expect(refresh.exitCode, refresh.stderr).toBe(0);
+  expect(readFileSync(join(dir, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("omp"));
+  expect(readFileSync(join(pi, "extensions", "grayboard.ts"), "utf8")).toBe(localSource("pi"));
+}, 60_000);
+
+// omp path-resolves a relative default-profile PI_CODING_AGENT_DIR against
+// its own start directory, so setup can't know the dir and refuses.
+test("setup refuses omp's adapter for a relative or ~ PI_CODING_AGENT_DIR in the default profile", () => {
+  for (const value of ["~/omp", "rel/omp"]) {
+    const f = fixture("omp");
+    const r = f.exec(["setup", "--local", "-y"], value);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain(`omp resolves PI_CODING_AGENT_DIR (${value}) against the directory omp starts in`);
+    expect(existsSync(join(f.root, value))).toBe(false);
+  }
+}, 120_000);
 
 test("setup upgrades an existing raw local omp adapter in place to the bundle", () => {
   const f = fixture("omp");
