@@ -3,7 +3,7 @@
 import { attachmentReach, getAttachment, releaseUpload, storeAttachment, type AttachmentRow } from "../core/attachments.ts";
 import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
-import { participant, queuedTx, type Repo } from "./db.ts";
+import { participant, queuedGuardTx, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
 import { addressSet } from "../core/bindings.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest } from "./policy.ts";
@@ -39,6 +39,10 @@ export function requestAttachment(repo: Repo, r: Read, handle: string, idText: s
   return { refused: d.reason };
 }
 
+// A hosted transfer's binding check (#1053): it reads on `r`, the handle of the context it runs in: the pool
+// between transactions, a body's own Tx inside one, so it never takes a second connection while a body holds one.
+export type Guard = (r: Read) => void;
+
 // Stores a checked file as an unsent upload of `handle`'s, within the quotas
 // of its principal, the user `email` (unsent bytes, and stored bytes in all),
 // and audits it. The HTTP upload route and the Slack app's in-process sends
@@ -50,17 +54,18 @@ export async function storeUpload(
   handle: string,
   file: AttachmentFile,
   detail: Record<string, unknown> = {},
-  guard?: () => void,
+  guard?: Guard,
 ): Promise<AttachmentRow> {
   const quota = { principal: email, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
-  const tx = queuedTx(repo);
+  const inBody = queuedGuardTx(repo, guard);
+  const tx = inBody.tx;
   const pool = repo.coreOn(repo.read);
-  const row = await storeAttachment(pool, repo.blobs, handle, file, { quota, guard, tx });
+  const row = await storeAttachment(pool, repo.blobs, handle, file, { quota, guard: inBody.guard, tx });
   try {
     // The guard and the audit row are one awaited write (#965): a failed audit row fails the upload, which is
     // released, rather than keeping bytes no `attachment.uploaded` row records.
-    await repo.write(() => {
-      guard?.();
+    await repo.write(w => {
+      guard?.(w);
       writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
         identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
       });
@@ -81,9 +86,10 @@ export async function releaseStored(
   handle: string,
   id: number,
   detail: Record<string, unknown> = {},
-  guard?: () => void,
+  guard?: Guard,
 ): Promise<AttachmentRow | null> {
-  const row = await releaseUpload(repo.coreOn(repo.read), repo.blobs, id, { addresses: [handle], principal: email }, guard, queuedTx(repo));
+  const inBody = queuedGuardTx(repo, guard);
+  const row = await releaseUpload(repo.coreOn(repo.read), repo.blobs, id, { addresses: [handle], principal: email }, inBody.guard, inBody.tx);
   if (row) {
     writeAudit(repo, "attachment.released", email, `attachment:${row.id}`, {
       identity: handle, filename: row.filename, size: row.size, sha256: row.sha256, ...detail,

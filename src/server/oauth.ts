@@ -624,13 +624,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         return json({ error: "server_error" }, 500);
       }
     },
-    authenticate(req: Request, requiredScopes: string[] = ["grayboard:tools"]): OAuthPrincipal | Response {
+    // `r`: as activeAccess's, for a check inside a body (the hosted byte routes' guard, #1053).
+    authenticate(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): OAuthPrincipal | Response {
       if (requiredScopes.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s))) throw new Error("unknown required OAuth scope");
       const u = new URL(req.url), auth = req.headers.get("authorization");
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
       if (u.searchParams.has("access_token") || !auth || !/^Bearer [A-Za-z0-9_-]{43}$/i.test(auth)) return bearerError(401, auth ? "invalid_token" : undefined, requiredScopes);
       const accessHash = hashToken(auth.slice(7));
-      const found = activeAccess(accessHash);
+      const found = activeAccess(accessHash, r);
       if (!found) return bearerError(401, "invalid_token", requiredScopes);
       const { access, email } = found;
       if (!requiredScopes.every(s => access.scopes.includes(s))) return bearerError(403, "insufficient_scope", requiredScopes);

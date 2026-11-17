@@ -718,7 +718,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       };
       return prior ? withPrior(p, context, prior, body) : withGate(p, context, false, body);
     },
-    async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: () => void) => Promise<T>): Promise<T> {
+    async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: (r: Read) => void) => Promise<T>): Promise<T> {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(repo.read, row) : undefined;
         if (!(root && named(root))) throw new ApplicationError("unbound", "attachments require a bound source session");
@@ -726,12 +726,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
         // fence only reads, back to back with no await, so no transaction: nothing in this process commits between
-        // its reads, and inside a caller's transaction they read the writer.
-        const guard = () => fence(repo.read, p, row, root);
+        // its reads. Its caller names the handle (#1053): the pool here, a body's own Tx inside one.
+        const guard = (r: Read) => fence(r, p, row, root);
         try {
-          guard();
+          guard(repo.read);
           const value = await fn(selected.session, guard);
-          guard();
+          guard(repo.read);
           return value;
         } catch (error) {
           await late.flushQueued();

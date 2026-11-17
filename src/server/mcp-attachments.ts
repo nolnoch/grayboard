@@ -1,6 +1,7 @@
 import { ApplicationError } from "./application.ts";
 import { sourceContext, type HostedSessions } from "./hosted.ts";
 import type { Repo } from "./db.ts";
+import type { Read } from "./store/tx.ts";
 import { attachmentDownload, attachmentRelease, attachmentUpload } from "./http.ts";
 import type { createOAuthServer } from "./oauth.ts";
 import type { UploadGate } from "./uploads.ts";
@@ -60,20 +61,20 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
         // The HTTP routes act as `as` (#284): the hosted session's name.
         selected.searchParams.delete("identity");
         selected.searchParams.set("as", session.identityFull);
-        const guard = () => {
+        // Every read on `r`, the handle of the context it runs in: the pool here, a body's own Tx inside one (#1053).
+        const guard = (r: Read) => {
           if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
-          const current = oauth.authenticate(req, ["grayboard:tools"]);
+          const current = oauth.authenticate(req, ["grayboard:tools"], r);
           if (current instanceof Response) throw new Refusal(current);
-          bindingGuard();
-          // On the pool, inside the attachment routes' bodies too, until #1053 passes the guard its body's handle (D8).
-          if (!repo.aliases.find(repo.read, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
+          bindingGuard(r);
+          if (!repo.aliases.find(r, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
-        guard();
+        guard(repo.read);
         const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, uploads, guard, signal)
           : req.method === "GET" ? await attachmentDownload(id!, selected, principal.authed, repo, guard)
           : await attachmentRelease(id!, selected, principal.authed, repo, guard);
         if (req.method === "POST" && req.body && !req.body.locked) await req.body.cancel();
-        guard();
+        guard(repo.read);
         return response;
       });
     } catch (cause) {
