@@ -1,6 +1,7 @@
 import { LOCAL_MSG_COLS, LOCAL_SENT_PENDING_SQL, LOCAL_UNDELIVERED_FROM_SQL, localHistorySql } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 import { SqliteBlobs } from "./blobs.ts";
+import { markDmDelivered } from "./mailbox.ts";
 import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments, type Uploader } from "../core/attachments.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
 import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
@@ -87,6 +88,8 @@ export function insertMessage(
   }).immediate();
 }
 
+// Above the cursor and not yet handed over: a 1.x case merge (#216) can lower
+// a cursor below DMs it stamped delivered.
 export function unreadFor(reader: string): Message[] {
   const cursor = getCursor(reader);
   return withAttachments(
@@ -95,7 +98,7 @@ export function unreadFor(reader: string): Message[] {
     db
       .prepare(
         `SELECT ${MSG_COLS} FROM messages
-         WHERE recipient = ? AND id > ?
+         WHERE recipient = ? AND id > ? AND delivered_at IS NULL
          ORDER BY id ASC`,
       )
       .all(reader, cursor) as Message[],
@@ -109,18 +112,8 @@ export function getCursor(reader: string): number {
   return row?.last_seen_id ?? 0;
 }
 
-// The harness was handed message `id` for `reader`: stamps its delivery time
-// once and moves the reader's cursor, in one transaction.
 export function deliveredTo(reader: string, id: number, at = Date.now()): void {
-  db.transaction(() => {
-    db.prepare(`UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL`).run(at, id);
-    db.prepare(
-      `INSERT INTO cursors (reader, last_seen_id)
-       VALUES (?, ?)
-       ON CONFLICT(reader) DO UPDATE SET last_seen_id = excluded.last_seen_id
-       WHERE excluded.last_seen_id > cursors.last_seen_id`,
-    ).run(reader, id);
-  }).immediate();
+  markDmDelivered(db, reader, id, at);
 }
 
 export function getMessage(id: number): Message | undefined {

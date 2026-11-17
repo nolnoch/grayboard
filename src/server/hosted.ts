@@ -429,10 +429,12 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (fullQueued?.promise) return fullQueued.promise;
     const mine: { promise?: Promise<void> } = {};
     fullQueued = mine;
+    // Cleared again when it settles: a write refused before its body starts (a failed BEGIN) must not leave every
+    // later request sharing its rejection.
     mine.promise = store.write(async tx => {
       if (fullQueued === mine) fullQueued = undefined;
       return readAll(tx);
-    }, applyAll);
+    }, applyAll).finally(() => { if (fullQueued === mine) fullQueued = undefined; });
     return mine.promise;
   }
   async function readAll(tx: Tx) {
@@ -839,9 +841,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         const selected = await snapshot(p, row);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
-        // fence only reads, its row reads back to back with no await after its token check's, so no transaction:
-        // nothing in this process commits between them. Its caller names the handle (#1053): the pool here, a body's
-        // own Tx inside one.
+        // fence only reads, so no transaction: on the pool a commit can land between its reads (#807 P3 A7h1), but each
+        // read is compared to the selection, so a mixed read only refuses. Its caller names the handle (#1053): the pool
+        // here, a body's own Tx inside one.
         const guard = (r: Read) => fence(r, p, row, root);
         try {
           await guard(repo.read);
@@ -889,8 +891,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         const taken = await takeLost(p, row, told ? "agent" : "controller"), lost = taken.map(({ alias, reason }) => ({ alias, reason }));
         if (told && taken.length) told(lostNotice(p, row!, taken));
         const held = root ? application.hostedHolds(repo.read, root.session_id) : [];
-        // The one await after the reads above (#807 P3 A7g2): candidates are hints, so a bind landing meanwhile only
-        // makes them a moment newer than `held`.
+        // An await after `held` (#807 P3 A7g2; `root` was read before takeLost's): candidates are hints, so a bind
+        // landing meanwhile only makes them a moment newer than `held`.
         const offered = !(root && named(root, held)) && !row?.root_session_id ? await application.hostedCandidates(repo.read, p.authed, root?.suggested ?? null) : undefined;
         return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
