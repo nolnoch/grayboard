@@ -27,7 +27,7 @@ test("omp hosted: signed out it says how to sign in; /grayboard login walks the 
 
 test("omp hosted task run: two subagents' calls are attributed to children registered under main; a peer's DM mid-run reaches main only; both children end when their runs do", () => ompHostedTaskScenario(dir), 120_000);
 
-test("omp hosted nested task run: a subagent's own subagent registers under main with its parent as via; its parent registers at its own first call; each write is its own child's; each ends with its run, the grandchild first (#439)", () => ompHostedNestedScenario(dir), 120_000);
+test("omp hosted nested task run: a subagent's own subagent registers under main with its parent as via; its parent registers at its own first call; each write is its own child's; each ends with its run (#439)", () => ompHostedNestedScenario(dir), 120_000);
 
 test("omp hosted /fork, /new and /resume in one runtime: each replaces the session; the name carries to the fork and the new session, and the resumed first session rebinds it; the outgoing session ends each time", () => ompHostedCarryScenario(dir), 120_000);
 

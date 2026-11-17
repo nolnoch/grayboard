@@ -376,7 +376,7 @@ export function ompHostedNestedScenario(dir: string): Promise<void> {
     ...taskFanout(1, /^nest$/, (i) => i === 0
       ? [nested, { tool: `${PREFIX}dm_send`, args: { to: PEER, body: "middle" } }]
       : [{ tool: `${PREFIX}dm_send`, args: { to: PEER, body: "inner" } }, { tool: "bash", args: { command: `while [ ! -f ${gate} ]; do sleep 0.1; done` } }]),
-  ], async ({ srv, start }) => {
+  ], async ({ srv, model, start }) => {
     await seedGrant(srv, stateDirOf(dir), OMP_CLIENT);
     const omp = start();
     const { sessionId } = await omp.command({ type: "get_state" }, 30_000);
@@ -406,12 +406,19 @@ export function ompHostedNestedScenario(dir: string): Promise<void> {
     expect(child).not.toBe(grandchild);
     const writes = await until(() => sends().length === 2 ? sends() : undefined, 30_000, "fake-child-0's send");
     expect(writes.map((w) => w.target)).toEqual([grandchild, child]);
-    for (const w of writes) expect(w.detail).toMatchObject({ root, held: ["alice@example.com/omp-nest"] });
+    for (const w of writes) expect(w.detail).toMatchObject({ session: w.target, root, held: ["alice@example.com/omp-nest"] });
+    // The task call blocked: fake-child-0's next request carries the grandchild's
+    // final answer as the task's result, and no request saw a background spawn.
+    const results = model.requests.filter((r) => childOf(r.body) === "fake-child-0").flatMap((r) => r.body.messages.filter((m) => m.role === "tool").map(messageText));
+    expect(results.some((t) => t.includes("fake-child-1 done"))).toBe(true);
+    expect(model.requests.filter((r) => r.body.messages.some((m) => messageText(m).includes("Spawned agent")))).toEqual([]);
     expect(srv.app.db.query<{ body: string; sender: string }, []>("SELECT body, sender FROM messages WHERE body IN ('inner', 'middle') ORDER BY id").all())
       .toEqual([{ body: "inner", sender: "alice@example.com/omp-nest" }, { body: "middle", sender: "alice@example.com/omp-nest" }]);
 
     await until(() => audits(srv, "hosted.child_released").length === 2, 30_000, "both children released");
-    expect(audits(srv, "hosted.child_released").map((r) => [r.target, r.detail.child])).toEqual([[root, grandchild], [root, child]]);
+    // Each end is sent after its run's last step without being awaited, so the
+    // two may land in either order.
+    expect(audits(srv, "hosted.child_released").map((r) => [r.target, r.detail.child]).sort()).toEqual([[root, grandchild], [root, child]].sort());
     expect(liveChildren(srv, root)).toEqual([]);
     await idle(omp);
     expect(grayboardDescendants(omp.pid)).toEqual([]);
