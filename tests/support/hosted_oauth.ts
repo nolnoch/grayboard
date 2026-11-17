@@ -88,13 +88,17 @@ export async function browse(issuer: string, authorizeUrl: string, harness: stri
   return (await fetch(loopback)).text();
 }
 
+// `stateDir`'s grant store for `clientId`, as another process on that
+// state dir holds it (a sign-out elsewhere is `storeLogin(…).logout()`).
+export const storeLogin = (srv: { resource: string }, stateDir: string, clientId: string, harness = "test", loginAction = "log in") =>
+  new Login({ resource: srv.resource, clientId, stateDir, harness, loginAction, present: () => {}, notify: () => {}, diagnostic: () => {} });
+
 // Writes `stateDir`'s grant store for `clientId` with a grant the server
 // issued to `email`, as a finished login would. `expiresIn` < 0 makes the
-// next token() refresh.
-export async function seedGrant(srv: HostedServer, stateDir: string, clientId: string, email = "alice@example.com", expiresIn = 3_600_000) {
+// next token() refresh. A new `epoch` is a sign-in in another process.
+export async function seedGrant(srv: HostedServer, stateDir: string, clientId: string, email = "alice@example.com", expiresIn = 3_600_000, epoch = "seeded") {
   const issued = await issueOAuth(srv.app.repo, srv.resource, email, SCOPES, Date.now(), clientId);
-  const login = new Login({ resource: srv.resource, clientId, stateDir, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} });
-  await writeJsonAtomic(login.path, { version: 1, resource: srv.resource, clientId, epoch: "seeded", issuer: srv.issuer, scope: SCOPES.join(" "),
+  await writeJsonAtomic(storeLogin(srv, stateDir, clientId).path, { version: 1, resource: srv.resource, clientId, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
     access: issued.token, accessExpiresAt: Date.now() + expiresIn, refresh: issued.refreshToken });
   return issued;
 }

@@ -36254,6 +36254,7 @@ class ToolProxy {
 
 // adapters/hosted-core/src/client.ts
 var message = (error) => error?.message ?? String(error);
+var endFailedText = (id, error) => `couldn't end session ${id} on the server: ${message(error)}`;
 var DETAIL_MAX = 300;
 function failureText(error, hint) {
   const text = failureMessage(error, hint);
@@ -36309,7 +36310,7 @@ class HostedClient {
     try {
       await this.temporary(id, (wire) => wire.call("session_end"));
     } catch (error) {
-      this.options.log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
+      this.options.log(endFailedText(id, error), "warning");
     }
   }
   proxy(mode, o) {
@@ -38003,6 +38004,22 @@ import { join as join5, resolve as resolve3 } from "path";
 // src/shared/protocol.ts
 var SESSION_FACT_MAX = 64;
 
+// src/shared/testpause.ts
+import { existsSync } from "fs";
+import { dirname as dirname3 } from "path";
+async function testPauseAsync(point, env = process.env) {
+  const file = env.BUS_TEST_PAUSE_FILE;
+  if (env.BUS_TEST_PAUSE !== point || !file)
+    return;
+  console.error(`[grayboard] test pause hit: ${point}`);
+  while (!existsSync(file)) {
+    if (!existsSync(dirname3(file)))
+      throw new Error(`test pause abandoned: ${point}`);
+    await Bun.sleep(10);
+  }
+  console.error(`[grayboard] test pause released: ${point}`);
+}
+
 // src/shared/claude_agents.ts
 var SIGN_IN = "signin";
 var ROOT = "-";
@@ -38013,6 +38030,8 @@ var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
 var agentsRoot = (base) => join5(base, "claude-agents");
 var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid));
 var FACTS = ["model", "effort"];
+var HOOK_ERROR = "hook-error";
+var HOOK_ERROR_MAX = 1024;
 var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
 var validFact = (v) => typeof v === "string" && FACT.test(v);
 function put(path, text) {
@@ -38049,6 +38068,7 @@ function dropSignIn(base, claudePid, url) {
   }
   rmSync(path, { force: true });
 }
+var CONTROLS = /[\x00-\x1f\x7f-\x9f]+/g;
 var MISSING_TEXT = {
   bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
   no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
@@ -38133,7 +38153,33 @@ function readFacts(base, claudePid, harnessStart, bad) {
     else
       bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);
   }
+  let failure;
+  try {
+    failure = readSmall(join5(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4).replace(CONTROLS, " ");
+  } catch {}
+  if (failure !== undefined)
+    bad("hook", failure);
   return out;
+}
+function factReader(read, say) {
+  const said = new Set;
+  return () => {
+    const seen = new Set;
+    const out = read((what, error) => {
+      const text = what === "hook" ? `a grayboard hook failed, so the server may show a stale model or effort: ${error}` : `the server gets no ${what} for this session: ${error}`;
+      seen.add(text);
+      if (!said.has(text)) {
+        said.add(text);
+        say(text);
+      }
+    });
+    if (out !== undefined) {
+      for (const text of said)
+        if (!seen.has(text))
+          said.delete(text);
+    }
+    return out;
+  };
 }
 var calledPath = (base, claudePid, agent) => join5(sessionDir(base, claudePid), "called", createHash7("sha256").update(agent).digest("hex"));
 function markCalled(base, claudePid, agent) {
@@ -38197,22 +38243,6 @@ function takeEnded(base, claudePid) {
     }
   }
   return out;
-}
-
-// src/shared/testpause.ts
-import { existsSync } from "fs";
-import { dirname as dirname3 } from "path";
-async function testPauseAsync(point, env = process.env) {
-  const file = env.BUS_TEST_PAUSE_FILE;
-  if (env.BUS_TEST_PAUSE !== point || !file)
-    return;
-  console.error(`[grayboard] test pause hit: ${point}`);
-  while (!existsSync(file)) {
-    if (!existsSync(dirname3(file)))
-      throw new Error(`test pause abandoned: ${point}`);
-    await Bun.sleep(10);
-  }
-  console.error(`[grayboard] test pause released: ${point}`);
 }
 
 // src/shared/identity.ts
@@ -38493,13 +38523,7 @@ function createPlugin(o) {
       say(record.message);
     }
   });
-  const badFacts = new Set;
-  const badFact = (fact, error) => {
-    if (badFacts.has(fact))
-      return;
-    badFacts.add(fact);
-    say(`the server gets no ${fact} for this session: ${error}`);
-  };
+  const facts = "error" in config ? undefined : factReader((bad) => readFacts(config.dataDir, o.claude.pid, o.claude.start, bad), say);
   const client = "error" in config || !login ? undefined : new HostedClient({
     harness: HARNESS,
     clientId: CLIENT_ID,
@@ -38513,7 +38537,7 @@ function createPlugin(o) {
     env: o.env,
     launcher: o.env.BUS_LAUNCHER === "1",
     log: (message) => say(message),
-    facts: (sessionID) => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined,
+    facts: (sessionID) => sessionID === config.id ? facts?.() : undefined,
     ...suggestion ? { suggested: (sessionID) => sessionID === config.id ? suggestion : undefined } : {}
   });
   const initializedOr = (signal) => {

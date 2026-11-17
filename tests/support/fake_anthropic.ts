@@ -14,7 +14,7 @@
 
 export type Block = { type: string; text?: string; id?: string; name?: string; input?: unknown; content?: unknown; tool_use_id?: string };
 export type Message = { role: string; content: string | Block[] };
-export type MessagesRequest = { model: string; stream?: boolean; system?: string | Block[]; messages: Message[]; tools?: { name: string }[] };
+export type MessagesRequest = { model: string; stream?: boolean; system?: string | Block[]; messages: Message[]; tools?: { name: string }[]; output_config?: { effort?: string } };
 export type Recorded<B> = { method: string; path: string; body: B };
 /** A text reply ends the turn; a tool reply calls `tool` under the tool-use id `id`. */
 export type Reply = { text: string } | { tool: string; id: string; input: Record<string, unknown> };
