@@ -667,7 +667,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     async authenticate(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): Promise<OAuthPrincipal | Response> {
       const accessHash = bearer(req, requiredScopes);
       if (accessHash instanceof Response) return accessHash;
-      return principalOf(await activeAccess(accessHash, r), accessHash, requiredScopes);
+      const access = await activeAccess(accessHash, r);
+      // Closed while the read awaited: refused as bearer() refuses before it.
+      if (closed) return bearerError(401, "invalid_token", requiredScopes);
+      return principalOf(access, accessHash, requiredScopes);
     },
     // authenticate's synchronous form, until #807 P3 A7d (activeAccessNow).
     authenticateNow(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): OAuthPrincipal | Response {

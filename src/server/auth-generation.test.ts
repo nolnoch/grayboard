@@ -137,7 +137,7 @@ test("work an authRead body starts reads afresh once the body is done: a disable
   expect(seen.email).toBeUndefined();
 });
 
-test("work an authRead body starts reads afresh once the body is done: a revoked token isn't served from the cache", async () => {
+test("work an authRead body starts reads afresh once the body is done: a disabled user's token isn't served from the cache", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const user = await repo.write(tx => repo.users.upsertByEmail(tx, "p@example.com", null));
   // A disable revokes the user's grants and tokens too; the access cache must miss after it.
@@ -163,7 +163,7 @@ function accessReads() {
 // #807 P3 A7c: the async lookup's read can await, so a commit may land between the read and the fill. The fill is
 // keyed on the generation the lookup started under, which that commit moved: a token disabled mid-read is never
 // cached as live, and the next check reads it afresh and refuses.
-test("a disable committed while an access read is held is never cached: the next check refuses", async () => {
+for (const end of ["disable", "revoke"] as const) test(`a ${end} committed while an access read is held is never cached: the next check refuses`, async () => {
   const repo = open();
   const user = await repo.write(tx => repo.users.upsertByEmail(tx, "r@example.com", null));
   const t = repo.now();
@@ -172,8 +172,8 @@ test("a disable committed while an access read is held is never cached: the next
   const g0 = repo.authGeneration();
   const held = await hostedPause("auth:access:read",
     () => repo.authRead(() => repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)),
-    () => repo.write(tx => repo.users.setDisabled(tx, user.id, true)));
-  // The read ran before the disable committed; its answer stands, linearized before it.
+    () => repo.write(tx => end === "disable" ? repo.users.setDisabled(tx, user.id, true) : repo.oauth.revokeToken(tx, issued, "native", t)));
+  // The read ran before the end committed; its answer stands, linearized before it.
   expect(held).toBeDefined();
   expect(repo.authGeneration()).not.toBe(g0);
   const reads = accessReads();

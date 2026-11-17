@@ -257,6 +257,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         if (refusal instanceof Response) refuse(refusal);
         throw new Error("unauthenticated");
       }
+      // Closed or cancelled while the check awaited: the context is finished below, never handed out.
+      if (closed || request.signal.aborted) throw new Error("MCP request is closed");
       return context;
     } catch (error) { context.finish(); throw error; }
   }
@@ -535,6 +537,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (exchange.context) {
       if (closed || exchange.request.signal.aborted) throw new Error("MCP request is closed");
       const principal = await oauth.authenticate(exchange.request, roleScopes(exchange.context.role));
+      if (closed || exchange.request.signal.aborted) throw new Error("MCP request is closed");
       if (principal instanceof Response) refuse(principal);
     }
     const context = exchange.context ??= await select(exchange.request);
@@ -725,6 +728,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       let postReservation: (() => void) | undefined;
       try {
         const authenticated = await oauth.authenticate(original, roleScopes(role));
+        // Closed while the check awaited (#807 P3 A7c): the same answer as closed before it.
+        if (closed) return new Response("MCP endpoint is closed", { status: 503 });
         if (authenticated instanceof Response) return authenticated;
         principal = authenticated;
         boundary.principal = principal.authed.user_id;

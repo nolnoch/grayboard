@@ -490,6 +490,8 @@ for (const revoked of [false, true]) test(`authentication lost between HTTP pref
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const status of [401, 403]) test(`${version}: explicit factory ${status} response is preserved unchanged`, async () => {
   let response: Response | undefined;
   const client = await connect(version, async (r, request) => { if (request.method === "POST") response = r; });
+  // The legacy client's background GET stream authenticates too; it must be done before the counting stub goes in.
+  if (version !== "2026-07-28") await untilHosted(() => hosted.activeGetStreams === 1);
   const credential = status === 401 ? "invalid" : (await issuedOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:delivery"])).token;
   const refusal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${credential}` } }));
   if (!(refusal instanceof Response)) throw new Error("expected fixture OAuth refusal");

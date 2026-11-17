@@ -226,8 +226,8 @@ export interface Repo {
   // caller's own transaction, nested, or with no generation to read, it's plain fn().
   authRead<T>(fn: () => T | Promise<T>): Promise<T>;
   // authRead for a synchronous body, and the two auth hot-path reads in synchronous form, for the hosted MCP callers
-  // that stay synchronous until #807 P3 A7d (its authorization check, the stream timer, resource watches, a lease's
-  // describe). They share the async forms' caches. SQLite only: a store with async statements has no such forms.
+  // that stay synchronous until #807 P3 A7d (its authorization check, the stream timer, the attachment guard, and the
+  // resources, hosted-session and delivery authorization callbacks). They share the async forms' caches. SQLite only: a store with async statements has no such forms.
   authNow: {
     read<T>(fn: () => Sync<T>): T;
     findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;

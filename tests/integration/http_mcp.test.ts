@@ -334,10 +334,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
   let boundary!: () => void;
   const authenticated = new Promise<void>(resolve => { boundary = resolve; });
   let checks = 0;
-  app.oauth.authenticate = (...args) => {
+  app.oauth.authenticate = async (...args) => {
     if (args[0].headers.get("Authorization") !== `Bearer ${issued.token}`) return original(...args);
     if (++checks === 2 && failure === "storage") throw new Error("SELECT secret FROM /private/oauth.sqlite");
-    const result = original(...args);
+    const result = await original(...args);
     if (checks === 1) { expect(result).not.toBeInstanceOf(Response); boundary(); }
     return result;
   };
