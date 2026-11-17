@@ -28,7 +28,7 @@ import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
-import { putSignIn, sessionDir, SIGN_IN } from "../../src/shared/claude_agents.ts";
+import { hasCalled, putSignIn, sessionDir, SIGN_IN } from "../../src/shared/claude_agents.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
@@ -57,12 +57,15 @@ beforeEach(() => {
   fake = join(dir, "claude");
   symlinkSync(process.execPath, fake);
   host = join(dir, "host.ts");
-  // SIGUSR2: the plugin crashes and Claude Code starts it again, keeping its pid (#555).
+  // SIGUSR1 (a /mcp reconnect: SIGTERM) and SIGUSR2 (a crash: SIGKILL) restart
+  // the plugin while Claude Code, so its pid, lives on (#555).
   writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
 let restarting = false;
 const run = () => { const p = Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }); p.exited.then((c) => { if (!restarting) process.exit(c ?? 0); }); return p; };
 let child = run();
-process.on("SIGUSR2", async () => { restarting = true; child.kill("SIGKILL"); await child.exited; restarting = false; child = run(); process.stderr.write(${JSON.stringify(RESTARTED + "\n")}); });`);
+const restart = async (signal) => { restarting = true; child.kill(signal); await child.exited; restarting = false; child = run(); process.stderr.write(${JSON.stringify(RESTARTED + "\n")}); };
+process.on("SIGUSR1", () => void restart("SIGTERM"));
+process.on("SIGUSR2", () => void restart("SIGKILL"));`);
 });
 afterEach(async () => {
   await closeSessions();
@@ -289,6 +292,26 @@ test("a plugin restarted after a subagent's call still ends that child's session
   runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: agent });
   await until(() => !childRow(id, agent), 10_000, "the earlier child's hosted session to end");
   expect(row(id)?.name).toBe("lead");
+}, 60_000);
+
+test("a /mcp reconnect's release ends the subagent's session and its note, so its SubagentStop later starts no session to end it (#555 item 8)", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const id = "sess-sub-reconnect", agent = "a5550000000000009";
+  let root = await plugin(id, { flags: [] });
+  runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
+  expect((await modelCall(root, "bind", { name: "lead", create: true })).error).toBe(false);
+  expect((await modelCall(root, "whoami", {}, { agent })).error).toBe(false);
+  const claude = claudePid(root);
+  expect(hasCalled(data, claude)).toBe(true);
+  root = Object.assign(await root.restart("reconnect", claude), { elicits: [], completed: [], withdrawn: [], aborted: [] });
+  expect(childRow(id, agent)).toBeNull();
+  expect(hasCalled(data, claude)).toBe(false);
+  runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: agent });
+  // Another subagent's call drains the marker before it runs.
+  expect((await modelCall(root, "whoami", {}, { agent: "a555000000000000a" })).error).toBe(false);
+  await Bun.sleep(1_000);
+  const minted = srv.app.db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?").get(hostedSessionId(user(), CLIENT_ID, `${id}/agent/${agent}`))!.n;
+  expect(minted).toBe(0);
 }, 60_000);
 
 test("a call whose PreToolUse record is missing or from a recycled pid is refused and writes nothing", async () => {

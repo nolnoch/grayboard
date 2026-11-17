@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dropSignIn, hasCalled, LEFTOVER_TTL_MS, markCalled, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
+import { dropCalled, dropSignIn, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
 import { SIGN_IN_FLOW_MS } from "./signin.ts";
 import { procStart } from "./proc.ts";
 
@@ -162,6 +162,28 @@ describe("session lifecycle", () => {
     expect(takeCalled(base, pid, "a1")).toBe(true);
     expect(takeCalled(base, pid, "a1")).toBe(false);
     expect(takeCalled(base, pid, odd)).toBe(true);
+    expect(hasCalled(base, pid)).toBe(false);
+  });
+
+  test("a recycled pid's SessionStart drops the earlier holder's notes and ends; ownDir tells the dirs apart (#555)", () => {
+    expect(ownDir(base, pid, start())).toBe(false);
+    hook("session-start", {}, true);
+    expect(ownDir(base, pid, start())).toBe(true);
+    markCalled(base, pid, "a1");
+    hook("subagent-stop", { agent_id: "a1" }, true);
+    // The same process starting again (/clear, /resume) keeps them.
+    hook("session-start", { source: "clear" }, true);
+    expect(hasCalled(base, pid)).toBe(true);
+    // An earlier holder of this pid wrote the dir.
+    writeFileSync(join(sessionDir(base, pid), "start"), "1");
+    expect(ownDir(base, pid, start())).toBe(false);
+    expect(ownDir(base, pid, null)).toBe(true);
+    hook("session-start", {}, true);
+    expect(hasCalled(base, pid)).toBe(false);
+    expect(takeEnded(base, pid)).toEqual([]);
+    expect(ownDir(base, pid, start())).toBe(true);
+    markCalled(base, pid, "a2");
+    dropCalled(base, pid);
     expect(hasCalled(base, pid)).toBe(false);
   });
 

@@ -37895,7 +37895,7 @@ ${record.message}`;
     if (!this.proxy)
       return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
     if (o.child !== undefined)
-      return this.childCall(o.child, tool, args, before);
+      return this.childCall(o.child, tool, args, before, o.passed);
     const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure2(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
     const early = refused();
     if (early)
@@ -37912,12 +37912,13 @@ ${record.message}`;
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
   }
-  async childCall(child, tool, args, before) {
+  async childCall(child, tool, args, before, passed) {
     if (this.closed)
       return failure2(`this ${this.client.options.harness} session is closing`);
     const after = before ? await before() : undefined;
     const proxy = this.proxy;
     this.children.add(child);
+    passed?.();
     this.used = true;
     if (proxy !== this.hooked) {
       try {
@@ -38139,6 +38140,18 @@ function markCalled(base, claudePid, agent) {
   const path = calledPath(base, claudePid, agent);
   mkdirSync2(join5(path, ".."), { recursive: true, mode: 448 });
   writeFileSync(path, "", { mode: 384 });
+}
+function ownDir(base, claudePid, harnessStart) {
+  let start;
+  try {
+    start = readFileSync4(join5(sessionDir(base, claudePid), "start"), "utf8");
+  } catch {
+    return false;
+  }
+  return harnessStart === null || start === "" || start === harnessStart;
+}
+function dropCalled(base, claudePid) {
+  rmSync(join5(sessionDir(base, claudePid), "called"), { recursive: true, force: true });
 }
 function hasCalled(base, claudePid) {
   try {
@@ -38600,8 +38613,9 @@ function createPlugin(o) {
   const drainEnded = () => {
     if ("error" in config || closed)
       return;
+    const ours = ownDir(config.dataDir, o.claude.pid, o.claude.start);
     for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
-      const called = takeCalled(config.dataDir, o.claude.pid, agent);
+      const called = takeCalled(config.dataDir, o.claude.pid, agent) && ours;
       if (validSourceId(childOf(agent)))
         root?.endChild(childOf(agent), called);
     }
@@ -38622,7 +38636,7 @@ function createPlugin(o) {
     }
     drainEnded();
   };
-  if (!("error" in config) && hasCalled(config.dataDir, o.claude.pid))
+  if (!("error" in config) && ownDir(config.dataDir, o.claude.pid, o.claude.start) && hasCalled(config.dataDir, o.claude.pid))
     watchEnded();
   const call = async (name, args, meta) => {
     if ("error" in config)
@@ -38643,14 +38657,17 @@ function createPlugin(o) {
       say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
       return failure2(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
     }
-    try {
-      markCalled(config.dataDir, o.claude.pid, taken.agent);
-    } catch (error) {
-      say(`couldn't note subagent ${taken.agent.slice(0, 160)}'s call: ${message(error)}; if this plugin restarts first, its session lasts until this one ends`);
-    }
+    const agent = taken.agent;
+    const passed = () => {
+      try {
+        markCalled(config.dataDir, o.claude.pid, agent);
+      } catch (error) {
+        say(`couldn't note subagent ${agent.slice(0, 160)}'s call: ${message(error)}; if this plugin restarts first, its session lasts until this one ends`);
+      }
+    };
     watchEnded();
     drainEnded();
-    return root.call(name, args, before, { child });
+    return root.call(name, args, before, { child, passed });
   };
   const tools = () => root?.tools() ?? hostTools(snapshotTools());
   const serve = (instructions) => {
@@ -38713,7 +38730,15 @@ function createPlugin(o) {
     closed = true;
     endWatch?.close();
     signins.flow?.abort.abort();
+    const held = root?.status().held;
     await root?.shutdown("release");
+    if (root && !held && !("error" in config)) {
+      try {
+        dropCalled(config.dataDir, o.claude.pid);
+      } catch (error) {
+        say(`couldn't clear subagent notes: ${message(error)}`);
+      }
+    }
     await server?.close().catch(() => {});
   };
   return { connect: connectTransport, shutdown };
