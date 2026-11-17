@@ -60,7 +60,7 @@ export function createResources(application: Application, options: ResourceOptio
   function authorized(session: ApplicationSession, allowUnbound = false, r?: Read): boolean {
     try {
       if (stopped || !options.isAuthorized(session, r)) return false;
-      application.revalidateSession(session, allowUnbound);
+      application.revalidateSession(session, allowUnbound, r);
       return true;
     } catch (error) {
       if (error instanceof ApplicationError && error.code === "unauthenticated") return false;

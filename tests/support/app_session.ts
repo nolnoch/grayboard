@@ -185,7 +185,7 @@ export class AppSession {
         const writesAs = toolsOnly && this.identity !== null
           ? this.application.hostedWritesAs(tx, this.authed, id, this.identity, true, (address, detail) => later(w => this.application.hostedRefused(w, id, address, detail)), later)
           : null;
-        this.application.hostedRegister(tx, this.authed, id, this.opts.harness ?? "test", writesAs, why => later(() => this.application.hostedCollided(this.authed, id, why)));
+        this.application.hostedRegister(tx, this.authed, id, this.opts.harness ?? "test", writesAs, why => later(w => this.application.hostedCollided(w, this.authed, id, why)));
         if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(tx, this.authed, id, { ownership: 0, client_id: "test" });
         return this.application.hostedSession(tx, this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
       }));

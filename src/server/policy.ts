@@ -178,13 +178,16 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
 // otherwise write a 90-day row per request. Past the burst a user's denies go
 // unrecorded until the bucket refills; the streak's end writes one
 // `authz.suppressed` row with the count. Allows aren't thinned: only owners
-// and admins reach them. One limiter per Repo (per server).
+// and admins reach them. One limiter per Repo (per server). The streak's end fires
+// inside recordDecision's sweep or take, so its row goes on the handle that call was
+// given (`suppressedOn`): the caller's body `Tx`, or a post outside any body.
 export const DENY_ROW_LIMIT: RateLimit = { burst: 30, perSec: 0.5 };
 const denyLimiters = new WeakMap<Repo, RateLimiter>();
+let suppressedOn: Read | undefined;
 function denyLimiter(repo: Repo): RateLimiter {
   let l = denyLimiters.get(repo);
   if (!l) {
-    l = new RateLimiter(DENY_ROW_LIMIT, { start() {}, end: (user, refused) => writeAudit(repo, repo.read, "authz.suppressed", user, null, { refused }) }, Date.now, 4096);
+    l = new RateLimiter(DENY_ROW_LIMIT, { start() {}, end: (user, refused) => writeAudit(repo, suppressedOn ?? repo.read, "authz.suppressed", user, null, { refused }) }, Date.now, 4096);
     denyLimiters.set(repo, l);
   }
   return l;
@@ -201,8 +204,10 @@ const clip = (v: unknown): unknown => (typeof v === "string" && v.length > MAX_D
 export function recordDecision(repo: Repo, h: Read, actor: Actor, req: AuthzRequest, d: Decision, extra: Record<string, unknown> = {}): void {
   if (!d.allow) {
     const limiter = denyLimiter(repo);
-    limiter.sweep();
-    if (!limiter.take(actor.user ?? "").ok) return;
+    suppressedOn = h;
+    let ok: boolean;
+    try { limiter.sweep(); ok = limiter.take(actor.user ?? "").ok; } finally { suppressedOn = undefined; }
+    if (!ok) return;
   }
   const { target, detail } = subject(req);
   writeAudit(repo, h, "authz.decision", actor.user, typeof target === "string" ? (clip(target) as string) : target, {
