@@ -307,7 +307,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const method of ["list", "read
   application.revalidateSession = session => {
     sessionChecks++;
     if (boundary === "session" && sessionChecks === 2) throw new Error("SELECT secret FROM private_database");
-    validate(session);
+    return validate(session);
   };
   try {
     const request = method === "list" ? client.listResources() : client.readResource({ uri: "grayboard://boards/general" });

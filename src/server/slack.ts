@@ -392,7 +392,7 @@ export class SlackBridge implements SlackLinker {
           // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
           // delivered (#470). Read in the body, after the progress writes queued before it.
           const posted = (await repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
-          if (m.board && m.post_id) application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
+          if (m.board && m.post_id) await application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
           else if (m.message_id) await application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
           await repo.slack.clearProgress(tx, link.user_id, r);
         }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt");

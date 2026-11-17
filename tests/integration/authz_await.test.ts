@@ -88,3 +88,26 @@ test("a page of one writer's messages makes one wake decision", async () => {
     spy.mockRestore();
   }
 });
+
+// `valid`'s user read awaits (#807 P3 A7u1): a session closed meanwhile is refused after it, before the operation
+// writes anything.
+test("a session closed while its bind's user read awaits is refused and holds nothing", async () => {
+  const bob = await srv.login(B);
+  const s = await srv.connected(bob, null);
+  const err = await hostedPause("valid:user:read", () => refusal(s.bind("fe")), async () => { s.close(); });
+  expect(err.code).toBe("unauthenticated");
+  expect(err.message).toBe("session is closed");
+  expect(srv.app.db.query("SELECT address FROM alias_holds WHERE address = ?").all(`${B}/fe`)).toEqual([]);
+  expect(srv.app.db.query("SELECT event FROM binding_events WHERE name = ? AND event = 'bound'").all(`${B}/fe`)).toEqual([]);
+});
+
+test("a session closed while its send's user read awaits is refused and writes no message", async () => {
+  const [alice, bob] = await Promise.all([srv.login(A), srv.login(B)]);
+  await srv.connected(bob, "fe");
+  const abe = await srv.connected(alice, "be");
+  const before = (srv.app.db.query("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n;
+  const err = await hostedPause("valid:user:read", () => refusal(abe.send(`${B}/fe`, "while closing")), async () => { abe.close(); });
+  expect(err.code).toBe("unauthenticated");
+  expect(err.message).toBe("session is closed");
+  expect((srv.app.db.query("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n).toBe(before);
+});

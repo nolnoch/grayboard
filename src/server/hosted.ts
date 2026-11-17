@@ -852,7 +852,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
-          const ok = application.unbind(tx, selected.session, args.name);
+          const ok = await application.unbind(tx, selected.session, args.name);
           if (ok.released) {
             // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
             await store.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: ok.held.length ? row.lease_deadline : null });

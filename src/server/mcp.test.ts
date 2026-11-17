@@ -1389,7 +1389,7 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
   const authRead = store.repo.authRead, validate = application.revalidateSession;
   let depth = 0, pinned = 0, unpinned = 0;
   store.repo.authRead = async fn => { depth++; try { return await authRead(fn); } finally { depth--; } };
-  application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; validate(session, allowUnbound); };
+  application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; return validate(session, allowUnbound); };
   const query = spyOn(Database.prototype, "query");
   try {
     const listed = await client.callTool({ name: "board_list", arguments: {} });
