@@ -44,7 +44,11 @@ type Child = {
 
 const SERVER = process.env.GRAYBOARD_MCP_NAME ?? "grayboard";
 // omp's MCP tool naming (mintMCPToolName in its tool-bridge.ts).
-const PREFIX = `mcp__${SERVER.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "server"}_`;
+const prefixOf = (server: string) => `mcp__${server.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "server"}_`;
+const PREFIX = prefixOf(SERVER);
+// Tools only grayboard serves together: an MCP server with all of them is a
+// grayboard, whatever it is named.
+const SIGNATURE = ["bind", "claim_take", "dm_inbox"];
 // The `_meta` key naming a subagent's call (GRAYBOARD_AGENT_META, src/shared/session_meta.ts).
 const AGENT_META = "io.github.nolnoch.grayboard/agent";
 // omp gives session_shutdown handlers 2 s; the grayboard process gets most of it to end its session.
@@ -113,6 +117,8 @@ type Shared = {
   stopping?: Promise<void>;
   exitReason?: string;
   instructions?: string;
+  // MCP servers already reported as a grayboard beside this one.
+  warned?: Set<string>;
 };
 const KEY = Symbol.for("io.github.nolnoch.grayboard/omp-local");
 const shared = ((globalThis as Record<symbol, unknown>)[KEY] ??= {}) as Shared;
@@ -620,8 +626,30 @@ export default function grayboard(pi: ExtensionAPI) {
   // The instructions tell the model what a <channel> message is; only the
   // main session receives any, so a subagent gets none. A prompt sent as omp
   // starts can beat the grayboard process's initialize; the first turn waits.
+  // A grayboard among the MCP servers omp applies after session_start (an
+  // ACP client's declared mcpServers, #1140) escaped secondGrayboard, and
+  // only its tools are visible. Said once per server, not refused: stopping
+  // this process wouldn't stop that one, which would be left the only
+  // owner, and omp drops its pushes.
+  const reportServedElsewhere = (ctx: ExtensionContext) => {
+    const servers = new Map<string, Set<string>>();
+    for (const t of pi.getAllTools()) {
+      if (!t.mcpServerName || !t.mcpToolName) continue;
+      const names = servers.get(t.mcpServerName) ?? new Set<string>();
+      servers.set(t.mcpServerName, names.add(t.mcpToolName));
+    }
+    shared.warned ??= new Set();
+    for (const [server, names] of servers) {
+      if (shared.warned.has(server) || !SIGNATURE.every((n) => names.has(n))) continue;
+      shared.warned.add(server);
+      const shadows = prefixOf(server) === PREFIX ? `; its tools have this adapter's names and replace them, so grayboard calls go to that process, another bus session` : "";
+      report(ctx, `grayboard: the MCP server "${server}" omp added after start (an ACP client's mcpServers) serves grayboard beside this adapter's${shadows}. Remove it from the client's mcpServers: this adapter already serves grayboard.`);
+    }
+  };
+
   pi.on("before_agent_start", async (event, ctx) => {
     if (!registered || ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    reportServedElsewhere(ctx);
     await currentChild();
     return hooks.beforeAgentStart(event);
   });

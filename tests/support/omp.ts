@@ -1087,6 +1087,63 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
   });
 }
 
+// A grayboard among an ACP client's declared mcpServers, which omp applies
+// after session_start's check, is reported once per server by its tool set,
+// whatever its name, and not refused; one named grayboard is said to replace
+// the adapter's tools. A server without grayboard's tools isn't (#1140).
+export function ompLocalAcpClientGrayboardScenario(dir: string): Promise<void> {
+  return named(OMP_HARNESS, async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([scripted("hi", [{ text: "hello" }]), scripted("again", [{ text: "hello again" }])]);
+    try {
+      installLocal(dir, model.port);
+      // A stdio MCP server serving the tool names given as its arguments.
+      const fake = join(dir, "fake_mcp.ts");
+      writeFileSync(fake, `
+const names = process.argv.slice(2);
+let buf = "";
+process.stdin.setEncoding("utf8").on("data", (c) => {
+  buf += c;
+  let nl;
+  while ((nl = buf.indexOf("\\n")) >= 0) {
+    const m = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1);
+    if (m.id === undefined) continue;
+    const result = m.method === "initialize" ? { protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } }
+      : m.method === "tools/list" ? { tools: names.map((name) => ({ name, description: name, inputSchema: { type: "object", properties: {} } })) } : {};
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
+  }
+});
+`);
+      const server = (name: string, tools: string[]) => ({ name, command: process.execPath, args: [fake, ...tools], env: [] });
+      const acp = startAcpOmp(dir, procs);
+      await acp.call("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      const { sessionId } = await acp.call<{ sessionId: string }>("session/new", { cwd: dir, mcpServers: [
+        server("grayboard", ["bind", "claim_take", "dm_inbox", "whoami"]),
+        server("bus2", ["bind", "claim_take", "dm_inbox"]),
+        server("other", ["bind", "search"]),
+      ] });
+      // bus.db appears when the adapter's child first opens it.
+      await until(() => existsSync(join(dir, "bus.db")) && localRows(dir, "SELECT 1 FROM alias_holds WHERE address = 'omp-local'").length === 1, 30_000, "the adapter's grayboard holds omp-local");
+      for (const text of ["hi", "again"]) await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
+      // The adapter's own log lines; ACP also mirrors each notice at debug.
+      const notices = ompLog(dir).split("\n").filter(Boolean).map((l) => JSON.parse(l) as { level: string; message: string })
+        .filter((l) => l.level === "error" && l.message.includes("omp added after start")).map((l) => l.message);
+      const said = (server: string) => notices.filter((m) => m.startsWith(`grayboard: the MCP server "${server}"`));
+      expect(said("grayboard")).toHaveLength(1);
+      expect(said("grayboard")[0]).toContain("replace them");
+      expect(said("bus2")).toHaveLength(1);
+      expect(said("bus2")[0]).not.toContain("replace them");
+      expect(notices).toHaveLength(2);
+      // Not refused: the adapter's process still runs and holds the name.
+      expect(grayboardDescendants(acp.proc.pid!)).toHaveLength(1);
+      expect(model.unhandled).toEqual([]);
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
 // omp keeps one extension runtime across /fork, /new and /resume
 // (session_switch), so the entry replaces its session each time.
 export const ompHostedCarryScenario = (dir: string): Promise<void> => hostedCarryScenario(OMP_HARNESS, dir);
