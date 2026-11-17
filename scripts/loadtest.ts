@@ -330,7 +330,8 @@ async function main() {
       });
       const lagSamples = ["0.5", "0.99", "1"].map(q => one(s, "grayboard_event_loop_lag_seconds", { quantile: q }));
       const w: Window = {
-        at: now, t: (now - start) / 1000, steady: now - start >= o.warmupS * 1000, churning: now < churnUntil,
+        // Steady from the first window that starts after the warm-up (#1038), by schedule, so scrape jitter can't flip it.
+        at: now, t: (now - start) / 1000, steady: next - o.windowS * 1000 - start >= o.warmupS * 1000, churning: now < churnUntil,
         rss: one(s, "grayboard_process_resident_memory_bytes") ?? -1, heap: one(s, "grayboard_process_heap_used_bytes") ?? -1,
         ...(lagSamples.every(x => x !== undefined) ? { lag: { p50: lagSamples[0]!, p99: lagSamples[1]!, max: lagSamples[2]! } } : {}),
         leases: one(s, "grayboard_delivery_leases") ?? -1, listens: one(s, "grayboard_mcp_admissions", { kind: "listen" }) ?? -1,
