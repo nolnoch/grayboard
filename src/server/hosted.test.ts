@@ -306,9 +306,10 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
     expect(items.length).toBeGreaterThan(0);
     await delivery.receipt(principal, b, lease.capability, items.map(i => i.id));
     const pulled = checks.slice(pull);
-    // The pull reads boards through repo.boards alone; the receipt's one core call is its board check on its Tx
-    // (canReceiveBoard, which stays on core until B5a2).
-    expect(pulled.filter(c => c.op === "coreOn").map(c => `${c.handle}:${c.inTxn}`)).toEqual(["tx:true"]);
+    // The pull and the receipt read boards through repo.boards alone (B5a2): the receipt's board check is
+    // repo.boards.get on its Tx (board_reads visibleBoards), not core.
+    expect(pulled.filter(c => c.op === "coreOn")).toEqual([]);
+    expect(pulled.some(c => c.op === "boards.get" && c.handle === "tx" && c.inTxn)).toBe(true);
     expect(pulled.some(c => c.op === "boards.pendingPushes" && c.handle === "pool" && !c.inTxn)).toBe(true);
     expect(pulled.some(c => c.op === "boards.acknowledge" && c.handle === "tx" && c.inTxn)).toBe(true);
     await hosted.whoami(principal, a);

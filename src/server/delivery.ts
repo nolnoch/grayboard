@@ -12,7 +12,7 @@ import { countRefusal } from "./metrics.ts";
 
 export type DeliveryPrincipal = OAuthPrincipal;
 export type DeliveryLease = { capability: string; identity: IdentityInfo; expiresAt: number; ownership: number; bind_gen: number };
-// `address`: the alias a direct item was sent to, which the client checks against its hold set (#451); a DM to the session's own ID and a board item have none (canReceiveBoard checks boards).
+// `address`: the alias a direct item was sent to, which the client checks against its hold set (#451); a DM to the session's own ID and a board item have none (boardsVisible checks boards).
 export type PendingDelivery = { id: string; actionable: boolean; event: DeliveryEvent; ownership: number; bind_gen: number; address?: string };
 // `context: false`: the host can't show an item without starting a turn (Claude Code), so non-waking items wait (#854).
 export type DeliveryOpenOptions = { context?: boolean };
@@ -245,10 +245,16 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
           const records: Issued[] = [];
+          // Each board's visibility read once, on the body's Tx (#807 P3 B5a2).
+          const boardSeen = new Map<string, boolean>();
           for (const id of ids) {
             const issued = lease.issued.get(id), r: Acked = issued ? { ...issued.item, board: boardOf(issued.item) } : lease.acknowledged.get(id) ?? stale(p, context, capability);
             if (r.ownership !== row.ownership_id || r.bind_gen !== row.bind_gen || (r.address !== undefined && !lease.session.addresses.includes(r.address))) stale(p, context, capability);
-            if (r.board !== undefined && !application.canReceiveBoard(tx, lease.session, r.board)) stale(p, context, capability);
+            if (r.board !== undefined) {
+              let seen = boardSeen.get(r.board);
+              if (seen === undefined) boardSeen.set(r.board, seen = (await application.boardsVisible(tx, lease.session, [r.board])).get(r.board) === true);
+              if (!seen) stale(p, context, capability);
+            }
             if (issued) records.push(issued);
           }
           const direct = records.filter(r => r.item.event.kind === "direct");

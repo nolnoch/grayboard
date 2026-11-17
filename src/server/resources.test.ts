@@ -143,7 +143,10 @@ test("only authorized same-board watchers receive hints; lost membership closes 
   expect(hb.counts.closed).toBe(1);
   expect((await resources.list(store.repo.read, b)).resources.map(r => r.uri)).not.toContain(privateUri);
   await expect(resources.read(store.repo.read, b, privateUri)).rejects.toThrow("no such board #private; see board_list");
-  expect(() => resources.watch(b, privateUri, hooks(), true)).toThrow("no such board #private; see board_list");
+  // The caller's board read (mcp's `Checked.boards`, #807 P3 B5a2) answers false, and the watch is refused as missing.
+  const seen = (await application.boardsVisible(store.repo.read, b, ["private"])).get("private");
+  expect(seen).toBe(false);
+  expect(() => resources.watch(b, privateUri, hooks(), seen!)).toThrow("no such board #private; see board_list");
   await call(a, "board_post", { board: "private", body: "new secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([3, 1, 0]);
 });
@@ -599,14 +602,16 @@ test("A7d2c: a watch finished while its changed check awaits is not notified", a
   }
 });
 
-// #807 P3 A7d2c (T-c3): watch reads no token, trusting its caller's check; a caller that doesn't say it checked is
-// refused, and the session's other watches stay open.
-test("A7d2c: a watch without checked is refused", async () => {
+// #807 P3 A7d2c (T-c3), B5a2: watch reads neither token nor board, trusting its caller's checks; a caller whose board
+// read said no, or that has no answer, is refused as a missing board, and the session's other watches stay open.
+test("A7d2c/B5a2: a watch its caller didn't judge visible is refused", async () => {
   const b = await select(bob);
   await call(b, "board_create", { name: "e2e", purpose: "tests" });
   const h = hooks();
   resources.watch(b, boardResourceUri("e2e"), h, true);
-  expect(() => resources.watch(b, boardResourceUri("e2e"), hooks(), undefined as unknown as true)).toThrow("resource session is closed or unauthorized");
+  for (const visible of [false, undefined as unknown as boolean]) {
+    expect(() => resources.watch(b, boardResourceUri("e2e"), hooks(), visible)).toThrow("no such board #e2e; see board_list");
+  }
   expect(resources.activeWatchCount).toBe(1);
   expect(h.counts.closed).toBe(0);
   // The synchronous auth forms are gone (#807 P3 A7d2c): every token read is async.

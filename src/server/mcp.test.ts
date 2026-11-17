@@ -1809,3 +1809,119 @@ test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen 
   await f.listen.close();
   await legacy.close();
 });
+
+// #807 P3 B5a2: a native live's board visibility, read each stream tick (phase B's `checkBoards`), since membership
+// writes move no auth generation and send no notice. `private` is alice's team's board; `bob` stays a member, so he
+// can post to it after alice leaves.
+async function teamFixture() {
+  const clock = await clocked(undefined, 3_600_000, true);
+  const grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], clock.time.now, OPENCODE_CLIENT);
+  token = grant.token;
+  const bob = await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], clock.time.now, OPENCODE_CLIENT);
+  const team = await seed(store.repo, async tx => {
+    const t = await store.repo.teams.create(tx, "private", grant.authed.user_id);
+    await store.repo.teams.addMember(tx, t.id, grant.authed.user_id);
+    await store.repo.teams.addMember(tx, t.id, bob.authed.user_id);
+    return t;
+  });
+  const remove = () => seed(store.repo, tx => store.repo.teams.removeMember(tx, team.id, grant.authed.user_id));
+  return { ...clock, grant, bob, remove };
+}
+const boardChecked = "mcp:board:checked";
+
+test("#807 P3 B5a2: a team removal reaches a stamped native listen within a stream tick", async () => {
+  const f = await teamFixture();
+  const client = await connect();
+  expect((await client.callTool({ name: "board_create", arguments: { name: "private", purpose: "B5a2", team: "private" } })).isError).not.toBe(true);
+  const listen = await client.listen({ resourceSubscriptions: ["grayboard://boards/private"] });
+  await f.tick(); await f.tick(); // the first stamps it; the second is a quiet one, through phase A's board check
+  expect(hosted.activeListens).toBe(1);
+  await f.remove();
+  await f.tickStream();
+  expect(hosted.activeListens).toBe(0);
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual(["not_found"]);
+  await listen.close();
+});
+
+test("#807 P3 B5a2: a board a legacy subscribe adds while the stream's board check holds waits for the next tick", async () => {
+  const f = await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const name of ["first", "second"]) expect((await raw.post("tools/call", { name: "board_create", arguments: { name, purpose: "B5a2" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/first", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const get = await raw.get(abort.signal);
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1);
+  await f.tickStream(); await f.tickStream();
+  // The check read `first` alone; `second` joins the stream while it holds, read by the subscribe's own checks.
+  const { failures } = await held(boardChecked, f.tickStream, async () => {
+    expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/second", _meta: meta })).text).not.toContain("\"error\"");
+    expect(hosted.activeWatches).toBe(2);
+  });
+  expect(hosted.activeGetStreams).toBe(1);
+  expect(failures()).toEqual([]);
+  await f.tickStream();
+  expect(hosted.activeGetStreams).toBe(1);
+  expect(hosted.activeWatches).toBe(2);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// A stopped legacy stream prunes its lost boards' registrations (asynchronously, which the next GET awaits), so a
+// lost board doesn't refuse every later GET; the other registrations stay. Stopped by phase B's board check, or by
+// the watch's own close when a post to the lost board reaches it.
+// "(prune held)": the prune holds after its read while the next GET arrives, which waits for it.
+for (const stop of ["the stream tick", "the watch's close", "the stream tick (prune held)"] as const) test(`#807 P3 B5a2: a legacy GET after ${stop} stops a lost board's stream opens with the rest`, async () => {
+  const f = await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const args of [{ name: "open" }, { name: "private", team: "private" }]) expect((await raw.post("tools/call", { name: "board_create", arguments: { ...args, purpose: "B5a2" }, _meta: meta })).text).not.toContain("isError\":true");
+  for (const uri of ["grayboard://boards/private", "grayboard://boards/open"]) expect((await raw.post("resources/subscribe", { uri, _meta: meta })).text).not.toContain("\"error\"");
+  const first = new AbortController();
+  const get = await raw.get(first.signal);
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 2);
+  await f.tickStream(); await f.tickStream();
+  await f.remove();
+  if (stop === "the stream tick (prune held)") {
+    const second = new AbortController();
+    const answer = Promise.withResolvers<Response>();
+    answer.promise.catch(() => {});
+    // `start` settles with the GET, so the pause (in the prune, which no caller awaits) stays until the GET answers.
+    await held("mcp:legacy:pruned", () => f.tickStream().then(() => answer.promise), async () => {
+      await untilHosted(() => hosted.activeGetStreams === 0);
+      first.abort(); await get.body?.cancel().catch(() => {});
+      const again = raw.get(second.signal);
+      again.then(answer.resolve, answer.reject);
+      // The pause forces the overlap; this window only gives a GET that didn't wait the time to answer.
+      expect(await Promise.race([again.then(() => "answered", () => "answered"), Bun.sleep(200).then(() => "waiting")])).toBe("waiting");
+    });
+    const response = await answer.promise;
+    expect(response.status).toBe(200);
+    await untilHosted(() => hosted.activeGetStreams === 1);
+    expect(hosted.activeWatches).toBe(1);
+    second.abort(); await response.body?.cancel().catch(() => {});
+    await raw.delete();
+    return;
+  }
+  if (stop === "the stream tick") await f.tickStream();
+  else {
+    const own = token;
+    token = f.bob.token;
+    try {
+      const bob = await connect();
+      expect((await bob.callTool({ name: "bind", arguments: { name: "bob-be", create: true } })).isError).not.toBe(true);
+      expect((await bob.callTool({ name: "board_post", arguments: { board: "private", body: "after" } })).isError).not.toBe(true);
+    }
+    finally { token = own; }
+  }
+  await untilHosted(() => hosted.activeGetStreams === 0);
+  first.abort(); await get.body?.cancel().catch(() => {});
+  const second = new AbortController();
+  const again = await raw.get(second.signal);
+  expect(again.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1);
+  expect(hosted.activeWatches).toBe(1);
+  second.abort(); await again.body?.cancel().catch(() => {});
+  await raw.delete();
+});

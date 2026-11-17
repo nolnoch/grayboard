@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { BOARD_NAME_RE, type SnapshotOptions } from "../core/boards.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
+import { CoreError } from "../core/errors.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { countRefusal } from "./metrics.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
@@ -102,7 +103,9 @@ export function createResources(application: Application, options: ResourceOptio
     try {
       const ok = await authorized(watch.session);
       await testPauseAsync("resources:live:checked");
-      if (ok && watches.has(watch.id) && application.canReceiveBoard(application.repo.read, watch.session, watch.board)) return true;
+      // The board read is the last await: the session and the watch are judged with none since (#807 P3 B5a2).
+      const visible = ok && watches.has(watch.id) && (await application.boardsVisible(application.repo.read, watch.session, [watch.board])).get(watch.board);
+      if (visible && watches.has(watch.id) && current(watch.session)) return true;
     } catch (e) { hostedFailure("resources.authorize", e); }
     finishQuietly(watch);
     return false;
@@ -119,14 +122,15 @@ export function createResources(application: Application, options: ResourceOptio
       const board = parseBoardResourceUri(uri);
       return { uri: boardResourceUri(board), ...await application.boardSnapshot(r, session, board, options) };
     },
-    // Synchronous, for a caller that has just checked the session's token with no read since (mcp's makeLive and
-    // its legacy control, after `authorize`): it says so with `checked`, and only `current` runs here. Without it the
+    // Synchronous, for a caller that has just checked the session's token and read the board's visibility for it,
+    // with no await since (mcp's makeLive and its legacy control, after `authorize`): `visible` is that read's answer
+    // (`Checked.boards`, #807 P3 B5a2), and only `current` runs here. A caller with no answer passes false: the
     // watch is refused, never left unchecked (#807 P3 A7d2c).
-    watch(session: ApplicationSession, uri: string, hooks: ResourceHooks, checked: true): string {
-      // A caller that didn't check is a bug: refused, without closing the session's other watches.
-      if (checked !== true) throw new ApplicationError("unauthenticated", "resource session is closed or unauthorized");
+    watch(session: ApplicationSession, uri: string, hooks: ResourceHooks, visible: boolean): string {
       if (!current(session)) refuse(session);
       const board = parseBoardResourceUri(uri);
+      // As a content read refuses a board it can't see: as missing, so its existence doesn't leak.
+      if (visible !== true) throw new CoreError(`no such board #${board}; see board_list`);
       if (watches.size >= caps.global || (bySession.get(session)?.size ?? 0) >= caps.perSession) {
         countRefusal("resource_watch");
         throw new ApplicationError("bad_request", "resource watch capacity reached");
