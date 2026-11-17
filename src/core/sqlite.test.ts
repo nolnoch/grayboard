@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { journalModeWarning, openReader, openSqlite, routeReads, STATEMENT_CACHE_SIZE } from "./sqlite.ts";
+import { checksWrite, journalModeWarning, openReader, openSqlite, routeReads, scriptStatements, STATEMENT_CACHE_SIZE } from "./sqlite.ts";
 
 let dir = "";
 afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
@@ -161,4 +161,23 @@ test("routeReads: no reader statement holds a snapshot: each read after a commit
   expect(all.values()).toEqual([[1]]);
   expect(new Set(onReader)).toEqual(new Set(["SELECT v FROM t WHERE k = ?", "SELECT count(*) AS n FROM t"]));
   db.close();
+});
+
+// #995: the write check exempts schema SQL only when every top-level statement is DDL; a trigger's body, literals
+// and comments don't count, and CASE … END inside a body doesn't close it.
+test("#995: checksWrite sees a write after a leading DDL statement, not one inside a trigger body or a literal", () => {
+  expect(checksWrite("SELECT 1")).toBe(false);
+  expect(checksWrite("DELETE FROM users WHERE id = ?")).toBe(true);
+  expect(checksWrite("CREATE TABLE IF NOT EXISTS t(a)")).toBe(false);
+  expect(checksWrite("CREATE TEMP TABLE x(a); DELETE FROM users")).toBe(true);
+  expect(checksWrite("CREATE TEMP TABLE x(a);\n  INSERT INTO x(a) SELECT 0")).toBe(true);
+  expect(checksWrite("CREATE TEMP TRIGGER g AFTER UPDATE ON users BEGIN UPDATE c SET n = n + 1; END")).toBe(false);
+  expect(checksWrite(`CREATE TRIGGER r BEFORE UPDATE OF s ON users WHEN NEW.s = 'x' BEGIN
+    UPDATE users SET s = CASE WHEN OLD.s IS NULL THEN 'a' ELSE 'b' END WHERE id = OLD.id;
+    SELECT RAISE(IGNORE);
+  END; DELETE FROM users`)).toBe(true);
+  expect(checksWrite(`CREATE TRIGGER r BEFORE INSERT ON t BEGIN SELECT CASE WHEN 1 THEN RAISE(ABORT, 'end; delete') END; END`)).toBe(false);
+  expect(checksWrite("CREATE TABLE t(a TEXT DEFAULT 'x; DELETE FROM users') -- ; UPDATE users\n")).toBe(false);
+  expect(checksWrite("CREATE TABLE t(a) /* ; INSERT INTO users */; DROP TABLE t")).toBe(false);
+  expect(scriptStatements("CREATE TABLE a(x); ; CREATE TABLE b(y);").map(s => s.trim())).toEqual(["CREATE TABLE a(x)", "CREATE TABLE b(y)"]);
 });
