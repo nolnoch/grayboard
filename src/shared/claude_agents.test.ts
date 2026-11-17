@@ -220,20 +220,20 @@ describe("facts (#545)", () => {
     expect(facts()).toEqual({ model: "claude-haiku-4-5" });
     hook("pre-tool-use", { tool_use_id: id(2), effort: { level: "high" } }, true);
     expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
-    // /clear: SessionStart rewrites the model; the effort stays.
-    hook("session-start", { source: "clear", model: "claude-opus-5-5[1m]" }, true);
-    expect(facts()).toEqual({ model: "claude-opus-5-5[1m]", effort: "high" });
+    // /clear: SessionStart carries no model (2.1.316), so both facts stay.
+    hook("session-start", { source: "clear" }, true);
+    expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
     // A root call on a model without effort says it has none (#558): null, which the wire sends as a clear.
     hook("pre-tool-use", { tool_use_id: id(3) }, true);
-    expect(facts()).toEqual({ model: "claude-opus-5-5[1m]", effort: null });
+    expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: null });
     // A null level, or a null effort, is none as well (#563 item 4).
     for (const effort of [{ level: null }, null]) {
       hook("pre-tool-use", { tool_use_id: id(5), effort: { level: "high" } }, true);
       hook("pre-tool-use", { tool_use_id: id(6), effort }, true);
-      expect(facts()).toEqual({ model: "claude-opus-5-5[1m]", effort: null });
+      expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: null });
     }
     // A switch makes it unknown again (left out, so the server keeps its value), not none.
-    hook("model-switch", { from_model: "claude-opus-5-5[1m]", to_model: "claude-opus-5-5" }, true);
+    hook("model-switch", { from_model: "claude-haiku-4-5", to_model: "claude-opus-5-5" }, true);
     expect(facts()).toEqual({ model: "claude-opus-5-5" });
     // A new process's SessionStart removes a none, too.
     hook("pre-tool-use", { tool_use_id: id(4) }, true);
@@ -277,10 +277,10 @@ describe("facts (#545)", () => {
     expect(said).toEqual([`effort: ${join(sessionDir(base, pid), "effort")} isn't a Claude Code effort`]);
   });
 
-  test("a new process's SessionStart drops facts an earlier holder of the pid left; /clear keeps the effort", () => {
+  test("a new process's SessionStart drops facts an earlier holder of the pid left; /clear keeps both", () => {
     hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
     hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "max" } }, true);
-    hook("session-start", { source: "clear", model: "claude-opus-5-5" }, true);
+    hook("session-start", { source: "clear" }, true);
     expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "max" });
     hook("session-start", { source: "startup" }, true);
     expect(facts()).toEqual({});
