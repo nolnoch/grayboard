@@ -29,7 +29,8 @@
 // misreports that session's display model or effort: facts grant nothing, and
 // it is the records' boundary and #229's.
 //
-// Facts (#545, measured on Claude Code 2.1.316): SessionStart's `model` and
+// Facts (#545, measured on Claude Code 2.1.316): a startup SessionStart's `model`
+// (clear and resume carry none) and
 // PostModelSwitch's `to_model` (after the user confirms a switch; PreModelSwitch
 // runs before that dialog) are the model, a full ID (`claude-opus-5-5`;
 // `to_model` is the ID as given to /model); the root's grayboard PreToolUse
@@ -188,7 +189,7 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       if (!o.hosted && validSourceId(input.session_id)) put(join(dir, "current"), JSON.stringify({ session: input.session_id, start: start ?? "", token: `${now}-${process.pid}-${Math.random().toString(36).slice(2)}` }));
       if (o.hosted) {
         // A new process starts with no facts, even in a dir an earlier holder of
-        // this pid left; a /clear keeps its process's effort.
+        // this pid left; a /clear keeps both of its process's facts.
         if (input.source !== "clear") for (const fact of FACTS) dropFact(dir, fact);
         putFact(dir, "model", input.model);
       }

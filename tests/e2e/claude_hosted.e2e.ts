@@ -173,9 +173,9 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort 
     expect(facts()).toEqual([{ model: "claude-sonnet-5-5", effort: "high" }]);
 
     // /clear: the plugin's root continues on the facts it had. SessionStart(clear)
-    // carries no model (2.1.316), so the hook keeps both files rather than
-    // dropping them; a drop would leave the server's row unchanged, so the
-    // files are what tell it.
+    // carries no model (2.1.316), so the hook keeps the model file rather than
+    // dropping it; a drop would leave the server's row unchanged, so the file
+    // is what tells it.
     const agents = join(h.config, "plugins/data/grayboard-grayboard/claude-agents");
     const changedBefore = changes();
     await t.submit("/clear");
