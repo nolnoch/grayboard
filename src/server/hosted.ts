@@ -187,7 +187,7 @@ const RECONCILE_EVERY = 120;
 // Activity writes coalesce (#912): a touch skips a row whose last_seen_at is within this of now, at most a tenth
 // of the idle window, so the idle sweep sees a row at most that much older than its last call.
 const TOUCH_EVERY_MS = 5_000;
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean }) {
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   // GRAYBOARD_HOSTED_IDLE_SECONDS is parsed strictly in config.ts and arrives here as options.idleSeconds.
@@ -260,8 +260,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     writeAudit(repo, h, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
   };
   // `r`: the body's Tx when the check runs inside one, so it sees the body's own revokes (#998); else the pool.
-  function authorized(p: OAuthPrincipal, r?: Read) {
-    if (stopped || !options.isAuthorized(p, r)) throw new ApplicationError("unauthenticated", "unauthenticated");
+  // A close while the read awaited refuses too (#807 P3 A7d2).
+  async function authorized(p: OAuthPrincipal, r?: Read) {
+    if (stopped || !await options.isAuthorized(p, r) || stopped) throw new ApplicationError("unauthenticated", "unauthenticated");
   }
   // `later`: a refusal's row, handed to the caller's `refusalRows` (the throw rolls back a row written inside, #452).
   // `wake`: a parked child's request makes it active again; an exchange's selection (`snapshot`) and session_end
@@ -528,7 +529,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // to the tool's own gate, which ends later (#907). `create`: false admits no unknown ID (#1097): `fn` then gets no
   // row, and the gate writes nothing but settle's.
   async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true, create = true): Promise<T> {
-    authorized(p);
+    await authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
     for (;;) {
@@ -537,16 +538,26 @@ export function createHostedSessions(application: Application, options: { now?: 
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
         const later = refusalRows();
         // Checked outside the transaction, where the auth cache serves it (#853); an idle queue runs the body below
-        // inside write(), with no await since. Only a body that waited behind another checks again, in the
-        // transaction (uncached), so settle's premise holds either way.
-        authorized(p);
-        let waited = false;
+        // inside write(). The check awaits (#807 P3 A7d2), so a body holding the queue meanwhile can commit a disable or
+        // revoke and release it before write() is called: `g`, the generation read just before the check, compared in the
+        // same synchronous run as write(), says whether anything that moves it committed since. A body that waited
+        // behind another, or ran after such a commit, checks again in the transaction (uncached), so settle's
+        // premise holds either way. Equal generations prove nothing committed between them only where a commit moves
+        // the generation synchronously (SQLite's counter); a store without one returns undefined, and every body
+        // checks again (Repo.commitGeneration). `g` is read before the check, so a commit during the check's awaits
+        // moves the generation past it and makes the body stale.
+        let g: string | undefined;
+        try { g = repo.commitGeneration(); } catch { g = undefined; }
+        await repo.authRead(() => authorized(p));
+        await testPauseAsync("hosted:gate:checked");
+        let waited = false, stale = true;
+        try { stale = g === undefined || repo.commitGeneration() !== g; } catch { stale = true; }
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.
         const pending = store.write(async tx => {
-          if (waited) authorized(p, tx);
-          // authorized(p) passed with no await since: settle skips p's own disabled read (#881).
+          if (waited || stale) await authorized(p, tx);
+          // authorized(p) passed with no commit to the auth tables since: settle skips p's own disabled read (#881).
           const settled = await settle(tx, context.id, p.authed.user_id);
           try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
           catch (error) { await later.flush(tx); return { error }; }
@@ -576,11 +587,11 @@ export function createHostedSessions(application: Application, options: { now?: 
   // facts and launcher declaration are written only on a change, and its writes_as is fixed for the ownership.
   const MISS = Symbol("prior stale");
   async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>): Promise<T> {
-    authorized(p);
+    await authorized(p);
     if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) return withGate(p, context, false, fn);
     const id = prior.root.session_id;
     const result = await gate(id).call(async () => {
-      authorized(p);
+      await authorized(p);
       if (stopped) return MISS;
       const touched = await store.write(async tx => {
         const fresh = store.get(tx, prior.row.session_id);
@@ -605,14 +616,14 @@ export function createHostedSessions(application: Application, options: { now?: 
     return result === MISS ? withGate(p, context, false, fn) : result as T;
   }
   async function attach(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<HostedSession> {
-    authorized(p, tx);
+    await authorized(p, tx);
     const fresh = store.get(tx, row.session_id);
     if (!fresh) throw new ApplicationError("unbound", "unbound; bind again");
     rootOnly(fresh);
-    fence(tx, p, row, row);
+    await fence(tx, p, row, row);
     if (fresh.grant_id === p.grantId) return fresh;
     testPause("hosted:attach:in-txn");
-    authorized(p, tx);
+    await authorized(p, tx);
     for (const child of store.ofOwnership(tx, fresh.ownership_id)) await store.update(tx, { ...child, grant_id: p.grantId });
     audit(tx, row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
     // The lease is tied to the grant (delivery.ts), so a reattach closes one only if it was open.
@@ -627,8 +638,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
     return { ...application.hostedSession(repo.read, p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(repo.read, root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
   }
-  function fence(r: Read, p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
-    authorized(p, r);
+  // The rows are read after the token check's await, back to back with none between them.
+  async function fence(r: Read, p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
+    await authorized(p, r);
     if (!row || !root) return;
     const fresh = store.get(r, row.session_id);
     const current = fresh ? rootOf(r, fresh) : undefined;
@@ -710,7 +722,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         try {
           await testPauseAsync("hosted:tool:in-gate");
           return await store.write<T>(async tx => {
-            fence(tx, p, row, root);
+            await fence(tx, p, row, root);
             const value = await fn(selected.session, tx);
             if (!writeReads.has(tool)) audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
             return value;
@@ -722,20 +734,21 @@ export function createHostedSessions(application: Application, options: { now?: 
       };
       return prior ? withPrior(p, context, prior, body) : withGate(p, context, false, body);
     },
-    async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: (r: Read) => void) => Promise<T>): Promise<T> {
+    async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: (r: Read) => Promise<void>) => Promise<T>): Promise<T> {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(repo.read, row) : undefined;
         if (!(root && named(root))) throw new ApplicationError("unbound", "attachments require a bound source session");
         const selected = snapshot(p, row);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
-        // fence only reads, back to back with no await, so no transaction: nothing in this process commits between
-        // its reads. Its caller names the handle (#1053): the pool here, a body's own Tx inside one.
+        // fence only reads, its row reads back to back with no await after its token check's, so no transaction:
+        // nothing in this process commits between them. Its caller names the handle (#1053): the pool here, a body's
+        // own Tx inside one.
         const guard = (r: Read) => fence(r, p, row, root);
         try {
-          guard(repo.read);
+          await guard(repo.read);
           const value = await fn(selected.session, guard);
-          guard(repo.read);
+          await guard(repo.read);
           return value;
         } catch (error) {
           await late.flushQueued();
@@ -816,7 +829,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         } finally { application.close(selected.session, tx); }
       }, async result => {
         await testPauseAsync("hosted:bind:after-commit");
-        authorized(p);
+        await authorized(p);
         return result;
       });
       // A push client opens delivery right after bind and reports it itself if it can't. A
@@ -849,7 +862,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         } finally { application.close(selected.session, tx); }
       }, async result => {
         await testPauseAsync("hosted:unbind:after-commit");
-        authorized(p);
+        await authorized(p);
         return result;
       });
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), alias = short(result.ok.alias);
@@ -874,7 +887,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:register:before-txn");
         const later = refusalRows();
         try { return await store.write(async tx => {
-          authorized(p, tx);
+          await authorized(p, tx);
           testPause("hosted:register:in-txn");
           const root = (await rowFor(tx, p, context, later.defer))!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
@@ -918,7 +931,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const root = rootOf(repo.read, row);
         const later = refusalRows();
         try { await store.write(async tx => {
-          fence(tx, p, row, root);
+          await fence(tx, p, row, root);
           const candidate = store.get(tx, target);
           if (candidate) ownRow(p, candidate, later.defer, row.session_id);
           // The caller's own session outside this root, or a missing ID: not a policy question, so no row.
