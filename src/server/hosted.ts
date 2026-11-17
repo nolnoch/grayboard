@@ -255,11 +255,12 @@ export function createHostedSessions(application: Application, options: { now?: 
   // The row is read only for an audit with no principal to name the actor and client (#907).
   // `h`: the caller's body `Tx`, which the row and user reads and the audit row all use (writeAudit). The user read
   // awaits (#807 P3 A7u2); no caller reads in-memory state after it.
-  const audit = async (h: Read, id: string, action: AuditAction, detail: Record<string, unknown>, principal?: OAuthPrincipal) => {
+  // A named function: hosted.test.ts finds its frame in a stack (an async arrow shows as <anonymous>).
+  async function audit(h: Read, id: string, action: AuditAction, detail: Record<string, unknown>, principal?: OAuthPrincipal) {
     const row = principal ? undefined : store.get(h, id);
     const actor = principal?.authed.user_email ?? (row && (await repo.users.findById(h, row.user_id))?.email) ?? null;
     writeAudit(repo, h, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
-  };
+  }
   // `r`: the body's Tx when the check runs inside one, so it sees the body's own revokes (#998); else the pool.
   // A close while the read awaited refuses too (#807 P3 A7d2).
   async function authorized(p: OAuthPrincipal, r?: Read) {

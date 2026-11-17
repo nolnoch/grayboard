@@ -882,7 +882,8 @@ test("an attach that fails after a newer one for the same user went live leaves 
   const attach = spyOn(application, "attachHuman").mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
   try {
     const first = bridge.userChanged(id);
-    expect(fail).toBeDefined();
+    // attach reads the user first (#807 P3 A7u2), so attachHuman is reached after that await.
+    await until(() => fail, 5000, "the first attach reached attachHuman");
     await bridge.userChanged(id);
     fail!(new Error("raced"));
     await first;
