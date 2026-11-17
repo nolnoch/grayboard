@@ -14248,17 +14248,17 @@ function tryAcquire(path, busyMs = 50) {
   };
 }
 async function acquire(path, options) {
-  const deadline = Date.now() + options.deadlineMs;
+  const deadline = performance.now() + options.deadlineMs;
   for (;; ) {
     options.signal?.throwIfAborted();
     const lock = tryAcquire(path, 0);
     if (lock)
       return lock;
     await options.onBusy?.();
-    const left = deadline - Date.now();
+    const left = deadline - performance.now();
     if (left <= 0)
       throw new LockTimeout(resolve(path));
-    await sleep(Math.min(100, left), undefined, options.signal ? { signal: options.signal } : undefined);
+    await sleep(Math.min(100 + Math.random() * 10, left), undefined, options.signal ? { signal: options.signal } : undefined);
   }
 }
 

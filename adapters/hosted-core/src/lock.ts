@@ -28,7 +28,8 @@ const held = new Set<string>();
 // short wait lets the loser drop SHARED first. A poll passes 0: the wait
 // blocks the event loop for all of `busyMs` whenever a live holder has the
 // lock, which a poll finds on nearly every try (#438-36), and a race lost at
-// 0 only costs one interval, since a 0 attempt always gives way to a waiting one.
+// 0 only costs one interval: a 0 attempt never makes a waiting one fail
+// too, since it either wins or drops its locks at once.
 export function tryAcquire(path: string, busyMs = 50): Lock | undefined {
   const file = resolve(path);
   if (held.has(file)) return undefined;
@@ -53,18 +54,21 @@ export function tryAcquire(path: string, busyMs = 50): Lock | undefined {
   };
 }
 
-// Polls tryAcquire (with no busy wait) every 100 ms until `deadlineMs`
+// Polls tryAcquire (with no busy wait) every 100-110 ms until `deadlineMs`
 // passes (LockTimeout) or `signal` aborts. `onBusy` runs after each attempt that found the lock held,
 // so it sees only what a live holder left; what it throws ends the wait.
 export async function acquire(path: string, options: { deadlineMs: number; signal?: AbortSignal; onBusy?: () => void | Promise<void> }): Promise<Lock> {
-  const deadline = Date.now() + options.deadlineMs;
+  // Monotonic: Date.now() counts whole ms (a deadline up to 1 ms early) and
+  // moves with the wall clock.
+  const deadline = performance.now() + options.deadlineMs;
   for (;;) {
     options.signal?.throwIfAborted();
     const lock = tryAcquire(path, 0);
     if (lock) return lock;
     await options.onBusy?.();
-    const left = deadline - Date.now();
+    const left = deadline - performance.now();
     if (left <= 0) throw new LockTimeout(resolve(path));
-    await sleep(Math.min(100, left), undefined, options.signal ? { signal: options.signal } : undefined);
+    // Jittered, so two pollers whose timers line up stop colliding.
+    await sleep(Math.min(100 + Math.random() * 10, left), undefined, options.signal ? { signal: options.signal } : undefined);
   }
 }
