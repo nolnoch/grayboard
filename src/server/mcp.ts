@@ -512,28 +512,29 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               await authorize(context, ctx.mcpReq.signal);
             }
             const stream = legacy.stream;
+            let compatible = false;
             if (stream) {
-              let compatible: boolean;
               try {
                 const streamChecked = await authorize(stream.context);
                 compatible = watchable(stream.context, uri, streamChecked) === cap && (!stream.uris.has(uri) || stream.uris.get(uri) === cap);
               } catch (error) {
                 if (!(error instanceof ApplicationError) || error.code !== "unauthenticated" && error.code !== "not_found") throw error;
-                compatible = false;
-              }
-              // A stream stopped or replaced while the check awaited is left alone: nothing to join or stop (#807 P3 A7d).
-              if (legacy.stream !== stream || stream.stopped) {}
-              else if (compatible) {
-                // Publish registration only after observer installation succeeds.
-                if (!stream.uris.has(uri)) { addWatch(stream, uri); stream.uris.set(uri, cap); indexInbox(stream); }
-              } else {
-                // The current POST owns registration; an incompatible GET must recover
-                // with fresh credentials rather than inherit this request's snapshot.
-                stream.stop();
               }
             }
-            // Retired or parked while the checks awaited: the registration would outlive its session.
+            // Past the last await (#807 P3 A7d): a session retired or parked meanwhile takes no registration, and the
+            // capability is checked again, since an inbox lease may have closed while the checks awaited.
             if (legacy.stopped || legacy.dormant) throw new ApplicationError("unauthenticated", "MCP session is closed");
+            if (watchable(context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
+            // A stream stopped or replaced while the check awaited is left alone: nothing to join or stop.
+            if (!stream || legacy.stream !== stream || stream.stopped) {}
+            else if (compatible) {
+              // Publish registration only after observer installation succeeds.
+              if (!stream.uris.has(uri)) { addWatch(stream, uri); stream.uris.set(uri, cap); indexInbox(stream); }
+            } else {
+              // The current POST owns registration; an incompatible GET must recover
+              // with fresh credentials rather than inherit this request's snapshot.
+              stream.stop();
+            }
             legacy.meta = exchanges.getStore()?.meta;
             legacy.subscriptions.set(uri, cap);
           } else {
@@ -560,7 +561,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       server.server.setRequestHandler("resources/subscribe", (req, ctx) => serialized(req.params.uri, ctx, true));
       server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => serialized(req.params.uri, ctx, false));
     }
-    if (role !== "subscriber") registerNativeTools(server, application, hosted, async ctx => { const context = current(ctx); await authorize(context, ctx.mcpReq.signal, false); return context; }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
+    if (role !== "subscriber") registerNativeTools(server, application, hosted, async ctx => { await authorize(current(ctx), ctx.mcpReq.signal, false); return current(ctx); }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
     return server;
   }
   const modernFactory = async () => {
@@ -642,14 +643,18 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     legacyAudit(legacy, "hosted.legacy_dropped", { reason, dormant_ms: legacy.dormant ? now() - legacy.dormant.since : 0, ...detail });
     retire(legacy, failed);
   }
-  // Contexts and legacy sessions whose phase-B check is in flight: a tick skips them, so a slow check never overlaps
-  // the next tick's on the same one (#807 P3 A7d). `checking` keeps each check's notice number, which the prune below
-  // keeps notices for until the check stamps. Phase B checks a bounded number at once.
+  // Contexts and legacy sessions queued for or in a phase-B check: a tick skips them, so a slow check never overlaps
+  // the next tick's on the same one (#807 P3 A7d). A tick marks each as it queues it, since phase B starts only a
+  // bounded number at once; the check's finally unmarks it. `checking` keeps each check's notice number (the queuing
+  // tick's, then the check's own at its start), which the prune below keeps notices for until the check stamps.
   const checking = new Map<Context, number>(), sweeping = new Set<Legacy>();
   const PHASE_B_PARALLEL = 16;
+  // A worker never dies on a throw, so every queued item reaches the check whose finally unmarks it.
   async function bounded<T>(items: T[], fn: (item: T) => Promise<void>) {
     let next = 0;
-    await Promise.all(Array.from({ length: Math.min(PHASE_B_PARALLEL, items.length) }, async () => { while (next < items.length) await fn(items[next++]!); }));
+    await Promise.all(Array.from({ length: Math.min(PHASE_B_PARALLEL, items.length) }, async () => {
+      while (next < items.length) { try { await fn(items[next++]!); } catch (e) { hostedFailure("mcp.stream", e); } }
+    }));
   }
   // An access expiry or revoke is an expected close, audited by streamClosed; only other failures are logged (#494 item 10).
   const unexpected = (e: unknown) => { if (!(e instanceof ApplicationError && e.code === "unauthenticated")) hostedFailure("mcp.stream", e); };
@@ -659,17 +664,18 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const start = seq;
     checking.set(context, start);
     try {
+      // authRead reads the generation and pins it for the body, where authGeneration returns the pin. A failed read
+      // there rejects authRead, and the caller closes the stream with reason `failed`: the check fails closed, as
+      // its own token read would. An undefined generation (no pin) stamps nothing; the next tick checks in full.
       return await application.repo.authRead(async () => {
-        // A failed generation read stamps nothing: the check still runs, and the next tick checks in full again.
-        let gen: string | undefined;
-        try { gen = application.repo.authGeneration(); } catch { gen = undefined; }
+        const gen = application.repo.authGeneration();
         await testPauseAsync("mcp:stream:check");
         return { gen, start, checked: rest(await authorize(context)) };
       });
     } finally { checking.delete(context); }
   }
-  async function checkLive(live: Live, t: number) {
-    const context = live.context;
+  // `context`: the live's as the tick queued it; an attach that re-selected it since leaves the answer unused.
+  async function checkLive(live: Live, context: Context, t: number) {
     try {
       const { gen, start, checked } = await fullCheck(context, checked => validChecked(live, checked));
       // Stopped, or re-selected by an attach, while the check awaited: its answer is about a context the live no
@@ -714,8 +720,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       }
       const authorized = await oauth.isAuthorized(principal);
       const sleeps = !authorized && principal.accessExpiry <= now() && await oauth.isGrantActive(principal.grantId);
+      await testPauseAsync("mcp:legacy:sweep");
       if (!same()) return;
-      if (!authorized) { if (sleeps) sleep(legacy); else retire(legacy); }
+      // Its GET's close row is written here, as sleep writes it, so a revoke audits the stream whichever of this
+      // sweep and the GET's own check settles first (streamClosed writes one row per context).
+      if (!authorized) {
+        if (sleeps) sleep(legacy);
+        else { if (legacy.stream) streamClosed(legacy.stream.context, new ApplicationError("unauthenticated", "unauthenticated")); retire(legacy); }
+      }
       else if (!legacy.stream && legacy.posts === 0 && now() - legacy.lastUsed >= 60_000) retire(legacy);
     } catch {
       if (!same()) return;
@@ -726,7 +738,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     // A live's stream is in streamContexts too (wrap adds both): valid() just authorized its context (#853).
     // Phase A, synchronous, from the auth cache (#899, #807 P3 A7d): a fresh stamp's checks, which read no hosted row
     // and write nothing. A stale stamp or an auth cache miss waits for phase B's full check, whose settle may commit.
-    const owned = new Set<Context>(), full: Live[] = [], fullStreams: [OwnedStream, Context][] = [];
+    const owned = new Set<Context>(), full: [Live, Context][] = [], fullStreams: [OwnedStream, Context][] = [];
     const t = now();
     let peek: AuthPeek | undefined;
     // A failed generation read leaves every context to phase B, whose own checks close the ones that fail.
@@ -738,19 +750,20 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       const s = peek && fresh(live.context, peek.generation, t);
       try { if (s && validStamped(live, s, peek!)) continue; }
       catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); continue; }
-      full.push(live);
+      full.push([live, live.context]); checking.set(live.context, seq);
     }
     for (const [stream, context] of streamContexts) {
       if (owned.has(context) || checking.has(context)) continue;
       try { if (peek && fresh(context, peek.generation, t) && authPeekCheck(context, peek)) continue; }
       catch (e) { unexpected(e); streamClosed(context, e); track(stream.stop()); continue; }
-      fullStreams.push([stream, context]);
+      fullStreams.push([stream, context]); checking.set(context, seq);
     }
     const legacies = [...legacyDormant, ...legacyAll].filter(legacy => !sweeping.has(legacy));
+    for (const legacy of legacies) sweeping.add(legacy);
     // Phase B: the full checks and the legacy sweep, async; nothing waits for them but close, and a test that
     // drives the timer by hand, to which it's returned.
     const phaseB = Promise.all([
-      bounded(full, live => checkLive(live, t)),
+      bounded(full, ([live, context]) => checkLive(live, context, t)),
       bounded(fullStreams, ([stream, context]) => checkStream(stream, context, t)),
       bounded(legacies, sweepLegacy),
     ]).then(() => {}, e => hostedFailure("mcp.stream", e));
@@ -919,6 +932,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               if (req.method === "GET") {
                 if (legacy.stream) { context.finish(); releasePost(); return new Response("MCP GET already active", { status: 409 }); }
                 const checked = await authorize(context);
+                await testPauseAsync("mcp:legacy:get-checked");
                 // Another GET took the stream, or the timer retired or parked the session, while the check awaited (#807 P3 A7d).
                 if (legacy.stopped || legacy.dormant) { context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 }); }
                 if (legacy.stream) { context.finish(); releasePost(); return new Response("MCP GET already active", { status: 409 }); }

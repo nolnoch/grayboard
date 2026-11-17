@@ -994,7 +994,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
   // Caches of what the auth tables say, keyed on authGeneration: a live access token only (an unknown or dead one is
   // re-read every time); a user row, or its absence, as read (#853). They sit here, under the store's own methods, so
-  // a test that replaces one of those methods replaces the cache too.
+  // a test that replaces one of those methods replaces the cache behind it, except authPeek's: it reads the access
+  // cache directly, so a stubbed findActiveAccess changes only what a miss later fills.
   // A lookup hits only when its generation is the cache's. A miss reads, then fills only if the generation is still
   // its own once the read is done (#807 P3 A7b): a lookup pinned before a commit neither fills nor clears the cache a
   // newer one keyed, so bodies with different pins don't thrash it, and generations need no order.

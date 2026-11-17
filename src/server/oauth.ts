@@ -679,7 +679,6 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       return principalOf(activeAccessNow(accessHash, r), accessHash, requiredScopes);
     },
     async isGrantActive(grantId: string): Promise<boolean> { return !closed && await repo.oauth.isGrantActive(repo.read, grantId, now()) && !closed; },
-    isGrantActiveNow(grantId: string): boolean { return !closed && repo.authNow.isGrantActive(repo.read, grantId, now()); },
     async isAuthorized(principal: OAuthPrincipal, r?: Read): Promise<boolean> {
       if (closed || principal.accessExpiry <= now()) return false;
       const a = (await activeAccess(principal.accessHash, r))?.access;
