@@ -17,14 +17,14 @@ import {
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, queuedTx, type MessageRow, type Repo, type Sync } from "./db.ts";
-import type { Read, Tx } from "./store/tx.ts";
+import { afterCommitOf, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  HOLD_ORDER, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
+  acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
   setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -211,8 +211,13 @@ type Hub = {
   delegateOpenCap: number;
   aliasScopeCap: number;
   now: () => number;
-  boardChanged: (board: string) => void;
+  // `on`: when its effect runs (`onCommit(handle)`, or core's own transaction for a core-driven callback).
+  boardChanged: (on: Commit, board: string) => void;
 };
+
+// Schedules an effect after the commit of the transaction a handle names, or now for a `Read` (#807 P1c-15a).
+type Commit = (effect: () => void | Promise<void>) => void;
+const onCommit = (h: Read): Commit => (effect) => afterCommitOf(h, effect);
 
 // A push its reader can no longer see, acknowledged as pendingFor finds it: posted through the write queue (#807 D4),
 // since the reads that find it run outside any transaction.
@@ -251,8 +256,8 @@ function drainDirect(hub: Hub, session: ApplicationSession, addresses: string[])
 
 // A human's session has no wakes to save: it gets deferred pushes and
 // digests at once.
-function wake(hub: Hub, handles: string[]): void {
-  afterCommit(hub.db, () => {
+function wake(hub: Hub, on: Commit, handles: string[]): void {
+  on(() => {
     for (const session of new Set(handles.map((h) => hub.registry.get(h)))) {
       if (session?.active) drainBoards(session, hub, session.human);
     }
@@ -443,8 +448,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     delegateRows: undefined,
     delegateOpenCap: opts.delegateOpenCap ?? DELEGATE_OPEN_CAP,
     aliasScopeCap: opts.aliasScopeCap ?? ALIAS_SCOPE_CAP,
-    boardChanged(board) {
-      afterCommit(db, () => {
+    boardChanged(on, board) {
+      on(() => {
         // A copy: observerLive removes a dead observer from the set mid-walk.
         for (const observer of [...observersByBoard.get(board) ?? []]) {
           if (observerLive(observer)) notify(() => observer.hooks.changed());
@@ -497,13 +502,16 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     removeObserver(observer);
     return false;
   }
-  function boardsChanged(boards: string[]) {
-    for (const board of new Set(boards)) hub.boardChanged(board);
+  function boardsChanged(on: Commit, boards: string[]) {
+    for (const board of new Set(boards)) hub.boardChanged(on, board);
   }
+  // Core's claim expiry runs in core's own queued transaction, which can't name a server Tx (D1): its effects stay on
+  // the connection's afterCommit until P3 forks claims into the server.
+  const coreCommit: Commit = (effect) => afterCommit(db, effect);
   // Announces claims that lapse on their boards.
   // Armed from requests, it fires for every holder: detached, so its rows
   // don't carry the arming request's address (security audit F-19).
-  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, handles), boardsChanged, queuedTx(repo));
+  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, coreCommit, handles), boards => boardsChanged(coreCommit, boards), queuedTx(repo));
   const expiry = { arm: () => detached(() => expiryTimer.arm()), stop: () => expiryTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
@@ -597,7 +605,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       const to = hub.registry.get(b.recipient);
       if (to?.active) to.sink.deliver({ kind: "direct", message: showMessage(b) });
     }
-    wake(hub, [...woken]);
+    wake(hub, onCommit(repo.read), [...woken]);
     void sweepBlobs(db, repo.blobs, queuedTx(repo));
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
@@ -887,13 +895,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // The root a hosted child acts under (#523), recorded on the child's ids row, where it outlives the
     // child's source row (deleted at the child's end) so a send or mention to the child's ID keeps
     // being refused child_session; null when the ID starts as a root, which makes it an address again.
-    hostedRoot(id: string, root: string | null) {
-      db.prepare(`UPDATE ids SET root_id = ? WHERE id = ? AND root_id IS NOT ?`).run(root, id, root);
-    },
+    hostedRoot(tx: Tx, id: string, root: string | null) { repo.hosted.setRoot(tx, id, root); },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
     // (`hostedCollided`, written after the rollback); without it the row is written here.
-    hostedRegister(authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
+    hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
       const prior = idRow(db, id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
@@ -915,7 +921,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         if (prior.ended_at !== null) {
           const endedAt = prior.ended_at;
           repo.atomic(() => {
-            db.prepare(`UPDATE ids SET ended_at = NULL, held_aliases_json = NULL WHERE id = ?`).run(id);
+            repo.hosted.reopenId(tx, id);
             writeAudit(repo, "id.reopened", authed.user_email, id, { ended_at: endedAt, harness });
           });
         }
@@ -924,14 +930,14 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         const changed = setIdFacts(db, id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
         if (changed) writeAudit(repo, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
-        if (writesAs !== null) db.prepare(`UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL`).run(writesAs, id);
+        if (writesAs !== null) repo.hosted.restateWritesAs(tx, id, writesAs);
       }
     },
     // A root's request declared a launcher (#473, #520): the flag is the ownership's (`ids.launcher`; its end clears
     // it), turned on by whichever of its requests declares first and audited as a local session's is, once.
     // `detail`: which ownership and client turned it on, now that a later request can (#520).
-    hostedDeclareLauncher(authed: AuthedUser, id: string, detail: { ownership: number; client_id: string }) {
-      if (db.prepare(`UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1`).run(id).changes) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
+    hostedDeclareLauncher(tx: Tx, authed: AuthedUser, id: string, detail: { ownership: number; client_id: string }) {
+      if (repo.hosted.declareLauncher(tx, id)) writeAudit(repo, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
     // before and after, only when one changed. Absent fields keep the stored value; an empty one clears it (#558).
@@ -983,7 +989,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // Every session's holds, oldest first, for the hosted sweep and reconcile.
     holdsByOwner(): Map<string, string[]> {
       const byOwner = new Map<string, string[]>();
-      for (const r of db.prepare(`SELECT id, address FROM alias_holds ${HOLD_ORDER}`).all() as { id: string; address: string }[]) {
+      for (const r of repo.hosted.holds(repo.read)) {
         const list = byOwner.get(r.id);
         if (list) list.push(r.address); else byOwner.set(r.id, [r.address]);
       }
@@ -991,7 +997,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     // Whether the session's ownership declared a launcher (#473, #520): what its instruction text follows, since the
     // stored flag, not the current request's `_meta`, decides whether it receives delegation requests.
-    hostedLauncher(id: string): boolean { return (db.prepare(`SELECT launcher FROM ids WHERE id = ?`).get(id) as { launcher: number | null } | null)?.launcher === 1; },
+    hostedLauncher(id: string): boolean { return repo.hosted.launcher(repo.read, id); },
     hostedPlace(id: string, place: string | null) { setPlace(db, id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
@@ -1007,7 +1013,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     async replay(session: ApplicationSession, addresses?: string[]) {
       valid(session, true);
       if (session.readOnly || !session.push) return;
-      afterCommit(db, () => {
+      // Called after the hello's or bind's commit, outside any body: a `Read`, so the drain runs now.
+      afterCommitOf(repo.read, () => {
         valid(session, true);
         drainDirect(hub, session, addresses ?? session.addresses);
         drainBoards(session, hub, true);
@@ -1102,11 +1109,11 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
     // each address acks it.
-    receiptBoards(session: ApplicationSession, refs: PendingRef[]) {
+    receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
       valid(session);
       for (const r of refs) {
         for (const a of session.addresses) acknowledge(db, a, r);
-        afterCommit(db, () => { session.inflight.delete(pendingKey(r)); });
+        tx.afterCommit(() => { session.inflight.delete(pendingKey(r)); });
       }
     },
     // Acked as the address the row names (S8): receivedUnacked and
@@ -1130,13 +1137,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session, UNBOUND_READS.has(tool));
       // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
       try { return handleCall(hub, tx, session, tool, args, publish); }
-      finally { afterCommit(db, () => expiry.arm()); }
+      finally { tx.afterCommit(() => expiry.arm()); }
     },
-    // Trusted committed domain operations, not client-supplied invalidations.
-    boardsChanged,
+    // Trusted committed domain operations, not client-supplied invalidations; called after their commit, so effects run now.
+    boardsChanged: (boards: string[]) => boardsChanged(onCommit(repo.read), boards),
     wake(handles: string[]) {
-      afterCommit(db, () => expiry.arm());
-      wake(hub, handles);
+      expiry.arm();
+      wake(hub, onCommit(repo.read), handles);
     },
     // An admin revoked or disabled a user: every session of theirs closes.
     // The hosted store ends them (disabled users) on its sweep.
@@ -1440,7 +1447,7 @@ function writeOnce<W extends Written>(
       });
     }
   }, recheck);
-  if ("replay" in out && uploads.length > 0) afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
+  if ("replay" in out && uploads.length > 0) tx.afterCommit(async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
   return out;
 }
 
@@ -1452,7 +1459,7 @@ function handleSend(
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
   const out = writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, () => writeSend(hub, tx, session, p));
   if ("replay" in out) return out.replay;
-  afterCommit(hub.db, () => {
+  tx.afterCommit(() => {
     // Committed, not yet answered: a lost answer's window (tests force it here).
     testPause("write:after-commit");
     deliverSend(hub, out.fresh.msg);
@@ -1584,7 +1591,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   // Committed with the write: kept, and written again should hosted's outer transaction roll back.
   for (const row of rows) { row(); session.afterRollback?.(row); }
   if ("replay" in out) return out.replay;
-  afterCommit(db, () => {
+  tx.afterCommit(() => {
     testPause("write:after-commit");
     deliverSend(hub, out.fresh.msg);
   });
@@ -1607,7 +1614,7 @@ function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(tx, m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (!repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
-  afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
+  tx.afterCommit(async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
   return {};
 }
 
@@ -1651,10 +1658,10 @@ function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string,
   }
   // A hosted session with no name answers peer_list as its ID, but is nobody (#402).
   if (session.readOnly && tool === "peer_list" && outcome.result && typeof outcome.result === "object") delete (outcome.result as { you?: string }).you;
-  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(board);
+  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(onCommit(tx), board);
   // The transitional adapter publishes its answer before the resulting deliveries.
-  if (publish) afterCommit(db, () => publish(outcome.result));
-  wake(hub, outcome.wake);
+  if (publish) tx.afterCommit(() => publish(outcome.result));
+  wake(hub, onCommit(tx), outcome.wake);
   return outcome.result;
 }
 
@@ -1689,14 +1696,14 @@ function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: stri
     return fail("internal", "board_post failed");
   }
   if ("replay" in out) {
-    if (publish) afterCommit(db, () => publish(out.replay));
+    if (publish) tx.afterCommit(() => publish(out.replay));
     return out.replay;
   }
   const r = out.fresh.payload;
-  afterCommit(db, () => testPause("write:after-commit"));
-  hub.boardChanged(r.board);
-  if (publish) afterCommit(db, () => publish(r));
-  wake(hub, out.fresh.wake);
+  tx.afterCommit(() => testPause("write:after-commit"));
+  hub.boardChanged(onCommit(tx), r.board);
+  if (publish) tx.afterCommit(() => publish(r));
+  wake(hub, onCommit(tx), out.fresh.wake);
   return r;
 }
 

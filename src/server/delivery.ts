@@ -215,7 +215,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
             if (unread.length < direct.length || unread.slice(0, direct.length).some(e => !requested.has(itemOf(e, lease).id))) stale(p, context, capability);
           }
           application.receiptDirect(tx, lease.session, direct.map(r => r.item.event.kind === "direct" ? r.item.event.message.id : stale(p, context, capability)));
-          application.receiptBoards(lease.session, records.filter(r => r.ref).map(r => r.ref!));
+          application.receiptBoards(tx, lease.session, records.filter(r => r.ref).map(r => r.ref!));
           return { lease, records };
         }, ({ lease, records }) => {
           for (const { item } of records) {

@@ -184,8 +184,8 @@ export class AppSession {
         const writesAs = toolsOnly && this.identity !== null
           ? this.application.hostedWritesAs(tx, this.authed, id, this.identity, true, (address, detail) => later(() => this.application.hostedRefused(id, address, detail)), later)
           : null;
-        this.application.hostedRegister(this.authed, id, this.opts.harness ?? "test", writesAs, why => later(() => this.application.hostedCollided(this.authed, id, why)));
-        if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(this.authed, id, { ownership: 0, client_id: "test" });
+        this.application.hostedRegister(tx, this.authed, id, this.opts.harness ?? "test", writesAs, why => later(() => this.application.hostedCollided(this.authed, id, why)));
+        if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(tx, this.authed, id, { ownership: 0, client_id: "test" });
         return this.application.hostedSession(tx, this.authed, id, [], writesAs, null, this.sink(), this.opts.push !== false);
       }));
     } catch (e) {
@@ -265,7 +265,7 @@ export class AppSession {
 
   async boardAck(refs: PendingRef[]): Promise<void> {
     const session = this.live();
-    await this.write(session, () => { this.application.receiptBoards(session, refs); });
+    await this.write(session, tx => { this.application.receiptBoards(tx, session, refs); });
   }
 
   async dmAck(id: number): Promise<void> {

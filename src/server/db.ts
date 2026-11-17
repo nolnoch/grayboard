@@ -5,7 +5,7 @@ import { queueFor } from "./store/queue.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { ALIAS_SESSION_SQL, setAccess } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, HOLD_ORDER, setAccess } from "../core/boards.ts";
 import { dropHold, logBinding } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
@@ -2006,6 +2006,12 @@ function makeHostedStore(db: Database): HostedStoreOf {
     forgetLost: (tx, ...a) => on(tx).forgetLost(...a),
     aliveAt: (r) => sqliteOf(r).query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
     heartbeat: (tx, ...a) => on(tx).heartbeat(...a),
+    setRoot: (tx, id, root) => { sqliteOf(tx).query("UPDATE ids SET root_id = ? WHERE id = ? AND root_id IS NOT ?").run(root, id, root); },
+    reopenId: (tx, id) => { sqliteOf(tx).query("UPDATE ids SET ended_at = NULL, held_aliases_json = NULL WHERE id = ?").run(id); },
+    restateWritesAs: (tx, id, writesAs) => { sqliteOf(tx).query("UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL").run(writesAs, id); },
+    declareLauncher: (tx, id) => sqliteOf(tx).query("UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1").run(id).changes > 0,
+    launcher: (r, id) => sqliteOf(r).query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(id)?.launcher === 1,
+    holds: (r) => sqliteOf(r).query<{ id: string; address: string }, []>(`SELECT id, address FROM alias_holds ${HOLD_ORDER}`).all(),
   };
   return store;
 }
