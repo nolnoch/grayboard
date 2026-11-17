@@ -73,7 +73,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   old.db.close();
   const reopened = openDatabase(path, opts);
   try {
-    expect(reopened.repo.users.findById(user.id)?.display_name).toBe("You");
+    expect((await reopened.repo.users.findById(reopened.repo.read, user.id))?.display_name).toBe("You");
     expect((await reopened.repo.sessions.findByTokenHash(reopened.repo.read, "old-session-hash"))?.id).toBe(session.id);
     expect(reopened.repo.aliases.listForScope(reopened.repo.read, "person", user.email).map(i => i.name)).toEqual(["fe"]);
     expect(reopened.repo.messages.history(reopened.repo.read, ["you@example.com/fe"])[0]?.body).toBe("preserved");
@@ -431,7 +431,7 @@ test("signIn D4 branch 2: another subject under the same issuer is subject_misma
   const { repo } = fresh();
   const u = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
   expect(await signIn(repo, G, "s-intruder", "a@example.com", null)).toEqual({ status: "subject_mismatch", user: u });
-  expect(repo.users.findById(u.id)).toEqual(u);
+  expect((await repo.users.findById(repo.read, u.id))).toEqual(u);
 });
 
 test("signIn D4 branch 3: an email another issuer holds, with or without a subject, is issuer_mismatch naming the holder", async () => {
@@ -442,7 +442,7 @@ test("signIn D4 branch 3: an email another issuer holds, with or without a subje
   const legacy = await upsert(repo, "old@example.com");
   await seed(repo, () => { db.run("UPDATE users SET idp_issuer = ? WHERE id = ?", [G, legacy.id]); });
   expect(await signIn(repo, OKTA, "o-2", "old@example.com", null)).toMatchObject({ status: "issuer_mismatch", user: { id: legacy.id, idp_subject: null }, issuer: G });
-  expect(repo.users.findById(legacy.id)).toMatchObject({ idp_issuer: G, idp_subject: null });
+  expect((await repo.users.findById(repo.read, legacy.id))).toMatchObject({ idp_issuer: G, idp_subject: null });
 });
 
 test("signIn D4 branch 4: this issuer's subjectless row links", async () => {
@@ -450,7 +450,7 @@ test("signIn D4 branch 4: this issuer's subjectless row links", async () => {
   const legacy = await upsert(repo, "old@example.com");
   await seed(repo, () => { db.run("UPDATE users SET idp_issuer = ? WHERE id = ?", [G, legacy.id]); });
   expect(await signIn(repo, G, "s-old", "old@example.com", "Old")).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_issuer: G, idp_subject: "s-old", display_name: "Old" } });
-  expect(repo.users.findById(legacy.id)).toMatchObject({ idp_issuer: G, idp_subject: "s-old", display_name: "Old" });
+  expect((await repo.users.findById(repo.read, legacy.id))).toMatchObject({ idp_issuer: G, idp_subject: "s-old", display_name: "Old" });
 });
 
 test("signIn D4 branch 5: a row with neither links to whichever issuer signs in first, both columns set", async () => {
@@ -458,7 +458,7 @@ test("signIn D4 branch 5: a row with neither links to whichever issuer signs in 
   const dev = await upsert(repo, "dev@example.com");
   expect(dev).toMatchObject({ idp_issuer: null, idp_subject: null });
   expect(await signIn(repo, OKTA, "o-1", "dev@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { id: dev.id, idp_issuer: OKTA, idp_subject: "o-1" } });
-  expect(repo.users.findById(dev.id)).toMatchObject({ idp_issuer: OKTA, idp_subject: "o-1" });
+  expect((await repo.users.findById(repo.read, dev.id))).toMatchObject({ idp_issuer: OKTA, idp_subject: "o-1" });
   expect(await signIn(repo, G, "s-1", "dev@example.com", null)).toMatchObject({ status: "issuer_mismatch", issuer: OKTA });
 });
 
@@ -485,7 +485,7 @@ test("signIn: clearSubject clears issuer and subject, so the next sign-in from a
   const { repo } = fresh();
   const u = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
   await seed(repo, tx => repo.users.clearSubject(tx, u.id));
-  expect(repo.users.findById(u.id)).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect((await repo.users.findById(repo.read, u.id))).toMatchObject({ idp_issuer: null, idp_subject: null });
   expect(await signIn(repo, OKTA, "o-1", "a@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { id: u.id, idp_issuer: OKTA, idp_subject: "o-1" } });
 });
 
@@ -501,7 +501,7 @@ for (const [winner, status] of [[OKTA, "issuer_mismatch"], [G, "subject_mismatch
       SELECT RAISE(IGNORE);
     END`);
     expect(await signIn(repo, G, "s-mine", "race@example.com", null)).toMatchObject({ status, user: { id: u.id, idp_issuer: winner, idp_subject: "s-theirs" } });
-    expect(repo.users.findById(u.id)).toMatchObject({ idp_issuer: winner, idp_subject: "s-theirs" });
+    expect((await repo.users.findById(repo.read, u.id))).toMatchObject({ idp_issuer: winner, idp_subject: "s-theirs" });
   });
 }
 
@@ -510,7 +510,7 @@ test("signIn: a disabled account without a subject isn't bound to whoever signs 
   const departed = await upsert(repo, "gone@example.com");
   await seed(repo, tx => repo.users.setDisabled(tx, departed.id, true));
   expect(await signIn(repo, G, "s-hire", "gone@example.com", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
-  expect(repo.users.findById(departed.id)).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect((await repo.users.findById(repo.read, departed.id))).toMatchObject({ idp_issuer: null, idp_subject: null });
 });
 
 // #928 D3: the issuer column, its one-time stamp, the every-open repair and the index swap.
@@ -708,8 +708,8 @@ test("#807 P1c-6: sessions run on the handle they're given", async () => {
   expect(await repo.sessions.findByTokenHash(repo.read, "hash-b")).toBeUndefined();
 });
 
-// #807 P1c-7: the users store's writes run on the handle they're given, as P1c-6's sessions do.
-test("#807 P1c-7: user writes run on the handle they're given", async () => {
+// #807 P1c-7: the users store's writes and reads run on the handle they're given, as P1c-6's sessions do.
+test("#807 P1c-7: the users store runs on the handle it's given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const { kept, u } = await seed(repo, async tx => ({ kept: tx, u: await repo.users.upsertByEmail(tx, "a@example.com", null) }));
   const settled = /used after its transaction settled/;
@@ -720,7 +720,15 @@ test("#807 P1c-7: user writes run on the handle they're given", async () => {
   await expect(repo.users.setDisabled({} as Tx, u.id, true)).rejects.toThrow("not a SQLite store handle");
   expect((await repo.users.findByEmail(repo.read, "b@example.com"))).toBeUndefined();
   expect((await repo.users.findByEmail(repo.read, "c@example.com"))).toBeUndefined();
-  expect(repo.users.findById(u.id)?.disabled_at).toBeNull();
+  expect((await repo.users.findById(repo.read, u.id))?.disabled_at).toBeNull();
+  // Reads refuse a kept or foreign handle too, the cached ones even on a hit: isDisabled fills the user cache first.
+  expect(await repo.users.isDisabled(repo.read, u.id)).toBe(false);
+  for (const h of [kept, {} as Tx]) {
+    const refused = h === kept ? settled : /not a SQLite store handle/;
+    await expect(repo.users.findById(h, u.id)).rejects.toThrow(refused);
+    await expect(repo.users.isDisabled(h, u.id)).rejects.toThrow(refused);
+    await expect(repo.users.activeEmail(h, u.id)).rejects.toThrow(refused);
+  }
 });
 
 // #807 P1c-8: the OAuth store runs on the handle it's given, as P1c-6's sessions do. The facade resolves the handle

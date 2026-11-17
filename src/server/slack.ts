@@ -131,7 +131,7 @@ export class SlackBridge implements SlackLinker {
     const { repo } = this.o;
     repo.post(async tx => {
       for (const link of await repo.slack.links(tx)) {
-        const user = repo.users.findById(link.user_id);
+        const user = await repo.users.findById(tx, link.user_id);
         if (!user || user.disabled_at !== null) continue;
         const target = `${link.email}/${HUMAN_NAME}`;
         // Dedup against the last DELIVERED notice, not the last death: the
@@ -201,7 +201,7 @@ export class SlackBridge implements SlackLinker {
     }
     this.codes.delete(code.toLowerCase());
     this.tries.delete(slackUser);
-    const user = repo.users.findById(entry.userId);
+    const user = await repo.users.findById(repo.read, entry.userId);
     if (!user) return;
     const other = await repo.slack.linkBySlackUser(repo.read, slackUser);
     if (other && other.user_id !== user.id) {
@@ -225,8 +225,9 @@ export class SlackBridge implements SlackLinker {
 
     // The link and its human identity commit in one transaction through the write queue (#807 D4). The Slack
     // account is checked again inside it: the email check above awaited Slack. The old human goes offline and the
-    // new one attaches after the commit, with no await between them, so a concurrent unlink can't leave attach()
-    // without its link.
+    // new one's attach starts after the commit, with no await between them; attach's own awaits (its user read,
+    // #807 P3 A7u2, and attachHuman's queued write) are covered by the link check inside attachHuman's write, so a
+    // concurrent unlink can't leave it attached without its link.
     type Linked = { taken: SlackLink } | { moved: SlackLink | undefined; link: SlackLink };
     const done = await repo.write(async (tx: Tx): Promise<Linked> => {
       const taken = await repo.slack.linkBySlackUser(tx, slackUser);
@@ -289,7 +290,8 @@ export class SlackBridge implements SlackLinker {
 
   private async attach(link: SlackLink): Promise<void> {
     const { repo } = this.o;
-    const user = repo.users.findById(link.user_id);
+    // Read first, then the stop flag (#807 P3 A7u2): a stop during the read refuses here.
+    const user = await repo.users.findById(repo.read, link.user_id);
     if (!user || user.disabled_at !== null || this.stopped) return;
     const prefix = `${link.email}/`;
     const handle = `${prefix}${HUMAN_NAME}`;

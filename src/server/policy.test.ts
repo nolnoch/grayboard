@@ -32,12 +32,14 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
 // went async, and their synchronous callers that couldn't await yet moved to policyNow. A7f1 moved http.ts's team
 // guards, roster, claim list and act-as check, and teams.ts's onAliasCreated, to `authorize` and the store's reads;
 // http.ts keeps healthz's probe. A7f2 moved application.ts's binds, alias recheck, sends, delegation reach and writer
-// marks; it keeps helloOkFields's team list (A7g). policy.ts counts its drivers' `decide(`.
+// marks; it keeps helloOkFields's team list (A7g). A7u2 raised hosted.ts by 2: rebuild, an afterCommit observer, reads
+// its holders' users through policyNow until A7g moves it. policy.ts counts its drivers' `decide(`.
 const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
   "src/server/access.ts": 16,
   "src/server/application.ts": 1,
   "src/server/db.ts": 2,
+  "src/server/hosted.ts": 2,
   "src/server/http.ts": 1,
   "src/server/policy.ts": 9,
 };

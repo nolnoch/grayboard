@@ -37,7 +37,7 @@ export function onTeamLeft(repo: Repo, tx: Tx, team: Team, email: string): void 
 // A person's alias follows each of its user's teams; a team's alias follows
 // only its own team (#284 S9), whoever created it.
 export async function onAliasCreated(repo: Repo, tx: Tx, userId: number, handle: string): Promise<void> {
-  const creator = repo.users.findById(userId)?.email;
+  const creator = (await repo.users.findById(tx, userId))?.email;
   if (!creator) return;
   const p = addressParts(handle);
   if (p?.kind !== "alias") return;
