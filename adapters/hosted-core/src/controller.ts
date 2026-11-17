@@ -478,7 +478,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     const attempts = new Map<string, number>();
     while (!signal.aborted && failures < 8) {
       let wire: Wire | undefined;
-      const began = Date.now();
+      // Only an attempt that never reached its whoami charges its own time: past it, the grace restarts, and a
+      // healthy subscription's length is no part of the next expiry's grace (#481).
+      const began = performance.now(), attempt = grace;
       try {
         await this.guard(r, epoch, signal);
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
@@ -577,7 +579,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           continue;
         }
         if (error instanceof AccessExpired && error.reason === "expired" && graceLeft(grace) > 0) {
-          grace.spent += Date.now() - began + ROTATION_POLL_MS;
+          grace.spent += (grace === attempt ? performance.now() - began : 0) + ROTATION_POLL_MS;
           this.set(r, "retrying", `Access expired; waiting for ${this.port.harness} to refresh it, approval retained`, "reopen", failureCode(error));
           ready();
           await this.wait(ROTATION_POLL_MS, signal);
@@ -667,11 +669,11 @@ export class Controller<E extends Enrollment = Enrollment> {
   // poll per attempt, for as long as `grace` has time left (#472).
   private async rotated<T>(grace: Grace, call: () => Promise<T>): Promise<T> {
     for (;;) {
-      const began = Date.now();
+      const began = performance.now();
       try { return await call(); }
       catch (error) {
         if (this.stopped || accessExpiry(error)?.reason !== "expired" || graceLeft(grace) <= 0) throw error;
-        grace.spent += Date.now() - began + ROTATION_POLL_MS;
+        grace.spent += performance.now() - began + ROTATION_POLL_MS;
         await this.wait(ROTATION_POLL_MS, this.closing.signal);
         // A close that ended the wait refuses the retry: nothing would dispose what it registers.
         if (this.stopped) throw error;
@@ -682,7 +684,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.diagnostics.restore(async id => { await this.activeRoot(id); return true; });
     if (!this.port.approval) return;
     // One rotation grace for the whole pass: the roots share the host's credential.
-    const spent: Grace = { spent: 0 };
+    const grace: Grace = { spent: 0 };
     for (const saved of await this.port.approval.saved()) {
       const id = saved.sessionID;
       if (this.stopped) continue;
@@ -704,7 +706,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         if (paused) { this.set(r, "paused", `Saved approval paused; ${this.hint}`); continue; }
         // Say the pause is clearing before the grace: the old paused record would otherwise stand for up to its length.
         if (expired) this.set(r, "retrying", `Access expired before the restart; waiting for ${this.port.harness} to refresh it, approval retained`, "restore", "native_access_expired");
-        try { await this.rotated(spent, () => this.port.credential.check(e)); }
+        try { await this.rotated(grace, () => this.port.credential.check(e)); }
         catch (error) {
           if (!expired) throw error;
           // A session ended, or a native bind started this root, during the grace: that state stands.
@@ -720,7 +722,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         }
         if (this.roots.get(id) !== r) continue;
         await this.watch(e);
-        await this.rotated(spent, () => this.prepare(r, true, true));
+        await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
         if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
