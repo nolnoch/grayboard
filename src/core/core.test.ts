@@ -770,6 +770,22 @@ test("#807 P3 B2: a failed asynchronous expiry read is logged", async () => {
   } finally { timer.stop(); reported.mockRestore(); }
 });
 
+// #807 P3 B2 audit: a failed read retries, so a transient store error doesn't leave the timer idle.
+test("#807 P3 B2: a failed asynchronous expiry read retries the arm", async () => {
+  const reported = spyOn(console, "error").mockImplementation(() => {});
+  let sweeps = 0, reads = 0;
+  const timer = expiryTimer({
+    next: () => ++reads === 1 ? Promise.reject(new Error("read failed")) : Promise.resolve(null),
+    sweep: async () => { sweeps++; return { wake: [], boards: [] }; },
+  }, () => {}, undefined, 10);
+  try {
+    for (let i = 0; i < 100 && reads < 2; i++) await Bun.sleep(10);
+    expect(sweeps).toBe(1);
+    expect(reads).toBe(2);
+    expect(reported.mock.calls).toEqual([["[grayboard] claim expiry arm failed:", new Error("read failed")]]);
+  } finally { timer.stop(); reported.mockRestore(); }
+});
+
 test("expiry board callbacks observe commits and failures cannot poison wake or rearming", async () => {
   subscribe(db, "sim", "e2e", "push");
   const woken: string[][] = [], changed: string[][] = [], bodies: string[][] = [];
