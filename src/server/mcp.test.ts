@@ -1446,6 +1446,28 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   await f.listen.close();
 });
 
+// A board commit hints the listen from the write queue's holder (its afterCommit flush), where a lapsed root's settle
+// can't run as an async post: it goes through the queue behind the holder and ends the root (#807 P3 A6e2 audit).
+test("a lapsed root's settle from a board commit's hint, inside the write queue's holder, ends the root", async () => {
+  const f = await stampedListen();
+  const root = aliceRoot().session_id;
+  await seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
+  f.time.now += 5_000;
+  token = (await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
+  const bob = await connect();
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect((await bob.callTool({ name: "bind", arguments: { name: "bob-poster", create: true } })).isError).not.toBe(true);
+    const posted = await bob.callTool({ name: "board_post", arguments: { board: "stamped", body: "wake the listen" } });
+    expect(posted.isError, JSON.stringify(posted.content)).not.toBe(true);
+    await untilHosted(() => hosted.activeListens === 0);
+    await store.repo.write(() => {});
+    expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
+    expect(logged.mock.calls.filter(args => args.some(a => String(a).includes("write queue's holder")))).toEqual([]);
+  } finally { logged.mockRestore(); }
+  await f.listen.close();
+});
+
 test("#899: a write no notice or generation sees reaches a stamped listen at the recheck backstop", async () => {
   const f = await stampedListen(10_000);
   // Raw SQL on the repo's own connection: no hosted notice, no generation move.

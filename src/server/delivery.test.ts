@@ -384,6 +384,9 @@ test("acknowledged items' bodies aren't retained by the receipt history", async 
 
 test("a lease finished while renew's update awaits stays finished: renew refuses it (#807 P3 A6e2)", async () => {
   const lease = await delivery.open(bob, context(bob));
+  const deadlines = () => store.repo.hosted.all(store.repo.read).map(r => r.lease_deadline);
+  const before = deadlines();
+  now += 1_000; // a renew now would write a later deadline
   const update = store.repo.hosted.update.bind(store.repo.hosted);
   let entered!: () => void, release!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });
@@ -397,6 +400,8 @@ test("a lease finished while renew's update awaits stays finished: renew refuses
     release();
     await expect(renewed).rejects.toHaveProperty("code", "not_found");
     expect(delivery.activeLeaseCount).toBe(0);
+    // The refusal rolled the renew's new deadline back.
+    expect(deadlines()).toEqual(before);
   } finally { release(); spy.mockRestore(); }
 });
 

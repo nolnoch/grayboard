@@ -177,10 +177,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const row = hosted.row(context.sessionContext.id);
     const root = row && hosted.rootOf(row);
     if (!root || root.lease_deadline === null || root.lease_deadline > now()) return { row, root };
-    // authorize is sync: the settle is posted (#807 P1b-4b), and its body is async (#807 P3 A6e2), so it never runs
-    // now and the request answers no row, failing closed. The settle judges the root when it runs, which may find a
-    // body it waited behind renewed the lease. A settle that ran now ended the root (and its children) anyway.
-    application.repo.post(tx => hosted.settle(tx, root.session_id), undefined, "hosted settle");
+    // authorize is sync and the settle's body async (#807 P3 A6e2), so nothing waits for it: the request answers no
+    // row, failing closed. It goes through the write queue, not post: authorize also runs inside the queue's holder
+    // (a board commit's afterCommit hint), where an async post throws; a write queues behind the holder. The settle
+    // judges the root when it runs, which may find a body it waited behind renewed the lease.
+    void application.repo.write(tx => hosted.settle(tx, root.session_id)).catch(e => hostedFailure("hosted.settle", e));
     return { row: undefined };
   }
   // authorize's checks that read no hosted row: the request, the token and grant, the session and its user.
