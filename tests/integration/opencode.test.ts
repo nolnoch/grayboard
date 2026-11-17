@@ -7,7 +7,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localEnv } from "../support/env.ts";
@@ -445,6 +445,69 @@ test("opencode: a grayboard process that answers initialize with an error is res
   await expect(oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).rejects.toThrow(reason);
   await until(() => grayboardChildPids(oc.pid).length === 0, 5_000, "no grayboard process left");
   await oc.send("dispose");
+}, 60_000);
+
+// A `grayboard/session` handshake answered with an error, at the child's
+// start (#1142) or at a root switch (#1145), restarts the process at once,
+// and the replacement serves the selected root. Only that one request is
+// refused; everything else reaches the real grayboard.
+for (const [n, phase, reason] of [[1, "start", "failed to initialize"], [2, "switch", "failed its session switch"]] as const) {
+  test(`opencode: a grayboard process whose ${phase} handshake is answered with an error is restarted at once, and the replacement serves the selected root (#1142, #1145)`, async () => {
+    const counter = join(dir, "session-calls");
+    const oc = driver("oc", entry({ command: [process.execPath, REFUSING_MCP, "--session", counter, String(n), process.execPath, CLI, "mcp", "--mode", "local"] }));
+    await oc.send("init");
+    await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+    let first: number | undefined;
+    if (phase === "switch") {
+      expect(JSON.parse(await oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).id).toBeString();
+      [first] = grayboardChildPids(oc.pid);
+      await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
+    }
+    const target = phase === "start" ? "s1" : "s2";
+    await until(async () => (await oc.send("state")).toasts.some((t: string) => t.includes(`grayboard process ${reason}: grayboard: refused for test; restarting it (1 of 3)`)), 15_000, "the restart notice");
+    const who = JSON.parse(await oc.send("call", { sessionID: target, tool: "grayboard_whoami", args: {} }));
+    const db = new Database(join(dir, "bus.db"), { readonly: true });
+    try { expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(who.id)).toEqual({ harness_session: target }); }
+    finally { db.close(); }
+    expect(readFileSync(counter, "utf8")).toBe(String(n + 1));
+    const live = grayboardChildPids(oc.pid);
+    expect(live).toHaveLength(1);
+    if (first !== undefined) expect(live).not.toContain(first);
+    const toasts: string[] = (await oc.send("state")).toasts;
+    expect(toasts.filter((t) => t.includes("restarting it"))).toHaveLength(1);
+    expect(toasts.filter((t) => t.includes("transition failed"))).toEqual([]);
+    await oc.send("dispose");
+  }, 60_000);
+}
+
+// An event that arrives while a switch handshake is in flight waits for the
+// transition; when that handshake fails and schedules a restart, the event
+// must not start a second child beside it, which would outlive dispose as a
+// second delivery owner (#1145 audit).
+test("opencode: an event waiting on a switch handshake that fails starts no second child; one child serves the new root and none outlives dispose (#1145)", async () => {
+  const counter = join(dir, "session-calls");
+  const oc = driver("oc", entry({ command: [process.execPath, REFUSING_MCP, "--session", counter, "2", process.execPath, CLI, "mcp", "--mode", "local"] }));
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+  expect(JSON.parse(await oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).id).toBeString();
+  await oc.send("holdAssociation", { sessionID: "s2" });
+  const selection = oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
+  await until(async () => (await oc.send("state")).heldAssociation === "s2", 10_000, "the held switch refusal");
+  // The driver runs each line's hook up to its first await before reading
+  // the next, so once state answers, this event waits on the transition.
+  const waiting = oc.send("event", { event: { type: "session.updated", properties: { info: { id: "s1" } } } });
+  await oc.send("state");
+  await oc.send("releaseAssociation");
+  await Promise.all([selection, waiting]);
+  const who = JSON.parse(await oc.send("call", { sessionID: "s2", tool: "grayboard_whoami", args: {} }));
+  const db = new Database(join(dir, "bus.db"), { readonly: true });
+  try { expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(who.id)).toEqual({ harness_session: "s2" }); }
+  finally { db.close(); }
+  expect(grayboardChildPids(oc.pid)).toHaveLength(1);
+  // Spawns: the first child and its one replacement.
+  expect((await oc.send("state")).spawnOwners).toHaveLength(2);
+  await oc.send("dispose");
+  expect(grayboardChildPids(oc.pid)).toEqual([]);
 }, 60_000);
 
 test("opencode: child instructions skip restart backoff and degrade to none after exhaustion", async () => {

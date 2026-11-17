@@ -3,7 +3,7 @@
 import { attachmentReach, getAttachment, releaseUpload, storeAttachment, type AttachmentRow } from "../core/attachments.ts";
 import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
-import { participant, queuedGuardTx, type Repo } from "./db.ts";
+import { participant, queuedGuardTx, queuedTx, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
 import { addressSet } from "../core/bindings.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest } from "./policy.ts";
@@ -41,7 +41,7 @@ export function requestAttachment(repo: Repo, r: Read, handle: string, idText: s
 
 // An attachment route's guard (the hosted byte routes' OAuth recheck, binding fence and alias check, #1053): it reads on `r`, the handle of the context it runs in: the pool
 // between transactions, a body's own Tx inside one, so it never takes a second connection while a body holds one.
-export type Guard = (r: Read) => void;
+export type Guard = (r: Read) => void | Promise<void>;
 
 // Stores a checked file as an unsent upload of `handle`'s, within the quotas
 // of its principal, the user `email` (unsent bytes, and stored bytes in all),
@@ -64,16 +64,17 @@ export async function storeUpload(
   try {
     // The guard and the audit row are one awaited write (#965): a failed audit row fails the upload, which is
     // released, rather than keeping bytes no `attachment.uploaded` row records.
-    await repo.write(w => {
-      guard?.(w);
+    await repo.write(async w => {
+      await guard?.(w);
       writeAudit(repo, w, "attachment.uploaded", email, `attachment:${row.id}`, {
         identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
       });
     });
     return row;
   } catch (error) {
-    // Only this upload, and only while unbound; concurrent sends keep their bytes.
-    await releaseUpload(pool, repo.blobs, row.id, { addresses: [handle], principal: email }, undefined, tx);
+    // Only this upload, and only while unbound; concurrent sends keep their bytes. Unguarded, so through the plain
+    // queue: the guarded one would run the guard again in each of its bodies (queuedGuardTx).
+    await releaseUpload(pool, repo.blobs, row.id, { addresses: [handle], principal: email }, undefined, queuedTx(repo));
     throw error;
   }
 }

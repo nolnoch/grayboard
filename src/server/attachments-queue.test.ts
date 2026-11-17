@@ -101,6 +101,22 @@ test("#974: a failed blob put's row delete waits behind another body holding the
   expect(rows(db)).toEqual([]);
 });
 
+// #807 P3 A7d2a: the guard is async; each body awaits it on its own Tx, so a refusal that settles after a microtask
+// still fails the body. Here the store body's check passes and the audit body's refuses.
+test("#807 P3 A7d2a: an async guard's refusal in the audit body fails the upload, which is released", async () => {
+  const { db, repo } = setup();
+  const seen: boolean[] = [];
+  const guard = async (r: unknown) => {
+    seen.push(r === repo.read);
+    await Promise.resolve();
+    if (seen.length === 2) throw new Error("revoked");
+  };
+  await expect(storeUpload(repo, "you@example.com", "be", file("hello"), {}, guard)).rejects.toThrow("revoked");
+  // Both checks ran inside a body, on its Tx.
+  expect(seen).toEqual([false, false]);
+  expect(rows(db)).toEqual([]);
+});
+
 test("#974: an upload whose guard refuses is released through the write queue", async () => {
   const { db, repo } = setup();
   let calls = 0, started = false;

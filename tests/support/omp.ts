@@ -854,6 +854,54 @@ export function ompLocalInitFailScenario(dir: string, how: "deadline" | "refused
   });
 }
 
+// A `grayboard/session` handshake answered with an error, at the process's
+// start (#1142) or at `new_session` (#1145), restarts it at once; the
+// replacement serves the selected session, and nothing fails the turn or the
+// switch. Only that one request is refused; the rest reach the real grayboard.
+export function ompLocalHandshakeFailScenario(dir: string, phase: "start" | "switch"): Promise<void> {
+  return named(OMP_HARNESS, async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([scripted("who", [{ tool: `${PREFIX}whoami`, args: {} }])]);
+    try {
+      const counter = join(dir, "session-calls");
+      const n = phase === "start" ? 1 : 2;
+      installLocal(dir, model.port, [process.execPath, REFUSING_MCP, "--session", counter, String(n)]);
+      const omp = startLocalOmp(dir, dir, procs, null);
+      await omp.command({ type: "get_state" }, 60_000);
+      const who = async () => {
+        const nth = (await omp.messages()).filter(m => m.role === "toolResult" && m.toolName === PREFIX + "whoami").length;
+        await omp.command({ type: "prompt", message: "who" });
+        const result = await toolResultNamed(omp, `${PREFIX}whoami`, nth);
+        await idle(omp);
+        expect(resultText(result)).not.toContain("refused for test");
+        expect(!!result.isError).toBe(false);
+        const id = JSON.parse(resultText(result)).id as string;
+        const state = await omp.command({ type: "get_state" });
+        expect(localRows<{ harness_session: string }>(dir, "SELECT harness_session FROM ids WHERE id = ?", id)[0]?.harness_session).toBe(state.sessionId);
+      };
+      let first: number | undefined;
+      if (phase === "switch") {
+        await who();
+        [first] = grayboardChildPids(omp.pid);
+        await omp.command({ type: "new_session" });
+      }
+      await until(() => existsSync(counter) && readFileSync(counter, "utf8") === String(n + 1), 30_000, "the replacement's handshake");
+      await who();
+      const live = grayboardChildPids(omp.pid);
+      expect(live).toHaveLength(1);
+      if (first !== undefined) expect(live).not.toContain(first);
+      expect(readFileSync(counter, "utf8")).toBe(String(n + 1));
+      expect(omp.notices().filter((t) => t.startsWith("grayboard"))).toEqual([]);
+      expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      expect(model.unhandled).toEqual([]);
+      await omp.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
 // A tool call waiting out a restart's backoff ends at its abort (#559), as
 // pi's does, rather than holding the turn until the grayboard process is
 // back, and it never runs there: the bind it carried takes no name.

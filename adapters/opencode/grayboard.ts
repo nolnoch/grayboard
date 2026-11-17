@@ -192,6 +192,8 @@ type Child = {
   ready: Promise<void>;
   call(method: string, params: object, signal?: AbortSignal): Promise<any>;
   associate(session: string, selection: number): Promise<void>;
+  // Kills the process and restarts it as an unexpected exit does.
+  fail(reason: string): void;
   stop(): Promise<void>;
 };
 
@@ -337,7 +339,8 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
         if (cancelled || closed) return;
         restart = undefined;
         exitReason = undefined;
-        child = start();
+        // Never replace a live child: the old one would keep delivering.
+        child ??= start();
         waiter.resolve();
       }, RESTART_DELAYS_MS[attempt]);
       restart = {
@@ -444,7 +447,7 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     ready.catch((e: Error) => { if (!closed) fail(`grayboard process failed to initialize: ${e.message}`); });
     const deadline = setTimeout(() => fail(`grayboard process didn't initialize within ${INIT_DEADLINE_MS / 1000} s`), INIT_DEADLINE_MS);
     ready.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
-    return { proc, ready, call, associate, stop };
+    return { proc, ready, call, associate, fail, stop };
   };
 
   // Exclude new tools while outgoing calls and delivery settle, then rotate
@@ -473,7 +476,14 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (c) {
         await c.ready;
         if (!current() || child !== c) return;
-        await c.associate(session, selection);
+        try { await c.associate(session, selection); }
+        catch (error) {
+          // A switch handshake the current child fails restarts it as the
+          // start handshake does (#1145); the catch below then leaves the
+          // restart, not transitionError, to answer calls.
+          if (current() && child === c) c.fail(`grayboard process failed its session switch: ${(error as Error).message}`);
+          throw error;
+        }
         if (!current() || child !== c) return;
       }
       transitionError = undefined;
@@ -604,7 +614,9 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (target && !closed && !refused && !exitReason && !restart) {
         await Promise.all(stopping);
         await transition;
-        if (!closed) child ??= start();
+        // A transition that failed its child (#1145) or an exit while this
+        // waited has a restart pending: starting one here too would orphan it.
+        if (!closed && !exitReason && !restart) child ??= start();
       }
     },
 
@@ -619,7 +631,7 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (transitionError || closed) return;
       if (target && !child && !exitReason && !closed) {
         await Promise.all(stopping);
-        if (!closed) child ??= start();
+        if (!closed && !exitReason && !restart) child ??= start();
       }
       await child?.ready.catch(() => {});
       await transition;

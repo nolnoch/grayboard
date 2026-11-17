@@ -622,7 +622,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   function activeAccess(accessHash: string, r: Read = repo.read): Promise<{ access: OAuthAccess; email: string } | undefined> {
     return repo.authRead(async () => withEmail(await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
   }
-  // The synchronous form, for the hosted MCP callers that stay synchronous until #807 P3 A7d2 (Repo.authNow).
+  // The synchronous form, for isAuthorizedNow until #807 P3 A7d2c (Repo.authNow).
   function activeAccessNow(accessHash: string, r: Read = repo.read): { access: OAuthAccess; email: string } | undefined {
     return repo.authNow.read(() => withEmail(repo.authNow.findActiveAccess(r, accessHash, resource, [], now())));
   }
@@ -663,7 +663,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         return json({ error: "server_error" }, 500);
       }
     },
-    // `r`: as activeAccess's, for a check inside a body (the hosted byte routes' guard, #1053).
+    // `r`: as activeAccess's, for a check inside a body (the hosted byte routes' guard, #1053, async since #807 P3 A7d2a).
     async authenticate(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): Promise<OAuthPrincipal | Response> {
       const accessHash = bearer(req, requiredScopes);
       if (accessHash instanceof Response) return accessHash;
@@ -671,12 +671,6 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       // Closed while the read awaited: refused as bearer() refuses before it.
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
       return principalOf(access, accessHash, requiredScopes);
-    },
-    // authenticate's synchronous form, until #807 P3 A7d2 (activeAccessNow).
-    authenticateNow(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): OAuthPrincipal | Response {
-      const accessHash = bearer(req, requiredScopes);
-      if (accessHash instanceof Response) return accessHash;
-      return principalOf(activeAccessNow(accessHash, r), accessHash, requiredScopes);
     },
     async isGrantActive(grantId: string): Promise<boolean> { return !closed && await repo.oauth.isGrantActive(repo.read, grantId, now()) && !closed; },
     async isAuthorized(principal: OAuthPrincipal, r?: Read): Promise<boolean> {
