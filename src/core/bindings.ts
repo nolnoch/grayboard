@@ -208,7 +208,7 @@ export function boardActor(
 let asTools: Set<string> | undefined;
 const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true, attachments: "paths" }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
 
-const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
+const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post", board_archive: "read" };
 
 /**
  * The address a DM reply goes out as without `as` (#284 S4): the parent's

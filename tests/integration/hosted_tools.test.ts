@@ -259,6 +259,19 @@ test("board_archive: the creator retires a board; others still read and reply by
   expect((await bs.call<ReadResult>("board_read", { board: "task-1", before_id: 999 })).posts.map((p) => p.body)).toEqual(["started", "done"]);
 });
 
+// #848: board_archive acts as the address that sees the board (BOARD_USES), as board_read does: a session whose
+// primary is another team's alias still archives a board its other alias created.
+test("#848: board_archive acts as the alias that sees the board, not the primary", async () => {
+  const alice = await login(A);
+  for (const name of ["eng", "ops"]) expect((await api(alice, "POST", "/api/teams", { name })).status).toBe(201);
+  const t = await srv.hosted(A, "ops/y");
+  await t.call("board_create", { name: "ops-task", purpose: "One task", team: "ops" });
+  await t.end();
+  const s = await srv.hosted(A, "eng/x");
+  await s.call("bind", { name: "ops/y" });
+  expect(await s.call("board_archive", { board: "ops-task" })).toMatchObject({ name: "ops-task", archived_by: "ops/y" });
+});
+
 test("claims are org-wide and atomic across users", async () => {
   const a = await srv.hosted(A, "be");
   const b = await srv.hosted(B, "be");

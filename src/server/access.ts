@@ -114,5 +114,12 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
 
     // A thread reply reaches a human only as far as a DM could.
     mayReach: (from, to) => reaches(repo, humanReach, from, to),
+
+    // A human archives only boards its own user's addresses created (#848): a
+    // team's alias, a service or another user's agent is someone else's.
+    sameUser(human, address) {
+      const h = repo.resolver.principalOf(human), a = repo.resolver.principalOf(address);
+      return h?.kind === "user" && a?.kind === "user" && h.name === a.name;
+    },
   };
 }

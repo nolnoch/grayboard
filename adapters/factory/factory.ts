@@ -303,7 +303,9 @@ export class Factory {
         joined.set(name, f);
         queues.add(name);
       } catch (e) {
-        this.o.log(`fleet ${f.name}: couldn't join #${name}: ${msg(e)}`);
+        // An archived board leaves board_list, so it reads as missing until board_create says why (#848).
+        if (/already exists, archived/.test(msg(e))) this.o.log(`fleet ${f.name}: #${name} is archived; its creator or their user reopens it (Slack: "reopen #${name}"), then the fleet joins it`);
+        else this.o.log(`fleet ${f.name}: couldn't join #${name}: ${msg(e)}`);
       }
     }
     this.joined.clear();
@@ -627,6 +629,8 @@ export class Factory {
         try {
           await this.bus.call("board_create", { name, purpose: `Subtasks the factory ${this.bus.handle} fans out for the ${fleet} fleet: one top-level post per subtask, naming the task it's part of, with its outcome in its thread.` });
         } catch (e) {
+          // An archived board leaves board_list, so it reads as missing until board_create says why (#848).
+          if (/already exists, archived/.test(msg(e))) return { why: `#${name}, where ${fleet}'s subtasks would go, is archived; its creator or their user reopens it (Slack: "reopen #${name}"). Nothing was fanned out.`, keep: false };
           if (tries < 1 && /already exists/.test(msg(e))) continue; // another handle or process made it first
           return { why: `couldn't open #${name} for the fan-out: ${msg(e)}`, keep: false };
         }
