@@ -59,7 +59,8 @@ const LOOKUPS = 1024;
 const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000;
 // Past the grace a root waits for the refresh (#661): it asks the host to
 // refresh (`credential.refresh`, once per expiry), then re-checks the stored credential, a local read, on this backoff,
-// for an hour of waits: after that the pause stands until a reload's restore.
+// for an hour of waits: after that the pause stands until a reload's restore. The outage retries (run loop and
+// restore) ask the host the same way once the server answers with the expiry, and keep their own backoff (#916).
 const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
 // A saved root restore couldn't prepare while the server was down (#424 6).
 const UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
@@ -532,8 +533,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       } catch (caught) {
         if (signal.aborted) break;
         const error = this.expired(caught);
-        // An access token that expires mid-outage couldn't be refreshed either;
-        // wait for the host's credential rather than pausing.
+        // An access token that expires mid-outage couldn't be refreshed either:
+        // keep retrying rather than pausing, and ask the host to refresh (#916).
         if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || (error instanceof AccessExpired && error.reason === "expired" && outage)) {
           if (error instanceof ServerUnreachable) outage = true;
           this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained"
@@ -541,6 +542,10 @@ export class Controller<E extends Enrollment = Enrollment> {
             : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained`
             : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
+          // The expiry came back from the server, so it's reachable again: ask the host to refresh now,
+          // as the recovery does; the port acts at most once per expiry.
+          // A failed request is recorded apart from the root (a drift's pause record must stand).
+          if (error instanceof AccessExpired && this.port.credential.refresh) await this.port.credential.refresh(e).catch(failure => this.failure("reopen", failure));
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
         }
@@ -714,7 +719,12 @@ export class Controller<E extends Enrollment = Enrollment> {
   private retryRestore(r: Root<E>) {
     const epoch = r.epoch;
     const retry = (async () => {
+      let expired = false;
       for (let attempt = 1; ; attempt++) {
+        // Outside the control queue, as the recovery's request is (#916).
+        // A failed request is recorded apart from the root, as the recovery's is.
+        if (expired && this.restorable(r, epoch) && this.port.credential.refresh) await this.port.credential.refresh(r.e).catch(error => this.failure("restore", error));
+        expired = false;
         await this.wait(Math.min(8000, 250 * 2 ** attempt), this.closing.signal);
         const done = await this.serial(async () => {
           if (!this.restorable(r, epoch)) return true;
@@ -727,9 +737,10 @@ export class Controller<E extends Enrollment = Enrollment> {
             if (!this.restorable(r, epoch)) return true;
             if (error instanceof ServerUnreachable) { this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error)); return false; }
             // As in the run loop's outage: a token that expired while the server
-            // (its issuer) was down couldn't be refreshed; wait for the host's.
+            // (its issuer) was down couldn't be refreshed; ask the host before the next try.
             if (error instanceof AccessExpired && error.reason === "expired") {
               this.set(r, "retrying", `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "restore", failureCode(error));
+              expired = true;
               return false;
             }
             r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");

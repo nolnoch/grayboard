@@ -37097,6 +37097,8 @@ class Controller {
             outage = true;
           this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
+          if (error instanceof AccessExpired && this.port.credential.refresh)
+            await this.port.credential.refresh(e).catch((failure) => this.failure("reopen", failure));
           await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
           continue;
         }
@@ -37296,7 +37298,11 @@ class Controller {
   retryRestore(r) {
     const epoch = r.epoch;
     const retry = (async () => {
+      let expired = false;
       for (let attempt = 1;; attempt++) {
+        if (expired && this.restorable(r, epoch) && this.port.credential.refresh)
+          await this.port.credential.refresh(r.e).catch((error) => this.failure("restore", error));
+        expired = false;
         await this.wait(Math.min(8000, 250 * 2 ** attempt), this.closing.signal);
         const done = await this.serial(async () => {
           if (!this.restorable(r, epoch))
@@ -37316,6 +37322,7 @@ class Controller {
             }
             if (error instanceof AccessExpired && error.reason === "expired") {
               this.set(r, "retrying", `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "restore", failureCode(error));
+              expired = true;
               return false;
             }
             r.paused = true;
