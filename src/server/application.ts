@@ -1490,11 +1490,12 @@ async function prepareSend(
   // An ID's deliverability is checked in the write's transaction (writeSend).
   // A team's alias the sender may not see reads as one nobody has (#1014), unless this replies in a thread with it:
   // a handle that wrote to you is one you may answer.
-  const replyingTo = async (address: string) => {
+  // A named function, not an arrow: its stack frame names it (tests/integration/alias_visibility.test.ts finds it so).
+  async function replyingTo(address: string) {
     if (parentId === null) return false;
     const parent = await repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
-  };
+  }
   if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
