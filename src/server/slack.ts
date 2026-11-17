@@ -331,12 +331,14 @@ export class SlackBridge implements SlackLinker {
     let seq = 0;
     const pendingThreads = new Map<string, { row: SlackThread; seq: number }>();
     const pendingProgress = new Map<string, { value: unknown; seq: number }>();
-    // The committed row is read with an await (#807 P3 A6b): the overlay is looked at again after it, so a row
-    // another call set meanwhile wins, and the overlay's read and its update below stay one synchronous step.
-    const threadByTs = async (ts: string): Promise<SlackThread | undefined> => {
-      const committed = pendingThreads.has(ts) ? undefined : await repo.slack.threadByTs(repo.read, link.user_id, ts);
-      return pendingThreads.get(ts)?.row ?? committed;
-    };
+    // The committed row is read with an await (#807 P3 A6b), and only when the overlay has none. A caller awaits it,
+    // then reads the overlay (`current`) and, for a write, calls postThread in the same synchronous step: a row
+    // another call set while it awaited wins, and two calls resolving in one drain each build on the other's row.
+    // An async helper that returned the overlay's row would hand back one read before the await, which a sibling
+    // call's postThread could overtake.
+    const committedThread = (ts: string): Promise<SlackThread | undefined> | undefined =>
+      pendingThreads.has(ts) ? undefined : repo.slack.threadByTs(repo.read, link.user_id, ts);
+    const current = (ts: string, committed: SlackThread | undefined) => pendingThreads.get(ts)?.row ?? committed;
     const postThread = (row: SlackThread, write: (tx: Tx) => Promise<void>, what: string) => {
       const mine = ++seq;
       pendingThreads.set(row.thread_ts, { row, seq: mine });
@@ -347,16 +349,18 @@ export class SlackBridge implements SlackLinker {
         for (const { row } of pendingThreads.values()) if (row.kind === kind && (row.board ?? null) === (board ?? null) && row.root_id === root) return row;
         return repo.slack.thread(repo.read, link.user_id, kind, board, root);
       },
-      byTs: threadByTs,
+      byTs: async (ts) => current(ts, await committedThread(ts)),
       // INSERT OR IGNORE: a row already there stays as it is.
       addThread: async (row) => {
-        if (await threadByTs(row.thread_ts)) { repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row"); return; }
+        const committed = await committedThread(row.thread_ts);
+        if (current(row.thread_ts, committed)) { repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row"); return; }
         postThread({ ...row, board: row.board ?? null }, tx => repo.slack.addThread(tx, link.user_id, row), "Slack thread row");
       },
       // As advanceThread's UPDATE: last_id only moves forward, and peer follows only a newer id.
       advance: async (ts, id, peer) => {
         const write = (tx: Tx) => repo.slack.advanceThread(tx, link.user_id, ts, id, peer);
-        const row = await threadByTs(ts);
+        const committed = await committedThread(ts);
+        const row = current(ts, committed);
         if (!row) { repo.post(write, undefined, "Slack thread advance"); return; }
         postThread({ ...row, peer: peer != null && id > row.last_id ? peer : row.peer, last_id: Math.max(row.last_id, id) }, write, "Slack thread advance");
       },
@@ -534,10 +538,14 @@ export class SlackBridge implements SlackLinker {
         return this.say(channel, ts, link && unlinked ? `Unlinked from \`${link.email}\`. Agents' messages to "${HUMAN_NAME}" won't reach you here.` : NOT_LINKED);
       }
     }
+    // The relay is found in memory, with no await before onEvent: the socket calls this in arrival order without
+    // awaiting it, and the relay's queue keeps that order only if each event reaches it synchronously (#807 P3 A6b).
+    // Otherwise the store is read to word the refusal, and a relay that attached while it read still takes the event.
+    for (const l of this.linked.values()) if (l.link.slack_user === user) return l.relay.onEvent(payload);
     const link = await this.o.repo.slack.linkBySlackUser(this.o.repo.read, user);
     const l = link && this.linked.get(link.user_id);
-    if (!l) return this.say(channel, threaded ? String(e.thread_ts) : ts, link ? "Your link is offline; the server log says why." : NOT_LINKED);
-    await l.relay.onEvent(payload);
+    if (l) return l.relay.onEvent(payload);
+    return this.say(channel, threaded ? String(e.thread_ts) : ts, link ? "Your link is offline; the server log says why." : NOT_LINKED);
   }
 
   private async say(channel: string, threadTs: string | undefined, text: string): Promise<void> {

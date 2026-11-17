@@ -1006,6 +1006,31 @@ test("#1062: a thread row and its advance, waiting in the write queue, read back
   } finally { holder.release(); }
 });
 
+// #807 P3 A6b: two advances that start together, the thread row in the overlay, each build on the other's row: one
+// that read its row before the await would post a projection from 41, so the older item's would win (43, sim).
+test("#807: two advances resolving together never regress the overlay's last_id or peer", async () => {
+  const { userId, store } = await linkedAlice();
+  const repo = srv.app.repo;
+  const ts = "1700000000.000200";
+  const want = { thread_ts: ts, kind: "dm" as const, board: null, root_id: 51, peer: "alice@example.com/fe", last_id: 55 };
+  const holder = holdQueue();
+  try {
+    await store.addThread({ thread_ts: ts, kind: "dm", board: null, root_id: 51, peer: "alice@example.com/be", last_id: 51 });
+    await Promise.all([store.advance(ts, 55, "alice@example.com/fe"), store.advance(ts, 53, "alice@example.com/sim")]);
+    expect(await store.byTs(ts)).toEqual(want);
+  } finally { holder.release(); }
+  await holder.done;
+  await until(async () => (await repo.slack.threadByTs(repo.read, userId, ts))?.last_id === 55, 5000, "the row and its advances committed");
+  // The committed read delayed: both advances await it, and the second to resolve reads the first's overlay row.
+  const original = repo.slack.threadByTs.bind(repo.slack);
+  const slow = spyOn(repo.slack, "threadByTs").mockImplementation(async (h, u, t) => { const row = await original(h, u, t); await ticks(3); return row; });
+  const later = holdQueue();
+  try {
+    await Promise.all([store.advance(ts, 59, "alice@example.com/sim"), store.advance(ts, 57, "alice@example.com/be")]);
+    expect(await store.byTs(ts)).toEqual({ ...want, peer: "alice@example.com/sim", last_id: 59 });
+  } finally { later.release(); slow.mockRestore(); }
+});
+
 test("#1062: queued progress reads back as saved, and the receipt drops it", async () => {
   const { userId, store } = await linkedAlice();
   const repo = srv.app.repo;
@@ -1113,4 +1138,27 @@ test("the Slack human archives and reopens its own user's boards, not another us
   expect(await listed()).toContain("mine");
   const missing = slack.say("archive #nope");
   expect((await reply(missing.ts)).markdown_text).toStartWith("⚠️ not archived: no board #nope");
+});
+
+// #807 P3 A6b: the socket calls the bridge in arrival order without awaiting it, and the relay's queue keeps that
+// order only if each event reaches it with no await first. The store's link lookup, made slow for the first event,
+// must not let the second overtake it.
+test("#807: Slack events reach the relay in arrival order, however slow the store's link lookup", async () => {
+  await link(await login("alice@example.com"));
+  const be = await hosted("alice@example.com", "be");
+  const repo = srv.app.repo;
+  const original = repo.slack.linkBySlackUser.bind(repo.slack);
+  let first = true;
+  const slow = spyOn(repo.slack, "linkBySlackUser").mockImplementation(async (h, u) => {
+    if (first) { first = false; await new Promise((r) => setTimeout(r, 100)); }
+    return original(h, u);
+  });
+  try {
+    slack.say("@be one");
+    slack.say("@be two");
+    await be.next(direct((m) => m.body === "one"), 5000);
+    await be.next(direct((m) => m.body === "two"), 5000);
+  } finally { slow.mockRestore(); }
+  const rows = srv.app.db.query("SELECT body FROM messages WHERE body IN ('one', 'two') ORDER BY id").all() as { body: string }[];
+  expect(rows.map((r) => r.body)).toEqual(["one", "two"]);
 });
