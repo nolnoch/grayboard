@@ -205,11 +205,11 @@ describe("OAuth domain store", () => {
   });
   test("admin revoke-all includes OAuth; single old-session logout and browser logout do not", async () => {
     const input = await issue();
-    const s = await w1(tx => first.repo.sessions.create(tx, userId, "old-hash", null));
-    await w1(tx => first.repo.sessions.revoke(tx, s.id));
+    const s = await seed(first.repo, tx => first.repo.sessions.create(tx, userId, "old-hash", null));
+    await seed(first.repo, tx => first.repo.sessions.revoke(tx, s.id));
     await w1(tx => first.repo.oauth.revokeBrowserSession(tx, sessionHash));
     expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(true);
-    await w1(tx => first.repo.sessions.revokeAllForUser(tx, userId));
+    await seed(first.repo, tx => first.repo.sessions.revokeAllForUser(tx, userId));
     expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
   });
   test("expiry caps, cleanup and retained spent refresh tombstones", async () => {
@@ -385,7 +385,7 @@ describe("OAuth domain store", () => {
     second.db.close();
     second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
     expect((await w2(tx => second.repo.oauth.redeemCode(tx, input, later))).status).toBe("replay");
-    await w1(tx => first.repo.sessions.revokeAllForUser(tx, userId));
+    await seed(first.repo, tx => first.repo.sessions.revokeAllForUser(tx, userId));
     await w1(tx => first.repo.users.setDisabled(tx, userId, true));
     expect(first.db.query("SELECT grant_id FROM oauth_codes WHERE hash = ?").get(code.codeHash)).toEqual({ grant_id: input.grantId });
     expect((await w2(tx => second.repo.oauth.redeemCode(tx, input, input.grantExpiresAt))).status).toBe("not_found");
@@ -460,7 +460,7 @@ describe("OAuth domain store", () => {
     first.db.exec("CREATE TRIGGER fail_revoke BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT, 'storage failure'); END");
     await expect(w1(tx => first.repo.oauth.revokeToken(tx, input.tokens.refreshHash, binding.clientId, start))).rejects.toThrow("storage failure");
     expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(true);
-    await expect(w1(tx => first.repo.sessions.revokeAllForUser(tx, userId))).rejects.toThrow("storage failure");
+    await expect(seed(first.repo, tx => first.repo.sessions.revokeAllForUser(tx, userId))).rejects.toThrow("storage failure");
     await expect(w1(tx => first.repo.users.setDisabled(tx, userId, true))).rejects.toThrow("storage failure");
     expect(first.repo.users.findById(userId)?.disabled_at).toBeNull();
   });
@@ -494,7 +494,7 @@ describe("OAuth domain store", () => {
     request = { ...request, ...login };
     code = { ...code, ...login };
     await issueCode();
-    const won = await w1(tx => first.repo.sessions.create(tx, userId, h("winner-token"), null));
+    const won = await seed(first.repo, tx => first.repo.sessions.create(tx, userId, h("winner-token"), null));
     first.db.exec(`CREATE TRIGGER steal AFTER INSERT ON sessions WHEN NEW.id <> ${won.id} BEGIN
       UPDATE oauth_codes SET session_id = ${won.id} WHERE hash = '${code.codeHash}'; END`);
     const input = { ...login, codeHash: code.codeHash, tokenHash: h("loser-token"), label: null };

@@ -22,7 +22,7 @@ try {
   let result: unknown;
   if (input.operation === "revoke") result = await repo.write(tx => repo.oauth.revokeToken(tx, input.refreshHash!, input.principal.clientId, now));
   else if (input.operation === "bind") result = await hosted.bind(input.principal, context, { name: input.name ?? "fe", create: true });
-  else if (input.operation === "receipt") { await delivery.receipt(input.principal, context, lease!.capability, pending.map(item => item.id)); result = { cursor: repo.cursors.directFor(repo.read, lease!.identity.identity_full) }; }
+  else if (input.operation === "receipt") { await delivery.receipt(input.principal, context, lease!.capability, pending.map(item => item.id)); result = { cursor: await repo.cursors.directFor(repo.read, lease!.identity.identity_full) }; }
   else if (input.operation === "register") result = await hosted.register(input.principal, context, input.child!);
   else if (input.operation === "end") result = await hosted.end(input.principal, context);
   else { now = input.sweepAt!; hosted.sweep(); result = { swept: true }; }

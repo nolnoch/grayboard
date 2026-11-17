@@ -184,7 +184,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   expect(events).toHaveLength(10);
   const peers = await owner.call<{ peers: unknown[] }>("peer_list", {});
   expect(peers.peers).toContainEqual(expect.objectContaining({ handle: "alice@example.com/fe", online: true, status: "working", where: "owner" }));
-  expect(store.repo.cursors.directFor(store.repo.read, owner.session.identityFull)).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, owner.session.identityFull)).toBe(0);
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   await expect(new AppSession(application, store.repo, user, "fe").connect()).rejects.toMatchObject({ code: "alias_held" }); // #284: was identity_in_use
 });
@@ -1072,7 +1072,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
     expect(hints).toEqual([uri]);
     expect(gets).toHaveLength(1);
     expect(gets[0]!.signal.aborted).toBe(false);
-    expect(store.repo.cursors.directFor(store.repo.read, "alice@example.com/be")).toBe(0);
+    expect(await store.repo.cursors.directFor(store.repo.read, "alice@example.com/be")).toBe(0);
     await client.unsubscribeResource({ uri });
     expect(hosted.activeWatches).toBe(0);
   } finally { application.observeBoard = original; }

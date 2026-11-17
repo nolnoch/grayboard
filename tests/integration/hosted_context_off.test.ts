@@ -137,7 +137,7 @@ test("a withheld item stays unreceipted: the direct cursor doesn't move", async 
   const bfe = await srv.hosted(B, "fe");
   await bfe.call("dm_send", { to: `${A}/be`, body: "held" });
   expect(await abe.inbox()).toEqual([]);
-  expect(srv.app.repo.cursors.directFor(srv.app.repo.read, `${A}/be`)).toBe(0);
+  expect(await srv.app.repo.cursors.directFor(srv.app.repo.read, `${A}/be`)).toBe(0);
 });
 
 test("a full page with none waking goes out: holding it back would starve the item behind it", async () => {

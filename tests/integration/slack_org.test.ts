@@ -116,7 +116,7 @@ test("a DM Slack posts is stamped delivered_at; one Slack refuses is given up un
   await until(() => stamp(ok.message_id).delivered_at !== null);
   slack.refusePosts = "msg_too_long";
   const refused = await be.call<SendResult>("dm_send", { to: "human", body: "too long" });
-  await until(() => srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/human") >= refused.message_id);
+  await until(async () => (await srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/human")) >= refused.message_id);
   expect(stamp(refused.message_id).delivered_at).toBeNull();
 }, 30_000);
 

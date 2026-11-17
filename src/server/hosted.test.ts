@@ -815,7 +815,7 @@ test("pending holds the reader gate while rebind waits; stale receipt cannot mov
   await binding;
   expect(issued).toHaveLength(1);
   await expect(delivery.receipt(principal, context("root"), lease.capability, issued.map(item => item.id))).rejects.toHaveProperty("code", "not_found");
-  expect(database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
+  expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
   await expect(delivery.renew(principal, context("root"), lease.capability)).rejects.toHaveProperty("code", "not_found");
   await expect(delivery.release(principal, context("root"), lease.capability)).rejects.toHaveProperty("code", "not_found");
 });

@@ -39,7 +39,7 @@ function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
 function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
-function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number): AuthedUser | null {
+async function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number): Promise<AuthedUser | null> {
   const raw = extractBearer(req);
   if (!raw) return null;
   return verifySessionToken(raw, repo, touches, idleDays);
@@ -112,12 +112,12 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
   if (!body?.email) return badRequest("email required");
   const email = body.email.toLowerCase();
   if (!isValidEmail(email)) return badRequest(`grayboard can't address "${email}"`);
-  return repo.write(tx => {
+  return repo.write(async tx => {
     const user  = repo.users.upsertByEmail(tx, email, null);
     const disabled = refuseDisabled(repo, tx, user, { dev: true, ip: ip ?? undefined });
     if (disabled) return disabled;
     const raw   = mintToken();
-    repo.sessions.create(tx, user.id, hashToken(raw), DEV_SESSION_LABEL);
+    await repo.sessions.create(tx, user.id, hashToken(raw), DEV_SESSION_LABEL);
     writeAudit(repo, tx, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
     return json({ session_token: raw, user_email: email, expires_at: null });
   });
@@ -144,8 +144,8 @@ export function signInRoute(method: string, path: string, config: Config): { cha
 }
 
 function authLogout(authed: AuthedUser, repo: Repo): Promise<Response> {
-  return repo.write(tx => {
-    repo.sessions.revoke(tx, authed.session_id);
+  return repo.write(async tx => {
+    await repo.sessions.revoke(tx, authed.session_id);
     writeAudit(repo, tx, "auth.logout", authed.user_email, null, { token_session: authed.session_id });
     return json({ ok: true });
   });
@@ -609,10 +609,10 @@ async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, 
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   // The live sessions go after the commit: a rolled-back revoke leaves them up, as it leaves their tokens valid.
-  const target = await repo.write((tx: Tx) => {
+  const target = await repo.write(async (tx: Tx) => {
     const target = repo.users.findByEmail(body.email.toLowerCase());
     if (!target) return null;
-    repo.sessions.revokeAllForUser(tx, target.id);
+    await repo.sessions.revokeAllForUser(tx, target.id);
     writeAudit(repo, tx, "auth.session_revoked", authed.user_email, body.email);
     return target;
   }, target => { if (target) disconnectUser(target.id); return target; });
@@ -696,7 +696,7 @@ export async function handleHttp(
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);
 
-  const authed = requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS);
+  const authed = await requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);

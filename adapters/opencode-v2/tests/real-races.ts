@@ -41,9 +41,9 @@ export async function realRace(f: {
     const old = owner()!.ownership_id; f.outage(true);
     const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/race", "Real network outage recovery", null, false)); app.application.wake(["you@example.com/race"]);
     await Bun.sleep(31_000); app.mcp.sessions.sweep();
-    assert.equal(owner(), null); assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), 0); assert.equal(g.inputs.length, 0);
+    assert.equal(owner(), null); assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), 0); assert.equal(g.inputs.length, 0);
     f.outage(false);
-    await until(() => app.repo.cursors.directFor(app.repo.read, "you@example.com/race") === message.id, "automatic rightful ownership after actual expired outage");
+    await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, "automatic rightful ownership after actual expired outage");
     assert.notEqual(owner()!.ownership_id, old); assert.equal(g.inputs.length, 1); assert.equal(g.inputs[0]!.sessionID, root);
     await host.session.wait({ sessionID: root }); assert(g.models.includes(root)); assert(!g.models.includes(other)); assert(!g.models.includes(child));
     console.log("REAL_NETWORK_OUTAGE_RECOVERY_OK", { oldOwnership: old, recoveredOwnership: owner()!.ownership_id, cursor: message.id }); return;
@@ -51,13 +51,13 @@ export async function realRace(f: {
   let release!: () => void;
   const entered = new Promise<void>(r => { g.entered = r; });
   g.released = new Promise<void>(r => { release = r; }); g.holding = true;
-  const beforeCursor = app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeReceipts = f.receipts();
+  const beforeCursor = await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeReceipts = f.receipts();
   const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/race", "IMMUTABLE REAL " + scenario, null, false));
   app.application.wake(["you@example.com/race"]);
   try {
     await Promise.race([entered, Bun.sleep(15_000).then(() => { throw new Error("No real issued batch"); })]);
     const original = structuredClone(g.inputs[0]!); assert.equal(original.sessionID, root); assert(original.text.includes(message.body));
-    assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeCursor);
+    assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeCursor);
     if (g.boundary === "after") { await host.session.wait({ sessionID: root }); assert(g.models.includes(root)); }
     else assert.equal(g.accepted.length, 0);
     const retiredSubscriber = f.subscriberWork.current(root);
@@ -111,12 +111,12 @@ export async function realRace(f: {
     if (scenario === "enrollment") assert(g.inputs.every(i => i.id === original.id), "Only the original message is admitted again, never a distinct one"); else assert.equal(g.inputs.length, 1, "No subsequent admission after original subscriber completion");
     if (scenario === "enrollment") {
       // The replayed item is acknowledged once by the new lease; the original lease never receipts.
-      await until(() => app.repo.cursors.directFor(app.repo.read, "you@example.com/race") === message.id, "replayed original acknowledged under the new lease");
+      await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, "replayed original acknowledged under the new lease");
       assert.equal(f.receipts(), beforeReceipts + 1, "Exactly one receipt, from the replay");
     } else {
       // A server-side end the client can't see (a rebind, a revoke) surfaces at the receipt, which the server refuses (#845).
       assert(f.receipts() - beforeReceipts <= 1, "At most one stale receipt attempt, refused");
-      assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
+      assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeCursor, "Actual backend cursor unchanged");
     }
     assert.deepEqual(await host.session.inbox.list({ sessionID: other }), []);
     assert.equal((await host.session.context({ sessionID: other })).filter((m: { id?: string; type?: string }) => m.type === "synthetic").length, 0);
@@ -142,6 +142,6 @@ export async function realRace(f: {
       for (const r of audits(app.db, "hosted.stale_capability")) assert.deepEqual(r, { id: r.id, actor: "you@example.com", target: session, detail: { client_id: OPENCODE_CLIENT } });
       assert(audits(app.db, "hosted.stale_capability")[0]!.id > rebound.id, "Refused only after the rebind closed the lease");
     }
-    console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
+    console.log("REAL_ISSUED_RACE_OK", JSON.stringify({ scenario, boundary: g.boundary, original, accepted: g.accepted.map(a => ({ id: a.id, sessionID: a.sessionID, payload: a.payload })), message: message.id, cursorBefore: beforeCursor, cursorAfter: await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), staleReceipts: f.receipts() - beforeReceipts, models: g.models }));
   } finally { g.holding = false; release(); f.expiryContinuation.release(); }
 }

@@ -390,7 +390,7 @@ try {
         await bounded(retiredSubscriber, 12_000, "Account drift must retire the actual admission-retry subscriber");
         await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
         assert.equal(gate.retryForwarded, false, "Aborted original continuation never reaches backend admission");
-        assert.equal(admissions.length, 0); assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/admission"), 0);
+        assert.equal(admissions.length, 0); assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/admission"), 0);
         console.log("REAL_DEFAULT_ADMISSION_ACCOUNT_GUARD_OK", { subscriberThrottles, admissions: admissions.length });
       } else {
         gate.requireRefused();
@@ -437,7 +437,7 @@ try {
     assert(!raceGate.models.includes(digest.id)); assert(raceGate.models.includes(action.id));
     // The digest's durable idle admission lands independently of the receipts, so wait for it as the durable-idle scenario does (line ~362).
     assert.equal((await wait(() => host!.session.inbox.list({ sessionID: digest.id }), xs => xs.length >= 1, "digest durable idle admission")).length, 1);
-    assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/action"), 0);
+    assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/action"), 0);
     const digestInput = admissions.find(i => i.sessionID === digest.id)!, input = admissions.find(i => i.sessionID === action.id)!;
     assert(input && digestInput);
     const boardCursor = () => app.db.prepare("SELECT cursor, notified_id FROM subscriptions WHERE board = ? AND handle = ?").get(board.name, "you@example.com/digest") as { cursor: number; notified_id: number };
@@ -446,7 +446,7 @@ try {
     await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input, digestInput, location }));
     const worker = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port) }, stdout: "inherit", stderr: "inherit" });
     assert.equal(await worker.exited, 0);
-    assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/action"), lost.id);
+    assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/action"), lost.id);
     assert(boardCursor().notified_id > oldBoard.notified_id, "Actual board digest notification cursor advanced only after replayed durable acceptance");
     console.log("REAL_PROCESS_DIGEST_ACTION_RELOAD_OK", { actionCursor: lost.id, boardBefore: oldBoard, boardAfter: boardCursor() });
     console.log("REAL_BACKEND_RELOAD_OK");
@@ -466,13 +466,13 @@ try {
       const saved = await Bun.file(join(root, "real-worker-held.json")).json();
       savedInput(saved.input); assert.equal(saved.input.sessionID, crashedRoot.id, "Held handoff preserves the exact crash root");
       assert.equal(saved.input.resume, true); assert.equal(saved.pid, crashWorker.pid);
-      assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/crash"), 0, "Held actual host write has not receipted real item");
+      assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/crash"), 0, "Held actual host write has not receipted real item");
       crashWorker.kill("SIGKILL"); await crashWorker.exited;
       assert.equal(saved.models.length, boundary === "before" ? 0 : 1, "Historical wake belongs only to already committed actionable root");
       await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input: saved.input, location, uncommitted: boundary === "before" }));
       const recovery = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port), GRAYBOARD_REAL_WORKER_MODE: "replay" }, stdout: "inherit", stderr: "inherit" });
       assert.equal(await recovery.exited, 0, "Actual OS-process recovery after kill passes");
-      assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/crash"), lost.id);
+      assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/crash"), lost.id);
       const result = await Bun.file(join(root, "real-reload-result.json")).json();
       console.log("REAL_PROCESS_CRASH_RECOVERY_OK", JSON.stringify({ boundary, original: saved.input, historicalModels: saved.models, recoveryModels: result.models, cursor: lost.id }));
       console.log("REAL_BACKEND_CRASH_OK");
@@ -641,7 +641,7 @@ try {
   held = true; const enteredPromise = new Promise<void>(r => { entered = r; });
   const dm = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/r4", "Held real durable admission", null, false)); app.application.wake(["you@example.com/r4"]);
   await enteredPromise;
-  assert(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4") < dm.id, "No real cursor movement before actual host durable admission");
+  assert((await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4")) < dm.id, "No real cursor movement before actual host durable admission");
   assert(admissions.at(-1)?.sessionID === a.id); held = false; release?.();
   await wait(() => app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), n => n === dm.id, "receipt after durable host acceptance");
   await host.session.wait({ sessionID: a.id });
@@ -654,27 +654,27 @@ try {
   await wait(() => rpc.status({}, { location }), s => rootRetrying(s, a.id), "lost receipt retry boundary before host reload"); await assertBPaused();
   const lostInput = admissions.find(x => x.text.includes("Replay after host reload"))!;
   await wait(() => admitted.some(x => x.id === lostInput.id), Boolean, "actual lost-receipt admission returned");
-  const cursorBeforeReload = app.repo.cursors.directFor(app.repo.read, "you@example.com/r4");
+  const cursorBeforeReload = await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4");
   const settledSessions = await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
   assert(settledSessions.includes(lostInput.sessionID), "Actual target participates in the complete owned-session drain");
   // No remaining controlled producer: tools, admission holds and race drivers are all idle.
   assert.equal(target, undefined); assert.equal(held, false); assert.equal(raceGate.holding, false); assert.equal(pendingAdmissions, 0);
   assertStable(join(root, "host.sqlite"), lostInput);
   assert(sessionStates(join(root, "host.sqlite")).every(s => s.time_suspended === null));
-  assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), cursorBeforeReload);
+  assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), cursorBeforeReload);
   assert.equal(dropReceipt, true); assert(rootRetrying(await rpc.status({}, { location }), a.id)); await assertBPaused();
   assert.equal(pendingAdmissions, 0); assert(sessionStates(join(root, "host.sqlite")).every(s => s.time_suspended === null));
   assertStable(join(root, "host.sqlite"), lostInput);
   assert.deepEqual(admitted.find(input => input.id === lostInput.id), lostInput, "Exact stable envelope survives actual admission");
   await host.close(); host = undefined; dropReceipt = false;
-  assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), cursorBeforeReload);
-  assert(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4") < lost.id);
+  assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), cursorBeforeReload);
+  assert((await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4")) < lost.id);
   await Bun.write(join(root, "real-reload.json"), JSON.stringify({ pid: process.pid, input: lostInput, location, settled: true, settledSessions }));
   const reloadProcess = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port) }, stdout: "inherit", stderr: "inherit" });
   assert.equal(await reloadProcess.exited, 0, "Separate installed-host reload process passes");
   const childReload = await Bun.file(join(root, "real-reload-result.json")).json();
   assert.notEqual(childReload.pid, process.pid);
-  assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), lost.id, "Child process receipt moved actual backend cursor");
+  assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), lost.id, "Child process receipt moved actual backend cursor");
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
   await wait(() => app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), n => n === lost.id, "restored lease replay receipt");
   await host.session.wait({ sessionID: a.id });
@@ -696,17 +696,17 @@ try {
   assertStable(join(root, "host.sqlite"), suspendedInput);
   assert(sessionStates(join(root, "host.sqlite")).some(s => s.id === a.id && s.time_suspended !== null), "Target must actually be suspended before close");
   assert.equal(dropReceipt, true); assert.equal(pendingAdmissions, 0);
-  const suspendedCursor = app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"); assert(suspendedCursor < suspendedDM.id);
+  const suspendedCursor = await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"); assert(suspendedCursor < suspendedDM.id);
   await host.close(); host = undefined; suspendedModel.released.release(); suspendedModel.target = ""; dropReceipt = false;
   assertStable(join(root, "host.sqlite"), suspendedInput);
   assert(sessionStates(join(root, "host.sqlite")).some(s => s.id === a.id && s.time_suspended !== null));
-  assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), suspendedCursor);
+  assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), suspendedCursor);
   await Bun.write(join(root, "real-suspended.json"), JSON.stringify({ pid: process.pid, input: suspendedInput, location }));
   const suspendedReload = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port), GRAYBOARD_REAL_WORKER_MODE: "suspended-resume" }, stdout: "inherit", stderr: "inherit" });
   assert.equal(await suspendedReload.exited, 0, "Separate suspended SDK resume regression passes");
   const suspendedResult = await Bun.file(join(root, "real-suspended-result.json")).json();
   assert.deepEqual(suspendedResult.models, [a.id]);
-  assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), suspendedDM.id);
+  assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4"), suspendedDM.id);
   console.log("REAL_SUSPENDED_RESUME_BEFORE_REPLAY_OK");
   host = await createHost(); await host.agent.list({ location }); rpc = host.rpc(Grayboard);
   await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
@@ -736,7 +736,7 @@ try {
   await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": a.id }), { name: "final", create: true });
   held = false; release?.();
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "out-of-band real service rebind observed after old host admission");
-  assert(receiptAttempts - staleReceipts <= 1, "at most the one stale receipt the server refuses (#845)"); assert(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4") < stale.id); assert.equal(oldAdmission.sessionID, a.id);
+  assert(receiptAttempts - staleReceipts <= 1, "at most the one stale receipt the server refuses (#845)"); assert((await app.repo.cursors.directFor(app.repo.read, "you@example.com/r4")) < stale.id); assert.equal(oldAdmission.sessionID, a.id);
   assert((await host.session.context({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id) || (await host.session.inbox.list({ sessionID: a.id })).some((m: { id?: string }) => m.id === oldAdmission.id));
   console.log("REAL_OLD_BATCH_REBIND_STALE_RECEIPT_SUPPRESSED_OK");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit approval of successor real binding");
@@ -767,7 +767,7 @@ try {
   const lastOpen = await host.session.get({ sessionID: a.id }); assert(lastOpen.metadata);
   const pendingBeforeDisable = admissions.length; await app.repo.write(tx => app.repo.users.setDisabled(tx, app.repo.users.findByEmail(email)!.id, true));
   await wait(() => app.mcp.activeLeases, n => n === 0, "actual user disable ends ownership"); assert.equal(row(a.id), null);
-  assert(app.repo.cursors.directFor(app.repo.read, "you@example.com/final") < oldPending.id); assert.equal(admissions.length, pendingBeforeDisable);
+  assert((await app.repo.cursors.directFor(app.repo.read, "you@example.com/final")) < oldPending.id); assert.equal(admissions.length, pendingBeforeDisable);
   console.log("REAL_ACCOUNT_DRIFT_AND_DISABLE_OK");
   assert(!calls.some(c => c.name === "dm_ack"), "Delivery receipts are never dm_ack");
   assert.equal(codes, 3); assert.equal(google, 3); assert.equal(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? cimd === 0 : cimd >= 1, true); assert.equal(refreshes, 0);

@@ -246,14 +246,14 @@ export interface Repo {
     setDisabled(tx: Tx, userId: number, disabled: boolean): void;
   };
   sessions: {
-    create(tx: Tx, userId: number, tokenHash: string, label: string | null): Session;
-    findByTokenHash(r: Read, hash: string): Session | undefined;
-    findById(r: Read, sessionId: number): Session | undefined;
-    revoke(tx: Tx, sessionId: number): void;
-    revokeAllForUser(tx: Tx, userId: number): void;
+    create(tx: Tx, userId: number, tokenHash: string, label: string | null): Promise<Session>;
+    findByTokenHash(r: Read, hash: string): Promise<Session | undefined>;
+    findById(r: Read, sessionId: number): Promise<Session | undefined>;
+    revoke(tx: Tx, sessionId: number): Promise<void>;
+    revokeAllForUser(tx: Tx, userId: number): Promise<void>;
     // Revokes every live dev-auth session (`grayboard login --dev`); returns how many.
-    revokeDev(tx: Tx): number;
-    touch(tx: Tx, sessionId: number, now: number): void;
+    revokeDev(tx: Tx): Promise<number>;
+    touch(tx: Tx, sessionId: number, now: number): Promise<void>;
   };
   principals: {
     findByName(name: string): PrincipalRow | undefined;
@@ -365,10 +365,10 @@ export interface Repo {
   // Read points (#284), keyed by the reading address: how far it has
   // received a stream (its direct messages, stream_ref = the address itself).
   cursors: {
-    get(r: Read, address: string, streamType: "direct" | "team", streamRef: string): number;
+    get(r: Read, address: string, streamType: "direct" | "team", streamRef: string): Promise<number>;
     // How far an address has received its direct messages.
-    directFor(r: Read, address: string): number;
-    advance(tx: Tx, address: string, streamType: "direct" | "team", streamRef: string, messageId: number): void;
+    directFor(r: Read, address: string): Promise<number>;
+    advance(tx: Tx, address: string, streamType: "direct" | "team", streamRef: string, messageId: number): Promise<void>;
   };
   audit: {
     write(tx: Tx, row: AccessLogRow): void;
@@ -398,20 +398,20 @@ export interface Repo {
   };
   writeReceipts: {
     // The receipt for (session, sender, fp) written after `since`.
-    find(r: Read, session: string, sender: string, fp: string, since: number): WriteReceipt | undefined;
+    find(r: Read, session: string, sender: string, fp: string, since: number): Promise<WriteReceipt | undefined>;
     // Takes (session, sender, fp) for a write about to run, as a placeholder the write's `upsert` fills in the same
     // transaction; false when a receipt for it exists (D3: one statement, so of two identical calls one claims it).
-    claim(tx: Tx, key: WriteReceiptKey, tool: string, at: number): boolean;
+    claim(tx: Tx, key: WriteReceiptKey, tool: string, at: number): Promise<boolean>;
     // Takes over the receipt for `key` only while it still names `stale` (a row since retracted or pruned, #306);
     // false when another call replaced it first.
-    reclaim(tx: Tx, key: WriteReceiptKey, stale: { ref_kind: "message" | "post"; ref_id: number }, at: number): boolean;
+    reclaim(tx: Tx, key: WriteReceiptKey, stale: { ref_kind: "message" | "post"; ref_id: number }, at: number): Promise<boolean>;
     // Replaces any receipt for the same (session, sender, fp).
-    upsert(tx: Tx, r: WriteReceipt): void;
+    upsert(tx: Tx, r: WriteReceipt): Promise<void>;
     // Whether the row a receipt names still exists (a retract or retention removes it).
-    refExists(r: Read, kind: "message" | "post", id: number): boolean;
+    refExists(r: Read, kind: "message" | "post", id: number): Promise<boolean>;
     // Deletes receipts written at or before `before`: one session's, or all. Returns how many.
-    pruneSession(tx: Tx, session: string, before: number): number;
-    prune(tx: Tx, before: number): number;
+    pruneSession(tx: Tx, session: string, before: number): Promise<number>;
+    prune(tx: Tx, before: number): Promise<number>;
   };
   // The database file's free pages (#137).
   storage: {
@@ -1083,10 +1083,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     sessions: {
-      create(tx, userId, tokenHash, label) {
+      async create(tx, userId, tokenHash, label) {
         return insertSession(sqliteOf(tx), userId, tokenHash, label, clock());
       },
-      findByTokenHash(r, hash) {
+      async findByTokenHash(r, hash) {
         return (
           sqliteOf(r).query<Session, [string]>(
             "SELECT * FROM sessions WHERE token_hash = ? AND revoked_at IS NULL",
@@ -1094,13 +1094,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         );
       },
       // By row, revoked ones included: the caller reads revoked_at (#351).
-      findById(r, sessionId) {
+      async findById(r, sessionId) {
         return sqliteOf(r).query<Session, [number]>("SELECT * FROM sessions WHERE id = ?").get(sessionId) ?? undefined;
       },
-      revoke(tx, sessionId) {
+      async revoke(tx, sessionId) {
         sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [clock(), sessionId]);
       },
-      revokeAllForUser(tx, userId) {
+      async revokeAllForUser(tx, userId) {
         const db = sqliteOf(tx);
         db.transaction(() => {
           const now = clock();
@@ -1111,10 +1111,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         }).immediate();
         changed(null);
       },
-      revokeDev(tx) {
+      async revokeDev(tx) {
         return sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
       },
-      touch(tx, sessionId, now) {
+      async touch(tx, sessionId, now) {
         sqliteOf(tx).run("UPDATE sessions SET last_used_at = ? WHERE id = ?", [now, sessionId]);
       },
     },
@@ -1453,19 +1453,19 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     cursors: {
-      get(r, address, streamType, streamRef) {
+      async get(r, address, streamType, streamRef) {
         const row = sqliteOf(r).query<{ last_seen_id: number }, [string, string, string]>(
           "SELECT last_seen_id FROM mailbox_cursors WHERE address = ? AND stream_type = ? AND stream_ref = ?",
         ).get(address, streamType, streamRef);
         return row?.last_seen_id ?? 0;
       },
-      directFor(r, address) {
+      async directFor(r, address) {
         const row = sqliteOf(r).query<{ last_seen_id: number }, [string, string]>(
           "SELECT last_seen_id FROM mailbox_cursors WHERE address = ? AND stream_type = 'direct' AND stream_ref = ?",
         ).get(address, address);
         return row?.last_seen_id ?? 0;
       },
-      advance(tx, address, streamType, streamRef, messageId) {
+      async advance(tx, address, streamType, streamRef, messageId) {
         sqliteOf(tx).run(
           `INSERT INTO mailbox_cursors (address, stream_type, stream_ref, last_seen_id) VALUES (?, ?, ?, ?)
            ON CONFLICT(address, stream_type, stream_ref)
@@ -1580,25 +1580,25 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     writeReceipts: {
-      find(r, session, sender, fp, since) {
+      async find(r, session, sender, fp, since) {
         return sqliteOf(r).query<WriteReceipt, [string, string, string, number]>(
           "SELECT * FROM write_receipts WHERE session = ? AND sender = ? AND fp = ? AND at > ?",
         ).get(session, sender, fp, since) ?? undefined;
       },
-      claim(tx, key, tool, at) {
+      async claim(tx, key, tool, at) {
         // ref_id 0 names no row; ref_kind only satisfies the column's CHECK until `upsert` fills both.
         return !!sqliteOf(tx).query<{ x: number }, [string, string, string, string, number]>(
           `INSERT INTO write_receipts (session, sender, fp, tool, ref_kind, ref_id, result_json, at) VALUES (?, ?, ?, ?, 'message', 0, '', ?)
            ON CONFLICT(session, sender, fp) DO NOTHING RETURNING 1 AS x`,
         ).get(key.session, key.sender, key.fp, tool, at);
       },
-      reclaim(tx, key, stale, at) {
+      async reclaim(tx, key, stale, at) {
         return !!sqliteOf(tx).query<{ x: number }, [number, string, string, string, string, number]>(
           `UPDATE write_receipts SET ref_id = 0, result_json = '', at = ?
            WHERE session = ? AND sender = ? AND fp = ? AND ref_kind = ? AND ref_id = ? RETURNING 1 AS x`,
         ).get(at, key.session, key.sender, key.fp, stale.ref_kind, stale.ref_id);
       },
-      upsert(tx, r) {
+      async upsert(tx, r) {
         sqliteOf(tx).run(
           `INSERT INTO write_receipts (session, sender, fp, tool, ref_kind, ref_id, result_json, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(session, sender, fp) DO UPDATE SET
@@ -1606,14 +1606,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           [r.session, r.sender, r.fp, r.tool, r.ref_kind, r.ref_id, r.result_json, r.at],
         );
       },
-      refExists(r, kind, id) {
+      async refExists(r, kind, id) {
         const table = kind === "message" ? "messages" : "posts";
         return !!sqliteOf(r).query<{ x: number }, [number]>(`SELECT 1 AS x FROM ${table} WHERE id = ?`).get(id);
       },
-      pruneSession(tx, session, before) {
+      async pruneSession(tx, session, before) {
         return sqliteOf(tx).run("DELETE FROM write_receipts WHERE session = ? AND at <= ?", [session, before]).changes;
       },
-      prune(tx, before) {
+      async prune(tx, before) {
         return sqliteOf(tx).run("DELETE FROM write_receipts WHERE at <= ?", [before]).changes;
       },
     },

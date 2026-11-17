@@ -85,24 +85,24 @@ export class TestServer {
     const url = this.handlerUrl(identity, `&filename=${encodeURIComponent(filename)}`);
     const req = new Request(url, { method: "POST", headers: { "Content-Length": String(bytes.length) }, body: bytes as Uint8Array<ArrayBuffer> });
     const total = this.app.repo.attachmentLimits.total;
-    const r = await attachmentUpload(req, url, this.authed(token), this.app.repo, new UploadGate(4 * total, total));
+    const r = await attachmentUpload(req, url, await this.authed(token), this.app.repo, new UploadGate(4 * total, total));
     return { status: r.status, body: (await r.json()) as Record<string, any> };
   }
 
   async downloadAs(token: string, identity: string, id: number, guard?: () => void): Promise<{ status: number }> {
-    const r = await attachmentDownload(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo, guard);
+    const r = await attachmentDownload(String(id), this.handlerUrl(identity), await this.authed(token), this.app.repo, guard);
     await r.body?.cancel();
     return { status: r.status };
   }
 
   async releaseAs(token: string, identity: string, id: number): Promise<{ status: number }> {
-    const r = await attachmentRelease(String(id), this.handlerUrl(identity), this.authed(token), this.app.repo);
+    const r = await attachmentRelease(String(id), this.handlerUrl(identity), await this.authed(token), this.app.repo);
     await r.body?.cancel();
     return { status: r.status };
   }
 
-  private authed(token: string): AuthedUser {
-    const authed = verifySessionToken(token, this.app.repo, this.app.touches, 0);
+  private async authed(token: string): Promise<AuthedUser> {
+    const authed = await verifySessionToken(token, this.app.repo, this.app.touches, 0);
     if (!authed) throw new Error("the token doesn't authenticate");
     return authed;
   }

@@ -32,23 +32,23 @@ test("#807: a session touch that fires while another body holds the write queue 
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }), () => db.close());
   const touches = createTouchQueue();
   cleanups.push(() => touches.cancelAll());
-  const session = await seed(repo, tx => {
+  const session = await seed(repo, async tx => {
     const user = repo.users.upsertByEmail(tx, "you@example.com", null);
-    const created = repo.sessions.create(tx, user.id, hashToken("raw-token"), "test");
+    const created = await repo.sessions.create(tx, user.id, hashToken("raw-token"), "test");
     db.run("UPDATE sessions SET last_used_at = 0 WHERE id = ?", [created.id]);
     return created;
   });
-  const lastUsed = () => repo.sessions.findById(repo.read, session.id)!.last_used_at;
+  const lastUsed = async () => (await repo.sessions.findById(repo.read, session.id))!.last_used_at;
   const touched = spyOn(repo.sessions, "touch");
   const holder = hold(db);
-  expect(verifySessionToken("raw-token", repo, touches, 0)).not.toBeNull();
+  expect(await verifySessionToken("raw-token", repo, touches, 0)).not.toBeNull();
   await new Promise(r => setImmediate(r)); // the scheduled touch fires
   await new Promise(r => setImmediate(r));
   expect(touched).not.toHaveBeenCalled();
   holder.release();
   await holder.done;
   await until(() => touched.mock.calls.length > 0, 5000, "the touch ran after the holder released");
-  expect(lastUsed()).toBeGreaterThan(0);
+  expect(await lastUsed()).toBeGreaterThan(0);
   touched.mockRestore();
 });
 

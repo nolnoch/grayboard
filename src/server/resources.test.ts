@@ -112,7 +112,7 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
   expect([h1.counts.closed, h2.counts.closed, h3.counts.closed]).toEqual([1, 1, 1]);
   await seed(store.repo, tx => application.send(tx, b, a.identityFull, "direct"));
   expect(ownerEvents).toHaveLength(1);
-  expect(store.repo.cursors.directFor(store.repo.read, a.identityFull)).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, a.identityFull)).toBe(0);
 });
 
 test("only authorized same-board watchers receive hints; lost membership closes without private data", async () => {
@@ -326,7 +326,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     for (const session of [a, b]) {
       expect(isSubscribed(store.db, session.identityFull, "e2e")).toBe(false);
       expect(await application.pending(store.repo.read, session)).toEqual([]);
-      expect(store.repo.cursors.directFor(store.repo.read, session.identityFull)).toBe(0);
+      expect(await store.repo.cursors.directFor(store.repo.read, session.identityFull)).toBe(0);
     }
   } finally { touches.cancelAll(); server.stop(true); }
 });
@@ -441,7 +441,7 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
       try { await call(); throw new Error("request unexpectedly succeeded"); } catch (error) { expect(error).toBe(failure); }
     }
     expect(h.counts).toEqual({ changed: 0, closed: 0 });
-    expect(store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
+    expect(await store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
   } finally { failed = false; application.revalidateSession = validate; }
   await call(a, "board_post", { board: "e2e", body: "healthy" });
   expect(h.counts).toEqual({ changed: 1, closed: 0 });
@@ -481,7 +481,7 @@ for (const background of ["revalidate", "hint", "closed", "timer"] as const) tes
     expect({ changed, closed }).toEqual({ changed: 0, closed: 1 });
     failed = false;
     if (background === "hint") expect((await resources.read(store.repo.read, a, boardResourceUri("e2e"))).posts[0]!.body).toBe("committed");
-    expect(store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
+    expect(await store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
     expect(() => resources.close()).not.toThrow();
     expect(closed).toBe(1);
   } finally { failed = false; application.observeBoard = observe; }

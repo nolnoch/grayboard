@@ -32,12 +32,12 @@ beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-application-"));
   store = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(store.repo);
-  const user = (tx: Tx, email: string): AuthedUser => {
+  const user = async (tx: Tx, email: string): Promise<AuthedUser> => {
     const u = store.repo.users.upsertByEmail(tx, email, null);
     // A session needs a live sign-in (#351).
     return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email });
   };
-  [alice, bob] = await seed(store.repo, tx => [user(tx, "alice@example.com"), user(tx, "bob@example.com")]);
+  [alice, bob] = await seed(store.repo, async tx => [await user(tx, "alice@example.com"), await user(tx, "bob@example.com")]);
 });
 afterEach(() => {
   application.stopExpiry();
@@ -53,15 +53,15 @@ test("typed operations and delivery need no frames; receipts alone move the deli
   expect(sent).toMatchObject({ delivered_now: true, pending: true });
   expect(sent).not.toHaveProperty("type");
   expect(await b.next(isDirect)).toMatchObject({ kind: "direct", message: { id: sent.message_id, body: "question?" } });
-  expect(store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(0);
   await b.dmAck(sent.message_id);
-  expect(store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(0);
   b.close();
   // A rebuilt session on the same key is the same ID: it re-binds the alias it holds and replays its mail.
   const b2 = await connect(bob, "fe", { key: "bob-key" });
   expect(await b2.next(isDirect)).toMatchObject({ message: { id: sent.message_id } });
   await b2.ack([sent.message_id]);
-  expect(store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(sent.message_id);
+  expect(await store.repo.cursors.directFor(store.repo.read, b.session.identityFull)).toBe(sent.message_id);
   expect((await a.history())[0]).toMatchObject({ delivered: true });
   expect((await a.inbox()).promised).toHaveLength(1);
   await a.dmAck(sent.message_id);
@@ -271,7 +271,7 @@ test("bounded pending reads preserve pending flags and do not acknowledge or dra
   const pending = await application.pending(store.repo.read, b, 1);
   expect(pending).toMatchObject([{ kind: "direct", message: { id, body: "pending", pending: true } }]);
   expect(await application.pending(store.repo.read, b, 1)).toEqual(pending);
-  expect(store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
+  expect(await store.repo.cursors.directFor(store.repo.read, b.identityFull)).toBe(0);
   await expect(application.pending(store.repo.read, b, 101)).rejects.toThrow();
   await expect(application.pending(store.repo.read, b, 0)).rejects.toThrow();
   await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.user_id, true));
