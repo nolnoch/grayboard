@@ -36,14 +36,19 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
   // A native call waits out a reconnect in progress (#917): one that started
   // mid-reconnect would reach an entry OpenCode has stopped. It counts as in
   // flight first, so no new reconnect starts while it waits or after.
-  async calling(id: string) {
+  // Says whether it waited, and whether the wait ran out with the reload unfinished.
+  async calling(id: string): Promise<"none" | "waited" | "timeout"> {
     this.calls.set(id, Date.now());
     const deadline = Date.now() + RECONNECT_WAIT_MS;
-    for (let r; (r = this.reconnecting) && Date.now() < deadline; ) {
+    let waited = false;
+    for (let r; (r = this.reconnecting); ) {
+      if (Date.now() >= deadline) return "timeout";
+      waited = true;
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([r, new Promise<void>(done => { timer = setTimeout(done, deadline - Date.now()); })]);
       clearTimeout(timer);
     }
+    return waited ? "waited" : "none";
   }
   private reconnecting?: Promise<void>;
   called(id: string) { this.calls.delete(id); }

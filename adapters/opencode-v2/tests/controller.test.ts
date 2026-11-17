@@ -622,6 +622,39 @@ test("a native call refused before dispatch never holds the reconnect (#661)", a
     expect(o.waits.slice(0, 22)).toEqual([...Array(21).fill(500), 1000]);
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
+// #917: OpenCode relists the entry's tools 100 ms (debounced) after a reload settles. A native call the reload
+// released waits for its tool to be listed again, so it still runs as native (here a child's call, refused at
+// registration); another tool's call is released at once and holds nothing.
+test("a native call released by a reconnect waits for its tool to be listed again; another tool's doesn't (#917)", async () => {
+  const o = await outage();
+  try {
+    const ctx = o.r.ctx as unknown as { tool: { list: () => Promise<unknown[]> } };
+    const list = ctx.tool.list;
+    let listed = true, empty = 0;
+    ctx.tool = { ...ctx.tool, list: async () => listed ? list() : (empty++, []) };
+    const binding = (o.controller as unknown as { binding: { reconnecting?: Promise<void>; calls: Map<string, number> } }).binding;
+    const reload = Promise.withResolvers<void>();
+    binding.reconnecting = reload.promise;
+    listed = false;
+    o.r.holdRegistration(async () => { throw new Error("child_bound: end the child first"); });
+    let settled = false;
+    const native = o.controller.before({ sessionID: "G", tool: "grayboard_dm_send", id: "mid" }).finally(() => { settled = true; });
+    native.catch(() => {});
+    const other = o.controller.before({ sessionID: "G", tool: "bash", id: "other" });
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(empty).toBe(0);
+    binding.reconnecting = undefined;
+    reload.resolve();
+    await other;
+    expect(binding.calls.has("other")).toBe(false);
+    await until(() => empty >= 3);
+    expect(settled).toBe(false);
+    listed = true;
+    await expect(native).rejects.toThrow("child_bound");
+    expect(binding.calls.has("mid")).toBe(false);
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
 test("a refresh that lands while the server is down resumes on restore's outage backoff, never pausing again (#661)", async () => {
   let down = false, refused = 0, during: unknown;
   const o: Awaited<ReturnType<typeof outage>> = await outage((_elapsed, ms) => {

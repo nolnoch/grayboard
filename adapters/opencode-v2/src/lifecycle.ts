@@ -18,6 +18,8 @@ type Invocation = { tool: string; sessionID: string; id: string };
 const VERSION = "1.10.0";
 // Sessions whose model is remembered: the most recently active ones.
 const FACTS_LIMIT = 256;
+// After a reconnect, how long a native call waits for OpenCode to list its tool again, and how often it looks.
+const RELIST_WAIT_MS = 2_000, RELIST_STEP_MS = 25;
 // OpenCode's own root session IDs: restored diagnostics for them skip the root lookup.
 export const OPENCODE_SESSION = /^ses_[a-f0-9]{64}$/;
 
@@ -83,13 +85,27 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     if (!(await this.ctx.tool.list()).some(t => t.id === tool && t.options?.namespace === namespace)) return;
     return tool.startsWith(namespace + "_") ? tool.slice(namespace.length + 1) : tool;
   }
+  private async relisted(tool: string) {
+    const deadline = Date.now() + RELIST_WAIT_MS;
+    for (;;) {
+      const found = await this.native(tool);
+      if (found !== undefined || Date.now() >= deadline) return found;
+      await new Promise(done => setTimeout(done, RELIST_STEP_MS));
+    }
+  }
   async before(event: Invocation) {
     // In flight until its after hook, for the reconnect `refresh` asks (#661), and held from before the tool list
     // is read: mid-reconnect the entry lists no tools, so the call waits that out first (#917). Another tool's
     // call, or a refused one, never runs as native.
-    await this.binding.calling(event.id);
+    const wait = await this.binding.calling(event.id);
     try {
-      const tool = await this.native(event.tool);
+      let tool = await this.native(event.tool);
+      // OpenCode rebuilds its tool list from the entry 100 ms (debounced) after the reload settles, so a call
+      // released by it can find its own tool not listed yet: one in this entry's namespace waits for it, bounded.
+      if (tool === undefined && wait !== "none" && event.tool.startsWith(this.namespace() + "_")) tool = await this.relisted(event.tool);
+      if (wait === "timeout" || (tool === undefined && wait === "waited" && event.tool.startsWith(this.namespace() + "_"))) {
+        this.record({ state: "degraded", message: `A native ${event.tool} call outwaited a reconnect that didn't finish; it ran unclassified`, operation: "refresh", sessionID: event.sessionID, code: "operation_failed" });
+      }
       if (tool === undefined) { this.binding.called(event.id); return; }
       await this.beforeCall({ sessionID: event.sessionID, tool });
     } catch (error) { this.binding.called(event.id); throw error; }
