@@ -404,7 +404,7 @@ export interface Repo {
     claim(tx: Tx, key: WriteReceiptKey, tool: string, at: number): Promise<boolean>;
     // Takes over the receipt for `key` only while it still names `stale` (a row since retracted or pruned, #306);
     // false when another call replaced it first.
-    reclaim(tx: Tx, key: WriteReceiptKey, stale: { ref_kind: "message" | "post"; ref_id: number }, at: number): boolean;
+    reclaim(tx: Tx, key: WriteReceiptKey, stale: { ref_kind: "message" | "post"; ref_id: number }, at: number): Promise<boolean>;
     // Replaces any receipt for the same (session, sender, fp).
     upsert(tx: Tx, r: WriteReceipt): Promise<void>;
     // Whether the row a receipt names still exists (a retract or retention removes it).

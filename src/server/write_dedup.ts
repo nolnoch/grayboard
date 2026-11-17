@@ -70,28 +70,28 @@ export function dedupWrite<W extends Written>(
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
   const since = now - WRITE_DEDUP_WINDOW_MS;
   // write, onReplay and recheck run in the savepoint, on its Tx: the parent's refuses statements while it's open.
-  return parent.savepoint((tx): DedupOutcome<W> => {
+  return parent.savepoint(async (tx): Promise<DedupOutcome<W>> => {
     const receipts = repo.writeReceipts;
     const key = { session: call.session, sender: call.sender, fp };
     // Bounds one session's rows by what it wrote in the window, so a receipt the claim meets is inside it.
-    receipts.pruneSession(tx, call.session, since);
+    await receipts.pruneSession(tx, call.session, since);
     // A lost claim reads the receipt that beat it. A pass that neither claims nor answers saw another transaction
     // change that receipt in between (pruned it, replaced a stale one first, or committed one already outside the
     // window after this call's prune), which a single writer never allows; three passes bound it.
     for (let pass = 0; !call.resend; pass++) {
       if (pass === 3) throw new Error(`write receipt for ${call.tool} by ${call.sender} kept changing under this call; retry it`);
-      if (receipts.claim(tx, key, call.tool, now)) break;
-      const hit = receipts.find(tx, call.session, call.sender, fp, since);
+      if (await receipts.claim(tx, key, call.tool, now)) break;
+      const hit = await receipts.find(tx, call.session, call.sender, fp, since);
       if (!hit) {
         // A receipt committed after the prune can already be outside the window (a long transaction, a skewed
         // clock): prune again so the next claim isn't refused by a receipt the lookup can't see.
-        receipts.pruneSession(tx, call.session, since);
+        await receipts.pruneSession(tx, call.session, since);
         continue;
       }
       // A receipt whose row is gone (retracted, pruned) is a miss: this call takes it over, unless another call
       // replaced it first, and the audit says why this repeat wrote fresh (#306).
-      if (!receipts.refExists(tx, hit.ref_kind, hit.ref_id)) {
-        if (!receipts.reclaim(tx, key, hit, now)) continue;
+      if (!(await receipts.refExists(tx, hit.ref_kind, hit.ref_id))) {
+        if (!(await receipts.reclaim(tx, key, hit, now))) continue;
         writeAudit(repo, tx, "request.receipt_stale", call.actor, call.sender, {
           tool: call.tool, fp, ref_kind: hit.ref_kind, ref_id: hit.ref_id, first_at: new Date(hit.at).toISOString(), session: call.session,
         });
@@ -108,7 +108,7 @@ export function dedupWrite<W extends Written>(
       return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
     }
     const w = write(tx) as W;
-    receipts.upsert(tx, {
+    await receipts.upsert(tx, {
       session: call.session, sender: call.sender, fp, tool: call.tool,
       ref_kind: w.ref.kind, ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at: now,
     });

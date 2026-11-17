@@ -115,6 +115,9 @@ export class ApplicationSession {
   // pending for: one push per item across the set, and an unbind drops the
   // released address, so the item reaches that alias's next binding.
   readonly inflight = new Map<string, Set<string>>();
+  // Set while a replay's direct-message drain is in flight (drainDirect): live DMs held for it, the ids its drains
+  // sent, how many are running, and the chain that runs them one at a time.
+  draining: { held: MessageRow[]; sent: Set<number>; runs: number; chain: Promise<void> } | null = null;
   active = true;
   // The session's ID (#284): keys its ids row, its holds, its binding
   // events and its writes' dedup. Empty for the Slack bridge's humans.
@@ -245,12 +248,39 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): void {
   }
 }
 
+// A direct message to a live session, as it commits. While a drain of the session's unread is in flight it waits
+// for that drain, so the session never gets a newer message before an older one the drain is still reading.
+function deliverDirect(session: ApplicationSession, message: MessageRow): void {
+  if (!session.active) return;
+  if (session.draining) session.draining.held.push(message);
+  else session.sink.deliver({ kind: "direct", message: showMessage(message) });
+}
+
 // Direct messages to any of `addresses` past each one's cursor (unacked ones
-// are resent).
-function drainDirect(hub: Hub, session: ApplicationSession, addresses: string[]): void {
-  const streams = addresses.map((a) => ({ type: "direct" as const, ref: a, since: hub.repo.cursors.get(hub.repo.read, a, "direct", a) }));
-  for (const message of hub.repo.messages.unreadSince(hub.repo.read, streams)) {
-    session.sink.deliver({ kind: "direct", message: showMessage(message) });
+// are resent). Its reads await (#807 P3 A6a), so another body can commit a
+// message meanwhile: from the call on, live ones wait in `session.draining`.
+// Drains run one at a time; the last to finish delivers what waited, in id
+// order, less what a drain already sent. A message committed after a drain's
+// read has a larger id than any it read, so order holds.
+async function drainDirect(hub: Hub, session: ApplicationSession, addresses: string[]): Promise<void> {
+  const d = (session.draining ??= { held: [], sent: new Set(), runs: 0, chain: Promise.resolve() });
+  d.runs++;
+  const run = d.chain.then(async () => {
+    const streams = await Promise.all(addresses.map(async (a) => ({ type: "direct" as const, ref: a, since: await hub.repo.cursors.get(hub.repo.read, a, "direct", a) })));
+    for (const message of hub.repo.messages.unreadSince(hub.repo.read, streams)) {
+      if (!session.active) return;
+      d.sent.add(message.id);
+      session.sink.deliver({ kind: "direct", message: showMessage(message) });
+    }
+  });
+  d.chain = run.catch(() => {});
+  try {
+    await run;
+  } finally {
+    if (--d.runs === 0) {
+      session.draining = null;
+      for (const m of d.held.sort((a, b) => a.id - b.id)) if (!d.sent.has(m.id)) deliverDirect(session, m);
+    }
   }
 }
 
@@ -612,7 +642,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   function afterEnds(woken: Set<string>, ends: { id: string; at: number }[]): void {
     for (const { id, at } of ends) for (const b of repo.messages.bouncesFrom(repo.read, id, at)) {
       const to = hub.registry.get(b.recipient);
-      if (to?.active) to.sink.deliver({ kind: "direct", message: showMessage(b) });
+      if (to) deliverDirect(to, b);
     }
     wake(hub, onCommit(repo.read), [...woken]);
     void sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
@@ -1025,12 +1055,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     async replay(session: ApplicationSession, addresses?: string[]) {
       valid(session, true);
       if (session.readOnly || !session.push) return;
-      // Called after the hello's or bind's commit, outside any body: a `Read`, so the drain runs now.
-      afterCommitOf(repo.read, () => {
+      // Called after the hello's or bind's commit, outside any body, so the drain runs now; awaited, so the replay
+      // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
+      try {
+        await drainDirect(hub, session, addresses ?? session.addresses);
         valid(session, true);
-        drainDirect(hub, session, addresses ?? session.addresses);
         drainBoards(session, hub, true);
-      });
+      } catch (error) { console.error("postcommit effect failed", error); }
     },
     async send(
       tx: Tx,
@@ -1063,7 +1094,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
       valid(session, false, r);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
-      const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(r, a, "direct", a) }));
+      const streams = await Promise.all(session.addresses.map(async (a) => ({ type: "direct" as const, ref: a, since: await repo.cursors.get(r, a, "direct", a) })));
       const messages = repo.messages.unreadSince(r, streams).slice(0, limit);
       const seen = new Set<string>();
       const all: Pending[] = [];
@@ -1115,9 +1146,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // handed: false is a give-up (Slack refused the message): the cursor
     // moves so it isn't retried, but nothing reached the harness to stamp.
-    receiptDirect(tx: Tx, session: ApplicationSession, ids: number[], opts: { handed: boolean } = { handed: true }) {
+    async receiptDirect(tx: Tx, session: ApplicationSession, ids: number[], opts: { handed: boolean } = { handed: true }) {
       valid(session, false, tx);
-      handleAck(tx, session, ids, repo, opts.handed ? now() : null);
+      await handleAck(tx, session, ids, repo, opts.handed ? now() : null);
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
@@ -1144,7 +1175,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
       valid(session, false, tx);
-      return handleRetract(hub, tx, session, id);
+      return await handleRetract(hub, tx, session, id);
     },
     async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       valid(session, UNBOUND_READS.has(tool), tx);
@@ -1439,7 +1470,7 @@ function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: Applica
 // Only after the outermost commit, never on a replay.
 function deliverSend(hub: Hub, msg: MessageRow): void {
   const recipient = hub.registry.get(msg.recipient);
-  if (recipient?.active) recipient.sink.deliver({ kind: "direct", message: showMessage(msg) });
+  if (recipient) deliverDirect(recipient, msg);
 }
 
 // An append write, deduplicated (#254): an identical call by this session
@@ -1624,7 +1655,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
 // The cursor moves only when the recipient acks, so a live recipient may hold
 // a pushed message past it: liveness counts as reached too. A repeat of a
 // retract that landed (its answer lost, #254) is answered from its audit row.
-function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number): { note?: string } {
+async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number): Promise<{ note?: string }> {
   const { repo, registry } = hub;
   const mine = session.addresses;
   const m = repo.messages.getById(tx, id);
@@ -1635,7 +1666,7 @@ function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number
   }
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
-  if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(tx, m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
+  if (m.delivered_at !== null || registry.get(m.recipient)?.active || (await repo.cursors.directFor(tx, m.recipient)) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (!repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
   tx.afterCommit(async () => { await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo)); });
   return {};
@@ -1768,7 +1799,7 @@ function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageId
   };
 }
 
-function handleHistory(hub: Hub, r: Read, session: ApplicationSession, peer: string | undefined, limit: number | undefined, beforeId: number | undefined): HistoryMessage[] {
+async function handleHistory(hub: Hub, r: Read, session: ApplicationSession, peer: string | undefined, limit: number | undefined, beforeId: number | undefined): Promise<HistoryMessage[]> {
   const { repo } = hub;
   let lim: number;
   try {
@@ -1778,14 +1809,14 @@ function handleHistory(hub: Hub, r: Read, session: ApplicationSession, peer: str
   }
   const peerFull = peer ? resolvePeer(repo, r, session.primary, peer, session.sessionId || session.primary).address : undefined;
   const mine = session.addresses;
-  const cursors = new Map<string, number>();
-  const reached = (to: string) => {
-    if (!cursors.has(to)) cursors.set(to, repo.cursors.directFor(r, to));
-    return cursors.get(to)!;
-  };
   // Newest `lim` before beforeId, shown oldest first as in local mode.
-  const messages = repo.messages.history(r, mine, peerFull, lim, beforeId).reverse().map((m) =>
-    mine.includes(m.sender) && m.recipient_type === "user" && !mine.includes(m.recipient) ? { ...m, delivered: m.delivered_at !== null || reached(m.recipient) >= m.id } : m,
+  const rows = repo.messages.history(r, mine, peerFull, lim, beforeId).reverse();
+  const sent = (m: MessageRow) => mine.includes(m.sender) && m.recipient_type === "user" && !mine.includes(m.recipient);
+  // The cursor of each recipient a sent, unstamped message needs, read once before the rows are shaped (#807 P3 A6a).
+  const unstamped = [...new Set(rows.filter((m) => sent(m) && m.delivered_at === null).map((m) => m.recipient))];
+  const cursors = new Map(await Promise.all(unstamped.map(async (to) => [to, await repo.cursors.directFor(r, to)] as const)));
+  const messages = rows.map((m) =>
+    sent(m) ? { ...m, delivered: m.delivered_at !== null || cursors.get(m.recipient)! >= m.id } : m,
   );
   const marks = writerMarks(repo, r, session, messages.map((m) => m.id), []);
   return messages.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
@@ -1825,11 +1856,11 @@ function handleThread(r: Read, session: ApplicationSession, messageId: number, r
 // A receipt: the harness was handed these ids. Each stamps its delivery time
 // once (unless `at` is null: given up, not handed) and moves its recipient
 // address's cursor; only your own direct messages count (S8).
-function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): void {
+async function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): Promise<void> {
   for (const msgId of messageIds) {
     const msg = repo.messages.getById(tx, msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
     if (at !== null) repo.messages.markDelivered(tx, msgId, at);
-    repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
+    await repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
   }
 }

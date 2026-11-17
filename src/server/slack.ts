@@ -227,7 +227,7 @@ export class SlackBridge implements SlackLinker {
     // new one attaches after the commit, with no await between them, so a concurrent unlink can't leave attach()
     // without its link.
     type Linked = { taken: SlackLink } | { moved: SlackLink | undefined; link: SlackLink };
-    const done = await repo.write((tx: Tx): Linked => {
+    const done = await repo.write(async (tx: Tx): Promise<Linked> => {
       const taken = repo.slack.linkBySlackUser(tx, slackUser);
       if (taken && taken.user_id !== user.id) return { taken };
       const previous = repo.slack.linkFor(tx, user.id);
@@ -242,7 +242,7 @@ export class SlackBridge implements SlackLinker {
         writeAudit(repo, tx, "alias.created", user.email, handle, { slack: true });
         onAliasCreated(repo, tx, user.id, handle);
         const newest = repo.messages.history(tx, [handle], undefined, 1)[0];
-        if (newest) repo.cursors.advance(tx, handle, "direct", handle, newest.id);
+        if (newest) await repo.cursors.advance(tx, handle, "direct", handle, newest.id);
       }
       markHuman(repo.coreOn(tx), handle, true);
       writeAudit(repo, tx, "slack.linked", user.email, slackUser);
@@ -373,17 +373,17 @@ export class SlackBridge implements SlackLinker {
         const p = outbox.get(id);
         const m = p?.meta ?? {};
         if (!session.active) throw new Error("Slack delivery session ended before receipt");
-        // The receipt validates the live session; it and the progress clear are one posted write (#807 D4). Run now
-        // (the idle queue, as always under SQLite today), a refusal throws and keeps the item and its progress for
-        // the next drain. Waiting behind another body, the item leaves the outbox now so the drain doesn't post it
-        // again; a refusal then rolls both back and is logged, and the unacked item is resent at the next start.
+        // The receipt validates the live session; it and the progress clear are one posted write (#807 D4). Its body
+        // awaits the cursor write (#807 P3 A6a), so it commits after post returns, even on an idle queue: the item
+        // leaves the outbox now so the drain doesn't post it again; a refusal then rolls both back and is logged, and
+        // the unacked item is resent at the next start.
         const r = ref(id);
-        const now = repo.post(tx => {
+        const now = repo.post(async tx => {
           // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
           // delivered (#470). Read in the body, after the progress writes queued before it.
           const posted = (repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
           if (m.board && m.post_id) application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
-          else if (m.message_id) application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
+          else if (m.message_id) await application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
           repo.slack.clearProgress(tx, link.user_id, r);
         }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt");
         if (!now) outbox.delete(id);
