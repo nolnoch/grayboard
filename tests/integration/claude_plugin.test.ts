@@ -24,7 +24,6 @@ import { CancelledNotificationSchema, ElicitationCompleteNotificationSchema, Eli
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Diagnostics } from "../../adapters/hosted-core/src/diagnostics.ts";
 import { tryAcquire } from "../../adapters/hosted-core/src/lock.ts";
-import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
