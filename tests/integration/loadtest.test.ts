@@ -97,6 +97,8 @@ describe("loadtest run", () => {
   test("a small fleet with churn passes every gate and drains to zero", async () => {
     const r = await run([]);
     expect({ code: r.code, failures: r.summary?.failures }, r.out).toEqual({ code: 0, failures: [] });
+    // Five windows; the first spans the warm-up, so four are steady (#1038).
+    expect({ windows: r.summary.windows, steady: r.summary.steadyWindows }).toEqual({ windows: 5, steady: 4 });
     expect(r.summary.dms.sent).toBeGreaterThan(0);
     expect(r.summary.dms.lost).toBe(0);
     expect(r.summary.misdelivered).toBe(0);

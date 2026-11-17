@@ -61,9 +61,8 @@ export function options(argv: string[]): Options {
     if (!Number.isFinite(x) || x < 0) throw new Error(`--${name} must be a non-negative number, not "${raw}"`);
     return x;
   };
-  // The full profile's steady period is the bar's hour, after its 10 min warm-up. Quick's 45 s leaves its ops
-  // pool two non-churning steady windows (≥ 100 ops, the 80% floor) even when a churn wave is slow (#1038).
-  const durationS = n("duration", 4200, 45);
+  // The full profile's steady period is the bar's hour, after its 10 min warm-up.
+  const durationS = n("duration", 4200, 40);
   const o: Options = {
     sessions: n("sessions", 1000, 40), users: n("users", 100, 4), drivers: n("drivers", 8, 2),
     durationS, warmupS: n("warmup", 600, 15), periodS: n("period", 30, 3), boards: n("boards", 20, 2),
