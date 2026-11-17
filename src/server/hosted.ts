@@ -287,12 +287,12 @@ export function createHostedSessions(application: Application, options: { now?: 
       admit(tx, p.authed.user_id, []);
       const t = now();
       const writesAs = context.writesAs === undefined ? null : await application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, true, (address, detail) => later(w => application.hostedRefused(w, context.id, address, detail)), later);
-      row = { session_id: context.id, ownership_id: store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
+      row = { session_id: context.id, ownership_id: await store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
-      application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
+      await application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
       // An ID that was a child (its source row ended) starts as a root: an address again (#523).
-      application.hostedRoot(tx, row.session_id, null);
+      await application.hostedRoot(tx, row.session_id, null);
       store.insert(tx, row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
@@ -305,7 +305,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     // Any request of a root's ownership may turn its launcher flag on (#520): OpenCode's native client starts the
     // ownership without the plugin's `_meta`, so the declaration arrives on a later subscriber request. A child's
     // and a tools-only root's are ignored; only the ownership's end clears it.
-    if (row && declare && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(tx, p.authed, row.session_id, { ownership: row.ownership_id, client_id: p.clientId });
+    if (row && declare && context.launcher && !row.root_session_id && row.writes_as === null) await application.hostedDeclareLauncher(tx, p.authed, row.session_id, { ownership: row.ownership_id, client_id: p.clientId });
     return row;
   }
   function rootOf(r: Read, row: HostedSession): HostedSession {
@@ -470,7 +470,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // live server (a concurrent opener). Writing alive_at in the same
   // transaction makes a second start measure ~0, so the credit is applied once.
   function creditDowntime(): Promise<void> {
-    return store.write(tx => {
+    return store.write(async tx => {
       const t = now(), alive = store.aliveAt(tx), downtime = alive === undefined ? null : t - alive;
       let credited = 0;
       if (alive !== undefined && downtime !== null && downtime > LIVE_STALENESS_MS) {
@@ -489,7 +489,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       // One row per start, credited or not, so an outage is auditable even
       // when no lease was live (alive_at null: no heartbeat on this schema yet).
       writeAudit(repo, tx, "server.started", null, null, { alive_at: alive ?? null, now: t, downtime_ms: downtime, credited });
-      store.heartbeat(tx, t);
+      await store.heartbeat(tx, t);
     });
   }
   // Rows a refusal produced inside a transaction its throw rolls back (#452, #467): `defer` collects them while it
@@ -640,9 +640,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   // Undefined when nothing is pending: the read first, so such a call opens no transaction and awaits nothing.
   function takeLost(p: OAuthPrincipal, row: HostedSession | undefined, reader: LostReader): Promise<HostedLost[]> | undefined {
     if (!row || row.root_session_id || !store.lost(repo.read, row.session_id, reader).length) return undefined;
-    return store.write(tx => {
+    return store.write(async tx => {
       if (reader === "controller") return store.reportLost(tx, row.session_id, now());
-      const taken = store.tellLost(tx, row.session_id, now());
+      const taken = await store.tellLost(tx, row.session_id, now());
       if (taken.length) audit(tx, row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
       return taken;
     });
@@ -671,9 +671,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     audit,
     // Inside delivery_open's transaction (#453): the lost holds root `row`'s Controller was reported, taken. Its
     // run loop opens only after the same iteration's whoami and the durable drop, so these are applied.
-    seeLost(tx: Tx, p: OAuthPrincipal, row: HostedSession) {
+    async seeLost(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<void> {
       if (!store.lost(tx, row.session_id, "controller").length) return;
-      const seen = store.seeLost(tx, row.session_id, now());
+      const seen = await store.seeLost(tx, row.session_id, now());
       if (seen.length) audit(tx, row.session_id, "hosted.alias_lost_seen", { aliases: seen.map(l => l.alias), ownership: row.ownership_id }, p);
     },
     reconcile,
@@ -810,7 +810,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (args.where !== undefined) application.hostedPlace(tx, row.session_id, args.where);
           if (added && row.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "rebound" });
           // A lost hold bound again is no longer lost: neither reader is told it, and the Controller keeps it (#453).
-          if (added) store.forgetLost(tx, row.session_id, ok.alias);
+          if (added) await store.forgetLost(tx, row.session_id, ok.alias);
           return { ok, added: ok.held.length !== before.length, first: before.length === 0, ownership: row.ownership_id };
         } finally { application.close(selected.session, tx); }
       }, async result => {
@@ -898,8 +898,8 @@ export function createHostedSessions(application: Application, options: { now?: 
             return { message: "already registered" };
           }
           if (existing) store.end(tx, existing.session_id, "closed", now());
-          application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId));
-          application.hostedRoot(tx, childId, root.session_id);
+          await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId));
+          await application.hostedRoot(tx, childId, root.session_id);
           store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
           audit(tx, root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
@@ -938,8 +938,8 @@ export function createHostedSessions(application: Application, options: { now?: 
       holders.clear(); listeners.clear();
       // A clean stop records its exact time, so the next start credits leases
       // with the real downtime rather than up to a heartbeat interval more.
-      // Idle at a clean stop, so the queue runs it now, before the caller closes the database.
-      store.write(tx => store.heartbeat(tx, now())).catch(e => hostedFailure("hosted.heartbeat", e));
+      // Returned, so the caller awaits its commit before it closes the database.
+      return store.write(tx => store.heartbeat(tx, now())).catch(e => hostedFailure("hosted.heartbeat", e));
     },
     instructions: hostedUnboundInstruction,
   };

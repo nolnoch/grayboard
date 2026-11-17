@@ -734,7 +734,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // A hosted root's change goes through the hosted store's writes, whose commit tells the hosted
     // service and delivery to close the lease now, not at its next renewal.
-    await tx.savepoint(sp => {
+    await tx.savepoint(async sp => {
       const primary = hosted && holdsOf(repo.coreOn(sp), u.id)[0] === u.address;
       dropHold(repo.coreOn(sp), u.address, u.id);
       logBinding(repo.coreOn(sp), u.id, u.address, "released", `access revoked: ${reason}`);
@@ -745,7 +745,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
           repo.hosted.update(sp, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(repo.coreOn(sp), u.id).length ? row.lease_deadline : null });
           if (row.lease_deadline !== null) writeAudit(repo, sp, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
-          repo.hosted.lose(sp, u.id, { alias: u.address, reason, primary }, now());
+          await repo.hosted.lose(sp, u.id, { alias: u.address, reason, primary }, now());
         }
       }
     });
@@ -946,11 +946,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // The root a hosted child acts under (#523), recorded on the child's ids row, where it outlives the
     // child's source row (deleted at the child's end) so a send or mention to the child's ID keeps
     // being refused child_session; null when the ID starts as a root, which makes it an address again.
-    hostedRoot(tx: Tx, id: string, root: string | null) { repo.hosted.setRoot(tx, id, root); },
+    async hostedRoot(tx: Tx, id: string, root: string | null) { await repo.hosted.setRoot(tx, id, root); },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
     // (`hostedCollided`, written after the rollback); without it the row is written here.
-    hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
+    async hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
       const prior = idRow(repo.coreOn(tx), id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
@@ -971,7 +971,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         // (aliasUses), identity deletion (aliasUser) and retention only see unended rows, so a holder must have one.
         if (prior.ended_at !== null) {
           const endedAt = prior.ended_at;
-          repo.hosted.reopenId(tx, id);
+          await repo.hosted.reopenId(tx, id);
           writeAudit(repo, tx, "id.reopened", authed.user_email, id, { ended_at: endedAt, harness });
         }
         touchId(repo.coreOn(tx), id);
@@ -979,14 +979,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         const changed = setIdFacts(repo.coreOn(tx), id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
         if (changed) writeAudit(repo, tx, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
-        if (writesAs !== null) repo.hosted.restateWritesAs(tx, id, writesAs);
+        if (writesAs !== null) await repo.hosted.restateWritesAs(tx, id, writesAs);
       }
     },
     // A root's request declared a launcher (#473, #520): the flag is the ownership's (`ids.launcher`; its end clears
     // it), turned on by whichever of its requests declares first and audited as a local session's is, once.
     // `detail`: which ownership and client turned it on, now that a later request can (#520).
-    hostedDeclareLauncher(tx: Tx, authed: AuthedUser, id: string, detail: { ownership: number; client_id: string }) {
-      if (repo.hosted.declareLauncher(tx, id)) writeAudit(repo, tx, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
+    async hostedDeclareLauncher(tx: Tx, authed: AuthedUser, id: string, detail: { ownership: number; client_id: string }) {
+      if (await repo.hosted.declareLauncher(tx, id)) writeAudit(repo, tx, "handle.launcher_set", authed.user_email, id, { on: true, ...detail });
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
     // before and after, only when one changed. Absent fields keep the stored value; an empty one clears it (#558).
