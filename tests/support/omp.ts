@@ -8,7 +8,7 @@
 // omp shares with pi live in tests/support/hosted_harness.ts.
 import { expect } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { hostTools, snapshotTools } from "../../adapters/hosted-core/src/proxy.ts";
@@ -994,7 +994,9 @@ function ompLog(dir: string): string {
 // its own runtime and agent id. The first session runs grayboard; the second
 // is refused, and so is its subagent, which would otherwise act as the first
 // session's names (#470). The first session's subagent, found through its
-// chain of parentIds, serves the tools as a child session.
+// chain of parentIds, serves the tools as a child session. An enabled
+// .mcp.json server that runs grayboard in the session's directory doesn't
+// refuse it: ACP sessions load no on-disk MCP config (#559).
 export function ompLocalAcpScenario(dir: string): Promise<void> {
   return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
@@ -1004,6 +1006,13 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
     try {
       installLocal(dir, model.port);
       peer = await localSession(dir, "peer");
+      // A "grayboard" that only leaves a marker: were omp to start it in ACP,
+      // skipping the check would let a second grayboard through.
+      const ran = join(dir, "bus-ran");
+      mkdirSync(join(dir, "fake"), { recursive: true });
+      writeFileSync(join(dir, "fake", "grayboard"), `#!/bin/sh\ntouch '${ran}'\n`);
+      chmodSync(join(dir, "fake", "grayboard"), 0o755);
+      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({ mcpServers: { bus: { command: join(dir, "fake", "grayboard"), args: ["mcp", "--mode", "local"] } } }));
       const acp = startAcpOmp(dir, procs);
       await acp.call("initialize", { protocolVersion: 1, clientCapabilities: {} });
       const { sessionId: first } = await acp.call<{ sessionId: string }>("session/new", { cwd: dir, mcpServers: [] });
@@ -1030,6 +1039,7 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
       expect(dms[0]!.via).toBe(dms[0]!.sender_id);
       const seen = localRows<{ target: string }>(dir, "SELECT target FROM audit_log WHERE action = 'id.child_seen'");
       expect(seen.map((s) => s.target)).toEqual([dms[0]!.sender_id]);
+      expect(existsSync(ran)).toBe(false);
       expect(model.unhandled).toEqual([]);
     } finally {
       await stopAll(procs);
