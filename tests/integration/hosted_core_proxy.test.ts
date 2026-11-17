@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
-import { CallAborted, hostTools, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
+import { CallAborted, hostTools, unlessAborted, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
 import { NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -485,6 +485,23 @@ test("an abort ends a call's wait for the shared connect, which the next call st
     NativeWire.prototype.listTools = list;
   }
   await p.retire();
+});
+
+// An already-aborted signal still observes the work: a connect only this call
+// opened would otherwise reject unhandled, and pi exits on that.
+test("unlessAborted with an already-aborted signal leaves the work's later rejection handled", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { promise: work, reject } = Promise.withResolvers<never>();
+    await expect(unlessAborted(work, AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+    reject(new Error("connect failed"));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
 });
 
 test("attachment_get cancels an oversized download before saving it", async () => {

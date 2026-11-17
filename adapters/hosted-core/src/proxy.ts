@@ -95,7 +95,12 @@ export class CallAborted extends Error {
 // (a shared connect other calls wait on); its later failure is theirs to see.
 export function unlessAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return work;
-  if (signal.aborted) return Promise.reject(new CallAborted());
+  if (signal.aborted) {
+    // Still observe the work: a connect this call opened and nobody else awaits
+    // would otherwise reject unhandled (pi exits on that).
+    work.then(undefined, () => {});
+    return Promise.reject(new CallAborted());
+  }
   return new Promise<T>((resolve, reject) => {
     const abort = () => reject(new CallAborted());
     signal.addEventListener("abort", abort, { once: true });
@@ -269,6 +274,7 @@ export class ToolProxy {
   // unreachable). A connection connect() replaced closes after its last call.
   // The connect is shared, so a call's abort ends only its own request.
   private async forward(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    if (signal?.aborted) throw new CallAborted();
     const native = this.native ?? this.open();
     native.users++;
     try {
@@ -289,6 +295,7 @@ export class ToolProxy {
   // connection; a server older than #430 publishes none, and gets the
   // shared defaults its own config also starts from.
   private async limits(signal?: AbortSignal): Promise<AttachmentLimits> {
+    if (signal?.aborted) throw new CallAborted();
     const wire = await unlessAborted((this.native ?? this.open()).ready, signal);
     return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
   }

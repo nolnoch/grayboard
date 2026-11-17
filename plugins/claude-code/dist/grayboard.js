@@ -36005,8 +36005,10 @@ class CallAborted extends Error {
 function unlessAborted(work, signal) {
   if (!signal)
     return work;
-  if (signal.aborted)
+  if (signal.aborted) {
+    work.then(undefined, () => {});
     return Promise.reject(new CallAborted);
+  }
   return new Promise((resolve, reject) => {
     const abort = () => reject(new CallAborted);
     signal.addEventListener("abort", abort, { once: true });
@@ -36168,6 +36170,8 @@ class ToolProxy {
     return this.forward(name, args, sessionID, signal);
   }
   async forward(name, args, sessionID, signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
     const native = this.native ?? this.open();
     native.users++;
     try {
@@ -36185,6 +36189,8 @@ class ToolProxy {
     }
   }
   async limits(signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
     const wire = await unlessAborted((this.native ?? this.open()).ready, signal);
     return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
   }
