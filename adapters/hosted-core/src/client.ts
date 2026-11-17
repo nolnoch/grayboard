@@ -40,6 +40,8 @@ export type HostedClientOptions = {
 };
 
 export const message = (error: unknown) => (error as Error)?.message ?? String(error);
+// A session_end that failed, as every surface says it.
+export const endFailedText = (id: string, error: unknown) => `couldn't end session ${id} on the server: ${message(error)}`;
 
 // A failed call's text: failureMessage's, and where that names no cause (its
 // refusal and generic text) the error's own message, the only detail there
@@ -99,7 +101,7 @@ export class HostedClient {
   // session then stays bound until that sweep.
   async endSession(id: string): Promise<void> {
     try { await this.temporary(id, wire => wire.call("session_end")); }
-    catch (error) { this.options.log(`couldn't end session ${id} on the server: ${message(error)}`, "warning"); }
+    catch (error) { this.options.log(endFailedText(id, error), "warning"); }
   }
 
   proxy(mode: "push" | "poll", o: { hooks?: CallHooks; onTools(tools: NativeTool[]): void; onAfterFailure?(): void }): ToolProxy {

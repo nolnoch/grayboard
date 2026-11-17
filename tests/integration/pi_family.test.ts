@@ -27,12 +27,12 @@ import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
-import { deliveryPath, FileStorage, sessionPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
+import { deliveryPath, FileStorage, sessionPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { describeLocation } from "../../src/shared/identity.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { browse, hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, storeLogin, type HostedServer } from "../support/hosted_oauth.ts";
 import { seed } from "../support/seed.ts";
 import { until } from "../support/until.ts";
 
@@ -146,13 +146,8 @@ async function root(id: string, name: string, extra: Partial<SessionInfo> = {}, 
 // Another pi process on this agentDir (none of this process's extension
 // state): a sign-in writes a new epoch and grant to the shared store, a
 // sign-out revokes and logs the store out.
-const storeLogin = () => new Login({ resource: srv.resource, clientId: CLIENT, stateDir, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} });
-async function loginElsewhere(epoch: string) {
-  const issued = await issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
-  await writeJsonAtomic(storeLogin().path, { version: 1, resource: srv.resource, clientId: CLIENT, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
-    access: issued.token, accessExpiresAt: Date.now() + 3_600_000, refresh: issued.refreshToken });
-}
-const logoutElsewhere = () => storeLogin().logout();
+const loginElsewhere = (epoch: string) => seedGrant(srv, stateDir, CLIENT, EMAIL, undefined, epoch);
+const logoutElsewhere = () => storeLogin(srv, stateDir, CLIENT).logout();
 // A session in another pi process, with its own grant and connection.
 async function elsewhere(): Promise<ToolProxy> {
   const { token } = await issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);

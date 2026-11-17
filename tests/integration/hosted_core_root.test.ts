@@ -18,15 +18,13 @@ import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { DeliveryHeldElsewhere, Refusal, type Item } from "../../adapters/hosted-core/src/model.ts";
 import { failure, ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { RootDelivery, type RootOptions } from "../../adapters/hosted-core/src/root.ts";
-import { deliveryPath, writeJsonAtomic } from "../../adapters/hosted-core/src/storage.ts";
+import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
-import { issueOAuth } from "../helpers/oauth.ts";
-import { hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
+import { hostedServer, seedGrant, storeLogin as sharedStore, type HostedServer } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
 const EMAIL = "alice@example.com";
-const SCOPES = ["grayboard:delivery", "grayboard:tools"];
 const HELD = new DeliveryHeldElsewhere("pi").message;
 const SIGNED_OUT = "Signed out of grayboard in pi; run /grayboard login";
 
@@ -45,7 +43,7 @@ afterEach(async () => {
   rmSync(stateDir, { recursive: true, force: true });
 });
 
-const storeLogin = () => new Login({ resource: srv.resource, clientId: CLIENT, stateDir, harness: "pi", loginAction: "run /grayboard login", present: () => {}, notify: () => {}, diagnostic: () => {} });
+const storeLogin = () => sharedStore(srv, stateDir, CLIENT, "pi", "run /grayboard login");
 
 // One hosted session's client as pi builds it, logging what it would say.
 function client(logs: { message: string; level: Level }[], launcher = false) {
@@ -95,11 +93,7 @@ const row = (raw: string): Row | null => {
 
 // Another pi process on this state dir: a sign-in writes a new epoch and
 // grant to the shared store; a sign-out revokes and logs the store out.
-async function loginElsewhere(epoch: string) {
-  const issued = await issueOAuth(srv.app.repo, srv.resource, EMAIL, SCOPES, Date.now(), CLIENT);
-  await writeJsonAtomic(storeLogin().path, { version: 1, resource: srv.resource, clientId: CLIENT, epoch, issuer: srv.issuer, scope: SCOPES.join(" "),
-    access: issued.token, accessExpiresAt: Date.now() + 3_600_000, refresh: issued.refreshToken });
-}
+const loginElsewhere = (epoch: string) => seedGrant(srv, stateDir, CLIENT, EMAIL, undefined, epoch);
 
 test("a credential drift's pause is the sign-out's to say: one line, no pause notice in it or the next tool result; a sign-in elsewhere restarts the root once", async () => {
   const a = await live("drift-1", "drifter");
