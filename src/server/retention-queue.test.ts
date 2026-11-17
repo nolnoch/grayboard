@@ -33,8 +33,8 @@ const rows = (db: { query: (s: string) => { all: () => unknown[] } }) => (db.que
 
 test("#807: retention while another body holds the write queue waits, then prunes", async () => {
   const { db, repo } = setup();
-  const m = await seed(repo, tx => {
-    const inserted = repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
+  const m = await seed(repo, async tx => {
+    const inserted = await repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
     db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [inserted.id]);
     return inserted;
   });

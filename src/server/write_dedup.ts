@@ -12,7 +12,7 @@
 import { createHash } from "node:crypto";
 
 import { writeAudit } from "./audit.ts";
-import type { Repo, Sync } from "./db.ts";
+import type { Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { canonicalJson, WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { Replayed, WriteRef } from "../shared/protocol.ts";
@@ -64,7 +64,7 @@ export type DedupOutcome<W extends Written> =
 // fresh call would get when authority over what the first call wrote has gone
 // since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
 export function dedupWrite<W extends Written>(
-  repo: Repo, parent: Tx, now: number, call: DedupCall, write: (tx: Tx) => Sync<W>, onReplay: (tx: Tx) => void = () => {},
+  repo: Repo, parent: Tx, now: number, call: DedupCall, write: (tx: Tx) => W | Promise<W>, onReplay: (tx: Tx) => void = () => {},
   recheck: (stored: W["payload"], tx: Tx) => void = () => {},
 ): Promise<DedupOutcome<W>> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
@@ -107,7 +107,7 @@ export function dedupWrite<W extends Written>(
       onReplay(tx);
       return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
     }
-    const w = write(tx) as W;
+    const w = await write(tx);
     await receipts.upsert(tx, {
       session: call.session, sender: call.sender, fp, tool: call.tool,
       ref_kind: w.ref.kind, ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at: now,
