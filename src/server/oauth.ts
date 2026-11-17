@@ -622,7 +622,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   function activeAccess(accessHash: string, r: Read = repo.read): Promise<{ access: OAuthAccess; email: string } | undefined> {
     return repo.authRead(async () => withEmail(await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
   }
-  // The synchronous form, for the hosted MCP callers that stay synchronous until #807 P3 A7d (Repo.authNow).
+  // The synchronous form, for the hosted MCP callers that stay synchronous until #807 P3 A7d2 (Repo.authNow).
   function activeAccessNow(accessHash: string, r: Read = repo.read): { access: OAuthAccess; email: string } | undefined {
     return repo.authNow.read(() => withEmail(repo.authNow.findActiveAccess(r, accessHash, resource, [], now())));
   }
@@ -672,7 +672,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
       return principalOf(access, accessHash, requiredScopes);
     },
-    // authenticate's synchronous form, until #807 P3 A7d (activeAccessNow).
+    // authenticate's synchronous form, until #807 P3 A7d2 (activeAccessNow).
     authenticateNow(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): OAuthPrincipal | Response {
       const accessHash = bearer(req, requiredScopes);
       if (accessHash instanceof Response) return accessHash;
