@@ -902,6 +902,42 @@ export function ompLocalHandshakeFailScenario(dir: string, phase: "start" | "swi
   });
 }
 
+// Each new_session's switch handshake refused: omp counts every one toward
+// the restart budget (a child younger than STABLE_MS keeps the count), so
+// the fourth gives up and says so (#1148).
+export function ompLocalSwitchExhaustScenario(dir: string): Promise<void> {
+  return named(OMP_HARNESS, async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([]);
+    try {
+      const counter = join(dir, "session-calls");
+      installLocal(dir, model.port, [process.execPath, REFUSING_MCP, "--session", counter, "2,4,6,8"]);
+      const omp = startLocalOmp(dir, dir, procs, null);
+      await omp.command({ type: "get_state" }, 60_000);
+      await until(() => existsSync(counter) && readFileSync(counter, "utf8") === "1", 30_000, "the start handshake");
+      for (let i = 0; i < 3; i++) {
+        await omp.command({ type: "new_session" }, 30_000);
+        // The refused switch (2i+2) and the replacement's start handshake (2i+3), after 0, 1 and 5 s.
+        await until(() => readFileSync(counter, "utf8") === String(2 * i + 3), 30_000, `restart ${i + 1}'s handshake`);
+      }
+      await omp.command({ type: "new_session" }, 30_000);
+      await until(() => omp.notices().some((t) => t.includes("restart omp to reconnect")), 15_000, "the give-up notice");
+      expect(omp.notices().filter((t) => t.startsWith("grayboard"))).toEqual([
+        "grayboard process failed its session switch: grayboard: refused for test after 3 restarts; restart omp to reconnect",
+      ]);
+      const restarts = ompLog(dir).split("\n").filter((l) => l.includes("failed its session switch") && l.includes("restarting it"));
+      expect(restarts.map((l) => l.match(/restarting it \((\d) of 3\)/)?.[1])).toEqual(["1", "2", "3"]);
+      expect(readFileSync(counter, "utf8")).toBe("8");
+      await until(() => grayboardChildPids(omp.pid).length === 0, 5_000, "no grayboard process left");
+      expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      await omp.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
 // A tool call waiting out a restart's backoff ends at its abort (#559), as
 // pi's does, rather than holding the turn until the grayboard process is
 // back, and it never runs there: the bind it carried takes no name.
