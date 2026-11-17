@@ -65,7 +65,7 @@ export type DedupOutcome<W extends Written> =
 // since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
 export function dedupWrite<W extends Written>(
   repo: Repo, parent: Tx, now: number, call: DedupCall, write: (tx: Tx) => W | Promise<W>, onReplay: (tx: Tx) => void = () => {},
-  recheck: (stored: W["payload"], tx: Tx) => void = () => {},
+  recheck: (stored: W["payload"], tx: Tx) => void | Promise<void> = () => {},
 ): Promise<DedupOutcome<W>> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
   const since = now - WRITE_DEDUP_WINDOW_MS;
@@ -100,7 +100,7 @@ export function dedupWrite<W extends Written>(
       const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
       const first_at = new Date(hit.at).toISOString();
       const stored = JSON.parse(hit.result_json) as W["payload"];
-      recheck(stored, tx);
+      await recheck(stored, tx);
       writeAudit(repo, tx, "request.replayed", call.actor, call.sender, {
         tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
       });
