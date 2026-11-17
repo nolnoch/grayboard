@@ -704,7 +704,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // End each at start, as the grace sweep would have: holds and claims
   // released, mail bounced. A hosted ID is the hosted store's to end.
   // The startup leftovers' ends (#807 P3 A1): the server's `ready` waits for them.
-  // The write is enqueued at construction, ahead of any other startup write, and reads the leftovers on its own Tx
+  // The write is enqueued at construction, ahead of every startup write but the dev-session revocation, and reads the leftovers on its own Tx
   // (#807 P3 B1b): a start with none commits an empty transaction.
   const ready = endIds(async (tx) => {
     const ids: string[] = [];
