@@ -880,6 +880,13 @@ export class PrincipalTaken extends Error {
   }
 }
 
+// The column a write's UNIQUE violation names ("principals.name"), or undefined for any other error. D6 classifies
+// Postgres's 23505 by its constraint in P3; on SQLite the message is the only place the column appears.
+function uniqueViolation(e: unknown): string | undefined {
+  if (!(e instanceof Error) || e.name !== "SQLiteError" || (e as { code?: unknown }).code !== "SQLITE_CONSTRAINT_UNIQUE") return undefined;
+  return /^UNIQUE constraint failed: (\S+)$/.exec(e.message)?.[1];
+}
+
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
   const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
   // Refuses to take `userId`'s ownership away when it is the team's last
@@ -1189,14 +1196,21 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     teams: {
       create(tx, name, createdBy) {
         const db = sqliteOf(tx);
+        // No prior read (D3, #807 P2-3): the UNIQUE names decide, so a principal that lands between a caller's check
+        // and this insert is still refused. A team's name is a principal's too, so either constraint means taken.
         return db.transaction(() => {
           const now = clock();
-          if (db.query<{ x: number }, [string]>("SELECT 1 AS x FROM principals WHERE name = ?").get(name)) throw new PrincipalTaken(name);
-          const team = db.query<Team, [string, number, number]>(
-            "INSERT INTO teams (name, created_by, created_at) VALUES (?, ?, ?) RETURNING *",
-          ).get(name, createdBy, now)!;
-          db.run(`INSERT INTO principals (kind, name, team_id, created_at) VALUES ('team', ?, ?, ?)`, [name, team.id, now]);
-          return team;
+          try {
+            const team = db.query<Team, [string, number, number]>(
+              "INSERT INTO teams (name, created_by, created_at) VALUES (?, ?, ?) RETURNING *",
+            ).get(name, createdBy, now)!;
+            db.run(`INSERT INTO principals (kind, name, team_id, created_at) VALUES ('team', ?, ?, ?)`, [name, team.id, now]);
+            return team;
+          } catch (e) {
+            const column = uniqueViolation(e);
+            if (column === "principals.name" || column === "teams.name") throw new PrincipalTaken(name);
+            throw e;
+          }
         })();
       },
       findByName(name) {

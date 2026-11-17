@@ -388,6 +388,26 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
   ]);
 });
 
+// #807 P2-3 (D3): teams.create reads nothing first; the UNIQUE names refuse a taken one. A trigger lands another
+// principal of the name inside the create, after any read it could have made, as a second Postgres pod could.
+test("#807 P2-3: teams.create refuses a name another principal takes mid-create, and maps only name violations", async () => {
+  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const u = await seed(repo, tx => repo.users.upsertByEmail(tx, "a@example.com", null));
+  db.run(`CREATE TEMP TRIGGER land_ingest AFTER INSERT ON teams WHEN NEW.name = 'ingest'
+    BEGIN INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0); END`);
+  await expect(seed(repo, tx => repo.teams.create(tx, "ingest", u.id))).rejects.toThrow(PrincipalTaken);
+  expect(repo.teams.findByName("ingest")).toBeUndefined();
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM principals WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
+  // Another team of the name: teams.name refuses it before the principal insert runs.
+  await seed(repo, tx => repo.teams.create(tx, "eng", u.id));
+  await expect(seed(repo, tx => repo.teams.create(tx, "eng", u.id))).rejects.toThrow(PrincipalTaken);
+  // Any other constraint is the caller's error, not a taken name.
+  const missing = seed(repo, tx => repo.teams.create(tx, "ops", 999_999));
+  await expect(missing).rejects.toThrow(/FOREIGN KEY/);
+  await expect(missing).rejects.not.toThrow(PrincipalTaken);
+  expect(repo.teams.findByName("ops")).toBeUndefined();
+});
+
 // Security audit F-13, #928 D4: users are matched by (issuer, subject) first,
 // so a reassigned email can't inherit an account, and one IdP's account never
 // signs into another IdP's by email.
