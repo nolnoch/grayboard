@@ -346,7 +346,7 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
       beforeReplace?.();
       if (document(path).text !== current.text) fail("Config changed during setup");
       if (document(sibling(path)).text !== otherDocument.text) fail("Sibling config changed during setup");
-      if (linked()) fail("Config changed during setup");
+      if (linked()) fail("Config changed during setup (it gained other hard links)");
       if (existed) renameSync(temp, path);
       else {
         // No config at preflight: a file created since must be kept, never replaced.

@@ -136,6 +136,23 @@ test("a hard link made during setup refuses the replace and leaves no temp file"
   expect(readdirSync(f.root).sort()).toEqual(["dotfiles.jsonc", "installed-plugin", "opencode.jsonc"]);
 });
 
+test("a hard link made during a migration restores the adapter and keeps the config backup", () => {
+  const f = fixture();
+  const other = join(f.root, "dotfiles.jsonc");
+  const text = JSON.stringify({ mcp: { grayboard: f.old } });
+  writeFileSync(f.config, text);
+  f.seedAdapter();
+  expect(() => setupOpenCode({ ...f.opts, migrate: true }, source, () => linkSync(f.config, other))).toThrow(/^Config changed during setup\..*manual recovery required/);
+  expect(readFileSync(f.adapter, "utf8")).toBe(source);
+  expect(readdirSync(join(f.root, "plugin"))).toEqual(["grayboard.ts"]);
+  expect(lstatSync(f.config).ino).toBe(lstatSync(other).ino);
+  expect(readFileSync(f.config, "utf8")).toBe(text);
+  const backups = readdirSync(f.root).filter(name => name.includes(".grayboard-backup"));
+  expect(backups.length).toBe(1);
+  expect(readFileSync(join(f.root, backups[0]!), "utf8")).toBe(text);
+  expect(readdirSync(f.root).some(name => name.endsWith(".tmp"))).toBe(false);
+});
+
 test("sibling conflict/malformed/symlink config refuses; unrelated sibling stays byte-exact", () => {
   const f = fixture();
   const sibling = f.config.slice(0, -1);
