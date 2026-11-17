@@ -16,7 +16,7 @@ import { adapterBundle } from "../../src/cli/adapters.ts" with { type: "macro" }
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { cleanEnv, localEnv } from "./env.ts";
 import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
-import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, tokenRequests, type HostedServer } from "./hosted_oauth.ts";
 import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
 import { accessAudits } from "./audit.ts";
@@ -1091,6 +1091,7 @@ export function ompHostedRefreshLogoutScenario(dir: string): Promise<void> {
     const refreshTokens = () => srv.app.db.query<{ n: number; spent: number }, [string]>(
       "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'").get(seeded.grantId)!;
     expect(refreshTokens()).toEqual({ n: 1, spent: 0 });
+    const tokens = tokenRequests(srv);
 
     // b starts once a has created omp's agent.db (ompDbReady); the one
     // rotation must still serve both processes.
@@ -1099,14 +1100,16 @@ export function ompHostedRefreshLogoutScenario(dir: string): Promise<void> {
     const b = start();
     const [sa, sb] = await Promise.all([a.command({ type: "get_state" }, 30_000), b.command({ type: "get_state" }, 30_000)]);
     expect(sa.sessionId).not.toBe(sb.sessionId);
-    // Both reached the server on the one rotation.
+    // Both reached the server on one refresh request, and so one rotation.
     await until(() => ompRow(srv, sa.sessionId) && ompRow(srv, sb.sessionId), 20_000, "both sessions on the server");
     expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
+    expect(tokens()).toEqual(["refresh_token"]);
 
     await a.command({ type: "prompt", message: "bind a" });
     await b.command({ type: "prompt", message: "bind b" });
     await until(() => ompRow(srv, sa.sessionId)?.name === "omp-a" && ompRow(srv, sb.sessionId)?.name === "omp-b" && srv.app.mcp.activeLeases === 2, 30_000, "both leased");
     expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
+    expect(tokens()).toEqual(["refresh_token"]);
     await Promise.all([idle(a), idle(b)]);
 
     // Logout in a: the grant is revoked, so the server drops both leases,
