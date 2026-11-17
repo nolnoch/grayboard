@@ -22,10 +22,15 @@ export async function resolveRoot(sessionID: string, get: (id: string) => Promis
   throw new AncestryError(`Grayboard ancestry exceeds 16 steps from ${sessionID}`);
 }
 
+// Ended sessions SessionRoutes keeps (#567). The set only refuses a lookup or
+// registration racing an end; a session ended this many ends ago has none in
+// flight, and its ancestry no longer resolves (the host removed it).
+export const ENDED_LIMIT = 4096;
 // Retain routing after OpenCode removes the session; deletion events carry only its ID.
 export class SessionRoutes {
   private readonly paths = new Map<string, SessionPath>();
   private readonly ended = new Set<string>();
+  constructor(private readonly limit = ENDED_LIMIT) {}
   remember(path: SessionPath) {
     if (this.ended.has(path.sessionID) || this.ended.has(path.root)) throw new AncestryError("Grayboard session ended during ancestry lookup");
     const previous = this.paths.get(path.sessionID);
@@ -40,6 +45,7 @@ export class SessionRoutes {
   end(sessionID: string): SessionPath | undefined {
     if (this.ended.has(sessionID)) return;
     this.ended.add(sessionID);
+    if (this.ended.size > this.limit) this.ended.delete(this.ended.values().next().value!);
     const path = this.paths.get(sessionID);
     this.paths.delete(sessionID);
     return path ? { ...path, via: [...path.via] } : undefined;

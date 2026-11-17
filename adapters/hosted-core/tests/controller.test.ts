@@ -36,6 +36,9 @@ function runtime(mode: Mode) {
   let renewAt: (() => number) | undefined, checkFault: (() => Error) | undefined;
   const heldElsewhere = new Set<string>();
   // A prepare's whoami (a temporary wire: no beforeRetry) waits on this; the host's admit, on that.
+  // Every session_register waits on `registerHold` while set; `ancestries` lists each ancestry lookup's session.
+  let registerHold: Promise<void> | undefined;
+  const ancestries: string[] = [];
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
   // The host's receipt hook (#441), when a test sets one.
   let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
@@ -76,7 +79,7 @@ function runtime(mode: Mode) {
         if (row) { row.held = row.held.filter(h => h !== address(args.name as string)); row.generation++; }
         return { name: row?.held[0]?.split("/")[1] ?? null, ownership: row?.ownership, instructions: ["unbound"] };
       }
-      if (name === "session_register") return { registered: true };
+      if (name === "session_register") { await registerHold; return { registered: true }; }
       if (name === "session_end" || name === "delivery_release") { rows.delete(this.sessionID); return { ok: true }; }
       if (name === "delivery_open") {
         if (beforeOpen) { const hook = beforeOpen; beforeOpen = undefined; hook(); row = rows.get(this.sessionID); }
@@ -132,7 +135,7 @@ function runtime(mode: Mode) {
     client: { name: "grayboard-test", version: "1.0.0" }, delivery: DELIVERY,
     storage: { get: async key => storage.get(key), set: async (key, value) => { storage.set(key, structuredClone(value)); } },
     place: () => "/work",
-    ancestry: sessionID => resolveRoot(sessionID, async id => { if (!nodes.has(id)) throw new Error("missing"); return { id, parentID: nodes.get(id), time: {} }; }),
+    ancestry: sessionID => (ancestries.push(sessionID), resolveRoot(sessionID, async id => { if (!nodes.has(id)) throw new Error("missing"); return { id, parentID: nodes.get(id), time: {} }; })),
     credential, approval,
     admit: async (e, item, id, _identity, signal) => { admits.push({ sessionID: e.sessionID, id, item: item.id }); await admitHold?.(signal); },
     receipted: (e, ids) => receiptHook?.(e.sessionID, ids),
@@ -143,7 +146,8 @@ function runtime(mode: Mode) {
   const item = (id: string): Item => ({ id, actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" });
   const named = (name: string) => calls.filter(c => c.name === name);
   return {
-    controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named, drifts, loops,
+    controller, make, rows, storage, batches, calls, admits, wires, nodes, approvals, item, named, drifts, loops, ancestries,
+    holdRegister: (gate?: Promise<void>) => { registerHold = gate; },
     // Every prepare's whoami waits on `gate` from now on.
     holdPrepare: (gate: Promise<void>) => { prepareHold = gate; },
     // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
@@ -525,6 +529,139 @@ test.each(modes)("a descendant that ends while its registration is in flight end
     expect(r.named("session_end").map(c => c.sessionID)).toEqual(["C"]);
     expect(await r.controller.childRoot("C")).toBeUndefined();
   } finally { await r.controller.close(); }
+});
+
+// #567: under an enrolled root, a child's calls and instructions fetches share one registration, in flight or
+// done, until the root's epoch moves (here a pause).
+test.each(modes)("a child's calls and fetches share one registration until its root's epoch moves (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    await Promise.all([r.controller.beforeCall({ sessionID: "C", tool: "dm_send" }), r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true)]);
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(1);
+    await r.controller.pause();
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+  } finally { await r.controller.close(); }
+});
+
+// #567: a call that joined a registration in flight which then fails (an older request's deadline, spent at a held
+// bind gate) registers once on its own instead of failing with it.
+test.each(modes)("a call whose joined registration fails registers once on its own (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    let fail!: (error: Error) => void;
+    r.holdRegister(new Promise<void>((_, reject) => { fail = reject; }));
+    const fetching = r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true);
+    await until(() => r.named("session_register").length === 1);
+    const calling = r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    r.holdRegister();
+    fail(new Error("MCP request timed out"));
+    await expect(fetching).rejects.toThrow("timed out");
+    await calling;
+    expect(r.named("session_register")).toHaveLength(2);
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+  } finally { await r.controller.close(); }
+});
+
+// #567 audit: the retry happens only while nothing the call registers under has moved: a root paused, or a child
+// ended, while the joined registration was held fails the call with it rather than starting an ownership nothing ends.
+test.each(modes)("a call whose joined registration fails after its root paused or its child ended doesn't register again (#567) (%s)", async mode => {
+  for (const move of ["pause", "end"] as const) {
+    const r = runtime(mode);
+    try {
+      await r.controller.enroll("R", ["be"], true);
+      await until(() => r.root(r.controller)?.state === "active");
+      let fail!: (error: Error) => void;
+      r.holdRegister(new Promise<void>((_, reject) => { fail = reject; }));
+      const fetching = r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true);
+      await until(() => r.named("session_register").length === 1);
+      const calling = r.controller.enlist({ sessionID: "C", root: "R", via: [] });
+      r.holdRegister();
+      if (move === "pause") await r.controller.pause(); else await r.controller.ended("C");
+      fail(new Error("MCP request timed out"));
+      const out = await Promise.allSettled([fetching, calling]);
+      expect(out.map(o => o.status === "rejected" && String(o.reason))).toEqual(["Error: MCP request timed out", "Error: MCP request timed out"]);
+      expect(r.named("session_register")).toHaveLength(1);
+    } finally { await r.controller.close(); }
+  }
+});
+
+// #567 audit: the server's end of a root's ownership (a lapsed lease, an idle sweep) deletes its child rows without
+// moving the root's epoch: a run loop that reopens under a new ownership invalidates the remembered registration,
+// as does a child call the server answers unbound.
+test.each(modes)("a child registers again after its root's ownership changes under it, or after a call answered unbound (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    const before = r.root(r.controller)?.ownership;
+    r.rows.delete("R"); r.closeStream("R");
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.ownership !== before);
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+    await r.controller.afterCall({ sessionID: "C", tool: "dm_send", result: { status: "completed", output: { unbound: true } } });
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(3);
+  } finally { await r.controller.close(); }
+});
+
+// #567: a pause whose release lands before a fetch's registration: that registration started the root's key a
+// new ownership, so the fetch ends it and the child's row, and gives up.
+test.each(modes)("an instructions fetch whose root pauses while it registers ends the rows it made (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    let release!: () => void;
+    r.holdRegister(new Promise<void>(resolve => { release = resolve; }));
+    const enlisting = r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true);
+    await until(() => r.named("session_register").length === 1);
+    await r.controller.pause();
+    expect(r.named("session_end").map(c => c.sessionID)).toEqual(["R"]);
+    release();
+    await expect(enlisting).rejects.toThrow("paused during registration");
+    expect(r.named("session_end").map(c => c.sessionID)).toEqual(["R", "C", "R"]);
+    expect(await r.controller.childRoot("C")).toBeUndefined();
+  } finally { await r.controller.close(); }
+});
+
+// #567 audit: a pause that keeps the ownership (a drift) released nothing, so a fetch registering through it ends no row.
+test.each(modes)("an instructions fetch whose root drifts while it registers ends no row (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    let release!: () => void;
+    r.holdRegister(new Promise<void>(resolve => { release = resolve; }));
+    const enlisting = r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true);
+    await until(() => r.named("session_register").length === 1);
+    r.drift();
+    await until(() => r.root(r.controller)?.state === "paused");
+    release();
+    await enlisting;
+    expect(r.named("session_end")).toEqual([]);
+  } finally { await r.controller.close(); }
+});
+
+// #567: a new root's configured bind reuses the ancestry `session.created`'s lookup just resolved.
+test.each(modes)("a configured bind after a lookup resolves ancestry once (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  const c = r.make({ configured: { name: "be", create: false } });
+  try {
+    expect(await c.childRoot("B")).toBeUndefined();
+    await c.configuredBind("B");
+    expect(r.ancestries.filter(id => id === "B")).toHaveLength(1);
+    expect(r.named("bind").map(call => call.sessionID)).toEqual(["B"]);
+  } finally { await c.close(); await r.controller.close(); }
 });
 
 test.each(modes)("a root's bind stops delivery before the call and reopens under the new name after it (%s)", async mode => {

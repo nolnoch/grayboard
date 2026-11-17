@@ -425,6 +425,12 @@ test("the native fetcher registers a subagent under its enrolled root before nam
     expect(order).toEqual([`register R {"child":"X"}`]);
     // The fetch reports its own failure; the refusal doesn't degrade the root.
     expect(records.filter(r => r.operation === "child_register")).toEqual([]);
+    // A fetch whose entry was forgotten (its signal aborted) while it registered names no wire. R holds no lease
+    // here, so G's earlier registration isn't remembered: it registers again (#567).
+    order.length = 0;
+    const forgotten = new AbortController(); forgotten.abort();
+    expect(await fetch("G", forgotten.signal)).toBeUndefined();
+    expect(order).toEqual([`register R {"child":"G","via":["C"]}`]);
   } finally {
     await controller.close();
     instructions.mockRestore(); connect.mockRestore(); close.mockRestore();
@@ -475,5 +481,38 @@ test("setup prefetches a subagent's text when it's created, its context hook rew
   } finally {
     await cleanup!();
     enrolled.mockRestore(); childRoot.mockRestore(); forgot.mockRestore();
+  }
+});
+
+// #567: setup routes a subagent's fetch failure to its root's record, not the subagent's.
+test("setup reports a subagent's instructions failure on its root (#567)", async () => {
+  const f = fixture();
+  const ctx = {
+    ...f.ctx, location: { directory: "/worktree" }, options: {},
+    session: {
+      get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, time: {}, metadata: {}, ...(sessionID === "C" ? { parentID: "R" } : {}) }), update: async () => {}, synthetic: async () => {},
+      hook: async () => ({ dispose: async () => {} }),
+    },
+    rpc: { register: async () => ({ dispose: async () => {} }) },
+    tool: { list: async () => [], hook: async () => ({ dispose: async () => {} }), transform: async () => ({ dispose: async () => {} }) },
+    event: {
+      async *subscribe({ signal }: { signal: AbortSignal }) {
+        yield { type: "session.created", data: { sessionID: "C" } };
+        if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+      },
+    },
+  } as unknown as Context;
+  const enrolled = spyOn(OpenCodeController.prototype, "enrollment").mockImplementation((id: string) => id === "R" ? {} as never : undefined);
+  const childRoot = spyOn(OpenCodeController.prototype, "childRoot").mockImplementation(async (id: string) => id === "C" ? { sessionID: "C", root: "R", via: [] } : undefined);
+  const failures: [string, unknown][] = [];
+  const failed = spyOn(OpenCodeController.prototype, "instructionsFailure").mockImplementation((id: string, error: unknown) => { failures.push([id, error]); });
+  const down = new ServerUnreachable("down");
+  const cleanup = await setup(ctx, () => {}, () => {}, async () => { throw down; });
+  try {
+    await until(() => failures.length > 0);
+    expect(failures).toEqual([["R", down]]);
+  } finally {
+    await cleanup!();
+    enrolled.mockRestore(); childRoot.mockRestore(); failed.mockRestore();
   }
 });
