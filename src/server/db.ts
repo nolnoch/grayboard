@@ -158,7 +158,7 @@ function withTx<T>(db: Database, fn: (tx: Tx) => T): () => T {
 const isThenable = (v: unknown): v is PromiseLike<unknown> =>
   v !== null && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
 
-// Core's shared writes (attachment store/release/sweep, claim expiry, #807 D4) through repo's write queue, each body
+// Core's shared writes (attachment store/release/sweep, #807 D4) through repo's write queue, each body
 // given the connection its queued body's `Tx` resolves to (P1c-15c-2). Core's bodies are synchronous, so the cast
 // only restates that. The server's own flows reach these through `repo.claims` and `repo.attachments` (P3 B2, B3); this
 // stays for tests that drive core's flows against a server database.
@@ -2408,8 +2408,10 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
     insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
   const endChild = (child: string, why: string, now: number) => {
     const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
+    if (!end.ended) return;
+    const bounces = db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(child, now);
     // Queued at commit, so a rolled-back release wakes nobody and bounces nothing.
-    if (end.ended) afterCommit(db, () => { ended.list.push({ id: child, at: now, wake: end.wake }); });
+    afterCommit(db, () => { ended.list.push({ id: child, at: now, wake: end.wake, bounces }); });
   };
   const lostOf = hostedLostOf(db);
   // Marks `where`'s rows' `column` and deletes the rows both readers took.

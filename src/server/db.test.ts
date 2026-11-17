@@ -1028,17 +1028,20 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
 test("#807 P3 B1a: the bindings reads run on the handle they're given; the batched ones keep HOLD_ORDER and leave misses out", async () => {
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const [s1, s2, idle] = ["id:0000000000001", "id:0000000000002", "id:0000000000003"];
-  const [fe, be, ops] = ["b@example.com/fe", "b@example.com/be", "b@example.com/ops"];
+  const [fe, be, ops, zz] = ["b@example.com/fe", "b@example.com/be", "b@example.com/ops", "b@example.com/zz"];
   const b = repo.bindings;
   const kept = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "b@example.com", null);
-    for (const n of ["fe", "be", "ops"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
+    for (const n of ["fe", "be", "ops", "zz"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
     const core = repo.coreOn(tx);
     for (const id of [s1, s2, idle]) registerId(core, { id, principal: "b@example.com", launcher: false });
     // s1's be is bound after its fe, and in the same millisecond: HOLD_ORDER keeps fe first.
     holdAlias(core, fe, s1, 500);
     holdAlias(core, be, s1, 500);
     holdAlias(core, ops, s2, 100);
+    // s2's zz is written after its ops but bound before it: HOLD_ORDER disagrees with rowid and address order.
+    holdAlias(core, zz, s2, 100);
+    db.run("UPDATE alias_holds SET bound_at = 50 WHERE address = ?", [zz]);
     db.run("UPDATE ids SET status = 'busy', status_at = 7, last_seen = 900 WHERE id = ?", [s2]);
     db.run("UPDATE aliases SET last_seen = 1000 WHERE address = ?", [fe]);
     // Inside the body that wrote them, on its Tx.
@@ -1060,7 +1063,7 @@ test("#807 P3 B1a: the bindings reads run on the handle they're given; the batch
   await expect(b.lastSeen(kept, [fe])).rejects.toThrow(settled);
   await expect(b.holdsOf({} as Tx, s1)).rejects.toThrow("not a SQLite store handle");
   const r = repo.read;
-  expect(await b.holdsOfMany(r, [s1, s2, idle])).toEqual(new Map([[s1, [fe, be]], [s2, [ops]], [idle, []]]));
+  expect(await b.holdsOfMany(r, [s1, s2, idle])).toEqual(new Map([[s1, [fe, be]], [s2, [zz, ops]], [idle, []]]));
   expect(await b.holdersOf(r, [fe, ops, "b@example.com/none"])).toEqual(new Map([[fe, s1], [ops, s2]]));
   expect(await b.userOf(r, fe)).toBe(s1);
   expect(await b.userOf(r, fe, "b@example.com")).toBeNull();
@@ -1070,7 +1073,7 @@ test("#807 P3 B1a: the bindings reads run on the handle they're given; the batch
   expect(await b.idRow(r, "id:000000000000Z")).toBeUndefined();
   expect((await b.unendedIds(r)).sort()).toEqual([s1, s2, idle]);
   expect(await b.idStatuses(r, [s1, s2])).toEqual(new Map([[s2, { status: "busy", status_at: 7 }]]));
-  expect((await b.aliasUses(r, "b@example.com")).map(u => u.address).sort()).toEqual([be, fe, ops]);
+  expect((await b.aliasUses(r, "b@example.com")).map(u => u.address).sort()).toEqual([be, fe, ops, zz]);
   // An alias's and a session's last-seen, a repeat once, a never-seen alias absent (an ids row always has one).
   expect(await b.lastSeen(r, [fe, s2, fe, be])).toEqual(new Map([[fe, 1000], [s2, 900]]));
 });
