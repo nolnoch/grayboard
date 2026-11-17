@@ -139,6 +139,22 @@ test("watchRoots invalidates a root when its state, holds or ownership change, n
   rec({ sessionID: "B" });
   expect(changed).toEqual(["R", "R", "R", "R", "B"]);
   expect(forwarded).toHaveLength(8);
+  // An ended root's shape goes (#538): the same shape after it is news.
+  sink.forget("B");
+  rec({ sessionID: "B" });
+  expect(changed).toEqual(["R", "R", "R", "R", "B", "B"]);
+});
+
+test("watchRoots keeps at most its limit of shapes, the oldest going first (#538)", () => {
+  const changed: string[] = [];
+  const sink = watchRoots(() => {}, id => { changed.push(id); }, 2);
+  const rec = (sessionID: string) => sink({ state: "active", message: "", sessionID } as Parameters<Parameters<typeof watchRoots>[0]>[0]);
+  // An ended root's own end record lands after its forget, so only the bound keeps the map small.
+  rec("A"); rec("B"); rec("A"); rec("C");
+  expect(changed).toEqual(["A", "B", "C"]);
+  // B was the oldest: its shape went, so its next record is news; A and C are still known.
+  rec("A"); rec("B"); rec("C");
+  expect(changed).toEqual(["A", "B", "C", "B", "C"]);
 });
 
 test("the native fetcher names the root on a native connection with the launcher declaration and no delivery, and the controller reports bind and unbind", async () => {
@@ -172,6 +188,15 @@ test("the native fetcher names the root on a native connection with the launcher
     controller.bindingChanged = id => { changed.push(id); };
     for (const tool of ["grayboard_bind", "grayboard_unbind", "grayboard_whoami", "other_bind"]) await controller.after({ sessionID: "R", tool, id: "c", status: "error" });
     expect(changed).toEqual(["R", "R"]);
+    // A fetch wire that fails to close is recorded, not swallowed (#538).
+    // It names no session, so watchRoots never reads it as the root's change and refetches.
+    const failure = spyOn(controller as unknown as { failure: (...args: unknown[]) => void }, "failure");
+    close.mockRejectedValueOnce(new Error("close failed"));
+    changed.length = 0;
+    expect(await fetch("R", new AbortController().signal)).toBe(bound);
+    await until(() => failure.mock.calls.length === 1, "the close failure");
+    expect(failure.mock.calls[0]).toEqual(["wire_close", new Error("close failed")]);
+    expect(changed).toEqual([]);
   } finally {
     await controller.close();
     instructions.mockRestore(); connect.mockRestore(); close.mockRestore();
@@ -236,7 +261,8 @@ test("setup's context hook leaves unenrolled sessions as built, never rejects, a
   } as unknown as Context;
   const close = spyOn(RootInstructions.prototype, "close").mockImplementation(function(this: RootInstructions) { order.push("instructions"); close.mockRestore(); this.close(); });
   const noted = spyOn(OpenCodeController.prototype, "noteModel");
-  const cleanup = await setup(ctx, () => {}, () => {}, async () => bound);
+  const debugged: Record<string, unknown>[] = [];
+  const cleanup = await setup(ctx, () => {}, (_message, fields) => { debugged.push(fields); }, async () => bound);
   const system = [{ type: "text", text: "agent" }, { type: "text", text: render(unbound) }];
   // Every session's model is noted, enrolled or not: a child's wires report its own (#364).
   const model = { providerID: "anthropic", id: "claude-opus-5-5", variant: "high" };
@@ -245,6 +271,15 @@ test("setup's context hook leaves unenrolled sessions as built, never rejects, a
   noted.mockRestore();
   expect(system[1]!.text).toBe(render(unbound));
   await expect(hook!({ sessionID: "R", system: null, messages: null })).resolves.toBeUndefined();
+  // An enrolled root's request goes through rewrite (#538): rebuilt, and a malformed one still never rejects.
+  const enrolled = spyOn(OpenCodeController.prototype, "enrollment").mockImplementation(id => id === "R" ? {} as never : undefined);
+  try {
+    const rootSystem = [{ type: "text", text: render(unbound) }];
+    await hook!({ sessionID: "R", system: rootSystem, messages: [] });
+    expect(rootSystem[0]!.text).toBe(render(bound));
+    await expect(hook!({ sessionID: "R", system: null, messages: null })).resolves.toBeUndefined();
+    expect(debugged.map(d => [d.root, d.plan])).toEqual([["R", "replace"], ["R", "none"]]);
+  } finally { enrolled.mockRestore(); }
   await cleanup!();
   // In-flight fetches abort first, then the hook goes, before the controller closes.
   expect(order.slice(0, 2)).toEqual(["instructions", "context"]);
@@ -269,6 +304,26 @@ test("a subagent's cached text follows its root: invalidating the root refetches
   // Asked under another root (or as a root), the entry is dropped and fetched afresh.
   expect(await cache.current("C")).toBe("text C 5");
   expect(fetched).toEqual(["C", "C", "C", "C", "C"]);
+  cache.close();
+});
+
+test("forget aborts a running fetch rather than leaving it beside the next, and drops the root's subagents (#538)", async () => {
+  const signals: AbortSignal[] = [];
+  const pending: (() => void)[] = [];
+  const cache = new RootInstructions((id, signal) => { signals.push(signal); return new Promise(resolve => { pending.push(() => resolve(`text ${id}`)); }); }, () => {}, 10);
+  expect(await cache.current("R")).toBeUndefined();
+  expect(await cache.current("C", "R")).toBeUndefined();
+  expect(cache.size).toBe(2);
+  cache.forget("R");
+  expect(signals.map(s => s.aborted)).toEqual([true, true]);
+  expect(cache.size).toBe(0);
+  // The next request starts one fetch of its own; the forgotten one's result is dropped.
+  const next = cache.current("R");
+  expect(signals).toHaveLength(3);
+  for (const resolve of pending) resolve();
+  await next;
+  expect(cache.state("R")).toBe("fresh");
+  expect(signals[2]!.aborted).toBe(false);
   cache.close();
 });
 
