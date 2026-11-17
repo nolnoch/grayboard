@@ -25,7 +25,7 @@ import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, parseAliasMeta, pendingFor, pendingKey, refOf,
+  age, snapshot, canSeeBoard, checkBody, checkPostAccess, parseAliasMeta, pendingKey, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -40,7 +40,8 @@ import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
-import { ownScopeOn, principalCanSee } from "./access.ts";
+import { boardAccess, ownScopeOn, principalCanSee, type BoardAccess } from "./access.ts";
+import { boardCatalog, boardSnapshot, pendingOf } from "./board_reads.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -122,6 +123,9 @@ export class ApplicationSession {
   // Set while a replay's direct-message drain is in flight (drainDirect): live DMs held for it, the ids its drains
   // sent, how many are running, and the chain that runs them one at a time.
   draining: { held: MessageRow[]; sent: Set<number>; runs: number; chain: Promise<void> } | null = null;
+  // Set while a board drain runs (drainBoards, #807 P3 B5a1): a wake meanwhile asks for one more run (`all` when any
+  // asks for it), and a receipt committed meanwhile names what the running drain read before it and mustn't resend.
+  boardDrain: { rerun: boolean; all: boolean; acked: Set<string>; done: Promise<void> } | null = null;
   active = true;
   // The session's ID (#284): keys its ids row, its holds, its binding
   // events and its writes' dedup. Empty for the Slack bridge's humans.
@@ -206,6 +210,8 @@ type Hub = {
   registry: Map<string, ApplicationSession>;
   sessions: Set<ApplicationSession>;
   humanReach: HumanReach;
+  // Board visibility on a caller's handle (#807 P3 B5a1).
+  access: BoardAccess;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
   // delegate's per-user bucket and the launcher cap (#252). A streak's
@@ -225,21 +231,68 @@ type Hub = {
 type Commit = (effect: () => void | Promise<void>) => void;
 const onCommit = (h: Read): Commit => (effect) => afterCommitOf(h, effect);
 
-// A push its reader can no longer see, acknowledged as pendingFor finds it, on `h`: inside a body (a delivery
-// receipt's `pending`) on its `Tx`; outside one (a drain, a lease's pull) posted through the write queue (#807 D4).
-const lostAck = (hub: Hub, h: Read) => (handle: string, ref: PendingRef) => {
-  const write = (tx: Tx) => acknowledge(hub.repo.coreOn(tx), handle, ref);
-  if (isTx(h)) write(h); else hub.repo.post(write, undefined, "lost-visibility push ack");
+// A push its reader can no longer see, acknowledged as pendingOf finds it, on `h`: inside a body (a delivery
+// receipt's `pending`) on its `Tx`, awaited; outside one (a drain, a lease's pull) queued on the write queue and not
+// awaited (#807 D4; never `repo.post`, which refuses an async body, B5a1 H2).
+const lostAck = (hub: Hub, h: Read, handle: string) => async (ref: PendingRef): Promise<void> => {
+  if (isTx(h)) return hub.repo.boards.acknowledge(h, handle, ref);
+  void hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref)).catch((error) => console.error("lost-visibility push ack failed", error));
 };
+
+// A pending item's identity down to the post a digest names: a receipt for it means the drain that read it must not
+// send it again; a newer digest of the same board is another item.
+const ackKey = (r: PendingRef) => (r.kind === "push" ? `p:${r.post_id}` : `d:${r.board}:${r.latest_id}`);
 
 // Send this session everything pending on boards, for any of its addresses,
 // that it hasn't been sent: a subscription taken as the ID while unbound and
 // the alias's own both deliver. all: also deferred pushes and digests (at
 // hello; see pendingFor).
-function drainBoards(session: ApplicationSession, hub: Hub, all = false): void {
-  for (const address of session.addresses) {
-    for (const item of pendingFor(hub.repo.coreOn(hub.repo.read), address, { all, ack: lostAck(hub, hub.repo.read) })) {
-      const key = pendingKey(refOf(item));
+//
+// Its reads await (#807 P3 B5a1, H1), so other bodies commit meanwhile. One drain runs per session: a call while one
+// runs asks it for another run and waits for that run, so a later drain never delivers before an earlier one. A
+// receipt that commits during a drain names an item that drain may have read before it: the drain skips it.
+function drainBoards(session: ApplicationSession, hub: Hub, all = false): Promise<void> {
+  const running = session.boardDrain;
+  if (running) {
+    running.rerun = true;
+    running.all ||= all;
+    return running.done;
+  }
+  const d: NonNullable<ApplicationSession["boardDrain"]> = { rerun: true, all, acked: new Set(), done: Promise.resolve() };
+  session.boardDrain = d;
+  // A run that fails doesn't end the drain: a rerun asked for meanwhile still runs, and the callers waiting see the
+  // last run's failure, if that one failed too.
+  d.done = (async () => {
+    let failure: { error: unknown } | undefined;
+    try {
+      while (d.rerun && session.active) {
+        const runAll = d.all;
+        d.rerun = false;
+        d.all = false;
+        try { await drainBoardsOnce(session, hub, runAll, d.acked); failure = undefined; }
+        catch (error) {
+          failure = { error };
+          // An `all` run that failed is owed again if another run follows.
+          d.all ||= runAll;
+        }
+      }
+    } finally { session.boardDrain = null; }
+    if (failure) throw failure.error;
+  })();
+  return d.done;
+}
+
+async function drainBoardsOnce(session: ApplicationSession, hub: Hub, all: boolean, acked: Set<string>): Promise<void> {
+  for (const address of [...session.addresses]) {
+    const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address));
+    // Closed while the read awaited: nothing more to send. Unbound from this address: the holds change dropped its
+    // in-flight items.
+    if (!session.active) return;
+    if (!session.addresses.includes(address)) continue;
+    for (const item of items) {
+      const ref = refOf(item);
+      if (acked.has(ackKey(ref))) continue;
+      const key = pendingKey(ref);
       const sent = session.inflight.get(key);
       if (sent) {
         sent.add(address);
@@ -300,7 +353,7 @@ async function drainDirect(hub: Hub, session: ApplicationSession, addresses: str
 function wake(hub: Hub, on: Commit, handles: string[]): void {
   on(() => {
     for (const session of new Set(handles.map((h) => hub.registry.get(h)))) {
-      if (session?.active) drainBoards(session, hub, session.human);
+      if (session?.active) void drainBoards(session, hub, session.human).catch((error) => console.error("postcommit effect failed", error));
     }
   });
 }
@@ -488,6 +541,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     registry: new Map(),
     sessions: new Set(),
     humanReach: opts.humanReach ?? "team",
+    access: boardAccess(repo, opts.humanReach ?? "team"),
     slackRunning: opts.slackRunning ?? (() => false),
     now,
     // Logged and audited once per run of refusals, so a loop floods neither.
@@ -515,11 +569,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     delegateOpenCap: opts.delegateOpenCap ?? DELEGATE_OPEN_CAP,
     aliasScopeCap: opts.aliasScopeCap ?? ALIAS_SCOPE_CAP,
     boardChanged(on, board) {
-      on(() => {
-        // A copy: observerLive removes a dead observer from the set mid-walk.
-        for (const observer of [...observersByBoard.get(board) ?? []]) {
-          if (observerLive(observer)) notify(() => observer.hooks.changed());
-        }
+      on(async () => {
+        // A copy: liveObservers removes a dead observer from the set mid-walk.
+        const live = await liveObservers(board, [...observersByBoard.get(board) ?? []]);
+        // Still observing after the await: a close meanwhile isn't notified.
+        for (const observer of live) if (observers.has(observer)) notify(() => observer.hooks.changed());
       });
     },
   };
@@ -559,14 +613,27 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     index(observersBySession, observer.session, observer, false);
     notify(observer.hooks.closed);
   }
-  function observerLive(observer: Observer): boolean {
-    if (!observers.has(observer)) return false;
+  // Of one board's observers, those still live: the session valid and one of its addresses (as they stood before the
+  // read) able to see the board, read once for them all (#807 P3 B5a1, H3). The rest are removed; a failed read
+  // removes them all, as a refused check would.
+  async function liveObservers(board: string, list: Observer[]): Promise<Observer[]> {
+    const checked = list.flatMap((o) => {
+      if (!observers.has(o)) return [];
+      try { validNow(o.session); return [{ o, addresses: [...o.session.addresses] }]; }
+      catch { removeObserver(o); return []; }
+    });
+    if (!checked.length) return [];
+    let seeing = new Set<string>();
     try {
-      validNow(observer.session);
-      if (observer.session.addresses.some((a) => canSeeBoard(repo.coreOn(repo.read), a, observer.board))) return true;
-    } catch {}
-    removeObserver(observer);
-    return false;
+      const b = await repo.boards.get(repo.read, board);
+      if (b) seeing = await hub.access.canSeeMany(repo.read, [...new Set(checked.flatMap((c) => c.addresses))], b);
+    } catch (error) { console.error("[grayboard] observer check failed:", error); }
+    const live: Observer[] = [];
+    for (const { o, addresses } of checked) {
+      if (addresses.some((a) => seeing.has(a))) live.push(o);
+      else removeObserver(o);
+    }
+    return live;
   }
   function boardsChanged(on: Commit, boards: string[]) {
     for (const board of new Set(boards)) hub.boardChanged(on, board);
@@ -1192,7 +1259,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
         if (!session.active) return;
         await valid(session, true);
-        drainBoards(session, hub, true);
+        await drainBoards(session, hub, true);
       } catch (error) { console.error("postcommit effect failed", error); }
     },
     async send(
@@ -1222,7 +1289,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       childState(session, "dm_inbox");
       return handleInbox(hub, r, session, days);
     },
-    // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
+    // Reads retain durable cursors; pendingOf still cleans inaccessible outbox rows.
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
       await valid(session, false, r);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
@@ -1231,7 +1298,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const seen = new Set<string>();
       const all: Pending[] = [];
       for (const a of session.addresses) {
-        for (const item of pendingFor(repo.coreOn(r), a, { all: true, ack: lostAck(hub, r) })) {
+        for (const item of await pendingOf(repo, hub.access, r, a, true, lostAck(hub, r, a))) {
           const key = pendingKey(refOf(item));
           if (!seen.has(key)) { seen.add(key); all.push(item); }
         }
@@ -1248,12 +1315,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     async boardCatalog(r: Read, session: ApplicationSession, after?: string) {
       await valid(session, true, r);
-      return boardCatalog(repo.coreOn(r), session.readOnly ? seer(repo, session) : session.primary, after);
+      return boardCatalog(repo, hub.access, r, session.readOnly ? userOf(session) : session.primary, after);
     },
     async boardSnapshot(r: Read, session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
       await valid(session, true, r);
       // A resource read is a read like board_read, and carries its marks (#825).
-      const snap = snapshot(repo.coreOn(r), reader(r, session, board), board, options);
+      const snap = await boardSnapshot(repo, hub.access, r, session.readOnly ? userOf(session) : session.addresses, board, options);
       const marks = await writerMarks(repo, r, session, [], snap.posts.map((p) => p.id));
       return { ...snap, posts: snap.posts.map((p) => ({ ...p, ...marks.post(p.id) })) };
     },
@@ -1288,8 +1355,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     async receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
       await valid(session, false, tx);
       for (const r of refs) {
-        for (const a of session.addresses) acknowledge(repo.coreOn(tx), a, r);
-        tx.afterCommit(() => { session.inflight.delete(pendingKey(r)); });
+        for (const a of session.addresses) await repo.boards.acknowledge(tx, a, r);
+        tx.afterCommit(() => {
+          session.inflight.delete(pendingKey(r));
+          session.boardDrain?.acked.add(ackKey(r));
+        });
       }
     },
     // Acked as the address the row names (S8): receivedUnacked and
@@ -1340,7 +1410,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // rejected). The users reads await, on the auth cache (#807 P3 A7u2): disconnectUser walks the sessions as they
     // stand after them; one user's failed read skips that user only, and the next tick retries it.
     async revalidate(): Promise<void> {
-      for (const observer of [...observers]) observerLive(observer);
+      await Promise.all([...observersByBoard].map(([board, set]) => liveObservers(board, [...set])));
       const ids = [...new Set([...hub.sessions].filter(s => !s.human).map(s => s.authed.user_id))];
       const disabled = await Promise.all(ids.map(id => repo.users.isDisabled(repo.read, id).catch(error => {
         console.error("[grayboard] revalidate: user read failed:", error);
@@ -1379,9 +1449,10 @@ export type Application = ReturnType<typeof createApplication>;
 // its user's principal directly, never as an address in the user's scope
 // (`human` there is the bridge's reserved identity), #410.
 function seer(repo: Repo, session: ApplicationSession): (board: Board) => boolean {
-  const p = { kind: "user" as const, name: session.authed.user_email };
+  const p = userOf(session);
   return (board) => principalCanSee(repo, p, board);
 }
+const userOf = (session: ApplicationSession): Principal => ({ kind: "user", name: session.authed.user_email });
 
 // Where a name was last used: its session's cwd, else its place.
 function whereSeen(seen: { cwd: string | null; place: string | null } | undefined): string | null {

@@ -274,13 +274,18 @@ test("#807 P1c-14b: a delivery receipt's messages reads run on its body's Tx", a
 
 // #807 P1c-15b: every core helper application.ts reaches goes through `repo.coreOn(handle)`: a body's `Tx` inside one,
 // the pool outside. Logged per call with whether a transaction is open, so an in-body call on the pool (or the reverse) shows.
+// P3 B5a1: the delivery pull and receipt reach boards through `repo.boards` (pool outside a body, the receipt's `Tx`
+// inside); only the receipt's board check is still core's.
 test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, outside on the pool", async () => {
-  const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const log = (op: string, h: unknown) => checks.push({ op, inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
   const original = database.repo.coreOn.bind(database.repo);
-  const spy = spyOn(database.repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
-    checks.push({ inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
-    return original(h);
-  }) as never);
+  const spy = spyOn(database.repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => { log("coreOn", h); return original(h); }) as never);
+  const group = database.repo.boards;
+  const boardSpies = (Object.keys(group) as (keyof typeof group)[]).map(name => {
+    const own = (group[name] as (...a: unknown[]) => unknown).bind(group);
+    return spyOn(group, name as never).mockImplementation(((h: unknown, ...rest: unknown[]) => { log(`boards.${name}`, h); return own(h, ...rest); }) as never);
+  });
   const a = context("p15-a"), b = context("p15-b");
   try {
     await hosted.bind(principal, a, { name: "p15a", create: true });
@@ -290,18 +295,25 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
     await hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, "p15b", "question", { pending: true }));
     await hosted.run(principal, a, "board_create", (session, tx) => application.call(tx, session, "board_create", { name: "p15", purpose: "tests" }));
     await hosted.run(principal, b, "board_subscribe", (session, tx) => application.call(tx, session, "board_subscribe", { board: "p15", mode: "push" }));
-    await hosted.run(principal, a, "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "p15", body: "x" }));
     await hosted.run(principal, b, "board_read", (session, tx) => application.call(tx, session, "board_read", { board: "p15" }));
+    // After the read: the pull below must find the post still pending, so the receipt acknowledges it.
+    await hosted.run(principal, a, "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "p15", body: "x" }));
     await hosted.run(principal, b, "dm_inbox", (session, tx) => application.inbox(tx, session));
+    expect(checks.length).toBeGreaterThan(bound);
+    const pull = checks.length;
     const lease = await delivery.open(principal, b);
     const items = await delivery.pending(principal, b, lease.capability);
     expect(items.length).toBeGreaterThan(0);
     await delivery.receipt(principal, b, lease.capability, items.map(i => i.id));
+    const pulled = checks.slice(pull);
+    // The pull reads boards through repo.boards alone; the receipt's one core call is its board check on its Tx
+    // (canReceiveBoard, which stays on core until B5a2).
+    expect(pulled.filter(c => c.op === "coreOn").map(c => `${c.handle}:${c.inTxn}`)).toEqual(["tx:true"]);
+    expect(pulled.some(c => c.op === "boards.pendingPushes" && c.handle === "pool" && !c.inTxn)).toBe(true);
+    expect(pulled.some(c => c.op === "boards.acknowledge" && c.handle === "tx" && c.inTxn)).toBe(true);
     await hosted.whoami(principal, a);
-    expect(checks.length).toBeGreaterThan(bound);
-    expect(checks.some(c => !c.inTxn && c.handle === "pool")).toBe(true);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
-  } finally { spy.mockRestore(); }
+  } finally { spy.mockRestore(); for (const s of boardSpies) s.mockRestore(); }
 });
 
 // #807 P3 B4a: a send to an `id:` address asks `repo.sessionEnd.refusal` on the send's Tx (the send side of an end's

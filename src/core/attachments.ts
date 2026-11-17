@@ -259,10 +259,21 @@ export function attachmentReach(
   dmVisible: (messageId: number) => boolean,
   from: Uploader = { addresses: [handle], principal: null },
 ): AttachmentReach {
-  if (a.post_id !== null) {
-    const p = getPost(db, a.post_id);
-    return { carrier: "post", readable: !!p && canSeeBoard(db, handle, p.board) };
-  }
+  return attachmentReachWith(a, (postId) => {
+    const p = getPost(db, postId);
+    return !!p && canSeeBoard(db, handle, p.board);
+  }, dmVisible, from);
+}
+
+// attachmentReach's rule over its carrier's visibility, asked of `postVisible` or `dmVisible`: the server reads both
+// up front on its own handle (#807 P3 B5a1).
+export function attachmentReachWith(
+  a: AttachmentRow,
+  postVisible: (postId: number) => boolean,
+  dmVisible: (messageId: number) => boolean,
+  from: Uploader,
+): AttachmentReach {
+  if (a.post_id !== null) return { carrier: "post", readable: postVisible(a.post_id) };
   if (a.message_id !== null) return { carrier: "message", readable: dmVisible(a.message_id) };
   return { carrier: "unbound", readable: from.addresses.includes(a.uploader) && (from.principal === null || a.uploader_principal === from.principal) };
 }

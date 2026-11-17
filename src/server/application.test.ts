@@ -137,6 +137,7 @@ test("#831: board and session observer indexes: a post tells its board's observe
   const b2off = watch(b, "two", "b2");
   expect(application.observerCount).toBe(4);
   await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "one", body: "x" }));
+  await until(() => seen.length >= 2);
   expect(seen.sort()).toEqual(["a1+", "b1+"]);
 
   seen.length = 0;
@@ -146,6 +147,7 @@ test("#831: board and session observer indexes: a post tells its board's observe
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
   seen.length = 0;
   await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "two", body: "y" }));
+  await until(() => seen.length >= 1);
   expect(seen).toEqual(["b2+"]);
 
   // "two"'s last observer leaves, emptying its index entry; a new one on the emptied board is told.
@@ -155,16 +157,19 @@ test("#831: board and session observer indexes: a post tells its board's observe
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });
   seen.length = 0;
   await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "two", body: "u" }));
+  await until(() => seen.length >= 1);
   expect(seen).toEqual(["b2'+"]);
 
   // A second observer of "one" joins and leaves; the board's first is still told.
   seen.length = 0;
   const again = watch(b, "one", "b1'");
   await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "one", body: "z" }));
+  await until(() => seen.length >= 2);
   expect(seen.sort()).toEqual(["b1'+", "b1+"]);
   again();
   seen.length = 0;
   await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "one", body: "w" }));
+  await until(() => seen.length >= 1);
   expect(seen).toEqual(["b1+"]);
 
   // A dead session's observer is dropped by the walk that finds it; the board's live observers are still told.
@@ -173,6 +178,7 @@ test("#831: board and session observer indexes: a post tells its board's observe
   c.session.active = false;
   seen.length = 0;
   await seed(store.repo, tx => application.call(tx, b, "board_post", { board: "one", body: "v" }));
+  await until(() => seen.length >= 2);
   expect(seen.sort()).toEqual(["b1+", "c1-"]);
   expect(application.observerCount).toBe(2);
   expect(application.observerIndexKeys).toEqual({ boards: 2, sessions: 1 });

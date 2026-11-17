@@ -14,7 +14,7 @@ import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { authorize, decidePure, recordDecision, type AuthzRequest, type PureRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
-import { forgetHandle, getBoard } from "../core/boards.ts";
+import { forgetHandle } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
@@ -418,7 +418,7 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
   return repo.write(async (tx) => {
     if (await repo.teams.findByName(tx, name)) return conflict(`team "${name}" already exists`);
     // The team's board shares its name, so the name must be free as a board too.
-    if (getBoard(repo.coreOn(tx), name)) return conflict(`a board named "#${name}" already exists`);
+    if (await repo.boards.get(tx, name)) return conflict(`a board named "#${name}" already exists`);
     let team: Team;
     try {
       team = await repo.teams.create(tx, name, authed.user_id);
