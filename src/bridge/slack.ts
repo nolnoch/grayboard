@@ -100,10 +100,11 @@ export async function startSlackBridge(
     const text = (r.content as { type: string; text?: string }[]).find((c) => c.type === "text")?.text ?? "";
     // The scratch path means nothing to the Slack owner the error goes to.
     if (r.isError) {
-      const error = text.replace(/^error:\s*/, "").replaceAll(`${scratchRoot}/`, "");
-      // A local refusal reads `<code>: <detail>` (core/session_end.ts Undeliverable); the relay words a few codes (#428).
-      const code = /^(id_ended|not_found|no_delivery|child_session): /.exec(error)?.[1];
-      return { ok: false, error, ...(code ? { code } : {}) };
+      const raw = text.replace(/^error:\s*/, "").replaceAll(`${scratchRoot}/`, "");
+      // A local refusal reads `<code>: <detail>` (core/session_end.ts Undeliverable); the relay words a few codes
+      // (#428). The code travels apart and the Slack reader sees the detail alone, as from the org bridge (#779).
+      const code = /^(id_ended|not_found|no_delivery|child_session): /.exec(raw)?.[1];
+      return code ? { ok: false, error: raw.slice(code.length + 2), code } : { ok: false, error: raw };
     }
     try {
       return { ok: true, value: JSON.parse(text) };
