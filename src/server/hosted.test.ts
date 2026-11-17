@@ -179,7 +179,7 @@ test("#807 P1c-13: alias reads inside hosted bodies run on that body's Tx", asyn
 });
 
 // #807 P1c-14b: the DM reads a hosted body makes (bind's undelivered notice, a send's parent and its
-// undelivered count, dm_history, dm_thread, dm_inbox, dm_ack, unbind's candidates and their last-seen) run on
+// undelivered count, dm_history, dm_thread, dm_inbox, dm_ack, a first bind's candidates and their last-seen) run on
 // that body's Tx; an unbound root's whoami lists its candidates on the pool, outside any body.
 // Every messages read and aliases.seen, recording the handle each was given and whether a body was open.
 function spyMessageReads() {

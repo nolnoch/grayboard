@@ -949,7 +949,8 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
     const root = m.insert(tx, peer, "user", id, "root", null, true);
     const reply = m.insert(tx, id, "user", peer, "reply", root.id);
     db.run("UPDATE aliases SET last_seen = 1000 WHERE address = ?", [peer]);
-    // Read inside the body that wrote them, on its Tx.
+    // Read inside the body that wrote them, on its Tx. On SQLite the pool routes to the writer inside a transaction
+    // too, so this half discriminates only on Postgres; the kept-Tx and foreign-handle refusals below are the SQLite check.
     expect(m.getById(tx, reply.id)?.parent_id).toBe(root.id);
     expect(m.thread(tx, reply.id).map(x => x.id)).toEqual([root.id, reply.id]);
     expect(m.history(tx, [id]).map(x => x.id)).toEqual([reply.id, root.id]);
