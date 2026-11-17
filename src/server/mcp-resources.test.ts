@@ -396,6 +396,20 @@ test("a configured per-session watch cap bounds an older-protocol session's reso
   await expect(client.subscribeResource({ uri: "grayboard://boards/two" })).rejects.toThrow();
 });
 
+// #807 P3 B1b: a root that holds no name is refused a watch on a board its user can list. Two checks refuse it:
+// bindingLive (its stamp says holding false) and the board capability (it has no address); the legacy wire masks both.
+test("an unbound native root's board subscribe is refused though its user lists the board", async () => {
+  const bound = await connect("2025-11-25", "native");
+  expect((await bound.callTool({ name: "board_create", arguments: { name: "seen", purpose: "unbound watch" } })).isError).not.toBe(true);
+  expect(await bound.subscribeResource({ uri: "grayboard://boards/seen" })).toEqual({});
+  meta["ai.opencode/sessionID"] = "resource-unbound-root";
+  try {
+    const unbound = await connect("2025-11-25", "native");
+    expect((await unbound.callTool({ name: "board_list", arguments: {} })).content).toEqual(expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("seen") })]));
+    await expect(unbound.subscribeResource({ uri: "grayboard://boards/seen" })).rejects.toThrow("resource not found");
+  } finally { meta["ai.opencode/sessionID"] = "resource-root"; }
+});
+
 // #881 passes a lease call's first authorization to the lease capability check instead of authorizing again.
 for (const method of ["renew", "inbox"] as const) test(`#902: a warm ${method} checks its grant ${method === "renew" ? 10 : 11} times`, async () => {
   const headers = new Headers();
