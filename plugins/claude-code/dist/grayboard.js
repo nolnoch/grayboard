@@ -36237,19 +36237,23 @@ class ToolProxy {
     }
   }
   loginNeeded(error) {
-    for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-      if (e instanceof AccessExpired)
-        return e;
-      if (e instanceof InsufficientScope)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "expired");
-    }
-    return;
+    const cause = signOutCause(error);
+    return cause === undefined || cause instanceof AccessExpired ? cause : new AccessExpired(this.options.harness, this.options.loginAction, cause);
   }
   transportFailure(error) {
     return error instanceof ServerUnreachable || !!this.loginNeeded(error);
   }
+}
+function signOutCause(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof AccessExpired)
+      return e;
+    if (e instanceof InsufficientScope)
+      return "login_required";
+    if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
+      return "expired";
+  }
+  return;
 }
 
 // adapters/hosted-core/src/client.ts
