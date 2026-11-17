@@ -183,11 +183,14 @@ test("a post mentioning an ended @id: is refused, and the refusal reaches the Sl
   await stopSession(sim.c);
   await startBridge();
   await call(be.c, "board_create", { name: "e2e", purpose: "fixtures" });
-  const ended = new RegExp(`^⚠️ not posted: id_ended: ${id} ended at \\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z; it held \`sim\`$`);
+  const ended = new RegExp(`^⚠️ not posted: ${id} ended at \\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z; it held \`sim\`$`);
 
   const top = slack.say(`#e2e ping @${id}`);
   expect((await until(() => slack.posts().find((p) => p.thread_ts === top.ts))).markdown_text).toMatch(ended);
   await until(() => slack.acks.includes(top.envelope));
+  // An id that never existed reads as the org bridge words it (#779): the detail, no bus code.
+  const unknown = slack.say("#e2e ping @id:0123456789abz");
+  expect((await until(() => slack.posts().find((p) => p.thread_ts === unknown.ts))).markdown_text).toBe("⚠️ not posted: no session id:0123456789abz");
 
   const root = await call(be.c, "board_post", { board: "e2e", body: "@alex who owns the soak?" });
   const p1 = await until(() => slack.posts().find((p) => p.markdown_text?.includes("who owns the soak")));
