@@ -24,18 +24,24 @@ export async function resolveRoot(sessionID: string, get: (id: string) => Promis
 
 // Ended sessions SessionRoutes keeps (#567). The set only refuses a lookup or
 // registration racing an end; a session ended this many ends ago has none in
-// flight, and its ancestry no longer resolves (the host removed it).
+// flight, and its ancestry no longer resolves (the host removed it). It also
+// bounds the orphans: descendants of an ended root whose own end hasn't come
+// (#1166).
 export const ENDED_LIMIT = 4096;
 // Retain routing after OpenCode removes the session; deletion events carry only its ID.
 export class SessionRoutes {
   private readonly paths = new Map<string, SessionPath>();
   private readonly ended = new Set<string>();
+  // Descendants of an ended root, oldest root end first. Each keeps its path so its own end, if the host sends it,
+  // still ends its registration; past the limit the oldest is forgotten, as a host may never send it (#1166).
+  private readonly orphans = new Set<string>();
   constructor(private readonly limit = ENDED_LIMIT) {}
   remember(path: SessionPath) {
     if (this.ended.has(path.sessionID) || this.ended.has(path.root)) throw new AncestryError("Grayboard session ended during ancestry lookup");
     const previous = this.paths.get(path.sessionID);
     if (previous && previous.root !== path.root) throw new AncestryError("Grayboard session ancestry changed");
     this.paths.set(path.sessionID, { ...path, via: [...path.via] });
+    this.orphans.delete(path.sessionID);
   }
   get(sessionID: string): SessionPath | undefined {
     const path = this.paths.get(sessionID);
@@ -47,7 +53,14 @@ export class SessionRoutes {
     this.ended.add(sessionID);
     if (this.ended.size > this.limit) this.ended.delete(this.ended.values().next().value!);
     const path = this.paths.get(sessionID);
-    this.paths.delete(sessionID);
+    this.paths.delete(sessionID); this.orphans.delete(sessionID);
+    if (path && path.root === sessionID) {
+      for (const [id, p] of this.paths) if (p.root === sessionID) this.orphans.add(id);
+      for (const id of this.orphans) {
+        if (this.orphans.size <= this.limit) break;
+        this.orphans.delete(id); this.paths.delete(id);
+      }
+    }
     return path ? { ...path, via: [...path.via] } : undefined;
   }
 }
