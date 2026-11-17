@@ -23,7 +23,7 @@ import { serverAccess } from "./access.ts";
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
-import { requestOrigin } from "./request_context.ts";
+import { detached, inRequest, requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess, type OAuthFailure } from "./oauth-types.ts";
@@ -106,10 +106,15 @@ export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
 // writes wait in the queue (core/sqlite.ts ownWriter).
 // fn gets the transaction's Tx (#807 P1c), closed when fn settles: a timer or un-awaited promise fn started that uses it
 // later throws instead of writing into whichever transaction is open by then.
+// fn and committed run as the work of the request that called write(), or of none (#1042): a body that waited starts
+// from the releasing holder's context, whose request origin its audit rows would otherwise carry (F-19). Only the
+// origin is set: binding the whole context (AsyncResource.bind) would also restore the queue's holder token.
 function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
   const queue = queueFor(db);
   if (queue.mine && db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls atomic"));
-  return queue.run(() => {
+  const o = requestOrigin();
+  return queue.run(() => o ? inRequest(o, body) : detached(body)).then(box => box.out) as Promise<Awaited<R>>;
+  function body(): { out: R } | Promise<{ out: R }> {
     const b = openBoundary(db);
     const tx = sqliteTx(db);
     const settle = (value: T) => { tx.close(); b.commit(); return { out: committed ? committed(value) : value as unknown as R }; };
@@ -119,7 +124,7 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
     if (!isThenable(out)) return settle(out as T);
     // Reactions attached here run as the holder (the queue's context follows them), so the commit is the writer's.
     return Promise.resolve(out).then(settle, fail);
-  }).then(box => box.out) as Promise<Awaited<R>>;
+  }
 }
 
 // fn's synchronous transaction body with its own Tx, closed when it returns or throws. Its savepoint refuses: a
@@ -787,15 +792,17 @@ function initSchema(db: Database): void {
   const logCols = db.prepare(`PRAGMA table_info(access_log)`).all() as { name: string }[];
   if (!logCols.some((c) => c.name === "ip")) db.exec(`ALTER TABLE access_log ADD COLUMN ip TEXT`);
   if (!logCols.some((c) => c.name === "ua")) db.exec(`ALTER TABLE access_log ADD COLUMN ua TEXT`);
+  // client_id: the OAuth client of the hosted MCP request that wrote the row (#847); null off /mcp and on older rows.
+  if (!logCols.some((c) => c.name === "client_id")) db.exec(`ALTER TABLE access_log ADD COLUMN client_id TEXT`);
 }
 
 /**
- * Every access_log row goes in here: it stamps the client address and user
- * agent of the request whose handling wrote it (security audit F-19).
+ * Every access_log row goes in here: it stamps the client address, user agent
+ * and OAuth client of the request whose handling wrote it (security audit F-19).
  */
 function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
   const o = requestOrigin();
-  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua) VALUES (?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null]);
+  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null, o?.client_id ?? null]);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and

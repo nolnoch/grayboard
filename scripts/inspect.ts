@@ -125,8 +125,11 @@ function users() {
   };
 }
 
+// The origin columns arrived later (ip/ua #846, client_id #847): a read-only open of an older server's database lacks them.
 function audit() {
-  return all(`SELECT id, at, actor, action, target, detail, ip, ua FROM access_log ORDER BY id DESC LIMIT 500`);
+  const have = new Set((db.query(`PRAGMA table_info(access_log)`).all() as { name: string }[]).map((c) => c.name));
+  const origin = ["ip", "ua", "client_id"].map((c) => (have.has(c) ? c : `NULL AS ${c}`)).join(", ");
+  return all(`SELECT id, at, actor, action, target, detail, ${origin} FROM access_log ORDER BY id DESC LIMIT 500`);
 }
 
 function api(url: URL): unknown {
@@ -392,7 +395,7 @@ async function auditView() {
   render(h("h2", {}, "Audit log"),
     rows.length ? table([
       ["When", (r) => fmt(r.at)], ["Action", (r) => chip(r.action)], ["Actor", (r) => r.actor || ""],
-      ["Target", (r) => r.target || ""], ["From", (r) => [r.ip || "", r.ua ? [" ", h("span", { class: "muted" }, r.ua)] : null]], ["Detail", (r) => h("span", { class: "muted" }, r.detail || "")],
+      ["Target", (r) => r.target || ""], ["From", (r) => [r.ip || "", r.ua ? [" ", h("span", { class: "muted" }, r.ua)] : null, r.client_id ? [" ", h("span", { class: "muted" }, r.client_id)] : null]], ["Detail", (r) => h("span", { class: "muted" }, r.detail || "")],
     ], rows) : h("p", { class: "muted" }, "None."));
 }
 
