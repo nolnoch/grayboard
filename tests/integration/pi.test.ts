@@ -11,7 +11,7 @@ import { localAdapterExcludedScenario } from "../support/local_adapter_exclusion
 import { startPi } from "../support/pi.ts";
 import {
   piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
-  piExcludedForegroundChildScenario, piForegroundChildScenario, piLocalCarryScenario, piLocalInitDeadlineScenario, piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piLocalStopsReadingScenario, piUnboundScenario,
+  piExcludedForegroundChildScenario, piForegroundChildScenario, piLocalCarryScenario, piLocalInitFailScenario, piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piLocalStopsReadingScenario, piUnboundScenario,
 } from "../support/pi.ts";
 
 let dir: string;
@@ -28,7 +28,8 @@ afterEach(async () => {
 test("pi: a DM wakes the session, which replies with dm_send; a digest rides along as context", () => piScenario(dir), 90_000);
 test("pi unbound: the session acts as its ID; two binds and an unbind through the extension's tools move the session's one grayboard onto its second name", () => piUnboundScenario(dir), 90_000);
 test("pi local: a killed grayboard restarts with its bound name; calls wait through all three backoffs, delivery resumes, another exit gives up, and /new resets the count (#559)", () => piLocalRestartScenario(dir), 90_000);
-test("pi local: a grayboard process that never answers initialize is killed at the deadline and restarted; after the last restart a call fails with the deadline reason (#559)", () => piLocalInitDeadlineScenario(dir), 90_000);
+test("pi local: a grayboard process that never answers initialize is killed at the deadline and restarted; after the last restart a call fails with the deadline reason (#559)", () => piLocalInitFailScenario(dir, "deadline"), 90_000);
+test("pi local: a grayboard process that answers initialize with an error is restarted at once; after the last restart a call fails with that error (#1142)", () => piLocalInitFailScenario(dir, "refused"), 90_000);
 test("pi local: /new during a pending 5 s restart cancels the outgoing timer without a tool call and leaves only the new child's name hold (#559)", () => piLocalRestartShutdownScenario(dir), 60_000);
 test("pi local: /new aborts a tool awaiting the pending restart instead of waiting out the backoff (#559)", () => piLocalRestartShutdownScenario(dir, true), 60_000);
 test("pi local: /new and /fork use actual minted IDs; /resume restores the selected ordered holds rather than outgoing carry, including a remembered empty snapshot (#195)", () => piLocalCarryScenario(dir), 120_000);

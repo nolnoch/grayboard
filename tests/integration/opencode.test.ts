@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localEnv } from "../support/env.ts";
 import { closeSessions, localSession, stopSession } from "../support/mcp.ts";
-import { CLI, ROOT } from "../support/paths.ts";
+import { CLI, REFUSING_MCP, ROOT } from "../support/paths.ts";
 import { grayboardChildren, grayboardChildPids, processDescendants, sigkill } from "../support/procs.ts";
 import { localOpenCode, opencodeTool, type LocalOpenCode, type OpenCodeMessage } from "../support/opencode.ts";
 import { messageText, onChannelDm, promptText, startFakeModel, type Rule } from "../support/fake_model.ts";
@@ -428,6 +428,21 @@ test("opencode: a grayboard process that never answers initialize is killed at t
   expect(toasts.filter((n) => n.includes("didn't initialize within 1 s; restarting it"))).toHaveLength(3);
   expect(toasts.some((n) => n.includes("didn't initialize within 1 s after 3 restarts"))).toBe(true);
   await expect(oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).rejects.toThrow("grayboard process didn't initialize within 1 s");
+  await until(() => grayboardChildPids(oc.pid).length === 0, 5_000, "no grayboard process left");
+  await oc.send("dispose");
+}, 60_000);
+
+// One that answers initialize with an error restarts at once (#1142).
+test("opencode: a grayboard process that answers initialize with an error is restarted at once; after the last restart a call fails with that error (#1142)", async () => {
+  const reason = "grayboard process failed to initialize: grayboard: refused for test";
+  const oc = driver("oc", entry({ command: [process.execPath, REFUSING_MCP, process.execPath, CLI, "mcp", "--mode", "local"] }));
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+  await until(async () => (await oc.send("state")).toasts.some((n: string) => n.includes("after 3 restarts")), 30_000, "restart exhaustion notice");
+  const toasts: string[] = (await oc.send("state")).toasts;
+  expect(toasts.filter((n) => n.includes(`${reason}; restarting it`))).toHaveLength(3);
+  expect(toasts.some((n) => n.includes(`${reason} after 3 restarts`))).toBe(true);
+  await expect(oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).rejects.toThrow(reason);
   await until(() => grayboardChildPids(oc.pid).length === 0, 5_000, "no grayboard process left");
   await oc.send("dispose");
 }, 60_000);

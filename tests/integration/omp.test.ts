@@ -5,7 +5,7 @@ import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalInitDeadlineScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalTaskScenario } from "../support/omp.ts";
+import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalInitFailScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalTaskScenario } from "../support/omp.ts";
 import { installLocal, startLocalOmp } from "../support/omp.ts";
 import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
 import { closeSessions } from "../support/mcp.ts";
@@ -46,7 +46,8 @@ test("omp local: a push-started bind refreshes instructions; a killed child rest
 test("omp local: /new, /fork and /resume rotate actual conversation roots without restarting the child; selected ordered holds and empty snapshots beat outgoing carry; crash restart uses the selected ID (#195)", () => ompLocalResumeScenario(dir), 120_000);
 
 test("omp local: a tool call waiting out a restart's 5 s backoff ends at its abort, not at the backoff's end, and the bind it carried never runs (#559)", () => ompLocalRestartAbortScenario(dir), 60_000);
-test("omp local: a grayboard process that never answers initialize is killed at the deadline and restarted; after the last restart a call fails with the deadline reason (#559)", () => ompLocalInitDeadlineScenario(dir), 90_000);
+test("omp local: a grayboard process that never answers initialize is killed at the deadline and restarted; after the last restart a call fails with the deadline reason (#559)", () => ompLocalInitFailScenario(dir, "deadline"), 90_000);
+test("omp local: a grayboard process that answers initialize with an error is restarted at once; after the last restart a call fails with that error (#1142)", () => ompLocalInitFailScenario(dir, "refused"), 90_000);
 test("omp local: a grayboard that stops reading while it holds the name is killed on EPIPE before the replacement starts, which takes the name back; no stale process remains (#580)", () => ompLocalStopsReadingScenario(dir), 120_000);
 test("omp local: one that also ignores SIGTERM is SIGKILLed, logged, and gone before the replacement starts (#604)", () => ompLocalStopsReadingScenario(dir, { ignoreSigterm: true }), 120_000);
 for (const kind of ["keyed", "human", "runner"] as const) {

@@ -513,9 +513,10 @@ export default function grayboard(pi: ExtensionAPI) {
       if (diff.length) report(ctx, `grayboard: the running grayboard serves different tools than \`grayboard tools\` listed at load: ${diff.join(", ")}`);
       if (own.protocol && shared.owner === pi && shared.ownerToken === owner && shared.selected === selection) await associate(call, selection, owner);
     });
-    // A call that awaits ready gets the failure; this only keeps an unawaited
-    // rejection from crashing omp when no call is waiting.
-    ready.catch(() => {});
+    // A handshake that fails without the process exiting (an error reply, an
+    // invalid acknowledgement) restarts it as an exit does (#1142). fail()
+    // ignores its own rejections and a child that's no longer current.
+    ready.catch((e: Error) => fail(`grayboard process failed to initialize: ${e.message}`));
     const deadline = setTimeout(() => fail(`grayboard process didn't initialize within ${INIT_DEADLINE_MS / 1000} s`), INIT_DEADLINE_MS);
     ready.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
     return { proc, ready, call, epoch: selection.epoch };
