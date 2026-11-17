@@ -413,10 +413,10 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
 
 // An alias a bind or a writes_as names is created on first use (S9), by
 // the user who named it. Callers are inside a transaction, whose Tx is `tx`.
-function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: Exclude<Target, { error: string }>, session: string): void {
+async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: Exclude<Target, { error: string }>, session: string): Promise<void> {
   const { repo } = hub;
   if (repo.aliases.find(tx, address)) return;
-  repo.aliases.create(tx, scope, authed.user_email);
+  await repo.aliases.create(tx, scope, authed.user_email);
   writeAudit(repo, tx, "alias.created", authed.user_email, address, { lazy: true, session });
   onAliasCreated(repo, tx, authed.user_id, address);
 }
@@ -759,12 +759,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // that transaction: the bridge's checks went stale while the write waited (an unlink or stop queued ahead of it).
   async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
-    return repo.write(tx => {
+    return repo.write(async tx => {
       if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = current?.(tx);
       if (stale) fail("unauthenticated", stale);
       if (!repo.aliases.find(tx, addr)) {
-        repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
+        await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
         writeAudit(repo, tx, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
         onAliasCreated(repo, tx, authed.user_id, addr);
       }
@@ -789,7 +789,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
-  function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): BindResult {
+  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
     valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
@@ -862,7 +862,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (capped) return refuse("bad_request", capped, capped);
 
     // No savepoint (#807 P3 A1): a throw here fails the bind, and every caller's transaction rolls back with it.
-    createLazily(hub, tx, authed, target, id);
+    await createLazily(hub, tx, authed, target, id);
     holdAlias(repo.coreOn(tx), address, id, now());
     logBinding(repo.coreOn(tx), id, address, "bound", null);
     if (meta) setAliasMeta(repo.coreOn(tx), address, meta, id, audit, authed.user_email);
@@ -1000,7 +1000,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // `refused`: as `collided` above, for the refused binding row (`hostedRefused`).
     // `later`: where a policy refusal's decision row goes, for the same reason (hosted's `later`).
     // `tx`: the body the request's row is written in.
-    hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: RefusalRow) => void): string {
+    async hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: RefusalRow) => void): Promise<string> {
       const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(repo.coreOn(tx), id, address, "refused", detail); };
       const target = bindTarget(hub, authed, raw);
       if ("error" in target) {
@@ -1024,7 +1024,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
           note(target.address, capped);
           return fail("bad_request", capped);
         }
-        createLazily(hub, tx, authed, target, id);
+        await createLazily(hub, tx, authed, target, id);
       }
       return target.address;
     },

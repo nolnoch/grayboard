@@ -183,9 +183,9 @@ export class AppSession {
     // A refusal's rows, written after its rollback, as hosted registration hands them to `later` (#807 P1b-4f).
     const rows: RefusalRow[] = [], later = (w: RefusalRow) => { rows.push(w); };
     try {
-      ({ session: this.session, info } = await seed(this.repo, tx => {
+      ({ session: this.session, info } = await seed(this.repo, async tx => {
         const writesAs = toolsOnly && this.identity !== null
-          ? this.application.hostedWritesAs(tx, authed, id, this.identity, true, (address, detail) => later(w => this.application.hostedRefused(w, id, address, detail)), later)
+          ? await this.application.hostedWritesAs(tx, authed, id, this.identity, true, (address, detail) => later(w => this.application.hostedRefused(w, id, address, detail)), later)
           : null;
         this.application.hostedRegister(tx, authed, id, this.opts.harness ?? "test", writesAs, why => later(w => this.application.hostedCollided(w, authed, id, why)));
         if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(tx, authed, id, { ownership: 0, client_id: "test" });

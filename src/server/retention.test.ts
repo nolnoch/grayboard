@@ -86,7 +86,7 @@ describe("retention pruning", () => {
     // A board reads as missing to an address no principal owns (#284).
     await seed(r, async tx => {
       await r.users.upsertByEmail(tx, "a@example.com", null);
-      r.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
+      await r.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
       createBoard(db, "a@example.com/be", "e2e", "test");
       post(db, "a@example.com/be", "e2e", "old");
       db.run("UPDATE posts SET created_at = 0");

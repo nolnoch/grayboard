@@ -261,10 +261,11 @@ export interface Repo {
   // Who an address acts for (#284 S12): an ID's registering user, an
   // alias's scope owner, a team broadcast's team.
   resolver: Resolver;
-  // Names in scopes, keyed by address.
+  // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
+  // async Access (A7): `find` and `findAllByName` are Access-seam reads, and the rest feed the synchronous session builder.
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
-    create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Alias;
+    create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Promise<Alias>;
     find(r: Read, address: string): Alias | undefined;
     listForScope(r: Read, kind: ScopeKind, ref: string): Alias[];
     // The scope's names less the Slack link's human, for the cap (#347).
@@ -275,7 +276,7 @@ export interface Repo {
     // session that holds or last held it (ALIAS_SESSION_SQL); unused ones are absent.
     seen(r: Read, addresses: string[]): Map<string, { last_seen: number; cwd: string | null; place: string | null }>;
     // Also deletes the alias's read points.
-    remove(tx: Tx, address: string): void;
+    remove(tx: Tx, address: string): Promise<void>;
   };
   teams: {
     // Inserts the team's principal in the same transaction; throws
@@ -1143,7 +1144,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     aliases: {
-      create(tx, scope, createdBy) {
+      async create(tx, scope, createdBy) {
         const db = sqliteOf(tx);
         const { scope_kind, scope_ref, name } = scope;
         return db.query<Alias, [string, string, string, string, string, number]>(
@@ -1174,7 +1175,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).all(JSON.stringify(addresses));
         return new Map(rows.map(({ address, ...facts }) => [address, facts]));
       },
-      remove(tx, address) {
+      async remove(tx, address) {
         const db = sqliteOf(tx);
         db.transaction(() => {
           db.run("DELETE FROM mailbox_cursors WHERE address = ?", [address]);

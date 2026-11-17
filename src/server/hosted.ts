@@ -13,7 +13,6 @@ import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.
 import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META, validSourceId } from "../shared/session_meta.ts";
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
-import type { Sync } from "./db.ts";
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
@@ -279,7 +278,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   // `settled`: the row settle read in the transaction before this one and left unwritten (#881), so it isn't read
   // twice; with none, it's read here.
-  function rowFor(tx: Tx, p: OAuthPrincipal, context: SessionContext, later: (write: RefusalRow) => void, create = true, wake = true, declare = true, settled?: { row: HostedSession | undefined }): HostedSession | undefined {
+  async function rowFor(tx: Tx, p: OAuthPrincipal, context: SessionContext, later: (write: RefusalRow) => void, create = true, wake = true, declare = true, settled?: { row: HostedSession | undefined }): Promise<HostedSession | undefined> {
     if (!("id" in context)) return undefined;
     let row = settled ? settled.row : store.get(tx, context.id);
     if (row) ownRow(p, row, later);
@@ -287,7 +286,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (!row && create) {
       admit(tx, p.authed.user_id, []);
       const t = now();
-      const writesAs = context.writesAs === undefined ? null : application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, true, (address, detail) => later(w => application.hostedRefused(w, context.id, address, detail)), later);
+      const writesAs = context.writesAs === undefined ? null : await application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, true, (address, detail) => later(w => application.hostedRefused(w, context.id, address, detail)), later);
       row = { session_id: context.id, ownership_id: store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
@@ -298,7 +297,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
       // its shape is refused on every request (#451 A4).
-      const declared = context.writesAs === undefined ? null : application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, false, (address, detail) => later(w => application.hostedRefused(w, context.id, address, detail)), later);
+      const declared = context.writesAs === undefined ? null : await application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, false, (address, detail) => later(w => application.hostedRefused(w, context.id, address, detail)), later);
       if (declared !== row.writes_as) throw new ApplicationError("id_collision", `session ${row.session_id} ${row.writes_as ? `writes as "${row.writes_as}"` : "holds its own aliases"}, and this request ${declared ? `writes as "${declared}"` : "declares no writes_as"}; a session's shape is fixed.`);
     }
     // The latest model and effort a request reports (#364); a write only on a change.
@@ -547,7 +546,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (waited) authorized(p, tx);
           // authorized(p) passed with no await since: settle skips p's own disabled read (#881).
           const settled = settle(tx, context.id, p.authed.user_id);
-          try { return { row: await tx.savepoint(sp => { const r = rowFor(sp, p, context, later.defer, true, wake, declare, settled)!; return { r, seen: touch(sp, r) }; }) }; }
+          try { return { row: await tx.savepoint(async sp => { const r = (await rowFor(sp, p, context, later.defer, true, wake, declare, settled))!; return { r, seen: touch(sp, r) }; }) }; }
           catch (error) { await later.flush(tx); return { error }; }
         });
         waited = true;
@@ -741,7 +740,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       });
     },
     // `defer`: for a session `fn` opens, its `afterRollback`. `tx`: the body's.
-    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T, committed?: (value: T) => R | Promise<R>): Promise<R> {
+    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T | Promise<T>, committed?: (value: T) => R | Promise<R>): Promise<R> {
       return withGate(p, context, true, async row => {
         if (!row) throw new ApplicationError("unbound", `this request carries no session context (${("missing" in context ? context.missing : "missing")}), so it can only read.`);
         rootOnly(row);
@@ -751,7 +750,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // every open's cap check); its own failure isn't a rollback, so it flushes no refusal rows.
         let done = false;
         try {
-          return await store.write(tx => fn(attach(tx, p, row), late.defer, tx) as Sync<T>, (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
+          return await store.write(async tx => fn(attach(tx, p, row), late.defer, tx), (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
       });
     },
@@ -785,7 +784,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery) {
       const normalized = normalizeAliasName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
-      const result = await service.owning(p, context, (row, defer, tx) => {
+      const result = await service.owning(p, context, async (row, defer, tx) => {
         testPause("hosted:bind:in-txn");
         const before = application.hostedHolds(tx, row.session_id);
         // A hosted contender idle past the window, or whose lease lapsed, ends and frees the alias; a live one
@@ -799,7 +798,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
-          const ok = application.bindNow(tx, selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) });
+          const ok = await application.bindNow(tx, selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) });
           const added = ok.held.length !== before.length;
           // `where` restates the place even when the name was already held (a re-bind), as on the other surfaces.
           if (added || args.where !== undefined) store.update(tx, { ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
@@ -868,10 +867,10 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (index < ids.length) return gate(ids[index]!).bind(() => locked(index + 1));
         await testPauseAsync("hosted:register:before-txn");
         const later = refusalRows();
-        try { return await store.write(tx => {
+        try { return await store.write(async tx => {
           authorized(p, tx);
           testPause("hosted:register:in-txn");
-          const root = rowFor(tx, p, context, later.defer)!;
+          const root = (await rowFor(tx, p, context, later.defer))!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
           // An external end/recreate of the root while this waited refuses it (a convert is root_is_child above);
           // a rebind of the same ownership (bind_gen) is what the gate made it wait for, not a change.

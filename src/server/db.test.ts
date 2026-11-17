@@ -65,7 +65,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   const { user, session } = await seed(old.repo, async tx => {
     const user = await old.repo.users.upsertByEmail(tx, "you@example.com", "You");
     const session = await old.repo.sessions.create(tx, user.id, "old-session-hash", "old client");
-    old.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
+    await old.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
     old.repo.messages.insert(tx, "you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
     for (const table of ["oauth_tokens", "oauth_grants", "oauth_codes", "oauth_browsers", "oauth_requests"]) old.db.exec(`DROP TABLE ${table}`);
     return { user, session };
@@ -209,15 +209,15 @@ describe("Repo", () => {
   test("aliases: create, list, remove", async () => {
     const fe = await seed(repo, async tx => {
       await repo.users.upsertByEmail(tx, "you@example.com", null);
-      const fe = repo.aliases.create(tx, person("you@example.com", "fe"), "you@example.com");
-      repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
+      const fe = await repo.aliases.create(tx, person("you@example.com", "fe"), "you@example.com");
+      await repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
       return fe;
     });
     expect(fe.address).toBe("you@example.com/fe");
     expect(repo.aliases.listForScope(repo.read, "person", "you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
     await seed(repo, async tx => {
       await repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 7);
-      repo.aliases.remove(tx, "you@example.com/fe");
+      await repo.aliases.remove(tx, "you@example.com/fe");
     });
     expect(repo.aliases.listForScope(repo.read, "person", "you@example.com")).toHaveLength(1);
     // Its read point goes with it: a new alias of the name starts from scratch.
@@ -229,8 +229,8 @@ describe("Repo", () => {
     const team = await seed(repo, async tx => {
       const u = await repo.users.upsertByEmail(tx, "you@example.com", null);
       repo.teams.create(tx, "eng", u.id);
-      repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
-      return repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
+      await repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
+      return await repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
     });
     expect(team).toMatchObject({ address: "eng/be", scope_kind: "team", scope_ref: "eng", name: "be" });
     expect(repo.aliases.find(repo.read, "eng/be")?.id).toBe(team.id);
@@ -589,9 +589,9 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
+    await repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     await repo.users.upsertByEmail(tx, "b@example.com", null);
-    repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
+    await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
     await repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
@@ -621,9 +621,9 @@ test("queuedTo and retract look the read point up by its key, never a mailbox_cu
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
+    await repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     await repo.users.upsertByEmail(tx, "b@example.com", null);
-    repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
+    await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
     await repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
@@ -898,7 +898,7 @@ test("#807 P1c-13: the aliases store runs on the handle it's given", async () =>
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const { kept } = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
+    await repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     // Read inside the body that wrote it, on its Tx.
     expect(repo.aliases.find(tx, "a@example.com/fe")?.name).toBe("fe");
     return { kept: tx };
@@ -974,7 +974,7 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
   const m = repo.messages;
   const { kept, root, reply } = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "b@example.com", null);
-    repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
+    await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     const root = m.insert(tx, peer, "user", id, "root", null, true);
     const reply = m.insert(tx, id, "user", peer, "reply", root.id);
     db.run("UPDATE aliases SET last_seen = 1000 WHERE address = ?", [peer]);

@@ -326,8 +326,8 @@ test("successful G2 root registration reattaches once; G1 revoke cannot end it, 
 
 test("opening a pre-hosted SQLite schema adds tables without changing users, messages or OAuth", async () => {
   const first = await issue();
-  const message = await seed(database.repo, tx => {
-    database.repo.aliases.create(tx, { scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
+  const message = await seed(database.repo, async tx => {
+    await database.repo.aliases.create(tx, { scope_kind: "person", scope_ref: first.authed.user_email, name: "fe" }, first.authed.user_email);
     return database.repo.messages.insert(tx, "you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
   });
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
