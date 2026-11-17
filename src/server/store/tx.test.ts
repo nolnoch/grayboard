@@ -398,3 +398,50 @@ test("a synchronous body's Tx refuses beforeCommit", async () => {
   expect(errs).toEqual([expect.stringContaining("beforeCommit in a synchronous write body")]);
   expect(rows(repo.read)).toEqual(["holder"]);
 });
+
+// #1182 audit: a savepoint's hook keys follow its SQLite frame, not its settle path.
+test("beforeCommit keys of a savepoint whose RELEASE fails, or of an un-awaited one inside a rolled-back savepoint, drop", async () => {
+  const repo = await open();
+  const seen: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(r => { release = r; });
+  const stray: Promise<unknown>[] = [];
+  await repo.write(async tx => {
+    // P fulfils with C still open: P's RELEASE refuses (out of order) and rolls P back; the body catches and goes on.
+    await expect(tx.savepoint(async p => {
+      p.beforeCommit({}, async () => { seen.push("released-p"); });
+      put(p, "p");
+      stray.push(p.savepoint(async c => { c.beforeCommit({}, async () => { seen.push("released-c"); }); await gate; }).catch(() => {}));
+    })).rejects.toThrow("out of order");
+    // P rejects with C still open: C's key goes with P's rollback.
+    await expect(tx.savepoint(async p => {
+      stray.push(p.savepoint(async c => { c.beforeCommit({}, async () => { seen.push("rolled-c"); }); await gate; }).catch(() => {}));
+      throw new Error("p failed");
+    })).rejects.toThrow("p failed");
+    put(tx, "body");
+  });
+  release();
+  await Promise.all(stray);
+  expect(seen).toEqual([]);
+  expect(rows(repo.read)).toEqual(["body"]);
+});
+
+test("a hook that re-registers its own key doesn't run again; a key from a hook's rolled-back savepoint drops", async () => {
+  const repo = await open();
+  const seen: string[] = [];
+  const key = {};
+  await repo.write(async tx => {
+    tx.beforeCommit(key, async root => {
+      seen.push("hook");
+      root.beforeCommit(key, async () => { seen.push("again"); });
+      await expect(root.savepoint(async sp => {
+        sp.beforeCommit({}, async () => { seen.push("dropped"); });
+        put(sp, "sp");
+        throw new Error("sp failed");
+      })).rejects.toThrow("sp failed");
+      put(root, "hook");
+    });
+  });
+  expect(seen).toEqual(["hook"]);
+  expect(rows(repo.read)).toEqual(["hook"]);
+});
