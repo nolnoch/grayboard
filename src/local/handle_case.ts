@@ -15,8 +15,8 @@
 // Data only (schema changes stay additive). It runs inside the open's schema
 // transaction, after the seed, on every open: a 1.x grayboard still running
 // as `Gray` writes the old name again, and the next open merges those rows
-// too. One name moves under its own savepoint; any failure rolls it back and
-// is reported as a collision, so the step never fails an open.
+// too. One name moves under its own savepoint; a statement that fails rolls
+// it back and is reported as a collision rather than failing the open.
 import type { Database } from "bun:sqlite";
 
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
@@ -39,8 +39,12 @@ const COLUMNS: readonly (readonly [table: string, column: string, keyed: boolean
 
 export type CaseNotice = (line: string) => void;
 
+// The alias row is the human flag's authority (core/boards.ts); handles.human
+// is 1.x's copy, which declaring a human since never updates.
 const isHuman = (db: Database, name: string): boolean =>
-  !!db.prepare(`SELECT 1 FROM aliases WHERE address = ?1 AND human = 1 UNION SELECT 1 FROM handles WHERE name = ?1 AND human = 1`).get(name);
+  !!db.prepare(`SELECT 1 FROM aliases WHERE address = ? AND human = 1`).get(name);
+const cursorOf = (db: Database, name: string): number =>
+  (db.prepare(`SELECT last_seen_id AS c FROM cursors WHERE reader = ?`).get(name) as { c: number } | null)?.c ?? 0;
 const exists = (db: Database, name: string): boolean =>
   !!db.prepare(`SELECT 1 FROM aliases WHERE address = ?1 UNION SELECT 1 FROM handles WHERE name = ?1`).get(name);
 
@@ -72,10 +76,27 @@ export function lowercaseLegacyHandles(db: Database, notice: CaseNotice = (l) =>
     }
     db.exec("SAVEPOINT handle_case");
     try {
+      // Two DM cursors become one. Below its own cursor each name's DMs were
+      // delivered (1.x never stamped delivered_at), so stamp them, then keep
+      // the lower cursor: the other name's undelivered DMs above it still
+      // push, and delivery skips what is stamped.
+      const lowest = merged ? Math.min(cursorOf(db, from), cursorOf(db, to)) : 0;
+      if (merged) {
+        const stamp = db.prepare(`UPDATE messages SET delivered_at = ?1 WHERE recipient = ?2 AND id <= ?3 AND delivered_at IS NULL`);
+        for (const name of [from, to]) stamp.run(Date.now(), name, cursorOf(db, name));
+        // The old alias's queue opt-out and last sighting carry over.
+        db.prepare(
+          `UPDATE aliases SET
+             queue_off = max(coalesce(queue_off, 0), coalesce((SELECT queue_off FROM aliases WHERE address = ?2), 0)),
+             last_seen = max(coalesce(last_seen, 0), coalesce((SELECT last_seen FROM aliases WHERE address = ?2), 0))
+           WHERE address = ?1`,
+        ).run(to, from);
+      }
       for (const [t, c, keyed] of COLUMNS) {
         db.prepare(`UPDATE OR IGNORE ${t} SET ${c} = ?1 WHERE ${c} = ?2`).run(to, from);
         if (keyed) db.prepare(`DELETE FROM ${t} WHERE ${c} = ?`).run(from);
       }
+      if (merged) db.prepare(`UPDATE cursors SET last_seen_id = ? WHERE reader = ?`).run(lowest, to);
       writeCoreAudit(db, "alias.case_moved", "grayboard", to, { from, merged });
       db.exec("RELEASE handle_case");
     } catch (e) {

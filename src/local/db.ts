@@ -87,6 +87,8 @@ export function insertMessage(
   }).immediate();
 }
 
+// Above the cursor and not yet handed over: a 1.x case merge (#216) can lower
+// a cursor below DMs it stamped delivered.
 export function unreadFor(reader: string): Message[] {
   const cursor = getCursor(reader);
   return withAttachments(
@@ -95,7 +97,7 @@ export function unreadFor(reader: string): Message[] {
     db
       .prepare(
         `SELECT ${MSG_COLS} FROM messages
-         WHERE recipient = ? AND id > ?
+         WHERE recipient = ? AND id > ? AND delivered_at IS NULL
          ORDER BY id ASC`,
       )
       .all(reader, cursor) as Message[],

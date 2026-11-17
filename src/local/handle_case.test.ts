@@ -102,7 +102,9 @@ test("an existing lowercase name absorbs the old one; its own keyed rows win", (
   expect(rowsUnder(db, "Gray")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
   // One row per name where a key holds one; both names' DMs, claims and posts.
   expect(rowsUnder(db, "gray")).toEqual([1, 1, 2, 2, 2, 1, 1, 2]);
-  expect(db.prepare(`SELECT last_seen_id FROM cursors WHERE reader = 'gray'`).get()).toEqual({ last_seen_id: 9 });
+  // The lower cursor, with each name's DMs up to its own cursor stamped delivered.
+  expect(db.prepare(`SELECT last_seen_id FROM cursors WHERE reader = 'gray'`).get()).toEqual({ last_seen_id: 1 });
+  expect(count(db, `SELECT COUNT(*) AS n FROM messages WHERE recipient = 'gray' AND delivered_at IS NULL`)).toBe(0);
   expect(db.prepare(`SELECT mode FROM subscriptions WHERE handle = 'gray'`).get()).toEqual({ mode: "quiet" });
   expect(db.prepare(`SELECT detail FROM audit_log WHERE action = 'alias.case_moved'`).all().map((r: any) => JSON.parse(r.detail))).toEqual([{ from: "Gray", merged: true }]);
   expect(audits(db, "alias.case_collision")).toEqual([]);
