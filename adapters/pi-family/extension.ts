@@ -18,7 +18,7 @@ import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams, render, wakes } from "../hosted-core/src/channel.ts";
 import { end, register } from "../hosted-core/src/children.ts";
-import { failureText, HostedClient, message, type Disposable, type Level } from "../hosted-core/src/client.ts";
+import { endFailedText, failureText, HostedClient, message, type Disposable, type Level } from "../hosted-core/src/client.ts";
 import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
 import { Login } from "../hosted-core/src/login.ts";
@@ -350,7 +350,7 @@ export function createGrayboard(h: Harness): Grayboard {
     afterCall: async () => {},
   });
   const endFailed = (id: string) => (error: unknown) =>
-    log(`couldn't end session ${id} on the server: ${message(error)}`, "warning");
+    log(endFailedText(id, error), "warning");
   // omp keeps a finished subagent live (revivable) for its idle TTL, so a
   // child released only at shutdown would hold a slot long after its run: a
   // fan-out of 128 within that TTL would fill the root's cap. An idle child
