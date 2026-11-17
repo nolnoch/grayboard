@@ -9,7 +9,7 @@ const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 
 test("hosted gates remain independent, mandatory and release-blocking", () => {
   const pkg = JSON.parse(read("package.json"));
-  expect(pkg.scripts.test).toBe("bun test --timeout 30000 ./src ./tests");
+  expect(pkg.scripts.test).toBe("bun test --timeout 30000 --parallel ./src ./tests");
   const hosted = read(".github/workflows/hosted.yml");
   expect(hosted).toContain("suite: [hosted-strict, hosted-git, hosted-config, hosted-host, hosted-matrix, hosted-native, hosted-durable, claude-hosted, rust-sdk]");
   expect(hosted).toContain("timeout-minutes: 60");
