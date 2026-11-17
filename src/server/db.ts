@@ -157,16 +157,24 @@ export function queuedTx(repo: Repo): WriteTx {
 
 // queuedTx, plus the core-shaped guard (`() => void`) core calls inside those bodies (attachment store and release):
 // it runs the server's `guard` on the body's own `Tx` (#1053), so the check reads the writer, not a second pool
-// connection. Bodies are synchronous and the queue runs one at a time, so one `body` slot serves them all.
-export function queuedGuardTx(repo: Repo, guard?: (r: Read) => void): { tx: WriteTx; guard?: () => void } {
-  let body: Tx | undefined;
-  const tx: WriteTx = <T>(fn: (db: CoreDb) => T) => repo.write((t: Tx) => {
-    body = t;
-    try { return fn(repo.coreOn(t)) as Sync<T>; } finally { body = undefined; }
+// connection. The server's guard is async and core's bodies are synchronous (#807 P3 A7d2a), so each body awaits the
+// guard on its Tx first, while it holds the queue, and only then runs core's body, whose core-shaped guard throws that
+// verdict: the same check on the same Tx, with no write of core's before it. Every body through `tx` pays the check,
+// the ones whose core body never calls the guard (the blob sweep, a failed store's cleanup) too. `body` is set and
+// cleared with no await between, and the queue runs one body at a time, so one slot serves them all.
+export function queuedGuardTx(repo: Repo, guard?: (r: Read) => void | Promise<void>): { tx: WriteTx; guard?: () => void } {
+  let body: { refused?: { error: unknown } } | undefined;
+  const tx: WriteTx = <T>(fn: (db: CoreDb) => T) => repo.write(async (t: Tx) => {
+    let refused: { error: unknown } | undefined;
+    if (guard) {
+      try { await guard(t); } catch (error) { refused = { error }; }
+    }
+    body = { refused };
+    try { return fn(repo.coreOn(t)); } finally { body = undefined; }
   }) as Promise<T>;
   return { tx, guard: guard && (() => {
     if (!body) throw new Error("an attachment guard ran outside its transaction body");
-    guard(body);
+    if (body.refused) throw body.refused.error;
   }) };
 }
 
@@ -228,8 +236,8 @@ export interface Repo {
   // caller's own transaction, nested, or with no generation to read, it's plain fn().
   authRead<T>(fn: () => T | Promise<T>): Promise<T>;
   // authRead for a synchronous body, and the two auth hot-path reads in synchronous form, for the hosted MCP callers
-  // that stay synchronous until #807 P3 A7d2 (the attachment guard, and the resources, hosted-session and delivery
-  // authorization callbacks). They share the async forms' caches. SQLite only: a store with async statements has no such forms.
+  // that stay synchronous until #807 P3 A7d2 (the resources, hosted-session and delivery authorization callbacks,
+  // through the OAuth server's isAuthorizedNow). They share the async forms' caches. SQLite only: a store with async statements has no such forms.
   authNow: {
     read<T>(fn: () => Sync<T>): T;
     findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;
