@@ -38029,6 +38029,9 @@ var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
 var agentsRoot = (base) => join5(base, "claude-agents");
 var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid));
 var FACTS = ["model", "effort"];
+var HOOK_ERROR = "hook-error";
+var HOOK_ERROR_MAX = 1024;
+var FACT_EVENTS = new Set(["session-start", "pre-tool-use", "model-switch"]);
 var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
 var validFact = (v) => typeof v === "string" && FACT.test(v);
 function put(path, text) {
@@ -38149,7 +38152,30 @@ function readFacts(base, claudePid, harnessStart, bad) {
     else
       bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);
   }
+  try {
+    bad("hook", readSmall(join5(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4));
+  } catch {}
   return out;
+}
+function factReader(read, say) {
+  const said = new Set;
+  return () => {
+    const seen = new Set;
+    const out = read((what, error) => {
+      const text = what === "hook" ? `a grayboard hook failed, so the server may show a stale model or effort: ${error}` : `the server gets no ${what} for this session: ${error}`;
+      seen.add(text);
+      if (!said.has(text)) {
+        said.add(text);
+        say(text);
+      }
+    });
+    if (out !== undefined) {
+      for (const text of said)
+        if (!seen.has(text))
+          said.delete(text);
+    }
+    return out;
+  };
 }
 var calledPath = (base, claudePid, agent) => join5(sessionDir(base, claudePid), "called", createHash7("sha256").update(agent).digest("hex"));
 function markCalled(base, claudePid, agent) {
@@ -38493,13 +38519,7 @@ function createPlugin(o) {
       say(record.message);
     }
   });
-  const badFacts = new Set;
-  const badFact = (fact, error) => {
-    if (badFacts.has(fact))
-      return;
-    badFacts.add(fact);
-    say(`the server gets no ${fact} for this session: ${error}`);
-  };
+  const facts = "error" in config ? undefined : factReader((bad) => readFacts(config.dataDir, o.claude.pid, o.claude.start, bad), say);
   const client = "error" in config || !login ? undefined : new HostedClient({
     harness: HARNESS,
     clientId: CLIENT_ID,
@@ -38513,7 +38533,7 @@ function createPlugin(o) {
     env: o.env,
     launcher: o.env.BUS_LAUNCHER === "1",
     log: (message) => say(message),
-    facts: (sessionID) => sessionID === config.id ? readFacts(config.dataDir, o.claude.pid, o.claude.start, badFact) : undefined,
+    facts: (sessionID) => sessionID === config.id ? facts?.() : undefined,
     ...suggestion ? { suggested: (sessionID) => sessionID === config.id ? suggestion : undefined } : {}
   });
   const initializedOr = (signal) => {

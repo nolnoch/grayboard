@@ -22,6 +22,8 @@
 //                         effort (#545), each written whole by one hook event
 //                         (a root call's effort drops itself when a model
 //                         switch overtook it, #561)
+//   hook-error            hosted only: why the last hook event that writes a
+//                         fact failed, removed when one succeeds (#561)
 //   signin                hosted only: the live sign-in link (#500), which the
 //                         plugin's server writes and its post-tool-use hook shows
 //
@@ -82,6 +84,11 @@ export const sessionDir = (base: string, claudePid: number) => join(agentsRoot(b
 /** The root's facts, one file each. */
 export const FACTS = ["model", "effort"] as const;
 export type Fact = (typeof FACTS)[number];
+/** Why the last fact-writing hook event failed; the plugin says it (#561). */
+export const HOOK_ERROR = "hook-error";
+const HOOK_ERROR_MAX = 1024;
+// The events that write facts.
+const FACT_EVENTS = new Set(["session-start", "pre-tool-use", "model-switch"]);
 // A model id or effort level: printable ASCII without spaces, as Claude Code's
 // are (`claude-opus-5-5`, `claude-opus-5-5[1m]`, `high`), no longer than the
 // server keeps, so what it shows is what the hook wrote.
@@ -175,7 +182,37 @@ function ageMs(path: string, now: number): number | undefined {
  * link is only ever a `systemMessage` (the user's line): `additionalContext`,
  * a `reason` and exit-2 stderr all reach the model.
  */
-export function runHook(event: string, stdin: string, o: { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number }): string | undefined {
+type HookOptions = { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number };
+export function runHook(event: string, stdin: string, o: HookOptions): string | undefined {
+  const failed = (error: unknown) => {
+    // Hosted: the hook says nothing (it must never block a call), so a fact it
+    // couldn't write would leave the last one standing with no signal. Its
+    // reason goes in a file the plugin says once (#561); on a full disk that
+    // write fails too, and stays silent.
+    if (!o.hosted || !FACT_EVENTS.has(event)) return;
+    try {
+      const pid = Number(o.env.CLAUDE_PID);
+      if (!Number.isSafeInteger(pid) || pid <= 1) return;
+      const text = `${event}: ${error instanceof Error ? error.message : String(error)}`.replace(/[\x00-\x1f\x7f]+/g, " ").slice(0, HOOK_ERROR_MAX);
+      put(join(sessionDir(o.base, pid), HOOK_ERROR), text);
+    } catch { /* nothing more to say it with */ }
+  };
+  let out: string | undefined;
+  try { out = hookEvent(event, stdin, o); }
+  catch (error) {
+    // Hosted: hookEvent rethrows only for this, and the hook exits 0 regardless.
+    failed(error);
+    if (o.hosted) return undefined;
+    throw error;
+  }
+  if (o.hosted && FACT_EVENTS.has(event)) {
+    const pid = Number(o.env.CLAUDE_PID);
+    if (Number.isSafeInteger(pid) && pid > 1) try { rmSync(join(sessionDir(o.base, pid), HOOK_ERROR), { force: true }); } catch (error) { failed(error); }
+  }
+  return out;
+}
+
+function hookEvent(event: string, stdin: string, o: HookOptions): string | undefined {
   try {
     const pid = Number(o.env.CLAUDE_PID);
     if (!Number.isSafeInteger(pid) || pid <= 1) return;
@@ -269,6 +306,7 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       throw error;
     }
     if (!o.hosted && event === "session-end") throw error;
+    if (o.hosted) throw error;
     // Attribution failures are said by the reader's missing-record error.
   }
 }
@@ -434,7 +472,7 @@ export function readCurrent(base: string, pid: number, harnessStart: string | nu
  * one is left out and passed to `bad` (the caller says it), so the other fact
  * still goes.
  */
-export function readFacts(base: string, claudePid: number, harnessStart: string | null, bad: (fact: Fact, error: string) => void): { model?: string | null; effort?: string | null } | undefined {
+export function readFacts(base: string, claudePid: number, harnessStart: string | null, bad: (what: Fact | "hook", error: string) => void): { model?: string | null; effort?: string | null } | undefined {
   const dir = sessionDir(base, claudePid);
   let start: string;
   try { start = readFileSync(join(dir, "start"), "utf8"); } catch { return undefined; }
@@ -450,7 +488,25 @@ export function readFacts(base: string, claudePid: number, harnessStart: string 
     else if (validFact(value)) out[fact] = value;
     else bad(fact, `${join(dir, fact)} isn't a Claude Code ${fact}`);
   }
+  // A hook that couldn't write a fact (#561); unreadable is as good as absent.
+  try { bad("hook", readSmall(join(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4)); } catch { /* none */ }
   return out;
+}
+
+/** The facts as the hooks last wrote them, read by `read` (readFacts's arguments bound); a problem is said once, again only after a read without it. */
+export function factReader(read: (bad: (what: Fact | "hook", error: string) => void) => ReturnType<typeof readFacts>, say: (text: string) => void): () => ReturnType<typeof readFacts> {
+  const said = new Set<string>();
+  return () => {
+    const seen = new Set<string>();
+    const out = read((what, error) => {
+      const text = what === "hook" ? `a grayboard hook failed, so the server may show a stale model or effort: ${error}` : `the server gets no ${what} for this session: ${error}`;
+      seen.add(text);
+      if (!said.has(text)) { said.add(text); say(text); }
+    });
+    // Nothing read (another process's dir) says nothing about what's fixed.
+    if (out !== undefined) for (const text of said) if (!seen.has(text)) said.delete(text);
+    return out;
+  };
 }
 
 const calledPath = (base: string, claudePid: number, agent: string) =>

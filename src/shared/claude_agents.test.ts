@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dropCalled, dropSignIn, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
+import { dropCalled, dropSignIn, factReader, HOOK_ERROR, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
 import { SIGN_IN_FLOW_MS } from "./signin.ts";
 import { procStart } from "./proc.ts";
 import { pauseEnv, releasePause } from "../../tests/support/local_bus.ts";
@@ -242,6 +242,40 @@ describe("facts (#545)", () => {
     hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
     expect(facts()).toEqual({ model: "claude-opus-5-5" });
     expect(said).toEqual([]);
+  });
+
+  test("a fact-writing hook that fails leaves its reason, which the reader says; the next success removes it (#561)", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    const dir = sessionDir(base, pid);
+    // A directory where the effort goes: the write fails, and the hook still never throws.
+    mkdirSync(join(dir, "effort", "x"), { recursive: true });
+    expect(() => hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "high" } }, true)).not.toThrow();
+    expect(facts()).toEqual({ model: "claude-opus-5-5" });
+    expect(said.map(s => s.split(":")[0])).toEqual(["effort", "hook"]);
+    expect(said[1]).toStartWith("hook: pre-tool-use: ");
+    rmSync(join(dir, "effort"), { recursive: true });
+    hook("pre-tool-use", { tool_use_id: id(2), effort: { level: "high" } }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(false);
+    said.length = 0;
+    expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "high" });
+    expect(said).toEqual([]);
+  });
+
+  test("the plugin's reader says a problem once, and again only after a read without it (#561)", () => {
+    const out: string[] = [];
+    let problems: [Parameters<Parameters<typeof readFacts>[3]>[0], string][] = [["effort", "bad"], ["hook", "pre-tool-use: full"]];
+    let other = false;
+    const read = factReader(bad => { if (other) return undefined; for (const [what, error] of problems) bad(what, error); return {}; }, text => out.push(text));
+    read(); read();
+    expect(out).toEqual(["the server gets no effort for this session: bad", "a grayboard hook failed, so the server may show a stale model or effort: pre-tool-use: full"]);
+    // Another process's dir reads nothing: no news, so nothing re-arms.
+    problems = []; other = true; read(); other = false;
+    problems = [["effort", "bad"]]; read();
+    expect(out).toHaveLength(2);
+    // Fixed, then broken again: said again; a new hook failure is its own.
+    problems = []; read();
+    problems = [["effort", "bad"], ["hook", "model-switch: full"]]; read();
+    expect(out.slice(2)).toEqual(["the server gets no effort for this session: bad", "a grayboard hook failed, so the server may show a stale model or effort: model-switch: full"]);
   });
 
   // #561 item 7: a root call's hook still running when a confirmed /model switch

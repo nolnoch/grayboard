@@ -158,6 +158,9 @@ var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
 var agentsRoot = (base) => join(base, "claude-agents");
 var sessionDir = (base, claudePid) => join(agentsRoot(base), String(claudePid));
 var FACTS = ["model", "effort"];
+var HOOK_ERROR = "hook-error";
+var HOOK_ERROR_MAX = 1024;
+var FACT_EVENTS = new Set(["session-start", "pre-tool-use", "model-switch"]);
 var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
 var validFact = (v) => typeof v === "string" && FACT.test(v);
 function putFact(dir, fact, value) {
@@ -203,6 +206,38 @@ function ageMs(path, now) {
   }
 }
 function runHook(event, stdin, o) {
+  const failed = (error) => {
+    if (!o.hosted || !FACT_EVENTS.has(event))
+      return;
+    try {
+      const pid = Number(o.env.CLAUDE_PID);
+      if (!Number.isSafeInteger(pid) || pid <= 1)
+        return;
+      const text = `${event}: ${error instanceof Error ? error.message : String(error)}`.replace(/[\x00-\x1f\x7f]+/g, " ").slice(0, HOOK_ERROR_MAX);
+      put(join(sessionDir(o.base, pid), HOOK_ERROR), text);
+    } catch {}
+  };
+  let out;
+  try {
+    out = hookEvent(event, stdin, o);
+  } catch (error) {
+    failed(error);
+    if (o.hosted)
+      return;
+    throw error;
+  }
+  if (o.hosted && FACT_EVENTS.has(event)) {
+    const pid = Number(o.env.CLAUDE_PID);
+    if (Number.isSafeInteger(pid) && pid > 1)
+      try {
+        rmSync(join(sessionDir(o.base, pid), HOOK_ERROR), { force: true });
+      } catch (error) {
+        failed(error);
+      }
+  }
+  return out;
+}
+function hookEvent(event, stdin, o) {
   try {
     const pid = Number(o.env.CLAUDE_PID);
     if (!Number.isSafeInteger(pid) || pid <= 1)
@@ -293,6 +328,8 @@ function runHook(event, stdin, o) {
       throw error;
     }
     if (!o.hosted && event === "session-end")
+      throw error;
+    if (o.hosted)
       throw error;
   }
 }
