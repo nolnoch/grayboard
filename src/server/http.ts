@@ -12,12 +12,13 @@ import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
-import { authorizeNow, decidePure, recordDecision, type AuthzRequest, type PureRequest } from "./policy.ts";
+import { authorize, decidePure, recordDecision, type AuthzRequest, type PureRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 import { listClaims } from "../core/claims.ts";
 import { addressSet, aliasHeldText, aliasUser, idRow } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
@@ -163,17 +164,21 @@ async function whoami(authed: AuthedUser, repo: Repo): Promise<Response> {
 // board, which a handle may not be able to see, is left out, and a holder
 // whose name the user may not see (a team's alias, outside the team) is
 // withheld with its note, as claim_list does (#871).
-function claimList(url: URL, authed: AuthedUser, repo: Repo): Response {
+async function claimList(url: URL, authed: AuthedUser, repo: Repo): Promise<Response> {
   const prefix = url.searchParams.get("prefix") ?? undefined;
   const principal = { kind: "user" as const, name: authed.user_email };
-  const sees = (holder: string): boolean => {
+  const sees = async (holder: string): Promise<boolean> => {
     // A deleted team name (#347) keeps its claims and stays inside the team that had it.
     const a = repo.aliases.find(repo.read, holder);
     const p = a ? null : addressParts(holder);
     const scope = a ? { scope_kind: a.scope_kind, scope_ref: a.scope_ref } : p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team" as const, scope_ref: p.scope } : null;
-    return !scope || scope.scope_ref === null || authorizeNow(repo, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
+    return !scope || scope.scope_ref === null || (await authorize(repo, repo.read, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
   };
-  return json(listClaims(repo.coreOn(repo.read), prefix).map(({ board: _b, ...c }) => (sees(c.holder) ? c : { ...c, holder: null, note: null })));
+  const claims = listClaims(repo.coreOn(repo.read), prefix);
+  // One decision per distinct holder.
+  const seen = new Map<string, boolean>();
+  for (const c of claims) if (!seen.has(c.holder)) seen.set(c.holder, await sees(c.holder));
+  return json(claims.map(({ board: _b, ...c }) => (seen.get(c.holder) ? c : { ...c, holder: null, note: null })));
 }
 
 // An address the caller may act as (#284 S11), in full, or the refusal: a
@@ -181,7 +186,7 @@ function claimList(url: URL, authed: AuthedUser, repo: Repo): Response {
 // the caller's scope or a team's it belongs to, and never be a human
 // (`humanReason` says why); a session ID must be the caller's, live and no
 // viewer, so nothing acts as an ended session.
-function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUser, repo: Repo, humanReason: string): string | Response {
+async function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUser, repo: Repo, humanReason: string): Promise<string | Response> {
   if (!input) return badRequest("as required: the address to act as");
   const p = addressParts(input);
   if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
@@ -198,9 +203,9 @@ function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUse
   }
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
   // The rule decides the human name first (`humanReason`), before the scope's owner.
-  const owner = repo.policyNow.principalOf(address);
+  const owner = await repo.principals.of(r, address);
   const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
-  const d = authorizeNow(repo, {}, req);
+  const d = await authorize(repo, r, {}, req);
   if (!d.allow) {
     recordDecision(repo, r, { user: authed.user_email, address }, req, d);
     if (d.rule === "alias.human_reserved") return forbidden(humanReason);
@@ -226,8 +231,8 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, wake: (ha
   if (!body?.as || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("as and a claim tool required");
   const tool = body.tool, args = body.args ?? {};
   // The address check and the tool are one queued transaction; the wakes follow its commit.
-  return repo.write((tx: Tx) => {
-    const handle = ownAddress(tx, body.as, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
+  return repo.write(async (tx: Tx) => {
+    const handle = await ownAddress(tx, body.as, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
     if (handle instanceof Response) return handle;
     if (args.as !== undefined) return badRequest("name the address to act as in as, not args.as");
     try {
@@ -268,7 +273,7 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, conf
     if (capped) return badRequest(capped);
     const identity = await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
     writeAudit(repo, tx, "alias.created", authed.user_email, identity.address);
-    onAliasCreated(repo, tx, authed.user_id, identity.address);
+    await onAliasCreated(repo, tx, authed.user_id, identity.address);
     return json({ name: identity.name, created_at: identity.created_at }, 201);
   });
 }
@@ -296,7 +301,7 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response 
 // (src/server/mcp-attachments.ts) set to the session's bound name; no HTTP
 // route takes it from a client (#475). The Slack bridge's human stores its
 // files in-process, not here.
-function queryAs(url: URL, authed: AuthedUser, repo: Repo): string | Response {
+function queryAs(url: URL, authed: AuthedUser, repo: Repo): Promise<string | Response> {
   return ownAddress(repo.read, url.searchParams.get("as"), authed, repo, HUMAN_RESERVED);
 }
 
@@ -306,7 +311,7 @@ function queryAs(url: URL, authed: AuthedUser, repo: Repo): string | Response {
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
 export async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, uploads: UploadGate, guard?: Guard, signal = req.signal): Promise<Response> {
-  const handle = queryAs(url, authed, repo);
+  const handle = await queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
   if (!rawName) return badRequest("filename required");
@@ -353,7 +358,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
 // A download (`<id>?as=`), for the hosted byte route's GET: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: Guard): Promise<Response> {
-  const handle = queryAs(url, authed, repo);
+  const handle = await queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   const read = requestAttachment(repo, repo.read, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
   if ("refused" in read) return jsonErr("not_found", read.refused, 404);
@@ -391,7 +396,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
 // A release (`<id>?as=`), for the hosted byte route's DELETE: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
 export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: Guard): Promise<Response> {
-  const handle = queryAs(url, authed, repo);
+  const handle = await queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   await guard?.(repo.read);
   const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, authed.user_email, handle, Number(idStr), {}, guard) : null;
@@ -438,9 +443,9 @@ function teamJoin(): Response {
 
 // A team the caller isn't in reads as not found, like its board; an admin
 // can't leave a team it isn't in. A refusal is recorded (policy.ts).
-function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): Team | null {
-  const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: repo.policyNow.teamByName(teamName.toLowerCase()) };
-  const d = authorizeNow(repo, {}, req);
+async function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): Promise<Team | null> {
+  const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
+  const d = await authorize(repo, h, {}, req);
   if (!d.allow) {
     recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
     return null;
@@ -451,9 +456,9 @@ function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): 
 // Members read their team's roster; admins can read any team's. as_admin
 // marks the audit row when an admin isn't a member. A denial is recorded
 // (policy.ts), and reads as not found.
-function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
-  const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: repo.policyNow.teamByName(teamName.toLowerCase()) };
-  const d = authorizeNow(repo, { admins: config.admins }, req);
+async function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<{ team: Team; audit: { as_admin?: true } } | null> {
+  const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
+  const d = await authorize(repo, h, { admins: config.admins }, req);
   if (!d.allow) {
     recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
     return null;
@@ -467,9 +472,9 @@ function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, 
 // team names the creator lost). as_admin marks an admin acting without
 // owning. A non-member still reads not found; a member who isn't an owner
 // is refused, naming who can. Every decision is recorded (policy.ts).
-function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
-  const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: repo.policyNow.teamByName(teamName.toLowerCase()) };
-  const d = authorizeNow(repo, { admins: config.admins }, req);
+async function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<{ team: Team; audit: { as_admin?: true } } | Response> {
+  const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
+  const d = await authorize(repo, h, { admins: config.admins }, req);
   recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
   if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
   return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
@@ -479,7 +484,7 @@ const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409
 
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: SessionHooks): Promise<Response> {
   return repo.write(async (tx) => {
-    const team = memberTeam(tx, teamName, authed, repo);
+    const team = await memberTeam(tx, teamName, authed, repo);
     if (!team) return notFound();
     try {
       await repo.teams.removeMember(tx, team.id, authed.user_id);
@@ -499,7 +504,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
   // demoted while a slow body trickles in must not act on a stale check.
   const body = await parseBody<{ email: string; role?: unknown }>(req);
   return repo.write(async (tx) => {
-    const managed = ownedTeam(tx, teamName, authed, repo, config);
+    const managed = await ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const { team } = managed;
     if (!body?.email) return badRequest("email required");
@@ -530,7 +535,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
 async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config, sessions: SessionHooks): Promise<Response> {
   const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
   return repo.write(async (tx) => {
-    const managed = ownedTeam(tx, teamName, authed, repo, config);
+    const managed = await ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const { team } = managed;
     if (!body?.email) return badRequest("email required");
@@ -559,7 +564,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
 async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ policy?: unknown }>(req);
   return repo.write(async (tx) => {
-    const managed = ownedTeam(tx, teamName, authed, repo, config);
+    const managed = await ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     const policy = body?.policy;
     if (typeof policy !== "string" || !(TEAM_POLICIES as readonly string[]).includes(policy)) return badRequest(`policy must be one of ${TEAM_POLICIES.map(p => `"${p}"`).join(", ")}`);
@@ -578,7 +583,7 @@ async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, re
 async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ name?: unknown }>(req); // before the ownership check, as in teamAdd
   return repo.write(async tx => {
-    const managed = ownedTeam(tx, teamName, authed, repo, config);
+    const managed = await ownedTeam(tx, teamName, authed, repo, config);
     if (managed instanceof Response) return managed;
     if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
     const name = body.name.toLowerCase();
@@ -595,12 +600,16 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
   });
 }
 
-function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Response {
-  const managed = managedTeam(repo.read, teamName, authed, repo, config);
-  if (!managed) return notFound();
-  // Synchronously beside the guard (#807 P3 A7e3): an await between them would let a member removed meanwhile read
-  // the roster. A7f moves both to the async loader together.
-  return json(repo.policyNow.teamMembers(managed.team.id));
+// The roster is read before the guard decides (#807 P3 A7f1): a member removed between the two reads is refused,
+// where guard-first would hand the roster to someone removed while it was being read. One added between them sees
+// the roster from just before they joined.
+async function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
+  const team = await repo.teams.findByName(repo.read, teamName.toLowerCase());
+  const roster = team ? await repo.teams.listMembers(repo.read, team.id) : [];
+  await testPauseAsync("http:team-members:between");
+  const managed = await managedTeam(repo.read, teamName, authed, repo, config);
+  if (!managed || managed.team.id !== team?.id) return notFound();
+  return json(roster);
 }
 
 // ── admin ────────────────────────────────────────────────────────────────────

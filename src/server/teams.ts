@@ -36,12 +36,12 @@ export function onTeamLeft(repo: Repo, tx: Tx, team: Team, email: string): void 
 
 // A person's alias follows each of its user's teams; a team's alias follows
 // only its own team (#284 S9), whoever created it.
-export function onAliasCreated(repo: Repo, tx: Tx, userId: number, handle: string): void {
+export async function onAliasCreated(repo: Repo, tx: Tx, userId: number, handle: string): Promise<void> {
   const creator = repo.users.findById(userId)?.email;
   if (!creator) return;
   const p = addressParts(handle);
   if (p?.kind !== "alias") return;
-  const teams = p.scopeKind === "person" ? repo.policyNow.teamsOf(userId) : [repo.policyNow.teamByName(p.scope)].filter((t): t is Team => !!t);
+  const teams = p.scopeKind === "person" ? await repo.teams.listForUser(tx, userId) : [await repo.teams.findByName(tx, p.scope)].filter((t): t is Team => !!t);
   for (const team of teams) {
     ensureTeamBoard(repo, tx, team, creator);
     follow(repo.coreOn(tx), handle, team);
