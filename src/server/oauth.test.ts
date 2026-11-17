@@ -1,6 +1,7 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { auth, Client, StreamableHTTPClientTransport, type OAuthClientProvider, type OAuthDiscoveryState, type StoredOAuthTokens } from "@modelcontextprotocol/client";
 import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { createHash, randomBytes, randomInt } from "node:crypto";
@@ -174,6 +175,31 @@ test("internal grant liveness survives individual access revocation but never au
   expect(await service.isGrantActive(next.grantId)).toBe(false);
   service.close();
   expect(await service.isGrantActive(grant.grantId)).toBe(false);
+});
+
+// #807 P3 A7u2: peekAuthorized answers from the auth cache alone. A live token whose user isn't cached under the same
+// generation is a miss (the caller checks in full), and nothing is read; a cached user that is disabled or gone refuses.
+test("peekAuthorized is a miss on a token hit whose user isn't cached, reads no user, and refuses a disabled or gone one", async () => {
+  const grant = await issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:tools"], clock);
+  const p = await service.authenticate(new Request(service.resource, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (p instanceof Response) throw new Error("expected fixture principal");
+  const query = spyOn(Database.prototype, "query");
+  const userReads = () => query.mock.calls.filter(([sql]) => String(sql) === "SELECT * FROM users WHERE id = ?").length;
+  try {
+    // authenticate filled the token and its user under one generation.
+    expect(service.peekAuthorized(p, storage.repo.authPeek()!)).toBe(true);
+    // A new generation, then the token alone: its user is a miss.
+    await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, grant.authed.user_id, false));
+    expect(await storage.repo.oauth.findActiveAccess(storage.repo.read, p.accessHash, service.resource, [], clock)).toBeDefined();
+    expect(service.peekAuthorized(p, storage.repo.authPeek()!)).toBeUndefined();
+    expect(userReads()).toBe(0);
+  } finally { query.mockRestore(); }
+  const user = (await storage.repo.users.findById(storage.repo.read, grant.authed.user_id))!;
+  const access = (await storage.repo.oauth.findActiveAccess(storage.repo.read, p.accessHash, service.resource, [], clock))!;
+  const peek = (u: typeof user | null) => ({ generation: "g", access: () => access, user: () => u });
+  expect(service.peekAuthorized(p, peek(user))).toBe(true);
+  expect(service.peekAuthorized(p, peek({ ...user, disabled_at: clock }))).toBe(false);
+  expect(service.peekAuthorized(p, peek(null))).toBe(false);
 });
 
 test("CIMD refuses every issuer-origin redirect before creating a phishing flow", async () => {
@@ -484,6 +510,10 @@ test("OAuth event trail records decisions, grant, strict replay warnings and rev
     for (const action of ["request_refused", "authorize", "upstream_authenticated", "consent_denied", "consent_approved", "grant_issued", "code_replay_revoked", "refreshed", "refresh_replay_revoked", "revoked", "revoke_requested"]) expect(actions).toContain("oauth." + action);
     // #928 D9: the upstream rows name their provider.
     expect(rows.filter(r => r.action === "oauth.upstream_authenticated").map(r => [r.actor, JSON.parse(r.detail)])).toContainEqual(["you@example.com", { client_id: "native", provider: "google" }]);
+    // #807 P3 A7u2: the consent rows name the signed-in user, read async before the decision's write.
+    const consents = rows.filter(r => /^oauth\.consent_(approved|denied)$/.test(r.action)).map(r => r.actor);
+    expect(consents.length).toBeGreaterThan(1);
+    expect(new Set(consents)).toEqual(new Set(["you@example.com"]));
     for (const row of rows.filter(r => /grant_issued|replay_revoked|refreshed|^oauth.revoked$/.test(r.action))) {
       expect(row.actor).toBe("you@example.com");
       expect(JSON.parse(row.detail).client_id).toBe("native");

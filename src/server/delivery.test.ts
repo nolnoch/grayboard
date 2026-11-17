@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { refusalCount } from "./metrics.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
+import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -448,4 +449,13 @@ test("a configured per-user lease cap admits past the default and refuses at its
   const contender = context(bob, "contender");
   await hosted.bind(bob, contender, { name: "contender", create: true });
   await expect(delivery.open(bob, contender)).rejects.toThrow("delivery lease capacity reached");
+});
+
+// The lease body awaits its lease_opened audit, whose actor read awaits: the row lands in the body's transaction, not
+// on a Tx closed by a commit that ran while the read was pending (#807 P3 A7u2 audit B2).
+test("open's lease_opened audit commits inside the lease body, naming the actor", async () => {
+  const lease = await hostedPause("hosted:audit:user", () => delivery.open(bob, context(bob)), async () => {});
+  expect(lease.capability).toBeString();
+  const rows = store.db.query<{ actor: string }, []>("SELECT actor FROM access_log WHERE action = 'hosted.lease_opened'").all();
+  expect(rows).toEqual([{ actor: bob.authed.user_email }]);
 });
