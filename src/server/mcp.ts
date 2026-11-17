@@ -53,7 +53,7 @@ const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
 // `instruction`: what the bound text reads from the ownership (its launcher flag and lease), read by `select` for a
 // context makeServer may give the bound text (#807 P3 A7h2).
-type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; verdict?: Verdict; role: HostedRole; session: ApplicationSession; info: IdentityInfo; instruction?: { launcher: boolean; leased: boolean }; finish(): void };
+type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number; holding: boolean }; verdict?: Verdict; role: HostedRole; session: ApplicationSession; info: IdentityInfo; instruction?: { launcher: boolean; leased: boolean }; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
 // A legacy session whose access token expired with its grant still active sleeps
 // (#476): its admission is released, its sid stays, and the binding's next
@@ -314,12 +314,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   function matches(a: Binding, b: Binding) { return a.user === b.user && a.email === b.email && a.grant === b.grant && a.role === b.role; }
   // Judged from rows already read (a Checked, or a live's `bound`): the pair must be the row and the root it names,
-  // under one ownership (the readRoot check), so a pair a commit split is refused.
+  // under one ownership (the readRoot check), so a pair a commit split is refused. Whether the root holds a name is
+  // the stamp's (#807 P3 B1b), read with it: it stands while the root's generation matches the stamp's.
   function bindingLive(context: Context, bound: Bound) {
     if (!("id" in context.sessionContext)) return false;
     const { row, root } = bound;
     if (!row || !root || root.session_id !== (row.root_session_id ?? row.session_id) || root.ownership_id !== row.ownership_id) return false;
-    return hosted.named(root) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
+    return (context.stamp?.holding || root.writes_as !== null) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
   }
   // The rows a live's binding reads: its own and its root's (from `row`, its own as its creator read it), fixed at
   // creation (#399). A commit names the one row it changed, so only the lives reading it are checked.

@@ -1384,6 +1384,35 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   await kept.close();
 });
 
+// #807 P3 B1b: a commit's notice judges a live synchronously, so whether its root holds a name comes from the stamp
+// its authorize read with the generation, never from a holds read outside a transaction.
+test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its listen, judged with no holds read", async () => {
+  const { Database } = await import("bun:sqlite");
+  const client = await connect();
+  expect((await client.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
+  expect((await client.callTool({ name: "board_create", arguments: { name: "held", purpose: "B1b" } })).isError).not.toBe(true);
+  const listen = await client.listen({ resourceSubscriptions: ["grayboard://boards/held"] });
+  expect(hosted.activeListens).toBe(1);
+  const root = async (r: Read) => (await store.repo.hosted.all(r)).find(row => !row.root_session_id && row.user_id === user.user_id)!;
+  // Holds reads outside any transaction: the pool's, as bindingLive's was before B1b.
+  const pooled: string[] = [];
+  const query = Database.prototype.query;
+  const spy = spyOn(Database.prototype, "query").mockImplementation(function (this: InstanceType<typeof Database>, sql: string) {
+    if (sql.includes("alias_holds") && !this.inTransaction) pooled.push(sql);
+    return query.call(this, sql);
+  } as typeof query);
+  try {
+    // A commit to the root's row that leaves its generation: its notice carries the row, and the judge keeps the live.
+    await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, { ...r, last_seen_at: r.last_seen_at + 1 }); });
+    expect(hosted.activeListens).toBe(1);
+    expect(pooled).toEqual([]);
+  } finally { spy.mockRestore(); }
+  // The same path still stops it once the generation moves.
+  await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+  await untilHosted(() => hosted.activeListens === 0);
+  await listen.close();
+});
+
 test("#902: a native tool call authorizes under one auth-generation read and leaves its row to the hosted gate", async () => {
   const { Database } = await import("bun:sqlite");
   const client = await connect();

@@ -100,6 +100,28 @@ test("a revoked hold leaves the live session: the alias's mail isn't pushed to i
   await expect(build.call("board_post", { board: "e2e", body: "as the team", as: "eng/build" })).rejects.toThrow();
 });
 
+// #807 P3 B1b: a recheck in a caller's body resyncs its live holders from the holds as that body commits, so a hold
+// the body drops after the recheck returns leaves the live session too.
+test("a recheck inside a caller's body resyncs a live holder from the holds the body commits", async () => {
+  const s = srv.appSession(bob, "eng/build");
+  await s.connect();
+  expect(await s.bind("side", { create: true })).toMatchObject({ held: ["eng/build", `${B}/side`] });
+  const repo = srv.app.repo;
+  await seed(repo, async tx => {
+    const team = (await repo.teams.findByName(tx, "eng"))!;
+    await repo.teams.removeMember(tx, team.id, (await repo.users.findByEmail(tx, B))!.id);
+    await srv.app.application.accessChanged(tx, B, "alice@example.com");
+    // After the recheck returned: the body drops the other hold too.
+    srv.app.db.run(`DELETE FROM alias_holds WHERE address = ?`, [`${B}/side`]);
+  });
+  expect(holder("eng/build")).toEqual([]);
+  // Neither address is the live session's any more: mail to the dropped one isn't pushed to it.
+  const peer = srv.appSession(alice, "fe");
+  await peer.connect();
+  await peer.send(`${B}/side`, "dropped in the body");
+  await s.none(direct((m) => m.body === "dropped in the body"));
+});
+
 // hosted twin: #451 (team aliases on a session, alias_lost)
 test("leaving a team releases its aliases from the leaver's sessions; revalidate catches a membership changed behind the server", async () => {
   let build = srv.appSession(bob, "eng/build");

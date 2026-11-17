@@ -377,7 +377,7 @@ export interface Repo {
     shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
   };
   // Every read and write returns a promise (#807 P3 A6d2, A7i) but openDelegations: core's synchronous resolveDelegation
-  // calls it per candidate, so it is core's port until P3 forks core, as hostedHolds is.
+  // calls it per candidate, so it is core's port until P3 forks core.
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
