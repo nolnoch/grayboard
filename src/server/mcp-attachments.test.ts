@@ -76,6 +76,11 @@ async function uploaded() {
 }
 const count = () => (store.db.query("SELECT COUNT(*) AS n FROM attachments").get() as { n: number }).n;
 
+// #807 P3 A7d2c: the OAuth server's synchronous checks are gone; every check awaits its token read.
+test("the OAuth server has no synchronous authorization forms", () => {
+  for (const key of ["authenticateNow", "isAuthorizedNow"]) expect(key in oauth).toBe(false);
+});
+
 test("precise routing, canonical challenge, strict query and existing identity only", async () => {
   for (const path of ["/api/attachments", "/hosted/mcp/attachments/1/extra", "/hosted/mcp/attachments-other"]) expect(router.fetch(request("GET", path))).toBeUndefined();
   expect(router.fetch(request("PUT"))).toBeUndefined();

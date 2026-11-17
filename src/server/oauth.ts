@@ -622,16 +622,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   function activeAccess(accessHash: string, r: Read = repo.read): Promise<{ access: OAuthAccess; email: string } | undefined> {
     return repo.authRead(async () => withEmail(await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
   }
-  // The synchronous form, for isAuthorizedNow until #807 P3 A7d2c (Repo.authNow).
-  function activeAccessNow(accessHash: string, r: Read = repo.read): { access: OAuthAccess; email: string } | undefined {
-    return repo.authNow.read(() => withEmail(repo.authNow.findActiveAccess(r, accessHash, resource, [], now())));
-  }
   function withEmail(access: OAuthAccess | undefined): { access: OAuthAccess; email: string } | undefined {
     if (!access) return undefined;
     const email = repo.users.activeEmail(access.userId);
     return email === undefined ? undefined : { access, email };
   }
-  // A bearer header's token hash, or the refusal; the access lookup is the caller's, sync or async.
+  // A bearer header's token hash, or the refusal; the access lookup is the caller's.
   function bearer(req: Request, requiredScopes: string[]): string | Response {
     if (requiredScopes.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s))) throw new Error("unknown required OAuth scope");
     const u = new URL(req.url), auth = req.headers.get("authorization");
@@ -685,10 +681,6 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const a = peek.access(principal.accessHash, resource, now());
       if (!a) return undefined;
       return repo.users.activeEmail(a.userId) !== undefined && authorizedBy(principal, a);
-    },
-    isAuthorizedNow(principal: OAuthPrincipal, r?: Read): boolean {
-      if (closed || principal.accessExpiry <= now()) return false;
-      return authorizedBy(principal, activeAccessNow(principal.accessHash, r)?.access);
     },
     close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); },
   };

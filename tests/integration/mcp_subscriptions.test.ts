@@ -337,6 +337,9 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membershi
   await watch(c, boardUri);
   await until(() => app.mcp.activeWatches === 1);
   const restoreFindActiveAccess = stubAuthRead(app.repo, "findActiveAccess", original => () => { throw new Error("SELECT secret FROM private_database"); });
+  // A users commit moves the auth generation, so the next tick misses the access cache and reads the stubbed store
+  // (phase B) even if a tick stamped the listen before the stub went in (#1152 audit).
+  await seed(app.repo, tx => app.repo.users.upsertByEmail(tx, "carol@example.com", null));
   try { await until(() => app.mcp.activeWatches === 0); }
   finally { restoreFindActiveAccess(); }
   expect(app.mcp.activeLeases).toBe(0);
