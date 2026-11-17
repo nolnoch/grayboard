@@ -4,9 +4,8 @@
 // access.test.ts exercise each rule directly).
 import { expect, test } from "bun:test";
 import { Glob } from "bun";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
 import { openDatabase } from "./db.ts";
