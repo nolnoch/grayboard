@@ -39,7 +39,7 @@ export function requestAttachment(repo: Repo, r: Read, handle: string, idText: s
   return { refused: d.reason };
 }
 
-// A hosted transfer's binding check (#1053): it reads on `r`, the handle of the context it runs in: the pool
+// An attachment route's guard (the hosted byte routes' OAuth recheck, binding fence and alias check, #1053): it reads on `r`, the handle of the context it runs in: the pool
 // between transactions, a body's own Tx inside one, so it never takes a second connection while a body holds one.
 export type Guard = (r: Read) => void;
 
