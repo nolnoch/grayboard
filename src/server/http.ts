@@ -163,7 +163,7 @@ function whoami(authed: AuthedUser, repo: Repo): Response {
 // board, which a handle may not be able to see, is left out, and a holder
 // whose name the user may not see (a team's alias, outside the team) is
 // withheld with its note, as claim_list does (#871).
-function claimList(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Response {
+function claimList(url: URL, authed: AuthedUser, repo: Repo): Response {
   const prefix = url.searchParams.get("prefix") ?? undefined;
   const principal = { kind: "user" as const, name: authed.user_email };
   const sees = (holder: string): boolean => {
@@ -173,7 +173,7 @@ function claimList(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Respon
     const scope = a ? { scope_kind: a.scope_kind, scope_ref: a.scope_ref } : p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team" as const, scope_ref: p.scope } : null;
     return !scope || scope.scope_ref === null || authorize(repo, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
   };
-  return json(listClaims(db, prefix).map(({ board: _b, ...c }) => (sees(c.holder) ? c : { ...c, holder: null, note: null })));
+  return json(listClaims(repo.coreOn(repo.read), prefix).map(({ board: _b, ...c }) => (sees(c.holder) ? c : { ...c, holder: null, note: null })));
 }
 
 // An address the caller may act as (#284 S11), in full, or the refusal: a
@@ -181,13 +181,13 @@ function claimList(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): Respon
 // the caller's scope or a team's it belongs to, and never be a human
 // (`humanReason` says why); a session ID must be the caller's, live and no
 // viewer, so nothing acts as an ended session.
-function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUser, repo: Repo, db: CoreDb, humanReason: string): string | Response {
+function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUser, repo: Repo, humanReason: string): string | Response {
   if (!input) return badRequest("as required: the address to act as");
   const p = addressParts(input);
   if (!p || p.kind === "team") return badRequest(`"${input}" isn't an alias or a session ID`);
   // Security audit F-01 (#851): every policy refusal below is an `authz.decision` row.
   if (p.kind === "id") {
-    const row = idRow(db, p.address);
+    const row = idRow(repo.coreOn(r), p.address);
     const req: AuthzRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
     const d = authorize(repo, {}, req);
     if (!d.allow) {
@@ -213,7 +213,7 @@ function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUse
   }
   // An alias in use by another user's session is exclusive (#284 S8, decided);
   // the caller's own sessions' uses aren't refused (a tools-only sidecar, #182).
-  const other = aliasUser(db, address, authed.user_email);
+  const other = aliasUser(repo.coreOn(r), address, authed.user_email);
   if (other) return jsonErr("alias_held", aliasHeldText(address, `another user's session ${other}`, "act as another name"), 409);
   return address;
 }
@@ -221,19 +221,20 @@ function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUse
 // For `grayboard claim`: a claim tool run as one of the caller's identities.
 const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
 
-async function claimCall(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
+async function claimCall(req: Request, authed: AuthedUser, repo: Repo, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
   const body = await parseBody<{ as?: string; tool?: string; args?: Record<string, unknown> }>(req);
   if (!body?.as || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("as and a claim tool required");
   const tool = body.tool, args = body.args ?? {};
   // The address check and the tool are one queued transaction; the wakes follow its commit.
   return repo.write((tx: Tx) => {
-    const handle = ownAddress(tx, body.as, authed, repo, db, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
+    const handle = ownAddress(tx, body.as, authed, repo, `claims are for agents; "${HUMAN_NAME}" is your Slack link`);
     if (handle instanceof Response) return handle;
     if (args.as !== undefined) return badRequest("name the address to act as in as, not args.as");
     try {
       // As the session the address is or is held by: its claims under any of
       // its addresses are its own here (#360).
-      return callBoardTool(db, handle, tool, args, { addresses: addressSet(db, handle, authed.user_email), user: authed.user_email });
+      const core = repo.coreOn(tx);
+      return callBoardTool(core, handle, tool, args, { addresses: addressSet(core, handle, authed.user_email), user: authed.user_email });
     } catch (e) {
       if (e instanceof CoreError) return badRequest(e.message);
       throw e;
@@ -254,7 +255,7 @@ function identityList(authed: AuthedUser, repo: Repo): Response {
   return json(repo.aliases.listForScope(repo.read, "person", authed.user_email).map(i => ({ name: i.name, created_at: i.created_at })));
 }
 
-async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ name: string }>(req);
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
@@ -267,12 +268,12 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, db: 
     if (capped) return badRequest(capped);
     const identity = repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
     writeAudit(repo, "alias.created", authed.user_email, identity.address);
-    onAliasCreated(db, repo, authed.user_id, identity.address);
+    onAliasCreated(repo, tx, authed.user_id, identity.address);
     return json({ name: identity.name, created_at: identity.created_at }, 201);
   });
 }
 
-function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb): Response | Promise<Response> {
+function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response | Promise<Response> {
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
   return repo.write(tx => {
@@ -280,10 +281,10 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
     if (!existing) return notFound();
     // Its holds and writers would outlive it: a second session could then bind
     // the name while the first still acts as it.
-    const user = aliasUser(db, existing.address);
+    const user = aliasUser(repo.coreOn(tx), existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or bind it elsewhere, first"), 409);
     repo.aliases.remove(tx, existing.address);
-    forgetHandle(db, existing.address);
+    forgetHandle(repo.coreOn(tx), existing.address);
     writeAudit(repo, "alias.deleted", authed.user_email, existing.address);
     return json({ ok: true });
   });
@@ -295,8 +296,8 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo, db: CoreDb
 // (src/server/mcp-attachments.ts) set to the session's bound name; no HTTP
 // route takes it from a client (#475). The Slack bridge's human stores its
 // files in-process, not here.
-function queryAs(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): string | Response {
-  return ownAddress(repo.read, url.searchParams.get("as"), authed, repo, db, HUMAN_RESERVED);
+function queryAs(url: URL, authed: AuthedUser, repo: Repo): string | Response {
+  return ownAddress(repo.read, url.searchParams.get("as"), authed, repo, HUMAN_RESERVED);
 }
 
 // An upload (`?as=&filename=`), the file's bytes as the body, for the hosted
@@ -305,7 +306,7 @@ function queryAs(url: URL, authed: AuthedUser, repo: Repo, db: CoreDb): string |
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
 export async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, uploads: UploadGate, guard?: () => void, signal = req.signal): Promise<Response> {
-  const handle = queryAs(url, authed, repo, db);
+  const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
   if (!rawName) return badRequest("filename required");
@@ -352,7 +353,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
 // A download (`<id>?as=`), for the hosted byte route's GET: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
-  const handle = queryAs(url, authed, repo, db);
+  const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   const read = requestAttachment(repo, repo.read, db, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
   if ("refused" in read) return jsonErr("not_found", read.refused, 404);
@@ -390,7 +391,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
 // A release (`<id>?as=`), for the hosted byte route's DELETE: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
 export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
-  const handle = queryAs(url, authed, repo, db);
+  const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   guard?.();
   const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr), {}, guard) : null;
@@ -405,7 +406,7 @@ function teamList(authed: AuthedUser, repo: Repo): Response {
   return json(repo.teams.listForUser(authed.user_id).map(t => ({ name: t.name, created_at: t.created_at })));
 }
 
-async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: CoreDb): Promise<Response> {
+async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
   const body = await parseBody<{ name: string }>(req);
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
@@ -413,7 +414,7 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: Core
   return repo.write((tx) => {
     if (repo.teams.findByName(name)) return conflict(`team "${name}" already exists`);
     // The team's board shares its name, so the name must be free as a board too.
-    if (getBoard(db, name)) return conflict(`a board named "#${name}" already exists`);
+    if (getBoard(repo.coreOn(tx), name)) return conflict(`a board named "#${name}" already exists`);
     let team: Team;
     try {
       team = repo.teams.create(tx, name, authed.user_id);
@@ -422,8 +423,8 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, db: Core
       throw e;
     }
     repo.teams.addMember(tx, team.id, authed.user_id, "owner");
-    ensureTeamBoard(db, team, authed.user_email);
-    onTeamJoined(db, repo, tx, team, authed.user_email);
+    ensureTeamBoard(repo, tx, team, authed.user_email);
+    onTeamJoined(repo, tx, team, authed.user_email);
     writeAudit(repo, "team.created", authed.user_email, name);
     writeAudit(repo, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
     return json({ name: team.name, created_at: team.created_at }, 201);
@@ -476,7 +477,7 @@ function ownedTeam(teamName: string, authed: AuthedUser, repo: Repo, config: Con
 
 const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
 
-function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb, sessions: SessionHooks): Promise<Response> {
+function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: SessionHooks): Promise<Response> {
   return repo.write((tx) => {
     const team = memberTeam(teamName, authed, repo);
     if (!team) return notFound();
@@ -486,14 +487,14 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, db: CoreDb,
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
     }
-    onTeamLeft(db, repo, tx, team, authed.user_email);
+    onTeamLeft(repo, tx, team, authed.user_email);
     sessions.accessChanged(authed.user_email, authed.user_email);
     writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
     return json({ ok: true });
   });
 }
 
-async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   // Read the body before the ownership check (security audit F-02): an owner
   // demoted while a slow body trickles in must not act on a stale check.
   const body = await parseBody<{ email: string; role?: unknown }>(req);
@@ -508,7 +509,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     const user  = repo.users.findByEmail(email);
     if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
     if (repo.teams.addMember(tx, team.id, user.id, role ?? "member")) {
-      onTeamJoined(db, repo, tx, team, email);
+      onTeamJoined(repo, tx, team, email);
       writeAudit(repo, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
       return json({ ok: true });
     }
@@ -526,7 +527,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
   });
 }
 
-async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config, sessions: SessionHooks): Promise<Response> {
+async function teamRemove(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config, sessions: SessionHooks): Promise<Response> {
   const body = await parseBody<{ email: string }>(req); // before the ownership check, as in teamAdd
   return repo.write((tx) => {
     const managed = ownedTeam(teamName, authed, repo, config);
@@ -544,7 +545,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
     }
-    onTeamLeft(db, repo, tx, team, email);
+    onTeamLeft(repo, tx, team, email);
     sessions.accessChanged(email, authed.user_email);
     writeAudit(repo, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
     return json({ ok: true });
@@ -574,7 +575,7 @@ async function teamPolicy(teamName: string, req: Request, authed: AuthedUser, re
 // writes as it, so no session outlives the name it acts as. Its queued
 // mail and claims stay with the address, as on unbind, for a member who
 // binds the name again.
-async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUser, repo: Repo, db: CoreDb, config: Config): Promise<Response> {
+async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   const body = await parseBody<{ name?: unknown }>(req); // before the ownership check, as in teamAdd
   return repo.write(tx => {
     const managed = ownedTeam(teamName, authed, repo, config);
@@ -585,10 +586,10 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
     if (!isValidIdentityName(name)) return badRequest("invalid name");
     const existing = repo.aliases.find(tx, `${managed.team.name}/${name}`);
     if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
-    const user = aliasUser(db, existing.address);
+    const user = aliasUser(repo.coreOn(tx), existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
     repo.aliases.remove(tx, existing.address);
-    forgetHandle(db, existing.address);
+    forgetHandle(repo.coreOn(tx), existing.address);
     writeAudit(repo, "alias.deleted", authed.user_email, existing.address, { team: managed.team.name, ...managed.audit });
     return json({ ok: true, deleted: existing.address });
   });
@@ -679,7 +680,7 @@ export type SessionHooks = {
 };
 
 export async function handleHttp(
-  req: Request, repo: Repo, db: CoreDb, config: Config, touches: TouchQueue, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
+  req: Request, repo: Repo, config: Config, touches: TouchQueue, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
   sessions: SessionHooks,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
@@ -701,13 +702,13 @@ export async function handleHttp(
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
-  if (path === "/api/claims" && method === "GET") return claimList(url, authed, repo, db);
-  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, db, wake, onBoardsChanged);
+  if (path === "/api/claims" && method === "GET") return claimList(url, authed, repo);
+  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, wake, onBoardsChanged);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
-  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, db, config);
+  if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, config);
   if (path.startsWith("/api/identities/") && method === "DELETE") {
-    return identityDelete(path.slice("/api/identities/".length), authed, repo, db);
+    return identityDelete(path.slice("/api/identities/".length), authed, repo);
   }
 
   if (path.startsWith("/api/slack/") && !slack) {
@@ -723,18 +724,18 @@ export async function handleHttp(
   }
 
   if (path === "/api/teams" && method === "GET")  return teamList(authed, repo);
-  if (path === "/api/teams" && method === "POST") return teamCreate(req, authed, repo, db);
+  if (path === "/api/teams" && method === "POST") return teamCreate(req, authed, repo);
 
   const teamOp = path.match(/^\/api\/teams\/([^/]+)\/([^/]+)$/);
   if (teamOp) {
     const [, teamName, action] = teamOp;
     if (action === "join"    && method === "POST") return teamJoin();
-    if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo, db, sessions);
-    if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, db, config);
-    if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, db, config, sessions);
+    if (action === "leave"   && method === "POST") return teamLeave(teamName, authed, repo, sessions);
+    if (action === "add"     && method === "POST") return teamAdd(teamName, req, authed, repo, config);
+    if (action === "remove"  && method === "POST") return teamRemove(teamName, req, authed, repo, config, sessions);
     if (action === "members" && method === "GET")  return teamMembers(teamName, authed, repo, config);
     if (action === "policy"  && method === "POST") return teamPolicy(teamName, req, authed, repo, config);
-    if (action === "delete-alias" && method === "POST") return teamDeleteAlias(teamName, req, authed, repo, db, config);
+    if (action === "delete-alias" && method === "POST") return teamDeleteAlias(teamName, req, authed, repo, config);
   }
 
   if (path.startsWith("/api/admin/")) {

@@ -9,12 +9,14 @@ import {
 } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
 import type { Repo, Team } from "./db.ts";
-import type { Read } from "./store/tx.ts";
+import type { Tx } from "./store/tx.ts";
 
 export const teamScope = (name: string) => `team:${name}`;
 
-export function ensureTeamBoard(db: CoreDb, team: Team, createdBy: string): void {
-  ensureBoard(db, team.name, `Team ${team.name}`, teamScope(team.name), createdBy);
+// Each takes the `Tx` of the write body that changed a membership or created
+// an alias, and reaches core's board helpers on that body's connection.
+export function ensureTeamBoard(repo: Repo, tx: Tx, team: Team, createdBy: string): void {
+  ensureBoard(repo.coreOn(tx), team.name, `Team ${team.name}`, teamScope(team.name), createdBy);
 }
 
 // Never overrides a mode the agent chose (including a past unsubscribe that
@@ -23,26 +25,25 @@ function follow(db: CoreDb, handle: string, team: Team): void {
   if (!isSubscribed(db, handle, team.name)) subscribe(db, handle, team.name, "digest");
 }
 
-// `r`: the team route's write body, the one that changed the membership.
-export function onTeamJoined(db: CoreDb, repo: Repo, r: Read, team: Team, email: string): void {
-  ensureTeamBoard(db, team, email);
-  for (const alias of repo.aliases.listForScope(r, "person", email)) follow(db, alias.address, team);
+export function onTeamJoined(repo: Repo, tx: Tx, team: Team, email: string): void {
+  ensureTeamBoard(repo, tx, team, email);
+  for (const alias of repo.aliases.listForScope(tx, "person", email)) follow(repo.coreOn(tx), alias.address, team);
 }
 
-export function onTeamLeft(db: CoreDb, repo: Repo, r: Read, team: Team, email: string): void {
-  for (const alias of repo.aliases.listForScope(r, "person", email)) unsubscribeScope(db, alias.address, teamScope(team.name));
+export function onTeamLeft(repo: Repo, tx: Tx, team: Team, email: string): void {
+  for (const alias of repo.aliases.listForScope(tx, "person", email)) unsubscribeScope(repo.coreOn(tx), alias.address, teamScope(team.name));
 }
 
 // A person's alias follows each of its user's teams; a team's alias follows
 // only its own team (#284 S9), whoever created it.
-export function onAliasCreated(db: CoreDb, repo: Repo, userId: number, handle: string): void {
+export function onAliasCreated(repo: Repo, tx: Tx, userId: number, handle: string): void {
   const creator = repo.users.findById(userId)?.email;
   if (!creator) return;
   const p = addressParts(handle);
   if (p?.kind !== "alias") return;
   const teams = p.scopeKind === "person" ? repo.teams.listForUser(userId) : [repo.teams.findByName(p.scope)].filter((t): t is Team => !!t);
   for (const team of teams) {
-    ensureTeamBoard(db, team, creator);
-    follow(db, handle, team);
+    ensureTeamBoard(repo, tx, team, creator);
+    follow(repo.coreOn(tx), handle, team);
   }
 }

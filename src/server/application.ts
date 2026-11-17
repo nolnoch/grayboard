@@ -380,7 +380,7 @@ function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: 
   if (repo.aliases.find(tx, address)) return;
   repo.aliases.create(tx, scope, authed.user_email);
   writeAudit(repo, "alias.created", authed.user_email, address, { lazy: true, session });
-  onAliasCreated(repo.coreOn(tx), repo, authed.user_id, address);
+  onAliasCreated(repo, tx, authed.user_id, address);
 }
 
 // Who holds an alias, for an alias_held refusal: its ID and where it runs.
@@ -714,7 +714,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       if (!repo.aliases.find(tx, addr)) {
         repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
         writeAudit(repo, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
-        onAliasCreated(repo.coreOn(tx), repo, authed.user_id, addr);
+        onAliasCreated(repo, tx, authed.user_id, addr);
       }
       touchAlias(repo.coreOn(tx), addr);
       logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "bound");
