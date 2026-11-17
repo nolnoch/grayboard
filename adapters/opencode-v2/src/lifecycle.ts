@@ -84,12 +84,15 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     return tool.startsWith(namespace + "_") ? tool.slice(namespace.length + 1) : tool;
   }
   async before(event: Invocation) {
-    const tool = await this.native(event.tool);
-    if (tool === undefined) return;
-    // In flight until its after hook, for the reconnect `refresh` asks (#661); a refused one never runs.
-    this.binding.calling(event.id);
-    try { await this.beforeCall({ sessionID: event.sessionID, tool }); }
-    catch (error) { this.binding.called(event.id); throw error; }
+    // In flight until its after hook, for the reconnect `refresh` asks (#661), and held from before the tool list
+    // is read: mid-reconnect the entry lists no tools, so the call waits that out first (#917). Another tool's
+    // call, or a refused one, never runs as native.
+    await this.binding.calling(event.id);
+    try {
+      const tool = await this.native(event.tool);
+      if (tool === undefined) { this.binding.called(event.id); return; }
+      await this.beforeCall({ sessionID: event.sessionID, tool });
+    } catch (error) { this.binding.called(event.id); throw error; }
   }
   async after(event: Invocation & ({ status: "completed"; result: { output?: unknown } } | { status: "error" })) {
     // In flight until afterCall settles, so no reconnect lands between (#661).

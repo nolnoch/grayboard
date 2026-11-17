@@ -163,3 +163,24 @@ test("refresh's transform is disposed with the binding", async () => {
   await f.binding.dispose();
   expect(f.transforms).toBe(before);
 });
+// #917: a native call that starts while a reconnect is reloading the entry waits until the reload is done, and then
+// holds the next reconnect like any call in flight.
+test("a native call that starts during a reconnect waits until the reload is done", async () => {
+  const f = fixture(), e = await f.binding.capture("R");
+  f.expire();
+  const { release, reached } = f.holdReload();
+  const refreshed = f.binding.refresh(e);
+  await reached;
+  let started = false;
+  const call = f.binding.calling("mid").then(() => { started = true; });
+  for (let i = 0; i < 100; i++) await Promise.resolve();
+  expect(started).toBe(false);
+  release();
+  await call;
+  expect(f.reloads).toBe(1);
+  expect(await refreshed).toBe(true);
+  f.rotate("fake-access-two", -1);
+  expect(await f.binding.refresh(e)).toBe(false);
+  f.binding.called("mid");
+  expect(await f.binding.refresh(e)).toBe(true);
+});
