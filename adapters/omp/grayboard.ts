@@ -40,6 +40,8 @@ type Child = {
   ready: Promise<void>;
   epoch: number;
   call(method: string, params: object, signal?: AbortSignal): Promise<unknown>;
+  // Kills the process and restarts it as an unexpected exit does.
+  fail(reason: string): void;
 };
 
 const SERVER = process.env.GRAYBOARD_MCP_NAME ?? "grayboard";
@@ -368,7 +370,17 @@ export default function grayboard(pi: ExtensionAPI) {
       if (!c) throw new Error(shared.exitReason ?? "grayboard: no grayboard process runs in this omp process");
       await c.ready;
       if (shared.owner !== pi || shared.ownerToken !== owner || shared.selected !== selection || shared.child !== c) return;
-      if (own.protocol && c.epoch !== selection.epoch) await associate(c.call, selection, owner);
+      if (!own.protocol || c.epoch === selection.epoch) return;
+      try { await associate(c.call, selection, owner); }
+      catch (error) {
+        // A switch handshake the current child fails (an error reply, an
+        // invalid acknowledgement) restarts it as the start handshake does
+        // (#1145): the replacement associates this selection at its start.
+        // fail() clears the transition, so currentChild waits the restart,
+        // and logs or reports it, so the switch itself doesn't fail.
+        if (shared.owner !== pi || shared.ownerToken !== owner || shared.selected !== selection || shared.child !== c) throw error;
+        c.fail(`grayboard process failed its session switch: ${(error as Error).message}`);
+      }
     });
     shared.transition = transition;
     transition.catch(() => {});
@@ -519,7 +531,7 @@ export default function grayboard(pi: ExtensionAPI) {
     ready.catch((e: Error) => fail(`grayboard process failed to initialize: ${e.message}`));
     const deadline = setTimeout(() => fail(`grayboard process didn't initialize within ${INIT_DEADLINE_MS / 1000} s`), INIT_DEADLINE_MS);
     ready.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
-    return { proc, ready, call, epoch: selection.epoch };
+    return { proc, ready, call, fail, epoch: selection.epoch };
   };
 
   // In every runtime: the main session's calls go out as its own; a
