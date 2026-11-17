@@ -175,8 +175,7 @@ function posted<T>(db: Database, fn: (tx: Tx) => T, given: ((value: T) => unknow
   // (#1051); returning nothing, the waited branch's own catch doesn't log it twice. A synchronous throw is unchanged.
   const committed = given && ((value: T) => {
     const r = given(value);
-    if (r !== null && (typeof r === "object" || typeof r === "function") && typeof (r as PromiseLike<unknown>).then === "function")
-      Promise.resolve(r).catch(error => console.error(`[grayboard] ${what} failed:`, error));
+    if (isThenable(r)) Promise.resolve(r).catch(error => console.error(`[grayboard] ${what} failed:`, error));
   });
   if (queue.mine && db.inTransaction) {
     const value = withTx(db, fn)();
@@ -210,7 +209,8 @@ export interface Repo {
   // its error, and throws when the queue is held or a transaction is open.
   writeNow<T>(fn: (tx: Tx) => Sync<T>): T;
   // A write no caller awaits, for code that can't (posted, above): true when it ran now, false when it waits behind
-  // another body, its failure then logged as `what` failed. fn's Tx is live until fn returns.
+  // another body, its failure then logged as `what` failed. A promise `committed` returns is caught and its rejection
+  // logged as `what` failed on every branch (#1051). fn's Tx is live until fn returns.
   post<T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => unknown, what?: string): boolean;
   // The store's read handle outside any transaction (#807 P1c): reads committed state.
   read: Read;
