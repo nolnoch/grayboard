@@ -29,34 +29,36 @@ export type OAuthTokenPair = OAuthBinding & {
 export type OAuthFailure = { status: "invalid" | "not_found" | "replay" | "capacity" };
 export type OAuthResult<T> = { status: "ok"; value: T } | OAuthFailure;
 // Writes take the body's `Tx`, reads a `Read` (#807 D2): the caller's `Tx` inside a write body, `repo.read` outside one.
+// Async but for the two auth hot-path reads (#807 P3 A6c), which go async with `Access` (A7): findActiveAccess sits
+// under authRead's cache (#853), and isGrantActive's callers (hosted MCP's live-session rechecks, src/server/mcp.ts) are sync.
 export interface OAuthStore {
-  createRequest(tx: Tx, input: OAuthRequest, now: number): OAuthResult<OAuthRequest>;
-  findRequest(r: Read, requestHash: string, browserHash: string, now: number): OAuthRequest | undefined;
+  createRequest(tx: Tx, input: OAuthRequest, now: number): Promise<OAuthResult<OAuthRequest>>;
+  findRequest(r: Read, requestHash: string, browserHash: string, now: number): Promise<OAuthRequest | undefined>;
   // Bind once after upstream login, before rendering consent; an account switch needs a new request.
-  bindRequestSession(tx: Tx, requestHash: string, browserHash: string, sessionHash: string, now: number): OAuthResult<OAuthRequest>;
-  createBrowserSession(tx: Tx, input: OAuthBrowserSession, now: number, replaceHash?: string): OAuthResult<OAuthBrowserSession>;
-  findBrowserSession(r: Read, sessionHash: string, now: number): OAuthBrowserSession | undefined;
-  revokeBrowserSession(tx: Tx, sessionHash: string): void;
-  decideRequest(tx: Tx, input: { requestHash: string; browserHash: string; csrfHash: string; sessionHash: string; approve: boolean; code: OAuthCode }, now: number): OAuthResult<OAuthCode | null>;
+  bindRequestSession(tx: Tx, requestHash: string, browserHash: string, sessionHash: string, now: number): Promise<OAuthResult<OAuthRequest>>;
+  createBrowserSession(tx: Tx, input: OAuthBrowserSession, now: number, replaceHash?: string): Promise<OAuthResult<OAuthBrowserSession>>;
+  findBrowserSession(r: Read, sessionHash: string, now: number): Promise<OAuthBrowserSession | undefined>;
+  revokeBrowserSession(tx: Tx, sessionHash: string): Promise<void>;
+  decideRequest(tx: Tx, input: { requestHash: string; browserHash: string; csrfHash: string; sessionHash: string; approve: boolean; code: OAuthCode }, now: number): Promise<OAuthResult<OAuthCode | null>>;
   // Resolves consented scopes without exposing the challenge; redemption still validates fresh PKCE atomically.
-  findCodeScopes(r: Read, codeHash: string, clientId: string, resource: string, redirectUri: string, now: number): string[] | undefined;
+  findCodeScopes(r: Read, codeHash: string, clientId: string, resource: string, redirectUri: string, now: number): Promise<string[] | undefined>;
   // codeChallenge must be freshly computed from the submitted verifier (S256); bound reuse revokes the family.
-  redeemCode(tx: Tx, input: OAuthAuthorization & { codeHash: string; grantId: string; grantExpiresAt: number; tokens: OAuthTokenPair }, now: number): OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>;
+  redeemCode(tx: Tx, input: OAuthAuthorization & { codeHash: string; grantId: string; grantExpiresAt: number; tokens: OAuthTokenPair }, now: number): Promise<OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>>;
   // A login code (scopes exactly LOGIN_SCOPE, #928 D8): consumes it and creates the CLI session in one transaction,
   // with redeemCode's client, redirect, verifier and active-user checks. A spent one presented again revokes its
   // session (replay). redeemCode refuses a login code, spent or not, and this refuses any other.
-  redeemLoginCode(tx: Tx, input: OAuthAuthorization & { codeHash: string; tokenHash: string; label: string | null }, now: number): OAuthResult<{ sessionId: number; userId: number }>;
+  redeemLoginCode(tx: Tx, input: OAuthAuthorization & { codeHash: string; tokenHash: string; label: string | null }, now: number): Promise<OAuthResult<{ sessionId: number; userId: number }>>;
   // Resolves original scopes for an omitted refresh scope; rotation rechecks everything atomically.
-  findRefreshGrant(r: Read, refreshHash: string, clientId: string, resource: string, now: number): OAuthGrant | undefined;
+  findRefreshGrant(r: Read, refreshHash: string, clientId: string, resource: string, now: number): Promise<OAuthGrant | undefined>;
   // input.scopes requests nonempty canonical access scopes within the original grant; tokens.scopes must match.
   // Requested TTLs are validated then clamped to the persisted absolute grant deadline; use returned deadlines.
-  rotateRefresh(tx: Tx, input: OAuthBinding & { refreshHash: string; tokens: OAuthTokenPair }, now: number): OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>;
-  revokeToken(tx: Tx, tokenHash: string, clientId: string, now: number): void;
+  rotateRefresh(tx: Tx, input: OAuthBinding & { refreshHash: string; tokens: OAuthTokenPair }, now: number): Promise<OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>>;
+  revokeToken(tx: Tx, tokenHash: string, clientId: string, now: number): Promise<void>;
   findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;
   isGrantActive(r: Read, grantId: string, now: number): boolean;
   // Once per database and `key` (#429: builtin_clients; #928: builtin_clients_cli): revokes every unrevoked
   // grant, and drops every unredeemed code, under `clientIds`, audits each grant, then records the cutover under
   // `key` so grants those clients issue later survive restarts. Returns the grants revoked; 0 after the first run.
-  revokePreBuiltinGrants(tx: Tx, clientIds: readonly string[], now: number, key?: "builtin_clients" | "builtin_clients_cli"): number;
-  cleanup(tx: Tx, now: number): void;
+  revokePreBuiltinGrants(tx: Tx, clientIds: readonly string[], now: number, key?: "builtin_clients" | "builtin_clients_cli"): Promise<number>;
+  cleanup(tx: Tx, now: number): Promise<void>;
 }
