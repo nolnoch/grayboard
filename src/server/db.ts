@@ -229,7 +229,10 @@ export interface Repo {
   // write goes on its Tx). A promise `committed` returns is caught and its rejection logged as `what` failed on every
   // branch (#1051). fn may be async (#807 P3 A3), except from the queue's holder; its Tx is live until fn settles.
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
-  // The store's read handle outside any transaction (#807 P1c): reads committed state.
+  // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
+  // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
+  // handle and must never resolve to a transaction's connection. Ambient `db` reads (policyNow, the users reads) aren't
+  // guarded.
   read: Read;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it, across its awaits (#807 P3 A7c). Inside the

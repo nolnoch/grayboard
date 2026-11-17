@@ -1346,7 +1346,7 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     // A write inside a transaction that rolls back: false within it, true again after.
     await expect(seed(storage.repo, async tx => {
       await storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id);
-      expect(await service.isAuthorized(p)).toBe(false);
+      expect(await service.isAuthorized(p, tx)).toBe(false);
       throw new Error("roll back");
     })).rejects.toThrow("roll back");
     expect(await service.isAuthorized(p)).toBe(true);

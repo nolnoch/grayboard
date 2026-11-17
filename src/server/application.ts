@@ -350,13 +350,13 @@ async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<stri
   return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
 }
 
-function helloOkFields(hub: Hub, authed: AuthedUser): SessionFacts {
+// `r`: the caller's handle, its body's `Tx` when it runs inside one (#807 P3 A7e2: a holder's `repo.read` is refused).
+function helloOkFields(hub: Hub, authed: AuthedUser, r: Read): SessionFacts {
   const { repo } = hub;
   return {
     user_email: authed.user_email,
     teams: repo.teams.listForUser(authed.user_id).map((t) => formatTeamAddress(t.name)),
-    // Read committed: the link isn't written by any body this runs in.
-    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(repo.read, authed.user_id) },
+    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(r, authed.user_id) },
     attachment_limits: repo.attachmentLimits,
   };
 }
@@ -780,7 +780,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
       hub.sessions.add(session);
       hub.registry.set(addr, session);
-      return { session, ok: { id: HUMAN_NAME, ...helloOkFields(hub, authed) } };
+      // After the commit: the write's transaction is closed, so committed state.
+      return { session, ok: { id: HUMAN_NAME, ...helloOkFields(hub, authed, repo.read) } };
     });
   }
 
@@ -937,7 +938,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // Computed before the session is registered: a throw here leaves no holder or route behind (#385 item 9).
       const info: IdentityInfo = {
         identity_full: session.primary,
-        ...helloOkFields(hub, authed),
+        ...helloOkFields(hub, authed, r),
         ...(session.readOnly && session.via === undefined ? { candidates: candidates(hub, r, authed, row?.suggested ?? null) } : {}),
       };
       hub.sessions.add(session);
