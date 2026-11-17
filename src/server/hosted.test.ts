@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import type { Tx } from "./store/tx.ts";
 import { refusalCount } from "./metrics.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
@@ -391,10 +392,10 @@ test("a commit invalidates only the rows it changed; a touch or an empty commit 
   const invalidations: (string | null)[] = [];
   const unlisten = hosted.listen(changed => { invalidations.push(changed); });
   try {
-    await seed(database.repo, () => database.repo.hosted.atomic(() => {}));
-    await seed(database.repo, tx => database.repo.hosted.atomic(() => database.repo.hosted.touch(tx, target.id, now)));
+    await seed(database.repo, tx => tx.savepoint(() => {}));
+    await seed(database.repo, tx => tx.savepoint(sp => database.repo.hosted.touch(sp, target.id, now)));
     expect(invalidations).toEqual([]);
-    await seed(database.repo, tx => database.repo.hosted.atomic(() => database.repo.hosted.end(tx, target.id, "closed", now)));
+    await seed(database.repo, tx => tx.savepoint(sp => database.repo.hosted.end(sp, target.id, "closed", now)));
     expect(invalidations).toEqual([target.id]);
     expect(application.holdsByOwner().size).toBe(3);
   } finally { unlisten(); }
@@ -938,15 +939,16 @@ test("a refusal row whose write after the rollback fails is counted, and the ref
 
 test("refusal rows whose queued write fails as a whole are all counted lost, once (#961)", async () => {
   const store = database.repo.hosted;
-  const { write, atomic } = store;
+  const { write } = store;
   let rows = 0;
   // flushQueued's body runs in a real transaction: each row fails on its own, then the whole write is refused, so a
   // row counted both ways would count twice.
   const writes = spyOn(store, "write").mockImplementation(((fn: (tx: unknown) => unknown, ...rest: unknown[]) => {
     if (!new Error().stack?.includes("flushQueued")) return (write as (...a: unknown[]) => unknown).call(store, fn, ...rest);
-    return (write as (...a: unknown[]) => unknown).call(store, (tx: unknown) => {
-      const each = spyOn(store, "atomic").mockImplementation(() => { rows++; throw new Error("row refused"); });
-      try { fn(tx); } finally { each.mockRestore(); }
+    return (write as (...a: unknown[]) => unknown).call(store, async (tx: Tx) => {
+      // Each row's savepoint fails: flushQueued calls nothing else on its Tx.
+      const failing = Object.create(tx, { savepoint: { value: async () => { rows++; throw new Error("row refused"); } } });
+      await fn(failing);
       throw new Error("commit refused");
     });
   }) as typeof write);
@@ -959,7 +961,7 @@ test("refusal rows whose queued write fails as a whole are all counted lost, onc
     expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused'").all()).toHaveLength(0);
     // One diagnostic per failed row, and one for the refused write.
     expect(quiet.mock.calls.filter(([line]) => String(line).includes('"operation":"hosted.refusal_row"'))).toHaveLength(3);
-  } finally { writes.mockRestore(); quiet.mockRestore(); expect(store.atomic).toBe(atomic); }
+  } finally { writes.mockRestore(); quiet.mockRestore(); }
 });
 
 test("ending a tools-only hosted root frees its alias for other users and restores writes_as when the same ID starts again (#451)", async () => {

@@ -75,8 +75,8 @@ function trackCommits(db: Database): void {
 }
 
 // A top-level IMMEDIATE transaction whose body awaits (#807 P1b-4e): db.transaction can't hold one open across an
-// await, so the boundary is explicit. Its post-commit effects collect as db.transaction's do (nested atomic bodies
-// are savepoints inside it) and run after commit() succeeds; rollback() drops them. Each settles it once.
+// await, so the boundary is explicit. Its post-commit effects collect as db.transaction's do (a nested db.transaction
+// is a savepoint inside it) and run after commit() succeeds; rollback() drops them. Each settles it once.
 export type Boundary = { commit(): void; rollback(): void };
 export function openBoundary(db: Database): Boundary {
   const frames = effects.get(db);

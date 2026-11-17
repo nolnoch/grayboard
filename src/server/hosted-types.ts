@@ -20,8 +20,7 @@ export type HostedLost = { alias: string; reason: string; primary: boolean };
 // subscriber whoami until its next delivery_open acknowledges it, so a lost response can't lose it).
 export type LostReader = "agent" | "controller";
 export interface HostedStore {
-  atomic<T>(fn: () => T): T;
-  // atomic through the server's write queue, for a transaction's outermost caller (Repo.write): `committed` runs
+  // One IMMEDIATE transaction through the server's write queue, for a transaction's outermost caller (Repo.write): `committed` runs
   // after the commit, before the queue's next body. fn may be async: `committed` gets its resolved value.
   write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
