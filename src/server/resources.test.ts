@@ -3,7 +3,7 @@ import { refusalCount } from "./metrics.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ApplicationError, createApplication, type ApplicationSession } from "./application.ts";
@@ -40,9 +40,14 @@ async function open(user: AuthedUser, name = "be", push = false) {
 async function select(user: AuthedUser, name = "be", push = false) {
   return (await open(user, name, push)).session;
 }
+// A watch's changed hook awaits its token check (#807 P3 A7d2c): every check here resolves in microtasks, so a
+// macrotask turn sees each notification a commit started.
+const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 // A board or claim tool on a raw session, in a queued body, as hosted run holds the write queue around a tool.
 async function call<T = unknown>(session: ApplicationSession, tool: string, args: Record<string, unknown>): Promise<T> {
-  return await seed(store.repo, tx => application.call(tx, session, tool, args)) as T;
+  const result = await seed(store.repo, tx => application.call(tx, session, tool, args)) as T;
+  await flush();
+  return result;
 }
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
@@ -79,7 +84,7 @@ test("resource hook failures emit one fixed diagnostic without forged stack or c
   const log = spyOn(console, "error").mockImplementation(() => {});
   const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
   try {
-    resources.watch(s, boardResourceUri("e2e"), { changed: async () => { throw forged; } });
+    resources.watch(s, boardResourceUri("e2e"), { changed: async () => { throw forged; } }, true);
     await call(s, "board_post", { board: "e2e", body: "test" });
     await Promise.resolve(); await Promise.resolve();
     expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"resources.changed","category":"failure","level":"error","class":"Error"}']);
@@ -95,9 +100,9 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
   const h1 = hooks(), h2 = hooks(), h3 = hooks();
-  resources.watch(a, boardResourceUri("e2e"), h1);
-  resources.watch(a, boardResourceUri("e2e"), h2);
-  resources.watch(b, boardResourceUri("e2e"), h3);
+  resources.watch(a, boardResourceUri("e2e"), h1, true);
+  resources.watch(a, boardResourceUri("e2e"), h2, true);
+  resources.watch(b, boardResourceUri("e2e"), h3, true);
   expect(isSubscribed(store.db, a.identityFull, "e2e")).toBe(false);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
   await call(b, "board_post", { board: "e2e", body: "hello" });
@@ -126,19 +131,19 @@ test("only authorized same-board watchers receive hints; lost membership closes 
   await call(a, "board_create", { name: "open", purpose: "open" });
   const privateUri = boardResourceUri("private");
   const ha = hooks(), hb = hooks(), other = hooks();
-  resources.watch(a, privateUri, ha);
-  resources.watch(b, privateUri, hb);
-  resources.watch(b, boardResourceUri("open"), other);
+  resources.watch(a, privateUri, ha, true);
+  resources.watch(b, privateUri, hb, true);
+  resources.watch(b, boardResourceUri("open"), other, true);
   await call(a, "board_post", { board: "private", body: "secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([1, 1, 0]);
   await seed(store.repo, (tx) => store.repo.teams.removeMember(tx, team.id, bob.user_id));
   await call(a, "board_post", { board: "private", body: "after removal" });
   expect(hb.counts).toEqual({ changed: 1, closed: 1 });
-  resources.revalidate();
+  await resources.revalidate();
   expect(hb.counts.closed).toBe(1);
   expect((await resources.list(store.repo.read, b)).resources.map(r => r.uri)).not.toContain(privateUri);
   await expect(resources.read(store.repo.read, b, privateUri)).rejects.toThrow("no such board #private; see board_list");
-  expect(() => resources.watch(b, privateUri, hooks())).toThrow("no such board #private; see board_list");
+  expect(() => resources.watch(b, privateUri, hooks(), true)).toThrow("no such board #private; see board_list");
   await call(a, "board_post", { board: "private", body: "new secret" });
   expect([ha.counts.changed, hb.counts.changed, other.counts.changed]).toEqual([3, 1, 0]);
 });
@@ -167,10 +172,10 @@ test("attachments are metadata only and cannot escape the selected board/page", 
 test("failed/missed callbacks do not acknowledge; reconcile reads recover and callback exceptions are isolated", async () => {
   const a = await select(alice), b = await select(bob);
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
-  resources.watch(b, boardResourceUri("e2e"), { changed: () => { throw new Error("sync"); } });
-  resources.watch(b, boardResourceUri("e2e"), { changed: async () => { throw new Error("async"); } });
+  resources.watch(b, boardResourceUri("e2e"), { changed: () => { throw new Error("sync"); } }, true);
+  resources.watch(b, boardResourceUri("e2e"), { changed: async () => { throw new Error("async"); } }, true);
   const good = hooks();
-  resources.watch(b, boardResourceUri("e2e"), good);
+  resources.watch(b, boardResourceUri("e2e"), good, true);
   await seed(store.repo, () => subscribe(store.db, b.identityFull, "e2e", "push"));
   await call(a, "board_post", { board: "e2e", body: "first" });
   await call(a, "board_post", { board: "e2e", body: "second" });
@@ -189,7 +194,7 @@ test("claim create/update/release and refused acquisition's opportunistic lapse 
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
   const h = hooks();
-  resources.watch(b, uri, h);
+  resources.watch(b, uri, h, true);
   const take = (key: string, extra = {}) => call(a, "claim_take", { key, board: "e2e", ...extra });
   const created = await take("ticket:ENG-142") as Record<string, unknown>;
   expect(created.ok).toBe(true);
@@ -231,7 +236,7 @@ test("rolled back claims and unauthorized board mutations emit no hint or transi
   await call(a, "claim_take", { key: "lapsed", board: "e2e" });
   await seed(store.repo, () => store.db.run("UPDATE claims SET expires_at = 0 WHERE key = 'lapsed'"));
   const h = hooks();
-  resources.watch(b, uri, h);
+  resources.watch(b, uri, h, true);
   store.db.run(`CREATE TRIGGER fail_claim_post BEFORE INSERT ON posts WHEN NEW.body = '[claim] rollback'
     BEGIN SELECT RAISE(ABORT, 'rollback'); END`);
   await expect(call(a, "claim_take", { key: "rollback", board: "e2e" })).rejects.toThrow("claim_take failed");
@@ -256,9 +261,9 @@ test("real bearer CLI claim route hints committed posts without attention subscr
     await seed(store.repo, () => { for (const board of ["e2e", "private"]) subscribe(store.db, session.identityFull, board, "off"); });
   }
   const publicHint = hooks(), privateHint = hooks(), removedHint = hooks();
-  resources.watch(b, boardResourceUri("e2e"), publicHint);
-  resources.watch(a, boardResourceUri("private"), privateHint);
-  resources.watch(b, boardResourceUri("private"), removedHint);
+  resources.watch(b, boardResourceUri("e2e"), publicHint, true);
+  resources.watch(a, boardResourceUri("private"), privateHint, true);
+  resources.watch(b, boardResourceUri("private"), removedHint, true);
   const config: Config = {
     dbPath: scratchDbPath(), blobDir: dir, httpPort: 0,
     devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
@@ -337,7 +342,7 @@ test("timer expiry independently hints with no attention subscribers", async () 
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   await seed(store.repo, () => subscribe(store.db, a.identityFull, "e2e", "off"));
   const h = hooks();
-  resources.watch(b, uri, h);
+  resources.watch(b, uri, h, true);
   await call(a, "claim_take", { key: "short", board: "e2e", ttl_minutes: 0.001 });
   expect(h.counts.changed).toBe(1);
   const deadline = Date.now() + 2_000;
@@ -358,7 +363,7 @@ test("retention hints only actual committed post deletions and snapshot reads le
   await seed(store.repo, () => store.db.run("UPDATE posts SET created_at = 0 WHERE board = 'e2e'"));
   await call(a, "board_post", { board: "e2e", body: "kept" });
   const h = hooks();
-  resources.watch(b, uri, h);
+  resources.watch(b, uri, h, true);
   const state = () => ({
     subscriptions: store.db.query("SELECT * FROM subscriptions ORDER BY board, handle").all(),
     outbox: store.db.query("SELECT * FROM outbox ORDER BY handle, post_id").all(),
@@ -366,10 +371,12 @@ test("retention hints only actual committed post deletions and snapshot reads le
   const before = state();
   const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
   await runRetention(store.repo, config, Date.now(), application.boardsChanged);
+  await flush();
   expect(h.counts.changed).toBe(1);
   expect((await resources.read(store.repo.read, b, uri)).posts.map(p => p.body)).toEqual(["kept"]);
   expect(state()).toEqual(before);
   await runRetention(store.repo, config, Date.now(), application.boardsChanged);
+  await flush();
   expect(h.counts.changed).toBe(1);
 });
 
@@ -377,12 +384,12 @@ test("unwatch is session-bound and bounded capacity is reclaimed by cancellation
   const a = await select(alice), b = await select(bob);
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   const h = hooks();
-  const ids = Array.from({ length: 32 }, () => resources.watch(a, boardResourceUri("e2e"), h));
-  expect(() => resources.watch(a, boardResourceUri("e2e"), h)).toThrow("capacity");
-  expect(() => resources.unwatch(b, ids[0]!)).toThrow("not found");
-  resources.unwatch(a, ids[0]!);
-  resources.unwatch(a, ids[0]!);
-  resources.watch(a, boardResourceUri("e2e"), h);
+  const ids = Array.from({ length: 32 }, () => resources.watch(a, boardResourceUri("e2e"), h, true));
+  expect(() => resources.watch(a, boardResourceUri("e2e"), h, true)).toThrow("capacity");
+  await expect(resources.unwatch(b, ids[0]!)).rejects.toThrow("not found");
+  await resources.unwatch(a, ids[0]!);
+  await resources.unwatch(a, ids[0]!);
+  resources.watch(a, boardResourceUri("e2e"), h, true);
   expect(h.counts.closed).toBe(1);
   application.close(a);
   expect(h.counts.closed).toBe(33);
@@ -393,29 +400,29 @@ test("revocation, disabled users, application disconnect and stop close watchers
   const a = await select(alice), b = await select(bob);
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   const revokedHook = hooks();
-  resources.watch(a, boardResourceUri("e2e"), revokedHook);
+  resources.watch(a, boardResourceUri("e2e"), revokedHook, true);
   revoked.add(a);
   // Notification must recheck authorization even without explicit revalidation.
   await call(b, "board_post", { board: "e2e", body: "after revoke" });
   expect(revokedHook.counts).toEqual({ changed: 0, closed: 1 });
   await expect(resources.list(store.repo.read, a)).rejects.toThrow("unauthorized");
   const disabledHook = hooks();
-  resources.watch(b, boardResourceUri("e2e"), disabledHook);
+  resources.watch(b, boardResourceUri("e2e"), disabledHook, true);
   await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.user_id, true));
-  resources.revalidate();
+  await resources.revalidate();
   expect(disabledHook.counts.closed).toBe(1);
   revoked.delete(a);
   const disconnectHook = hooks();
-  resources.watch(a, boardResourceUri("e2e"), disconnectHook);
+  resources.watch(a, boardResourceUri("e2e"), disconnectHook, true);
   application.disconnectUser(alice.user_id);
   expect(disconnectHook.counts.closed).toBe(1);
   const c = await select(alice, "fe");
   const stopped = hooks();
-  resources.watch(c, boardResourceUri("e2e"), stopped);
+  resources.watch(c, boardResourceUri("e2e"), stopped, true);
   application.stopExpiry();
   expect(stopped.counts.closed).toBe(1);
   resources.close();
-  expect(() => resources.watch(c, boardResourceUri("e2e"), hooks())).toThrow("unauthorized");
+  expect(() => resources.watch(c, boardResourceUri("e2e"), hooks(), true)).toThrow("unauthorized");
 });
 
 for (const boundary of ["grant", "session"] as const) for (const internal of [false, true]) test(`strict resource ${boundary} faults preserve provenance and watches (application error: ${internal})`, async () => {
@@ -434,10 +441,12 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
     validate(session);
   };
   const uri = boardResourceUri("e2e"), h = hooks();
-  const watch = resources.watch(b, uri, h);
+  const watch = resources.watch(b, uri, h, true);
   failed = true;
   try {
-    for (const call of [() => resources.list(store.repo.read, b), () => resources.read(store.repo.read, b, uri), () => resources.watch(b, uri, hooks()), () => resources.unwatch(b, watch)]) {
+    // A checked watch reads no grant (its caller just did), so only the session boundary reaches it.
+    const watchAgain = boundary === "session" ? [() => resources.watch(b, uri, hooks(), true)] : [];
+    for (const call of [() => resources.list(store.repo.read, b), () => resources.read(store.repo.read, b, uri), ...watchAgain, () => resources.unwatch(b, watch)]) {
       try { await call(); throw new Error("request unexpectedly succeeded"); } catch (error) { expect(error).toBe(failure); }
     }
     expect(h.counts).toEqual({ changed: 0, closed: 0 });
@@ -447,11 +456,11 @@ for (const boundary of ["grant", "session"] as const) for (const internal of [fa
   expect(h.counts).toEqual({ changed: 1, closed: 0 });
   expect((await resources.read(store.repo.read, b, uri)).posts.map(p => p.body)).toEqual(["healthy"]);
   expect(isSubscribed(store.db, b.identityFull, "e2e")).toBe(false);
-  resources.unwatch(b, watch);
+  await resources.unwatch(b, watch);
   expect(h.counts.closed).toBe(1);
 });
 
-for (const background of ["revalidate", "hint", "closed", "timer"] as const) test(`background resource ${background} faults isolate cleanup and close callbacks`, async () => {
+for (const background of ["revalidate", "hint", "closed"] as const) test(`background resource ${background} faults isolate cleanup and close callbacks`, async () => {
   const a = await select(alice), b = await select(bob);
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   resources.close();
@@ -469,15 +478,11 @@ for (const background of ["revalidate", "hint", "closed", "timer"] as const) tes
   try {
     resources.watch(b, boardResourceUri("e2e"), {
       changed() { changed++; }, closed() { closed++; throw new Error("closed callback failed"); },
-    });
+    }, true);
     failed = true;
-    if (background === "revalidate") expect(() => resources.revalidate()).not.toThrow();
+    if (background === "revalidate") await resources.revalidate();
     if (background === "hint") await call(a, "board_post", { board: "e2e", body: "committed" });
     if (background === "closed") expect(() => application.close(b)).not.toThrow();
-    if (background === "timer") {
-      const deadline = Date.now() + 2_000;
-      while (closed === 0 && Date.now() < deadline) await Bun.sleep(10);
-    }
     expect({ changed, closed }).toEqual({ changed: 0, closed: 1 });
     failed = false;
     if (background === "hint") expect((await resources.read(store.repo.read, a, boardResourceUri("e2e"))).posts[0]!.body).toBe("committed");
@@ -491,18 +496,18 @@ test("resource background session storage faults fail closed, but authoritative 
   const a = await select(alice);
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
   const h = hooks();
-  resources.watch(a, boardResourceUri("e2e"), h);
+  resources.watch(a, boardResourceUri("e2e"), h, true);
   const validate = application.revalidateSession;
   application.revalidateSession = () => { throw new Error("session storage unavailable"); };
   try {
-    expect(() => resources.revalidate()).not.toThrow();
+    await resources.revalidate();
     expect(h.counts).toEqual({ changed: 0, closed: 1 });
   } finally { application.revalidateSession = validate; }
-  for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
+  for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks(), true);
   application.revalidateSession = () => { throw new ApplicationError("unauthenticated", "closed session"); };
   try { await expect(resources.list(store.repo.read, a)).rejects.toThrow("unauthorized"); }
   finally { application.revalidateSession = validate; }
-  for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks());
+  for (let i = 0; i < 32; i++) resources.watch(a, boardResourceUri("e2e"), hooks(), true);
 });
 
 // #805: a session's watches are counted per session, not by scanning every watch; closing one frees its slot, and
@@ -511,18 +516,18 @@ test("per-session watch capacity counts only that session's watches and frees on
   const a = await select(alice), b = await select(bob);
   await call(a, "board_create", { name: "cap", purpose: "capacity" });
   await call(b, "board_create", { name: "other", purpose: "capacity" });
-  const ids = Array.from({ length: 32 }, () => resources.watch(a, "grayboard://boards/cap", hooks()));
+  const ids = Array.from({ length: 32 }, () => resources.watch(a, "grayboard://boards/cap", hooks(), true));
   const counted = refusalCount("resource_watch");
-  expect(() => resources.watch(a, "grayboard://boards/cap", hooks())).toThrow("resource watch capacity reached");
+  expect(() => resources.watch(a, "grayboard://boards/cap", hooks(), true)).toThrow("resource watch capacity reached");
   expect(refusalCount("resource_watch")).toBe(counted + 1);
-  const theirs = resources.watch(b, "grayboard://boards/other", hooks());
-  resources.unwatch(a, ids[0]!);
-  ids[0] = resources.watch(a, "grayboard://boards/cap", hooks());
+  const theirs = resources.watch(b, "grayboard://boards/other", hooks(), true);
+  await resources.unwatch(a, ids[0]!);
+  ids[0] = resources.watch(a, "grayboard://boards/cap", hooks(), true);
   expect(resources.activeWatchCount).toBe(33);
   revoked.add(a);
   await expect(resources.list(store.repo.read, a)).rejects.toThrow("resource session is closed or unauthorized");
   expect(resources.activeWatchCount).toBe(1);
-  resources.unwatch(b, theirs);
+  await resources.unwatch(b, theirs);
   expect(resources.activeWatchCount).toBe(0);
 });
 
@@ -535,9 +540,9 @@ test("configured watch caps admit past the defaults and refuse at the configured
   resources = createResources(application, { isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
   const a = await select(alice);
   await call(a, "board_create", { name: "wide", purpose: "capacity" });
-  for (let i = 0; i < 1100; i++) resources.watch(a, "grayboard://boards/wide", hooks());
+  for (let i = 0; i < 1100; i++) resources.watch(a, "grayboard://boards/wide", hooks(), true);
   expect(resources.activeWatchCount).toBe(1100);
-  expect(() => resources.watch(a, "grayboard://boards/wide", hooks())).toThrow("resource watch capacity reached");
+  expect(() => resources.watch(a, "grayboard://boards/wide", hooks(), true)).toThrow("resource watch capacity reached");
 });
 
 test("#998 audit: list and read check access on the handle they read on, a body's Tx inside one", async () => {
@@ -552,4 +557,53 @@ test("#998 audit: list and read check access on the handle they read on, a body'
   await checked.read(store.repo.read, a, boardResourceUri("e2e"));
   expect(handles).toEqual(["pool", "pool"]);
   checked.close();
+});
+
+// #807 P3 A7d2c (T-c1): the changed hook's token check awaits; a watch finished meanwhile (here by unwatch, which
+// leaves the session and its board access intact) gets no notification.
+test("A7d2c: a watch finished while its changed check awaits is not notified", async () => {
+  const a = await select(alice), b = await select(bob);
+  const uri = boardResourceUri("e2e");
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  const h = hooks();
+  const id = resources.watch(b, uri, h, true);
+  const point = "resources:live:checked";
+  const pauseDir = mkdtempSync(join(tmpdir(), "gb-resources-pause-")), file = join(pauseDir, "release");
+  let hit!: () => void, released!: () => void;
+  const reached = new Promise<void>(resolve => { hit = resolve; }), done = new Promise<void>(resolve => { released = resolve; });
+  const log = spyOn(console, "error").mockImplementation((message: unknown) => {
+    if (message === `[grayboard] test pause hit: ${point}`) hit();
+    if (message === `[grayboard] test pause released: ${point}`) released();
+  });
+  const oldPoint = process.env.BUS_TEST_PAUSE, oldFile = process.env.BUS_TEST_PAUSE_FILE;
+  process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
+  try {
+    await call(a, "board_post", { board: "e2e", body: "during the check" });
+    await reached;
+    await resources.unwatch(b, id);
+    expect(h.counts).toEqual({ changed: 0, closed: 1 });
+    writeFileSync(file, "release");
+    await done;
+    await flush();
+    expect(h.counts).toEqual({ changed: 0, closed: 1 });
+  } finally {
+    writeFileSync(file, "release");
+    if (oldPoint === undefined) delete process.env.BUS_TEST_PAUSE; else process.env.BUS_TEST_PAUSE = oldPoint;
+    if (oldFile === undefined) delete process.env.BUS_TEST_PAUSE_FILE; else process.env.BUS_TEST_PAUSE_FILE = oldFile;
+    log.mockRestore(); rmSync(pauseDir, { recursive: true, force: true });
+  }
+});
+
+// #807 P3 A7d2c (T-c3): watch reads no token, trusting its caller's check; a caller that doesn't say it checked is
+// refused, and the session's other watches stay open.
+test("A7d2c: a watch without checked is refused", async () => {
+  const b = await select(bob);
+  await call(b, "board_create", { name: "e2e", purpose: "tests" });
+  const h = hooks();
+  resources.watch(b, boardResourceUri("e2e"), h, true);
+  expect(() => resources.watch(b, boardResourceUri("e2e"), hooks(), undefined as unknown as true)).toThrow("resource session is closed or unauthorized");
+  expect(resources.activeWatchCount).toBe(1);
+  expect(h.counts.closed).toBe(0);
+  // The synchronous auth forms are gone (#807 P3 A7d2c): every token read is async.
+  expect("authNow" in store.repo).toBe(false);
 });

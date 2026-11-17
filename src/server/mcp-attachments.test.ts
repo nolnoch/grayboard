@@ -51,7 +51,7 @@ beforeEach(async () => {
   await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email));
   gate = new UploadGate(1024, 1024);
   application = createApplication(store.repo);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r) => oauth.isAuthorizedNow(p, r) }); await hosted.ready;
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r) => oauth.isAuthorized(p, r) }); await hosted.ready;
   const principal = await oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
   if (principal instanceof Response) throw new Error("fixture auth failed");
   await hosted.bind(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "attachment-root" }), { name: "be" });
@@ -73,6 +73,11 @@ async function uploaded() {
   return (await response.json() as { id: number }).id;
 }
 const count = () => (store.db.query("SELECT COUNT(*) AS n FROM attachments").get() as { n: number }).n;
+
+// #807 P3 A7d2c: the OAuth server's synchronous checks are gone; every check awaits its token read.
+test("the OAuth server has no synchronous authorization forms", () => {
+  for (const key of ["authenticateNow", "isAuthorizedNow"]) expect(key in oauth).toBe(false);
+});
 
 test("precise routing, canonical challenge, strict query and existing identity only", async () => {
   for (const path of ["/api/attachments", "/hosted/mcp/attachments/1/extra", "/hosted/mcp/attachments-other"]) expect(router.fetch(request("GET", path))).toBeUndefined();

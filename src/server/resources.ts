@@ -4,6 +4,7 @@ import { BOARD_NAME_RE, type SnapshotOptions } from "../core/boards.ts";
 import { ApplicationError, type Application, type ApplicationSession } from "./application.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { countRefusal } from "./metrics.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 import type { Read } from "./store/tx.ts";
 
 export function boardResourceUri(board: string): string {
@@ -23,7 +24,10 @@ export type ResourceHooks = {
 export type ResourceOptions = {
   // Trusted boundary rechecks the session's grant/scopes; never derive a principal here.
   // `r`: the body's Tx when the check runs inside one (`list`, `read` inside hosted `run`); else the pool.
-  isAuthorized(session: ApplicationSession, r?: Read): boolean;
+  isAuthorized(session: ApplicationSession, r?: Read): boolean | Promise<boolean>;
+  // The check's part that reads no token, synchronous: the session still has a live principal of its own user. A
+  // `watch` whose caller already checked the token runs only this (#807 P3 A7d2c).
+  isCurrent?(session: ApplicationSession): boolean;
   caps?: HostedCaps["watches"];
 };
 type Watch = {
@@ -57,26 +61,45 @@ export function createResources(application: Application, options: ResourceOptio
   function finishQuietly(watch: Watch) {
     try { finish(watch); } catch (e) { hostedFailure("resources.finish", e); }
   }
-  function authorized(session: ApplicationSession, allowUnbound = false, r?: Read): boolean {
+  const unauthenticated = (error: unknown) => error instanceof ApplicationError && error.code === "unauthenticated";
+  // The checks that read no token: not stopped, the session current, its user and binding (revalidateSession).
+  function current(session: ApplicationSession, allowUnbound = false, r?: Read): boolean {
     try {
-      if (stopped || !options.isAuthorized(session, r)) return false;
+      if (stopped || !(options.isCurrent?.(session) ?? true)) return false;
       application.revalidateSession(session, allowUnbound, r);
       return true;
     } catch (error) {
-      if (error instanceof ApplicationError && error.code === "unauthenticated") return false;
+      if (unauthenticated(error)) return false;
       throw error;
     }
   }
-  function requireSession(session: ApplicationSession, allowUnbound = false, r?: Read) {
-    if (authorized(session, allowUnbound, r)) return;
+  // The token check, then `current` after its await: a stop or a session change that landed meanwhile refuses
+  // (#807 P3 A7d2c). A failed read rejects, never authorizes.
+  async function authorized(session: ApplicationSession, allowUnbound = false, r?: Read): Promise<boolean> {
+    try {
+      if (stopped || !await options.isAuthorized(session, r)) return false;
+    } catch (error) {
+      if (unauthenticated(error)) return false;
+      throw error;
+    }
+    return current(session, allowUnbound, r);
+  }
+  function refuse(session: ApplicationSession): never {
     for (const watch of [...bySession.get(session) ?? []]) finishQuietly(watch);
     throw new ApplicationError("unauthenticated", "resource session is closed or unauthorized");
   }
-  function live(watch: Watch): boolean {
+  async function requireSession(session: ApplicationSession, allowUnbound = false, r?: Read) {
+    if (!await authorized(session, allowUnbound, r)) refuse(session);
+  }
+  // Runs from a commit's afterCommit (the board observer's `changed`) and from revalidate; nothing waits for it. A
+  // watch finished while the check awaited stays finished, and gets no notification (#807 P3 A7d2c).
+  async function live(watch: Watch): Promise<boolean> {
     if (!watches.has(watch.id)) return false;
     // Background faults close the watch without failing a committed mutation.
     try {
-      if (authorized(watch.session) && application.canReceiveBoard(application.repo.read, watch.session, watch.board)) return true;
+      const ok = await authorized(watch.session);
+      await testPauseAsync("resources:live:checked");
+      if (ok && watches.has(watch.id) && application.canReceiveBoard(application.repo.read, watch.session, watch.board)) return true;
     } catch (e) { hostedFailure("resources.authorize", e); }
     finishQuietly(watch);
     return false;
@@ -84,17 +107,22 @@ export function createResources(application: Application, options: ResourceOptio
   const service = {
     get activeWatchCount() { return watches.size; },
     async list(r: Read, session: ApplicationSession, after?: string) {
-      requireSession(session, true, r);
+      await requireSession(session, true, r);
       const page = await application.boardCatalog(r, session, after);
       return { resources: page.boards.map(board => ({ uri: boardResourceUri(board.name), board })), next_after: page.next_after };
     },
     async read(r: Read, session: ApplicationSession, uri: string, options: SnapshotOptions = {}) {
-      requireSession(session, true, r);
+      await requireSession(session, true, r);
       const board = parseBoardResourceUri(uri);
       return { uri: boardResourceUri(board), ...await application.boardSnapshot(r, session, board, options) };
     },
-    watch(session: ApplicationSession, uri: string, hooks: ResourceHooks): string {
-      requireSession(session);
+    // Synchronous, for a caller that has just checked the session's token with no await since (mcp's makeLive and
+    // its legacy control, after `authorize`): it says so with `checked`, and only `current` runs here. Without it the
+    // watch is refused, never left unchecked (#807 P3 A7d2c).
+    watch(session: ApplicationSession, uri: string, hooks: ResourceHooks, checked: true): string {
+      // A caller that didn't check is a bug: refused, without closing the session's other watches.
+      if (checked !== true) throw new ApplicationError("unauthenticated", "resource session is closed or unauthorized");
+      if (!current(session)) refuse(session);
       const board = parseBoardResourceUri(uri);
       if (watches.size >= caps.global || (bySession.get(session)?.size ?? 0) >= caps.perSession) {
         countRefusal("resource_watch");
@@ -107,29 +135,28 @@ export function createResources(application: Application, options: ResourceOptio
       own.add(watch);
       try {
         watch.unsubscribe = application.observeBoard(session, board, {
-          changed: () => { if (live(watch)) notify("resources.changed", () => hooks.changed()); },
+          changed: () => { void live(watch).then(ok => { if (ok && !stopped) notify("resources.changed", () => hooks.changed()); }); },
           closed: () => finishQuietly(watch),
         });
       } catch (error) { drop(watch); throw error; }
       return watch.id;
     },
-    unwatch(session: ApplicationSession, id: string): void {
-      requireSession(session);
+    async unwatch(session: ApplicationSession, id: string): Promise<void> {
+      await requireSession(session);
       const watch = watches.get(id);
       if (!watch) return;
       if (watch.session !== session) throw new ApplicationError("not_found", "resource watch not found");
       finish(watch);
     },
-    // Auth/team administration outside application.call must trigger this hook.
-    revalidate(): void { for (const watch of [...watches.values()]) live(watch); },
+    // Closes every watch whose session or board access no longer holds. No timer runs it: every watch belongs to a
+    // hosted MCP live (mcp.ts addWatch), whose stream timer rechecks the same token and board access each second and
+    // stops the live, which ends its session and with it the watch (#807 P3 A7d2c).
+    async revalidate(): Promise<void> { await Promise.all([...watches.values()].map(live)); },
     close(): void {
       stopped = true;
-      clearInterval(timer);
       for (const watch of [...watches.values()]) finishQuietly(watch);
     },
   };
-  const timer = setInterval(() => service.revalidate(), 1000);
-  timer.unref();
   return service;
 }
 export type Resources = ReturnType<typeof createResources>;

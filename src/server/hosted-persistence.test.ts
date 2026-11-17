@@ -26,7 +26,7 @@ const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCO
 async function open() {
   database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
   application = createApplication(database.repo);
-  const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.authNow.isGrantActive(r, p.grantId, now);
+  const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.oauth.isGrantActive(r, p.grantId, now);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized });
 }
