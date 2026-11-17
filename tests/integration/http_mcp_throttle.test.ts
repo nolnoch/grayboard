@@ -145,7 +145,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
     expect(second.response.status).toBe(200);
     expect(second.text).toContain('"tools"');
     expect(hostedRowCount(srv.app.db)).toBe(0);
-    expect(srv.app.repo.aliases.listForScope(srv.app.repo.read, "person", "alice@example.com").map(alias => alias.name)).toEqual(["be"]);
+    expect((await srv.app.repo.aliases.listForScope(srv.app.repo.read, "person", "alice@example.com")).map(alias => alias.name)).toEqual(["be"]);
     const before = [finds, lists];
     expect(finds).toBe(0);
     expect(lists).toBeGreaterThan(1);

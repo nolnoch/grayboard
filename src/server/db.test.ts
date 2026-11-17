@@ -75,7 +75,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   try {
     expect((await reopened.repo.users.findById(reopened.repo.read, user.id))?.display_name).toBe("You");
     expect((await reopened.repo.sessions.findByTokenHash(reopened.repo.read, "old-session-hash"))?.id).toBe(session.id);
-    expect(reopened.repo.aliases.listForScope(reopened.repo.read, "person", user.email).map(i => i.name)).toEqual(["fe"]);
+    expect((await reopened.repo.aliases.listForScope(reopened.repo.read, "person", user.email)).map(i => i.name)).toEqual(["fe"]);
     expect(reopened.repo.messages.history(reopened.repo.read, ["you@example.com/fe"])[0]?.body).toBe("preserved");
     expect(await reopened.repo.oauth.isGrantActive(reopened.repo.read, "missing", Date.now())).toBe(false);
     expect(reopened.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'oauth_%'").all()).toHaveLength(5);
@@ -214,12 +214,12 @@ describe("Repo", () => {
       return fe;
     });
     expect(fe.address).toBe("you@example.com/fe");
-    expect(repo.aliases.listForScope(repo.read, "person", "you@example.com").map((a) => a.name)).toEqual(["be", "fe"]);
+    expect((await repo.aliases.listForScope(repo.read, "person", "you@example.com")).map((a) => a.name)).toEqual(["be", "fe"]);
     await seed(repo, async tx => {
       await repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 7);
       await repo.aliases.remove(tx, "you@example.com/fe");
     });
-    expect(repo.aliases.listForScope(repo.read, "person", "you@example.com")).toHaveLength(1);
+    expect(await repo.aliases.listForScope(repo.read, "person", "you@example.com")).toHaveLength(1);
     // Its read point goes with it: a new alias of the name starts from scratch.
     expect(await repo.cursors.directFor(repo.read, "you@example.com/fe")).toBe(0);
   });
@@ -235,9 +235,9 @@ describe("Repo", () => {
     expect(team).toMatchObject({ address: "eng/be", scope_kind: "team", scope_ref: "eng", name: "be" });
     expect((await repo.aliases.find(repo.read, "eng/be"))?.id).toBe(team.id);
     expect(await repo.aliases.find(repo.read, "eng/fe")).toBeUndefined();
-    expect(repo.aliases.listForScope(repo.read, "team", "eng").map((a) => a.address)).toEqual(["eng/be"]);
-    expect(repo.aliases.listForScope(repo.read, "person", "you@example.com").map((a) => a.address)).toEqual(["you@example.com/be"]);
-    expect(repo.aliases.listForScope(repo.read, "person", "eng")).toEqual([]);
+    expect((await repo.aliases.listForScope(repo.read, "team", "eng")).map((a) => a.address)).toEqual(["eng/be"]);
+    expect((await repo.aliases.listForScope(repo.read, "person", "you@example.com")).map((a) => a.address)).toEqual(["you@example.com/be"]);
+    expect((await repo.aliases.listForScope(repo.read, "person", "eng"))).toEqual([]);
     expect((await repo.aliases.findAllByName(repo.read, "be")).map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
   });
 
@@ -917,13 +917,13 @@ test("#807 P1c-13: the aliases store runs on the handle it's given", async () =>
   expect(() => a.create(kept, person("a@example.com", "be"), "a@example.com")).toThrow(settled);
   expect(() => a.remove(kept, "a@example.com/fe")).toThrow(settled);
   await expect(a.find(kept, "a@example.com/fe")).rejects.toThrow(settled);
-  expect(() => a.listForScope(kept, "person", "a@example.com")).toThrow(settled);
-  expect(() => a.countForScope(kept, "person", "a@example.com")).toThrow(settled);
+  await expect(a.listForScope(kept, "person", "a@example.com")).rejects.toThrow(settled);
+  await expect(a.countForScope(kept, "person", "a@example.com")).rejects.toThrow(settled);
   await expect(a.findAllByName(kept, "fe")).rejects.toThrow(settled);
   await expect(a.find({} as Tx, "a@example.com/fe")).rejects.toThrow("not a SQLite store handle");
   expect(await a.find(repo.read, "a@example.com/be")).toBeUndefined();
-  expect(a.listForScope(repo.read, "person", "a@example.com").map(x => x.name)).toEqual(["fe"]);
-  expect(a.countForScope(repo.read, "person", "a@example.com")).toBe(1);
+  expect((await a.listForScope(repo.read, "person", "a@example.com")).map(x => x.name)).toEqual(["fe"]);
+  expect((await a.countForScope(repo.read, "person", "a@example.com"))).toBe(1);
   expect((await a.findAllByName(repo.read, "fe")).map(x => x.address)).toEqual(["a@example.com/fe"]);
   // A create rolls back with its body, and a remove's read points with it.
   await expect(seed(repo, tx => {
@@ -992,7 +992,7 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
     expect(m.getById(tx, reply.id)?.parent_id).toBe(root.id);
     expect(m.thread(tx, reply.id).map(x => x.id)).toEqual([root.id, reply.id]);
     expect(m.history(tx, [id]).map(x => x.id)).toEqual([reply.id, root.id]);
-    expect(repo.aliases.seen(tx, [peer]).get(peer)?.last_seen).toBe(1000);
+    expect((await repo.aliases.seen(tx, [peer])).get(peer)?.last_seen).toBe(1000);
     return { kept: tx, root, reply };
   });
   const settled = /used after its transaction settled/;
@@ -1009,9 +1009,9 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
   expect(() => m.receivedUnacked(kept, [id], 0)).toThrow(settled);
   expect(() => m.sentPending(kept, [peer], 0)).toThrow(settled);
   expect(() => m.openDelegations(kept, id, 0)).toThrow(settled);
-  expect(() => repo.aliases.seen(kept, [peer])).toThrow(settled);
+  await expect(repo.aliases.seen(kept, [peer])).rejects.toThrow(settled);
   expect(() => m.getById({} as Tx, root.id)).toThrow("not a SQLite store handle");
-  expect(() => repo.aliases.seen({} as Tx, [peer])).toThrow("not a SQLite store handle");
+  await expect(repo.aliases.seen({} as Tx, [peer])).rejects.toThrow("not a SQLite store handle");
   // The pool reads what the body committed.
   const r = repo.read;
   expect(m.getById(r, root.id)?.body).toBe("root");
@@ -1025,5 +1025,5 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
   expect(m.receivedUnacked(r, [id], 0).map(x => x.id)).toEqual([root.id]);
   expect(m.sentPending(r, [peer], 0).map(x => x.id)).toEqual([root.id]);
   expect(m.openDelegations(r, id, 0)).toBe(0);
-  expect(repo.aliases.seen(r, [peer, "b@example.com/none"])).toEqual(new Map([[peer, { last_seen: 1000, cwd: null, place: null }]]));
+  expect((await repo.aliases.seen(r, [peer, "b@example.com/none"]))).toEqual(new Map([[peer, { last_seen: 1000, cwd: null, place: null }]]));
 });

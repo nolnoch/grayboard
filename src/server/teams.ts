@@ -25,13 +25,13 @@ function follow(db: CoreDb, handle: string, team: Team): void {
   if (!isSubscribed(db, handle, team.name)) subscribe(db, handle, team.name, "digest");
 }
 
-export function onTeamJoined(repo: Repo, tx: Tx, team: Team, email: string): void {
+export async function onTeamJoined(repo: Repo, tx: Tx, team: Team, email: string): Promise<void> {
   ensureTeamBoard(repo, tx, team, email);
-  for (const alias of repo.aliases.listForScope(tx, "person", email)) follow(repo.coreOn(tx), alias.address, team);
+  for (const alias of await repo.aliases.listForScope(tx, "person", email)) follow(repo.coreOn(tx), alias.address, team);
 }
 
-export function onTeamLeft(repo: Repo, tx: Tx, team: Team, email: string): void {
-  for (const alias of repo.aliases.listForScope(tx, "person", email)) unsubscribeScope(repo.coreOn(tx), alias.address, teamScope(team.name));
+export async function onTeamLeft(repo: Repo, tx: Tx, team: Team, email: string): Promise<void> {
+  for (const alias of await repo.aliases.listForScope(tx, "person", email)) unsubscribeScope(repo.coreOn(tx), alias.address, teamScope(team.name));
 }
 
 // A person's alias follows each of its user's teams; a team's alias follows

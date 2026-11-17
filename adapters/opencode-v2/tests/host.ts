@@ -758,7 +758,7 @@ try {
   assert.ok(credits.some(c => c.ownership === timelyOwnership && c.field === "lease_deadline" && c.downtime_ms >= 31_000), "restart credited the lease");
   console.log("REAL_SERVER_RESTART_DEADLINES_OK", { ownership: timelyOwnership, credits: credits.length });
   await rpc.pause({}, { location }); await rpc.enroll({ sessionID: a.id, name: "does-not-exist" }, { location }); assert.equal(app.mcp.activeLeases, 0); assert.equal(row(a.id)?.name ?? null, null);
-  assert.equal(app.repo.aliases.listForScope(app.repo.read, "person", "you@example.com").some(i => i.name === "does-not-exist"), false);
+  assert.equal((await app.repo.aliases.listForScope(app.repo.read, "person", "you@example.com")).some(i => i.name === "does-not-exist"), false);
   await rpc.enroll({ sessionID: a.id, name: "r4" }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit reapproval existing name");
   const drift = await ctx.mcp.transform(e => { const old = e.get("grayboard"); assert(old?.type === "remote"); e.set("grayboard", { ...old, headers: { "X-Fixture-Drift": "away" } }); }); await ctx.mcp.reload();
   await wait(() => rpc.status({}, { location }), s => rootStatus(s, a.id)?.state === "paused", "real config drift"); await drift.dispose(); await ctx.mcp.reload(); assert.equal(rootStatus(await rpc.status({}, { location }), a.id)?.state, "paused");

@@ -304,20 +304,20 @@ export interface Repo {
   // transaction they read its writes. principalOf is principals.of. SQLite only: a Postgres Repo won't have it.
   // policy.test.ts ratchets its callers.
   policyNow: PolicyReadsSync & AccessReadsSync;
-  // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
-  // async Access (A7): `listForScope` and `seen` feed the synchronous session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
+  // Names in scopes, keyed by address. Every write and read returns a promise (#807 P3 A6d, A7f3, A7g2), on the
+  // caller's handle.
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
     create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Promise<Alias>;
     find(r: Read, address: string): Promise<Alias | undefined>;
-    listForScope(r: Read, kind: ScopeKind, ref: string): Alias[];
+    listForScope(r: Read, kind: ScopeKind, ref: string): Promise<Alias[]>;
     // The scope's names less the Slack link's human, for the cap (#347).
-    countForScope(r: Read, kind: ScopeKind, ref: string): number;
+    countForScope(r: Read, kind: ScopeKind, ref: string): Promise<number>;
     // Every scope's alias of this name.
     findAllByName(r: Read, name: string): Promise<Alias[]>;
     // When each of these addresses was last used, and the cwd or place of the
     // session that holds or last held it (ALIAS_SESSION_SQL); unused ones are absent.
-    seen(r: Read, addresses: string[]): Map<string, { last_seen: number; cwd: string | null; place: string | null }>;
+    seen(r: Read, addresses: string[]): Promise<Map<string, { last_seen: number; cwd: string | null; place: string | null }>>;
     // Also deletes the alias's read points.
     remove(tx: Tx, address: string): Promise<void>;
   };
@@ -1329,18 +1329,18 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;
       },
       find: async (r, address) => aliasAt(sqliteOf(r), address),
-      listForScope(r, kind, ref) {
+      async listForScope(r, kind, ref) {
         return sqliteOf(r).query<Alias, [string, string]>(
           `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
         ).all(ref, kind);
       },
-      countForScope(r, kind, ref) {
+      async countForScope(r, kind, ref) {
         return sqliteOf(r).query<{ n: number }, [string, string, string]>(
           `SELECT COUNT(*) AS n FROM aliases WHERE scope_ref = ? AND scope_kind = ? AND name != ?`,
         ).get(ref, kind, HUMAN_NAME)!.n;
       },
       findAllByName: async (r, name) => aliasesNamed(sqliteOf(r), name),
-      seen(r, addresses) {
+      async seen(r, addresses) {
         const rows = sqliteOf(r).query<{ address: string; last_seen: number; cwd: string | null; place: string | null }, [string]>(
           `SELECT a.address, a.last_seen, i.cwd, i.place FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
             WHERE a.address IN (SELECT value FROM json_each(?)) AND a.last_seen IS NOT NULL`,

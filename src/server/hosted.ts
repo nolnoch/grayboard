@@ -865,11 +865,14 @@ export function createHostedSessions(application: Application, options: { now?: 
         const taken = pending ? await pending : [], lost = taken.map(({ alias, reason }) => ({ alias, reason }));
         if (told && taken.length) told(lostNotice(p, row!, taken));
         const held = root ? application.hostedHolds(repo.read, root.session_id) : [];
+        // The one await after the reads above (#807 P3 A7g2): candidates are hints, so a bind landing meanwhile only
+        // makes them a moment newer than `held`.
+        const offered = !(root && named(root, held)) && !row?.root_session_id ? await application.hostedCandidates(repo.read, p.authed, root?.suggested ?? null) : undefined;
         return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           // A child binds nothing, so it isn't offered names to bind (#523).
-          ...(!(root && named(root, held)) ? { unbound: true, ...(row?.root_session_id ? {} : { candidates: application.hostedCandidates(repo.read, p.authed, root?.suggested ?? null) }) } : {}) };
+          ...(!(root && named(root, held)) ? { unbound: true, ...(offered ? { candidates: offered } : {}) } : {}) };
       });
     },
     // `declared`: the native request's declaration (deliveryDeclaration); text only.
@@ -941,9 +944,11 @@ export function createHostedSessions(application: Application, options: { now?: 
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), alias = short(result.ok.alias);
       if (!result.ok.released) return { content: [{ type: "text" as const, text: notHolding(alias) }], structuredContent: { name: held[0] ?? null, instructions: [], ownership: result.ownership } };
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
+      // Read before the reply's thunk, which is synchronous (#807 P3 A7g2).
+      const offered = held.length ? [] : await application.hostedCandidates(repo.read, p.authed, result.suggested);
       const instructions = held.length
         ? (general: boolean) => boundInstructions(held[0]!, source, general, () => hostedGeneral(source !== null && "id" in context && application.hostedLauncher(context.id)), [], held.slice(1))
-        : () => [hostedUnboundInstruction(application.hostedCandidates(repo.read, p.authed, result.suggested))];
+        : () => [hostedUnboundInstruction(offered)];
       const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? null, result.ok.left ?? [], instructions);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },

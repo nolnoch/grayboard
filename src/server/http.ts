@@ -153,7 +153,7 @@ function authLogout(authed: AuthedUser, repo: Repo): Promise<Response> {
 }
 
 async function whoami(authed: AuthedUser, repo: Repo): Promise<Response> {
-  const identities = repo.aliases.listForScope(repo.read, "person", authed.user_email).map(i => i.name);
+  const identities = (await repo.aliases.listForScope(repo.read, "person", authed.user_email)).map(i => i.name);
   const teams      = (await repo.teams.listForUser(repo.read, authed.user_id)).map(t => t.name);
   return json({ email: authed.user_email, identities, teams });
 }
@@ -256,8 +256,8 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, wake: (ha
 
 // ── identities ────────────────────────────────────────────────────────────────
 
-function identityList(authed: AuthedUser, repo: Repo): Response {
-  return json(repo.aliases.listForScope(repo.read, "person", authed.user_email).map(i => ({ name: i.name, created_at: i.created_at })));
+async function identityList(authed: AuthedUser, repo: Repo): Promise<Response> {
+  return json((await repo.aliases.listForScope(repo.read, "person", authed.user_email)).map(i => ({ name: i.name, created_at: i.created_at })));
 }
 
 async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
@@ -269,7 +269,7 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, conf
   return repo.write(async tx => {
     const existing = await repo.aliases.find(tx, `${authed.user_email}/${name}`);
     if (existing) return conflict(`identity "${name}" already exists`);
-    const capped = aliasCapRefusal(repo, tx, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
+    const capped = await aliasCapRefusal(repo, tx, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
     if (capped) return badRequest(capped);
     const identity = await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
     writeAudit(repo, tx, "alias.created", authed.user_email, identity.address);
@@ -429,7 +429,7 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
     }
     await repo.teams.addMember(tx, team.id, authed.user_id, "owner");
     ensureTeamBoard(repo, tx, team, authed.user_email);
-    onTeamJoined(repo, tx, team, authed.user_email);
+    await onTeamJoined(repo, tx, team, authed.user_email);
     writeAudit(repo, tx, "team.created", authed.user_email, name);
     writeAudit(repo, tx, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
     return json({ name: team.name, created_at: team.created_at }, 201);
@@ -492,7 +492,7 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: S
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
     }
-    onTeamLeft(repo, tx, team, authed.user_email);
+    await onTeamLeft(repo, tx, team, authed.user_email);
     await sessions.accessChanged(tx, authed.user_email, authed.user_email);
     writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
     return json({ ok: true });
@@ -514,7 +514,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     const user  = await repo.users.findByEmail(tx, email);
     if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
     if (await repo.teams.addMember(tx, team.id, user.id, role ?? "member")) {
-      onTeamJoined(repo, tx, team, email);
+      await onTeamJoined(repo, tx, team, email);
       writeAudit(repo, tx, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
       return json({ ok: true });
     }
@@ -550,7 +550,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
     }
-    onTeamLeft(repo, tx, team, email);
+    await onTeamLeft(repo, tx, team, email);
     await sessions.accessChanged(tx, email, authed.user_email);
     writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
     return json({ ok: true });
