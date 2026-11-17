@@ -84,9 +84,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
   const attachments = createMcpAttachments(repo, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
   // The startup writes, each through the write queue in the order queued (#807 P3 A4): the dev-session revocation,
-  // OAuth's built-in client cutovers, and hosted's downtime credit and first sweep. The listener serves nothing until
+  // the leftover sessions' ends, OAuth's built-in client cutovers, and hosted's downtime credit and first sweep. The listener serves nothing until
   // all have settled; a failure then rejects it, and every request fails, so the caller (main.ts) exits on it.
-  const ready: Promise<void> = settleAll([devRevoked, oauth.ready, mcp.sessions.ready]).then(() => testPauseAsync("server:ready"));
+  const ready: Promise<void> = settleAll([devRevoked, application.ready, oauth.ready, mcp.sessions.ready]).then(() => testPauseAsync("server:ready"));
   let started = false;
   ready.then(() => { started = true; }, () => {});
 
@@ -169,7 +169,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   if (opts.background !== false) {
     timers.push(setInterval(sweepLimits, 30_000), setInterval(() => {
       // A throw here would surface as an unhandled error every 30 s with no context; log it and let the next tick retry.
-      try { revalidate(); } catch (e) { console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`); }
+      try { void revalidate(); } catch (e) { console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`); }
     }, 30_000));
     stopRetention = startRetentionJobs(repo, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }

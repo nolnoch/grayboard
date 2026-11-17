@@ -121,15 +121,11 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
   // The hub's view of the session (its live holder) changes only after a commit: reconcile closes it then.
   const closed = spyOn(application, "close");
   try {
-    // Each send's promise is awaited after the synchronous savepoint that started it: its writes ran inside it,
-    // and a refusal fails the test here rather than as an unhandled rejection.
     await expect(seed(database.repo, async tx => {
-      let sent: Promise<unknown> | undefined;
-      database.repo.hosted.atomic(() => {
-        sent = application.send(tx, recipient.session, "launcher", "rolled back nested");
-        database.repo.hosted.end(tx, context().id!, "closed", Date.now());
+      await tx.savepoint(async sp => {
+        await application.send(sp, recipient.session, "launcher", "rolled back nested");
+        database.repo.hosted.end(sp, context().id!, "closed", Date.now());
       });
-      await sent;
       expect(closed).not.toHaveBeenCalled();
       expect(events).toEqual([]); expect(invalidations).toBe(0);
       throw new Error("outer rollback");
@@ -140,14 +136,12 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
     expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
     // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
     await seed(database.repo, async tx => {
-      let sent: Promise<unknown> | undefined;
-      database.repo.hosted.atomic(() => { sent = application.send(tx, recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(tx, id, Date.now()); });
-      await sent;
+      await tx.savepoint(async sp => { await application.send(sp, recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(sp, id, Date.now()); });
       expect(events).toEqual([]); expect(invalidations).toBe(0);
     });
     expect(events).toHaveLength(1); expect(invalidations).toBe(0);
-    await seed(database.repo, tx => {
-      database.repo.hosted.atomic(() => database.repo.hosted.end(tx, id, "closed", Date.now()));
+    await seed(database.repo, async tx => {
+      await tx.savepoint(sp => database.repo.hosted.end(sp, id, "closed", Date.now()));
       expect(invalidations).toBe(0);
     });
     expect(invalidations).toBe(1);
@@ -159,13 +153,11 @@ test("caught inner rollback discards only inner effects and preserves outer effe
   const observed: string[] = [];
   await seed(database.repo, async tx => {
     afterCommit(database.db, () => { observed.push("outer-first"); });
-    let ghost: Promise<unknown> | undefined;
-    expect(() => database.db.transaction(() => {
-      ghost = application.send(tx, recipient.session, "launcher", "inner ghost");
+    await expect(tx.savepoint(async sp => {
+      await application.send(sp, recipient.session, "launcher", "inner ghost");
       throw new Error("inner rollback");
-    }).deferred()).toThrow("inner rollback");
-    await ghost;
-    await database.repo.hosted.atomic(() => application.send(tx, recipient.session, "launcher", "outer durable"));
+    })).rejects.toThrow("inner rollback");
+    await tx.savepoint(sp => application.send(sp, recipient.session, "launcher", "outer durable"));
     afterCommit(database.db, () => { observed.push("outer-last"); });
     expect(events).toEqual([]);
   });

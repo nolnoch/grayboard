@@ -117,13 +117,13 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   const team = srv.app.repo.teams.findByName("eng")!;
   await seed(srv.app.repo, (tx) => srv.app.repo.teams.removeMember(tx, team.id, srv.app.repo.users.findByEmail(B)!.id));
   expect(holder("eng/build")).toEqual([build.id]);
-  srv.app.revalidate();
+  await srv.app.revalidate();
   expect(holder("eng/build")).toEqual([]);
   expect(lastEvent("eng/build")).toEqual({ session_id: build.id, event: "released", detail: `access revoked: ${REASON}` });
   // A member's hold survives the backstop.
   const kept = srv.appSession(alice, "eng/build");
   await kept.connect();
-  srv.app.revalidate();
+  await srv.app.revalidate();
   expect(holder("eng/build")).toEqual([kept.id]);
 });
 

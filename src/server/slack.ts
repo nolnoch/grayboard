@@ -403,9 +403,9 @@ export class SlackBridge implements SlackLinker {
         }) as T;
       } catch (error) {
         if (rows.length) {
-          await repo.write(tx => {
+          await repo.write(async tx => {
             for (const write of rows) {
-              try { repo.atomic(() => write(tx)); } catch (failure) { console.error("[grayboard slack] refusal row failed:", failure); }
+              try { await tx.savepoint(write); } catch (failure) { console.error("[grayboard slack] refusal row failed:", failure); }
             }
           }).catch(failure => console.error("[grayboard slack] refusal rows failed:", failure));
         }

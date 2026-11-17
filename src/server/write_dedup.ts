@@ -58,18 +58,19 @@ export type DedupOutcome<W extends Written> =
 // uploads). The receipt is claimed before the write by one statement (D3,
 // #807 P2-2), so of two identical calls under READ COMMITTED (D3) one writes
 // and the other replays; the claim, the write, the receipt and the audit row are
-// one transaction (a savepoint inside an open one), and a write that throws
+// one savepoint inside the caller's transaction, and a write that throws
 // leaves no receipt. `now` is the hub's clock. `recheck` runs on a hit, in the same
 // transaction, before anything is answered or audited: it throws the refusal a
 // fresh call would get when authority over what the first call wrote has gone
 // since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
 export function dedupWrite<W extends Written>(
-  repo: Repo, tx: Tx, now: number, call: DedupCall, write: () => Sync<W>, onReplay: () => void = () => {},
-  recheck: (stored: W["payload"]) => void = () => {},
-): DedupOutcome<W> {
+  repo: Repo, parent: Tx, now: number, call: DedupCall, write: (tx: Tx) => Sync<W>, onReplay: (tx: Tx) => void = () => {},
+  recheck: (stored: W["payload"], tx: Tx) => void = () => {},
+): Promise<DedupOutcome<W>> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
   const since = now - WRITE_DEDUP_WINDOW_MS;
-  return repo.atomic((): DedupOutcome<W> => {
+  // write, onReplay and recheck run in the savepoint, on its Tx: the parent's refuses statements while it's open.
+  return parent.savepoint((tx): DedupOutcome<W> => {
     const receipts = repo.writeReceipts;
     const key = { session: call.session, sender: call.sender, fp };
     // Bounds one session's rows by what it wrote in the window, so a receipt the claim meets is inside it.
@@ -99,14 +100,14 @@ export function dedupWrite<W extends Written>(
       const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
       const first_at = new Date(hit.at).toISOString();
       const stored = JSON.parse(hit.result_json) as W["payload"];
-      recheck(stored);
+      recheck(stored, tx);
       writeAudit(repo, tx, "request.replayed", call.actor, call.sender, {
         tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
       });
-      onReplay();
+      onReplay(tx);
       return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
     }
-    const w = write() as W;
+    const w = write(tx) as W;
     receipts.upsert(tx, {
       session: call.session, sender: call.sender, fp, tool: call.tool,
       ref_kind: w.ref.kind, ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at: now,
