@@ -6,6 +6,6 @@ export const accessAudits = (db: { query(sql: string): { all(...args: string[]):
     .map((r) => ({ at: r.at, actor: r.actor, target: r.target, detail: JSON.parse(r.detail) }));
 
 // Where each of the server's access_log rows of `action` came from, oldest first (security audit F-19).
-export type AuditOrigin = { ip: string | null; ua: string | null };
+export type AuditOrigin = { ip: string | null; ua: string | null; client_id: string | null };
 export const auditOrigins = (db: { query(sql: string): { all(...args: string[]): unknown[] } }, action: string): AuditOrigin[] =>
-  db.query("SELECT ip, ua FROM access_log WHERE action = ? ORDER BY id").all(action) as AuditOrigin[];
+  db.query("SELECT ip, ua, client_id FROM access_log WHERE action = ? ORDER BY id").all(action) as AuditOrigin[];

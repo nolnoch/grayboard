@@ -784,15 +784,17 @@ function initSchema(db: Database): void {
   const logCols = db.prepare(`PRAGMA table_info(access_log)`).all() as { name: string }[];
   if (!logCols.some((c) => c.name === "ip")) db.exec(`ALTER TABLE access_log ADD COLUMN ip TEXT`);
   if (!logCols.some((c) => c.name === "ua")) db.exec(`ALTER TABLE access_log ADD COLUMN ua TEXT`);
+  // client_id: the OAuth client of the hosted MCP request that wrote the row (#847); null off /mcp and on older rows.
+  if (!logCols.some((c) => c.name === "client_id")) db.exec(`ALTER TABLE access_log ADD COLUMN client_id TEXT`);
 }
 
 /**
- * Every access_log row goes in here: it stamps the client address and user
- * agent of the request whose handling wrote it (security audit F-19).
+ * Every access_log row goes in here: it stamps the client address, user agent
+ * and OAuth client of the request whose handling wrote it (security audit F-19).
  */
 function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
   const o = requestOrigin();
-  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua) VALUES (?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null]);
+  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null, o?.client_id ?? null]);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
