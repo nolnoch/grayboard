@@ -341,7 +341,7 @@ test("unbound hosted sessions cannot use named operations or persist synthetic h
   const now = Date.now();
   await seed(store.repo, async tx => {
     const ownership = await store.repo.hosted.start(tx, "hosted-unbound", alice.user_id, "test", now);
-    store.repo.hosted.insert(tx, {
+    await store.repo.hosted.insert(tx, {
       session_id: "hosted-unbound", ownership_id: ownership, user_id: alice.user_id, client_id: "test", grant_id: "grant", source_session_id: "hosted-unbound",
       writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null,
     });

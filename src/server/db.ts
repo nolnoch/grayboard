@@ -2066,12 +2066,12 @@ function makeHostedStore(db: Database): HostedStoreOf {
     children: (r, root) => sqliteOf(r).query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
     roots: (r, user) => sqliteOf(r).query<HostedSession, [number]>(
       "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
-    park: (tx, ...a) => on(tx).park(...a),
-    unpark: (tx, ...a) => on(tx).unpark(...a),
+    park: async (tx, ...a) => on(tx).park(...a),
+    unpark: async (tx, ...a) => on(tx).unpark(...a),
     start: async (tx, ...a) => on(tx).start(...a),
-    insert: (tx, ...a) => on(tx).insert(...a),
-    update: (tx, ...a) => on(tx).update(...a),
-    touch: (tx, ...a) => on(tx).touch(...a),
+    insert: async (tx, ...a) => on(tx).insert(...a),
+    update: async (tx, ...a) => on(tx).update(...a),
+    touch: async (tx, ...a) => on(tx).touch(...a),
     // The unary `+` keeps the planner off idx_hosted_root, which every root matches, so these two read
     // idx_hosted_deadline and idx_hosted_user (#399).
     expired: (r, now) => sqliteOf(r).query<HostedSession, [number]>(
@@ -2080,13 +2080,13 @@ function makeHostedStore(db: Database): HostedStoreOf {
       AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
     disabled: (r) => sqliteOf(r).query<HostedSession, []>(
       "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
-    childEnd: (tx, ...a) => on(tx).childEnd(...a),
+    childEnd: async (tx, ...a) => on(tx).childEnd(...a),
     takeEnded() {
       const taken = ended.list;
       ended.list = [];
       return taken;
     },
-    end: (tx, ...a) => on(tx).end(...a),
+    end: async (tx, ...a) => on(tx).end(...a),
     lose: async (tx, ...a) => on(tx).lose(...a),
     lost: (r, session, reader) => hostedLostOf(sqliteOf(r))(session, `${LOST_READ[reader]} IS NULL`),
     tellLost: async (tx, ...a) => on(tx).tellLost(...a),

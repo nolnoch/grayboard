@@ -831,27 +831,27 @@ test("#807 P1c-11: hosted writes run on the handle they're given", async () => {
     const ownership = await repo.hosted.start(tx, "root-1", u.id, "test", 1);
     const row = { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
       writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null };
-    repo.hosted.insert(tx, row);
+    await repo.hosted.insert(tx, row);
     return { kept: tx, row };
   });
   expect(repo.hosted.get(repo.read, "root-1")?.last_seen_at).toBe(1);
   const settled = /used after its transaction settled/;
   const h = repo.hosted, x = {} as never;
-  expect(() => h.park(kept, "root-1", 2)).toThrow(settled);
-  expect(() => h.unpark(kept, "root-1", "g", 2)).toThrow(settled);
+  await expect(h.park(kept, "root-1", 2)).rejects.toThrow(settled);
+  await expect(h.unpark(kept, "root-1", "g", 2)).rejects.toThrow(settled);
   await expect(h.start(kept, "root-2", row.user_id, "test", 2)).rejects.toThrow(settled);
-  expect(() => h.insert(kept, { ...row, session_id: "root-2" })).toThrow(settled);
-  expect(() => h.update(kept, { ...row, last_seen_at: 9 })).toThrow(settled);
-  expect(() => h.touch(kept, "root-1", 9)).toThrow(settled);
-  expect(() => h.end(kept, "root-1", "closed", 9)).toThrow(settled);
-  expect(() => h.childEnd(kept, "root-1", 9, x)).toThrow(settled);
+  await expect(h.insert(kept, { ...row, session_id: "root-2" })).rejects.toThrow(settled);
+  await expect(h.update(kept, { ...row, last_seen_at: 9 })).rejects.toThrow(settled);
+  await expect(h.touch(kept, "root-1", 9)).rejects.toThrow(settled);
+  await expect(h.end(kept, "root-1", "closed", 9)).rejects.toThrow(settled);
+  await expect(h.childEnd(kept, "root-1", 9, x)).rejects.toThrow(settled);
   await expect(h.lose(kept, "root-1", { alias: "a@example.com/fe", reason: "r", primary: true }, 9)).rejects.toThrow(settled);
   await expect(h.tellLost(kept, "root-1", 9)).rejects.toThrow(settled);
   await expect(h.reportLost(kept, "root-1", 9)).rejects.toThrow(settled);
   await expect(h.seeLost(kept, "root-1", 9)).rejects.toThrow(settled);
   await expect(h.forgetLost(kept, "root-1", "a@example.com/fe")).rejects.toThrow(settled);
   await expect(h.heartbeat(kept, 9)).rejects.toThrow(settled);
-  expect(() => h.touch({} as Tx, "root-1", 9)).toThrow("not a SQLite store handle");
+  await expect(h.touch({} as Tx, "root-1", 9)).rejects.toThrow("not a SQLite store handle");
   expect(h.get(repo.read, "root-1")).toMatchObject({ last_seen_at: 1, parked_at: null });
   expect(h.get(repo.read, "root-2")).toBeUndefined();
   expect(h.owned(repo.read, "root-2")).toBe(false);
@@ -865,7 +865,7 @@ test("#807 P1c-12: hosted reads run on the handle they're given", async () => {
   const { kept, u } = await seed(repo, async tx => {
     const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
     const ownership = await repo.hosted.start(tx, "root-1", u.id, "test", 1);
-    repo.hosted.insert(tx, { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
+    await repo.hosted.insert(tx, { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
       writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: 5, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null });
     // Read inside the body that wrote it, on its Tx.
     expect(repo.hosted.get(tx, "root-1")?.ownership_id).toBe(ownership);

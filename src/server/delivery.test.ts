@@ -189,9 +189,9 @@ test("renew is fenced and extends sticky deadline, reopening is idempotent", asy
   expect((await delivery.open(bob, context(bob))).capability).toBe(lease.capability);
   now += 10_000;
   expect((await delivery.renew(bob, context(bob), lease.capability)).expiresAt).toBe(now + 30_000);
-  now += 29_999; hosted.sweep();
+  now += 29_999; await hosted.sweep();
   expect(delivery.activeLeaseCount).toBe(1);
-  now += 1; hosted.sweep();
+  now += 1; await hosted.sweep();
   expect(delivery.activeLeaseCount).toBe(0);
   expect(hostedRowCount(store.db)).toBe(0);
 });
@@ -396,7 +396,7 @@ test("renew completes while a transfer holds the reader gate past the original d
     const renewed = await delivery.renew(bob, context(bob), lease.capability);
     expect(renewed.expiresAt).toBe(now + 30_000);
     now += 20_000;
-    hosted.sweep();
+    await hosted.sweep();
     expect(delivery.activeLeaseCount).toBe(1);
     expect(delivery.describe(bob, context(bob), lease.capability).ownership).toBe(lease.ownership);
   } finally { release(); }

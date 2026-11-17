@@ -40,7 +40,7 @@ export async function realRace(f: {
     const owner = () => app.db.prepare("SELECT ownership_id FROM hosted_sessions WHERE source_session_id = ?").get(root) as { ownership_id: number } | null;
     const old = owner()!.ownership_id; f.outage(true);
     const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/race", "Real network outage recovery", null, false)); app.application.wake(["you@example.com/race"]);
-    await Bun.sleep(31_000); app.mcp.sessions.sweep();
+    await Bun.sleep(31_000); await app.mcp.sessions.sweep();
     assert.equal(owner(), null); assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), 0); assert.equal(g.inputs.length, 0);
     f.outage(false);
     await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, "automatic rightful ownership after actual expired outage");
@@ -89,7 +89,7 @@ export async function realRace(f: {
       }
       case "expiry": {
         f.expiryContinuation.arm();
-        f.outage(true); await Bun.sleep(31_000); app.mcp.sessions.sweep();
+        f.outage(true); await Bun.sleep(31_000); await app.mcp.sessions.sweep();
         assert.equal(app.db.prepare("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get(root), null, "Real wall-clock sticky deadline releases ownership");
         break;
       }

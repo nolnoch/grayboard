@@ -171,7 +171,7 @@ test("registration before bind/open preserves the graph and never extends a stic
   expect(database.repo.hosted.get(database.repo.read, id)).toMatchObject({ ownership_id: ownership, lease_deadline: lease.expiresAt, last_seen_at: now });
   expect(database.repo.hosted.all(database.repo.read)).toHaveLength(3);
   now = lease.expiresAt + 1;
-  hosted.sweep();
+  await hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);
 });
 
@@ -203,7 +203,7 @@ test("successful new and idempotent registration refresh activity but refusals d
   expect(database.repo.hosted.get(database.repo.read, id)?.last_seen_at).toBe(now);
   const active = now;
   now += 1_001;
-  hosted.sweep();
+  await hosted.sweep();
   // The root and "second" stay active; "first", idle since its registration, is parked (#566).
   expect(database.repo.hosted.all(database.repo.read)).toHaveLength(2);
   expect(database.repo.hosted.children(database.repo.read, id)).toHaveLength(2);
@@ -213,7 +213,7 @@ test("successful new and idempotent registration refresh activity but refusals d
   expect(database.repo.hosted.get(database.repo.read, id)?.grant_id).toBe(first.grantId);
   await hosted.end(p, context(p, "blocked"));
   now = active + 900_001;
-  hosted.sweep();
+  await hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);
 });
 
@@ -275,7 +275,7 @@ test("two restarts retain ownership and deadline; downtime is credited; expiry r
   expect(releases()).toEqual([]);
   expect(database.repo.hosted.all(database.repo.read)).toHaveLength(2);
   // ...but time while the server is up does.
-  now += 31_000; hosted.sweep();
+  now += 31_000; await hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "expired" }]);
   await close(); await open();
