@@ -17,6 +17,7 @@ import {
 } from "../shared/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
 import { viaLabel } from "../shared/notifications.ts";
+import type { SendResult } from "../shared/protocol.ts";
 import type { Store, ThreadRow } from "./store.ts";
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 
@@ -93,7 +94,7 @@ const SHARE_POLLS = 10;
 const CHECK = "white_check_mark";
 
 const HINT =
-  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread. To make a board: "new #board what it\'s for".';
+  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread. To make a board: "new #board what it\'s for"; to archive or reopen one: "archive #board", "reopen #board".';
 
 export class Relay {
   private draining = false;
@@ -483,6 +484,8 @@ export class Relay {
     const nb = /^new\s+#([a-z0-9_-]{1,32})(?:[\s:,]+(\S[\s\S]*))?$/i.exec(text);
     if (nb && files.length) return this.say(ts, `⚠️ not created: files don't come along when making a board; make #${nb[1]!.toLowerCase()} first, then post them with "#${nb[1]!.toLowerCase()} …"`);
     if (nb) return this.createBoard(nb[1]!.toLowerCase(), nb[2], ts);
+    const ar = /^(archive|reopen)\s+#([a-z0-9_-]{1,32})\s*$/i.exec(text);
+    if (ar && !files.length) return this.archiveBoard(ar[2]!.toLowerCase(), ar[1]!.toLowerCase() === "archive", ts);
     const bp = /^#([a-z0-9_-]{1,32})(?:\s+(\S[\s\S]*))?$/i.exec(text);
     if (bp && (bp[2] || files.length)) return this.sendPost(bp[1]!.toLowerCase(), bp[2] ?? "", files, undefined, ts, null);
     await this.say(ts, HINT);
@@ -550,13 +553,15 @@ export class Relay {
     );
     const where = row?.thread_ts ?? ts;
     if (!r.ok) return this.say(where, row ? threadBounce(r) ?? `⚠️ not sent: ${r.error}` : `⚠️ not sent: ${r.error}`);
-    const v = r.value as { message_id: number; delivered_now: boolean; recipient_last_seen?: string };
+    const v = r.value as Pick<SendResult, "message_id" | "delivered_now" | "recipient_last_seen" | "wakes" | "wake_note">;
     if (row) this.store.advance(row.thread_ts, v.message_id);
     if (v.delivered_now) await this.react(ts);
     else {
       const seen = v.recipient_last_seen ? ` (last seen ${v.recipient_last_seen})` : "";
       await this.say(where, `queued: ${to} is offline${seen}; it gets this when its next session starts.`);
     }
+    // Another user's agent no grant lets this person wake (#806): say so, or they wait on an agent that won't act.
+    if (v.wakes === false) await this.say(where, v.wake_note ?? `delivered as mail: ${to} won't act on it until its user does.`);
   }
 
   private async sendPost(board: string, text: string, files: Record<string, any>[], parent: number | undefined, ts: string, row: ThreadRow | null): Promise<void> {
@@ -603,6 +608,17 @@ export class Relay {
     await this.bus.call("board_subscribe", { board, mode: "quiet" });
     await this.react(ts);
     await this.say(ts, `created #${board}. Post with "#${board} …"; @mention the agents you want to hear from, since no one else is subscribed yet.`);
+  }
+
+  // The owner's way to archive a board (#848): board_archive lets the creator's
+  // own user's human archive or reopen it.
+  private async archiveBoard(board: string, archived: boolean, ts: string): Promise<void> {
+    const r = await this.bus.call("board_archive", { board, archived });
+    const verb = archived ? "archived" : "reopened";
+    if (!r.ok) return this.say(ts, `⚠️ not ${verb}: ${/no such board/.test(r.error) ? await this.noBoard(board) : r.error}`);
+    const v = r.value as { note?: string };
+    if (v.note) return this.say(ts, v.note);
+    await this.react(ts);
   }
 
   // The bus's "no such board" points agents at board_list; the owner gets the

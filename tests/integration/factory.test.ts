@@ -885,6 +885,29 @@ test("fan-out (#638): a subtask whose run fails still reaches the synthesis, whi
   await done;
 });
 
+// #848: an archived board leaves board_list, so the factory reads it as missing; board_create's refusal names the
+// archive, and the factory's log and reply say so rather than retrying or calling it a failure to create.
+test("an archived fleet or work board is named as archived, not retried", async () => {
+  const runner = new FakeRunner();
+  runner.script = (r) => (r.id === 7 && !r.task.includes("## Subtask results") ? PLAN() : undefined);
+  const bus = new FakeBus();
+  let workCreates = 0;
+  bus.refuse = (tool, args) => {
+    if (tool !== "board_create") return false;
+    if (args.name === "sim-work") workCreates++;
+    return args.name === "be-tasks" || args.name === "sim-work" ? `board #${args.name} already exists, archived; board_archive(board, false) reopens it` : false;
+  };
+  const { logs, done } = loop({ runner, bus, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }, { name: "be", agent: "researcher" }] });
+  await until(() => logs.some((l) => l.includes("#be-tasks")), 5000, "the sync");
+  expect(logs).toContain(`fleet be: #be-tasks is archived; its creator reopens it with board_archive(board, false), or, for a user's board, that user from Slack: "reopen #be-tasks", then the fleet joins it`);
+  bus.deliver(task(7));
+  await until(() => bus.replies(7).length === 2, 5000, "7 couldn't fan out");
+  expect(bus.replies(7)[1]).toBe(`[factory] failed: #sim-work, where sim's subtasks would go, is archived; its creator reopens it with board_archive(board, false), or, for a user's board, that user from Slack: "reopen #sim-work". Nothing was fanned out.`);
+  expect(workCreates).toBe(1);
+  await bus.close();
+  await done;
+});
+
 test("work board (#665, #668): a create another process won first is retried as found; a failed open is dropped and tried again on the next fan-out", async () => {
   const runner = new FakeRunner();
   runner.script = (r) => ((r.id === 7 || r.id === 8 || r.id === 9) && !r.task.includes("## Subtask results") ? PLAN() : undefined);

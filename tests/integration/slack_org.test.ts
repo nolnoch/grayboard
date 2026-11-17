@@ -932,6 +932,35 @@ test("when Slack can't be reached to check the email, the link is refused with a
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);
 
+// #856: a Slack DM to another user's agent that no grant lets this person wake (#806) says so in its thread; one
+// to the person's own agent doesn't. The relay handles Slack events in order (Relay.inbound), so once the second
+// DM's note is in Slack the first DM's handling is done.
+test("a Slack DM to another user's agent says it won't wake it; one to your own agent doesn't", async () => {
+  const alice = await login("alice@example.com");
+  await login("bob@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const fe = await hosted("bob@example.com", "fe");
+  const inThread = (ts: string) => slack.posts().filter((p) => p.thread_ts === ts);
+
+  const mine = slack.say("@be hi my agent");
+  await be.next(direct((m) => m.body === "hi my agent"), 5000);
+  const theirs = slack.say("@bob@example.com/fe hi bob's agent");
+  await fe.next(direct((m) => m.body === "hi bob's agent"), 5000);
+  const note = await until(() => inThread(theirs.ts).find((p) => p.markdown_text?.includes("Delivered as mail")), 5000, "the wake note reached Slack");
+  expect(note.markdown_text).toContain("bob@example.com's agent won't act on it until its user does");
+  expect(slack.reactions().map((r) => r.timestamp)).toEqual([mine.ts, theirs.ts]);
+  expect(inThread(mine.ts)).toEqual([]);
+
+  // A reply in the mapped thread gets the note too; with fe ended (its person alias stays), after the queued line.
+  await fe.end();
+  slack.say("still there?", { thread_ts: theirs.ts });
+  await until(() => inThread(theirs.ts).length === 3, 5000, "the reply's two lines reached Slack");
+  const [queued, again] = inThread(theirs.ts).slice(1).map((p) => p.markdown_text);
+  expect(queued).toStartWith("queued: bob@example.com/fe is offline");
+  expect(again).toBe(note.markdown_text);
+});
+
 // #1062: the RelayStore's overlay of pending writes (#1016), driven at the store. The thread() overlay and the advance
 // projection sit on the outbound reply path, whose root lookup is itself a queued read, so FIFO commits the posted row
 // first today: they guard a Repo whose reads leave the queue, and no end-to-end path reaches them yet.
@@ -1051,4 +1080,32 @@ test("#1062: the receipt drops the overlay of a progress write that failed", asy
     expect(srv.app.repo.slack.progress(srv.app.repo.read, userId, "post:990002")).toBeUndefined();
     await until(() => store.progress(again) === undefined, 5000, "the receipt dropped the failed write's overlay");
   } finally { holder.release(); errors.mockRestore(); }
+});
+
+// #848: the Slack human archives and reopens with "archive #board"/"reopen #board", but only a board its own user's
+// agent created: on a server the human override doesn't cross users.
+test("the Slack human archives and reopens its own user's boards, not another user's", async () => {
+  const alice = await login("alice@example.com");
+  await login("bob@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const fe = await hosted("bob@example.com", "fe");
+  await be.call("board_create", { name: "mine", purpose: "alice's" });
+  await fe.call("board_create", { name: "theirs", purpose: "bob's" });
+  const listed = async () => (await be.call<{ name: string }[]>("board_list")).map((b) => b.name);
+  const reply = (ts: string) => until(() => slack.posts().find((p) => p.thread_ts === ts), 5000, "the reply reached Slack");
+  const reacted = (ts: string) => until(() => slack.reactions().some((r) => r.timestamp === ts), 5000, "the reaction reached Slack");
+
+  const refused = slack.say("archive #theirs");
+  expect((await reply(refused.ts)).markdown_text).toBe("⚠️ not archived: only #theirs's creator (bob@example.com/fe) or its user (bob@example.com, from Slack: archive #theirs / reopen #theirs) can archive or reopen it");
+  expect(await listed()).toContain("theirs");
+
+  await reacted(slack.say("archive #mine").ts);
+  expect(await listed()).not.toContain("mine");
+  const again = slack.say("ARCHIVE #mine");
+  expect((await reply(again.ts)).markdown_text).toStartWith("#mine was already archived at ");
+  await reacted(slack.say("reopen #mine").ts);
+  expect(await listed()).toContain("mine");
+  const missing = slack.say("archive #nope");
+  expect((await reply(missing.ts)).markdown_text).toStartWith("⚠️ not archived: no board #nope");
 });

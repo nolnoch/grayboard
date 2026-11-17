@@ -108,6 +108,13 @@ export type Access = {
   seesAlias?(handle: string, scope: Omit<AliasScope, "name">): boolean;
   // The board only a human handle can start posts on, or null for none.
   announceBoard: string | null;
+  // Whether `human` acts for the same user as `address`, so may archive a board
+  // it created (#848). Omitted: always (local mode has one user).
+  sameUser?(human: string, address: string): boolean;
+  // The user `address` acts for (its email), or null for a team, a service or
+  // an address that names none; names who else may archive a board in a
+  // refusal. Omitted: the refusal says "your user" (local mode has one).
+  ownerOf?(address: string): string | null;
 };
 
 export const ANNOUNCE_BOARD = "announce";
@@ -431,8 +438,9 @@ export function createBoard(
 // refuses new top-level posts (replies still land, so open threads finish) and
 // stays readable by name; subscriptions, cursors and claims are untouched.
 // Archiving isn't an edit (principle 5): no post changes, and it reverses.
-// Only the board's creator (any of the caller's addresses) or a human may;
-// a mode's own boards (#announce, a team's board) never archive.
+// Only the board's creator (any of the caller's addresses) or the creator's
+// own user's human may; a mode's own boards (#announce, a team's board) never
+// archive.
 export function archiveBoard(
   db: Database,
   handle: string,
@@ -445,8 +453,9 @@ export function archiveBoard(
     throw new CoreError(`#${b.name} belongs to the bus itself and can't be archived`);
   }
   const addresses = opts.addresses ?? [handle];
-  if (!opts.human && !isHuman(db, handle) && !addresses.includes(b.created_by)) {
-    throw new CoreError(`only #${b.name}'s creator (${b.created_by}) or your user can archive or reopen it`);
+  const human = (opts.human || isHuman(db, handle)) && (access(db).sameUser?.(handle, b.created_by) ?? true);
+  if (!human && !addresses.includes(b.created_by)) {
+    throw new CoreError(archiveRefusal(db, b));
   }
   // A repeat is answered from state (#254), never written twice.
   if (archived && b.archived_at) {
@@ -455,6 +464,17 @@ export function archiveBoard(
   if (!archived && !b.archived_at) return { board: b, note: `#${b.name} isn't archived` };
   db.prepare(`UPDATE boards SET archived_at = ?, archived_by = ? WHERE name = ?`).run(archived ? Date.now() : null, archived ? handle : null, b.name);
   return { board: getBoard(db, b.name)! };
+}
+
+// Who may archive or reopen `b`, named for a caller who may not.
+function archiveRefusal(db: Database, b: Board): string {
+  const a = access(db);
+  const who = `only #${b.name}'s creator (${b.created_by})`;
+  if (!a.ownerOf) return `${who} or your user can archive or reopen it`;
+  const owner = a.ownerOf(b.created_by);
+  return owner
+    ? `${who} or its user (${owner}, from Slack: archive #${b.name} / reopen #${b.name}) can archive or reopen it`
+    : `${who} can archive or reopen it`;
 }
 
 // For a mode's own bookkeeping (e.g. a team's board), not agent requests:
