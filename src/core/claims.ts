@@ -45,7 +45,7 @@ function holderHidden(db: Database, seer: string, holder: string): boolean {
   return seenHandles(db, seer, [holder]).length === 0;
 }
 
-type ClaimChanges = { wake: string[]; boards: string[] };
+export type ClaimChanges = { wake: string[]; boards: string[] };
 export type ClaimResult = ClaimChanges & (
   | { ok: true; claim: Claim; renewed: boolean }
   | { ok: false; held_by: string | null; note: string | null; expires_at: number }
@@ -331,7 +331,7 @@ export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?
 // the work was done, so the post says to check with them. Runs inside the
 // caller's transaction: the delete makes each lapse announce once, however
 // many sessions sweep.
-function sweepChanges(db: Database, now: number): ClaimChanges {
+export function sweepChanges(db: Database, now: number): ClaimChanges {
   const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as ClaimRow[];
   const wake = new Set<string>();
   const boards = new Set<string>();
@@ -365,6 +365,13 @@ export function sweepExpired(db: Database, now = Date.now()): ClaimChanges {
   return db.transaction(() => sweepChanges(db, now)).immediate();
 }
 
+// What an expiry timer reads and writes: the next expiry of a claim with a board, and the sweep, which reads the
+// clock inside its write. A server's store reads asynchronously (#807 P3 B2); local mode's reads are synchronous.
+export type ExpirySource = {
+  next(): number | null | Promise<number | null>;
+  sweep(): ClaimChanges | Promise<ClaimChanges>;
+};
+
 // One timer, armed for the next expiry of a claim with a board, so a lapse is
 // announced when it happens. Call arm() after anything that may have added a
 // claim (a tool call, a wakeup); it only ever moves the timer earlier. stop() is terminal.
@@ -373,6 +380,23 @@ export function claimExpiryTimer(
   onWake: (handles: string[]) => void,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
   tx: WriteTx = immediateTx(db),
+): { arm(): void; stop(): void } {
+  return expiryTimer({
+    next: () => (db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as { next: number | null }).next,
+    // A queued `tx` may make the sweep wait (#807 D4): the clock is read inside it.
+    sweep: () => tx((w) => sweepChanges(w, Date.now())),
+  }, onWake, onBoardsChanged);
+}
+
+// claimExpiryTimer over any source. An asynchronous next() resolves after the arm that asked: a read that started
+// before a commit may miss that commit's claim, but the commit's own arm reads after it; a stale earlier time only
+// fires an empty sweep, which re-arms. A failed sweep or read retries after `retryMs`: a transient store error
+// mustn't leave live claims' lapses unannounced until the next arm.
+export function expiryTimer(
+  source: ExpirySource,
+  onWake: (handles: string[]) => void,
+  onBoardsChanged?: (boards: string[]) => void | Promise<void>,
+  retryMs = 5_000,
 ): { arm(): void; stop(): void } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
@@ -389,9 +413,8 @@ export function claimExpiryTimer(
     timer = undefined;
     at = Infinity;
     try {
-      // The server's queue may make the sweep wait (#807 D4): the clock is read inside it, and a stop while it
-      // waited still stops what follows.
-      const { wake, boards } = await tx((w) => sweepChanges(w, Date.now()));
+      // A stop while the sweep waited still stops what follows.
+      const { wake, boards } = await source.sweep();
       if (stopped) return;
       if (boards.length) {
         try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
@@ -399,16 +422,19 @@ export function claimExpiryTimer(
       if (!stopped && wake.length) onWake(wake);
     } catch (e) {
       console.error("[grayboard] claim expiry sweep failed:", e);
-      return set(Date.now() + 5_000);
+      return set(Date.now() + retryMs);
     }
     arm();
   };
+  const moveTo = (next: number | null) => {
+    if (next !== null && next < at) set(next);
+  };
   const arm = () => {
     if (stopped) return;
-    const row = db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as {
-      next: number | null;
-    };
-    if (row.next !== null && row.next < at) set(row.next);
+    const next = source.next();
+    if (!(next instanceof Promise)) return moveTo(next);
+    // set() checks stopped, so a stop while the read waited arms nothing.
+    next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(Date.now() + retryMs); });
   };
   arm();
   return {

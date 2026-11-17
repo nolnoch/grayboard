@@ -7,6 +7,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
 import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
@@ -157,7 +158,7 @@ function withTx<T>(db: Database, fn: (tx: Tx) => T): () => T {
 const isThenable = (v: unknown): v is PromiseLike<unknown> =>
   v !== null && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
 
-// Core's shared writes (attachment store/release/sweep, claim expiry, #807 D4) through repo's write queue, each body
+// Core's shared writes (attachment store/release/sweep, #807 D4) through repo's write queue, each body
 // given the connection its queued body's `Tx` resolves to (P1c-15c-2). Core's bodies are synchronous, so the cast
 // only restates that.
 export function queuedTx(repo: Repo): WriteTx {
@@ -360,6 +361,16 @@ export interface Repo {
     setPlace(tx: Tx, id: string, place: string | null): Promise<void>;
     // An alias's labels (core setAliasMeta), audited through `audit`.
     setMeta(tx: Tx, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string): Promise<void>;
+  };
+  // Claims' reads and the expiry sweep (#807 P3 B2), on the caller's handle. The claim tools' writes stay with
+  // callBoardTool (B5b).
+  claims: {
+    // Live claims, by key; with prefix, only keys that start with it.
+    list(r: Read, prefix?: string): Promise<Claim[]>;
+    // The earliest expiry of a claim with a board (the expiry timer's next fire), or null.
+    nextExpiry(r: Read): Promise<number | null>;
+    // Deletes the claims lapsed at now and announces them (core sweepChanges).
+    sweep(tx: Tx, now: number): Promise<ClaimChanges>;
   };
   // The writes return promises (#807 P3 A6g), and so do the reads, on the caller's handle (A7e3).
   teams: {
@@ -1450,6 +1461,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       setIdFacts: async (tx, id, facts) => setIdFacts(sqliteOf(tx), id, facts),
       setPlace: async (tx, id, place) => setPlace(sqliteOf(tx), id, place),
       setMeta: async (tx, address, meta, session, audit, actor) => setAliasMeta(sqliteOf(tx), address, meta, session, audit, actor),
+    },
+
+    claims: {
+      list: async (r, prefix) => listClaims(sqliteOf(r), prefix),
+      nextExpiry: async (r) => sqliteOf(r).query<{ next: number | null }, []>(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get()!.next,
+      sweep: async (tx, now) => sweepChanges(sqliteOf(tx), now),
     },
 
     teams: {

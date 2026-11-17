@@ -40,7 +40,7 @@ import {
   type ReadResult,
 } from "./boards.ts";
 import { announcementsInstruction, callBoardTool, claimsInstruction, humanInstruction } from "./tools.ts";
-import { claim, claimExpiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
+import { claim, claimExpiryTimer, expiryTimer, listClaims, release, sweepExpired, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 import { dropHold, holdAlias, logBinding } from "./bindings.ts";
 import { boardNotification } from "../shared/notifications.ts";
@@ -729,6 +729,61 @@ test("the expiry timer fires at the next lapse without anyone asking", async () 
   timer.stop();
   expect(woken).toEqual([["sim"]]);
   expect(listClaims(db)).toEqual([]);
+});
+
+// #807 P3 B2: a server's expiry source reads asynchronously. Its read arms the timer when it resolves; a stop while it
+// waits arms nothing; a failed read is logged, not thrown at the arm's caller.
+test("#807 P3 B2: an asynchronous expiry read arms when it resolves, and a stop while it waits arms nothing", async () => {
+  let sweeps = 0;
+  const reads: ((next: number | null) => void)[] = [];
+  const timer = expiryTimer({
+    next: () => new Promise<number | null>(resolve => { reads.push(resolve); }),
+    sweep: async () => { sweeps++; return { wake: [], boards: [] }; },
+  }, () => {});
+  try {
+    expect(reads).toHaveLength(1);
+    reads.shift()!(Date.now());
+    // The sweep re-arms: its read is the next one.
+    for (let i = 0; i < 100 && reads.length === 0; i++) await Bun.sleep(10);
+    expect(sweeps).toBe(1);
+    expect(reads).toHaveLength(1);
+    timer.stop();
+    reads.shift()!(Date.now());
+    await Bun.sleep(50);
+    expect(sweeps).toBe(1);
+  } finally { timer.stop(); }
+});
+
+test("#807 P3 B2: a failed asynchronous expiry read is logged", async () => {
+  const reported = spyOn(console, "error").mockImplementation(() => {});
+  const timer = expiryTimer({
+    next: () => Promise.reject(new Error("read failed")),
+    sweep: async () => ({ wake: [], boards: [] }),
+  }, () => {});
+  try {
+    expect(() => timer.arm()).not.toThrow();
+    for (let i = 0; i < 100 && reported.mock.calls.length < 2; i++) await Bun.sleep(10);
+    expect(reported.mock.calls).toEqual([
+      ["[grayboard] claim expiry arm failed:", new Error("read failed")],
+      ["[grayboard] claim expiry arm failed:", new Error("read failed")],
+    ]);
+  } finally { timer.stop(); reported.mockRestore(); }
+});
+
+// #807 P3 B2 audit: a failed read retries, so a transient store error doesn't leave the timer idle.
+test("#807 P3 B2: a failed asynchronous expiry read retries the arm", async () => {
+  const reported = spyOn(console, "error").mockImplementation(() => {});
+  let sweeps = 0, reads = 0;
+  const timer = expiryTimer({
+    next: () => ++reads === 1 ? Promise.reject(new Error("read failed")) : Promise.resolve(null),
+    sweep: async () => { sweeps++; return { wake: [], boards: [] }; },
+  }, () => {}, undefined, 10);
+  try {
+    for (let i = 0; i < 100 && reads < 2; i++) await Bun.sleep(10);
+    expect(sweeps).toBe(1);
+    expect(reads).toBe(2);
+    expect(reported.mock.calls).toEqual([["[grayboard] claim expiry arm failed:", new Error("read failed")]]);
+  } finally { timer.stop(); reported.mockRestore(); }
 });
 
 test("expiry board callbacks observe commits and failures cannot poison wake or rearming", async () => {

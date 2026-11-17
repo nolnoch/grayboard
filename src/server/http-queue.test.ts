@@ -119,13 +119,13 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
   const you = await srv.login("you@example.com"), bob = await srv.login("bob@example.com");
   const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   let route = "";
-  const bindingSpies = (Object.keys(repo.bindings) as (keyof typeof repo.bindings)[]).map(name => {
-    const own = (repo.bindings[name] as (...a: unknown[]) => unknown).bind(repo.bindings);
-    return spyOn(repo.bindings, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      checks.push({ route, op: name, inTxn: db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+  const bindingSpies = [repo.bindings, repo.claims].flatMap(group => (Object.keys(group) as (keyof typeof group)[]).map(name => {
+    const own = (group[name] as (...a: unknown[]) => unknown).bind(group);
+    return spyOn(group, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push({ route, op: String(name), inTxn: db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
       return own(r, ...rest);
     }) as never);
-  });
+  }));
   const original = repo.coreOn.bind(repo);
   const spy = spyOn(repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
     checks.push({ route, op: "coreOn", inTxn: db.inTransaction, handle: h === repo.read ? "pool" : "tx" });
@@ -155,9 +155,13 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     const inBody = ["team create", "team add", "identity create", "claim call", "claim call as id", "identity delete", "team delete-alias", "team remove", "team leave"];
     // Each in-body route reached core at least once, so the last check isn't vacuous for it.
     expect(inBody.filter(r => !checks.some(c => c.route === r && c.handle === "tx"))).toEqual([]);
-    expect(checks.some(c => c.route === "claim list" && c.handle === "pool")).toBe(true);
+    // B2: the claim list reads through repo.claims, on the pool.
+    expect(checks.some(c => c.route === "claim list" && c.op === "list" && c.handle === "pool")).toBe(true);
     // B1a: the ID branch's row, the alias-in-use checks and the claim's address set read on the body's Tx.
-    const reads = (r: string) => checks.filter(c => c.route === r && c.op !== "coreOn").map(c => `${c.op}:${c.handle}`);
+    // The expiry timer's re-arm (`nextExpiry`) runs detached after a claim call's commit, so its route label is whichever
+    // call is current when it lands: it is left out of the per-route reads and must read on the pool, outside any body.
+    expect(checks.filter(c => c.op === "nextExpiry" && (c.handle !== "pool" || c.inTxn))).toEqual([]);
+    const reads = (r: string) => checks.filter(c => c.route === r && c.op !== "coreOn" && c.op !== "nextExpiry").map(c => `${c.op}:${c.handle}`);
     expect(reads("claim call as id")).toEqual(["idRow:tx", "addressSet:tx"]);
     expect(reads("claim call")).toEqual(["userOf:tx", "addressSet:tx"]);
     expect(reads("identity delete")).toEqual(["userOf:tx"]);

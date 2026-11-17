@@ -285,8 +285,8 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
   try {
     await hosted.bind(principal, a, { name: "p15a", create: true });
     await hosted.bind(principal, b, { name: "p15b", create: true });
+    // P3 B1c/B2: bind reaches core no more (its binding writes are repo.bindings', its claims read repo.claims').
     const bound = checks.length;
-    expect(checks.filter(c => c.inTxn && c.handle === "tx").length).toBeGreaterThan(0);
     await hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, "p15b", "question", { pending: true }));
     await hosted.run(principal, a, "board_create", (session, tx) => application.call(tx, session, "board_create", { name: "p15", purpose: "tests" }));
     await hosted.run(principal, b, "board_subscribe", (session, tx) => application.call(tx, session, "board_subscribe", { board: "p15", mode: "push" }));
