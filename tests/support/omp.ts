@@ -7,7 +7,7 @@
 // and the hosted helpers come from tests/support/pi.ts.
 import { expect } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { hostTools, snapshotTools } from "../../adapters/hosted-core/src/proxy.ts";
@@ -1015,8 +1015,13 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
     try {
       installLocal(dir, model.port);
       peer = await localSession(dir, "peer");
-      // No grayboard runs at this command; omp's ACP sessions don't start it anyway.
-      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({ mcpServers: { bus: { command: join(dir, "missing", "grayboard"), args: ["mcp", "--mode", "local"] } } }));
+      // A "grayboard" that only leaves a marker: were omp to start it in ACP,
+      // skipping the check would let a second grayboard through.
+      const ran = join(dir, "bus-ran");
+      mkdirSync(join(dir, "fake"), { recursive: true });
+      writeFileSync(join(dir, "fake", "grayboard"), `#!/bin/sh\ntouch '${ran}'\n`);
+      chmodSync(join(dir, "fake", "grayboard"), 0o755);
+      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({ mcpServers: { bus: { command: join(dir, "fake", "grayboard"), args: ["mcp", "--mode", "local"] } } }));
       const acp = startAcpOmp(dir, procs);
       await acp.call("initialize", { protocolVersion: 1, clientCapabilities: {} });
       const { sessionId: first } = await acp.call<{ sessionId: string }>("session/new", { cwd: dir, mcpServers: [] });
@@ -1043,6 +1048,7 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
       expect(dms[0]!.via).toBe(dms[0]!.sender_id);
       const seen = localRows<{ target: string }>(dir, "SELECT target FROM audit_log WHERE action = 'id.child_seen'");
       expect(seen.map((s) => s.target)).toEqual([dms[0]!.sender_id]);
+      expect(existsSync(ran)).toBe(false);
       expect(model.unhandled).toEqual([]);
     } finally {
       await stopAll(procs);
