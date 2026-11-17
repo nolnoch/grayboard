@@ -139,8 +139,9 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
     if (!isThenable(out) && !tx.hasBeforeCommit) return settle(out as T);
     // Reactions attached here run as the holder (the queue's context follows them), so the commit is the writer's.
     // The beforeCommit hooks run after the body fulfils, on its still-open Tx (#807 P3 A7g); a sync body that
-    // registered one goes this way too.
-    return Promise.resolve(out).then(async value => { await tx.runBeforeCommit(); return value; }).then(settle, fail);
+    // registered one goes this way too. With none, the commit is as many ticks after the body as before: an
+    // un-awaited write's caller resumes after it committed, not inside it.
+    return Promise.resolve(out).then(value => tx.hasBeforeCommit ? tx.runBeforeCommit().then(() => settle(value), fail) : settle(value), fail);
   }
 }
 
