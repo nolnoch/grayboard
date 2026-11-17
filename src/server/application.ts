@@ -579,11 +579,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // logged and audited id.end_failed, and leaves the others ended. Only a revoked alias's end is retried while
   // the server runs (revalidate re-checks it); a startup leftover's is
   // retried at the next start, and its holds stay until then (#475 item 2).
-  // Settles once the ends are written; a failure of the whole write is logged, not rejected (the next start retries).
+  // Settles once the ends are written. A failure of the whole write rejects it: its only caller is startup, whose
+  // `ready` then rejects and the server exits, as the idle-queue post this replaced threw out of startup (#807 P3 A1).
   function endIds(ids: string[], why: string): Promise<void> {
     if (!ids.length) return Promise.resolve();
-    return repo.write(tx => endIdsIn(tx, ids, why), ends => afterEnds(ends.woken, ends.bounced))
-      .then(() => {}, error => console.error("[grayboard] session ends failed:", error));
+    return repo.write(tx => endIdsIn(tx, ids, why), ends => afterEnds(ends.woken, ends.bounced)).then(() => {});
   }
   type Ends = { woken: Set<string>; bounced: { id: string; at: number }[] };
   // endIds's body, inside a write body: `tx` is that body's. Each end's savepoint runs on its own Tx.
