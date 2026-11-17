@@ -21,7 +21,7 @@ afterEach(() => {
 
 // #275: an unauthenticated flood costs one database probe per HEALTH_TTL_MS.
 test("healthz probes the database at most once per window and reports the version", async () => {
-  const probe = spyOn(store.repo.users, "findByEmail");
+  const probe = spyOn(store.repo.policyNow, "userByEmail");
   for (let i = 0; i < 100; i++) {
     const r = healthz(store.repo, 5_000 + i);
     expect(r.status).toBe(200);
@@ -34,7 +34,7 @@ test("healthz probes the database at most once per window and reports the versio
 });
 
 test("a failed probe is cached too: one 503 and one log line per window, then recovery is seen", () => {
-  const probe = spyOn(store.repo.users, "findByEmail").mockImplementation(() => { throw new Error("disk I/O error"); });
+  const probe = spyOn(store.repo.policyNow, "userByEmail").mockImplementation(() => { throw new Error("disk I/O error"); });
   const log = spyOn(console, "error").mockImplementation(() => {});
   try {
     for (let i = 0; i < 50; i++) expect(healthz(store.repo, 9_000 + i).status).toBe(503);
@@ -48,7 +48,7 @@ test("a failed probe is cached too: one 503 and one log line per window, then re
 test("each repo has its own cache", () => {
   const other = openDatabase(scratchDbPath(), { blobDir: dir });
   try {
-    const failing = spyOn(other.repo.users, "findByEmail").mockImplementation(() => { throw new Error("gone"); });
+    const failing = spyOn(other.repo.policyNow, "userByEmail").mockImplementation(() => { throw new Error("gone"); });
     const log = spyOn(console, "error").mockImplementation(() => {});
     try {
       expect(healthz(store.repo, 1_000).status).toBe(200);
@@ -144,7 +144,7 @@ test("a really blocked loop fails healthz through the sampler's windows; the rin
 });
 
 test("a down database wins over a lagging loop", async () => {
-  const probe = spyOn(store.repo.users, "findByEmail").mockImplementation(() => { throw new Error("gone"); });
+  const probe = spyOn(store.repo.policyNow, "userByEmail").mockImplementation(() => { throw new Error("gone"); });
   const errors = spyOn(console, "error").mockImplementation(() => {});
   try {
     const slow = { p50: 1, p99: 2, max: 3 };
