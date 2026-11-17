@@ -27,6 +27,6 @@ const mismatches = [...installedChecks, ...publicChecks].filter(x => x.sha256 !=
 const backend = files(join(checkout, "src")).map(path => ({ path: relative(checkout, path), sha256: digest(path) }));
 // The fixtures that drive the host, including the transaction races' process helpers from tests/support (#383)
 // and the stubbed identity provider the host starts its server with (#928).
-const drivers = [...files(join(packageRoot, "tests")), ...["tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts", "tests/support/until.ts"].map(path => join(checkout, path))].map(path => ({ path: relative(checkout, path), sha256: digest(path) }));
+const drivers = [...files(join(packageRoot, "tests")), ...["tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts"].map(path => join(checkout, path))].map(path => ({ path: relative(checkout, path), sha256: digest(path) }));
 await Bun.write(output, JSON.stringify({ bun: Bun.version, installed: !!installed, publicInstalled: !!configInstalled, installedChecks, publicChecks, mismatches, backend, drivers }, null, 2) + "\n");
 assert.equal(mismatches.length, 0, "Installed package bytes must match this source tree");

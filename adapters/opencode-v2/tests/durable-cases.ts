@@ -7,7 +7,7 @@ import type { NativeInput, NativeAdmission } from "./effect-instrument.js";
 import { afterProducers } from "./causal.ts";
 import type { SubscriberWork } from "./subscriber-work.ts";
 import { bounded, drainSessions } from "./reload-state.ts";
-import { until } from "../../../tests/support/until.ts";
+import { until } from "./until.ts";
 
 type Host = FixtureHost;
 type Input = NativeInput;

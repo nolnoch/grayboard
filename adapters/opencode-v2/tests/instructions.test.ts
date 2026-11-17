@@ -10,7 +10,7 @@ import { EFFORT_META, LAUNCHER_META, MODEL_META, NativeWire, SUGGESTED_META, Ser
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import type { RecordStatus } from "../src/core/diagnostics.js";
 import { fixture } from "./native-fixture.js";
-import { until } from "../../../tests/support/until.ts";
+import { until } from "./until.ts";
 
 // OpenCode's `entries()` (core/mcp-guidance, @opencode/core 2.1.4) for a codemode server and a plain one.
 const execute = '    Use tools from this server through `execute` under `tools["grayboard"]`.';

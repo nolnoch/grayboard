@@ -16,7 +16,7 @@ import { assertWrote, audits, hostedRow, releases } from "./server-db.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../../src/server/oauth-config.ts";
 import type { OAuthPrincipal } from "../../../src/server/oauth.ts";
 import { transactionProcess } from "../../../tests/support/transaction-process.ts";
-import { until } from "../../../tests/support/until.ts";
+import { until } from "./until.ts";
 
 export const transactionScenarios = ["pending-gate", "bind-commit", "register-txn", "attach-revoke", "lease-expire"];
 

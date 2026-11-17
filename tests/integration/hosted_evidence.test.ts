@@ -85,7 +85,7 @@ for (const mode of ["assertion", "truncated", "crash", "provenance", "success", 
   for (const file of ["e2e.sh", "hosted-e2e.sh", "hosted-evidence.ts", "hosted-provenance.ts", "hosted-matrix.ts", "hosted-matrix-shell.ts"]) cpSync(join(checkout, "scripts", file), join(root, "scripts", file));
   cpSync(join(checkout, ".bun-version"), join(root, ".bun-version")); // the Bun pin hosted-evidence.ts and hosted-e2e.sh read (#379)
   writeFileSync(join(root, "src/fixture.ts"), "export {};\n");
-  for (const file of ["tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts", "tests/support/until.ts"]) writeFileSync(join(root, file), "export {};\n");
+  for (const file of ["tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts"]) writeFileSync(join(root, file), "export {};\n");
   writeFileSync(join(root, "adapters/opencode-v2/package.json"), '{"name":"fixture","version":"1.0.0"}');
   writeFileSync(join(root, "adapters/hosted-core/package.json"), '{"name":"fixture-core","version":"1.0.0"}');
   writeFileSync(join(root, "tests/integration/hosted_core_sync.test.ts"), 'import { test } from "bun:test"; test("sync", () => {});\n');
@@ -215,7 +215,7 @@ test("JUnit counts reject partial or inconsistent documents and read the failure
 
 test("the provenance script lists tracked files only, so an untracked file passes the allowlist (#378 2)", () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "gb-provenance-tracked-"))); roots.push(root);
-  const tracked = ["src/main.ts", "src/moved.ts", "adapters/opencode-v2/package.json", "adapters/opencode-v2/index.js", "adapters/opencode-v2/tui.js", "adapters/opencode-v2/README.md", "adapters/opencode-v2/src/index.ts", "adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts", "tests/support/until.ts"];
+  const tracked = ["src/main.ts", "src/moved.ts", "adapters/opencode-v2/package.json", "adapters/opencode-v2/index.js", "adapters/opencode-v2/tui.js", "adapters/opencode-v2/README.md", "adapters/opencode-v2/src/index.ts", "adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts"];
   for (const path of tracked) { mkdirSync(join(root, path, ".."), { recursive: true }); writeFileSync(join(root, path), path); }
   const env = fixtureEnv(root), git = (...args: string[]) => fixtureGit(root, env, ...args);
   git("init", "-q"); git("add", "."); git(...identity, "commit", "-qm", "fixture");
@@ -229,6 +229,6 @@ test("the provenance script lists tracked files only, so an untracked file passe
   expect(run.exitCode).toBe(0);
   const value = JSON.parse(readFileSync(output, "utf8"));
   expect(value.backend.map((e: { path: string }) => e.path)).toEqual(["src/main.ts"]);
-  expect(value.drivers.map((e: { path: string }) => e.path)).toEqual(["adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts", "tests/support/until.ts"]);
+  expect(value.drivers.map((e: { path: string }) => e.path)).toEqual(["adapters/opencode-v2/tests/host.test.ts", "tests/e2e/opencode-config.ts", "tests/support/transaction-process.ts", "tests/support/hosted-operation.ts", "tests/support/stub_provider.ts"]);
   expect(provenance(value, root, "git").mismatches).toEqual([]);
 });

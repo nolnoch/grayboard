@@ -10,7 +10,7 @@ import type { startServer } from "../../../src/server/app.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 import { audits, hostedRow } from "./server-db.ts";
-import { until } from "../../../tests/support/until.ts";
+import { until } from "./until.ts";
 
 type Input = NativeInput;
 export type AdmissionGate = {

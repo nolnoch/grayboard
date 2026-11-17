@@ -13,7 +13,7 @@ import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
 import { fixture } from "./native-fixture.js";
-import { until } from "../../../tests/support/until.ts";
+import { until } from "./until.ts";
 import { FailedContinuation } from "./failed-continuation.js";
 import { observeRuns } from "./subscriber-work.js";
 import { barrier, bounded } from "./reload-state.js";
