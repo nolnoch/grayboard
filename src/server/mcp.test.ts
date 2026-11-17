@@ -1372,8 +1372,8 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   // A binding change committed outside any request of either session, so only the notice can reach the listens.
   const rebind = async (email: string) => {
     const userId = (await store.repo.users.findByEmail(store.repo.read, email))!.id;
-    await seed(store.repo, tx => {
-      const row = store.repo.hosted.all(tx).find(r => r.user_id === userId)!;
+    await seed(store.repo, async tx => {
+      const row = (await store.repo.hosted.all(tx)).find(r => r.user_id === userId)!;
       return store.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 });
     });
   };
@@ -1422,14 +1422,14 @@ async function stampedListen(recheckMs = 3_600_000, manual = false) {
   expect(hosted.activeListens).toBe(1);
   return { time, tick, tickStream, grant, listen };
 }
-const aliceRoot = (r: Read = store.repo.read) => store.repo.hosted.all(r).find(r => !r.root_session_id && r.user_id === user.user_id)!;
+const aliceRoot = async (r: Read = store.repo.read) => (await store.repo.hosted.all(r)).find(r => !r.root_session_id && r.user_id === user.user_id)!;
 const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][] = [
   ["access revoke", ({ time }) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, time.now))],
   ["grant revoke", ({ time, grant }) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(grant.refreshToken), OPENCODE_CLIENT, time.now))],
   ["sign-out everywhere", () => seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id))],
   ["disable", () => seed(store.repo, tx => store.repo.users.setDisabled(tx, user.user_id, true))],
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
-  ["binding change", () => seed(store.repo, tx => { const r = aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); })],
+  ["binding change", () => seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); })],
 ];
 // Only the stream timer ticks (the hosted sweep would end an expired session's row itself), and the backstop sits
 // past the access TTL, so the expiry case reaches phase A's auth check with a fresh stamp.
@@ -1482,9 +1482,9 @@ test("#807 P3 A7d: a failed generation read in phase B's check closes the stream
 
 test("#899: a stamped listen ends within a tick of its root's lease lapsing, a deadline no write marks", async () => {
   const f = await stampedListen();
-  const root = aliceRoot().session_id;
+  const root = (await aliceRoot()).session_id;
   // The update's notice makes the next tick a full check, which stamps the new deadline.
-  await seed(store.repo, tx => { const r = aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
+  await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
   await f.tick(); await f.tick();
   expect(hosted.activeListens).toBe(1);
   f.time.now += 4_999; await f.tick();
@@ -1494,7 +1494,7 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   f.time.now += 1; await f.tick();
   expect(hosted.activeListens).toBe(0);
   await store.repo.write(() => {});
-  expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
+  expect(await store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
   await f.listen.close();
 });
 
@@ -1502,8 +1502,8 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
 // can't run as an async post: it goes through the queue behind the holder and ends the root (#807 P3 A6e2 audit).
 test("a lapsed root's settle from a board commit's hint, inside the write queue's holder, ends the root", async () => {
   const f = await stampedListen();
-  const root = aliceRoot().session_id;
-  await seed(store.repo, tx => { const r = aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
+  const root = (await aliceRoot()).session_id;
+  await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
   f.time.now += 5_000;
   token = (await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
   const bob = await connect();
@@ -1514,7 +1514,7 @@ test("a lapsed root's settle from a board commit's hint, inside the write queue'
     expect(posted.isError, JSON.stringify(posted.content)).not.toBe(true);
     await untilHosted(() => hosted.activeListens === 0);
     await store.repo.write(() => {});
-    expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
+    expect(await store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
     expect(logged.mock.calls.filter(args => args.some(a => String(a).includes("write queue's holder")))).toEqual([]);
   } finally { logged.mockRestore(); }
   await f.listen.close();
@@ -1523,11 +1523,38 @@ test("a lapsed root's settle from a board commit's hint, inside the write queue'
 test("#899: a write no notice or generation sees reaches a stamped listen at the recheck backstop", async () => {
   const f = await stampedListen(10_000);
   // Raw SQL on the repo's own connection: no hosted notice, no generation move.
-  await seed(store.repo, tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [aliceRoot(tx).session_id]));
+  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
   f.time.now += 9_999; await f.tick();
   expect(hosted.activeListens).toBe(1);
   f.time.now += 1; await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
+  await f.listen.close();
+});
+
+// #807 P3 A7h2: a notice that carries no row (here the full reconcile's null) leaves the lives to the full pass, which
+// reads their rows on its Tx and judges them in its apply: no stream tick needed, and none before the read.
+test("#807 P3 A7h2: a null notice's full pass stops a live whose binding moved, after the pass's read", async () => {
+  const f = await stampedListen(3_600_000, true);
+  // Raw SQL: the commit sends no notice, so only the pass below can see it.
+  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  let during = -1;
+  await held("hosted:reconcile:read", () => hosted.sessions.reconcile(), async () => { during = hosted.activeListens; });
+  expect(during).toBe(1);
+  expect(hosted.activeListens).toBe(0);
+  await f.listen.close();
+});
+
+// #807 P3 A7h2 audit: the watcher rows are read before the rebuilds, and each rebuild in its own savepoint, so a rebuild
+// that throws still lets the pass's apply stop a live whose binding moved.
+test("#807 P3 A7h2: a full pass whose rebuild throws still stops a live whose binding moved", async () => {
+  const f = await stampedListen(3_600_000, true);
+  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  const builds = spyOn(application, "hostedBuildFacts").mockRejectedValue(new Error("build failed"));
+  try {
+    await hosted.sessions.reconcile();
+    expect(builds).toHaveBeenCalled();
+  } finally { builds.mockRestore(); }
+  expect(hosted.activeListens).toBe(0);
   await f.listen.close();
 });
 
@@ -1547,7 +1574,7 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true, where: "tools" });
   const f = await stampedListen();
   const other = new Database(path);
-  try { other.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [aliceRoot().session_id]); } finally { other.close(); }
+  try { other.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot()).session_id]); } finally { other.close(); }
   await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
   await f.listen.close();
@@ -1608,7 +1635,7 @@ test("#807 P3 A7d: a held phase-B check whose live stopped meanwhile acts on not
   f.time.now += 10_000;
   const { failures } = await heldCheck(f.tickStream, async () => {
     // A binding change stops the live, unaudited; the revoke then refuses the released check.
-    await seed(store.repo, tx => { const r = aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
     expect(hosted.activeListens).toBe(0);
     await revokeAccess(token, f.time.now);
   });
@@ -1679,6 +1706,24 @@ test("#807 P3 A7d: of two legacy GETs whose checks await together, one takes the
   expect(hosted.activeWatches).toBe(1);
   for (const a of aborts) a.abort();
   for (const g of gets) await g.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #807 P3 A7h2: a live keeps its creator's rows only when no notice for them came after the read began; a GET whose
+// root's binding moved while its check awaited re-reads them once it opens, and stops, with no stream tick.
+test("#807 P3 A7h2: a legacy GET whose binding moves while its check awaits re-reads its rows and stops", async () => {
+  const { time } = await clocked(undefined, undefined, true);
+  const access = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const raw = await rawLegacySession(access, meta);
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "moved", purpose: "A7h2" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/moved", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:legacy:get-checked", () => raw.get(abort.signal), async () => {
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+  });
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 0);
+  abort.abort(); await get.body?.cancel().catch(() => {});
   await raw.delete();
 });
 

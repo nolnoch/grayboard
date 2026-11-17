@@ -2204,16 +2204,16 @@ function makeHostedStore(db: Database): HostedStoreOf {
     writesOn,
     write: (fn, committed) => queued(db, fn, committed),
     subscribe: () => () => {},
-    get: (r, id) => hostedRow(sqliteOf(r), id),
-    owned: (r, id) => sqliteOf(r).query<{ n: number }, [string, string]>(
+    get: async (r, id) => hostedRow(sqliteOf(r), id),
+    owned: async (r, id) => sqliteOf(r).query<{ n: number }, [string, string]>(
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
     ).get(id, id) !== null,
-    all: (r) => sqliteOf(r).query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all(),
-    counts: (r, user) => sqliteOf(r).query<{ total: number; user: number }, [number]>(
+    all: async (r) => sqliteOf(r).query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all(),
+    counts: async (r, user) => sqliteOf(r).query<{ total: number; user: number }, [number]>(
       "SELECT (SELECT count(*) FROM hosted_sessions WHERE parked_at IS NULL) AS total, (SELECT count(*) FROM hosted_sessions WHERE user_id = ?1 AND parked_at IS NULL) AS user").get(user)!,
-    ofOwnership: (r, ownership) => sqliteOf(r).query<HostedSession, [number]>("SELECT * FROM hosted_sessions WHERE ownership_id = ? AND parked_at IS NULL").all(ownership),
-    children: (r, root) => sqliteOf(r).query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
-    roots: (r, user) => sqliteOf(r).query<HostedSession, [number]>(
+    ofOwnership: async (r, ownership) => sqliteOf(r).query<HostedSession, [number]>("SELECT * FROM hosted_sessions WHERE ownership_id = ? AND parked_at IS NULL").all(ownership),
+    children: async (r, root) => sqliteOf(r).query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE root_session_id = ?").all(root),
+    roots: async (r, user) => sqliteOf(r).query<HostedSession, [number]>(
       "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
     park: async (tx, ...a) => on(tx).park(...a),
     unpark: async (tx, ...a) => on(tx).unpark(...a),
@@ -2223,11 +2223,11 @@ function makeHostedStore(db: Database): HostedStoreOf {
     touch: async (tx, ...a) => on(tx).touch(...a),
     // The unary `+` keeps the planner off idx_hosted_root, which every root matches, so these two read
     // idx_hosted_deadline and idx_hosted_user (#399).
-    expired: (r, now) => sqliteOf(r).query<HostedSession, [number]>(
+    expired: async (r, now) => sqliteOf(r).query<HostedSession, [number]>(
       "SELECT * FROM hosted_sessions WHERE lease_deadline <= ? AND +root_session_id IS NULL").all(now),
-    idle: (r, cutoff) => sqliteOf(r).query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
+    idle: async (r, cutoff) => sqliteOf(r).query<HostedSession, [number]>(`SELECT * FROM hosted_sessions h WHERE h.parked_at IS NULL AND h.last_seen_at < ?
       AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
-    disabled: (r) => sqliteOf(r).query<HostedSession, []>(
+    disabled: async (r) => sqliteOf(r).query<HostedSession, []>(
       "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
     childEnd: async (tx, ...a) => on(tx).childEnd(...a),
     takeEnded() {
@@ -2237,23 +2237,24 @@ function makeHostedStore(db: Database): HostedStoreOf {
     },
     end: async (tx, ...a) => on(tx).end(...a),
     lose: async (tx, ...a) => on(tx).lose(...a),
-    lost: (r, session, reader) => hostedLostOf(sqliteOf(r))(session, `${LOST_READ[reader]} IS NULL`),
+    lost: async (r, session, reader) => hostedLostOf(sqliteOf(r))(session, `${LOST_READ[reader]} IS NULL`),
     tellLost: async (tx, ...a) => on(tx).tellLost(...a),
     reportLost: async (tx, ...a) => on(tx).reportLost(...a),
     seeLost: async (tx, ...a) => on(tx).seeLost(...a),
     forgetLost: async (tx, ...a) => on(tx).forgetLost(...a),
-    aliveAt: (r) => sqliteOf(r).query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
+    aliveAt: async (r) => sqliteOf(r).query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
     heartbeat: async (tx, ...a) => on(tx).heartbeat(...a),
     setRoot: async (tx, id, root) => { sqliteOf(tx).query("UPDATE ids SET root_id = ? WHERE id = ? AND root_id IS NOT ?").run(root, id, root); },
     reopenId: async (tx, id) => { sqliteOf(tx).query("UPDATE ids SET ended_at = NULL, held_aliases_json = NULL WHERE id = ?").run(id); },
     restateWritesAs: async (tx, id, writesAs) => { sqliteOf(tx).query("UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL").run(writesAs, id); },
     declareLauncher: async (tx, id) => sqliteOf(tx).query("UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1").run(id).changes > 0,
-    launcher: (r, id) => sqliteOf(r).query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(id)?.launcher === 1,
-    holds: (r) => sqliteOf(r).query<{ id: string; address: string }, []>(`SELECT id, address FROM alias_holds ${HOLD_ORDER}`).all(),
+    launcher: async (r, id) => launcherOf(sqliteOf(r), id),
+    holds: async (r) => sqliteOf(r).query<{ id: string; address: string }, []>(`SELECT id, address FROM alias_holds ${HOLD_ORDER}`).all(),
   };
   return store;
 }
 
+const launcherOf = (db: Database, id: string) => db.query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(id)?.launcher === 1;
 const hostedRow = (db: Database, id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
 // The hosted_alias_lost column each reader's take marks (#453).
 const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };

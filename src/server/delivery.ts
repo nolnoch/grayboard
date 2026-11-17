@@ -30,6 +30,9 @@ type Lease = {
   session: ApplicationSession; identity: IdentityInfo; hooks: DeliveryHooks; issued: Map<string, Issued>; acknowledged: Map<string, Acked>; openVersion: number; pendingOpens: Set<number>; acceptedVersion: number; cancelledCreator: boolean;
   // `context: false`: a host that starts a turn for every item (#854; `drained` below).
   context: boolean;
+  // The session's row as the last commit seen left it (#807 P3 A7h2): open's, then each notice's or full pass's.
+  // The synchronous checks (`deliver()`, `finish`'s drained key) judge it; a check that admits work reads its own.
+  row: HostedSession | undefined;
 };
 const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); } };
 class StaleCapability extends ApplicationError {
@@ -71,7 +74,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   let stopped = false;
   function finish(lease: Lease) {
     if (!leases.delete(lease.capability)) return;
-    if (store.get(pool, lease.sessionId)?.ownership_id !== lease.ownership) drained.delete(drainKey(lease));
+    if (lease.row?.ownership_id !== lease.ownership) drained.delete(drainKey(lease));
     if (bySession.get(lease.sessionId) === lease) bySession.delete(lease.sessionId);
     const user = lease.principal.authed.user_id, n = (perUser.get(user) ?? 1) - 1;
     if (n) perUser.set(user, n); else perUser.delete(user);
@@ -82,10 +85,23 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     return !!row && row.session_id === lease.sessionId && row.ownership_id === lease.ownership && row.bind_gen === lease.generation &&
       row.grant_id === lease.principal.grantId && row.lease_deadline !== null && row.lease_deadline > now();
   }
-  // `changed`: the one row a commit changed (#399), so only its leases are checked; null checks them all.
-  const unlisten = hosted.listen(changed => {
-    const check = changed === null ? [...leases.values()] : [bySession.get(changed)].filter(l => l !== undefined);
-    for (const lease of check) if (!matches(lease, store.get(pool, lease.sessionId))) finish(lease);
+  // A lease's row from a commit: kept, and the lease finished if it no longer matches.
+  function seen(lease: Lease, row: HostedSession | undefined) {
+    lease.row = row;
+    if (!matches(lease, row)) finish(lease);
+  }
+  // `changed`: the one row a commit changed (#399), so only its lease is checked, against `row` as the commit left
+  // it. A notice without the row (null, or one without facts) leaves the leases to the full pass it requested,
+  // which reads their rows on its Tx and hands them over before the queue's next body (#807 P3 A7h2). Meanwhile
+  // `deliver()` may wake a lease that pass will finish; the pull it causes checks a row of its own and is refused.
+  const unlisten = hosted.listen((changed, row) => {
+    if (changed === null || row === undefined) return;
+    const lease = bySession.get(changed);
+    if (lease) seen(lease, row ?? undefined);
+  });
+  const unwatch = hosted.watchRows({
+    ids: () => bySession.keys(),
+    apply(rows) { for (const [id, row] of rows) { const lease = bySession.get(id); if (lease) seen(lease, row); } },
   });
   function stale(p: DeliveryPrincipal, context: SessionContext, capability: string): never {
     throw new StaleCapability();
@@ -96,19 +112,19 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     throw error;
   }
   // The lease for `capability`, without the token check: only for a caller that checked p's token this turn, with no
-  // await since (#853), so synchronous.
-  // `r`: the body's Tx when this runs inside one, so the fallback row read stays in that transaction; else the pool.
-  function getChecked(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, r: Read = pool) {
+  // await since (#853), so synchronous. `row`: context's row, read by the caller (on its Tx inside a body); none
+  // refuses.
+  function getChecked(p: DeliveryPrincipal, context: SessionContext, capability: string, row: HostedSession | undefined) {
     const lease = leases.get(capability);
     if (stopped || !lease || !("id" in context) || context.id !== lease.sessionId ||
       p.authed.user_id !== lease.principal.authed.user_id || p.clientId !== lease.principal.clientId || p.grantId !== lease.principal.grantId ||
-      !matches(lease, row ?? store.get(r, lease.sessionId))) return stale(p, context, capability);
+      !matches(lease, row)) return stale(p, context, capability);
     return lease;
   }
   // getChecked, then p's token checked on `r` (#807 P3 A7d2b). A lease finished while the check awaited (a commit's
   // hosted.listen, a shutdown) is refused, never returned.
-  async function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, r: Read = pool) {
-    const lease = getChecked(p, context, capability, row, r);
+  async function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row: HostedSession | undefined, r: Read = pool) {
+    const lease = getChecked(p, context, capability, row);
     if (!await options.isAuthorized(p, r) || stopped || leases.get(capability) !== lease) return stale(p, context, capability);
     return lease;
   }
@@ -148,21 +164,22 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const replaced = previous ? 1 : 0;
         if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
         const expiresAt = now() + ttl;
-        await store.update(tx, { ...row, lease_deadline: expiresAt, last_seen_at: now() });
+        const opened = { ...row, lease_deadline: expiresAt, last_seen_at: now() };
+        await store.update(tx, opened);
         await hosted.audit(tx, row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null, ...(openOptions.context === false ? { context: false } : {}) });
-        return { row, expiresAt, holds, facts };
+        return { row: opened, expiresAt, holds, facts };
       }, result => {
         if ("capability" in result) return opened(result, false, hooks);
         if (previous) finish(previous);
         const { row, expiresAt, holds, facts } = result;
         let lease!: Lease;
         const selected = application.hostedBuild(p.authed, row.session_id, holds, null, row, {
-          deliver() { if (lease && matches(lease, store.get(pool, lease.sessionId))) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
+          deliver() { if (lease && matches(lease, lease.row)) { lease.session.inflight.clear(); notify("delivery.changed", lease.hooks.changed); } },
           closed() { if (lease) finish(lease); },
         }, facts, true);
         lease = { principal: p, capability: randomBytes(32).toString("base64url"), expiresAt, sessionId: row.session_id,
           ownership: row.ownership_id, generation: row.bind_gen, session: selected.session, identity: selected.info, hooks, issued: new Map(), acknowledged: new Map(), openVersion: 0, pendingOpens: new Set(), acceptedVersion: 0, cancelledCreator: false,
-          context: openOptions.context ?? true };
+          context: openOptions.context ?? true, row };
         track(lease);
         return opened(lease, true, hooks);
       });
@@ -181,7 +198,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
       return hosted.control(p, context, false, async row => {
         const { lease } = await store.write(async tx => {
-          const fresh = store.get(tx, row.session_id);
+          const fresh = await store.get(tx, row.session_id);
           const lease = await get(p, context, capability, fresh, tx), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
           await store.update(tx, { ...fresh, lease_deadline: deadline, last_seen_at: now() });
@@ -203,7 +220,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       return hosted.control(p, context, false, async row => {
         const lease = await get(p, context, capability, row);
         await testPauseAsync("hosted:pending:in-gate");
-        await get(p, context, capability);
+        await get(p, context, capability, await store.get(pool, row.session_id));
         let items = (await application.pending(application.repo.read, lease.session, limit)).map(event => itemOf(event, lease));
         // Security audit F-03 (#854): a host without context starts a turn for every item it's given, so
         // after the ownership's first drain (local mode's) a lone non-waking item (ungranted,
@@ -223,7 +240,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         await testPauseAsync("hosted:receipt:before-txn");
         await store.write(async tx => {
           testPause("hosted:receipt:in-txn");
-          const row = "id" in context ? store.get(tx, context.id) : undefined;
+          const row = "id" in context ? await store.get(tx, context.id) : undefined;
           const lease = await get(p, context, capability, row, tx);
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
@@ -258,7 +275,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
         await store.write(async tx => {
-          await get(p, context, capability, store.get(tx, row.session_id), tx);
+          await get(p, context, capability, await store.get(tx, row.session_id), tx);
           await store.end(tx, row.session_id, "closed", now());
         });
       }, () => undefined).catch(error => refused(p, context, error));
@@ -274,7 +291,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       await hosted.gate(lease.sessionId).bind(async () => {
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
         await store.write(async tx => {
-          if (matches(lease, store.get(tx, lease.sessionId))) await store.end(tx, lease.sessionId, "closed", now());
+          if (matches(lease, await store.get(tx, lease.sessionId))) await store.end(tx, lease.sessionId, "closed", now());
           await hosted.settle(tx, lease.sessionId);
         }, () => {
           finish(lease);
@@ -283,7 +300,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     revalidate() { hosted.sweep().catch(e => hostedFailure("hosted.sweep", e)); },
     close() {
-      stopped = true; unlisten();
+      stopped = true; unlisten(); unwatch();
       // The capability is dropped, but the lease row stays; a restart credits it with the downtime (#423).
       for (const lease of [...leases.values()]) { hosted.auditAs(pool, lease.sessionId, "hosted.lease_detached", { reason: "shutdown" }, lease.principal); finish(lease); }
     },

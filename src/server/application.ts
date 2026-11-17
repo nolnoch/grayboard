@@ -435,11 +435,11 @@ async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, sco
 // Who holds an alias, for an alias_held refusal: its ID and where it runs.
 // `place` describes the holder's machine, so only its own principal sees it
 // (#349): a team alias's asker can be another member. `r`: the bind's body.
-function describeHolder(hub: Hub, r: Read, id: string, asker: string): string {
+async function describeHolder(hub: Hub, r: Read, id: string, asker: string): Promise<string> {
   const row = idRow(hub.repo.coreOn(r), id);
   const place = row?.principal === asker ? row.place : null;
   // A hosted root has no connection to disconnect: it is last seen when its client last called (#402).
-  const hosted = hub.repo.hosted.get(r, id);
+  const hosted = await hub.repo.hosted.get(r, id);
   if (hosted) return `the hosted session ${id}${place ? `, in ${place}` : ""}, last seen ${Math.floor((hub.now() - hosted.last_seen_at) / 1000)}s ago`;
   return `the session ${id}${place ? `, in ${place}` : ""}`;
 }
@@ -644,9 +644,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // retried at the next start, and its holds stay until then (#475 item 2).
   // Settles once the ends are written. A failure of the whole write rejects it: its only caller is startup, whose
   // `ready` then rejects and the server exits, as the idle-queue post this replaced threw out of startup (#807 P3 A1).
-  function endIds(ids: string[], why: string): Promise<void> {
-    if (!ids.length) return Promise.resolve();
-    return repo.write(tx => endIdsIn(tx, ids, why), ends => afterEnds(ends.woken, ends.bounced)).then(() => {});
+  // `ids` reads the IDs to end on the write's Tx (#807 P3 A7h1: the hosted filter's reads await); none ends nothing.
+  function endIds(ids: (tx: Tx) => Promise<string[]>, why: string): Promise<void> {
+    return repo.write(async tx => {
+      const list = await ids(tx);
+      return list.length ? endIdsIn(tx, list, why) : null;
+    }, ends => { if (ends) afterEnds(ends.woken, ends.bounced); }).then(() => {});
   }
   type Ends = { woken: Set<string>; bounced: { id: string; at: number }[] };
   // endIds's body, inside a write body: `tx` is that body's. Each end's savepoint runs on its own Tx.
@@ -691,7 +694,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // End each at start, as the grace sweep would have: holds and claims
   // released, mail bounced. A hosted ID is the hosted store's to end.
   // The startup leftovers' ends (#807 P3 A1): the server's `ready` waits for them.
-  const ready = endIds(unendedIds(repo.coreOn(repo.read)).filter((id) => !repo.hosted.owned(repo.read, id)), "wss_removed");
+  // The pool's synchronous check first, so a start with no leftovers writes nothing; the ends' write reads them again.
+  const ready = !unendedIds(repo.coreOn(repo.read)).length ? Promise.resolve() : endIds(async (tx) => {
+    const ids: string[] = [];
+    for (const id of unendedIds(repo.coreOn(tx))) if (!(await repo.hosted.owned(tx, id))) ids.push(id);
+    return ids;
+  }, "wss_removed");
   // Re-checks the aliases that sessions act as (S9) against policy.ts (scope.act), for
   // one principal's sessions or (null) every session's, and revokes the ones
   // it now refuses. by: the user whose act changed the access (an admin's
@@ -755,7 +763,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // Its writes go in a savepoint, on the savepoint's Tx.
   async function revokeUse(tx: Tx, u: AliasUse & { reason: string }, by: string | null, ended: string[], resync: string[]): Promise<void> {
     const { reason } = u;
-    const hosted = repo.hosted.owned(tx, u.id);
+    const hosted = await repo.hosted.owned(tx, u.id);
     if (!u.held) {
       // A hosted tools-only root ends its ownership, not an ID (hosted IDs are the store's).
       await tx.savepoint(async sp => {
@@ -773,7 +781,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       logBinding(repo.coreOn(sp), u.id, u.address, "released", `access revoked: ${reason}`);
       writeAudit(repo, sp, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
       if (hosted) {
-        const row = repo.hosted.get(sp, u.id);
+        const row = await repo.hosted.get(sp, u.id);
         if (row) {
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
           await repo.hosted.update(sp, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(repo.coreOn(sp), u.id).length ? row.lease_deadline : null });
@@ -885,7 +893,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // alias; a live one refuses the bind.
     const holder = holderOf(repo.coreOn(tx), address);
     if (holder !== null && holder !== id) {
-      const who = describeHolder(hub, tx, holder, authed.user_email);
+      const who = await describeHolder(hub, tx, holder, authed.user_email);
       return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who });
     }
     // Another user's tools-only session writing as it holds nothing, but the
@@ -1097,9 +1105,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     aliasHolderId(r: Read, address: string): string | null { return holderOf(repo.coreOn(r), address); },
     // Every session's holds, oldest first, for the hosted sweep and reconcile, on `h` (the full reconcile's body Tx).
-    holdsByOwner(h: Read): Map<string, string[]> {
+    async holdsByOwner(h: Read): Promise<Map<string, string[]>> {
       const byOwner = new Map<string, string[]>();
-      for (const r of repo.hosted.holds(h)) {
+      for (const r of await repo.hosted.holds(h)) {
         const list = byOwner.get(r.id);
         if (list) list.push(r.address); else byOwner.set(r.id, [r.address]);
       }
@@ -1107,7 +1115,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // Whether the session's ownership declared a launcher (#473, #520): what its instruction text follows, since the
     // stored flag, not the current request's `_meta`, decides whether it receives delegation requests.
-    hostedLauncher(id: string): boolean { return repo.hosted.launcher(repo.read, id); },
+    hostedLauncher(id: string): Promise<boolean> { return repo.hosted.launcher(repo.read, id); },
     hostedPlace(tx: Tx, id: string, place: string | null) { setPlace(repo.coreOn(tx), id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
@@ -1357,15 +1365,17 @@ async function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput:
 // root) aren't listed; nor is a root whose only live connections are idle
 // legacy GETs, which receive nothing (#431). A hosted session with no name is
 // listed as master listed it (#402). One row per session ID.
-function unboundPeers(hub: Hub, r: Read, session: ApplicationSession): UnboundPeer[] {
+async function unboundPeers(hub: Hub, r: Read, session: ApplicationSession): Promise<UnboundPeer[]> {
   const user = session.authed.user_id;
+  // The one await (#807 P3 A7h1), before the in-memory connection list is read.
+  const own = await hub.repo.hosted.roots(r, user);
   // Per live session ID: whether any of its connections is listed (#489: a call adds its own beside others).
   const live = new Map<string, boolean>();
   for (const c of hub.sessions) {
     if (c.transport !== "hosted" || c.authed.user_id !== user) continue;
     live.set(c.sessionId, (live.get(c.sessionId) ?? false) || c.listed);
   }
-  const roots = hub.repo.hosted.roots(r, user).filter((row) =>
+  const roots = own.filter((row) =>
     row.writes_as === null && live.get(row.session_id) !== false && holdsOf(hub.repo.coreOn(r), row.session_id).length === 0);
   const statuses = idStatuses(hub.repo.coreOn(r), roots.map((r) => r.session_id));
   const now = hub.now();
@@ -1800,7 +1810,7 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     user: session.authed.user_email,
     addresses: session.addresses,
     ...(session.readOnly ? { reader: seer(hub.repo, session) } : {}),
-    ...(tool === "peer_list" ? { unbound: unboundPeers(hub, tx, session) } : {}),
+    ...(tool === "peer_list" ? { unbound: await unboundPeers(hub, tx, session) } : {}),
   };
   // `as`, else the first address that can see the board (#284 S3, S14).
   let actor: string;

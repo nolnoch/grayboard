@@ -73,24 +73,24 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: root ends actual 
   const foreign = await value(foreignRoot, "session_register", { child: "foreign-child" });
   for (const id of [other.root, other.child, foreign.root, foreign.child]) {
     expect((await root.callTool({ name: "session_end", arguments: { session: id } })).isError).toBe(true);
-    expect(app.repo.hosted.get(app.repo.read, id)).toBeDefined();
+    expect(await app.repo.hosted.get(app.repo.read, id)).toBeDefined();
   }
   const child = await connect(version, grant.token, "first");
   for (const id of [first.root, sibling.child]) {
     expect((await child.callTool({ name: "session_end", arguments: { session: id } })).isError).toBe(true);
   }
   expect(await value(root, "session_end", { session: first.child })).toEqual({ ended: true });
-  expect(app.repo.hosted.get(app.repo.read, first.child)).toBeUndefined();
+  expect(await app.repo.hosted.get(app.repo.read, first.child)).toBeUndefined();
   expect(app.application.hostedHolds(app.application.repo.read, first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
-  expect(app.repo.hosted.get(app.repo.read, sibling.child)?.root_session_id).toBe(first.root);
+  expect((await app.repo.hosted.get(app.repo.read, sibling.child))?.root_session_id).toBe(first.root);
   const siblingClient = await connect(version, grant.token, "sibling");
   expect(await value(siblingClient, "session_end")).toEqual({ ended: true });
-  expect(app.repo.hosted.get(app.repo.read, sibling.child)).toBeUndefined();
+  expect(await app.repo.hosted.get(app.repo.read, sibling.child)).toBeUndefined();
   expect(app.application.hostedHolds(app.application.repo.read, first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
   expect(await value(root, "session_end")).toEqual({ ended: true });
-  expect(app.repo.hosted.get(app.repo.read, first.root)).toBeUndefined();
-  expect(app.repo.hosted.get(app.repo.read, other.root)).toBeDefined();
-  expect(app.repo.hosted.get(app.repo.read, foreign.root)).toBeDefined();
+  expect(await app.repo.hosted.get(app.repo.read, first.root)).toBeUndefined();
+  expect(await app.repo.hosted.get(app.repo.read, other.root)).toBeDefined();
+  expect(await app.repo.hosted.get(app.repo.read, foreign.root)).toBeDefined();
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child end frees the existing child capacity`, async () => {
@@ -102,14 +102,14 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child e
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   const context = sessionContext(principal, { "ai.opencode/sessionID": "capacity-root" });
   for (let i = 1; i < 128; i++) await app.mcp.sessions.register(principal, context, `child-${i}`);
-  const count = () => app.repo.hosted.all(app.repo.read).filter(row => row.root_session_id === first.root).length;
-  expect(count()).toBe(128);
+  const count = async () => (await app.repo.hosted.all(app.repo.read)).filter(row => row.root_session_id === first.root).length;
+  expect(await count()).toBe(128);
   expect((await root.callTool({ name: "session_register", arguments: { child: "replacement" } })).isError).toBe(true);
   expect(await value(root, "session_end", { session: first.child })).toEqual({ ended: true });
-  expect(count()).toBe(127);
+  expect(await count()).toBe(127);
   const replacement = await value(root, "session_register", { child: "replacement" });
   expect(replacement.child).toMatch(SESSION_ID);
-  expect(count()).toBe(128);
+  expect(await count()).toBe(128);
   expect(app.application.hostedHolds(app.application.repo.read, first.root).map(a => a.slice(a.lastIndexOf("/") + 1))).toEqual(["be"]);
 });
 
@@ -147,10 +147,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
   skew += 900_001;
   await value(root, "whoami"); // its request sweeps, parking the sleeper
   for (let i = 0; i < MAX_CHILDREN; i++) await app.mcp.sessions.register(principal, context, `busy-${i}`);
-  expect(app.repo.hosted.get(app.repo.read, child)?.parked_at).not.toBeNull();
+  expect((await app.repo.hosted.get(app.repo.read, child))?.parked_at).not.toBeNull();
   const sleeper = await connect(version, grant.token, "sleeper");
   expect(await value(sleeper, "session_end")).toEqual({ ended: true });
-  expect(app.repo.hosted.get(app.repo.read, child)).toBeUndefined();
+  expect(await app.repo.hosted.get(app.repo.read, child)).toBeUndefined();
   expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
 });
 
@@ -163,7 +163,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
 test("ending calls under an unknown ID write nothing; session_end reports ended: false", async () => {
   const grant = await issue();
   const stranger = await connect("2026-07-28", grant.token, "gone-before-end", { "X-Grayboard-Lease": "a".repeat(43) });
-  const [admitted] = app.repo.hosted.all(app.repo.read);
+  const [admitted] = await app.repo.hosted.all(app.repo.read);
   await app.mcp.sessions.release(admitted!.session_id, "closed");
   expect(hostedRowCount(app.db)).toBe(0);
   const audits = () => app.db.query<{ action: string }, []>("SELECT action FROM access_log ORDER BY rowid").all().map(a => a.action);

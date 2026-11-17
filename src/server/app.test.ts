@@ -91,10 +91,10 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
     const before = Date.now();
     app = startServer(config, { hostname, background: false }); await app.ready;
     const after = Date.now();
-    const rows = app.repo.hosted.all(app.repo.read);
+    const rows = await app.repo.hosted.all(app.repo.read);
     const credits = restartCredits(app);
     const released = () => app!.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='released' AND detail='expired'").get()?.count;
-    expect(app.repo.hosted.aliveAt(app.repo.read)).toBeGreaterThanOrEqual(before);
+    expect(await app.repo.hosted.aliveAt(app.repo.read)).toBeGreaterThanOrEqual(before);
     // Every start is audited, credited or not; a fresh database has no heartbeat.
     const starts = serverStarts(app);
     expect(starts).toHaveLength(2);
@@ -151,7 +151,7 @@ test("a clean stop records its time, so a quick restart credits nothing", async 
   try {
     app = startServer(config, { hostname, background: false }); await app.ready;
     await leasedRoot(app);
-    const deadline = app.repo.hosted.all(app.repo.read).find(row => !row.root_session_id)!.lease_deadline!;
+    const deadline = (await app.repo.hosted.all(app.repo.read)).find(row => !row.root_session_id)!.lease_deadline!;
     const stopping = Date.now();
     await app.stop(); app = undefined;
     const stopped = Date.now();
@@ -162,7 +162,7 @@ test("a clean stop records its time, so a quick restart credits nothing", async 
       expect(alive).toBeLessThanOrEqual(stopped);
     } finally { outage.close(); }
     app = startServer(config, { hostname, background: false }); await app.ready;
-    expect(app.repo.hosted.all(app.repo.read).find(row => !row.root_session_id)!.lease_deadline).toBe(deadline);
+    expect((await app.repo.hosted.all(app.repo.read)).find(row => !row.root_session_id)!.lease_deadline).toBe(deadline);
     expect(restartCredits(app)).toEqual([]);
   } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -182,10 +182,10 @@ test("a second opener during a credited restart doesn't credit the outage again"
       outage.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE root_session_id IS NULL", [alive + 20_000]);
     } finally { outage.close(); }
     app = startServer(config, { hostname, background: false }); await app.ready;
-    const credited = app.repo.hosted.all(app.repo.read).find(row => !row.root_session_id)!.lease_deadline!;
+    const credited = (await app.repo.hosted.all(app.repo.read)).find(row => !row.root_session_id)!.lease_deadline!;
     second = startServer(config, { hostname, background: false }); await second.ready;
     expect(restartCredits(second)).toEqual([expect.objectContaining({ before: alive + 20_000, after: credited })]);
-    expect(second.repo.hosted.all(second.repo.read).find(row => !row.root_session_id)!.lease_deadline).toBe(credited);
+    expect((await second.repo.hosted.all(second.repo.read)).find(row => !row.root_session_id)!.lease_deadline).toBe(credited);
   } finally { await second?.stop(); await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -193,8 +193,8 @@ test("a running server's liveness heartbeat advances", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-heartbeat-"));
   const app = startServer(restartConfig(dir), { hostname, background: false }); await app.ready;
   try {
-    const first = app.repo.hosted.aliveAt(app.repo.read)!;
-    await until(() => app.repo.hosted.aliveAt(app.repo.read)! > first, 5_000);
+    const first = (await app.repo.hosted.aliveAt(app.repo.read))!;
+    await until(async () => (await app.repo.hosted.aliveAt(app.repo.read))! > first, 5_000);
   } finally { await app.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 

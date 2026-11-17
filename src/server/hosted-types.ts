@@ -29,21 +29,22 @@ export interface HostedStore {
   // With `read`, a named row's notice carries `read`'s answer on the committing transaction, just before its COMMIT
   // (#807 P3 A7g1); undefined when the read failed or the body was synchronous.
   subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
-  get(r: Read, id: string): HostedSession | undefined;
+  // The store's reads all return promises, on the caller's handle (#807 P3 A7h1).
+  get(r: Read, id: string): Promise<HostedSession | undefined>;
   // Whether the session ID is a hosted session's: a root's ownership row
   // stays after it ends; a child's row only while it is registered.
-  owned(r: Read, id: string): boolean;
+  owned(r: Read, id: string): Promise<boolean>;
   // Every row but parked children (#566): the row set the limits count (`counts`) and the sweeps scan. `get` still returns a
   // parked row, and `children` lists a root's children, parked or not.
-  all(r: Read): HostedSession[];
+  all(r: Read): Promise<HostedSession[]>;
   // What admission counts, without loading rows (#805): unparked rows on the server and the user's. The user's is
   // O(own rows) on idx_hosted_user; the server's walks idx_hosted_parked, bounded by the global row cap.
-  counts(r: Read, user: number): { total: number; user: number };
+  counts(r: Read, user: number): Promise<{ total: number; user: number }>;
   // An ownership's unparked rows (idx_hosted_ownership): what a grant re-attach moves.
-  ofOwnership(r: Read, ownership: number): HostedSession[];
-  children(r: Read, root: string): HostedSession[];
+  ofOwnership(r: Read, ownership: number): Promise<HostedSession[]>;
+  children(r: Read, root: string): Promise<HostedSession[]>;
   // A user's live roots, oldest first (#475): peer_list's unbound sessions are those holding nothing.
-  roots(r: Read, user: number): HostedSession[];
+  roots(r: Read, user: number): Promise<HostedSession[]>;
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
   park(tx: Tx, session: string, now: number): Promise<void>;
   unpark(tx: Tx, session: string, grant: string, now: number): Promise<void>;
@@ -53,9 +54,9 @@ export interface HostedStore {
   touch(tx: Tx, session: string, now: number): Promise<void>;
   // The sweep's candidates by query, not by scanning every row (#399): roots whose lease lapsed by `now`; idle
   // unparked rows (children, and roots with no lease and no hold) last seen before `cutoff`; disabled users' roots.
-  expired(r: Read, now: number): HostedSession[];
-  idle(r: Read, cutoff: number): HostedSession[];
-  disabled(r: Read): HostedSession[];
+  expired(r: Read, now: number): Promise<HostedSession[]>;
+  idle(r: Read, cutoff: number): Promise<HostedSession[]>;
+  disabled(r: Read): Promise<HostedSession[]>;
   // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
   start(tx: Tx, session: string, user: number, client: string, now: number, suggested?: string | null): Promise<number>;
   end(tx: Tx, session: string, reason: HostedEnd, now: number, deadline?: number): Promise<boolean>;
@@ -69,14 +70,14 @@ export interface HostedStore {
   // delivery_open: the Controller applied them before opening); `forgetLost` drops an alias the root bound again.
   // A hold both readers took is deleted.
   lose(tx: Tx, session: string, lost: HostedLost, now: number): Promise<void>;
-  lost(r: Read, session: string, reader: LostReader): HostedLost[];
+  lost(r: Read, session: string, reader: LostReader): Promise<HostedLost[]>;
   tellLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
   reportLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
   seeLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
   forgetLost(tx: Tx, session: string, alias: string): Promise<void>;
   // The server's last recorded liveness (epoch ms), absent before the first
   // heartbeat on this schema. A restart credits leases with the downtime (#423).
-  aliveAt(r: Read): number | undefined;
+  aliveAt(r: Read): Promise<number | undefined>;
   heartbeat(tx: Tx, now: number): Promise<void>;
   // The hosted facts on a session's `ids` row (#807 P1c-15a): a child's root (#523), an ended ID live again (#475 item 7a),
   // a tools-only root's writes_as (A4) and its ownership's launcher flag (#473, #520). `declareLauncher`: whether it turned
@@ -85,7 +86,7 @@ export interface HostedStore {
   reopenId(tx: Tx, id: string): Promise<void>;
   restateWritesAs(tx: Tx, id: string, writesAs: string): Promise<void>;
   declareLauncher(tx: Tx, id: string): Promise<boolean>;
-  launcher(r: Read, id: string): boolean;
+  launcher(r: Read, id: string): Promise<boolean>;
   // Every session's holds, oldest first: the hosted sweep's and reconcile's.
-  holds(r: Read): { id: string; address: string }[];
+  holds(r: Read): Promise<{ id: string; address: string }[]>;
 }

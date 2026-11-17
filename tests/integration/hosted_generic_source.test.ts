@@ -201,7 +201,7 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
   await stop();
   start([operator(BROKER, false)]);
   // The bound root keeps its name; its client's requests are unmapped from now on.
-  expect(app.repo.hosted.all(app.repo.read).filter(r => app.application.hostedHolds(app.application.repo.read, r.session_id).some(a => a.endsWith("/owner"))).map(r => r.client_id)).toEqual([BROKER]);
+  expect((await app.repo.hosted.all(app.repo.read)).filter(r => app.application.hostedHolds(app.application.repo.read, r.session_id).some(a => a.endsWith("/owner"))).map(r => r.client_id)).toEqual([BROKER]);
   const tokens = { kept, fresh: await grant(BROKER), cimd: await grant(CIMD_CLIENT) };
   for (const [label, token] of Object.entries(tokens)) {
     const meta: [string, string][] = [[GRAYBOARD_SESSION_META, "owner"], [OPENCODE_SESSION_META, "owner"]];
@@ -222,7 +222,7 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
     }
   }
   expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/intruder")).toBeUndefined();
-  expect(app.repo.hosted.all(app.repo.read).map(r => r.source_session_id)).toEqual(["owner"]);
+  expect((await app.repo.hosted.all(app.repo.read)).map(r => r.source_session_id)).toEqual(["owner"]);
 });
 
 test("OpenCode maps only its own key and an opted-in client only the generic key", async () => {
@@ -242,7 +242,7 @@ test("OpenCode maps only its own key and an opted-in client only the generic key
     expect(json(await call(alone, "whoami"))).toMatchObject({ primary: `alice@example.com/${own === OPENCODE_SESSION_META ? "oc-run" : "broker-run"}` });
   }
   expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/wrong-key")).toBeUndefined();
-  expect(app.repo.hosted.all(app.repo.read).map(r => [r.client_id, r.source_session_id]).sort()).toEqual([
+  expect((await app.repo.hosted.all(app.repo.read)).map(r => [r.client_id, r.source_session_id]).sort()).toEqual([
     [BROKER, `root ${GRAYBOARD_SESSION_META}`], [OPENCODE_CLIENT, `root ${OPENCODE_SESSION_META}`],
   ]);
 });
@@ -255,7 +255,7 @@ test("one raw source under two clients of one user is two hosted sessions", asyn
   await bind(second, "second");
   expect(json(await call(first, "whoami"))).toMatchObject({ primary: "alice@example.com/first" });
   expect(json(await call(second, "whoami"))).toMatchObject({ primary: "alice@example.com/second" });
-  const rows = app.repo.hosted.all(app.repo.read).filter(r => r.source_session_id === "shared");
+  const rows = (await app.repo.hosted.all(app.repo.read)).filter(r => r.source_session_id === "shared");
   expect(rows.map(r => r.client_id).sort()).toEqual([BROKER, BROKER_TWO].sort());
   expect(new Set(rows.map(r => r.session_id)).size).toBe(2);
 });
@@ -286,7 +286,7 @@ test("with no operator clients, each built-in client signs in through consent, b
   }
   const peers = json(await call(conns[0]!, "peer_list", { include_offline: true })).peers as { handle: string; harness?: string }[];
   expect(peers.filter(p => p.handle.endsWith("-run")).map(p => [p.handle, p.harness]).sort()).toEqual(harnesses.map(h => [`alice@example.com/${h}-run`, h]).sort());
-  expect(app.repo.hosted.all(app.repo.read).map(r => r.client_id).sort()).toEqual([...BUILTIN_CLIENT_IDS].sort());
+  expect((await app.repo.hosted.all(app.repo.read)).map(r => r.client_id).sort()).toEqual([...BUILTIN_CLIENT_IDS].sort());
 });
 
 test("a built-in client's delivery declaration selects its initialize and bind text", async () => {
