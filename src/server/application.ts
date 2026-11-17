@@ -12,8 +12,8 @@ import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holdsOf,
-  logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
+  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, boardActor, childStateRefusal, closestNames,
+  orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
@@ -25,7 +25,7 @@ import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
   acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, parseAliasMeta, pendingFor, pendingKey, refOf,
-  setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, normalizeBoard, getBoard,
+  cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
@@ -212,7 +212,7 @@ type Hub = {
   // its outcome keeps them, on that call's `Tx`; otherwise (a sweep, outside any body) posted.
   delegateLimit: RateLimit;
   delegateLimiter: RateLimiter;
-  delegateRows: RefusalRow[] | undefined;
+  delegateRows: SyncRow[] | undefined;
   delegateOpenCap: number;
   aliasScopeCap: number;
   now: () => number;
@@ -448,10 +448,19 @@ async function describeHolder(hub: Hub, r: Read, id: string, asker: string): Pro
 }
 
 // A refusal's row, written by the session's `afterRollback` when the call runs inside a transaction the refusal's
-// throw rolls back (#452, #467), or now on `tx`, the body the call runs in.
-export type RefusalRow = (tx: Tx) => void;
-function rowAfterRollback(session: ApplicationSession, tx: Tx, write: RefusalRow) {
+// throw rolls back (#452, #467), or now on `tx`, the body the call runs in. Every flusher runs it through an awaited
+// `tx.savepoint`, so a binding row may be async (#807 P3 B1c).
+export type RefusalRow = (tx: Tx) => void | Promise<void>;
+// A row written where nothing awaits it (an audit or decision row, a streak or throttle row, one core's synchronous
+// `reach` emits): synchronous by convention, so none floats a promise (#807 P3 B1c, R10). The type doesn't refuse an
+// async function (TypeScript accepts one where `void` is returned): every producer must call only synchronous writers.
+export type SyncRow = (tx: Tx) => void;
+function rowAfterRollback(session: ApplicationSession, tx: Tx, write: SyncRow) {
   if (session.afterRollback) session.afterRollback(write); else write(tx);
+}
+// An async row (a binding row): written now is awaited.
+async function asyncRowAfterRollback(session: ApplicationSession, tx: Tx, write: RefusalRow): Promise<void> {
+  if (session.afterRollback) session.afterRollback(write); else await write(tx);
 }
 
 // Who asked, for a decision row (policy.ts): the session's user, the address
@@ -467,11 +476,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // commit keeps it, and handed to `afterRollback` as well, to be written again if the transaction rolls back. A
   // refused take always rolls it back. Outside a bind (a sweep, outside any body) the row is posted.
   let streakAt: { tx: Tx; afterRollback?: (write: RefusalRow) => void } | undefined;
-  const streakRow = (write: RefusalRow) => {
+  const streakRow = (write: SyncRow) => {
     if (!streakAt) { repo.post(write, undefined, "bind rate-limit row"); return; }
     write(streakAt.tx); streakAt.afterRollback?.(write);
   };
-  const delegateRow = (write: RefusalRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else repo.post(write, undefined, "delegation throttle row"); };
+  const delegateRow = (write: SyncRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else repo.post(write, undefined, "delegation throttle row"); };
   const hub: Hub = {
     repo,
     registry: new Map(),
@@ -572,9 +581,15 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   function detach(session: ApplicationSession): void {
     for (const a of session.addresses) if (hub.registry.get(a) === session) hub.registry.delete(a);
   }
-  // `h`: the body the close runs in (bind's and unbind's `finally`), whose `Tx` takes its rows; else the rows are posted.
+  // `h`: the body the close runs in (bind's and unbind's `finally`), whose `Tx` takes its rows at its commit (they roll
+  // back with it, as they did written inline); else each is its own queued write. Close stays synchronous, and its
+  // callers include the write queue's holder (a reconcile apply, a commit callback), where an async post throws, so
+  // the outside-a-body write is a `repo.write` not awaited, its failure logged (#807 P3 B1c).
   function close(session: ApplicationSession, h: Read = repo.read) {
-    const write = (row: (tx: Tx) => void, what: string) => { if (isTx(h)) row(h); else repo.post(row, undefined, what); };
+    const write = (row: (tx: Tx) => Promise<void>, what: string) => {
+      if (isTx(h)) h.beforeCommit({}, row);
+      else void repo.write(row).catch(e => console.error(`[grayboard] ${what} failed:`, e));
+    };
     if (!session.active) return;
     session.active = false;
     hub.sessions.delete(session);
@@ -583,7 +598,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const addr = session.primary;
       if (addr && hub.registry.get(addr) === session) {
         hub.registry.delete(addr);
-        write(tx => logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "released", "connection closed"), "human release row");
+        write(tx => repo.bindings.log(tx, HUMAN_NAME, addr, "released", "connection closed"), "human release row");
       }
       return;
     }
@@ -591,9 +606,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // (reconcile) or a shutdown, never a release, so it leaves the holds alone.
     const id = session.sessionId;
     detach(session);
-    // Close runs from sync finally blocks and commit callbacks: the touch is written on `h` or posted, not awaited (#807 P1b-4b).
+    // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
+    // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer) write(tx => touchId(repo.coreOn(tx), writer), "last-seen touch");
+    if (writer) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch");
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
@@ -795,8 +811,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // service and delivery to close the lease now, not at its next renewal.
     await tx.savepoint(async sp => {
       const primary = hosted && (await repo.bindings.holdsOf(sp, u.id))[0] === u.address;
-      dropHold(repo.coreOn(sp), u.address, u.id);
-      logBinding(repo.coreOn(sp), u.id, u.address, "released", `access revoked: ${reason}`);
+      await repo.bindings.release(sp, u.address, u.id);
+      await repo.bindings.log(sp, u.id, u.address, "released", `access revoked: ${reason}`);
       writeAudit(repo, sp, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
       if (hosted) {
         const row = await repo.hosted.get(sp, u.id);
@@ -830,10 +846,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // Read in the body, on its Tx, for the hello the committed callback builds (#807 P3 A7g).
       const hello = await helloFacts(hub, authed, tx);
       // Again after the awaits (#807 P3 A7f3 audit): a stop outside the write queue lands meanwhile; the throw rolls the create back.
+      // The rows before the last check (#807 P3 B1c, R3): nothing awaits after it; its throw rolls them back.
+      await repo.bindings.touchAlias(tx, addr);
+      await repo.bindings.log(tx, HUMAN_NAME, addr, "bound");
       const late = await current?.(tx);
       if (late) fail("unauthenticated", late);
-      touchAlias(repo.coreOn(tx), addr);
-      logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "bound");
       return hello;
     }, hello => {
       const session = new ApplicationSession(authed, sink, true, true);
@@ -870,7 +887,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     const target = await bindTarget(hub, tx, authed, m.alias);
     await testPauseAsync("bind:target:decided");
     if ("error" in target) {
-      if (target.address) { const a = target.address; rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, a, "refused", target.error)); }
+      if (target.address) { const a = target.address; await asyncRowAfterRollback(session, tx, w => repo.bindings.log(w, id, a, "refused", target.error)); }
       if (target.authz) { const { req, d } = target.authz; rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, target.address), req, d)); }
       return fail(target.code, target.error);
     }
@@ -878,33 +895,33 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // refused target's rows are written first, as every deny's is.
     await valid(session, true, tx);
     const { address, scope } = target;
-    const refuse = (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): never => {
-      rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, address, "refused", detail));
+    const refuse = async (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): Promise<never> => {
+      await asyncRowAfterRollback(session, tx, w => repo.bindings.log(w, id, address, "refused", detail));
       return fail(code, message, extra);
     };
     let meta: AliasMetaSet | undefined;
     try {
       meta = m.meta === undefined ? undefined : parseAliasMeta(m.meta);
     } catch (e) {
-      if (e instanceof CoreError) return refuse("bad_request", e.message, e.message);
+      if (e instanceof CoreError) return await refuse("bad_request", e.message, e.message);
       throw e;
     }
     const audit = serverAuditSink(repo, tx);
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
-      if (meta) setAliasMeta(repo.coreOn(tx), address, meta, id, audit, authed.user_email);
+      if (meta) await repo.bindings.setMeta(tx, address, meta, id, audit, authed.user_email);
       return { alias: address, held: [...session.holds] };
     }
     if (session.holds.length >= MAX_HOLDS) {
       const why = tooManyHolds(session.holds);
-      return refuse("bad_request", why, why);
+      return await refuse("bad_request", why, why);
     }
     // A typo would otherwise create a fresh alias, and the DMs queued for the
     // intended one would never arrive.
     if (m.create === false && !(await repo.aliases.find(tx, address))) {
       const known = closestNames(scope.name, (await repo.aliases.listForScope(tx, scope.scope_kind, scope.scope_ref)).map((a) => a.name).filter((n) => n !== HUMAN_NAME));
       const message = unknownNameError(scope.name, known);
-      return refuse("identity_unknown", message, message, { known });
+      return await refuse("identity_unknown", message, message, { known });
     }
     // Another session's hold is never taken over. The hosted service clears a stale
     // hosted holder first (#402): one idle past the hosted window ended and freed the
@@ -912,35 +929,45 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     const holder = await repo.bindings.holderOf(tx, address);
     if (holder !== null && holder !== id) {
       const who = await describeHolder(hub, tx, holder, authed.user_email);
-      return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who });
+      return await refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who });
     }
     // Another user's tools-only session writing as it holds nothing, but the
     // alias is in use, so it's exclusive all the same (S8, decided).
     const writer = await repo.bindings.userOf(tx, address, authed.user_email);
     if (writer !== null) {
       const why = `another user's session ${writer}`;
-      return refuse("alias_held", aliasHeldText(address, why, "bind another name"), why);
+      return await refuse("alias_held", aliasHeldText(address, why, "bind another name"), why);
     }
     if (session.holds.length >= MAX_HOLDS) {
       const why = tooManyHolds(session.holds);
-      return refuse("bad_request", why, why);
+      return await refuse("bad_request", why, why);
     }
     // A new name past its scope's cap (#347); checked here, not in the
     // transaction below, so the refused binding event stays.
     const capped = (await repo.aliases.find(tx, address)) ? null : await aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
-    if (capped) return refuse("bad_request", capped, capped);
+    if (capped) return await refuse("bad_request", capped, capped);
 
     // No savepoint (#807 P3 A1): a throw here fails the bind, and every caller's transaction rolls back with it.
     await createLazily(hub, tx, authed, target, id);
     await testPauseAsync("bind:alias:created");
     // Again after the create's await: no hold for a session terminated meanwhile.
     await valid(session, true, tx);
-    holdAlias(repo.coreOn(tx), address, id, now());
-    logBinding(repo.coreOn(tx), id, address, "bound", null);
-    if (meta) setAliasMeta(repo.coreOn(tx), address, meta, id, audit, authed.user_email);
-    touchAlias(repo.coreOn(tx), address);
-
-    setHolds(hub, session, holdsOf(repo.coreOn(tx), id));
+    // The take is the authority (D3): the checks above fix the refusal order; one that lost since (on Postgres a
+    // concurrent bind) refuses here, naming whoever has it now.
+    if (!(await repo.bindings.take(tx, address, id, authed.user_email, now()))) {
+      const now_ = await repo.bindings.holderOf(tx, address);
+      // On Postgres an unbind or end may commit between the take and these reads, leaving neither: "another session".
+      const user = now_ === null ? await repo.bindings.userOf(tx, address, authed.user_email) : null;
+      const who = now_ !== null ? await describeHolder(hub, tx, now_, authed.user_email) : user !== null ? `another user's session ${user}` : "another session";
+      return await refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, now_ !== null ? { holder: who } : {});
+    }
+    await repo.bindings.log(tx, id, address, "bound", null);
+    if (meta) await repo.bindings.setMeta(tx, address, meta, id, audit, authed.user_email);
+    await repo.bindings.touchAlias(tx, address);
+    const held = await repo.bindings.holdsOf(tx, id);
+    // After the last await (R1): a session closed meanwhile isn't registered again; the throw rolls the bind back.
+    stillOpen(session);
+    setHolds(hub, session, held);
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = await owedBridgeNotice(repo, tx, authed.user_email);
     const notices = await noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
@@ -961,13 +988,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (!p || p.kind === "id" || p.kind === "team") fail("bad_request", `"${alias}" isn't an alias: a name, or scope/name`);
     const address = p.kind === "bare" ? `${session.authed.user_email}/${p.name}` : p.address;
     if (!session.holds.includes(address)) return { alias: address, released: false, held: [...session.holds] };
-    const core = repo.coreOn(tx);
     // No savepoint (#807 P3 A1): a throw fails the unbind, and its caller's transaction rolls back with it.
-    dropHold(core, address, id);
-    logBinding(core, id, address, "released", "unbind");
-    touchAlias(core, address);
+    await repo.bindings.release(tx, address, id);
+    await repo.bindings.log(tx, id, address, "released", "unbind");
+    await repo.bindings.touchAlias(tx, address);
+    // After the last await (R2), as bind's.
+    stillOpen(session);
     setHolds(hub, session, session.holds.filter((a) => a !== address));
-    const left = listClaims(core).filter((c) => c.holder === address).map((c) => c.key);
+    const left = listClaims(repo.coreOn(tx)).filter((c) => c.holder === address).map((c) => c.key);
     return { alias: address, released: true, held: [...session.holds], ...(left.length ? { left } : {}) };
   }
 
@@ -1050,7 +1078,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         // No savepoint (#807 P3 A1), here or at a reopen: a throw fails the registration, and its caller's
         // transaction (or rowFor's savepoint) rolls back with it.
         const model = cleanFact(facts?.model), effort = cleanFact(facts?.effort);
-        registerId(repo.coreOn(tx), { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+        await repo.bindings.registerId(tx, { id, principal: authed.user_email, harness, launcher: false, ...(writesAs === null ? {} : { writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
         writeAudit(repo, tx, "id.registered", authed.user_email, id, { harness, ...(writesAs === null ? {} : { writes_as: writesAs }), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
       }
       else {
@@ -1061,9 +1089,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
           await repo.hosted.reopenId(tx, id);
           writeAudit(repo, tx, "id.reopened", authed.user_email, id, { ended_at: endedAt, harness });
         }
-        touchId(repo.coreOn(tx), id);
+        await repo.bindings.touchId(tx, id);
         // A new ownership of the same ID reports its own model and effort: what the last one reported is stale.
-        const changed = setIdFacts(repo.coreOn(tx), id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
+        const changed = await repo.bindings.setIdFacts(tx, id, { model: facts?.model ?? null, effort: facts?.effort ?? null });
         if (changed) writeAudit(repo, tx, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "ownership" });
         // An ownership's end clears the row's writes_as (the store's end), so a new ownership of the same ID restates it.
         if (writesAs !== null) await repo.hosted.restateWritesAs(tx, id, writesAs);
@@ -1077,8 +1105,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // The latest model and effort a hosted session's request reports (#364): written, and audited with the
     // before and after, only when one changed. Absent fields keep the stored value; an empty one clears it (#558).
-    hostedFacts(tx: Tx, authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
-      const changed = setIdFacts(repo.coreOn(tx), id, facts);
+    async hostedFacts(tx: Tx, authed: AuthedUser, id: string, facts: { model?: string; effort?: string }) {
+      const changed = await repo.bindings.setIdFacts(tx, id, facts);
       if (changed) writeAudit(repo, tx, "id.facts_changed", authed.user_email, id, { before: changed.before, after: changed.after, why: "request" });
     },
     // A tools-only declaration's alias, resolved and checked: a name the
@@ -1088,13 +1116,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // `later`: where a policy refusal's decision row goes, for the same reason (hosted's `later`).
     // `tx`: the body the request's row is written in.
     async hostedWritesAs(tx: Tx, authed: AuthedUser, id: string, raw: string, create = false, refused?: (address: string, detail: string) => void, later?: (write: RefusalRow) => void): Promise<string> {
-      const note = (address: string, detail: string) => { if (refused) refused(address, detail); else logBinding(repo.coreOn(tx), id, address, "refused", detail); };
+      const note = async (address: string, detail: string) => { if (refused) refused(address, detail); else await repo.bindings.log(tx, id, address, "refused", detail); };
       const target = await bindTarget(hub, tx, authed, raw);
       if ("error" in target) {
-        if (target.address) note(target.address, target.error);
+        if (target.address) await note(target.address, target.error);
         if (target.authz) {
           const { req, d } = target.authz;
-          const row: RefusalRow = w => recordDecision(repo, w, { user: authed.user_email, address: target.address, session: id }, req, d);
+          const row: SyncRow = w => recordDecision(repo, w, { user: authed.user_email, address: target.address, session: id }, req, d);
           if (later) later(row); else row(tx);
         }
         return fail(target.code, target.error);
@@ -1102,13 +1130,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const other = await repo.bindings.userOf(tx, target.address, authed.user_email);
       if (other) {
         const why = `another user's session ${other}`;
-        note(target.address, why);
+        await note(target.address, why);
         return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
       if (create) {
         const capped = (await repo.aliases.find(tx, target.address)) ? null : await aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
         if (capped) {
-          note(target.address, capped);
+          await note(target.address, capped);
           return fail("bad_request", capped);
         }
         await createLazily(hub, tx, authed, target, id);
@@ -1134,11 +1162,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Whether the session's ownership declared a launcher (#473, #520): what its instruction text follows, since the
     // stored flag, not the current request's `_meta`, decides whether it receives delegation requests.
     hostedLauncher(id: string): Promise<boolean> { return repo.hosted.launcher(repo.read, id); },
-    hostedPlace(tx: Tx, id: string, place: string | null) { setPlace(repo.coreOn(tx), id, place); },
+    hostedPlace(tx: Tx, id: string, place: string | null): Promise<void> { return repo.bindings.setPlace(tx, id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,
     bindNow,
-    hostedRefused(tx: Tx, id: string, address: string, detail: string) { logBinding(repo.coreOn(tx), id, address, "refused", detail); },
+    hostedRefused(tx: Tx, id: string, address: string, detail: string): Promise<void> { return repo.bindings.log(tx, id, address, "refused", detail); },
     hostedCollided(h: Read, authed: AuthedUser, id: string, why: string) { writeAudit(repo, h, "id.collision", authed.user_email, id, { why }); },
     unbind,
     close,
@@ -1692,7 +1720,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   // call: written inside the dedup transaction they'd roll back with it, so
   // they're written after it. A refusal's decision rows go to the session's
   // afterRollback, which every queued caller sets (hosted run, Slack inWrite).
-  const rows: RefusalRow[] = [];
+  const rows: SyncRow[] = [];
   hub.delegateRows = rows;
   // Whether this user may name `to`'s launcher (#256): its own user's, or
   // another's under a shared 'delegating' team (policy.ts delegate.to). The
@@ -1707,7 +1735,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   // Decided before core asks (#807 P3 A7f2): core's resolveDelegation is synchronous and calls `reach` only for the
   // explicit `to`, which is resolved before it runs. The deny row is returned, not written, so it's emitted only when
   // core asks (after its own field checks), as before.
-  type Reach = { result: DelegateReach; row?: RefusalRow };
+  type Reach = { result: DelegateReach; row?: SyncRow };
   const reachDecision = async (h: Tx, to: string, recheck = false): Promise<Reach> => {
     // A team's alias this session may not see reads as one nobody has (#1014), before any grant is judged. A replay
     // named it while it could: it says why it can't be replayed, not that the name never connected.

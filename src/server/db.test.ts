@@ -1082,3 +1082,33 @@ test("#807 P3 B1a: the bindings reads run on the handle they're given; the batch
   // An alias's and a session's last-seen, a repeat once, a never-seen alias absent (an ids row always has one).
   expect(await b.lastSeen(r, [fe, s2, fe, be])).toEqual(new Map([[fe, 1000], [s2, 900]]));
 });
+
+test("#807 P3 B1c: bindings.take refuses another ID's hold and another user's writer, re-takes its own, and orders one ID's takes", async () => {
+  const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const [s1, s2, bWriter, cWriter] = ["id:0000000000001", "id:0000000000002", "id:0000000000003", "id:0000000000004"];
+  const [fe, be, ops, qa] = ["b@example.com/fe", "b@example.com/be", "b@example.com/ops", "b@example.com/qa"];
+  const holds = () => db.query("SELECT address, id, bound_at FROM alias_holds ORDER BY address").all();
+  await seed(repo, async tx => {
+    for (const u of ["b@example.com", "c@example.com"]) await repo.users.upsertByEmail(tx, u, null);
+    for (const n of ["fe", "be", "ops", "qa"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
+    const core = repo.coreOn(tx);
+    for (const id of [s1, s2]) registerId(core, { id, principal: "b@example.com", launcher: false });
+    // A tools-only writer as fe of another user, and one as be of the same user.
+    registerId(core, { id: cWriter, principal: "c@example.com", launcher: false, writesAs: fe });
+    registerId(core, { id: bWriter, principal: "b@example.com", launcher: false, writesAs: be });
+    holdAlias(core, ops, s2, 100);
+  });
+  const take = (address: string, id: string, now: number) => repo.write(tx => repo.bindings.take(tx, address, id, "b@example.com", now));
+  // Another ID's hold, the same user's: no take, and its row stays as it was.
+  expect(await take(ops, s1, 200)).toBeNull();
+  // Another user's unended writer: no take.
+  expect(await take(fe, s1, 200)).toBeNull();
+  expect(holds()).toEqual([{ address: ops, id: s2, bound_at: 100 }]);
+  // The same user's writer shares the alias with a holder.
+  expect(await take(be, s1, 300)).toEqual({ bound_at: 300 });
+  // Two takes by one ID in one millisecond keep their order (holdAlias's contract).
+  expect(await take(qa, s1, 300)).toEqual({ bound_at: 301 });
+  // The same ID's re-take restamps its own hold.
+  expect(await take(be, s1, 400)).toEqual({ bound_at: 400 });
+  expect(holds()).toEqual([{ address: be, id: s1, bound_at: 400 }, { address: ops, id: s2, bound_at: 100 }, { address: qa, id: s1, bound_at: 301 }]);
+});

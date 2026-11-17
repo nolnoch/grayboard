@@ -344,6 +344,13 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
     checks.push({ inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
     return original(h);
   }) as never);
+  // A binding row goes through `repo.bindings` (#807 P3 B1c): its writes are logged beside core's.
+  const logs: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const log = database.repo.bindings.log.bind(database.repo.bindings);
+  const logSpy = spyOn(database.repo.bindings, "log").mockImplementation(((h: Parameters<typeof log>[0], ...rest: unknown[]) => {
+    logs.push({ inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
+    return (log as (...a: unknown[]) => Promise<void>)(h, ...rest);
+  }) as never);
   const holder = ctx("p15b2-holder"), other = ctx("p15b2-other");
   const refused = () => database.db.prepare("SELECT name FROM binding_events WHERE session_id = ? AND event = 'refused'").all((other as { id: string }).id);
   try {
@@ -351,11 +358,11 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
     expect(database.db.prepare("SELECT place FROM ids WHERE id = ?").get((holder as { id: string }).id)).toEqual({ place: "repo on main" });
     await delivery.open(generic, holder);
     await hosted.bind(generic, other, { name: "p15b2-other", create: true });
-    const before = checks.length;
+    const before = logs.length;
     await expect(hosted.bind(generic, other, { name: "p15b2" })).rejects.toHaveProperty("code", "alias_held");
     expect(refused()).toEqual([{ name: "you@example.com/p15b2" }]);
     // The refused bind's row is written by flushQueued's own body, on its Tx.
-    expect(checks.slice(before).filter(c => c.inTxn && c.handle === "tx").length).toBeGreaterThan(0);
+    expect(logs.slice(before)).toEqual([{ inTxn: true, handle: "tx" }]);
     await hosted.whoami(generic, ctx("p15b2-other", { [GRAYBOARD_MODEL_META]: "claude-opus-5-5" }));
     expect(database.db.prepare("SELECT model FROM ids WHERE id = ?").get((other as { id: string }).id)).toEqual({ model: "claude-opus-5-5" });
     await hosted.run(generic, holder, "board_create", (session, tx) => application.call(tx, session, "board_create", { name: "p15b2", purpose: "tests" }));
@@ -367,7 +374,7 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
     await delivery.receipt(generic, holder, lease.capability, items.map(i => i.id));
     expect(await hosted.unbind(generic, other, { name: "p15b2-other" })).toMatchObject({ structuredContent: { name: null } });
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
-  } finally { spy.mockRestore(); }
+  } finally { spy.mockRestore(); logSpy.mockRestore(); }
 });
 
 // #807 P3 A2: an audit row written inside a hosted body goes on that body's Tx, never through `repo.post` (which ran it

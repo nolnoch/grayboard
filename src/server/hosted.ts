@@ -321,7 +321,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       if (declared !== row.writes_as) throw new ApplicationError("id_collision", `session ${row.session_id} ${row.writes_as ? `writes as "${row.writes_as}"` : "holds its own aliases"}, and this request ${declared ? `writes as "${declared}"` : "declares no writes_as"}; a session's shape is fixed.`);
     }
     // The latest model and effort a request reports (#364); a write only on a change.
-    if (row && context.facts) application.hostedFacts(tx, p.authed, row.session_id, context.facts);
+    if (row && context.facts) await application.hostedFacts(tx, p.authed, row.session_id, context.facts);
     // Any request of a root's ownership may turn its launcher flag on (#520): OpenCode's native client starts the
     // ownership without the plugin's `_meta`, so the declaration arrives on a later subscriber request. A child's
     // and a tools-only root's are ignored; only the ownership's end clears it.
@@ -937,7 +937,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           const added = ok.held.length !== before.length;
           // `where` restates the place even when the name was already held (a re-bind), as on the other surfaces.
           if (added || args.where !== undefined) await store.update(tx, { ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
-          if (args.where !== undefined) application.hostedPlace(tx, row.session_id, args.where);
+          if (args.where !== undefined) await application.hostedPlace(tx, row.session_id, args.where);
           if (added && row.lease_deadline !== null) await audit(tx, row.session_id, "hosted.lease_closed", { reason: "rebound" });
           // A lost hold bound again is no longer lost: neither reader is told it, and the Controller keeps it (#453).
           if (added) await store.forgetLost(tx, row.session_id, ok.alias);

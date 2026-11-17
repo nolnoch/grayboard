@@ -6,8 +6,8 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, setAccess, type CoreDb } from "../core/boards.ts";
-import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type IdRow } from "../core/bindings.ts";
+import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
@@ -321,8 +321,8 @@ export interface Repo {
     // Also deletes the alias's read points.
     remove(tx: Tx, address: string): Promise<void>;
   };
-  // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a). The writes
-  // (holdAlias, logBinding, the ids and presence stamps) are still core's, through coreOn, until B1c.
+  // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a), and every
+  // write on the caller's Tx (B1c).
   bindings: {
     // The aliases a session holds, oldest hold first (HOLD_ORDER).
     holdsOf(r: Read, id: string): Promise<string[]>;
@@ -344,6 +344,22 @@ export interface Repo {
     aliasUses(r: Read, principal: string | null): Promise<AliasUse[]>;
     // When each handle (an alias or a session ID) was last seen; one never seen is absent.
     lastSeen(r: Read, handles: string[]): Promise<Map<string, number>>;
+    // Holds address for id (D3): null, writing nothing, when another session holds it or another principal's
+    // session acts as it (userOf with exceptPrincipal = principal). A same-ID re-take moves its bound_at. bound_at
+    // stays after the ID's other holds, so two takes in one millisecond keep their order (HOLD_ORDER).
+    take(tx: Tx, address: string, id: string, principal: string, now: number): Promise<{ bound_at: number } | null>;
+    release(tx: Tx, address: string, id: string): Promise<void>;
+    // A binding_events row (core logBinding: a repeated refusal is one row with a count).
+    log(tx: Tx, id: string, name: string, event: BindingEvent, detail?: string | null, at?: number): Promise<void>;
+    touchAlias(tx: Tx, address: string, now?: number): Promise<void>;
+    touchId(tx: Tx, id: string, now?: number): Promise<void>;
+    // Rejects with IdCollision when the ID has a row; a pruned ID's tombstone comes back as ReusedId.
+    registerId(tx: Tx, facts: IdFacts): Promise<ReusedId | null>;
+    // null: no such ID.
+    setIdFacts(tx: Tx, id: string, facts: { model?: string | null; effort?: string | null }): Promise<{ before: IdSessionFacts; after: IdSessionFacts } | null>;
+    setPlace(tx: Tx, id: string, place: string | null): Promise<void>;
+    // An alias's labels (core setAliasMeta), audited through `audit`.
+    setMeta(tx: Tx, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string): Promise<void>;
   };
   // The writes return promises (#807 P3 A6g), and so do the reads, on the caller's handle (A7e3).
   teams: {
@@ -1413,6 +1429,27 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         }
         return out;
       },
+      async take(tx, address, id, principal, now) {
+        const db = sqliteOf(tx);
+        // The writer check and the upsert are one method, so a store whose transactions interleave (Postgres, C10a)
+        // locks the alias row first and keeps them together. The upsert's WHERE leaves another ID's hold alone.
+        if (aliasUser(db, address, principal)) return null;
+        return db.query<{ bound_at: number }, [string, string, number]>(
+          `INSERT INTO alias_holds (address, id, bound_at)
+             VALUES (?1, ?2, MAX(?3, COALESCE((SELECT MAX(bound_at) + 1 FROM alias_holds WHERE id = ?2 AND address != ?1), ?3)))
+           ON CONFLICT(address) DO UPDATE SET bound_at = excluded.bound_at WHERE alias_holds.id = excluded.id
+           RETURNING bound_at`,
+        ).get(address, id, now);
+      },
+      release: async (tx, address, id) => dropHold(sqliteOf(tx), address, id),
+      // A stamp the caller doesn't give is core's default (Date.now), as when the server called core directly.
+      log: async (tx, id, name, event, detail = null, at) => logBinding(sqliteOf(tx), id, name, event, detail, at),
+      touchAlias: async (tx, address, now) => touchAlias(sqliteOf(tx), address, now),
+      touchId: async (tx, id, now) => touchId(sqliteOf(tx), id, now),
+      registerId: async (tx, facts) => registerId(sqliteOf(tx), facts),
+      setIdFacts: async (tx, id, facts) => setIdFacts(sqliteOf(tx), id, facts),
+      setPlace: async (tx, id, place) => setPlace(sqliteOf(tx), id, place),
+      setMeta: async (tx, address, meta, session, audit, actor) => setAliasMeta(sqliteOf(tx), address, meta, session, audit, actor),
     },
 
     teams: {
