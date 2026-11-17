@@ -192,10 +192,12 @@ export function claim(
 // A queue post's claim ended without an ack: offer the post to the next lane
 // that hasn't held it. With none left, the post stays readable on its board
 // unclaimed, and a reply in its thread, as the lane that held it last, tells
-// the poster and the claim's watchers (#220). Lanes are counted, not named: a
-// reader may not see a team's alias (#871). Like a holder that lost access,
-// one that can't post there now ends it quietly.
-function requeue(db: Database, c: ClaimRow, now: number): ClaimChanges {
+// the poster and the claim's watchers (#220). The reply's author shows that
+// last lane, as `[expired]` posts show a holder; its text counts the others
+// rather than naming them. A decline's reply is the declining session's
+// (`ctx`); a lapse's is the claimant's user (#855). Like a holder that lost
+// access, one that can't post there now ends it quietly.
+function requeue(db: Database, c: ClaimRow, now: number, ctx: ClaimCtx = {}): ClaimChanges {
   const cc = watchersCc(db, c.key, true);
   const r = redeliverQueuePost(db, c.key, c.holder, now);
   if (!r) return { wake: [], boards: [] };
@@ -203,7 +205,9 @@ function requeue(db: Database, c: ClaimRow, now: number): ClaimChanges {
   const lanes = r.held === 1 ? "its one lane" : `all ${r.held} lanes`;
   const text = `[unclaimed] ${c.key}: ${lanes} passed on it, and no other lane is left; it stays here unclaimed${cc}`;
   try {
-    const res = post(db, c.holder, r.board, text, r.postId, { author_user: holderUser(db, c), allowArchived: true });
+    const res = post(db, c.holder, r.board, text, r.postId, {
+      author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true,
+    });
     return { wake: res.wake, boards: [res.post.board] };
   } catch (e) {
     if (e instanceof CoreError) return { wake: [], boards: [] };
@@ -253,7 +257,7 @@ export function release(
       // A declined queue post goes to the next lane with the original post;
       // the decline post would itself rotate as a new work item, so it isn't
       // announced either (#192 review).
-      return requeue(db, cur, Date.now());
+      return requeue(db, cur, Date.now(), ctx);
     }
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;

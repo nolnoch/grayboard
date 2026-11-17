@@ -786,7 +786,8 @@ export function queueLanes(
 // redelivers it to the next lane). At-least-once: the claim key is the
 // idempotency token. The claim does not announce on the board - the delivery
 // IS the visibility, and an announce would cascade back through the queue
-// rotation. Caller is inside post's transaction.
+// rotation. The claim records the lane's session's user (#855), so a reply the
+// bus writes when it ends unclaimed is that user's. Caller is inside post's transaction.
 function claimQueuePost(db: Database, board: string, p: Post, lane: string, now: number, note = "queue post"): void {
   const key = `queue:${board}:${p.id}`;
   const expires = now + QUEUE_CLAIM_TTL_MS;
@@ -798,8 +799,9 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
   ).run(lane, p.id);
   const res = db
     .prepare(
-      `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE((SELECT principal FROM ids WHERE id = ?2),
+         (SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?2)))`,
     )
     .run(key, lane, note, board, now, expires);
   // The claim is the idempotency token: when a row already holds the key,

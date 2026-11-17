@@ -131,6 +131,50 @@ test("a lapse on a one-lane queue says the post is unclaimed, and cc's the claim
   expect(listClaims(db).some((c) => c.key === key)).toBe(false);
 });
 
+// #220: a lane that held the post is skipped even when it's the least recently woken.
+test("with three lanes, a post skips the lane that held it, however long ago that lane was woken", () => {
+  ensureAlias(db, "yak", "test");
+  touchAlias(db, "yak");
+  subscribe(db, "yak", "work", "push");
+  const r = post(db, "be", "work", "work item");
+  const key = claimKey(r.post.id);
+  const holder = () => listClaims(db).find((c) => c.key === key)?.holder;
+  const first = holder()!;
+  release(db, first, key, "pass");
+  const second = holder()!;
+  const third = ["fe", "sim", "yak"].find((h) => h !== first && h !== second)!;
+  // The third lane was woken more recently, by another post, than the first lane: rotation alone would pick the first.
+  db.prepare(`INSERT INTO claim_events (key, handle, event, board, at) VALUES ('queue:work:999', ?, 'take', 'work', ?)`).run(third, Date.now() + 60_000);
+  release(db, second, key, "pass");
+  expect(holder()).toBe(third);
+  release(db, third, key, "pass");
+  expect(holder()).toBeUndefined();
+  const replies = db.prepare(`SELECT author, body FROM posts WHERE parent_id = ?`).all(r.post.id);
+  expect(replies).toEqual([{ author: third, body: `[unclaimed] ${key}: all 3 lanes passed on it, and no other lane is left; it stays here unclaimed` }]);
+});
+
+// #855: the [unclaimed] reply is written by the session whose decline caused it.
+test("a decline's [unclaimed] reply is the declining session's, as its user", () => {
+  db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+  const r = post(db, "be", "work", "work item"); // fe, the only lane, claims
+  release(db, "fe", claimKey(r.post.id), "pass", { session: "id:00000000000fe", via: "id:00000000000fe", user: "u-fe" });
+  expect(db.prepare(`SELECT author, author_id, via, author_user FROM posts WHERE parent_id = ?`).all(r.post.id)).toEqual([
+    { author: "fe", author_id: "id:00000000000fe", via: "id:00000000000fe", author_user: "u-fe" },
+  ]);
+});
+
+// #855: a lapse has no caller; the reply is the user of the session that held the lane's name.
+test("a lapse's [unclaimed] reply is the user of the lane's session", () => {
+  db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+  registerId(db, { id: "id:00000000000fe", principal: "u-fe", launcher: false });
+  holdAlias(db, "fe", "id:00000000000fe");
+  const r = post(db, "be", "work", "work item"); // fe, the only lane, claims
+  sweepExpired(db, Date.now() + 31 * 60_000);
+  expect(db.prepare(`SELECT author, author_id, author_user FROM posts WHERE parent_id = ?`).all(r.post.id)).toEqual([
+    { author: "fe", author_id: null, author_user: "u-fe" },
+  ]);
+});
+
 test("a reply by the claim holder acks and releases the claim", () => {
   const r = post(db, "be", "work", "work item"); // fe claims
   const reply = post(db, "fe", "work", "done: landed", r.post.id);
