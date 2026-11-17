@@ -9,6 +9,7 @@ import type { Tx } from "./store/tx.ts";
 import { writeAudit } from "./audit.ts";
 import { tokenSessionIn } from "../../tests/support/token_session.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
@@ -404,6 +405,8 @@ test("unknown and reserved names are audited without creation; trusted human get
   // The bridge's human has no session ID (#284 S16); it logs as `human`.
   expect(human.sessionId).toBe("");
   application.close(human);
+  // Outside a body, close queues its release row (#807 P3 B1c): a write behind it on the queue runs after it.
+  await store.repo.write(async () => {});
   expect(store.db.query("SELECT event FROM binding_events WHERE name = ? ORDER BY id").all(human.identityFull)).toEqual([{ event: "refused" }, { event: "bound" }, { event: "released" }]);
 });
 
@@ -491,6 +494,51 @@ test("#807: attachHuman while another body holds the write queue waits, then bin
   await done;
   expect((await attached).session.human).toBe(true);
   expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([{ event: "bound" }]);
+});
+
+// #807 P3 B1c: the take is the authority (D3). A hold or a writer that lands between bind's early checks and its take
+// (here a trigger on the lazy create, standing in for Postgres's concurrent bind) refuses the bind alias_held, naming
+// whoever has it now; the refused row is written after the rollback, which takes the lazily created alias with it.
+test("#807 P3 B1c: a hold or another user's writer landing after bind's checks refuses at the take", async () => {
+  const a = await connect(alice, null), other = await connect(alice, null, { key: "alice-other" });
+  const writer = await connect(bob, null, { key: "bob-tools", push: false });
+  const race = "alice@example.com/race", race2 = "alice@example.com/race2";
+  store.db.run(`CREATE TEMP TRIGGER land_hold AFTER INSERT ON aliases WHEN NEW.address = '${race}'
+    BEGIN INSERT INTO alias_holds (address, id, bound_at) VALUES (NEW.address, '${other.id}', 1); END`);
+  store.db.run(`CREATE TEMP TRIGGER land_writer AFTER INSERT ON aliases WHEN NEW.address = '${race2}'
+    BEGIN UPDATE ids SET writes_as = NEW.address WHERE id = '${writer.id}'; END`);
+  const refused = (name: string) => store.db.query("SELECT detail FROM binding_events WHERE session_id = ? AND name = ? AND event = 'refused'").all(a.id, name);
+  await expect(a.bind("race", { create: true })).rejects.toMatchObject({ code: "alias_held", extra: { holder: expect.stringContaining(other.id) } });
+  expect(refused(race)).toEqual([{ detail: expect.stringContaining(other.id) }]);
+  await expect(a.bind("race2", { create: true })).rejects.toMatchObject({ code: "alias_held", message: expect.stringContaining(`another user's session ${writer.id}`) });
+  expect(refused(race2)).toEqual([{ detail: `another user's session ${writer.id}` }]);
+  for (const address of [race, race2]) expect(await store.repo.aliases.find(store.repo.read, address)).toBeUndefined();
+  expect(store.db.query("SELECT COUNT(*) AS n FROM alias_holds").get()).toEqual({ n: 0 });
+  expect(a.session.holds).toEqual([]);
+});
+
+// #807 P3 B1c: close's rows. On a body's Tx they're written at its commit and roll back with it, as when written
+// inline; outside a body they're queued writes, so a close from the write queue's holder (a commit callback) lands
+// after it rather than throwing as an async post there would.
+test("#807 P3 B1c: close's touch commits or rolls back with its body, and from a commit callback is queued", async () => {
+  const seen = (id: string) => (store.db.query("SELECT last_seen FROM ids WHERE id = ?").get(id) as { last_seen: number }).last_seen;
+  const errors = spyOn(console, "error");
+  try {
+    const rolled = await connect(alice, "rolled"), kept = await connect(alice, "kept", { key: "alice-kept" }), late = await connect(alice, "late", { key: "alice-late" });
+    await seed(store.repo, async tx => { store.repo.coreOn(tx).run("UPDATE ids SET last_seen = 0"); });
+    await expect(store.repo.write(async tx => { application.close(rolled.session, tx); throw new Error("body refused"); })).rejects.toThrow("body refused");
+    expect(rolled.session.active).toBe(false);
+    expect(seen(rolled.id)).toBe(0);
+    await store.repo.write(async tx => {
+      application.close(kept.session, tx);
+      // Not mid-body: at the commit.
+      expect(seen(kept.id)).toBe(0);
+    });
+    expect(seen(kept.id)).toBeGreaterThan(0);
+    await store.repo.write(async () => {}, () => application.close(late.session));
+    await until(() => seen(late.id) > 0, 2000, "the queued close touch");
+    expect(errors.mock.calls.filter(c => String(c[0]).includes("last-seen touch"))).toEqual([]);
+  } finally { errors.mockRestore(); }
 });
 
 test("#807: a rolled-back attachHuman leaves the earlier bridge connection in place", async () => {
