@@ -950,4 +950,12 @@ test("a Slack DM to another user's agent says it won't wake it; one to your own 
   expect(note.markdown_text).toContain("bob@example.com's agent won't act on it until its user does");
   expect(slack.reactions().map((r) => r.timestamp)).toEqual([mine.ts, theirs.ts]);
   expect(inThread(mine.ts)).toEqual([]);
+
+  // A reply in the mapped thread gets the note too; with fe ended (its person alias stays), after the queued line.
+  await fe.end();
+  slack.say("still there?", { thread_ts: theirs.ts });
+  await until(() => inThread(theirs.ts).length === 3, 5000, "the reply's two lines reached Slack");
+  const [queued, again] = inThread(theirs.ts).slice(1).map((p) => p.markdown_text);
+  expect(queued).toStartWith("queued: bob@example.com/fe is offline");
+  expect(again).toBe(note.markdown_text);
 });
