@@ -4,7 +4,7 @@
 // lease's inbox. Covers the distributed board semantics in
 // docs/server-sessions.md and docs/server-access.md. Moved from ws.test.ts; hub mechanics are in
 // hub.test.ts, routes in http_routes.test.ts.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -305,11 +305,25 @@ test("#843: a whoami, dm_ack or bind fault answers internal_error in structuredC
   await seed(srv.app.repo, () => { srv.app.db.exec(`CREATE TRIGGER holds_fail BEFORE INSERT ON alias_holds BEGIN SELECT RAISE(ABORT, 'holds_fail'); END`); });
   const bind = await unbound.callRaw("bind", { name: "sim", create: true });
   expect([bind.isError, bind.structuredContent, JSON.parse(textOf(bind))]).toEqual([true, { code: "internal_error" }, { code: "internal_error", message: "internal error" }]);
-  // A message table gone from under the live server makes the ack's write fail. The first ID is missing, the
+  // The ack table gone from under the live server makes the ack's write fail. The first ID is missing, the
   // second faults: the fault keeps its own code rather than becoming the missing ID's not_found.
   await seed(srv.app.repo, () => { srv.app.db.exec(`ALTER TABLE dm_acks RENAME TO dm_acks_gone`); });
   const ack = await fe.callRaw("dm_ack", { message_id: [99999, sent.message_id] });
   expect([ack.isError, ack.structuredContent, textOf(ack)]).toEqual([true, { code: "internal_error" }, "error: internal error"]);
+  // Put the schema back, so the server's stop ends sessions cleanly.
+  await seed(srv.app.repo, () => { srv.app.db.exec(`ALTER TABLE dm_acks_gone RENAME TO dm_acks; DROP TRIGGER holds_fail`); });
+});
+
+// #1032: a bind refused not_found (a scope that names no team) is logged as a refusal, like the other bind codes.
+test("#1032: a bind into a scope that names no team logs a not_found refusal", async () => {
+  const unbound = await srv.hosted(A, null);
+  const err = spyOn(console, "error");
+  try {
+    await expect(unbound.call("bind", { name: "no-such-team/sim", create: true })).rejects.toMatchObject({ code: "not_found" });
+    const refusals = err.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("[grayboard] hosted MCP refused: "))
+      .map(l => JSON.parse(l.slice("[grayboard] hosted MCP refused: ".length)) as { reason: string });
+    expect(refusals.map(r => r.reason)).toEqual(["not_found"]);
+  } finally { err.mockRestore(); }
 });
 
 test("a bare DM recipient is only ever your own identity of that name (F-08)", async () => {
