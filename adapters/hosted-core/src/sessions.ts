@@ -31,7 +31,10 @@ export class SessionRoutes {
   private readonly paths = new Map<string, SessionPath>();
   private readonly ended = new Set<string>();
   // Descendants of an ended root, oldest root end first. Each keeps its path so its own end, if the host sends it,
-  // still ends its registration; past the limit the oldest is forgotten, as a host may never send it (#1166).
+  // still ends its registration; past the limit the oldest is forgotten, as a host may never send it (#1166). A
+  // forgotten orphan's later end sends no child end: its registration then waits for the server's idle sweep, unless
+  // the root's release already ended it. `ended` and `orphans` age independently, so remember() could revive a
+  // child of a root `ended` has dropped; that needs ENDED_LIMIT ends between the root's end and a lookup in flight.
   private readonly orphans = new Set<string>();
   constructor(private readonly limit = ENDED_LIMIT) {}
   remember(path: SessionPath) {

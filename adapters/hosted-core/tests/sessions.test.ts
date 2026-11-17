@@ -33,6 +33,14 @@ test("an ended root's descendants keep their paths up to the limit, oldest root 
   expect(() => routes.remember({ sessionID: "G", root: "R", via: ["C"] })).toThrow("ended");
 });
 
+test("one root's descendants past the limit: the earliest remembered is forgotten (#1166)", () => {
+  const routes = new SessionRoutes(2);
+  routes.remember({ sessionID: "R", root: "R", via: [] });
+  for (const id of ["A", "B", "C"]) routes.remember({ sessionID: id, root: "R", via: [] });
+  routes.end("R");
+  expect(["A", "B", "C"].map(id => routes.get(id)?.sessionID)).toEqual([undefined, "B", "C"]);
+});
+
 test("a live root's descendants are not orphans and are never forgotten (#1166)", () => {
   const routes = new SessionRoutes(1);
   routes.remember({ sessionID: "R", root: "R", via: [] });
