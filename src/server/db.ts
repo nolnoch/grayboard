@@ -158,7 +158,7 @@ function withTx<T>(db: Database, fn: (tx: Tx) => T): () => T {
 const isThenable = (v: unknown): v is PromiseLike<unknown> =>
   v !== null && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
 
-// Core's shared writes (attachment store/release/sweep, claim expiry, #807 D4) through repo's write queue, each body
+// Core's shared writes (attachment store/release/sweep, #807 D4) through repo's write queue, each body
 // given the connection its queued body's `Tx` resolves to (P1c-15c-2). Core's bodies are synchronous, so the cast
 // only restates that.
 export function queuedTx(repo: Repo): WriteTx {

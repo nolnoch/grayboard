@@ -970,7 +970,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (meta) await repo.bindings.setMeta(tx, address, meta, id, audit, authed.user_email);
     await repo.bindings.touchAlias(tx, address);
     const held = await repo.bindings.holdsOf(tx, id);
-    // After the last await (R1): a session closed meanwhile isn't registered again; the throw rolls the bind back.
+    // After the last write's await (R1; the notices below only read): a session closed meanwhile isn't registered
+    // again; the throw rolls the bind back.
     stillOpen(session);
     setHolds(hub, session, held);
     // The first bind of a user's session after the bridge died carries the death notice, once.
