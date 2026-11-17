@@ -3,6 +3,7 @@ import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader, Hos
 import { testPause } from "../shared/testpause.ts";
 import { queueFor } from "./store/queue.ts";
 import { mkdirSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
 import { ALIAS_SESSION_SQL, HOLD_ORDER, setAccess, type CoreDb } from "../core/boards.ts";
@@ -224,7 +225,8 @@ export interface Repo {
   // body (#881): one authorization's token and user reads share it. Inside the caller's own transaction, nested, or
   // with no generation to read, it's plain fn().
   authRead<T>(fn: () => Sync<T>): T;
-  // The auth cache's generation: authRead's pinned one inside its body, else read now; undefined inside the caller's
+  // The auth cache's generation: authRead's pinned one inside its body (and in work the body starts: the pin follows
+  // the async task, #807 P3 A7b), else read now; undefined inside the caller's
   // own transaction. Another task's open transaction doesn't move it: it reflects commits only (#996). Equal values
   // mean no committed write to oauth_tokens, oauth_grants or users from this connection, and no commit at all from
   // another, came between them (#899).
@@ -955,8 +957,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // key a cache entry on the holder's uncommitted bump, which its rollback would undo. Undefined to the holder inside
   // its own transaction, whose reads see writes that may yet roll back, and after a failed counter read until the
   // next commit reads it again (uncached rather than stale).
-  // `pinned`: the generation authRead read for its body (#881); null outside one.
-  let pinned: string | null = null;
+  // `pin`: the generation authRead read for its body (#881), per async task rather than per module (#807 P3 A7b), so
+  // bodies that overlap once they await each keep their own. Work a body starts (a timer, a queued write, a
+  // continuation) inherits the store, but the pin is live only until the body settles: after that the work reads the
+  // generation afresh, so a cache filled under the body's generation can't answer it once a commit (a revoke, a
+  // disable) has moved the generation on.
+  const pin = new AsyncLocalStorage<{ g: string; live: boolean }>();
+  const pinned = () => { const p = pin.getStore(); return p?.live ? p.g : undefined; };
   let committed: number | undefined;
   const readCommitted = () => { try { committed = counter.get()!.n; } catch (error) { committed = undefined; console.error("[grayboard] auth generation read failed:", error); } };
   readCommitted();
@@ -968,19 +975,32 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     const n = db.inTransaction ? committed : counter.get()!.n;
     return n === undefined ? undefined : `${n}:${dataVersion.get()!.data_version}`;
   };
-  const authGeneration = () => ownsTx(db) ? undefined : pinned ?? readGeneration();
+  const authGeneration = () => ownsTx(db) ? undefined : pinned() ?? readGeneration();
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
-  // Caches of what the auth tables say, cleared when authGeneration moves: a live access token only (an
-  // unknown or dead one is re-read every time); a user row, or its absence, as read (#853). They sit
-  // here, under the store's own methods, so a test that replaces one of those methods replaces the cache too.
+  // Caches of what the auth tables say, keyed on authGeneration: a live access token only (an unknown or dead one is
+  // re-read every time); a user row, or its absence, as read (#853). They sit here, under the store's own methods, so
+  // a test that replaces one of those methods replaces the cache too.
+  // A lookup hits only when its generation is the cache's. A miss reads, then fills only if the generation is still
+  // its own once the read is done (#807 P3 A7b): a lookup pinned before a commit neither fills nor clears the cache a
+  // newer one keyed, so bodies with different pins don't thrash it, and generations need no order.
+  // A failed generation read fills nothing (the lookup's answer stands, uncached).
+  const fills = (g: string, cacheGen: string | undefined, clear: () => void): string | undefined => {
+    let now: string | undefined;
+    try { now = readGeneration(); } catch (error) { console.error("[grayboard] auth generation read failed:", error); return cacheGen; }
+    if (now !== g) return cacheGen;
+    if (g !== cacheGen) clear();
+    return g;
+  };
   let userGeneration: string | undefined;
   const users = new Map<number, User | null>();
   const cachedUser = (userId: number): User | undefined => {
     const g = authGeneration();
     if (g === undefined) return userById(userId);
-    if (g !== userGeneration) { users.clear(); userGeneration = g; }
-    let u = users.get(userId);
-    if (u === undefined) users.set(userId, u = userById(userId) ?? null);
+    const hit = g === userGeneration ? users.get(userId) : undefined;
+    if (hit !== undefined) return hit ?? undefined;
+    const u = userById(userId) ?? null;
+    const kept = fills(g, userGeneration, () => users.clear());
+    if (kept === g) { userGeneration = g; users.set(userId, u); }
     return u ?? undefined;
   };
   // A live access token by hash: held while the generation is unchanged and both the token and its grant
@@ -993,13 +1013,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     sqliteOf(r);
     const g = authGeneration();
     if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(r, h, resource, requiredScopes, now);
-    if (g !== accessGeneration) { accesses.clear(); accessGeneration = g; }
     const key = `${resource}\n${h}`;
-    let a = accesses.get(key);
+    let a = g === accessGeneration ? accesses.get(key) : undefined;
     if (!a || !(now < a.expiresAt && now < a.grantExpiresAt)) {
       a = oauth.findActiveAccess(r, h, resource, [], now);
-      if (!a) { accesses.delete(key); return undefined; }
-      accesses.set(key, a);
+      const kept = fills(g, accessGeneration, () => accesses.clear());
+      if (kept === g) { accessGeneration = g; if (a) accesses.set(key, a); else accesses.delete(key); }
+      if (!a) return undefined;
     }
     const held = a;
     return requiredScopes.every(s => held.scopes.includes(s)) ? held : undefined;
@@ -1010,11 +1030,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
     read: sqliteRead(db),
     authRead<T>(fn: () => Sync<T>): T {
-      if (pinned !== null || ownsTx(db)) return fn() as T;
+      if (pinned() !== undefined || ownsTx(db)) return fn() as T;
       const g = readGeneration();
       if (g === undefined) return fn() as T;
-      pinned = g;
-      try { return fn() as T; } finally { pinned = null; }
+      const p = { g, live: true };
+      try { return pin.run(p, fn) as T; } finally { p.live = false; }
     },
     authGeneration,
 

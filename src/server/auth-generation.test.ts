@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { openDatabase, type Repo } from "./db.ts";
 import { sqliteOf, type Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { createHash } from "node:crypto";
+import { OAUTH_TTL, type OAuthAuthorization } from "./oauth-types.ts";
 
 const open = (): Repo => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
 const gate = () => { let open!: () => void; const p = new Promise<void>(r => { open = r; }); return { p, open }; };
@@ -93,4 +95,59 @@ test("an auth-table write that commits without a tracked boundary still moves th
   // A holder's committed callback, outside any transaction: a bare autocommit UPDATE (clearSubject's statement).
   await repo.write(() => {}, () => { sqliteOf(repo.read).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [user.id]); });
   expect(repo.authGeneration()).not.toBe(before);
+});
+
+// An access token for userId, through the store's consent and redemption path; returns its hash.
+async function issueAccess(repo: Repo, userId: number, resource: string, start: number): Promise<string> {
+  const h = (s: string) => createHash("sha256").update(s).digest("hex");
+  const binding: OAuthAuthorization = { clientId: "native", resource, scopes: ["grayboard:tools"], redirectUri: "http://127.0.0.1/callback", codeChallenge: "A".repeat(43) };
+  const request = { ...binding, requestHash: h("request"), browserHash: h("browser"), csrfHash: h("csrf"), stateHash: h("state"), consentSessionHash: null, createdAt: start, expiresAt: start + OAUTH_TTL.request };
+  const code = { ...binding, userId, codeHash: h("code"), createdAt: start, expiresAt: start + OAUTH_TTL.code };
+  const sessionHash = h("browser-session");
+  const tokens = { ...binding, accessHash: h("access"), refreshHash: h("refresh"), accessExpiresAt: start + OAUTH_TTL.access, refreshExpiresAt: start + OAUTH_TTL.refresh };
+  await repo.write(async tx => {
+    expect((await repo.oauth.createBrowserSession(tx, { sessionHash, userId, createdAt: start, expiresAt: start + OAUTH_TTL.browser }, start)).status).toBe("ok");
+    expect((await repo.oauth.createRequest(tx, request, start)).status).toBe("ok");
+    expect((await repo.oauth.bindRequestSession(tx, request.requestHash, request.browserHash, sessionHash, start)).status).toBe("ok");
+    expect((await repo.oauth.decideRequest(tx, { requestHash: request.requestHash, browserHash: request.browserHash, csrfHash: request.csrfHash, sessionHash, approve: true, code }, start)).status).toBe("ok");
+    expect((await repo.oauth.redeemCode(tx, { ...binding, codeHash: code.codeHash, grantId: "grant_0123456789abcdef", grantExpiresAt: start + OAUTH_TTL.grant, tokens }, start)).status).toBe("ok");
+  });
+  return tokens.accessHash;
+}
+
+// #807 P3 A7b: authRead's pin is per async task and live only while its body runs. Work the body starts that runs
+// after it (a continuation, a timer) reads the generation afresh, so a disable or revoke committed meanwhile is seen,
+// not answered from the cache the body filled under its own generation.
+test("work an authRead body starts reads afresh once the body is done: a disable after it isn't served from the cache", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const user = await repo.write(tx => repo.users.upsertByEmail(tx, "p@example.com", null));
+  const g0 = repo.authGeneration();
+  const later = gate();
+  // Boxed: authRead's body is synchronous until A7c; the continuation it starts runs after it, with its store.
+  const after = repo.authRead(() => {
+    expect(repo.users.activeEmail(user.id)).toBe("p@example.com"); // fills the user cache at g0
+    return { seen: later.p.then(() => ({ g: repo.authGeneration(), email: repo.users.activeEmail(user.id) })) };
+  }).seen;
+  await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
+  later.open();
+  const seen = await after;
+  expect(seen.g).not.toBe(g0);
+  expect(seen.email).toBeUndefined();
+});
+
+test("work an authRead body starts reads afresh once the body is done: a revoked token isn't served from the cache", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const user = await repo.write(tx => repo.users.upsertByEmail(tx, "p@example.com", null));
+  // A disable revokes the user's grants and tokens too; the access cache must miss after it.
+  const t = repo.now();
+  const later = gate();
+  const resource = "https://bus.example.com/mcp";
+  const issued = await issueAccess(repo, user.id, resource, t);
+  const after = repo.authRead(() => {
+    expect(repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)).toBeDefined(); // fills the access cache
+    return { seen: later.p.then(() => repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)) };
+  }).seen;
+  await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
+  later.open();
+  expect(await after).toBeUndefined();
 });
