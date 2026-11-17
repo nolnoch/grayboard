@@ -867,8 +867,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         const taken = pending ? await pending : [], lost = taken.map(({ alias, reason }) => ({ alias, reason }));
         if (told && taken.length) told(lostNotice(p, row!, taken));
         const held = root ? application.hostedHolds(repo.read, root.session_id) : [];
-        // The one await after the reads above (#807 P3 A7g2): candidates are hints, so a bind landing meanwhile only
-        // makes them a moment newer than `held`.
+        // An await after `held` (#807 P3 A7g2; `root` was read before takeLost's): candidates are hints, so a bind
+        // landing meanwhile only makes them a moment newer than `held`.
         const offered = !(root && named(root, held)) && !row?.root_session_id ? await application.hostedCandidates(repo.read, p.authed, root?.suggested ?? null) : undefined;
         return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),

@@ -352,7 +352,7 @@ export interface Repo {
     // Whether two users share any team: the human-reach rule's teammates, in one statement (A7e3).
     shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
   };
-  // The writes return promises (#807 P3 A6d2); the reads stay synchronous until A7, as the alias reads do.
+  // The writes return promises (#807 P3 A6d2); the reads stay synchronous until A7.
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
