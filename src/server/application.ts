@@ -25,9 +25,9 @@ import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  age, snapshot, canSeeBoard, checkBody, checkPostAccess, parseAliasMeta, pendingKey, refOf,
+  age, checkBody, checkPostAccess, parseAliasMeta, pendingKey, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
-  type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
+  type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -1340,7 +1340,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // Of `boards`, which the session may receive: one of its addresses, as they stand at the call, may see the board;
     // a missing board is false (#807 P3 B5a2). Read on `r`, so inside a body it sees the body's writes. A sync caller
-    // judges the answer with no await since (mcp's `Checked.boards`).
+    // judges the answer later (mcp's `Checked.boards`, read before the hosted row, the check's last await).
     async boardsVisible(r: Read, session: ApplicationSession, boards: Iterable<string>): Promise<Map<string, boolean>> {
       validNow(session);
       return boardsVisibleTo(r, [...session.addresses], boards);
@@ -1437,16 +1437,6 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     const names = [...new Set(boards)];
     const seen = addresses.length && names.length ? await visibleBoards(repo, hub.access, r, addresses, names) : new Map<string, Board>();
     return new Map(names.map((b) => [b, seen.has(b)]));
-  }
-  // Who a board read is judged for: the first of the session's addresses that can see it (S14).
-  function reader(r: Read, session: ApplicationSession, board: string): Viewer {
-    if (session.readOnly) return seer(repo, session);
-    try {
-      return boardActor(repo.coreOn(r), "board_read", { board }, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
-    } catch (e) {
-      if (e instanceof CoreError) throw coreRefusal(e);
-      throw e;
-    }
   }
   return application;
 }

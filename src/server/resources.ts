@@ -122,8 +122,8 @@ export function createResources(application: Application, options: ResourceOptio
       const board = parseBoardResourceUri(uri);
       return { uri: boardResourceUri(board), ...await application.boardSnapshot(r, session, board, options) };
     },
-    // Synchronous, for a caller that has just checked the session's token and read the board's visibility for it,
-    // with no await since (mcp's makeLive and its legacy control, after `authorize`): `visible` is that read's answer
+    // Synchronous, for a caller that has just checked the session's token, with no await since, and read the board's
+    // visibility for it before the hosted row (mcp's makeLive and its legacy control, after `authorize`): `visible` is that read's answer
     // (`Checked.boards`, #807 P3 B5a2), and only `current` runs here. A caller with no answer passes false: the
     // watch is refused, never left unchecked (#807 P3 A7d2c).
     watch(session: ApplicationSession, uri: string, hooks: ResourceHooks, visible: boolean): string {
