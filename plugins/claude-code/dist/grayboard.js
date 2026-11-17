@@ -36624,6 +36624,7 @@ class Controller {
   port;
   routes = new SessionRoutes;
   lookups = new Map;
+  registered = new Map;
   Transport;
   roots = new Map;
   watches = new Map;
@@ -36691,7 +36692,9 @@ class Controller {
     this.drift(`${DRIFTED}; ${this.hint}`);
   }
   async path(sessionID) {
-    const path = await this.port.ancestry(sessionID);
+    return this.route(await this.port.ancestry(sessionID));
+  }
+  route(path) {
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
     for (const [index, id] of path.via.entries())
       this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
@@ -36717,18 +36720,40 @@ class Controller {
     const r = this.roots.get(path.root);
     return path.root !== sessionID && r && !r.paused ? path : undefined;
   }
-  async enlist(path, report = true) {
-    const r = this.roots.get(path.root);
+  async enlist(path, fetch2 = false) {
+    const r = this.roots.get(path.root), live = !!r && !r.paused;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call = (sessionID, c) => this.temporary(e, c, sessionID);
-    await register2(call, { root: path.root, via: path.via, child: path.sessionID }).catch((error) => {
-      if (report)
+    const known = r && this.registered.get(path.sessionID);
+    let done = known && known.r === r && known.epoch === r.epoch ? known.done : undefined;
+    if (!done) {
+      const started = done = register2(call, { root: path.root, via: path.via, child: path.sessionID });
+      if (r) {
+        this.registered.set(path.sessionID, { r, epoch: r.epoch, done: started });
+        if (this.registered.size > LOOKUPS)
+          this.registered.delete(this.registered.keys().next().value);
+      }
+      started.catch(() => {
+        if (this.registered.get(path.sessionID)?.done === started)
+          this.registered.delete(path.sessionID);
+      });
+    }
+    await done.catch((error) => {
+      if (!fetch2)
         this.failure("child_register", error, r);
       throw error;
     });
     if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
       await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
       throw new AncestryError("Grayboard session ended during registration");
+    }
+    if (fetch2 && live && (this.roots.get(path.root) !== r || r.paused)) {
+      this.registered.delete(path.sessionID);
+      if (this.roots.get(path.root) === r) {
+        await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
+        await end(call, { child: path.root }).catch((error) => this.failure("session_end", error, r));
+      }
+      throw new AncestryError("Grayboard root paused during registration");
     }
     this.routes.remember(path);
   }
@@ -37542,7 +37567,8 @@ class Controller {
   async configuredBind(sessionID) {
     if (this.stopped || !this.configured)
       return;
-    const path = await this.path(sessionID);
+    const known = this.lookups.get(sessionID);
+    const path = known ? this.route(known) : await this.path(sessionID);
     if (path.root !== sessionID)
       return;
     try {
@@ -37557,6 +37583,7 @@ class Controller {
     if (this.stopped)
       return;
     this.lookups.delete(sessionID);
+    this.registered.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path)
       return;

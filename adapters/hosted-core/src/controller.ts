@@ -88,6 +88,8 @@ const display = (address: string) => shortOf(address.slice(0, address.lastIndexO
 export class Controller<E extends Enrollment = Enrollment> {
   readonly routes = new SessionRoutes();
   private readonly lookups = new Map<string, SessionPath>();
+  // A descendant's registration under its enrolled root, kept while that root keeps its epoch (#567).
+  private readonly registered = new Map<string, { r: Root<E>; epoch: number; done: Promise<void> }>();
   readonly Transport: typeof Wire;
   protected roots = new Map<string, Root<E>>();
   private watches = new Map<string, { dispose(): Promise<void> }>();
@@ -147,8 +149,8 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   // The watch's and a guard's drift alike; hosts key on DRIFTED (pi's describe, a root's sink).
   private credentialChanged() { this.drift(`${DRIFTED}; ${this.hint}`); }
-  private async path(sessionID: string) {
-    const path = await this.port.ancestry(sessionID);
+  private async path(sessionID: string) { return this.route(await this.port.ancestry(sessionID)); }
+  private route(path: SessionPath) {
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
     for (const [index, id] of path.via.entries()) this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
     this.routes.remember(path);
@@ -176,17 +178,39 @@ export class Controller<E extends Enrollment = Enrollment> {
   // before a native wire names it, which unregistered would start an ownership
   // of its own (#535). One that ended while registering may have sent its end
   // before this registration landed, so it ends the row it made. A refusal is
-  // the root's `child_register` failure unless `report` is false: an
-  // instructions fetch reports its own, without degrading the root.
-  async enlist(path: SessionPath, report = true): Promise<void> {
-    const r = this.roots.get(path.root);
+  // the root's `child_register` failure unless this is an instructions `fetch`,
+  // which reports its own, without degrading the root. Under an enrolled root,
+  // calls and fetches share one registration until the root's epoch moves (a
+  // stop, pause or re-enroll; a re-enroll deletes child rows server-side) (#567).
+  async enlist(path: SessionPath, fetch = false): Promise<void> {
+    const r = this.roots.get(path.root), live = !!r && !r.paused;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call: Temporary = (sessionID, c) => this.temporary(e, c, sessionID);
-    await register(call, { root: path.root, via: path.via, child: path.sessionID })
-      .catch(error => { if (report) this.failure("child_register", error, r); throw error; });
+    const known = r && this.registered.get(path.sessionID);
+    let done = known && known.r === r && known.epoch === r.epoch ? known.done : undefined;
+    if (!done) {
+      const started = done = register(call, { root: path.root, via: path.via, child: path.sessionID });
+      if (r) {
+        this.registered.set(path.sessionID, { r, epoch: r.epoch, done: started });
+        if (this.registered.size > LOOKUPS) this.registered.delete(this.registered.keys().next().value!);
+      }
+      started.catch(() => { if (this.registered.get(path.sessionID)?.done === started) this.registered.delete(path.sessionID); });
+    }
+    await done.catch(error => { if (!fetch) this.failure("child_register", error, r); throw error; });
     if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
       await end(call, { child: path.sessionID }).catch(error => this.failure("child_end", error, r));
       throw new AncestryError("Grayboard session ended during registration");
+    }
+    // A fetch whose root paused while it registered: the pause's release may have landed first, and the
+    // registration then started the root's key a new ownership. A root still paused ends it again, with
+    // the child's row; one a re-enroll replaced owns its key, so its rows stand (#567).
+    if (fetch && live && (this.roots.get(path.root) !== r || r!.paused)) {
+      this.registered.delete(path.sessionID);
+      if (this.roots.get(path.root) === r) {
+        await end(call, { child: path.sessionID }).catch(error => this.failure("child_end", error, r));
+        await end(call, { child: path.root }).catch(error => this.failure("session_end", error, r));
+      }
+      throw new AncestryError("Grayboard root paused during registration");
     }
     this.routes.remember(path);
   }
@@ -893,9 +917,11 @@ export class Controller<E extends Enrollment = Enrollment> {
     });
   }
   // A new top-level root binds the configured name; receiving still needs approval where the host keeps one.
+  // `session.created` resolved its ancestry a moment ago (`childRoot`): that lookup serves (#567).
   async configuredBind(sessionID: string) {
     if (this.stopped || !this.configured) return;
-    const path = await this.path(sessionID);
+    const known = this.lookups.get(sessionID);
+    const path = known ? this.route(known) : await this.path(sessionID);
     if (path.root !== sessionID) return;
     try {
       const e = await this.port.credential.capture(sessionID);
@@ -907,7 +933,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // ownership; a descendant ends its registration without ending its root.
   async ended(sessionID: string) {
     if (this.stopped) return;
-    this.lookups.delete(sessionID);
+    this.lookups.delete(sessionID); this.registered.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path) return;
     const r = this.roots.get(path.root);

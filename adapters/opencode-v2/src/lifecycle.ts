@@ -185,7 +185,7 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
       const path = await controller.childRoot(sessionID);
       e = path && controller.enrollment(path.root);
       if (!path || !e) return;
-      await controller.enlist(path, false);
+      await controller.enlist(path, true);
     }
     // A session (or its root) that ended since the lookup or the registration: an `initialize` landing after its
     // end would start an ownership for its key that only the idle sweep ends (#567). `forget` aborts `signal`.
