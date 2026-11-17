@@ -12,8 +12,9 @@ test("a held pause is abandoned when its parent process is killed", async () => 
   const dir = mkdtempSync(join(tmpdir(), "gb-pause-"));
   try {
     const pidFile = join(dir, "child.pid");
-    // The child records its pid, then holds at a sync pause no one releases; its parent waits on it.
-    const child = `await Bun.write(${JSON.stringify(pidFile)}, String(process.pid)); (await import(${JSON.stringify(pause)})).testPause("p");`;
+    // The child loads testpause (which captures its parent then), records its pid, then holds at a sync pause no one
+    // releases; its parent waits on it.
+    const child = `const { testPause } = await import(${JSON.stringify(pause)}); await Bun.write(${JSON.stringify(pidFile)}, String(process.pid)); testPause("p");`;
     const parentScript = `const c = Bun.spawn([process.execPath, "-e", ${JSON.stringify(child)}], { env: { ...process.env, BUS_TEST_PAUSE: "p", BUS_TEST_PAUSE_FILE: ${JSON.stringify(join(dir, "release"))} }, stderr: "inherit" }); await c.exited;`;
     const parent = Bun.spawn([process.execPath, "-e", parentScript], { stderr: "pipe" });
     await until(async () => await Bun.file(pidFile).exists(), 10_000, "the child holds its pause");
@@ -24,4 +25,4 @@ test("a held pause is abandoned when its parent process is killed", async () => 
     await until(() => !alive(), 10_000, "the orphaned child abandons its pause and exits");
     expect(await new Response(parent.stderr).text()).toContain("test pause abandoned: p");
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 30_000);
