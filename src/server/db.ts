@@ -497,8 +497,8 @@ export interface Repo {
   };
   slack: {
     links(r: Read): Promise<SlackLink[]>;
-    // application.helloFacts reads it on the caller's handle; delegate reads it before core's synchronous
-    // resolveDelegation runs (#807 P3 A7i).
+    // application.helloFacts reads it on the caller's handle; delegate reads it before core's
+    // resolveDelegationWith decides (#807 P3 A7i).
     linkFor(r: Read, userId: number): Promise<SlackLink | undefined>;
     linkBySlackUser(r: Read, slackUser: string): Promise<SlackLink | undefined>;
     // Replaces the user's earlier link, if any.

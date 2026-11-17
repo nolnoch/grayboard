@@ -75,11 +75,7 @@ export type DelegateReach = { ok: "own" | "granted" } | { refused: string };
 // open cap, so a teammate's loop can't lock its owner out of their own launcher (#256).
 export const grantedCap = (cap: number): number => Math.max(1, Math.floor(cap / 2));
 
-// The default reach, and the only one locally (one user per bus): own user or refused.
-export const ownUserReach = (db: Database, principal: string | null) => (to: string): DelegateReach =>
-  sameUser(principal, to, db) ? { ok: "own" } : { refused: crossUserRefusal(to) };
-
-// Whether `candidate` is in the requester's own user. The user is the
+// Whether a candidate address is in the requester's own user, given the user behind it (`addressUser`). The user is the
 // authenticated principal, never an address's spelling: a team alias
 // (`eng/sim`) is shared by every member, so a prefix test would let Alice's
 // `eng/sim` reach Bob's `eng/launcher` (security audit F-01). An ID's user
@@ -88,10 +84,6 @@ export const ownUserReach = (db: Database, principal: string | null) => (to: str
 // launcher list reads it). Locally every principal is null: one user per
 // bus. No session behind the candidate: not another user's; the roster and
 // launcher checks refuse it as unknown.
-export function sameUser(principal: string | null, candidate: string, db: Database): boolean {
-  return userMatches(principal, addressUser(db, candidate));
-}
-
 const userMatches = (principal: string | null, user: string | null | undefined): boolean => user === undefined || user === principal;
 
 // The user behind an address, by the rule above: an ID's principal, an
