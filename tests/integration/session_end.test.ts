@@ -91,11 +91,13 @@ test("a session whose end fails is audited and retried at the next revalidate; t
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const bad = await srv.connected(bob, "eng/deploy", { push: false });
   const good = await srv.connected(bob, "eng/ops", { push: false });
-  const mail = srv.app.repo.mail;
-  const unread = mail.unread.bind(mail);
-  mail.unread = (id) => {
-    if (id === bad.id) throw new Error("disk on fire");
-    return unread(id);
+  const repo = srv.app.repo, mailOn = repo.mailOn.bind(repo);
+  repo.mailOn = (tx) => {
+    const port = mailOn(tx);
+    return { ...port, unread: (id) => {
+      if (id === bad.id) throw new Error("disk on fire");
+      return port.unread(id);
+    } };
   };
 
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
@@ -106,7 +108,7 @@ test("a session whose end fails is audited and retried at the next revalidate; t
   expect(failed.map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([{ actor: null, why: "revoked", error: "Error: disk on fire" }]);
 
   // The session still writes as an alias it may not: the next revalidate ends it.
-  mail.unread = unread;
+  repo.mailOn = mailOn;
   srv.app.revalidate();
   expect(row(bad.id)!.ended_at).toBe(clock);
   expect(ended(bad.id)).toEqual([expect.objectContaining({ why: "revoked" })]);

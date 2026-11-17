@@ -355,7 +355,7 @@ try {
     let last: Response | undefined;
     admissionNow = Date.now();
     const gate = admissionGate = new SubscriberAdmission(s.id, () => admissionNow!);
-    const message = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/admission", "Actionable delivery recovers after actual HTTP429", null, false)); app.application.wake(["you@example.com/admission"]);
+    const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/admission", "Actionable delivery recovers after actual HTTP429", null, false)); app.application.wake(["you@example.com/admission"]);
     try {
       await bounded(gate.entered.promise, 20_000, "Exact-root subscriber request held before actual backend admission");
       // Delivery upkeep has its own per-user bucket (#845): the drain spends it as the subscriber role, sessionless.
@@ -415,7 +415,7 @@ try {
     assert(app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + before.access } })) instanceof Response);
     const renewed = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + current.access } })); assert(!(renewed instanceof Response)); assert.equal(renewed.grantId, principal.grantId);
     await rpc.enroll({ sessionID: s.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "same current native grant reopens receiving");
-    const message = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/refresh", "Fresh native access after native-owned refresh", null, false)); app.application.wake(["you@example.com/refresh"]);
+    const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/refresh", "Fresh native access after native-owned refresh", null, false)); app.application.wake(["you@example.com/refresh"]);
     await wait(() => app.repo.cursors.directFor(app.repo.read, "you@example.com/refresh"), n => n === message.id, "subscriber uses only fresh projected native access");
     assert.equal(refreshes, 1); assert.equal(codes, 1);
     console.log("REAL_NATIVE_OWNED_REFRESH_OK", { codes, refreshes, cursor: message.id, grantUnchanged: true });
@@ -429,7 +429,7 @@ try {
     const board = await app.repo.write(() => { const b = createBoard(app.db, "you@example.com/digest", "reload", "Reload digest"); subscribe(app.db, "you@example.com/digest", b.name, "digest"); return b; });
     dropReceipt = true; const since = calls.length;
     await app.repo.write(() => post(app.db, "you@example.com/sim", board.name, "Process reload immutable digest")); app.application.boardsChanged([board.name]);
-    const lost = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/action", "Process reload immutable action", null, false)); app.application.wake(["you@example.com/action"]);
+    const lost = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/action", "Process reload immutable action", null, false)); app.application.wake(["you@example.com/action"]);
     // One lost receipt from each root: a total count lets one root's redelivery retries pass alone (#466).
     const lostBy = () => new Set(calls.slice(since).filter(c => c.subscriber && c.name === "delivery_receipt").map(c => c.session));
     await wait(lostBy, sessions => sessions.has(digest.id) && sessions.has(action.id), "a lost receipt from each of the digest and action roots");
@@ -461,7 +461,7 @@ try {
     const crashWorker = Bun.spawn([process.execPath, join(import.meta.dir, "real-reload.ts")], { env: { ...process.env, GRAYBOARD_REAL_BACKEND_PORT: String(app.server.port), GRAYBOARD_REAL_WORKER_MODE: "hold-" + boundary }, stdout: "inherit", stderr: "inherit" });
     try {
       await wait(() => Bun.file(join(root, "real-worker-ready.json")).exists(), Boolean, "separate process host ready");
-      const lost = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/crash", "Crash at actual " + boundary + " admission", null, false)); app.application.wake(["you@example.com/crash"]);
+      const lost = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/crash", "Crash at actual " + boundary + " admission", null, false)); app.application.wake(["you@example.com/crash"]);
       await wait(() => Bun.file(join(root, "real-worker-held.json")).exists(), Boolean, "actual admission crash boundary");
       const saved = await Bun.file(join(root, "real-worker-held.json")).json();
       savedInput(saved.input); assert.equal(saved.input.sessionID, crashedRoot.id, "Held handoff preserves the exact crash root");
@@ -510,7 +510,7 @@ try {
     console.log("REAL_INSTRUCTIONS_BIND_BEFORE_ENROLL_OK");
     // A delegation request admitted to the launcher root: the request that carries it carries the launcher instruction.
     const ask = "[delegation request from you@example.com] Fixture delegation " + late.id;
-    await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/late", ask, null, false)); app.application.wake(["you@example.com/late"]);
+    await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/late", ask, null, false)); app.application.wake(["you@example.com/late"]);
     await wait(() => modelRequests, rs => rs.some(r => r.sessionID === late.id && r.body.includes("Fixture delegation " + late.id)), "delegation reaches the model");
     await host.session.wait({ sessionID: late.id });
     text = said(late.id, "Fixture delegation " + late.id);
@@ -639,7 +639,7 @@ try {
   const beforeDigest = modelCalls; await app.repo.write(() => post(app.db, "you@example.com/sim", board.name, "Idle digest")); app.application.boardsChanged([board.name]);
   await wait(() => host!.session.inbox.list({ sessionID: a.id }), xs => xs.length >= 1, "digest durable idle admission"); assert.equal(modelCalls, beforeDigest);
   held = true; const enteredPromise = new Promise<void>(r => { entered = r; });
-  const dm = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Held real durable admission", null, false)); app.application.wake(["you@example.com/r4"]);
+  const dm = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/r4", "Held real durable admission", null, false)); app.application.wake(["you@example.com/r4"]);
   await enteredPromise;
   assert(app.repo.cursors.directFor(app.repo.read, "you@example.com/r4") < dm.id, "No real cursor movement before actual host durable admission");
   assert(admissions.at(-1)?.sessionID === a.id); held = false; release?.();
@@ -648,7 +648,7 @@ try {
   const original = admissions.at(-1)!; assert((await host.session.context({ sessionID: a.id })).some((m: { id?: string }) => m.id === original.id));
   console.log("REAL_DURABLE_RECEIPT_NOT_ACK_OK", { cursor: dm.id, receiptAttempts });
   dropReceipt = true; const receiptsBeforeLoss = receiptAttempts;
-  const lost = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Replay after host reload", null, false)); app.application.wake(["you@example.com/r4"]);
+  const lost = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/r4", "Replay after host reload", null, false)); app.application.wake(["you@example.com/r4"]);
   await wait(() => admissions, xs => xs.some(x => x.text.includes("Replay after host reload")), "lost receipt durable admission");
   await wait(() => receiptAttempts, n => n > receiptsBeforeLoss, "lost receipt attempted after real durable admission");
   await wait(() => rpc.status({}, { location }), s => rootRetrying(s, a.id), "lost receipt retry boundary before host reload"); await assertBPaused();
@@ -685,7 +685,7 @@ try {
   // Separate regression: unfinished SDK execution resumes before duplicate forwarding.
   await drainSessions(join(root, "host.sqlite"), sessionID => host!.session.wait({ sessionID }));
   suspendedModel.target = a.id; dropReceipt = true; const suspendedReceipts = receiptAttempts;
-  const suspendedDM = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Suspended SDK execution across reload", null, false));
+  const suspendedDM = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/r4", "Suspended SDK execution across reload", null, false));
   app.application.wake(["you@example.com/r4"]);
   await bounded(suspendedModel.entered.promise, 20_000, "Target model reached owned suspension barrier");
   await wait(() => admitted.find(x => x.text.includes("Suspended SDK execution across reload")), Boolean, "suspended input admission returned");
@@ -729,7 +729,7 @@ try {
   console.log("REAL_CONFIG_AWAY_BACK_LATCH_OK");
   await rpc.enroll({ sessionID: a.id }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "reenroll after observed drift");
   held = true; const staleEntered = new Promise<void>(r => { entered = r; });
-  const stale = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/r4", "Old issued batch across native rebind", null, false)); app.application.wake(["you@example.com/r4"]);
+  const stale = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/r4", "Old issued batch across native rebind", null, false)); app.application.wake(["you@example.com/r4"]);
   await staleEntered; const oldAdmission = admissions.at(-1)!, staleReceipts = receiptAttempts;
   const grant = await ctx.integration.connection.resolve(selected); assert(grant?.type === "oauth");
   const principal = app.oauth.authenticate(new Request(resource, { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
@@ -762,7 +762,7 @@ try {
   console.log("REAL_G1_G2_ATTACH_REVOKE_OK");
   email = "other@example.com"; await signIn(native.integrationID); await host.mcp.connect({ server: "grayboard", location });
   assert.equal(rootStatus(await rpc.status({}, { location }), a.id)?.state, "paused", "A new native account never retargets old approval");
-  const oldPending = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/final", "Old account must not retarget", null, false));
+  const oldPending = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/final", "Old account must not retarget", null, false));
   await rpc.enroll({ sessionID: a.id, name: "final", create: true }, { location }); await wait(() => app.mcp.activeLeases, n => n === 1, "explicit new account approval");
   const lastOpen = await host.session.get({ sessionID: a.id }); assert(lastOpen.metadata);
   const pendingBeforeDisable = admissions.length; await app.repo.write(tx => app.repo.users.setDisabled(tx, app.repo.users.findByEmail(email)!.id, true));

@@ -1,6 +1,6 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -131,6 +131,24 @@ test("registered child attachments resolve the root; query name is only an asser
   expect((await send(mismatch)).status).toBe(403);
 });
 
+// #807 P1c-14b: a download's read check reads the carrying message on the pool, and its guarded recheck on the download's body Tx.
+test("#807 P1c-14b: a download's message read runs on the pool, its recheck on the body's Tx", async () => {
+  const id = await uploaded();
+  await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "fe" }, issued.authed.user_email));
+  const root = sessionContext(principal(), { [OPENCODE_SESSION_META]: "attachment-root" });
+  await hosted.run(principal(), root, "dm_send", (session, tx) => application.send(tx, session, "fe", "the file", { attachment_ids: [id] }));
+  const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const original = store.repo.messages.getById.bind(store.repo.messages);
+  const spy = spyOn(store.repo.messages, "getById").mockImplementation((r, messageId) => {
+    if (new Error().stack?.includes("dmVisible")) checks.push({ inTxn: store.db.inTransaction, handle: r === store.repo.read ? "pool" : "tx" });
+    return original(r, messageId);
+  });
+  try {
+    expect((await send(request("GET", `/mcp/attachments/${id}?identity=be`))).status).toBe(200);
+  } finally { spy.mockRestore(); }
+  expect(checks).toEqual([{ inTxn: false, handle: "pool" }, { inTxn: true, handle: "tx" }]);
+});
+
 // A registration's `via` names the ancestry for routing only: it never maps the intermediate. (The OpenCode
 // host suites can't show this since #535: there every subagent of an enrolled root registers on its own.)
 test("via ancestry is not registration or attachment mapping authority", async () => {
@@ -252,8 +270,8 @@ test("a concurrently bound upload survives fail-closed cleanup", async () => {
   const operation = send();
   await entered.promise;
   const row = store.db.query("SELECT id FROM attachments").get() as { id: number };
-  const message = await seed(store.repo, () => {
-    const inserted = store.repo.messages.insert("alice@example.com/be", "user", "alice@example.com/be", "sent", null);
+  const message = await seed(store.repo, tx => {
+    const inserted = store.repo.messages.insert(tx, "alice@example.com/be", "user", "alice@example.com/be", "sent", null);
     bindAttachments(store.db, [row.id], { addresses: ["alice@example.com/be"], principal: "alice@example.com" }, { message_id: inserted.id }, store.repo.attachmentLimits);
     return inserted;
   });

@@ -316,6 +316,33 @@ test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async ()
   expect(checks.filter((c) => !c.inTxn || c.handle !== "tx")).toEqual([]);
 }, 30_000);
 
+// #807 P1c-14b: a delegate's open-request count (the launcher's backlog), and every other messages read in its body,
+// run on the request's Tx, not the pool.
+test("server: a delegate reads messages on its body's Tx (#807 P1c-14b)", async () => {
+  const srv = serve();
+  const repo = srv.app.repo;
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const spies = (["openDelegations", "undeliveredFrom", "getById"] as const).map((name) => {
+    const original = repo.messages[name].bind(repo.messages) as (...a: unknown[]) => unknown;
+    return spyOn(repo.messages, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (new Error().stack?.includes("handleDelegate")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await srv.login("alice@example.com");
+    expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    await launcher(srv, alice, "eng/builder");
+    const sim = await srv.connected(alice, "eng/sim");
+    await sim.delegate({ persona: "p", task: "t", to: "builder" });
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+    await srv.stop();
+  }
+  expect(checks.map((c) => c.op)).toContain("openDelegations");
+  expect(checks.filter((c) => !c.inTxn || c.handle !== "tx")).toEqual([]);
+}, 30_000);
+
 // #393 1 (docs/vision.md principle 11): a repeat inside the dedup window
 // re-checks authority over the launcher the first call picked, so a team
 // launcher name that has since moved to a teammate's session is refused,

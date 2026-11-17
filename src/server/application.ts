@@ -24,7 +24,7 @@ import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  ALIAS_SESSION_SQL, HOLD_ORDER, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
+  HOLD_ORDER, acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
   setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -244,7 +244,7 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): void {
 // are resent).
 function drainDirect(hub: Hub, session: ApplicationSession, addresses: string[]): void {
   const streams = addresses.map((a) => ({ type: "direct" as const, ref: a, since: hub.repo.cursors.get(hub.repo.read, a, "direct", a) }));
-  for (const message of hub.repo.messages.unreadSince(streams)) {
+  for (const message of hub.repo.messages.unreadSince(hub.repo.read, streams)) {
     session.sink.deliver({ kind: "direct", message: showMessage(message) });
   }
 }
@@ -320,24 +320,13 @@ function helloOkFields(hub: Hub, authed: AuthedUser): SessionFacts {
 
 // The sentences a session's instructions carry for its addresses: active
 // claims, and direct messages it sent that still haven't arrived a day later.
-function noticesFor(hub: Hub, addresses: string[], first: string[] = []): string[] {
+function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[] = []): string[] {
   return [
     ...first,
-    ...undeliveredInstruction(hub.repo.messages.undeliveredFrom(addresses, hub.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(hub.db, h)),
+    ...undeliveredInstruction(hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(hub.db, h)),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(hub.db), addresses),
   ];
-}
-
-// When each alias was last used and where, for hosted candidates.
-function sessionsSeen(db: CoreDb, handles: string[]): Map<string, { last_seen: number; where: string | null }> {
-  const rows = db
-    .prepare(
-      `SELECT a.address, a.last_seen, i.cwd, i.place FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
-        WHERE a.address IN (SELECT value FROM json_each(?)) AND a.last_seen IS NOT NULL`,
-    )
-    .all(JSON.stringify(handles)) as { address: string; last_seen: number; cwd: string | null; place: string | null }[];
-  return new Map(rows.map((r) => [r.address, { last_seen: r.last_seen, where: r.cwd ? describeLocation(r.cwd) : r.place }]));
 }
 
 // What a bind or a tools-only declaration's writes_as names (#284 S9): a bare name
@@ -577,17 +566,17 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // retried at the next start, and its holds stay until then (#475 item 2).
   function endIds(ids: string[], why: string): void {
     if (!ids.length) return;
-    repo.post(() => endIdsIn(ids, why), ends => afterEnds(ends.woken, ends.bounced), "session ends");
+    repo.post(tx => endIdsIn(tx, ids, why), ends => afterEnds(ends.woken, ends.bounced), "session ends");
   }
   type Ends = { woken: Set<string>; bounced: { id: string; at: number }[] };
-  // endIds's body, inside a write body.
-  function endIdsIn(ids: string[], why: string): Ends {
+  // endIds's body, inside a write body: `tx` is that body's.
+  function endIdsIn(tx: Tx, ids: string[], why: string): Ends {
     const woken = new Set<string>(), bounced: { id: string; at: number }[] = [];
     for (const id of ids) {
       let ended;
       const at = now();
       try {
-        ended = repo.atomic(() => endSession(db, repo.mail, id, { why, now: at, audit: serverAuditSink(repo) }));
+        ended = repo.atomic(() => endSession(db, repo.mailOn(tx), id, { why, now: at, audit: serverAuditSink(repo) }));
       } catch (e) {
         console.error(`[grayboard] ending session ${id} (${why}) failed:`, e);
         writeAudit(repo, "id.end_failed", null, id, { why, error: String(e) });
@@ -604,7 +593,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // What follows ends, after their commit: a bounce goes to a live sender now, as a send does (a drain would
   // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go.
   function afterEnds(woken: Set<string>, ends: { id: string; at: number }[]): void {
-    for (const { id, at } of ends) for (const b of repo.messages.bouncesFrom(id, at)) {
+    for (const { id, at } of ends) for (const b of repo.messages.bouncesFrom(repo.read, id, at)) {
       const to = hub.registry.get(b.recipient);
       if (to?.active) to.sink.deliver({ kind: "direct", message: showMessage(b) });
     }
@@ -667,7 +656,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
         writeAudit(repo, "alias.revoke_failed", by, u.address, { session: u.id, principal: u.principal, error: String(e) });
       }
     }
-    return { resync, ends: endIdsIn(ended, "revoked") };
+    return { resync, ends: endIdsIn(tx, ended, "revoked") };
   }
   function revokeUse(tx: Tx, u: AliasUse & { reason: string }, by: string | null, ended: string[], resync: string[]): void {
     const { reason } = u;
@@ -825,7 +814,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     setHolds(hub, session, holdsOf(db, id));
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = owedBridgeNotice(repo, authed.user_email);
-    const notices = noticesFor(hub, session.addresses, owed ? [owed] : []);
+    const notices = noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
 
@@ -1044,19 +1033,19 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     },
     async thread(r: Read, session: ApplicationSession, id: number) {
       valid(session);
-      return handleThread(session, id, repo);
+      return handleThread(r, session, id, repo);
     },
     async inbox(r: Read, session: ApplicationSession, days?: number) {
       valid(session);
       childState(session, "dm_inbox");
-      return handleInbox(hub, session, days);
+      return handleInbox(hub, r, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
       valid(session);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = session.addresses.map((a) => ({ type: "direct" as const, ref: a, since: repo.cursors.get(r, a, "direct", a) }));
-      const messages = repo.messages.unreadSince(streams).slice(0, limit);
+      const messages = repo.messages.unreadSince(r, streams).slice(0, limit);
       const seen = new Set<string>();
       const all: Pending[] = [];
       for (const a of session.addresses) {
@@ -1067,7 +1056,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       }
       const boards = all.slice(0, limit - messages.length);
       // A digest's latest post never wakes, so it carries other_user only.
-      const marks = writerMarks(repo, session, messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
+      const marks = writerMarks(repo, r, session, messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
       return [
         ...messages.map((m): DeliveryEvent => ({ kind: "direct", message: { ...showMessage(m), ...marks.message(m.id) } })),
         ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push"
@@ -1083,7 +1072,7 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
       valid(session, true);
       // A resource read is a read like board_read, and carries its marks (#825).
       const snap = snapshot(db, reader(session, board), board, options);
-      const marks = writerMarks(repo, session, [], snap.posts.map((p) => p.id));
+      const marks = writerMarks(repo, r, session, [], snap.posts.map((p) => p.id));
       return { ...snap, posts: snap.posts.map((p) => ({ ...p, ...marks.post(p.id) })) };
     },
     // O(1), for the metrics scrape (#805).
@@ -1125,13 +1114,13 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
     async acknowledgeDm(tx: Tx, session: ApplicationSession, id: number) {
       valid(session);
       childState(session, "dm_ack");
-      const m = repo.messages.getById(id), mine = session.addresses;
+      const m = repo.messages.getById(tx, id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
         : mine.includes(m.recipient) ? m.recipient
         : m.pending && mine.includes(m.sender) ? m.sender
         : null;
       if (!m || reader === null) fail("not_found", `no message ${id} to you or pending from you; dm_inbox lists them`);
-      repo.messages.ack(reader, m.id);
+      repo.messages.ack(tx, reader, m.id);
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
       valid(session);
@@ -1206,21 +1195,26 @@ function seer(repo: Repo, session: ApplicationSession): (board: Board) => boolea
   return (board) => principalCanSee(repo, p, board);
 }
 
+// Where a name was last used: its session's cwd, else its place.
+function whereSeen(seen: { cwd: string | null; place: string | null } | undefined): string | null {
+  return !seen ? null : seen.cwd ? describeLocation(seen.cwd) : seen.place;
+}
+
 // A hosted unbound session's candidates: the user's own names nobody holds.
 function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput: string | null): Candidate[] {
   const { repo, db } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
   const free = (n: string) => n !== HUMAN_NAME && holderOf(db, full(n)) === null;
   const names = repo.aliases.listForScope(r, "person", authed.user_email).map((i) => i.name).filter(free);
-  const queued = repo.messages.queuedTo(names.map(full));
-  const seen = sessionsSeen(db, names.map(full));
+  const queued = repo.messages.queuedTo(r, names.map(full));
+  const seen = repo.aliases.seen(r, names.map(full));
   const claims = new Map<string, number>();
   for (const c of listClaims(db)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const suggested = suggestedInput !== null && free(suggestedInput) ? suggestedInput : null;
   return orderCandidates(
     names.map((n) => ({
       name: n, queued: queued.get(full(n)) ?? 0, claims: claims.get(full(n)) ?? 0,
-      last_seen: seen.get(full(n))?.last_seen ?? 0, where: seen.get(full(n))?.where ?? null,
+      last_seen: seen.get(full(n))?.last_seen ?? 0, where: whereSeen(seen.get(full(n))),
     })),
     suggested,
   ).slice(0, MAX_CANDIDATES);
@@ -1301,7 +1295,7 @@ type PreparedSend = { from: string; to: string; body: string; parentId: number |
 // The address a send goes out as: `as` when given (#284 S3), else for a
 // reply the held alias its parent reached or was sent as (S4), else the
 // primary.
-function sendAs(hub: Hub, session: ApplicationSession, as: string | undefined, parentId: number | null): string {
+function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string | undefined, parentId: number | null): string {
   if (as !== undefined) {
     try {
       return actingAs(as, asAddresses(session), session.authed.user_email);
@@ -1310,7 +1304,7 @@ function sendAs(hub: Hub, session: ApplicationSession, as: string | undefined, p
       throw e;
     }
   }
-  const parent = parentId === null ? undefined : hub.repo.messages.getById(parentId);
+  const parent = parentId === null ? undefined : hub.repo.messages.getById(r, parentId);
   return (parent && participant(parent, session.addresses) ? replySender(parent, session.holds) : null) ?? session.primary;
 }
 
@@ -1338,7 +1332,7 @@ function prepareSend(
   // a handle that wrote to you is one you may answer.
   const replyingTo = (address: string) => {
     if (parentId === null) return false;
-    const parent = repo.messages.getById(parentId);
+    const parent = repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   };
   if (to.kind === "alias" && (!repo.aliases.find(r, to.address) || (teamAliasHidden(repo, r, session.sessionId || from, to.address) && !replyingTo(to.address)))) {
@@ -1352,7 +1346,7 @@ function prepareSend(
   }
 
   if (parentId !== null) {
-    const parent = repo.messages.getById(parentId);
+    const parent = repo.messages.getById(r, parentId);
     if (!participant(parent, session.addresses)) fail("not_found", `parent_id ${parentId} is not a message you sent or received`);
     const peer = replyPeer(parent, session.addresses);
     if (to.address !== peer) fail("bad_request", replyPeerError(parentId, peer));
@@ -1370,7 +1364,7 @@ function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSen
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(db, p.to);
-    msg = repo.messages.insert(p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
+    msg = repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1389,7 +1383,7 @@ function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSen
         delivered_now: false,
         ...f,
         ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
-        undelivered_from_you: repo.messages.undeliveredFrom(session.addresses).find((u) => u.recipient === p.to)?.n ?? 1,
+        undelivered_from_you: repo.messages.undeliveredFrom(tx, session.addresses).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
         ...unwoken(repo, tx, session, live, p.to),
       };
@@ -1453,7 +1447,7 @@ function writeOnce<W extends Written>(
 function handleSend(
   hub: Hub, tx: Tx, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean, as: string | undefined,
 ): SendResult {
-  const p = prepareSend(hub, tx, session, sendAs(hub, session, as, parentId), recipient, body, parentId, pending, ids);
+  const p = prepareSend(hub, tx, session, sendAs(hub, tx, session, as, parentId), recipient, body, parentId, pending, ids);
   // Keyed by what the server resolved, so two spellings of one call collide.
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
   const out = writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, () => writeSend(hub, tx, session, p));
@@ -1498,7 +1492,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
   let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
   // A launcher's open requests: the same window dm_inbox lists by default (#252).
   const since = hub.now() - inboxDays(undefined) * 86_400_000;
-  const open = (h: string) => repo.messages.openDelegations(h, since);
+  const open = (h: string) => repo.messages.openDelegations(tx, h, since);
   // The limiter's streak rows and the policy denies' decision rows from this
   // call: written inside the dedup transaction they'd roll back with it, so
   // they're written after it. A refusal's decision rows go to the session's
@@ -1521,7 +1515,11 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
     if (teamAliasHidden(repo, tx, session.sessionId || session.primary, to)) {
       return { refused: recheck ? `"${to}" is a team's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) };
     }
-    const owner = addressUser(db, to);
+    // On a replay, a person's human is that person's, though no session holds it (the Slack bridge's connection has
+    // none), so a human-fallback delegation is rechecked rather than refused as unheld (#1030). A fresh call naming a
+    // human keeps reading as own, and routing refuses it as no launcher.
+    const t = recheck ? addressParts(to) : null;
+    const owner = t?.kind === "alias" && t.name === HUMAN_NAME && t.scopeKind === "person" ? t.scope : addressUser(db, to);
     if (owner === undefined && recheck) return { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` };
     if (owner === undefined || owner === authed.user_email) return { ok: "own" };
     if (owner === null) return { refused: crossUserRefusal(to) };
@@ -1603,7 +1601,7 @@ function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: Omit<D
 function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number): { note?: string } {
   const { repo, registry } = hub;
   const mine = session.addresses;
-  const m = repo.messages.getById(id);
+  const m = repo.messages.getById(tx, id);
   if (!m) {
     const done = repo.audit.last("message.retracted", `message:${id}`);
     const by = done?.detail ? (JSON.parse(done.detail) as { sender?: string }).sender : undefined;
@@ -1612,7 +1610,7 @@ function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || repo.cursors.directFor(tx, m.recipient) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  if (!repo.messages.retract(m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
+  if (!repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
   afterCommit(hub.db, async () => { await sweepBlobs(hub.db, repo.blobs, queuedTx(repo)); });
   return {};
 }
@@ -1652,7 +1650,7 @@ function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string,
   // board_read's posts carry the writer marks every read path does (#825).
   if (tool === "board_read") {
     const r = outcome.result as ReadResult;
-    const marks = writerMarks(hub.repo, session, [], r.posts.map((p) => p.id));
+    const marks = writerMarks(hub.repo, tx, session, [], r.posts.map((p) => p.id));
     outcome = { ...outcome, result: { ...r, posts: r.posts.map((p) => ({ ...p, ...marks.post(p.id) })) } };
   }
   // A hosted session with no name answers peer_list as its ID, but is nobody (#402).
@@ -1722,8 +1720,8 @@ function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: stri
 // session's user (#256): the mark a launcher acts on, which a plain dm_send
 // carrying a delegation header can't earn.
 type WriterMark = { other_user?: true; ungranted?: true; delegated?: true };
-function writerMarks(repo: Repo, session: ApplicationSession, messageIds: number[], postIds: number[]) {
-  const writers = repo.messages.writerUsers(messageIds, postIds);
+function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageIds: number[], postIds: number[]) {
+  const writers = repo.messages.writerUsers(r, messageIds, postIds);
   const me = session.authed.user_email;
   const decided = new Map<string, boolean>();
   const may = (verb: "msg.wake" | "delegate.to", user: string) => {
@@ -1732,7 +1730,7 @@ function writerMarks(repo: Repo, session: ApplicationSession, messageIds: number
     return decided.get(key)!;
   };
   const foreign = messageIds.filter((id) => { const u = writers.messages.get(id); return u !== undefined && u !== me; });
-  const delegations = foreign.length ? repo.messages.delegationIds(foreign) : new Set<number>();
+  const delegations = foreign.length ? repo.messages.delegationIds(r, foreign) : new Set<number>();
   const mark = (user: string | undefined, judged: boolean): WriterMark =>
     user === undefined || user === me ? {} : { other_user: true, ...(judged && !may("msg.wake", user) ? { ungranted: true as const } : {}) };
   return {
@@ -1760,14 +1758,14 @@ function handleHistory(hub: Hub, r: Read, session: ApplicationSession, peer: str
     return cursors.get(to)!;
   };
   // Newest `lim` before beforeId, shown oldest first as in local mode.
-  const messages = repo.messages.history(mine, peerFull, lim, beforeId).reverse().map((m) =>
+  const messages = repo.messages.history(r, mine, peerFull, lim, beforeId).reverse().map((m) =>
     mine.includes(m.sender) && m.recipient_type === "user" && !mine.includes(m.recipient) ? { ...m, delivered: m.delivered_at !== null || reached(m.recipient) >= m.id } : m,
   );
-  const marks = writerMarks(repo, session, messages.map((m) => m.id), []);
+  const marks = writerMarks(repo, r, session, messages.map((m) => m.id), []);
   return messages.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
 }
 
-function handleInbox(hub: Hub, session: ApplicationSession, days: number | undefined): InboxResult {
+function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days: number | undefined): InboxResult {
   const { repo, db } = hub;
   const mine = session.addresses;
   let since: number;
@@ -1776,13 +1774,13 @@ function handleInbox(hub: Hub, session: ApplicationSession, days: number | undef
   } catch (e) {
     return fail("bad_request", (e as Error).message);
   }
-  const owed = unanswered(mine, repo.messages.receivedUnacked(mine, since), (id) => repo.messages.thread(id), session.primary);
-  const promises = promised(mine, repo.messages.sentPending(mine, hub.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(id));
-  const queued = repo.messages.undeliveredFrom(mine).map((u) => {
+  const owed = unanswered(mine, repo.messages.receivedUnacked(r, mine, since), (id) => repo.messages.thread(r, id), session.primary);
+  const promises = promised(mine, repo.messages.sentPending(r, mine, hub.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(r, id));
+  const queued = repo.messages.undeliveredFrom(r, mine).map((u) => {
     const seen = lastSeen(db, u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(hub.now() - seen)} ago` } : {}) };
   });
-  const marks = writerMarks(repo, session, owed.map((m) => m.id), []);
+  const marks = writerMarks(repo, r, session, owed.map((m) => m.id), []);
   return {
     unanswered: owed.map((m) => ({ ...m, ...marks.message(m.id) })),
     ...(promises.length ? { promised: promises } : {}),
@@ -1790,11 +1788,11 @@ function handleInbox(hub: Hub, session: ApplicationSession, days: number | undef
   };
 }
 
-function handleThread(session: ApplicationSession, messageId: number, repo: Repo): DirectMessage[] {
+function handleThread(r: Read, session: ApplicationSession, messageId: number, repo: Repo): DirectMessage[] {
   const mine = (m: MessageRow | undefined): m is MessageRow => participant(m, session.addresses);
-  if (!mine(repo.messages.getById(messageId))) fail("not_found", `message ${messageId} not found`);
-  const rows = repo.messages.thread(messageId).filter(mine);
-  const marks = writerMarks(repo, session, rows.map((m) => m.id), []);
+  if (!mine(repo.messages.getById(r, messageId))) fail("not_found", `message ${messageId} not found`);
+  const rows = repo.messages.thread(r, messageId).filter(mine);
+  const marks = writerMarks(repo, r, session, rows.map((m) => m.id), []);
   return rows.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
 }
 
@@ -1803,9 +1801,9 @@ function handleThread(session: ApplicationSession, messageId: number, repo: Repo
 // address's cursor; only your own direct messages count (S8).
 function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): void {
   for (const msgId of messageIds) {
-    const msg = repo.messages.getById(msgId);
+    const msg = repo.messages.getById(tx, msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
-    if (at !== null) repo.messages.markDelivered(msgId, at);
+    if (at !== null) repo.messages.markDelivered(tx, msgId, at);
     repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
   }
 }

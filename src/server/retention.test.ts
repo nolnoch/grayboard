@@ -28,31 +28,31 @@ describe("retention pruning", () => {
   test("pruneMessages deletes messages older than cutoff", async () => {
     // Insert a message with a far-past timestamp by manipulating via direct insert
     // We use a trick: insert, then advance time via the prune cutoff
-    const m = await seed(repo, () => repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null));
+    const m = await seed(repo, tx => repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null));
     // Prune everything up to and including now — should remove the message
-    await seed(repo, () => pruneMessages(repo, Date.now() + 1));
-    const gone = repo.messages.getById(m.id);
+    await seed(repo, tx => pruneMessages(repo, tx, Date.now() + 1));
+    const gone = repo.messages.getById(repo.read, m.id);
     expect(gone).toBeUndefined();
   });
 
   test("pruneMessages keeps messages newer than cutoff", async () => {
-    const m = await seed(repo, () => repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null));
+    const m = await seed(repo, tx => repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "new", null));
     // Prune only things older than 1 hour ago — should keep the fresh message
-    await seed(repo, () => pruneMessages(repo, Date.now() - 3_600_000));
-    const still = repo.messages.getById(m.id);
+    await seed(repo, tx => pruneMessages(repo, tx, Date.now() - 3_600_000));
+    const still = repo.messages.getById(repo.read, m.id);
     expect(still).not.toBeUndefined();
   });
 
   test("pruneMessages keeps replies whose parent aged out", async () => {
     const { db, repo: r } = open();
-    const { root, reply } = await seed(r, () => {
-      const root = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
+    const { root, reply } = await seed(r, tx => {
+      const root = r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
       db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [root.id]);
-      return { root, reply: r.messages.insert("b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
+      return { root, reply: r.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
     });
-    await expect(seed(r, () => pruneMessages(r, 1))).resolves.toBeUndefined(); // used to fail the parent_id foreign key
-    expect(r.messages.getById(root.id)).toBeUndefined();
-    expect(r.messages.getById(reply.id)?.parent_id).toBeNull();
+    await expect(seed(r, tx => pruneMessages(r, tx, 1))).resolves.toBeUndefined(); // used to fail the parent_id foreign key
+    expect(r.messages.getById(r.read, root.id)).toBeUndefined();
+    expect(r.messages.getById(r.read, reply.id)?.parent_id).toBeNull();
   });
 
   test("retention takes a pruned message's files, and their bytes only once nothing names them", async () => {
@@ -63,16 +63,16 @@ describe("retention pruning", () => {
     const up = async (who: string) => (await storeAttachment(db, r.blobs, who, file, { quota, tx: queuedTx(r) })).id;
     const from = { addresses: ["a@example.com/fe"], principal: "a@example.com" };
     const oldFile = await up("a@example.com/fe");
-    const old = await seed(r, () => r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null, false, { ids: [oldFile], uploader: from }, null));
+    const old = await seed(r, tx => r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null, false, { ids: [oldFile], uploader: from }, null));
     const keptFile = await up("a@example.com/fe");
-    const kept = await seed(r, () => {
-      const kept = r.messages.insert("a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [keptFile], uploader: from }, null);
+    const kept = await seed(r, tx => {
+      const kept = r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [keptFile], uploader: from }, null);
       db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
       return kept;
     });
     await runRetention(r, db, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);
-    expect(r.messages.thread(kept.id)[0].attachments).toHaveLength(1);
+    expect(r.messages.thread(r.read, kept.id)[0].attachments).toHaveLength(1);
     expect(db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 1 });
     expect(readdirSync(blobDir).filter((d) => d !== "tmp")).toHaveLength(1);
     await runRetention(r, db, config, Date.now() + 2 * 86_400_000);

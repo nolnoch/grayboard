@@ -33,19 +33,19 @@ const rows = (db: { query: (s: string) => { all: () => unknown[] } }) => (db.que
 
 test("#807: retention while another body holds the write queue waits, then prunes", async () => {
   const { db, repo } = setup();
-  const m = await seed(repo, () => {
-    const inserted = repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "old", null);
+  const m = await seed(repo, tx => {
+    const inserted = repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
     db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [inserted.id]);
     return inserted;
   });
   const holder = hold(db);
   const ran = runRetention(repo, db, { messageRetentionDays: 1, auditRetentionDays: 1 } as Config);
   await ticks();
-  expect(repo.messages.getById(m.id)).toBeDefined();
+  expect(repo.messages.getById(repo.read, m.id)).toBeDefined();
   holder.release();
   await holder.done;
   await ran;
-  expect(repo.messages.getById(m.id)).toBeUndefined();
+  expect(repo.messages.getById(repo.read, m.id)).toBeUndefined();
 });
 
 test("#807: a server claim expiry timer's sweep waits behind another body holding the write queue", async () => {

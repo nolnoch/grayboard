@@ -1,4 +1,5 @@
 import { queuedTx, type Repo } from "./db.ts";
+import type { Tx } from "./store/tx.ts";
 import type { Config } from "./config.ts";
 import { pruneEndedIds, prunePosts, type CoreDb } from "../core/boards.ts";
 import { pruneUnbound, sweepBlobs } from "../core/attachments.ts";
@@ -8,8 +9,8 @@ import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
 
 export { RECLAIM_PAGES_PER_RUN };
 
-export function pruneMessages(repo: Repo, cutoffMs: number): void {
-  repo.messages.prune(cutoffMs);
+export function pruneMessages(repo: Repo, tx: Tx, cutoffMs: number): void {
+  repo.messages.prune(tx, cutoffMs);
 }
 
 export function pruneAudit(repo: Repo, cutoffMs: number): void {
@@ -41,7 +42,7 @@ export async function runRetention(repo: Repo, db: CoreDb, config: Config, now =
   // so requests interleave between them rather than wait out the whole run.
   try {
     // Board posts share the message retention window.
-    await repo.write(() => pruneMessages(repo, now - config.messageRetentionDays * 86_400_000));
+    await repo.write(tx => pruneMessages(repo, tx, now - config.messageRetentionDays * 86_400_000));
     await repo.write(() => prunePosts(db, now - config.messageRetentionDays * 86_400_000), boards => {
       if (boards.length) {
         try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
