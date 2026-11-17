@@ -906,6 +906,29 @@ test("an attach that fails after a newer one for the same user went live leaves 
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("still there?")));
 }, 30_000);
 
+// #807 P3 A7i: attach's stale check reads the link, then the stop flag, so a stop that lands while that read awaits
+// is seen. The third link read on the write's Tx is the late check's (the first check's, then the hello's, then it).
+test("#807 P3 A7i: a bridge stop during attach's last link read refuses the attach", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const bridge = srv.app.slack!, repo = srv.app.repo;
+  const id = (await seed(repo, tx => repo.users.upsertByEmail(tx, "alice@example.com", null))).id;
+  const original = repo.slack.linkFor.bind(repo.slack);
+  let onTx = 0;
+  const reads = spyOn(repo.slack, "linkFor").mockImplementation(async (r, userId) => {
+    const row = await original(r, userId);
+    if (r !== repo.read && ++onTx === 3) bridge.stop();
+    return row;
+  });
+  const attach = spyOn(srv.app.application, "attachHuman");
+  try {
+    await bridge.userChanged(id);
+    expect(onTx).toBe(3);
+    expect(attach).toHaveBeenCalledTimes(1);
+    await expect(attach.mock.results[0]!.value).rejects.toThrow("the Slack bridge stopped");
+  } finally { reads.mockRestore(); attach.mockRestore(); }
+}, 30_000);
+
 // #805 F-05: a link code proves the CLI's token, not who sends it. Only the
 // Slack account whose email is the user's may redeem it; a stolen code sent
 // from another account is refused, used up, and leaves the link as it was.
