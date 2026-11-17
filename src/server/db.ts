@@ -6,7 +6,8 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { acknowledge, ALIAS_SESSION_SQL, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import type { Post } from "../shared/notifications.ts";
 import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
@@ -368,6 +369,21 @@ export interface Repo {
     nextExpiry(r: Read): Promise<number | null>;
     // Deletes the claims lapsed at now and announces them (core sweepChanges).
     sweep(tx: Tx, now: number): Promise<ClaimChanges>;
+  };
+  // Board reads and the delivery acknowledgement (#807 P3 B5a1), on the caller's handle. Visibility is the caller's
+  // (BoardAccess, src/server/access.ts): nothing here filters by it. Board writes stay with callBoardTool (B5b).
+  boards: {
+    get(r: Read, name: string): Promise<Board | undefined>;
+    post(r: Read, id: number): Promise<Post | undefined>;
+    // Up to CATALOG_PAGE boards named after `cursor`, in name order (core catalogPage).
+    catalogPage(r: Read, cursor: string): Promise<Board[]>;
+    // A snapshot's page of a board already judged visible: options checked, posts with attachments (core snapshotPage).
+    snapshotPage(r: Read, board: string, opts: SnapshotOptions): Promise<Omit<BoardSnapshot, "board">>;
+    // The handle's undelivered pushes, oldest first, and its due digests (core pendingPushes, pendingDigests).
+    pendingPushes(r: Read, handle: string): Promise<PushRow[]>;
+    pendingDigests(r: Read, handle: string): Promise<DigestRow[]>;
+    // Marks a pending item delivered to `handle` (core acknowledge): a push's outbox row, a push-mode cursor, a digest's catch-up.
+    acknowledge(tx: Tx, handle: string, ref: PendingRef): Promise<void>;
   };
   // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
   sessionEnd: {
@@ -1506,6 +1522,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         const list = launchers(c);
         return delegationFacts({ launchers: list, users: new Map(list.map(h => [h, addressUser(c, h)])), open: new Map(list.map(h => [h, open(h)])) });
       },
+    },
+
+    boards: {
+      get: async (r, name) => getBoard(sqliteOf(r), name),
+      post: async (r, id) => getPost(sqliteOf(r), id),
+      catalogPage: async (r, cursor) => catalogPage(sqliteOf(r), cursor),
+      snapshotPage: async (r, board, opts) => snapshotPage(sqliteOf(r), board, opts),
+      pendingPushes: async (r, handle) => pendingPushes(sqliteOf(r), handle),
+      pendingDigests: async (r, handle) => pendingDigests(sqliteOf(r), handle),
+      acknowledge: async (tx, handle, ref) => acknowledge(sqliteOf(tx), handle, ref),
     },
 
     sessionEnd: {

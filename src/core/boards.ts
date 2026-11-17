@@ -1413,22 +1413,52 @@ export function getPost(db: Database, id: number): Post | undefined {
   return row ? showPost(row) : undefined;
 }
 
-export function boardCatalog(db: Database, handle: Viewer, after?: string): { boards: Board[]; next_after: string | null } {
+export type Catalog = { boards: Board[]; next_after: string | null };
+export function boardCatalog(db: Database, handle: Viewer, after?: string): Catalog {
+  return catalogWalk(after, (cursor) => catalogPage(db, cursor), (rows) => rows.filter((b) => sees(db, handle, b)));
+}
+
+// The catalog's walk, shared with the server's async catalog: pages of boards after `after` (in name order), each
+// filtered by `visible`, until a page of 100 visible boards is filled; `next_after` names the last one when more may follow.
+export const CATALOG_PAGE = 100;
+export function catalogWalk(after: unknown, page: (cursor: string) => Board[], visible: (rows: Board[]) => Board[]): Catalog;
+export function catalogWalk(after: unknown, page: (cursor: string) => Promise<Board[]>, visible: (rows: Board[]) => Promise<Board[]>): Promise<Catalog>;
+export function catalogWalk(after: unknown, page: (cursor: string) => Board[] | Promise<Board[]>, visible: (rows: Board[]) => Board[] | Promise<Board[]>): Catalog | Promise<Catalog> {
   if (after !== undefined && (typeof after !== "string" || !BOARD_NAME_RE.test(after) || after.trim() !== after)) {
     throw new CoreError("invalid catalog cursor");
   }
   const boards: Board[] = [];
-  let cursor = after ?? "";
-  while (boards.length <= 100) {
-    const rows = db.prepare(`SELECT * FROM boards WHERE name > ? ORDER BY name LIMIT 100`).all(cursor) as Board[];
-    for (const board of rows) {
-      if (sees(db, handle, board)) boards.push(showBoard(board));
-      if (boards.length > 100) return { boards: boards.slice(0, 100), next_after: boards[99]!.name };
+  // One page: its visible rows join `boards`; a result when the catalog page is full or the boards ran out, else the
+  // next cursor.
+  const step = (rows: Board[], seen: Board[]): Catalog | string => {
+    for (const b of seen) {
+      boards.push(b);
+      if (boards.length > CATALOG_PAGE) return { boards: boards.slice(0, CATALOG_PAGE), next_after: boards[CATALOG_PAGE - 1]!.name };
     }
-    if (rows.length < 100) break;
-    cursor = rows[99]!.name;
+    return rows.length < CATALOG_PAGE ? { boards, next_after: null } : rows[CATALOG_PAGE - 1]!.name;
+  };
+  const first = page((after as string | undefined) ?? "");
+  if (!(first instanceof Promise)) {
+    let rows = first;
+    for (;;) {
+      const next = step(rows, visible(rows) as Board[]);
+      if (typeof next !== "string") return next;
+      rows = page(next) as Board[];
+    }
   }
-  return { boards, next_after: null };
+  return (async () => {
+    let rows = await first;
+    for (;;) {
+      const next = step(rows, await visible(rows));
+      if (typeof next !== "string") return next;
+      rows = await page(next);
+    }
+  })();
+}
+
+// One catalog page: up to CATALOG_PAGE boards named after `cursor`, in name order, unfiltered.
+export function catalogPage(db: Database, cursor: string): Board[] {
+  return (db.prepare(`SELECT * FROM boards WHERE name > ? ORDER BY name LIMIT ${CATALOG_PAGE}`).all(cursor) as Board[]).map(showBoard);
 }
 
 export type SnapshotOptions = { limit?: number; before_id?: number };
@@ -1437,17 +1467,23 @@ export type BoardSnapshot = { board: Board; posts: Post[]; next_before_id: numbe
 // History without attention-queue or subscription side effects, oldest first per page.
 export function snapshot(db: Database, handle: Viewer, boardInput: string, opts: SnapshotOptions = {}): BoardSnapshot {
   const board = visibleBoard(db, handle, boardInput);
+  return { board, ...snapshotPage(db, board.name, opts) };
+}
+
+// A snapshot's page of a board already judged visible: the options checked, then the posts with their attachments.
+// The server's async snapshot reads it through its store after its own visibility check, in the same order.
+export function snapshotPage(db: Database, board: string, opts: SnapshotOptions = {}): Omit<BoardSnapshot, "board"> {
   const limit = opts.limit === undefined ? 20 : opts.limit;
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new CoreError("snapshot limit must be an integer from 1 to 100");
   if (opts.before_id !== undefined && (!Number.isSafeInteger(opts.before_id) || opts.before_id < 1)) {
     throw new CoreError("snapshot before_id must be a positive safe integer");
   }
   const rows = (opts.before_id === undefined
-    ? db.prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`).all(board.name, limit + 1)
-    : db.prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? AND id < ? ORDER BY id DESC LIMIT ?`).all(board.name, opts.before_id, limit + 1)) as PostRow[];
+    ? db.prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? ORDER BY id DESC LIMIT ?`).all(board, limit + 1)
+    : db.prepare(`SELECT ${POST_COLS} FROM posts WHERE board = ? AND id < ? ORDER BY id DESC LIMIT ?`).all(board, opts.before_id, limit + 1)) as PostRow[];
   const more = rows.length > limit;
   const posts = rows.slice(0, limit).reverse().map(showPost);
-  return { board, posts: withAttachments(db, "post", posts), next_before_id: more ? posts[0]!.id : null };
+  return { posts: withAttachments(db, "post", posts), next_before_id: more ? posts[0]!.id : null };
 }
 
 export type ReadResult = { board: string; posts: Post[]; unread_remaining: number };
@@ -1571,9 +1607,19 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean; 
     }
     return v;
   };
+  const { items, lost } = pushItems(pendingPushes(db, handle), visible);
+  for (const ref of lost) (opts.ack ?? ((h, r) => acknowledge(db, h, r)))(handle, ref);
+  if (!wantsDigests(items, opts.all)) return [];
+  return [...items, ...digestItems(pendingDigests(db, handle), visible)];
+}
 
-  const out: Pending[] = [];
-  const pushes = withAttachments(
+// pendingFor's pieces, shared with the server's async drain (#807 P3 B5a1): its reads, then its rule over them.
+export type PushRow = { reason: "mention" | "thread" | "subscription"; wake: boolean; post: Post };
+export type DigestRow = { board: string; unread: number; latest: Post };
+
+// The handle's undelivered pushes, oldest first, with their attachments.
+export function pendingPushes(db: Database, handle: string): PushRow[] {
+  const rows = withAttachments(
     db,
     "post",
     db
@@ -1581,25 +1627,34 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean; 
         `SELECT o.reason, o.wake, ${P_POST_COLS} FROM outbox o JOIN posts p ON p.id = o.post_id
           WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
       )
-      .all(handle) as (PostRow & { reason: "mention" | "thread" | "subscription"; wake: number })[],
+      .all(handle) as (PostRow & { reason: PushRow["reason"]; wake: number })[],
   );
-  for (const { reason, wake, ...row } of pushes) {
-    const p = showPost(row);
-    if (visible(p.board)) out.push(wake ? { kind: "push", reason, post: p } : { kind: "push", reason, post: p, deferred: true });
-    else (opts.ack ?? ((h, r) => acknowledge(db, h, r)))(handle, { kind: "push", post_id: p.id });
-  }
-  if (!opts.all && !out.some((i) => i.kind === "push" && !i.deferred)) return [];
+  return rows.map(({ reason, wake, ...row }) => ({ reason, wake: !!wake, post: showPost(row) }));
+}
 
-  // Digest: unread exists and nothing has been sent since the last catch-up (DIGEST_SQL).
+// The handle's digests due (DIGEST_SQL): unread exists and nothing was sent since its last catch-up, with the latest post.
+export function pendingDigests(db: Database, handle: string): DigestRow[] {
   const digests = db
     .prepare(DIGEST_SQL)
     .all(handle, handle, handle, handle, handle, handle, handle, handle, handle) as { board: string; unread: number; latest_id: number | null }[];
-  for (const d of digests) {
-    if (d.unread > 0 && d.latest_id !== null && visible(d.board)) {
-      out.push({ kind: "digest", board: d.board, unread: d.unread, latest: getPost(db, d.latest_id)! });
-    }
+  return digests.flatMap((d) => (d.unread > 0 && d.latest_id !== null ? [{ board: d.board, unread: d.unread, latest: getPost(db, d.latest_id)! }] : []));
+}
+
+// Pushes on boards the reader sees become items, waking or deferred; the rest are lost and acknowledged.
+export function pushItems(rows: PushRow[], visible: (board: string) => boolean): { items: Pending[]; lost: PendingRef[] } {
+  const items: Pending[] = [], lost: PendingRef[] = [];
+  for (const { reason, wake, post } of rows) {
+    if (visible(post.board)) items.push(wake ? { kind: "push", reason, post } : { kind: "push", reason, post, deferred: true });
+    else lost.push({ kind: "push", post_id: post.id });
   }
-  return out;
+  return { items, lost };
+}
+
+// Deferred pushes and digests ride along only with a waking push, or with `all`.
+export const wantsDigests = (items: Pending[], all = false): boolean => all || items.some((i) => i.kind === "push" && !i.deferred);
+
+export function digestItems(rows: DigestRow[], visible: (board: string) => boolean): Pending[] {
+  return rows.filter((d) => visible(d.board)).map((d): Pending => ({ kind: "digest", board: d.board, unread: d.unread, latest: d.latest }));
 }
 
 export function refOf(item: Pending): PendingRef {

@@ -1,11 +1,13 @@
 // Who may read an attachment on the server: the HTTP download route and the
 // Slack bridge's human identities ask the same question.
-import { attachmentReach, withBlob, type AttachmentRow, type UploadQuota, type Uploader } from "../core/attachments.ts";
+import { attachmentReachWith, withBlob, type AttachmentRow, type UploadQuota, type Uploader } from "../core/attachments.ts";
 import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
 import { sha256Hex } from "../shared/hash.ts";
 import { participant, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
+import { boardAccess } from "./access.ts";
+import { visibleBoards } from "./board_reads.ts";
 import { decidePure, recordDecision, type Actor, type PureRequest } from "./policy.ts";
 
 // The read request for attachment `idText`, judged by policy.ts decidePure(): `handle` may read it on a post on a board it can see,
@@ -15,10 +17,9 @@ import { decidePure, recordDecision, type Actor, type PureRequest } from "./poli
 // null for the Slack bridge's humans, which have no session. `user` is the
 // reading user's email, always set on a server: an unsent upload is readable
 // only by the user who made it, not by whoever holds its address next (#367).
-// The carrying message is read before core's synchronous attachmentReach asks about it (#807 P3 A7i); a post carrier's
-// board visibility is still core's, on `r`, until the boards port (B5a).
+// The carrier is read before core's attachmentReachWith rules on it: a message (#807 P3 A7i), or a post and its board's
+// visibility on `r` (B5a1).
 async function readRequest(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, user: string) {
-  const db = repo.coreOn(r);
   const id = Number(idText);
   const row = Number.isInteger(id) && id > 0 ? await repo.attachments.get(r, id) : undefined;
   const addresses = await repo.bindings.addressSet(r, handle, principal);
@@ -27,7 +28,14 @@ async function readRequest(repo: Repo, r: Read, handle: string, idText: string, 
     if (messageId !== row?.message_id) throw new Error(`readRequest: message ${messageId} is not the attachment's carrier`);
     return participant(carrier, addresses);
   };
-  const req: PureRequest = { verb: "attachment.read", identity: handle, attachment: idText.slice(0, 32), reach: row && attachmentReach(db, handle, row, dmVisible, { addresses, principal: user }) };
+  // A post carrier's board, judged for `handle` on `r` (#807 P3 B5a1).
+  const post = row?.post_id != null ? await repo.boards.post(r, row.post_id) : undefined;
+  const postSeen = post !== undefined && (await visibleBoards(repo, boardAccess(repo), r, handle, [post.board])).has(post.board);
+  const postVisible = (postId: number) => {
+    if (postId !== row?.post_id) throw new Error(`readRequest: post ${postId} is not the attachment's carrier`);
+    return postSeen;
+  };
+  const req: PureRequest = { verb: "attachment.read", identity: handle, attachment: idText.slice(0, 32), reach: row && attachmentReachWith(row, postVisible, dmVisible, { addresses, principal: user }) };
   return { row, req };
 }
 
