@@ -10,4 +10,6 @@ if [ -z "${GRAYBOARD_TEST_REAL_RACE:-}" ]; then
   for mode in 0 1; do
     GRAYBOARD_PACKAGE_TEST_DIR="$prepared/attachments-$mode" GRAYBOARD_REAL_PREPARED="$prepared" GRAYBOARD_TEST_REAL_RACE=attachments GRAYBOARD_TEST_CODEMODE="$mode" sh tests/real-run.sh
   done
+  # The instructions scenario runs codemode off in the hosted matrix (real-races.sh); this is its codemode run (#1138).
+  GRAYBOARD_PACKAGE_TEST_DIR="$prepared/instructions-1" GRAYBOARD_REAL_PREPARED="$prepared" GRAYBOARD_TEST_REAL_RACE=instructions GRAYBOARD_TEST_CODEMODE=1 sh tests/real-run.sh
 fi

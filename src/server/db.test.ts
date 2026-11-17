@@ -362,9 +362,10 @@ describe("Repo", () => {
 
   test("audit.write and prune", async () => {
     const oldTs = Date.now() - 100;
-    await seed(repo, (tx) => repo.audit.write(tx, { at: oldTs, actor: "wade@example.com", action: "auth.login", target: null, detail: null }));
+    await seed(repo, (tx) => repo.audit.write(tx, { at: oldTs, actor: "wade@example.com", action: "auth.login", target: "prune-me", detail: null }));
+    expect((await repo.audit.last(repo.read, "auth.login", "prune-me"))?.at).toBe(oldTs);
     await seed(repo, (tx) => repo.audit.prune(tx, Date.now())); // prune everything older than now
-    // No assertion on rows (no SELECT on audit in Repo) but prune should not throw
+    expect(await repo.audit.last(repo.read, "auth.login", "prune-me")).toBeUndefined();
   });
 });
 

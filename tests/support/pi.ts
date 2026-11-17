@@ -20,14 +20,15 @@ import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { seed } from "./seed.ts";
 import { cleanEnv, localEnv } from "./env.ts";
-import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
-import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
+import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type Reply, type Rule } from "./fake_model.ts";
+import { browse, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { runCli } from "./cli.ts";
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
+import { hostedCarryScenario, hostedRefreshLogoutScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
@@ -106,9 +107,11 @@ type PiOpts = {
   // Match the hosted launcher's persisted-session options.
   persist?: boolean;
   session?: string;
+  // Extra environment for the pi process (and so the adapter).
+  env?: Record<string, string>;
 };
 
-export function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {}, persist = false, session }: PiOpts = {}): Pi {
+export function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {}, persist = false, session, env = {} }: PiOpts = {}): Pi {
   const agentDir = join(dir, "pi-agent");
   const extension = join(agentDir, "extensions", "grayboard.ts");
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
@@ -129,7 +132,7 @@ export function startPi(dir: string, modelPort: number, procs: ChildProcess[], {
   writeModels(agentDir, modelPort);
   const proc = spawn("node", [PI_CLI, ...PI_ARGS, ...(persist ? [] : ["--no-session"]), ...(session ? ["--session", session] : [])], {
     cwd: dir,
-    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }),
+    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ...env }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   procs.push(proc);
@@ -138,7 +141,7 @@ export function startPi(dir: string, modelPort: number, procs: ChildProcess[], {
 
 // Selected snapshots beat outgoing carry, including an explicitly empty one.
 export function piLocalCarryScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const prefix = "mcp__grayboard__";
     const model = startFakeModel([
@@ -232,22 +235,12 @@ export async function stopAll(procs: ChildProcess[]): Promise<void> {
   }));
 }
 
-// A failure names pi's version.
-async function named(run: () => Promise<void>): Promise<void> {
-  try {
-    await run();
-  } catch (e) {
-    if (e instanceof Error) e.message = `pi ${PI.version}: ${e.message}`;
-    throw e;
-  }
-}
-
 // A DM wakes the session, which replies with dm_send; a digest rides along as
 // context. The extension's tools reach the first turn, and the session's one
 // grayboard process runs under pi. The caller closes the MCP sessions
 // (closeSessions).
 export function piScenario(dir: string, bin?: string): Promise<void> {
-  return named(() => scenario(dir, bin));
+  return named(PI_HARNESS, () => scenario(dir, bin));
 }
 
 async function scenario(dir: string, bin?: string): Promise<void> {
@@ -322,7 +315,7 @@ async function scenario(dir: string, bin?: string): Promise<void> {
 // without BUS_IDENTITY. Calls made while the restart is pending wait for it;
 // after three restarts, another exit leaves pi alive with a reconnect notice.
 export function piLocalRestartScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-carry", create: true } }]),
@@ -399,11 +392,42 @@ export function piLocalRestartScenario(dir: string): Promise<void> {
   });
 }
 
+// A grayboard process that never answers initialize is killed at the
+// deadline and restarted as an exit is (#559); after the last restart a
+// tool call fails with the deadline's reason instead of hanging.
+export function piLocalInitDeadlineScenario(dir: string): Promise<void> {
+  return named(PI_HARNESS, async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([scripted("who", [{ tool: "mcp__grayboard__whoami", args: {} }])]);
+    try {
+      // Every child, restarts included, blocks before it answers initialize.
+      mkdirSync(join(dir, "pause"), { recursive: true });
+      const env = { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" };
+      const pi = startPi(dir, model.port, procs, { identity: null, env });
+      await pi.command({ type: "get_state" }, 60_000);
+      const notice = await until(() => pi.notices().find((n) => n.includes("after 3 restarts; restart pi to reconnect")), 60_000, "restart exhaustion notice");
+      expect(notice).toContain("grayboard process didn't initialize within 1 s");
+      expect(pi.notices().filter((n) => n.includes("didn't initialize within 1 s; restarting it"))).toHaveLength(3);
+      await pi.command({ type: "prompt", message: "who" });
+      const failed = await toolResult(pi, "whoami");
+      expect(failed.isError).toBe(true);
+      expect(resultText(failed)).toContain("grayboard process didn't initialize within 1 s");
+      await until(() => grayboardChildPids(pi.pid).length === 0, 5_000, "no grayboard process left");
+      await idle(pi);
+      expect(model.unhandled).toEqual([]);
+      await pi.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
 // /new during the longest backoff cancels the outgoing session's timer,
 // whether idle or blocked in a tool wait. Observe past the timer's deadline
 // to catch a late duplicate child, and verify the new child owns the name.
 export function piLocalRestartShutdownScenario(dir: string, waitingTool = false): Promise<void> {
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-shutdown", create: true } }]),
@@ -468,7 +492,7 @@ export function piLocalRestartShutdownScenario(dir: string, waitingTool = false)
 // grayboard process, a DM to the new name triggers a turn, and that turn's
 // system prompt carries the bound name's instructions.
 export function piUnboundScenario(dir: string, bin?: string): Promise<void> {
-  return named(() => unboundScenario(dir, bin));
+  return named(PI_HARNESS, () => unboundScenario(dir, bin));
 }
 
 async function unboundScenario(dir: string, bin?: string): Promise<void> {
@@ -570,7 +594,7 @@ export function piRunnerScenario(dir: string): Promise<void> {
       return false;
     }
   };
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       launch("orphan", () => "no-such-session"),
@@ -739,7 +763,7 @@ export default function (pi) {
 export function piForegroundChildScenario(dir: string): Promise<void> {
   const prefix = "mcp__grayboard__";
   const whoami: Reply = { tool: prefix + "whoami", args: {} };
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("spawn child", [{ tool: "spawn_child", args: { prompt: "child one" } }]),
@@ -848,7 +872,7 @@ export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "
   const node = Bun.which("node");
   const runnerPid = join(dir, "runner.pid");
   let current = "";
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("spawn child", [{ tool: "spawn_child", args: { prompt: "child one" } }]),
@@ -970,7 +994,7 @@ export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "
 // An enabled grayboard MCP entry would give pi a second grayboard with the same
 // tool names: the extension registers nothing, starts nothing, and says why.
 export function piReenabledScenario(dir: string, bin?: string): Promise<void> {
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([]);
     try {
@@ -997,7 +1021,7 @@ export function piReenabledScenario(dir: string, bin?: string): Promise<void> {
 
 // No grayboard at the entry's command: the extension fails to load, with the reason.
 export function piMissingBinaryScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([]);
     try {
@@ -1016,7 +1040,7 @@ export function piMissingBinaryScenario(dir: string): Promise<void> {
 // A grayboard that stops reading while it still runs (tests/support/stdin_closed.sh):
 // pi survives EPIPE, retries, and reports exhaustion without leaving children.
 export function piStdinClosedScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([]);
     let pi: Pi | undefined;
@@ -1049,7 +1073,7 @@ export function piStdinClosedScenario(dir: string): Promise<void> {
 // exit before the replacement starts, so the replacement takes the name back
 // and no stale delivery owner remains (#599, omp's #580).
 export function piLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?: boolean } = {}): Promise<void> {
-  return named(async () => {
+  return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-599", create: true } }]),
@@ -1143,7 +1167,7 @@ export function piLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?:
 const BUNDLE = adapterBundle("pi");
 const PI_CLIENT = "grayboard-pi";
 export const PEER = "bob@example.com/peer";
-const LOGIN_NOTICE = "grayboard: Signed out of grayboard in pi; run /grayboard login";
+const LOGIN_NOTICE = loginNotice("pi");
 const HELD = "another pi process holds delivery for this session";
 const GRAYBOARD_TOOLS = hostTools(snapshotTools()).map((t) => `mcp__grayboard__${t.name}`).sort();
 
@@ -1246,6 +1270,22 @@ const leasedAs = (srv: HostedServer, raw: string, name: string) => leased(srv, P
 export const ownershipEnded = (srv: HostedServer, id: number): boolean =>
   srv.app.db.query<{ ended_at: number | null }, [number]>("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(id)?.ended_at != null;
 
+// pi in the shared hosted scenarios (tests/support/hosted_harness.ts).
+const PI_HARNESS: HostedHarness = {
+  name: "pi", version: PI.version, client: PI_CLIENT, prefix: "mcp__grayboard__",
+  stateDir: stateDirOf, install: installHosted, start: startHostedPi, idle,
+  onServerTimeout: 15_000,
+  // /fork from the first entry branches before the first prompt, so the fork
+  // copies none of the first session's records.
+  fork: async (pi) => {
+    const { messages } = await pi.command({ type: "get_fork_messages" });
+    await pi.command({ type: "fork", entryId: messages[0].entryId });
+  },
+  forkCopiesRecords: false,
+  logoutNoticeLags: false,
+  pauseLags: false,
+};
+
 // After the user prompt `prompt` (the latest; <channel> deliveries aren't
 // prompts), one step per assistant message; past the last, the default reply
 // ends the turn.
@@ -1347,31 +1387,6 @@ export async function expectSignInOffer(srv: HostedServer, proc: Pi, harness: st
   expect(resultText(ran)).not.toContain("Signed out");
 }
 
-type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: { persist?: boolean; session?: string }): Pi };
-
-// A server, the fake model (answerPeer first, then `rules`), the peer and the
-// installed extension; `run` starts the pi processes. Everything stops after.
-function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void>): Promise<void> {
-  return named(async () => {
-    const procs: ChildProcess[] = [];
-    const srv = hostedServer();
-    const model = startFakeModel([answerPeer("mcp__grayboard__"), ...rules]);
-    let peer: Peer | undefined;
-    try {
-      peer = await hostedPeer(srv, dir);
-      installHosted(dir, srv, model.port);
-      await run({ srv, model, peer, start: (o) => startHostedPi(dir, procs, o) });
-      expect(model.unhandled).toEqual([]);
-      expect(peer.reports).toEqual([]);
-    } finally {
-      await stopAll(procs);
-      await peer?.close();
-      model.stop();
-      await srv.stop();
-    }
-  });
-}
-
 // The spec's load smoke for pi (#279; omp's: ompHostedScenario): the bundle the
 // CLI's macro emits, loaded by the pinned pi under Node with an isolated HOME
 // and a seeded grant. No load failure and no login notice: it loaded and read
@@ -1384,7 +1399,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
 // `ctx.agent?.kind` isn't asserted: pi 1.4.0 has no agent kind and the pi
 // entry never reads it (omp's entry does).
 export function piHostedLoadSmoke(dir: string): Promise<void> {
-  return withHosted(dir, [], async ({ srv, start }) => {
+  return withHosted(PI_HARNESS, dir, [], async ({ srv, start }) => {
     await seedGrant(srv, stateDirOf(dir), PI_CLIENT);
     const pi = start();
     const { sessionId } = await pi.command({ type: "get_state" });
@@ -1413,7 +1428,7 @@ export function piHostedLoadSmoke(dir: string): Promise<void> {
 // peer's file comes in with attachment_get. No grayboard process runs.
 export function piHostedScenario(dir: string): Promise<void> {
   const report = "quarterly report\n", notes = "peer notes\n";
-  return withHosted(dir, [
+  return withHosted(PI_HARNESS, dir, [
     scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-task", create: true } }]),
     scripted("send report", [{ tool: "mcp__grayboard__dm_send", args: { to: PEER, body: "report attached", attachments: [join(dir, "report.txt")] } }]),
   ], async ({ srv, model, peer, start }) => {
@@ -1492,119 +1507,16 @@ export function piHostedScenario(dir: string): Promise<void> {
   });
 }
 
-// /fork is a new root with its own lease that carries the name; /new carries
-// it too; /resume of the first session rebinds that session's remembered
-// name. Each time the name receives in the current session.
-export function piHostedCarryScenario(dir: string): Promise<void> {
-  return withHosted(dir, [scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-carry", create: true } }])], async ({ srv, peer, start }) => {
-    await seedGrant(srv, stateDirOf(dir), PI_CLIENT);
-    const pi = start({ persist: true });
-    const first = await pi.command({ type: "get_state" });
-    await pi.command({ type: "prompt", message: "bind" });
-    await until(() => leasedAs(srv, first.sessionId, "pi-carry"), 30_000, "first session leased as pi-carry");
-    const p1 = await pingPong(srv, peer, "pi-carry");
-    await idle(pi);
-    const firstOwnership = piRow(srv, first.sessionId)!.ownership_id;
+export const piHostedCarryScenario = (dir: string): Promise<void> => hostedCarryScenario(PI_HARNESS, dir);
 
-    // /fork: the outgoing session ends; the fork binds the name under its own ownership and lease.
-    const { messages } = await pi.command({ type: "get_fork_messages" });
-    await pi.command({ type: "fork", entryId: messages[0].entryId });
-    const forked = await pi.command({ type: "get_state" });
-    expect(forked.sessionId).not.toBe(first.sessionId);
-    await until(() => leasedAs(srv, forked.sessionId, "pi-carry"), 15_000, "fork leased as pi-carry");
-    expect(piRow(srv, first.sessionId)).toBeUndefined();
-    expect(ownershipEnded(srv, firstOwnership)).toBe(true);
-    expect(piRow(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
-    const p2 = await pingPong(srv, peer, "pi-carry");
-    await idle(pi);
-
-    // /new carries it on.
-    const forkOwnership = piRow(srv, forked.sessionId)!.ownership_id;
-    await pi.command({ type: "new_session" });
-    const fresh = await pi.command({ type: "get_state" });
-    expect([first.sessionId, forked.sessionId]).not.toContain(fresh.sessionId);
-    await until(() => leasedAs(srv, fresh.sessionId, "pi-carry"), 15_000, "new session leased as pi-carry");
-    expect(piRow(srv, forked.sessionId)).toBeUndefined();
-    expect(ownershipEnded(srv, forkOwnership)).toBe(true);
-    const p3 = await pingPong(srv, peer, "pi-carry");
-    await idle(pi);
-
-    // /resume of the first session: it rebinds the name it remembers.
-    await pi.command({ type: "switch_session", sessionPath: first.sessionFile });
-    expect((await pi.command({ type: "get_state" })).sessionId).toBe(first.sessionId);
-    await until(() => leasedAs(srv, first.sessionId, "pi-carry"), 15_000, "resumed first session leased as pi-carry");
-    expect(piRow(srv, fresh.sessionId)).toBeUndefined();
-    const p4 = await pingPong(srv, peer, "pi-carry");
-    await idle(pi);
-    expect(grayboardDescendants(pi.pid)).toEqual([]);
-    // Each session's file records its deliveries: the first holds the DMs it
-    // received before the fork and after the resume, the fork's and /new's
-    // the one each did.
-    await expectDeliveryRecords(first.sessionFile, first.sessionId, [p1, p4], "pi-carry");
-    // The fork branched before the first prompt, so it copied none of the first's records.
-    await expectDeliveryRecords(forked.sessionFile, forked.sessionId, [p2], "pi-carry");
-    await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], "pi-carry");
-    await pi.quit();
-  });
-}
-
-// Two pi processes on one agentDir start with an expired access token: one
-// refresh serves both. Then /grayboard logout in one revokes the grant and
-// pauses both.
-export function piHostedRefreshLogoutScenario(dir: string): Promise<void> {
-  return withHosted(dir, [
-    scripted("bind a", [{ tool: "mcp__grayboard__bind", args: { name: "pi-a", create: true } }]),
-    scripted("bind b", [{ tool: "mcp__grayboard__bind", args: { name: "pi-b", create: true } }]),
-    scripted("check", [{ tool: "mcp__grayboard__whoami", args: {} }]),
-  ], async ({ srv, start }) => {
-    const seeded = await seedGrant(srv, stateDirOf(dir), PI_CLIENT, "alice@example.com", -60_000);
-    const refreshTokens = () => srv.app.db.query<{ n: number; spent: number }, [string]>(
-      "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'").get(seeded.grantId)!;
-    expect(refreshTokens()).toEqual({ n: 1, spent: 0 });
-
-    const a = start(), b = start();
-    const [sa, sb] = await Promise.all([a.command({ type: "get_state" }), b.command({ type: "get_state" })]);
-    expect(sa.sessionId).not.toBe(sb.sessionId);
-    // Both reached the server on the one rotation.
-    await until(() => piRow(srv, sa.sessionId) && piRow(srv, sb.sessionId), 15_000, "both sessions on the server");
-    expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
-
-    await a.command({ type: "prompt", message: "bind a" });
-    await b.command({ type: "prompt", message: "bind b" });
-    await until(() => piRow(srv, sa.sessionId)?.name === "pi-a" && piRow(srv, sb.sessionId)?.name === "pi-b" && srv.app.mcp.activeLeases === 2, 30_000, "both leased");
-    expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
-    await Promise.all([idle(a), idle(b)]);
-
-    // Logout in a: the grant is revoked, so the server drops both leases,
-    // and both processes pause with the login notice.
-    const seenA = a.notices().length, seenB = b.notices().length;
-    await a.command({ type: "prompt", message: "/grayboard logout" });
-    expect(a.notices().slice(seenA)).toContain("grayboard: signed out; every pi session on this server pauses until run /grayboard login");
-    await until(() => srv.app.mcp.activeLeases === 0, 15_000, "both leases dropped");
-    expect(srv.app.db.query<{ revoked_at: number | null }, [string]>("SELECT revoked_at FROM oauth_grants WHERE id = ?").get(seeded.grantId)!.revoked_at).not.toBeNull();
-    await until(() => b.notices().slice(seenB).includes(LOGIN_NOTICE), 15_000, "the login notice in the other process");
-    for (const pi of [a, b]) {
-      const status = await statusOf(pi);
-      expect(status).toContain("\nsign-in: signed out (logged_out); run /grayboard login\n");
-      expect(status).toMatch(/: paused, /);
-    }
-    // The other process's next tool call offers a sign-in; once it lands,
-    // both processes' roots restart (unbound: the logout's revoke ended their sessions).
-    await expectSignInOffer(srv, b, "pi", { results: 0, whoami: (nth) => toolResult(b, "whoami", nth), idle });
-    for (const proc of [a, b]) await until(async () => {
-      const status = await statusOf(proc);
-      return status.includes("\nsign-in: signed in\n") && !status.includes("paused") ? status : undefined;
-    }, 20_000, "both roots restarted signed in");
-    await Promise.all([a.quit(), b.quit()]);
-  });
-}
+export const piHostedRefreshLogoutScenario = (dir: string): Promise<void> => hostedRefreshLogoutScenario(PI_HARNESS, dir);
 
 // The same session opened in a second pi process: it runs tools only behind
 // the first's delivery lock (its status and first tool result say so) and the
 // server sees one lease holder; when the first quits, the second takes
 // delivery over under the session's remembered name.
 export function piHostedTwiceScenario(dir: string): Promise<void> {
-  return withHosted(dir, [
+  return withHosted(PI_HARNESS, dir, [
     scripted("bind", [{ tool: "mcp__grayboard__bind", args: { name: "pi-twice", create: true } }]),
     scripted("check", [{ tool: "mcp__grayboard__whoami", args: {} }]),
   ], async ({ srv, peer, start }) => {

@@ -14216,13 +14216,13 @@ class LockTimeout extends Error {
 }
 var SQLITE_BUSY = 5;
 var held = new Set;
-function tryAcquire(path) {
+function tryAcquire(path, busyMs = 50) {
   const file = resolve(path);
   if (held.has(file))
     return;
   const db = new DatabaseSync(file);
   try {
-    db.exec("PRAGMA busy_timeout=50");
+    db.exec(`PRAGMA busy_timeout=${Math.max(0, Math.trunc(busyMs))}`);
     db.exec("BEGIN EXCLUSIVE");
   } catch (error) {
     db.close();
@@ -14248,17 +14248,17 @@ function tryAcquire(path) {
   };
 }
 async function acquire(path, options) {
-  const deadline = Date.now() + options.deadlineMs;
+  const deadline = performance.now() + options.deadlineMs;
   for (;; ) {
     options.signal?.throwIfAborted();
-    const lock = tryAcquire(path);
+    const lock = tryAcquire(path, 0);
     if (lock)
       return lock;
     await options.onBusy?.();
-    const left = deadline - Date.now();
+    const left = deadline - performance.now();
     if (left <= 0)
       throw new LockTimeout(resolve(path));
-    await sleep(Math.min(100, left), undefined, options.signal ? { signal: options.signal } : undefined);
+    await sleep(Math.min(100 + Math.random() * 10, left), undefined, options.signal ? { signal: options.signal } : undefined);
   }
 }
 
@@ -31766,8 +31766,8 @@ class Connection {
       throw !this.signal.aborted && !(error instanceof ServerUnreachable) && unreachable(error) ? new ServerUnreachable(error) : error;
     }
   }
-  options() {
-    return { signal: this.signal, timeout: 1e4 };
+  options(signal) {
+    return { signal: signal ? AbortSignal.any([this.signal, signal]) : this.signal, timeout: 1e4 };
   }
   async close() {
     await this.client.close();
@@ -31855,8 +31855,8 @@ class NativeWire extends Connection {
     } while (cursor);
     return tools;
   }
-  async callTool(name, args, sessionID) {
-    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options()));
+  async callTool(name, args, sessionID, signal) {
+    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal)));
   }
 }
 
@@ -32105,14 +32105,14 @@ class FileStorage {
     return raw === undefined ? {} : SessionState.parse(raw);
   }
 }
-function tryDelivery(path) {
+function tryDelivery(path, busyMs) {
   mkdirSync(dirname(path), { recursive: true, mode: 448 });
-  return tryAcquire(path);
+  return tryAcquire(path, busyMs);
 }
 async function waitDelivery(path, signal, intervalMs = 5000) {
   for (;; ) {
     signal.throwIfAborted();
-    const lock = tryDelivery(path);
+    const lock = tryDelivery(path, 0);
     if (lock)
       return lock;
     await sleep4(intervalMs, undefined, { signal });
@@ -35832,20 +35832,20 @@ class HostedAttachments {
   constructor(options) {
     this.options = options;
   }
-  async send(paths, sessionID, send) {
-    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(), cwd: this.options.cwd });
-    return sendWithUploads(files, this.transport(sessionID), send);
+  async send(paths, sessionID, send, signal) {
+    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(signal), cwd: this.options.cwd });
+    return sendWithUploads(files, this.transport(sessionID, signal), send);
   }
-  async get(args, sessionID) {
+  async get(args, sessionID, signal) {
     const id = checkAttachmentId(args.id);
     const target = await saveTarget(args.dir, this.options.roots, serverBusDir(this.options.resource.href), this.options.env, this.options.cwd);
-    return downloadAttachment(id, target, (await this.options.limits()).file, this.transport(sessionID));
+    return downloadAttachment(id, target, (await this.options.limits(signal)).file, this.transport(sessionID, signal));
   }
-  transport(sessionID) {
+  transport(sessionID, signal) {
     const base = `${this.options.resource.href.replace(/\/$/, "")}/attachments`;
     return {
       upload: async (file) => {
-        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data);
+        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data, signal);
         const stored = object({ id: number2().int().positive() }).safeParse(await response.json().catch(() => {
           return;
         }));
@@ -35866,7 +35866,7 @@ class HostedAttachments {
       },
       download: async (id, maxBytes) => {
         const ms = transferTimeoutMs(maxBytes);
-        const response = await this.http("GET", `${base}/${id}`, sessionID, ms);
+        const response = await this.http("GET", `${base}/${id}`, sessionID, ms, undefined, signal);
         const reader = response.body?.getReader();
         if (!reader)
           throw new Error(`attachment ${id}: empty download`);
@@ -35899,8 +35899,8 @@ class HostedAttachments {
       unreleased: this.options.unreleased
     };
   }
-  async http(method, url, sessionID, ms, body) {
-    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.options.signal]);
+  async http(method, url, sessionID, ms, body, call) {
+    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.options.signal, ...call ? [call] : []]);
     for (let attempt = 0;; attempt++) {
       const token = await this.options.auth.token();
       if (!token)
@@ -35995,6 +35995,32 @@ class Refused extends Error {
     this.result = result;
   }
 }
+
+class CallAborted extends Error {
+  constructor(options) {
+    super("aborted", options);
+    this.name = "CallAborted";
+  }
+}
+function unlessAborted(work, signal) {
+  if (!signal)
+    return work;
+  if (signal.aborted) {
+    work.then(undefined, () => {});
+    return Promise.reject(new CallAborted);
+  }
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new CallAborted);
+    signal.addEventListener("abort", abort, { once: true });
+    work.then((value) => {
+      signal.removeEventListener("abort", abort);
+      resolve(value);
+    }, (error) => {
+      signal.removeEventListener("abort", abort);
+      reject(error);
+    });
+  });
+}
 function broken(error) {
   if (!(error instanceof ServerUnreachable))
     return false;
@@ -36027,7 +36053,7 @@ class ToolProxy {
       signal: this.closing.signal,
       roots: options.roots ?? attachRoots(),
       env: options.env,
-      limits: () => this.limits(),
+      limits: (signal) => this.limits(signal),
       unreleased: (id, error) => options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error }))
     });
   }
@@ -36040,8 +36066,8 @@ class ToolProxy {
     await this.open().ready;
     return this.current;
   }
-  call(name, args, sessionID) {
-    return this.track(this.invoke(name, args, sessionID));
+  call(name, args, sessionID, signal) {
+    return this.track(this.invoke(name, args, sessionID, signal));
   }
   instructions(sessionID) {
     const cached = this.instructionsBySession.get(sessionID);
@@ -36080,7 +36106,9 @@ class ToolProxy {
     work.then(settled, settled);
     return work;
   }
-  async invoke(name, args, sessionID) {
+  async invoke(name, args, sessionID, signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
     const signedOut = await this.signedOut();
     if (signedOut)
       return failure2(signedOut.message);
@@ -36094,12 +36122,18 @@ class ToolProxy {
     }
     let outcome = { status: "error" }, lost = false;
     try {
-      const result = await this.dispatch(name, args, sessionID);
+      if (signal?.aborted)
+        throw new CallAborted;
+      const result = await this.dispatch(name, args, sessionID, signal);
       lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError)
         outcome = { status: "completed", output: outputOf(result) };
+      if (signal?.aborted)
+        throw new CallAborted;
       return result;
     } catch (error) {
+      if (signal?.aborted)
+        throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       const expired = this.loginNeeded(error);
       if (expired)
         return failure2(expired.message);
@@ -36128,22 +36162,24 @@ class ToolProxy {
       await wire.close();
     }
   }
-  async dispatch(name, args, sessionID) {
+  async dispatch(name, args, sessionID, signal) {
     if (name === ATTACHMENT_GET_TOOL.name)
-      return this.attachmentGet(args, sessionID);
+      return this.attachmentGet(args, sessionID, signal);
     if ((name === "dm_send" || name === "board_post") && args.attachments !== undefined)
-      return this.withUploads(name, args, sessionID);
-    return this.forward(name, args, sessionID);
+      return this.withUploads(name, args, sessionID, signal);
+    return this.forward(name, args, sessionID, signal);
   }
-  async forward(name, args, sessionID) {
+  async forward(name, args, sessionID, signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
     const native = this.native ?? this.open();
     native.users++;
     try {
-      const wire = await native.ready;
+      const wire = await unlessAborted(native.ready, signal);
       try {
-        return await wire.callTool(name, args, sessionID);
+        return await wire.callTool(name, args, sessionID, signal);
       } catch (error) {
-        if (broken(error))
+        if (!signal?.aborted && broken(error))
           this.drop(native);
         throw error;
       }
@@ -36152,19 +36188,21 @@ class ToolProxy {
         this.shut(native);
     }
   }
-  async limits() {
-    const wire = await (this.native ?? this.open()).ready;
+  async limits(signal) {
+    if (signal?.aborted)
+      throw new CallAborted;
+    const wire = await unlessAborted((this.native ?? this.open()).ready, signal);
     return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
   }
-  async withUploads(name, args, sessionID) {
+  async withUploads(name, args, sessionID, signal) {
     const { attachments, ...rest } = args;
     try {
       return await this.attachments.send(attachments, sessionID, async (ids) => {
-        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID);
+        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID, signal);
         if (result.isError)
           throw new Refused(result);
         return result;
-      });
+      }, signal);
     } catch (error) {
       if (error instanceof Refused)
         return error.result;
@@ -36175,9 +36213,9 @@ class ToolProxy {
       return failure2(error.message);
     }
   }
-  async attachmentGet(args, sessionID) {
+  async attachmentGet(args, sessionID, signal) {
     try {
-      return text(await this.attachments.get(args, sessionID));
+      return text(await this.attachments.get(args, sessionID, signal));
     } catch (error) {
       if (this.transportFailure(error))
         throw error;
@@ -36237,19 +36275,23 @@ class ToolProxy {
     }
   }
   loginNeeded(error) {
-    for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-      if (e instanceof AccessExpired)
-        return e;
-      if (e instanceof InsufficientScope)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "expired");
-    }
-    return;
+    const cause = signOutCause(error);
+    return cause === undefined || cause instanceof AccessExpired ? cause : new AccessExpired(this.options.harness, this.options.loginAction, cause);
   }
   transportFailure(error) {
     return error instanceof ServerUnreachable || !!this.loginNeeded(error);
   }
+}
+function signOutCause(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof AccessExpired)
+      return e;
+    if (e instanceof InsufficientScope)
+      return "login_required";
+    if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
+      return "expired";
+  }
+  return;
 }
 
 // adapters/hosted-core/src/client.ts
@@ -36348,10 +36390,12 @@ class HostedClient {
         this.options.log(`couldn't reach the server: ${message(error)}`, "warning");
     }
   }
-  async call(proxy, tool, args, sessionID) {
+  async call(proxy, tool, args, sessionID, signal) {
     try {
-      return await proxy.call(tool, args, sessionID);
+      return await proxy.call(tool, args, sessionID, signal);
     } catch (error) {
+      if (signal?.aborted)
+        throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       return failure2(failureText(error, this.options.retryHint));
     }
   }
@@ -37893,10 +37937,12 @@ ${record.message}`;
     this.log(text, "warning");
   };
   async call(tool, args, before, o = {}) {
+    if (o.signal?.aborted)
+      throw new CallAborted;
     if (!this.proxy)
       return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
     if (o.child !== undefined)
-      return this.childCall(o.child, tool, args, before, o.passed);
+      return this.childCall(o.child, tool, args, before, o.passed, o.signal);
     const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure2(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
     const early = refused();
     if (early)
@@ -37908,12 +37954,12 @@ ${record.message}`;
     if (!this.o.push)
       await this.bindConfigured();
     this.used = true;
-    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
+    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID, o.signal);
     const shown = [...SLOTS.map((slot) => this.notices.get(slot)), after].filter((n) => !!n);
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
   }
-  async childCall(child, tool, args, before, passed) {
+  async childCall(child, tool, args, before, passed, signal) {
     if (this.closed)
       return failure2(`this ${this.client.options.harness} session is closing`);
     const after = before ? await before() : undefined;
@@ -37928,7 +37974,7 @@ ${record.message}`;
         return failure2(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`);
       }
     }
-    const result = await this.client.call(proxy, tool, args, child);
+    const result = await this.client.call(proxy, tool, args, child, signal);
     return after ? { ...result, content: [{ type: "text", text: `grayboard: ${after}` }, ...result.content] } : result;
   }
   async endChild(child, called = false) {

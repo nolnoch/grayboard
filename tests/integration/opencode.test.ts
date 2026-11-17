@@ -43,13 +43,13 @@ function entry(over: Record<string, unknown> = {}) {
   return { type: "local", command: [process.execPath, CLI, "mcp", "--mode", "local"], environment: { BUS_PUSH: "off" }, enabled: false, ...over };
 }
 
-function driver(identity: string | undefined, e: Record<string, unknown>): Driver {
+function driver(identity: string | undefined, e: Record<string, unknown>, extra: Record<string, string> = {}): Driver {
   const config = join(dir, "config");
   mkdirSync(join(config, "opencode"), { recursive: true });
   writeFileSync(join(config, "opencode", "opencode.json"), JSON.stringify({ mcp: { grayboard: e } }));
   const proc = spawn(process.execPath, [join(ROOT, "tests/support/opencode_driver.ts")], {
     cwd: dir,
-    env: localEnv(dir, identity, { XDG_CONFIG_HOME: config }),
+    env: localEnv(dir, identity, { XDG_CONFIG_HOME: config, ...extra }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   drivers.push(proc);
@@ -413,6 +413,24 @@ test("opencode: a child's user message and a deleted-session race never retarget
   expect(next.session).toBe("root");
   await oc.send("dispose");
 });
+
+// A grayboard process that never answers initialize is killed at the
+// deadline and restarted as an exit is (#559); after the last restart a
+// tool call fails with the deadline's reason instead of hanging.
+test("opencode: a grayboard process that never answers initialize is killed at the deadline and restarted; after the last restart a call fails with the deadline reason (#559)", async () => {
+  // Every child, restarts included, blocks before it answers initialize.
+  mkdirSync(join(dir, "pause"), { recursive: true });
+  const oc = driver("oc", entry(), { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" });
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+  await until(async () => (await oc.send("state")).toasts.some((n: string) => n.includes("after 3 restarts")), 30_000, "restart exhaustion notice");
+  const toasts: string[] = (await oc.send("state")).toasts;
+  expect(toasts.filter((n) => n.includes("didn't initialize within 1 s; restarting it"))).toHaveLength(3);
+  expect(toasts.some((n) => n.includes("didn't initialize within 1 s after 3 restarts"))).toBe(true);
+  await expect(oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).rejects.toThrow("grayboard process didn't initialize within 1 s");
+  await until(() => grayboardChildPids(oc.pid).length === 0, 5_000, "no grayboard process left");
+  await oc.send("dispose");
+}, 60_000);
 
 test("opencode: child instructions skip restart backoff and degrade to none after exhaustion", async () => {
   // The real retry sequence waits 0 + 1 + 5 seconds; retain the driver's

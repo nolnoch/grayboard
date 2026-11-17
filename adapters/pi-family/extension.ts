@@ -26,9 +26,9 @@ import * as signIns from "../hosted-core/src/offer.ts";
 import type { Flow, Last, Origin, Outcome, SignInState } from "../hosted-core/src/offer.ts";
 import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
-import { failure, hostTools, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { CallAborted, failure, hostTools, signOutCause, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
 import { outputOf } from "../hosted-core/src/results.ts";
-import { RootDelivery } from "../hosted-core/src/root.ts";
+import { NotStarted, RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
 import { configuredIdentity, describeLocation, sessionIdentity } from "../../src/shared/identity.ts";
 
@@ -53,7 +53,8 @@ export interface Harness {
   readonly agentDir: string; // state lives under <agentDir>/grayboard/
   marker(): Marker;
   // (Re)registers the tool list; `call` runs one under the current session.
-  register(tools: NativeTool[], call: (tool: string, args: Record<string, unknown>) => Promise<CallToolResult>): void;
+  // `signal`: the harness's abort of one call; an aborted call throws.
+  register(tools: NativeTool[], call: (tool: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<CallToolResult>): void;
   // A rendered `<channel>`; `wake` starts a turn (idle) or steers in (mid-run).
   deliver(content: string, wake: boolean): void;
   notify(message: string, level: Level): void;
@@ -74,6 +75,13 @@ export const RESUME_HINT = "run /grayboard resume";
 // A tool call that failed: the call itself is what to retry.
 const RETRY_HINT = "call the tool again";
 const SOURCE = "grayboard";
+// How long a model call waits for the instructions before going out without
+// them, and how long after a timeout or failure it skips the fetch: a server
+// that accepts connections and stalls would otherwise hold every prompt for
+// the connect timeout (#438-25).
+export const INSTRUCTIONS_WAIT_MS = 2_000;
+export const INSTRUCTIONS_BACKOFF_MS = 30_000;
+const LATE = Symbol("late");
 
 // A tool's arguments and MCP result as both entries' tools take and return
 // them: text and image blocks, and an error said in text when the server
@@ -285,31 +293,33 @@ export function createGrayboard(h: Harness): Grayboard {
 
   // ---- tools ----
 
-  const call = (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
-    const running = dispatch(tool, args);
+  const call = (tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> => {
+    const running = dispatch(tool, args, signal);
     inflight.add(running);
     const settled = () => { inflight.delete(running); };
     running.then(settled, settled);
     return running;
   };
-  const dispatch = async (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+  const dispatch = async (tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> => {
+    // Aborted before it started: no sign-in offer, no registration, nothing sent.
+    if (signal?.aborted) throw new CallAborted();
     if ("error" in config) return failure(config.error);
-    if (root) return root.call(tool, args, offer);
+    if (root) return root.call(tool, args, offer, { signal });
     if (!proxy || !session) return failure(`the ${h.name} session hasn't started yet`);
     used = true;
     const p = proxy, id = session.id;
     const note = await offer();
-    const result = await client!.call({ call: (name, a, sid) => attributed(p, name, a, sid) }, tool, args, id);
+    const result = await client!.call({ call: (name, a, sid, s) => attributed(p, name, a, sid, s) }, tool, args, id, signal);
     return note ? { ...result, content: [{ type: "text", text: `grayboard: ${note}` }, ...result.content] } : result;
   };
   // The server refuses an unattributed child's call before running it, so
   // one retry after registering again never repeats a write. The client's
   // error wrapper sits outside it: a converted failure never probes.
-  const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string): Promise<CallToolResult> => {
-    let result = await p.call(tool, args, id);
-    if (role.kind === "child" && registered && result.isError && await unattributed(p, id)) {
+  const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string, signal?: AbortSignal): Promise<CallToolResult> => {
+    let result = await p.call(tool, args, id, signal);
+    if (role.kind === "child" && registered && result.isError && await unattributed(p, id, signal)) {
       registered = false; registration = undefined;
-      result = await p.call(tool, args, id);
+      result = await p.call(tool, args, id, signal);
     }
     return result;
   };
@@ -323,8 +333,8 @@ export function createGrayboard(h: Harness): Grayboard {
   // retried by the next. Concurrent calls share one register. The server ends
   // the registration with the root's ownership (a lapsed lease the root then
   // rebinds), so a refused call checks whether it still holds.
-  const unattributed = async (p: ToolProxy, id: string) => {
-    const who = outputOf(await p.call("whoami", {}, id));
+  const unattributed = async (p: ToolProxy, id: string, signal?: AbortSignal) => {
+    const who = outputOf(await p.call("whoami", {}, id, signal));
     return !!who && typeof who === "object" && "unbound" in who && who.unbound === true && !("child" in who && who.child === true);
   };
   // A child's root and the subagents between, as the harness says at each
@@ -469,14 +479,41 @@ export function createGrayboard(h: Harness): Grayboard {
   // System-prompt section: the server's instructions for this session. A
   // child registers first: the text an unregistered session gets tells it to
   // bind, which the server refuses a child.
+  // Bounded by INSTRUCTIONS_WAIT_MS; a timeout or failure is said once until a
+  // fetch succeeds, and starts INSTRUCTIONS_BACKOFF_MS without fetching, which
+  // a timed-out fetch that then lands ends (its text is cached). A sign-out
+  // (the sign-in path says it; the first call after a login fetches), a root
+  // still starting, and a shutdown are neither said nor backed off.
+  let quietUntil = 0;
+  let failing = false;
   const instructions = async (): Promise<string | undefined> => {
-    if (!session) return undefined;
-    try {
+    if (!session || Date.now() < quietUntil) return undefined;
+    const s = session;
+    const fetching = (async () => {
       if (root) return await root.instructions();
       if (!proxy) return undefined;
-      if (role.kind === "child") await enlist(role, session.id);
-      return await proxy.instructions(session.id);
-    } catch { return undefined; }
+      if (role.kind === "child") await enlist(role, s.id);
+      return await proxy.instructions(s.id);
+    })();
+    fetching.catch(() => {}); // a fetch that outlives the deadline settles unobserved
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<typeof LATE>(resolve => { timer = setTimeout(() => resolve(LATE), INSTRUCTIONS_WAIT_MS); });
+    let why: string;
+    try {
+      const text = await Promise.race([fetching, late]);
+      if (text !== LATE) { failing = false; return text; }
+      why = `took longer than ${INSTRUCTIONS_WAIT_MS} ms`;
+    } catch (error) {
+      if (closed || signOutCause(error) || error instanceof NotStarted) return undefined;
+      why = `failed: ${message(error)}`;
+    } finally { clearTimeout(timer); }
+    if (closed) return undefined;
+    const until = quietUntil = Date.now() + INSTRUCTIONS_BACKOFF_MS;
+    // Late but answered: the backoff it started ends.
+    fetching.then(() => { if (quietUntil === until) { quietUntil = 0; failing = false; } }, () => {});
+    if (!failing) log(`fetching the instructions ${why}, so they aren't refreshed; trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s or once a fetch answers`, "warning");
+    failing = true;
+    return undefined;
   };
 
   // ---- /grayboard ----
