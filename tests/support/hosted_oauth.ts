@@ -48,7 +48,8 @@ export function hostedServer(overrides: Partial<Config> = {}, email = "alice@exa
 // Every request that reaches `srv`'s token endpoint from now on, as its
 // grant_type in arrival order (#439 item 2: a count of refresh requests, not of
 // rotations). The HTTP router calls oauth.fetch through the object, so the
-// wrapper sees each request, a refused or failed one included.
+// wrapper sees each request the auth gate passes on, a refused or failed one
+// included.
 export function tokenRequests(srv: TestServer): () => string[] {
   const seen: string[] = [];
   const oauth = srv.app.oauth, inner = oauth.fetch.bind(oauth);
