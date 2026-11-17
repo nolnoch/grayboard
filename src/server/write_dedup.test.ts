@@ -190,6 +190,43 @@ describe("dedupWrite", () => {
     expect(audits("request.replayed")).toHaveLength(1);
   });
 
+  test("a receipt committed after the prune but already outside the window is pruned, not a lost claim", async () => {
+    const receipts = repo.writeReceipts;
+    const claim = receipts.claim;
+    let landed = false;
+    // Another call's receipt, stamped before this call's window, commits between this call's prune and its claim.
+    receipts.claim = (tx, key, tool, at) => {
+      if (!landed) {
+        landed = true;
+        receipts.upsert(tx, { ...key, tool, ref_kind: "message", ref_id: 99, result_json: "{}", at: at - WRITE_DEDUP_WINDOW_MS - 1 });
+      }
+      return claim(tx, key, tool, at);
+    };
+    let out: Awaited<ReturnType<typeof dedup>>;
+    try {
+      out = await dedup(1_000 + WRITE_DEDUP_WINDOW_MS, call(), send());
+    } finally {
+      receipts.claim = claim;
+    }
+    expect("fresh" in out).toBe(true);
+    expect(audits("request.replayed")).toEqual([]);
+  });
+
+  test("a receipt that keeps changing under the call is refused after three passes, writing nothing", async () => {
+    const receipts = repo.writeReceipts;
+    const { claim, find } = receipts;
+    let claims = 0;
+    receipts.claim = () => { claims++; return false; };
+    receipts.find = () => undefined;
+    try {
+      await expect(dedup(1_000, call(), send())).rejects.toThrow(/kept changing under this call; retry it/);
+    } finally {
+      Object.assign(receipts, { claim, find });
+    }
+    expect(claims).toBe(3);
+    expect(count("SELECT COUNT(*) AS n FROM messages")).toBe(0);
+  });
+
   test("past the window a repeat writes again; another session or sender never collides", async () => {
     await dedup(1_000, call(), send());
     expect("fresh" in await dedup(1_000 + WRITE_DEDUP_WINDOW_MS, call(), send())).toBe(true);

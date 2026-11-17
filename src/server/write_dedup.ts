@@ -56,8 +56,8 @@ export type DedupOutcome<W extends Written> =
 // caller must push, wake and audit nothing; `onReplay` runs in the replay's
 // transaction, for what the repeat brought that nothing will use (its fresh
 // uploads). The receipt is claimed before the write by one statement (D3,
-// #807 P2-2), so of two identical calls on any isolation level one writes and
-// the other replays; the claim, the write, the receipt and the audit row are
+// #807 P2-2), so of two identical calls under READ COMMITTED (D3) one writes
+// and the other replays; the claim, the write, the receipt and the audit row are
 // one transaction (a savepoint inside an open one), and a write that throws
 // leaves no receipt. `now` is the hub's clock. `recheck` runs on a hit, in the same
 // transaction, before anything is answered or audited: it throws the refusal a
@@ -75,13 +75,18 @@ export function dedupWrite<W extends Written>(
     // Bounds one session's rows by what it wrote in the window, so a receipt the claim meets is inside it.
     receipts.pruneSession(tx, call.session, since);
     // A lost claim reads the receipt that beat it. A pass that neither claims nor answers saw another transaction
-    // change that receipt in between (pruned it, or replaced a stale one first), which a single writer never allows;
-    // three passes bound it.
+    // change that receipt in between (pruned it, replaced a stale one first, or committed one already outside the
+    // window after this call's prune), which a single writer never allows; three passes bound it.
     for (let pass = 0; !call.resend; pass++) {
       if (pass === 3) throw new Error(`write receipt for ${call.tool} by ${call.sender} kept changing under this call; retry it`);
       if (receipts.claim(tx, key, call.tool, now)) break;
       const hit = receipts.find(tx, call.session, call.sender, fp, since);
-      if (!hit) continue;
+      if (!hit) {
+        // A receipt committed after the prune can already be outside the window (a long transaction, a skewed
+        // clock): prune again so the next claim isn't refused by a receipt the lookup can't see.
+        receipts.pruneSession(tx, call.session, since);
+        continue;
+      }
       // A receipt whose row is gone (retracted, pruned) is a miss: this call takes it over, unless another call
       // replaced it first, and the audit says why this repeat wrote fresh (#306).
       if (!receipts.refExists(tx, hit.ref_kind, hit.ref_id)) {
