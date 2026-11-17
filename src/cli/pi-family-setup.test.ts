@@ -424,3 +424,12 @@ for (const h of HARNESSES) test(`setup and refresh-adapters warn when ${h}'s gra
   expect(fixed.stderr + fixed.stdout).not.toContain(warning);
   expect(f.entry()).toEqual(localEntry);
 }, 60_000);
+
+// From source, a macro runs when its module loads: only adapter_texts.ts, which
+// setup and refresh-adapters load on demand, may import one, so `mcp`,
+// `--version` and every other command never run `bun build` (#438).
+test("only adapter_texts.ts imports the adapter macros among the CLI's modules", () => {
+  const importers = readdirSync(import.meta.dir).filter(f => f.endsWith(".ts") && !f.endsWith(".test.ts"))
+    .filter(f => /^import .* with \{ type: "macro" \};/m.test(readFileSync(join(import.meta.dir, f), "utf8")));
+  expect(importers).toEqual(["adapter_texts.ts"]);
+});

@@ -569,10 +569,13 @@ test("a runner child with no parent session works as an unregistered session, wa
   await root("loner-next", "loner", {}, false);
 });
 
-test("a config.json URL the extension would refuse leaves it loading: start warns, and every tool call and status name the fix", async () => {
+test("a missing config.json, or a URL the extension would refuse, leaves it loading: start warns, and every tool call and status name the fix", async () => {
   const rule = `${join(stateDir, "config.json")} names a server URL that isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; run \`grayboard setup --server <url>\` with one that is`;
-  for (const url of ["http://10.0.0.5:8080/mcp", "https://grayboard.example/mcp?team=1"]) {
-    writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url }));
+  const unset = "grayboard is not set up for a server; run `grayboard setup --server <url>`";
+  const cases: [string | undefined, string][] = [["http://10.0.0.5:8080/mcp", rule], ["https://grayboard.example/mcp?team=1", rule], [undefined, unset]];
+  for (const [url, rule] of cases) {
+    if (url) writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url }));
+    else rmSync(join(stateDir, "config.json"), { force: true });
     const i = instance();
     await i.ext.start({ id: `noncanonical-${instances.length}`, reason: "startup" });
     expect(i.notices).toEqual([{ level: "warning", message: `grayboard: ${rule}` }]);

@@ -10,7 +10,9 @@ import { UPGRADE_REFUSAL } from "../shared/protocol.ts";
 import { makeClient, makeUnauthClient, loadCredentials, busMode, credentialsPath, ApiClient, ApiError, signInHint, type Credentials } from "./api.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { adapterSource, adapterBundle } from "./adapters.ts" with { type: "macro" };
+// The macro-built adapter texts, loaded only by the commands that write them (#438).
+type AdapterTexts = typeof import("./adapter_texts.ts");
+const adapterTexts = (): Promise<AdapterTexts> => import("./adapter_texts.ts");
 import { selfUpdate, type UpdateResult } from "./update.ts";
 import { setupOpenCode, opencodeShimGuard, type OpenCodeSetupOptions } from "./opencode-setup.ts";
 import { claudeCli, claudeLaunch, hasUserEntry, installClaudePlugin, pluginCommands, pluginEnabled, pluginVersions, printable, projectEntryWarnings, refreshClaudeHooks, refreshClaudePlugin, registerClaudeLocal, type PluginReport } from "./claude-setup.ts";
@@ -70,7 +72,7 @@ const OC_CONFIG: HarnessConfig = {
   section: "mcp",
   local: e => ({ ...e, enabled: false, environment: pushOff(e, "environment") }),
 };
-const OC_PLUGIN = { path: join(OC_DIR, "plugin", "grayboard.ts"), source: adapterSource("opencode") };
+const OC_PLUGIN = { path: join(OC_DIR, "plugin", "grayboard.ts") };
 
 // pi and omp have two adapters each, one per mode. Server: the hosted
 // extension (`.js`, a bundle of adapters/pi-family) talks to the server's
@@ -91,8 +93,9 @@ type PiFamily = {
   local: string;
   hosted: string;
   hostedConfig: string;
-  source: string;
-  bundle: string;
+  // The keys of its local and hosted texts in adapter_texts.ts.
+  source: keyof AdapterTexts;
+  bundle: keyof AdapterTexts;
 };
 const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | "bundle">): PiFamily => ({
   name, clientId: `grayboard-${name}`, stateDir: join(dir, "grayboard"),
@@ -101,8 +104,8 @@ const piFamily = (name: "pi" | "omp", dir: string, f: Pick<PiFamily, "source" | 
   local: join(dir, "extensions", "grayboard.ts"), hosted: join(dir, "extensions", "grayboard.js"), hostedConfig: hostedConfigPath(join(dir, "grayboard")),
   source: f.source, bundle: f.bundle,
 });
-const PI = piFamily("pi", PI_DIR, { source: adapterSource("pi"), bundle: adapterBundle("pi") });
-const OMP = piFamily("omp", OMP_DIR, { source: adapterBundle("omp", "local"), bundle: adapterBundle("omp") });
+const PI = piFamily("pi", PI_DIR, { source: "PI_LOCAL", bundle: "PI_HOSTED" });
+const OMP = piFamily("omp", OMP_DIR, { source: "OMP_LOCAL", bundle: "OMP_HOSTED" });
 
 /** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
 const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
@@ -139,7 +142,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
   }
   if (url) {
     if (dropEntry(h.config)) notes.push(`Removed the grayboard entry from ${h.config.path} (the hosted extension needs none)`);
-    writeAdapter(h.hosted, h.bundle);
+    writeAdapter(h.hosted, (await adapterTexts())[h.bundle]);
     rmSync(h.local, { force: true });
     writeJsonFile(h.hostedConfig, { url } satisfies HostedConfig);
     notes.push(`Wrote ${h.hostedConfig}`);
@@ -152,7 +155,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
   if (putEntry(h.config, next)) {
     notes.push(next ? `Registered in ${h.config.path} (disabled: the extension serves the tools)` : `Disabled the grayboard entry in ${h.config.path} (the adapter serves the tools)`);
   }
-  writeAdapter(h.local, h.source);
+  writeAdapter(h.local, (await adapterTexts())[h.source]);
   rmSync(h.hosted, { force: true });
   if (typeof old === "string") {
     rmSync(h.hostedConfig, { force: true });
@@ -637,9 +640,9 @@ program
   .requiredOption("--config <path>", "Selected OpenCode JSON/JSONC file")
   .option("--migrate", "Explicitly migrate recognized Grayboard entries and back up owned adapters")
   .option("--dry-run", "Validate and report targeted changes without filesystem writes")
-  .action((opts: OpenCodeSetupOptions) => {
+  .action(async (opts: OpenCodeSetupOptions) => {
     try {
-      const result = setupOpenCode(opts, OC_PLUGIN.source);
+      const result = setupOpenCode(opts, (await adapterTexts()).OPENCODE);
       const config = result.changed ? (result.dryRun ? "config changes required" : "config changes applied") : "config unchanged";
       const adapters = result.adapters ? `; ${result.adapters} carried adapter${result.adapters === 1 ? "" : "s"} ${result.dryRun ? "to disable" : "disabled"}` : "";
       const migration = result.migrated ? (result.dryRun ? "; recognized migration required" : "; recognized migration") : "";
@@ -785,7 +788,7 @@ program
     if (opts.register && opencode && !server && !ocGuard.skip && (await confirm("Make grayboard available in every opencode project?", true)) && ocRecheck()) {
       if (!existsSync(OC_CONFIG.path)) writeJsonFile(OC_CONFIG.path, { $schema: "https://opencode.ai/config.json" });
       try { putEntry(OC_CONFIG, { type: "local", command: [command, ...args] }); } catch (e) { console.error((e as Error).message); process.exit(1); }
-      writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
+      writeAdapter(OC_PLUGIN.path, (await adapterTexts()).OPENCODE);
       console.log(`Registered in ${OC_CONFIG.path} (disabled: the plugin serves the tools); installed ${OC_PLUGIN.path}`);
     }
 
@@ -936,7 +939,7 @@ program
       const guard = opencodeShimGuard(OC_DIR);
       if (guard.warning) console.log(`[grayboard] ${guard.warning}`);
       if (!guard.skip) {
-        writeAdapter(OC_PLUGIN.path, OC_PLUGIN.source);
+        writeAdapter(OC_PLUGIN.path, (await adapterTexts()).OPENCODE);
         console.log(`Refreshed ${OC_PLUGIN.path}`);
         try {
           if (putEntry(OC_CONFIG)) console.log(`Disabled the grayboard entry in ${OC_CONFIG.path} (the adapter serves the tools)`);
