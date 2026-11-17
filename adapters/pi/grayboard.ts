@@ -128,6 +128,19 @@ const PARENT_SESSION = (process.env.PI_SUBAGENT_CHILD === "1" ? process.env.PI_S
 // namespaced Symbol.for, as the hosted pi adapter's does.
 const LIVE_KEY = Symbol.for("io.github.nolnoch.grayboard/pi-local-sessions");
 const LIVE: Map<string, string> = ((globalThis as unknown as Record<symbol, Map<string, string> | undefined>)[LIVE_KEY] ??= new Map());
+// In a process whose env makes its session keyed (BUS_SESSION_KEY) or the
+// human's (BUS_HUMAN=1), the live session that holds that key or identity,
+// by session key: only one can (#1075). Every other session this process
+// starts while it lives is its subagent, found or not by header (a
+// --no-session root's children have none).
+const HOLDER_KEY = Symbol.for("io.github.nolnoch.grayboard/pi-local-holder");
+const HOLDER: { key: string; id: string }[] = ((globalThis as unknown as Record<symbol, { key: string; id: string }[] | undefined>)[HOLDER_KEY] ??= []);
+const KEYED = ENV.BUS_SESSION_KEY !== undefined;
+const HUMAN = ENV.BUS_HUMAN === "1";
+// A subagent never speaks as the human. Its own unbound session would be an
+// ordinary one under this pi process, which would carry a sibling
+// subagent's names through the process's name record, so it gets no tools.
+const HUMAN_CHILD = "grayboard: this subagent runs under the human's pi session (BUS_HUMAN=1), and a subagent never acts as the human handle, so it has no grayboard session; the human's session does";
 const sessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionFile() ?? `id:${ctx.sessionManager.getSessionId()}`;
 
 // The file whose entry pi's own MCP client would run, if one does: its tools
@@ -211,9 +224,9 @@ export default function grayboard(pi: ExtensionAPI) {
   const mode = ARGS.indexOf("--mode");
   const local = !ARGS.some(arg => arg === "--server" || arg.startsWith("--server=") || (arg.startsWith("--mode=") && arg !== "--mode=local")) && (mode < 0 || ARGS[mode + 1] === "local");
   // A child (a runner's, or a foreground one, per selection) doesn't own delivery.
-  const owns = local && ENV.BUS_SESSION_KEY === undefined && ENV.BUS_HUMAN !== "1";
+  const owns = local && !KEYED && !HUMAN;
   let epoch = 0;
-  let selected: { id: string; epoch: number; ctx: ExtensionContext; key: string; parent?: string } | undefined;
+  let selected: { id: string; epoch: number; ctx: ExtensionContext; key: string; parent?: string; holds?: true; excluded?: string } | undefined;
 
   const deliver = (params: ChannelParams) => {
     // Direct messages, mentions, thread replies: act on them (starts a turn
@@ -240,7 +253,13 @@ export default function grayboard(pi: ExtensionAPI) {
     // The session's own id, which its subagent runners' children find it by,
     // and its root's id in a child; set (or cleared) per start, since /new,
     // /resume and fork change the id.
-    const env = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: selection.parent, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
+    const env: Record<string, string | undefined> = { ...ENV, BUS_HARNESS_SESSION: selection.id, BUS_PARENT_SESSION: selection.parent, BUS_ADAPTER_OWNER: protocol ? owner : undefined };
+    // A keyed root's subagent is its child (#1075): the key and its harness
+    // are the root's, and grayboard mcp refuses them with BUS_PARENT_SESSION.
+    if (local && selection.parent !== undefined) {
+      delete env.BUS_SESSION_KEY;
+      delete env.BUS_HARNESS_PID;
+    }
     const proc = spawn(CMD!, ARGS, { cwd: ctx.cwd, env, stdio: ["pipe", "pipe", "inherit"] });
     const pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
     let next = 1;
@@ -412,15 +431,19 @@ export default function grayboard(pi: ExtensionAPI) {
       // A runner's env wins; else a foreground subagent's header names its
       // launching session, live in this process (a fork's names the session
       // it left, whose entry that session's shutdown deleted). Not found, it
-      // starts as a root. Only a session that would own its delivery looks:
-      // grayboard mcp refuses BUS_PARENT_SESSION with BUS_SESSION_KEY or
-      // BUS_HUMAN=1, so a keyed or human root's foreground child keeps
-      // starting as its own session.
+      // starts as a root. In a keyed or human process, the session holding
+      // the key or identity is the root, and every other one its subagent.
+      const key = sessionKey(ctx);
       const from = owns ? ctx.sessionManager.getHeader()?.parentSession : undefined;
-      const parent = PARENT_SESSION ?? (from ? LIVE.get(from) : undefined);
-      selected = { id, epoch: ++epoch, ctx, key: sessionKey(ctx), ...(parent ? { parent } : {}) };
+      const holder = local && (KEYED || HUMAN) && PARENT_SESSION === undefined ? HOLDER.find(h => h.key !== key) : undefined;
+      const sub = PARENT_SESSION ?? holder?.id;
+      const parent = owns ? PARENT_SESSION ?? (from ? LIVE.get(from) : undefined) : local && HUMAN ? undefined : sub;
+      const excluded = local && HUMAN && sub !== undefined ? HUMAN_CHILD : undefined;
+      const holds = local && (KEYED || HUMAN) && sub === undefined;
+      selected = { id, epoch: ++epoch, ctx, key, ...(parent ? { parent } : {}), ...(holds ? { holds } : {}), ...(excluded ? { excluded } : {}) };
+      if (holds) HOLDER.push({ key, id });
       // Its own subagents (grandchildren too) resolve to its top root.
-      LIVE.set(selected.key, parent ?? id);
+      LIVE.set(key, parent ?? id);
     }
     if (!registered && !refused) {
       const path = enabledEntry(ctx);
@@ -432,8 +455,8 @@ export default function grayboard(pi: ExtensionAPI) {
       }
     }
     if (refused) return report(ctx, refused);
-    exitReason = undefined;
-    child ??= start(ctx);
+    exitReason = selected?.excluded;
+    if (!exitReason) child ??= start(ctx);
   });
 
   // pi leaves MCP server instructions out of the prompt for direct tools, and
@@ -453,6 +476,8 @@ export default function grayboard(pi: ExtensionAPI) {
     restart?.cancel();
     // First, before any await: a /fork's start must not find this session.
     if (selected && LIVE.get(selected.key) === (selected.parent ?? selected.id)) LIVE.delete(selected.key);
+    const held = selected?.holds ? HOLDER.findIndex(h => h.key === selected!.key && h.id === selected!.id) : -1;
+    if (held >= 0) HOLDER.splice(held, 1);
     selected = undefined;
     instructions = undefined;
     // A child fail() killed must be gone before the next session's starts.

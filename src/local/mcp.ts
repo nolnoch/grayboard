@@ -400,7 +400,7 @@ if (WRITES_AS) {
   } catch (e) {
     if (!(e instanceof IdCollision)) throw e;
     if (KEYED && e.endedAt === null) {
-      const r = await attachSession(db, self, HUMAN, { model: MODEL ?? null, effort: EFFORT ?? null });
+      const r = await attachSession(db, self, HUMAN, { model: MODEL ?? null, effort: EFFORT ?? null }, undefined, HARNESS_SESSION);
       if (!r.ok) {
         console.error(`[grayboard] ${r.error}`);
         process.exit(1);

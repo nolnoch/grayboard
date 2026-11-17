@@ -24,6 +24,8 @@ import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest,
 import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
+import { runCli } from "./cli.ts";
+import { mintSessionKey } from "../../src/core/bindings.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
 
@@ -823,6 +825,72 @@ export function piForegroundChildScenario(dir: string): Promise<void> {
       expect(forked.aliases).toEqual(["pi"]);
       expect(idRow(forked.id)).toMatchObject({ root_id: null, harness_session: fork.sessionId });
       expect(audit("id.child_fallback")).toEqual([]);
+      expect(model.unhandled).toEqual([]);
+      expect(pi.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      await pi.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+      db?.close();
+    }
+  });
+}
+
+// A keyed (BUS_SESSION_KEY) or human (BUS_HUMAN=1) root's foreground child
+// (#897, #1075): a keyed root's is its child, started without the root's key;
+// a human root's gets no grayboard, and its call says why. Neither crash-loops.
+export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "human"): Promise<void> {
+  const prefix = "mcp__grayboard__";
+  const whoami: Reply = { tool: prefix + "whoami", args: {} };
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("spawn child", [{ tool: "spawn_child", args: { prompt: "child one" } }]),
+      scripted("child one", [whoami]),
+      scripted("who", [whoami]),
+    ]);
+    let db: Database | undefined;
+    try {
+      const env: Record<string, string> = { BUS_PUSH: "off" };
+      if (kind === "keyed") env.BUS_SESSION_KEY = mintSessionKey();
+      else {
+        expect((await runCli(["human", "adapter-human"], { cwd: dir, env: localEnv(dir) })).code).toBe(0);
+        env.BUS_HUMAN = "1";
+      }
+      mkdirSync(join(dir, "pi-agent", "extensions"), { recursive: true });
+      const foreground = join(dir, "pi-agent", "extensions", "foreground.ts");
+      writeFileSync(foreground, FOREGROUND_EXTENSION(join(dir, "pi-agent", "extensions", "grayboard.ts"), foreground));
+      const pi = startPi(dir, model.port, procs, { identity: kind === "human" ? "adapter-human" : null, entry: { env }, persist: true });
+      await pi.command({ type: "get_state" }, 30_000);
+      await pi.command({ type: "prompt", message: "who" });
+      const root = JSON.parse(resultText(await toolResult(pi, "whoami")));
+      await idle(pi);
+      expect(root.child).toBeUndefined();
+
+      await pi.command({ type: "prompt", message: "spawn child" });
+      const asked = (prompt: string) => model.requests.map((r) => r.body).filter((b) => b.messages.some((m) => m.role === "user" && promptText(m) === prompt));
+      await until(() => asked("spawn child").some((b) => b.messages.some((m) => m.role === "tool")), 60_000, "spawn child returned");
+      await idle(pi);
+      const tools = (asked("child one").at(-1)?.messages ?? []).filter((m) => m.role === "tool").map(messageText);
+      expect(tools).toHaveLength(1);
+      db = new Database(join(dir, "bus.db"), { readonly: true });
+      const liveRoots = () => db!.query(`SELECT id FROM ids WHERE root_id IS NULL AND ended_at IS NULL AND harness_session IS NOT NULL`).all();
+      if (kind === "keyed") {
+        // The keyed root's child, as an ordinary root's is (#557 3).
+        const child = JSON.parse(tools[0]!);
+        expect(child).toMatchObject({ root: root.id, child: true });
+        expect(child.id).not.toBe(root.id);
+        expect(db.query(`SELECT root_id FROM ids WHERE id = ?`).get(child.id)).toEqual({ root_id: root.id });
+        expect(db.query(`SELECT actor, target FROM audit_log WHERE action = 'id.child_seen'`).all()).toEqual([{ actor: root.id, target: child.id }]);
+      } else {
+        // No session of its own, and never the human handle: the call says why.
+        expect(tools[0]).toContain("a subagent never acts as the human handle");
+        expect(db.query(`SELECT target FROM audit_log WHERE action = 'id.child_seen'`).all()).toEqual([]);
+        expect(root.primary).toBe("adapter-human");
+      }
+      // The root alone runs, and no grayboard crash-looped.
+      expect(liveRoots()).toEqual([{ id: root.id }]);
+      expect(pi.notices().filter((n) => n.includes("restarting") || n.includes("exited"))).toEqual([]);
       expect(model.unhandled).toEqual([]);
       expect(pi.events.filter((e) => e.type === "extension_error")).toEqual([]);
       await pi.quit();
