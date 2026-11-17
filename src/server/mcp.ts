@@ -685,8 +685,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       const { gen, start, checked } = await fullCheck(context, checked => checked);
       if (current()) stamp(context, gen, t, start, checked);
     } catch (e) {
-      if (!current()) return;
-      stamps.delete(context); unexpected(e); streamClosed(context, e); track(stream.stop());
+      // A stream that ended while the check awaited still gets its close row: a stop that audits nothing (a resource
+      // watch's close) leaves it to this check, and streamClosed skips a client's own close and a second row. One an
+      // attach moved to another context is that context's to check.
+      if (closed) return;
+      const held = streamContexts.get(stream);
+      if (held !== undefined && held !== context) return;
+      stamps.delete(context); unexpected(e); streamClosed(context, e);
+      if (held === context) track(stream.stop());
     }
   }
   // A legacy session's grant and token, checked after its awaits against the session as it then stands: one a POST
