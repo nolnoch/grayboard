@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { idAddress } from "../core/bindings.ts";
 import { registerId, type Board, type CoreDb } from "../core/boards.ts";
 import type { Principal } from "../core/resolver.ts";
-import { boardAccess, scopeKey, serverAccess, type AliasScopeOf } from "./access.ts";
+import { boardAccess, principalCanSee, scopeKey, serverAccess, type AliasScopeOf } from "./access.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
@@ -28,7 +28,7 @@ const SCOPES: AliasScopeOf[] = [
   { scope_kind: "team", scope_ref: "ops" }, { scope_kind: "team", scope_ref: "nope" }, { scope_kind: "team", scope_ref: null },
   { scope_kind: "service", scope_ref: "svc" },
 ];
-const TOKENS = [`${B}/qa`, `${B}/human`, `${D}/human`, "eng/deploy", "be", "qa", "deploy", "human", "team:eng", WADE_ID, ENDED_ID, idAddress("f".repeat(64)), "nope", "!!"];
+const TOKENS = [`${B}/qa`, `${B}/human`, `${D}/human`, "eng/deploy", "be", "qa", "deploy", "human", "team:eng", WADE_ID, ENDED_ID, idAddress("f".repeat(64)), "nope", "!!", "eng/ghost", `${B}/ghost`];
 const AUTHORS = [`${W}/be`, `${B}/be`, `${E}/be`, `${D}/be`, WADE_ID, "eng/deploy", "eng/other"];
 
 let repo: Repo;
@@ -74,9 +74,11 @@ async function rows(r: Read, tx: Tx | null, humanReach: "team" | "all"): Promise
     for (const h of HANDLES) out.push([`canSee ${h} ${b.name}`, sync.canSee(h, b), await async.canSee(r, h, b)]);
     out.push([`canSeeMany ${b.name}`, each.sort(), sorted(await async.canSeeMany(r, HANDLES, b))]);
   }
-  for (const v of [...HANDLES, { kind: "user", name: W } as Principal, { kind: "team", name: "ops" } as Principal]) {
-    const want = typeof v === "string" ? BOARDS.filter(b => sync.canSee(v, b)).map(b => b.name).sort() : null;
-    if (want) out.push([`visibleTo ${v}`, want, sorted(await async.visibleTo(r, v, BOARDS))]);
+  // A principal viewer (the read-only seer) against principalCanSee; a service principal sees only unscoped boards.
+  const principals: Principal[] = [{ kind: "user", name: W }, { kind: "user", name: D }, { kind: "team", name: "ops" }, { kind: "service", name: "svc" }];
+  for (const v of [...HANDLES, ...principals]) {
+    const want = BOARDS.filter(b => typeof v === "string" ? sync.canSee(v, b) : principalCanSee(repo, v, b)).map(b => b.name).sort();
+    out.push([`visibleTo ${typeof v === "string" ? v : `${v.kind}:${v.name}`}`, want, sorted(await async.visibleTo(r, v, BOARDS))]);
   }
   for (const h of HANDLES) {
     for (const scope of [null, "team:eng", "team:ops", "team:nope", "weird"]) out.push([`checkCreate ${h} ${scope}`, sync.checkCreate(h, scope), await async.checkCreate(r, h, scope)]);
@@ -143,7 +145,7 @@ test("its reads go on the handle it's given: a body sees its own membership, not
   });
   await expect(rolled).rejects.toThrow("roll back");
   expect([sync.canSee(dan, eng), await a.canSee(repo.read, dan, eng), await a.checkCreate(repo.read, dan, "team:eng")]).toEqual([false, false, `no such team "eng"`]);
-  // A kept Tx is refused, whatever the method.
+  // A kept Tx is refused by any method that reads on it.
   const kept = await repo.write(async tx => tx);
   await expect(a.canSeeMany(kept, [dan], eng)).rejects.toThrow(/used after its transaction settled/);
   await expect(a.resolveMention(kept, WADE_ID, dan, eng, true)).rejects.toThrow(/used after its transaction settled/);

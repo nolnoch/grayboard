@@ -135,11 +135,12 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
 // serverAccess's decisions with every read on the caller's handle: a write body's `Tx` sees the body's own rows (a
 // member just added, D2), `repo.read` committed state. Core's synchronous `Access` stays for the paths still in core;
 // the server's board ports (B5a1-B5b3) take this instead. The batch forms answer what core asks once per recipient
-// or scope (post's subscribers, who's rows) with one decision per distinct principal or scope.
+// or scope (post's subscribers, who's rows): canSeeMany, visibleTo and the scope tables with one decision per distinct
+// principal or scope, mayReachMany per distinct address; resolveMentions still decides per token.
 
 // An alias scope as a map key: seesAliasScopes' and seesAliasMetaScopes' answers are keyed by it.
 export type AliasScopeOf = Omit<AliasScope, "name">;
-export const scopeKey = (s: AliasScopeOf): string => `${s.scope_kind}\0${s.scope_ref}`;
+export const scopeKey = (s: AliasScopeOf): string => JSON.stringify([s.scope_kind, s.scope_ref]);
 
 // core's ownScope on the caller's handle: an alias's own scope, or the principal an ID acts for; null for anything
 // else. A bare name means this scope's alias of that name.
