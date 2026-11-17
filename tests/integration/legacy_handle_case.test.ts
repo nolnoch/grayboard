@@ -77,3 +77,24 @@ test(`${FROM}'s Gray, then a v2 release's gray, then this tree started as Gray: 
   expect(busRows(bus, `SELECT address FROM aliases WHERE lower(address) = 'gray'`)).toEqual([{ address: "gray" }]);
   expect(busRows<{ detail: string }>(bus, `SELECT detail FROM audit_log WHERE action = 'alias.case_moved'`).map((r) => JSON.parse(r.detail))).toEqual([{ from: "Gray", merged: true }]);
 }, 60_000);
+
+// #1189: another process's open merging into a live `gray` wakes it. Assumes a
+// case-sensitive filesystem (sock.Gray and sock.gray are distinct files), as on CI's Linux.
+test(`a ${FROM} DM to Gray while this tree's gray is live arrives at the next open`, async () => {
+  const bus = mkdtempSync(join(tmpdir(), "grayboard-case-"));
+  dirs.push(bus);
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  const gray = await localSession(bus, "Gray");
+  expect((await gray.call("whoami")).primary).toBe("gray");
+  // A 1.x pair still running: its `Gray` writes the old name again.
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  const be = await localSession(bus, "be", { bin: rel.cli });
+  await be.call("dm_send", { to: "Gray", body: "late" });
+  await stopSession(be.c);
+  expect(busRows(bus, `SELECT recipient FROM messages WHERE body = 'late'`)).toEqual([{ recipient: "Gray" }]);
+  expect(gray.pushes.find((p) => p.content === "late")).toBeUndefined();
+
+  await localSession(bus, "fe");
+  await until(() => gray.pushes.find((p) => p.content === "late"));
+  expect(busRows(bus, `SELECT recipient FROM messages WHERE body = 'late'`)).toEqual([{ recipient: "gray" }]);
+}, 60_000);
