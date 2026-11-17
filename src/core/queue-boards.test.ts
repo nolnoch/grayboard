@@ -378,3 +378,27 @@ test("a repeated decline (its answer lost, #254) succeeds without a second relea
   sweepExpired(db, Date.now() + 31 * 60_000); // yak lapses; zed takes it
   expect(() => release(db, "yak", claimKey(r.post.id))).toThrow(/held by zed/);
 });
+
+// #221: a lane was woken when it was handed the work, not when the post was
+// written. A redelivered old post moves its new holder to the back of the
+// rotation, so that lane isn't also handed the next new post.
+test("a redelivery of an old post moves its new holder to the back of the rotation", () => {
+  ensureAlias(db, "zed", "test");
+  touchAlias(db, "zed");
+  subscribe(db, "zed", "work", "push");
+  const posts = [1, 2, 3].map((n) => post(db, "be", "work", `item ${n}`));
+  expect(posts.map((r) => r.wake)).toEqual([["fe"], ["sim"], ["zed"]]);
+  // Pin the three deliveries to distinct past times: fe, then sim, then zed.
+  posts.forEach((r, i) => {
+    const at = (i + 1) * 1000;
+    db.prepare(`UPDATE posts SET created_at = ? WHERE id = ?`).run(at, r.post.id);
+    db.prepare(`UPDATE claim_events SET at = ? WHERE key = ?`).run(at, claimKey(r.post.id));
+  });
+  // fe declines item 1; sim, the least recently woken other lane, takes it now.
+  release(db, "fe", claimKey(posts[0]!.post.id), "not my lane");
+  expect(listClaims(db).find((c) => c.key === claimKey(posts[0]!.post.id))?.holder).toBe("sim");
+  // Item 1 was written at 1000, but sim was handed it now: sim goes last.
+  expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["fe", "zed", "sim"]);
+  expect(post(db, "be", "work", "item 4").wake).toEqual(["fe"]);
+  expect(post(db, "be", "work", "item 5").wake).toEqual(["zed"]);
+});

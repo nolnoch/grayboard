@@ -221,7 +221,7 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
       expect(await r.json(), `${label} ${route}`).toMatchObject({ code: "unbound" });
     }
   }
-  expect(app.repo.aliases.find(app.repo.read, "alice@example.com/intruder")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/intruder")).toBeUndefined();
   expect(app.repo.hosted.all(app.repo.read).map(r => r.source_session_id)).toEqual(["owner"]);
 });
 
@@ -241,7 +241,7 @@ test("OpenCode maps only its own key and an opted-in client only the generic key
     const alone = await connect(token, [[own, `root ${own}`]]);
     expect(json(await call(alone, "whoami"))).toMatchObject({ primary: `alice@example.com/${own === OPENCODE_SESSION_META ? "oc-run" : "broker-run"}` });
   }
-  expect(app.repo.aliases.find(app.repo.read, "alice@example.com/wrong-key")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/wrong-key")).toBeUndefined();
   expect(app.repo.hosted.all(app.repo.read).map(r => [r.client_id, r.source_session_id]).sort()).toEqual([
     [BROKER, `root ${GRAYBOARD_SESSION_META}`], [OPENCODE_CLIENT, `root ${OPENCODE_SESSION_META}`],
   ]);
