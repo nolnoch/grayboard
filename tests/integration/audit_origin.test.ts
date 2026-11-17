@@ -54,14 +54,16 @@ test("a claim expiry armed by a request writes outside it", async () => {
   const s = await srv.hosted("alice@example.com", "be");
   await s.call("board_create", { name: "lobby", purpose: "general" });
   await s.call("claim_take", { key: "ticket:1", board: "lobby", ttl_minutes: 60 });
-  // Lapse soon: the next claim call re-arms the timer from inside its request.
-  await seed(srv.app.repo, () => srv.app.db.run("UPDATE claims SET expires_at = ? WHERE key = 'ticket:1'", [Date.now() + 300]));
+  // Lapse soon, but after the next claim call, which re-arms the timer from inside its request (a call that ran
+  // past the lapse would sweep it itself: the check below says so rather than passing on nothing).
+  await seed(srv.app.repo, () => srv.app.db.run("UPDATE claims SET expires_at = ? WHERE key = 'ticket:1'", [Date.now() + 1500]));
   const write = srv.app.repo.write.bind(srv.app.repo);
   const after: (RequestOrigin | undefined)[] = [];
   let armed = false;
   srv.app.repo.write = ((fn: Parameters<typeof write>[0]) => { if (armed) after.push(requestOrigin()); return write(fn); }) as typeof write;
   await s.call("claim_take", { key: "ticket:2", board: "lobby", ttl_minutes: 60 });
   armed = true;
+  expect(srv.app.db.query("SELECT 1 FROM claims WHERE key = 'ticket:1'").get()).toBeTruthy();
   await until(() => !srv.app.db.query("SELECT 1 FROM claims WHERE key = 'ticket:1'").get(), 5000, "ticket:1 lapsed");
   expect(after.length).toBeGreaterThan(0);
   expect(after).toEqual(after.map(() => undefined));
