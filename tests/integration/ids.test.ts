@@ -5,7 +5,7 @@
 // ID attributes its writes (`via`) and is never an address.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { storeAttachment } from "../../src/core/attachments.ts";
@@ -501,6 +501,31 @@ test("a runner with an inherited BUS_LAUNCHER=1 is never a launcher: not when it
   expect(launcherOf(promoted)).toBe(0);
   expect(launcherSet(promoted)).toEqual([{ on: false }]);
   expect((await fe.call("peer_list")).peers.find((p: { handle: string }) => p.handle === "qa")).not.toHaveProperty("launcher");
+}, 30_000);
+
+// #1078: a subagent's harness pid can be its root's pi process, shared with
+// every sibling, so a process started as one keeps no name record: a promoted
+// or fallen-back runner writes none, and the next process under that harness
+// (a sibling, or this one restarted) can't take its names from one.
+test("a runner, promoted or fallen back, writes no name record, and its restart doesn't carry its names", async () => {
+  const fe = await runnerRootSession("fe", "pi-1");
+  const root = (await fe.call("whoami")).id as string;
+  const runner = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-1" } });
+  expect(((await runner.call("whoami")) as Who).root).toBe(root);
+  expect(await runner.call("bind", { name: "qa", create: true })).toContain('Bound to "qa"');
+  expect(((await runner.call("whoami")) as Who).root).toBeUndefined();
+  expect(existsSync(join(dir, `bind.${runner.harnessPid}`))).toBe(false);
+
+  const orphan = await localSession(dir, undefined, { extra: { BUS_PARENT_SESSION: "pi-none" } });
+  const own = (await orphan.call("whoami")) as Who;
+  expect(fallbacks(own.id)).toHaveLength(1);
+  expect(await orphan.call("bind", { name: "qa2", create: true })).toContain('Bound to "qa2"');
+  expect(existsSync(join(dir, `bind.${orphan.harnessPid}`))).toBe(false);
+  const again = await orphan.restart("reconnect");
+  const next = (await again.call("whoami")) as Who;
+  expect(next.id).not.toBe(own.id);
+  expect(next.aliases).toEqual([]);
+  expect(existsSync(join(dir, `bind.${again.harnessPid}`))).toBe(false);
 }, 30_000);
 
 test("a DM or @mention to a child's ID is refused child_session naming its root's primary; the child ends with its root and stays refused", async () => {
