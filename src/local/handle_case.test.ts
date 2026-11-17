@@ -182,3 +182,76 @@ test("a notice prints only once its move commits", () => {
   expect(lines[0]).toContain(`"Gray" is now "gray"`);
   db.close();
 });
+
+// #1189
+test("a repeat merge after a 1.x re-write audits again but prints no second notice, and wakes the name", () => {
+  const path = legacyBus(["Gray"]);
+  const first = openLocalDb(path);
+  expect(first.ended.wake).toContain("gray");
+  first.db.close();
+  const { db: old } = openLocalDb(path);
+  old.prepare(`INSERT INTO handles (name, first_seen, last_seen) VALUES ('Gray', 1, 1)`).run();
+  old.close();
+  const { db, ended } = openLocalDb(path);
+  expect(ended.wake).toContain("gray");
+  db.prepare(`INSERT INTO handles (name, first_seen, last_seen) VALUES ('Gray', 1, 1)`).run();
+  const lines: string[] = [];
+  db.transaction(() => lowercaseLegacyHandles(db, (l) => lines.push(l)))();
+  expect(lines).toEqual([]);
+  expect(audits(db, "alias.case_moved")).toEqual([["gray", "Gray"], ["gray", "Gray"], ["gray", "Gray"]]);
+  db.close();
+});
+
+test("an open that moves nothing wakes nothing for it", () => {
+  const { db, ended } = openLocalDb(legacyBus(["gray"]));
+  expect(ended.wake).not.toContain("gray");
+  db.close();
+});
+
+test("a 1.x human named Human moves to human; an agent named Human doesn't", () => {
+  const human = legacyBus(["Human"], (db) => db.prepare(`UPDATE handles SET human = 1 WHERE name = 'Human'`).run());
+  const a = openLocalDb(human).db;
+  expect(a.prepare(`SELECT address, human FROM aliases WHERE human = 1`).all()).toEqual([{ address: "human", human: 1 }]);
+  expect(audits(a, "alias.case_collision")).toEqual([]);
+  a.close();
+  const agent = openLocalDb(legacyBus(["Human"])).db;
+  expect(audits(agent, "alias.case_collision")).toEqual([["human", "Human"]]);
+  agent.close();
+});
+
+test("a statement that fails mid-move rolls that name back and reports it; the open succeeds", () => {
+  const path = legacyBus(["Gray", "Blue"], (db) =>
+    db.exec(`CREATE TRIGGER forced BEFORE UPDATE OF holder ON claims WHEN NEW.holder = 'gray' BEGIN SELECT RAISE(ABORT, 'forced'); END`));
+  const { db, ended } = openLocalDb(path);
+  expect(rowsUnder(db, "Gray")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+  expect(rowsUnder(db, "gray")).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+  expect(rowsUnder(db, "blue")).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+  expect(audits(db, "alias.case_collision")).toEqual([["gray", "Gray"]]);
+  expect(ended.wake).toContain("blue");
+  expect(ended.wake).not.toContain("gray");
+  db.close();
+});
+
+test("both names on one key: the union keeps one row each", () => {
+  const path = legacyBus(["Gray", "gray"], (db) => {
+    const now = Date.now();
+    const post = (db.prepare(`SELECT id FROM posts WHERE author = 'gray'`).get() as { id: number }).id;
+    const msg = (db.prepare(`SELECT id FROM messages WHERE recipient = 'gray'`).get() as { id: number }).id;
+    for (const h of ["Gray", "gray"]) {
+      db.prepare(`INSERT INTO outbox (handle, post_id, reason) VALUES (?, ?, 'mention')`).run(h, post);
+      db.prepare(`INSERT INTO thread_mutes (handle, root_id) VALUES (?, ?)`).run(h, post);
+      db.prepare(`INSERT INTO claim_watches (key, handle) VALUES ('ticket:x', ?)`).run(h);
+      db.prepare(`INSERT INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)`).run(h, msg, now);
+    }
+    db.prepare(`INSERT INTO claim_watches (key, handle) VALUES ('ticket:only-old', 'Gray')`).run();
+  });
+  const { db } = openLocalDb(path);
+  for (const [t, c] of [["outbox", "handle"], ["thread_mutes", "handle"], ["claim_watches", "handle"], ["dm_acks", "reader"]]) {
+    expect([t, count(db, `SELECT COUNT(*) AS n FROM ${t} WHERE ${c} = 'Gray'`)]).toEqual([t, 0]);
+  }
+  expect(count(db, `SELECT COUNT(*) AS n FROM outbox WHERE handle = 'gray'`)).toBe(1);
+  expect(count(db, `SELECT COUNT(*) AS n FROM thread_mutes WHERE handle = 'gray'`)).toBe(1);
+  expect(count(db, `SELECT COUNT(*) AS n FROM claim_watches WHERE handle = 'gray'`)).toBe(2);
+  expect(count(db, `SELECT COUNT(*) AS n FROM dm_acks WHERE reader = 'gray'`)).toBe(1);
+  db.close();
+});
