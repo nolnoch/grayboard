@@ -308,7 +308,12 @@ export class SlackBridge implements SlackLinker {
         // address (security audit F-19).
         if (m.kind === "direct") detached(() => relay.notify(dmNotification(m.message)));
         else if (m.item.kind === "digest") {
-          try { repo.post(tx => application.receiptBoards(tx, session, [refOf(m.item)]), undefined, "Slack digest receipt"); } catch {}
+          // A queued write, not a post (#807 P3 A7u1): receiptBoards is async, and this sink also runs from the write
+          // queue's holder (a commit's wake drains the human's digests), where an async post throws. A refusal (the
+          // human detached meanwhile) is expected; anything else is logged.
+          void repo.write(tx => application.receiptBoards(tx, session, [refOf(m.item)])).catch(error => {
+            if (!(error instanceof ApplicationError)) console.error("[grayboard] Slack digest receipt failed:", error);
+          });
         }
         else detached(() => relay.notify(boardNotification(m.item)));
       },

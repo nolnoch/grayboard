@@ -458,9 +458,9 @@ async function reattach(root: string, hold: () => void): Promise<void> {
   expect((await api(root, "POST", "/api/admin/enable-user", { email: "alice@example.com" })).status).toBe(200);
 }
 
-// #981: a digest the Slack human is sent is acknowledged by a posted receipt (#807 D4, slack.ts sink): behind a held
-// queue it waits, then marks the digest sent.
-test("#807: a Slack digest receipt waits for the write queue, then marks the digest sent", async () => {
+// #981: a digest the Slack human is sent is acknowledged by a receipt through the write queue (#807 D4, slack.ts
+// sink): the hello replay's drain, outside any body, marks the digest sent.
+test("#807: a Slack digest the human's replay drains is marked sent", async () => {
   const [alice, , root] = await Promise.all(["alice", "bob", "root"].map((n) => login(`${n}@example.com`)));
   await link(alice);
   // Another user's agent: disabling alice also closes her own agents' connections.
@@ -473,17 +473,29 @@ test("#807: a Slack digest receipt waits for the write queue, then marks the dig
   const chatter = await fe.call<BoardPostResult>("board_post", { board: "noise", body: "chatter" });
   const notified = () => (srv.app.db.prepare(`SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`).get(human) as { notified_id: number }).notified_id;
   expect(notified()).toBeLessThan(chatter.post_id);
-  let hold: ReturnType<typeof holdAtPost> | undefined;
-  try {
-    await reattach(root, () => { hold = holdAtPost("Slack digest receipt"); });
-    await until(() => hold!.ran.length > 0, 5000, "the sink posted the digest receipt");
-    expect(hold!.ran).toEqual([false]);
-    await hold!.holder()!.started;
-    expect(notified()).toBeLessThan(chatter.post_id);
-    hold!.holder()!.release();
-    await hold!.holder()!.done;
-    await until(() => notified() === chatter.post_id, 5000, "the receipt marked the digest sent");
-  } finally { hold?.restore(); }
+  await reattach(root, () => {});
+  await until(() => notified() === chatter.post_id, 5000, "the receipt marked the digest sent");
+  expect(posted("chatter")).toBe(false);
+}, 30_000);
+
+// #807 P3 A7u1 audit: a commit's wake drains the human's pending digests from the write queue's holder, where an
+// async post throws; the receipt is a queued write, so it lands after the holder and marks the digest sent.
+test("#807: a Slack digest drained by a mention's wake, from the queue's holder, is marked sent", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  await be.call("board_create", { name: "noise", purpose: "chatter" });
+  await be.call("board_create", { name: "desk", purpose: "questions" });
+  const repo = srv.app.repo;
+  const human = "alice@example.com/human";
+  await seed(repo, tx => subscribe(repo.coreOn(tx), human, "noise", "digest"));
+  const chatter = await be.call<BoardPostResult>("board_post", { board: "noise", body: "chatter" });
+  const notified = () => (srv.app.db.prepare(`SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`).get(human) as { notified_id: number }).notified_id;
+  expect(notified()).toBeLessThan(chatter.post_id);
+  // A mention on another board wakes the human inside its commit: that drain carries the noise digest too.
+  await be.call("board_post", { board: "desk", body: "@human a question" });
+  await until(() => posted("a question"), 5000, "the mention reached Slack");
+  await until(() => notified() === chatter.post_id, 5000, "the receipt marked the digest sent");
   expect(posted("chatter")).toBe(false);
 }, 30_000);
 
