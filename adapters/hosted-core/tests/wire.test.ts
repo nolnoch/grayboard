@@ -13,7 +13,8 @@ test("a real connect whose token() throws an access expiry surfaces that expiry 
     { token: async () => { tokens++; throw expired; } }, new AbortController().signal, "ses_test");
   const caught = await wire.connect().then(() => undefined, (error: unknown) => error);
   try {
-    expect(caught).toBeInstanceOf(Error);
+    // Fails if an SDK bump starts wrapping: update the comment above, not the code (the cause walk still finds it).
+    expect(caught).toBe(expired);
     expect(tokens).toBeGreaterThan(0);
     expect(accessExpiry(caught)).toBe(expired);
     expect(unreachable(caught)).toBe(false);
