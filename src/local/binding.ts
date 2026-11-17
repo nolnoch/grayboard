@@ -342,7 +342,7 @@ const ATTACH_WAIT_MS = 5000;
  * or the row isn't this harness's. `held` is every name the session holds, oldest first.
  * `facts`: this child's model and effort, which replace the stored ones.
  */
-export async function attachSession(db: Database, s: SessionRow, human: boolean, facts: IdSessionFacts = { model: null, effort: null }, ms = ATTACH_WAIT_MS): Promise<AttachResult> {
+export async function attachSession(db: Database, s: SessionRow, human: boolean, facts: IdSessionFacts = { model: null, effort: null }, ms = ATTACH_WAIT_MS, harnessSession?: string): Promise<AttachResult> {
   // Only a child of this harness is worth waiting for; any other refuses.
   const predecessor = () => {
     const b = db.prepare(`SELECT pid, attached_pid, attached_start FROM bindings WHERE session_id = ?`).get(s.session_id) as
@@ -386,6 +386,9 @@ export async function attachSession(db: Database, s: SessionRow, human: boolean,
     // one reported is stale, as for a hosted session's new ownership.
     const changed = setIdFacts(db, s.session_id, facts);
     if (changed) writeCoreAudit(db, "id.facts_changed", s.session_id, s.session_id, { before: changed.before, after: changed.after, why: "reattach" });
+    // The harness's id for the conversation is the new child's (pi's /new
+    // under a keyed root): its subagents find the root by it (#1075).
+    if (harnessSession !== undefined) db.prepare(`UPDATE ids SET harness_session = ? WHERE id = ?`).run(harnessSession, s.session_id);
     return { ok: true, held };
   }).immediate();
 }

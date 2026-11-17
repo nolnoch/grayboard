@@ -874,12 +874,24 @@ export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "
       await idle(pi);
       const tools = (asked("child one").at(-1)?.messages ?? []).filter((m) => m.role === "tool").map(messageText);
       expect(tools).toHaveLength(1);
-      const child = JSON.parse(tools[0]!);
-      expect(child.child).toBeUndefined();
-      expect(child.id).not.toBe(root.id);
       db = new Database(join(dir, "bus.db"), { readonly: true });
-      expect(db.query(`SELECT root_id FROM ids WHERE id = ?`).get(child.id)).toEqual({ root_id: null });
-      expect(db.query(`SELECT target FROM audit_log WHERE action = 'id.child_seen'`).all()).toEqual([]);
+      const liveRoots = () => db!.query(`SELECT id FROM ids WHERE root_id IS NULL AND ended_at IS NULL AND harness_session IS NOT NULL`).all();
+      if (kind === "keyed") {
+        // The keyed root's child, as an ordinary root's is (#557 3).
+        const child = JSON.parse(tools[0]!);
+        expect(child).toMatchObject({ root: root.id, child: true });
+        expect(child.id).not.toBe(root.id);
+        expect(db.query(`SELECT root_id FROM ids WHERE id = ?`).get(child.id)).toEqual({ root_id: root.id });
+        expect(db.query(`SELECT actor, target FROM audit_log WHERE action = 'id.child_seen'`).all()).toEqual([{ actor: root.id, target: child.id }]);
+      } else {
+        // No session of its own, and never the human handle: the call says why.
+        expect(tools[0]).toContain("a subagent never acts as the human handle");
+        expect(db.query(`SELECT target FROM audit_log WHERE action = 'id.child_seen'`).all()).toEqual([]);
+        expect(root.primary).toBe("adapter-human");
+      }
+      // The root alone runs, and no grayboard crash-looped.
+      expect(liveRoots()).toEqual([{ id: root.id }]);
+      expect(pi.notices().filter((n) => n.includes("restarting") || n.includes("exited"))).toEqual([]);
       expect(model.unhandled).toEqual([]);
       expect(pi.events.filter((e) => e.type === "extension_error")).toEqual([]);
       await pi.quit();
