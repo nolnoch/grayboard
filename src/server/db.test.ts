@@ -362,9 +362,10 @@ describe("Repo", () => {
 
   test("audit.write and prune", async () => {
     const oldTs = Date.now() - 100;
-    await seed(repo, (tx) => repo.audit.write(tx, { at: oldTs, actor: "wade@example.com", action: "auth.login", target: null, detail: null }));
+    await seed(repo, (tx) => repo.audit.write(tx, { at: oldTs, actor: "wade@example.com", action: "auth.login", target: "prune-me", detail: null }));
+    expect((await repo.audit.last(repo.read, "auth.login", "prune-me"))?.at).toBe(oldTs);
     await seed(repo, (tx) => repo.audit.prune(tx, Date.now())); // prune everything older than now
-    // No assertion on rows (no SELECT on audit in Repo) but prune should not throw
+    expect(await repo.audit.last(repo.read, "auth.login", "prune-me")).toBeUndefined();
   });
 });
 
@@ -647,7 +648,7 @@ test("audit.last searches access_log by (action, target), never a scan or a sort
   await seed(repo, () => {
     for (const [at, target] of [[1, "7"], [3, "7"], [2, "7"], [4, "8"]] as const) db.prepare("INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, 'a', 'dm.retract', ?, ?)").run(at, target, `row ${at}`);
   });
-  expect(repo.audit.last(repo.read, "dm.retract", "7")?.detail).toBe("row 3");
+  expect((await repo.audit.last(repo.read, "dm.retract", "7"))?.detail).toBe("row 3");
 });
 
 // #807 P1c-5: a leaf store runs its statements on the handle it's given, so a Tx kept past its body (D4) is refused

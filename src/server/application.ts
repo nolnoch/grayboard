@@ -331,10 +331,11 @@ const userPrincipal = (authed: AuthedUser): Principal => ({ kind: "user", name: 
 const uploaderOf = (s: ApplicationSession): Uploader => ({ addresses: s.addresses, principal: s.authed.user_email });
 
 // The audit log keeps an undelivered bridge death owed across restarts.
-// Selection reads and records delivery synchronously, so only one agent gets it.
-function owedBridgeNotice(repo: Repo, tx: Tx, email: string): string | undefined {
+// Selection reads and records delivery in one bind body, which holds the write queue across its awaits (#807 D4),
+// so only one agent gets it.
+async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<string | undefined> {
   const target = `${email}/${HUMAN_NAME}`;
-  const stop = repo.audit.last(tx, "bridge.stopped", target);
+  const stop = await repo.audit.last(tx, "bridge.stopped", target);
   if (!stop) return undefined;
   let detail: { reason?: string; at?: string; suppressed?: boolean };
   try {
@@ -343,7 +344,7 @@ function owedBridgeNotice(repo: Repo, tx: Tx, email: string): string | undefined
     return undefined;
   }
   if (detail.suppressed || !detail.at || !detail.reason) return undefined;
-  const notified = repo.audit.last(tx, "bridge.notified", target);
+  const notified = await repo.audit.last(tx, "bridge.notified", target);
   if (notified && notified.at >= stop.at) return undefined;
   writeAudit(repo, tx, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
   return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
@@ -870,7 +871,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
 
     setHolds(hub, session, holdsOf(repo.coreOn(tx), id));
     // The first bind of a user's session after the bridge died carries the death notice, once.
-    const owed = owedBridgeNotice(repo, tx, authed.user_email);
+    const owed = await owedBridgeNotice(repo, tx, authed.user_email);
     const notices = noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
@@ -1670,7 +1671,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   const mine = session.addresses;
   const m = repo.messages.getById(tx, id);
   if (!m) {
-    const done = repo.audit.last(tx, "message.retracted", `message:${id}`);
+    const done = await repo.audit.last(tx, "message.retracted", `message:${id}`);
     const by = done?.detail ? (JSON.parse(done.detail) as { sender?: string }).sender : undefined;
     if (done && by !== undefined && mine.includes(by)) return { note: alreadyRetracted(done.at) };
   }

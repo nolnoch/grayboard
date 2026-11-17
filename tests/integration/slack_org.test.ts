@@ -754,7 +754,7 @@ test("a bridge that fails at boot records its death for its linked users, via th
   // behind it runs once it has.
   await srv.app.repo.write(() => {});
 
-  const row = srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human");
+  const row = await srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human");
   expect(row).toBeDefined();
   expect(JSON.parse(row!.detail!)).toMatchObject({ reason: expect.stringMatching(/not started/) });
 });
@@ -763,7 +763,7 @@ test("a deliberate bridge teardown stays silent (no audit row)", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack!.stop();
-  expect(srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human")).toBeUndefined();
+  expect(await srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human")).toBeUndefined();
 });
 
 test("a bridge that failed to start issues no codes", async () => {
@@ -808,7 +808,7 @@ test("a fatal bridge stop tells the owner on their next bind, once", async () =>
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack!.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
-  await until(() => !!srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human"));
+  await until(async () => !!(await srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human")));
 
   const hello = await srv.appSession(alice, "be").connect();
   const bridgeNotices = (hello.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
@@ -821,7 +821,7 @@ test("a hosted bind carries the owed bridge notice in its answer, once", async (
   const alice = await login("alice@example.com");
   await link(alice);
   srv.app.slack!.stop({ fatal: true, detail: "Socket Mode was disabled for this Slack app (link_disabled)" });
-  await until(() => !!srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human"));
+  await until(async () => !!(await srv.app.repo.audit.last(srv.app.repo.read, "bridge.stopped", "alice@example.com/human")));
 
   const first = await hosted("alice@example.com", null);
   const answer = JSON.stringify(await first.bind("be"));
