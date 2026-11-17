@@ -304,3 +304,144 @@ test("repo.read inside the caller's own transaction is refused; the body's Tx, o
   expect(String(timerError)).toContain(refusal);
   expect(rows(repo.read)).toEqual(["a", "b", "c", "d"]);
 });
+
+// #807 P3 A7g: Tx.beforeCommit.
+test("beforeCommit runs once per key after the body, before COMMIT, on the root Tx with the queue held", async () => {
+  const repo = await open();
+  const seen: string[] = [];
+  const key = {};
+  let hookStarted!: () => void, otherQueued!: () => void;
+  const started = new Promise<void>(r => { hookStarted = r; }), queued = new Promise<void>(r => { otherQueued = r; });
+  const write = repo.write(async tx => {
+    tx.afterCommit(() => { seen.push(`after:${rows(repo.read).join(",")}`); });
+    tx.beforeCommit(key, async root => {
+      seen.push(`hook:${rows(root).join(",")}`);
+      hookStarted();
+      await queued;
+      put(root, "hook");
+    });
+    tx.beforeCommit(key, async () => { seen.push("second"); });
+    await tx.savepoint(async sp => { sp.beforeCommit(key, async () => { seen.push("third"); }); put(sp, "sp"); });
+    put(tx, "body");
+    seen.push("body");
+  });
+  await started;
+  // Another task's write, queued while the hook awaits: it runs after the commit, not between the hook and COMMIT.
+  const other = repo.write(t => { put(t, "other"); });
+  otherQueued();
+  await Promise.all([write, other]);
+  // The hook saw the body's last write; its own committed with the body's.
+  expect(seen).toEqual(["body", "hook:sp,body", "after:sp,body,hook"]);
+  expect(rows(repo.read)).toEqual(["sp", "body", "hook", "other"]);
+});
+
+test("a beforeCommit rejection rolls the transaction back and rejects the write", async () => {
+  const repo = await open();
+  const seen: string[] = [];
+  await expect(repo.write(async tx => {
+    put(tx, "a");
+    tx.afterCommit(() => { seen.push("after"); });
+    tx.beforeCommit({}, async root => { put(root, "hook"); throw new Error("hook failed"); });
+  })).rejects.toThrow("hook failed");
+  expect(rows(repo.read)).toEqual([]);
+  expect(seen).toEqual([]);
+  await repo.write(tx => { put(tx, "next"); });
+  expect(rows(repo.read)).toEqual(["next"]);
+});
+
+test("beforeCommit from a savepoint runs at the outer commit on the root Tx, and drops with the savepoint's rollback", async () => {
+  const repo = await open();
+  const seen: string[] = [];
+  const kept = {}, dropped = {}, shared = {}, nested = {};
+  await repo.write(async tx => {
+    tx.beforeCommit(shared, async () => { seen.push("shared"); });
+    await tx.savepoint(async sp => {
+      sp.beforeCommit(kept, async root => { put(root, "kept"); seen.push("kept"); });
+      await sp.savepoint(async inner => { inner.beforeCommit(nested, async () => { seen.push("nested"); }); });
+    });
+    await expect(tx.savepoint(async sp => {
+      sp.beforeCommit(dropped, async () => { seen.push("dropped"); });
+      sp.beforeCommit(shared, async () => { seen.push("shared again"); });
+      await tick();
+      throw new Error("sp failed");
+    })).rejects.toThrow("sp failed");
+    // A committed savepoint's nested key drops with an outer savepoint that later rolls back.
+    await expect(tx.savepoint(async a => {
+      await a.savepoint(async b => { b.beforeCommit({ late: true }, async () => { seen.push("late"); }); });
+      throw new Error("a failed");
+    })).rejects.toThrow("a failed");
+  });
+  expect(seen).toEqual(["shared", "kept", "nested"]);
+  expect(rows(repo.read)).toEqual(["kept"]);
+});
+
+test("a hook a beforeCommit hook registers runs before COMMIT; a synchronous write body's hook runs too", async () => {
+  const repo = await open();
+  await repo.write(tx => {
+    tx.beforeCommit({}, async root => {
+      put(root, "first");
+      root.beforeCommit({}, async again => { put(again, "second"); });
+    });
+  });
+  expect(rows(repo.read)).toEqual(["first", "second"]);
+});
+
+test("a synchronous body's Tx refuses beforeCommit", async () => {
+  const repo = await open();
+  const errs: string[] = [];
+  await repo.write(() => 1, () => {
+    expect(repo.post(tx => {
+      try { tx.beforeCommit({}, async () => {}); } catch (e) { errs.push(String(e)); }
+      put(tx, "holder");
+    })).toBe(true);
+  });
+  expect(errs).toEqual([expect.stringContaining("beforeCommit in a synchronous write body")]);
+  expect(rows(repo.read)).toEqual(["holder"]);
+});
+
+// #1182 audit: a savepoint's hook keys follow its SQLite frame, not its settle path.
+test("beforeCommit keys of a savepoint whose RELEASE fails, or of an un-awaited one inside a rolled-back savepoint, drop", async () => {
+  const repo = await open();
+  const seen: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(r => { release = r; });
+  const stray: Promise<unknown>[] = [];
+  await repo.write(async tx => {
+    // P fulfils with C still open: P's RELEASE refuses (out of order) and rolls P back; the body catches and goes on.
+    await expect(tx.savepoint(async p => {
+      p.beforeCommit({}, async () => { seen.push("released-p"); });
+      put(p, "p");
+      stray.push(p.savepoint(async c => { c.beforeCommit({}, async () => { seen.push("released-c"); }); await gate; }).catch(() => {}));
+    })).rejects.toThrow("out of order");
+    // P rejects with C still open: C's key goes with P's rollback.
+    await expect(tx.savepoint(async p => {
+      stray.push(p.savepoint(async c => { c.beforeCommit({}, async () => { seen.push("rolled-c"); }); await gate; }).catch(() => {}));
+      throw new Error("p failed");
+    })).rejects.toThrow("p failed");
+    put(tx, "body");
+  });
+  release();
+  await Promise.all(stray);
+  expect(seen).toEqual([]);
+  expect(rows(repo.read)).toEqual(["body"]);
+});
+
+test("a hook that re-registers its own key doesn't run again; a key from a hook's rolled-back savepoint drops", async () => {
+  const repo = await open();
+  const seen: string[] = [];
+  const key = {};
+  await repo.write(async tx => {
+    tx.beforeCommit(key, async root => {
+      seen.push("hook");
+      root.beforeCommit(key, async () => { seen.push("again"); });
+      await expect(root.savepoint(async sp => {
+        sp.beforeCommit({}, async () => { seen.push("dropped"); });
+        put(sp, "sp");
+        throw new Error("sp failed");
+      })).rejects.toThrow("sp failed");
+      put(root, "hook");
+    });
+  });
+  expect(seen).toEqual(["hook"]);
+  expect(rows(repo.read)).toEqual(["hook"]);
+});
