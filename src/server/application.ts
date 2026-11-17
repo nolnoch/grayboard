@@ -20,7 +20,7 @@ import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
-import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
+import { authorizeNow, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
@@ -404,7 +404,7 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
   }
   const t = { ...scope, scope_ref: scope.scope_ref! };
   const req: AuthzRequest = { verb: "alias.bind", principal: userPrincipal(authed), scope: t, name: scope.name };
-  const d = authorize(repo, {}, req);
+  const d = authorizeNow(repo, {}, req);
   if (!d.allow && d.rule === "alias.human_reserved") return { code: "forbidden", error: HUMAN_RESERVED, address, authz: { req, d } };
   // A team reads as missing to a non-member (#1020): the refusal aliasScope gives a scope nobody owns.
   if (!d.allow && d.rule === "scope.team_member") return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
@@ -682,7 +682,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const revoked: (AliasUse & { reason: string })[] = [];
       for (const u of aliasUses(repo.coreOn(tx), principal)) {
         const p = repo.principals.findByName(u.principal);
-        const d = p ? authorize(repo, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
+        const d = p ? authorizeNow(repo, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
         const reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
         if (reason) revoked.push({ ...u, reason });
       }
@@ -1323,7 +1323,7 @@ function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: s
   const p = addressParts(input);
   if (!p) fail("bad_request", `invalid address "${input}": expected "id:…", "scope/name" or "team:name"`);
   if (p.kind !== "bare") return p;
-  const scope = ownScope(repo.resolver, from);
+  const scope = ownScope(repo.policyNow, from);
   const own = scope ? addressParts(`${scope}/${p.name}`) : null;
   if (own?.kind === "alias" && repo.aliases.find(r, own.address)) return own;
   if (p.name === HUMAN_NAME) {
@@ -1332,9 +1332,9 @@ function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: s
     // full handle, as peer_list shows it.
     fail("not_found", `your user hasn't linked Slack, so there's no "${HUMAN_NAME}" to message; they can run grayboard slack link`);
   }
-  const vp = repo.resolver.principalOf(viewer);
+  const vp = repo.policyNow.principalOf(viewer);
   const all = repo.aliases.findAllByName(r, p.name)
-    .filter((a) => vp !== null && authorize(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow)
+    .filter((a) => vp !== null && authorizeNow(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } }).allow)
     .map((i) => i.address).sort();
   const which = all.length ? `"${p.name}" isn't in your scope; name it in full: ${all.join(", ")}` : `no identity is named "${p.name}"`;
   return fail("not_found", `${which}; peer_list shows exact handles`);
@@ -1346,8 +1346,8 @@ function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: s
 function teamAliasHidden(repo: Repo, r: Read, viewer: string, address: string): boolean {
   const a = repo.aliases.find(r, address);
   if (a?.scope_kind !== "team" || a.scope_ref === null) return false;
-  const vp = repo.resolver.principalOf(viewer);
-  return vp === null || !authorize(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } }).allow;
+  const vp = repo.policyNow.principalOf(viewer);
+  return vp === null || !authorizeNow(repo, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } }).allow;
 }
 
 // A send checked and resolved, ready to write: `from` the address it goes
@@ -1404,7 +1404,7 @@ function prepareSend(
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
-  const decision = authorize(repo, { humanReach: hub.humanReach }, req);
+  const decision = authorizeNow(repo, { humanReach: hub.humanReach }, req);
   if (!decision.allow) {
     rowAfterRollback(session, r, w => recordDecision(repo, w, sessionActor(session, from), req, decision));
     fail(decision.code, decision.reason);
@@ -1470,7 +1470,7 @@ function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: Applica
   if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return {};
   const toUser = live?.authed.user_email ?? (() => { const a = repo.aliases.find(r, to); return a?.scope_kind === "person" ? a.scope_ref : undefined; })();
   if (toUser === undefined) return {};
-  const decision = authorize(repo, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
+  const decision = authorizeNow(repo, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
   if (decision.allow) return {};
   // Named only when the address already names them (a person alias): a team
   // alias's or an ID's holder is a handle, not a user (security audit F-12).
@@ -1592,7 +1592,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
     if (owner === undefined || owner === authed.user_email) return { ok: "own" };
     if (owner === null) return { refused: crossUserRefusal(to) };
     const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
-    const decision = authorize(repo, {}, req);
+    const decision = authorizeNow(repo, {}, req);
     if (decision.allow) return { ok: "granted" };
     rowAfterRollback(session, h, w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }));
     return { refused: crossUserRefusal(to) };
@@ -1631,7 +1631,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
       const r = reach(sp)(stored.to, true);
       if ("refused" in r) throw new CoreError(r.refused + hint);
       const req: AuthzRequest = { verb: "msg.send", from: session.primary, to: stored.to };
-      const decision = authorize(repo, { humanReach: hub.humanReach }, req);
+      const decision = authorizeNow(repo, { humanReach: hub.humanReach }, req);
       if (!decision.allow) {
         rowAfterRollback(session, sp, w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision));
         fail(decision.code, decision.reason + hint);
@@ -1794,7 +1794,7 @@ function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageId
   const decided = new Map<string, boolean>();
   const may = (verb: "msg.wake" | "delegate.to", user: string) => {
     const key = `${verb} ${user}`;
-    if (!decided.has(key)) decided.set(key, authorize(repo, {}, { verb, from_user: user, to_user: me }).allow);
+    if (!decided.has(key)) decided.set(key, authorizeNow(repo, {}, { verb, from_user: user, to_user: me }).allow);
     return decided.get(key)!;
   };
   const foreign = messageIds.filter((id) => { const u = writers.messages.get(id); return u !== undefined && u !== me; });

@@ -301,8 +301,8 @@ test("unbound hosted reads never use the human address and still list and read b
   const bobBe = (await connect(bob, "be", { key: "bob-secret" })).session;
   await seed(store.repo, tx => application.call(tx, bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" }));
   const asked: string[] = [];
-  const principalOf = store.repo.resolver.principalOf.bind(store.repo.resolver);
-  store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
+  const principalOf = store.repo.policyNow.principalOf.bind(store.repo.policyNow);
+  store.repo.policyNow.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
   const unregistered = application.hostedSession(store.repo.read, alice, "id:0000000000000", [], null, null, delivery()).session;
   await seed(store.repo, tx => application.hostedRegister(tx, alice, "id:1111111111111", "opencode"));

@@ -234,7 +234,7 @@ export function canReadAttachment(
 }
 
 // canReadAttachment's answer and which carrier decided it, for the server's
-// authorize() to name its rule (#851).
+// decidePure() to name its rule (#851).
 export type AttachmentReach = { carrier: "post" | "message" | "unbound"; readable: boolean };
 export function attachmentReach(
   db: Database,

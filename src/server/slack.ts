@@ -1,7 +1,7 @@
 // The org Slack bridge: one Slack app for the whole server, enabled by
 // SLACK_APP_TOKEN + SLACK_BOT_TOKEN. Each linked user talks to the app in
 // their own DM with it, as their human identity "<email>/human". That identity
-// uses the hosted application directly, sharing delivery, cursors, policy.ts authorize()
+// uses the hosted application directly, sharing delivery, cursors, policy.ts decide()
 // and board access with agents. See docs/slack-org-bridge.md.
 //
 // Linking proves both sides: `grayboard slack link` (a signed-in grayboard

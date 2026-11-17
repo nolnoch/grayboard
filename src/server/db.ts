@@ -12,7 +12,7 @@ import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import type { Principal, Resolver } from "../core/resolver.ts";
+import type { Principal } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
 import { endSession, type MailPort } from "../core/session_end.ts";
@@ -21,7 +21,7 @@ import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSql
 import type { WriteTx } from "../core/write_tx.ts";
 import { type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { serverAccess } from "./access.ts";
-import type { HumanReach } from "./policy.ts";
+import type { AccessReadsSync, HumanReach, PolicyReadsSync } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
 import { detached, inRequest, requestOrigin } from "./request_context.ts";
@@ -281,12 +281,14 @@ export interface Repo {
   principals: {
     findByName(name: string): PrincipalRow | undefined;
   };
-  // Who an address acts for (#284 S12): an ID's registering user, an
-  // alias's scope owner, a team broadcast's team.
-  resolver: Resolver;
+  // Policy's reads (and resolveMention's alias reads), synchronously on the SQLite connection (#807 P3 A7e1): the
+  // loader authorizeNow drives, and the core Access seam's, until #807 B makes them async. Inside the caller's own
+  // transaction they read its writes. principalOf is who an address acts for (#284 S12): an ID's registering user,
+  // an alias's scope owner, a team broadcast's team. SQLite only: a Postgres Repo won't have it. policy.test.ts
+  // ratchets its callers.
+  policyNow: PolicyReadsSync & AccessReadsSync;
   // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
-  // async Access (A7): `find` and `findAllByName` are Access-seam reads, `listForScope` and `seen` feed the synchronous
-  // session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
+  // async Access (A7): `listForScope` and `seen` feed the synchronous session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
     create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Promise<Alias>;
@@ -1055,6 +1057,38 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     }
     return scoped(a, requiredScopes);
   };
+  // One SQL statement per read, on whichever connection the caller gives: a store read's sqliteOf(r), or policyNow's
+  // routed `db` (#807 P3 A7e1).
+  const aliasAt = (c: Database, address: string): Alias | undefined =>
+    c.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
+  const aliasesNamed = (c: Database, name: string): Alias[] =>
+    c.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
+  const userByEmail = (email: string): User | undefined =>
+    db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
+  const teamByName = (name: string): Team | undefined =>
+    db.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
+  const teamsOf = (userId: number): Team[] =>
+    db.query<Team, [number]>(`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`).all(userId);
+  const isOwner = (teamId: number, userId: number): boolean =>
+    !!db.query<{ x: number }, [number, number]>(
+      `SELECT 1 AS x FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ? AND ${OWNER_SQL}`,
+    ).get(teamId, userId);
+  const isMember = (teamId: number, userId: number): boolean =>
+    !!db.query<{ x: number }, [number, number]>("SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?").get(teamId, userId);
+  const shareCollaborative = (userA: number, userB: number) => sharePolicy(userA, userB, ["collaborative", "delegating"]);
+  const shareDelegating = (userA: number, userB: number) => sharePolicy(userA, userB, ["delegating"]);
+  const principalOf = (address: string): Principal | null => {
+    const p = addressParts(address);
+    if (!p || p.kind === "bare") return null;
+    const name = p.kind === "id"
+      ? db.query<{ principal: string | null }, [string]>("SELECT principal FROM ids WHERE id = ?").get(p.address)?.principal
+      : p.kind === "alias" ? p.scope : p.name;
+    const row = name ? principalByName(name) : undefined;
+    // team:x names a team, never a service; a person scope (an email) is only a user's.
+    if (!row || (p.kind === "team" && row.kind !== "team")) return null;
+    if (p.kind === "alias" && (p.scopeKind === "person") !== (row.kind === "user")) return null;
+    return { kind: row.kind, name: row.name };
+  };
   return {
     now: clock,
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
@@ -1126,9 +1160,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async clearSubject(tx, userId) {
         sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
       },
-      findByEmail(email) {
-        return db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
-      },
+      findByEmail: userByEmail,
       findById: userById,
       isDisabled(userId) {
         return cachedUser(userId)?.disabled_at != null;
@@ -1196,19 +1228,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       findByName: principalByName,
     },
 
-    resolver: {
-      principalOf(address) {
-        const p = addressParts(address);
-        if (!p || p.kind === "bare") return null;
-        const name = p.kind === "id"
-          ? db.query<{ principal: string | null }, [string]>("SELECT principal FROM ids WHERE id = ?").get(p.address)?.principal
-          : p.kind === "alias" ? p.scope : p.name;
-        const row = name ? principalByName(name) : undefined;
-        // team:x names a team, never a service; a person scope (an email) is only a user's.
-        if (!row || (p.kind === "team" && row.kind !== "team")) return null;
-        if (p.kind === "alias" && (p.scopeKind === "person") !== (row.kind === "user")) return null;
-        return { kind: row.kind, name: row.name };
-      },
+    policyNow: {
+      principalByName, principalOf, teamByName, isMember, isOwner, teamsOf, shareCollaborative, shareDelegating, userByEmail,
+      alias: address => aliasAt(db, address),
+      aliasesNamed: name => aliasesNamed(db, name),
     },
 
     aliases: {
@@ -1220,9 +1243,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
            VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
         ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;
       },
-      find(r, address) {
-        return sqliteOf(r).query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
-      },
+      find: (r, address) => aliasAt(sqliteOf(r), address),
       listForScope(r, kind, ref) {
         return sqliteOf(r).query<Alias, [string, string]>(
           `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
@@ -1233,9 +1254,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           `SELECT COUNT(*) AS n FROM aliases WHERE scope_ref = ? AND scope_kind = ? AND name != ?`,
         ).get(ref, kind, HUMAN_NAME)!.n;
       },
-      findAllByName(r, name) {
-        return sqliteOf(r).query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
-      },
+      findAllByName: (r, name) => aliasesNamed(sqliteOf(r), name),
       seen(r, addresses) {
         const rows = sqliteOf(r).query<{ address: string; last_seen: number; cwd: string | null; place: string | null }, [string]>(
           `SELECT a.address, a.last_seen, i.cwd, i.place FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
@@ -1272,14 +1291,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           }
         })();
       },
-      findByName(name) {
-        return db.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
-      },
-      listForUser(userId) {
-        return db.query<Team, [number]>(
-          `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`,
-        ).all(userId);
-      },
+      findByName: teamByName,
+      listForUser: teamsOf,
       async addMember(tx, teamId, userId, role = "member") {
         const db = sqliteOf(tx);
         return db.run(
@@ -1306,11 +1319,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return row.owner ? "owner" : "member";
         })();
       },
-      isOwner(teamId, userId) {
-        return !!db.query<{ x: number }, [number, number]>(
-          `SELECT 1 AS x FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ? AND ${OWNER_SQL}`,
-        ).get(teamId, userId);
-      },
+      isOwner,
       listMembers(teamId) {
         return db.query<{ user_id: number; email: string; owner: number }, [number]>(
           `SELECT u.id as user_id, u.email, ${OWNER_SQL} AS owner FROM users u
@@ -1322,11 +1331,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           "SELECT user_id FROM team_members WHERE team_id = ?",
         ).all(teamId).map(r => r.user_id);
       },
-      isMember(teamId, userId) {
-        return !!db.query<{ x: number }, [number, number]>(
-          "SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?",
-        ).get(teamId, userId);
-      },
+      isMember,
       async setPolicy(tx, teamId, policy) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
@@ -1336,12 +1341,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return (TEAM_POLICIES as readonly string[]).includes(row.policy) ? row.policy as TeamPolicy : "open";
         })();
       },
-      shareCollaborative(userA, userB) {
-        return sharePolicy(userA, userB, ["collaborative", "delegating"]);
-      },
-      shareDelegating(userA, userB) {
-        return sharePolicy(userA, userB, ["delegating"]);
-      },
+      shareCollaborative,
+      shareDelegating,
     },
 
     messages: {

@@ -12,7 +12,7 @@ import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
-import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
+import { authorizeNow, decidePure, recordDecision, type AuthzRequest, type PureRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { forgetHandle, getBoard } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
@@ -171,7 +171,7 @@ function claimList(url: URL, authed: AuthedUser, repo: Repo): Response {
     const a = repo.aliases.find(repo.read, holder);
     const p = a ? null : addressParts(holder);
     const scope = a ? { scope_kind: a.scope_kind, scope_ref: a.scope_ref } : p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team" as const, scope_ref: p.scope } : null;
-    return !scope || scope.scope_ref === null || authorize(repo, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
+    return !scope || scope.scope_ref === null || authorizeNow(repo, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
   };
   return json(listClaims(repo.coreOn(repo.read), prefix).map(({ board: _b, ...c }) => (sees(c.holder) ? c : { ...c, holder: null, note: null })));
 }
@@ -188,8 +188,8 @@ function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUse
   // Security audit F-01 (#851): every policy refusal below is an `authz.decision` row.
   if (p.kind === "id") {
     const row = idRow(repo.coreOn(r), p.address);
-    const req: AuthzRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
-    const d = authorize(repo, {}, req);
+    const req: PureRequest = { verb: "session.act", user: authed.user_email, session: p.address, row: row && { principal: row.principal, viewer: !!row.viewer, ended_at: row.ended_at } };
+    const d = decidePure({}, req);
     if (!d.allow) {
       recordDecision(repo, r, { user: authed.user_email }, req, d);
       return forbidden(d.reason);
@@ -197,10 +197,10 @@ function ownAddress(r: Read, input: string | null | undefined, authed: AuthedUse
     return p.address;
   }
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
-  // authorize() decides the human name first (`humanReason`), before the scope's owner.
-  const owner = repo.resolver.principalOf(address);
+  // The rule decides the human name first (`humanReason`), before the scope's owner.
+  const owner = repo.policyNow.principalOf(address);
   const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
-  const d = authorize(repo, {}, req);
+  const d = authorizeNow(repo, {}, req);
   if (!d.allow) {
     recordDecision(repo, r, { user: authed.user_email, address }, req, d);
     if (d.rule === "alias.human_reserved") return forbidden(humanReason);
@@ -440,7 +440,7 @@ function teamJoin(): Response {
 // can't leave a team it isn't in. A refusal is recorded (policy.ts).
 function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): Team | null {
   const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
-  const d = authorize(repo, {}, req);
+  const d = authorizeNow(repo, {}, req);
   if (!d.allow) {
     recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
     return null;
@@ -453,7 +453,7 @@ function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): 
 // (policy.ts), and reads as not found.
 function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
   const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
-  const d = authorize(repo, { admins: config.admins }, req);
+  const d = authorizeNow(repo, { admins: config.admins }, req);
   if (!d.allow) {
     recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
     return null;
@@ -469,7 +469,7 @@ function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, 
 // is refused, naming who can. Every decision is recorded (policy.ts).
 function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
   const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
-  const d = authorize(repo, { admins: config.admins }, req);
+  const d = authorizeNow(repo, { admins: config.admins }, req);
   recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
   if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
   return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
@@ -739,8 +739,8 @@ export async function handleHttp(
   }
 
   if (path.startsWith("/api/admin/")) {
-    const req: AuthzRequest = { verb: "admin", email: authed.user_email };
-    const decision = authorize(repo, { admins: config.admins }, req);
+    const req: PureRequest = { verb: "admin", email: authed.user_email };
+    const decision = decidePure({ admins: config.admins }, req);
     recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
     if (!decision.allow) return forbidden(decision.reason);
   }

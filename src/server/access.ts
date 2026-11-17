@@ -1,5 +1,6 @@
 // Board access for the distributed server, evaluated for the acting address
-// through the Resolver (#284 S12). Open boards (scope null) are visible to
+// through the Resolver (#284 S12). Core calls it synchronously, so its reads
+// are repo.policyNow's (#807 P3 A7e1) until B5b. Open boards (scope null) are visible to
 // any address with a principal; "team:<name>" boards to that team's own
 // aliases and to its members' addresses. A session bound to `eng/x` acts as
 // eng: it sees eng's boards, not its binder's other teams'. Installed on the
@@ -10,7 +11,7 @@ import { CoreError } from "../core/errors.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
 import { undeliverableId } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import { authorize, type ActScope, type HumanReach } from "./policy.ts";
+import { authorizeNow, type ActScope, type HumanReach } from "./policy.ts";
 import type { Repo } from "./db.ts";
 
 function teamOf(scope: string | null): string | null {
@@ -20,12 +21,12 @@ function teamOf(scope: string | null): string | null {
 // Whether principal p may act in a scope (#284 S9), as policy.ts decides it:
 // a filter check, so it writes no decision row.
 function actsIn(repo: Repo, p: Principal, scope: ActScope): boolean {
-  return authorize(repo, {}, { verb: "scope.act", principal: p, scope }).allow;
+  return authorizeNow(repo, {}, { verb: "scope.act", principal: p, scope }).allow;
 }
 
 // Whether `from` may wake `to` (a human's phone), the DM rule as a filter.
 function reaches(repo: Repo, humanReach: HumanReach, from: string, to: string): boolean {
-  return authorize(repo, { humanReach }, { verb: "human.reach", from, to }).allow;
+  return authorizeNow(repo, { humanReach }, { verb: "human.reach", from, to }).allow;
 }
 
 // Board visibility is the principal's: an org board is everyone's, a team
@@ -43,7 +44,7 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
     p.kind === "team" ? p.name === teamName : actsIn(repo, p, { scope_kind: "team", scope_ref: teamName });
 
   const canSee = (handle: string, board: Board): boolean => {
-    const p = repo.resolver.principalOf(handle);
+    const p = repo.policyNow.principalOf(handle);
     return !!p && principalCanSee(repo, p, board);
   };
 
@@ -53,9 +54,9 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
   const seesAlias = (handle: string, scope: Omit<AliasScope, "name">): boolean => {
     // A person's names are listed to every caller, as before #348.
     if (scope.scope_kind === "person") return true;
-    const p = repo.resolver.principalOf(handle);
+    const p = repo.policyNow.principalOf(handle);
     if (p === null || scope.scope_ref === null) return false;
-    return authorize(repo, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
+    return authorizeNow(repo, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
   };
 
   return {
@@ -64,7 +65,7 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
     // An alias's labels reach only a principal that may act in its scope
     // (#284 S13): a team's task or private board name stays inside the team.
     seesAliasMeta(handle, scope) {
-      const p = repo.resolver.principalOf(handle);
+      const p = repo.policyNow.principalOf(handle);
       return p !== null && scope.scope_ref !== null && actsIn(repo, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
     },
 
@@ -78,8 +79,8 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
       const team = teamOf(scope);
       if (team === null) return `invalid board scope "${scope}"`;
       // A team reads as missing to a non-member (#1020): one refusal for both.
-      const p = repo.resolver.principalOf(handle);
-      return repo.teams.findByName(team) && p && inTeam(p, team) ? null : `no such team "${team}"`;
+      const p = repo.policyNow.principalOf(handle);
+      return repo.policyNow.teamByName(team) && p && inTeam(p, team) ? null : `no such team "${team}"`;
     },
 
     // The grammar of #284 decision 16 (S13): @id:… is the session itself (a
@@ -99,15 +100,15 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
         return why ? null : t.address;
       }
       const reach = (h: string) => canSee(h, board) && reaches(repo, humanReach, author, h);
-      if (t.kind === "alias") return repo.aliases.find(repo.read, t.address) && reach(t.address) ? t.address : null;
-      const scope = ownScope(repo.resolver, author);
+      if (t.kind === "alias") return repo.policyNow.alias(t.address) && reach(t.address) ? t.address : null;
+      const scope = ownScope(repo.policyNow, author);
       const own = scope ? `${scope}/${t.name}` : null;
-      if (own && repo.aliases.find(repo.read, own)) return own;
+      if (own && repo.policyNow.alias(own)) return own;
       if (t.name === HUMAN_NAME) return null;
       if (!strict) return null;
       // Only names the posting session may see exist (#348): a team's stay
       // inside the team, so a hidden one refuses nothing.
-      const roster = repo.aliases.findAllByName(repo.read, t.name).filter((a) => seesAlias(viewer, a)).map((i) => i.address).filter(reach);
+      const roster = repo.policyNow.aliasesNamed(t.name).filter((a) => seesAlias(viewer, a)).map((i) => i.address).filter(reach);
       if (roster.length) throw new CoreError(`@${t.name} isn't in your scope; name it in full: ${roster.join(", ")}`);
       return null;
     },
@@ -118,12 +119,12 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
     // A human archives only boards its own user's addresses created (#848): a
     // team's alias, a service or another user's agent is someone else's.
     sameUser(human, address) {
-      const h = repo.resolver.principalOf(human), a = repo.resolver.principalOf(address);
+      const h = repo.policyNow.principalOf(human), a = repo.policyNow.principalOf(address);
       return h?.kind === "user" && a?.kind === "user" && h.name === a.name;
     },
 
     ownerOf(address) {
-      const p = repo.resolver.principalOf(address);
+      const p = repo.policyNow.principalOf(address);
       return p?.kind === "user" ? p.name : null;
     },
   };

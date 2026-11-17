@@ -49,7 +49,7 @@ beforeEach(async () => {
 
 describe("Resolver", () => {
   test("maps IDs, person aliases, team aliases and team broadcasts to principals", () => {
-    const r = repo.resolver;
+    const r = repo.policyNow;
     expect(r.principalOf(WADE_ID)).toEqual({ kind: "user", name: "wade@example.com" });
     expect(r.principalOf("wade@example.com/be")).toEqual({ kind: "user", name: "wade@example.com" });
     expect(r.principalOf("eng/deploy")).toEqual({ kind: "team", name: "eng" });
@@ -57,14 +57,14 @@ describe("Resolver", () => {
   });
 
   test("names no principal for an unknown scope, an unregistered ID, a bare name or a viewer handle", () => {
-    const r = repo.resolver;
+    const r = repo.policyNow;
     for (const a of ["nobody@example.com/be", "nope/x", "team:nope", idAddress("f".repeat(64)), "be", "wade@example.com/~abc", ""]) {
       expect(r.principalOf(a)).toBeNull();
     }
   });
 
   test("team:x names only a team", () => {
-    expect(repo.resolver.principalOf("team:wade@example.com")).toBeNull();
+    expect(repo.policyNow.principalOf("team:wade@example.com")).toBeNull();
   });
 });
 
