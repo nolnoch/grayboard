@@ -11,11 +11,12 @@ import type { ScopeKind } from "../core/addresses.ts";
 // delete-alias`, a user with `grayboard identity rm`. GRAYBOARD_ALIAS_SCOPE_CAP.
 export const ALIAS_SCOPE_CAP = 500;
 
-// The refusal for a new name in a scope at its cap, or null. Callers check
-// and create with no await between, so two creates can't both pass at the
-// last slot. `r`: the body's Tx the create runs in, so the count sees its own creates.
-export function aliasCapRefusal(repo: Repo, r: Read, scope: { scope_kind: ScopeKind; scope_ref: string }, cap: number): string | null {
-  const n = repo.aliases.countForScope(r, scope.scope_kind, scope.scope_ref);
+// The refusal for a new name in a scope at its cap, or null. Callers check and create inside one queued body,
+// so two creates can't both pass at the last slot: the count's await (#807 P3 A7g2) is before the verdict, and no
+// other body writes until the caller's commits. That rests on D4's single queue; D3's `FOR UPDATE` on the scope's
+// parent row, the form that holds without it, comes with the Postgres store (P3). `r`: the body's Tx the create runs in, so the count sees its own creates.
+export async function aliasCapRefusal(repo: Repo, r: Read, scope: { scope_kind: ScopeKind; scope_ref: string }, cap: number): Promise<string | null> {
+  const n = await repo.aliases.countForScope(r, scope.scope_kind, scope.scope_ref);
   if (n < cap) return null;
   const free = scope.scope_kind === "team"
     ? `a team owner frees one with grayboard team delete-alias ${scope.scope_ref} <name>`

@@ -97,8 +97,8 @@ test("private board visibility is checked again after reading the blob", async (
     await app.repo.teams.addMember(tx, team.id, alice.authed.user_id);
     await app.repo.teams.addMember(tx, team.id, bob.authed.user_id);
     ensureTeamBoard(app.repo, tx, team, "alice@example.com");
-    onTeamJoined(app.repo, tx, team, "alice@example.com");
-    onTeamJoined(app.repo, tx, team, "bob@example.com");
+    await onTeamJoined(app.repo, tx, team, "alice@example.com");
+    await onTeamJoined(app.repo, tx, team, "bob@example.com");
     return team;
   });
   const id = (await (await attachment(alice.token)).json() as { id: number }).id;
@@ -113,7 +113,7 @@ test("private board visibility is checked again after reading the blob", async (
   // The download holds no write: its blob read waits outside the queue, so this body runs now.
   await seed(app.repo, async (tx) => {
     await app.repo.teams.removeMember(tx, team.id, bob.authed.user_id);
-    onTeamLeft(app.repo, tx, team, "bob@example.com");
+    await onTeamLeft(app.repo, tx, team, "bob@example.com");
   });
   resume();
   const response = await reading;

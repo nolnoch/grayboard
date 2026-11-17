@@ -876,7 +876,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // A typo would otherwise create a fresh alias, and the DMs queued for the
     // intended one would never arrive.
     if (m.create === false && !(await repo.aliases.find(tx, address))) {
-      const known = closestNames(scope.name, repo.aliases.listForScope(tx, scope.scope_kind, scope.scope_ref).map((a) => a.name).filter((n) => n !== HUMAN_NAME));
+      const known = closestNames(scope.name, (await repo.aliases.listForScope(tx, scope.scope_kind, scope.scope_ref)).map((a) => a.name).filter((n) => n !== HUMAN_NAME));
       const message = unknownNameError(scope.name, known);
       return refuse("identity_unknown", message, message, { known });
     }
@@ -901,7 +901,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // A new name past its scope's cap (#347); checked here, not in the
     // transaction below, so the refused binding event stays.
-    const capped = (await repo.aliases.find(tx, address)) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+    const capped = (await repo.aliases.find(tx, address)) ? null : await aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
     if (capped) return refuse("bad_request", capped, capped);
 
     // No savepoint (#807 P3 A1): a throw here fails the bind, and every caller's transaction rolls back with it.
@@ -950,7 +950,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     repo,
     admitHosted,
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
-    hostedCandidates(r: Read, authed: AuthedUser, suggested: string | null) { return candidates(hub, r, authed, suggested); },
+    hostedCandidates(r: Read, authed: AuthedUser, suggested: string | null): Promise<Candidate[]> { return candidates(hub, r, authed, suggested); },
     // The aliases a hosted root holds, oldest first: alias_holds is their only truth (#451).
     hostedHolds(r: Read, id: string): string[] { return holdsOf(repo.coreOn(r), id); },
     // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing.
@@ -967,7 +967,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const own = idRow(repo.coreOn(r), id)?.principal === authed.user_email;
       const hello = await helloFacts(hub, authed, r);
       const readOnly = shape.holds.length === 0 && shape.writesAs === null;
-      return { own, hello, ...(readOnly && !(shape.root !== null && own) ? { candidates: candidates(hub, r, authed, shape.suggested) } : {}) };
+      return { own, hello, ...(readOnly && !(shape.root !== null && own) ? { candidates: await candidates(hub, r, authed, shape.suggested) } : {}) };
     },
     hostedBuild(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, facts: BuildFacts, push = false, root: string | null = null) {
       const session = new ApplicationSession(authed, sink, false, push);
@@ -1080,7 +1080,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
       if (create) {
-        const capped = (await repo.aliases.find(tx, target.address)) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+        const capped = (await repo.aliases.find(tx, target.address)) ? null : await aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
         if (capped) {
           note(target.address, capped);
           return fail("bad_request", capped);
@@ -1327,14 +1327,17 @@ function whereSeen(seen: { cwd: string | null; place: string | null } | undefine
   return !seen ? null : seen.cwd ? describeLocation(seen.cwd) : seen.place;
 }
 
-// A hosted unbound session's candidates: the user's own names nobody holds.
-function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput: string | null): Candidate[] {
+// A hosted unbound session's candidates: the user's own names nobody holds. `r`: the caller's body Tx inside one,
+// else the pool, where a commit may land between the awaited reads: candidates are hints, so they needn't be one
+// instant, and the synchronous reads all follow the last await.
+async function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput: string | null): Promise<Candidate[]> {
   const { repo } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
+  const all = (await repo.aliases.listForScope(r, "person", authed.user_email)).map((i) => i.name);
+  const seen = await repo.aliases.seen(r, all.map(full));
   const free = (n: string) => n !== HUMAN_NAME && holderOf(repo.coreOn(r), full(n)) === null;
-  const names = repo.aliases.listForScope(r, "person", authed.user_email).map((i) => i.name).filter(free);
+  const names = all.filter(free);
   const queued = repo.messages.queuedTo(r, names.map(full));
-  const seen = repo.aliases.seen(r, names.map(full));
   const claims = new Map<string, number>();
   for (const c of listClaims(repo.coreOn(r))) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const suggested = suggestedInput !== null && free(suggestedInput) ? suggestedInput : null;

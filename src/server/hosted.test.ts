@@ -246,7 +246,7 @@ test("#807 P1c-14b: messages reads inside hosted bodies run on that body's Tx", 
     for (const op of ["getById", "writerUsers", "history", "thread", "queuedTo", "undeliveredFrom", "receivedUnacked", "sentPending", "seen"]) expect(inBody).toContain(op);
     const outside = checks.length;
     await hosted.whoami(principal, a);
-    expect(checks.slice(outside).filter(c => c.op === "queuedTo" || c.op === "seen").map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["queuedTo:pool:false", "seen:pool:false"]);
+    expect(checks.slice(outside).filter(c => c.op === "queuedTo" || c.op === "seen").map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["seen:pool:false", "queuedTo:pool:false"]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { restore(); }
 });
@@ -614,7 +614,7 @@ test("unbound context cannot write or implicitly create names", async () => {
   await expect(hosted.run(principal, context("one"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
   await expect(hosted.bind(principal, context("one"), { name: "fe" })).rejects.toHaveProperty("code", "identity_unknown");
   await expect(hosted.bind(principal, { missing: "metadata missing" }, { name: "fe", create: true })).rejects.toHaveProperty("code", "unbound");
-  expect(database.repo.aliases.listForScope(database.repo.read, "person", principal.authed.user_email)).toEqual([]);
+  expect((await database.repo.aliases.listForScope(database.repo.read, "person", principal.authed.user_email))).toEqual([]);
 });
 
 test("two contexts execute tools under distinct bound identities", async () => {
