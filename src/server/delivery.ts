@@ -233,7 +233,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           get(p, context, capability, store.get(tx, row.session_id), false, tx);
           store.end(tx, row.session_id, "closed", now());
         });
-      }).catch(error => refused(p, context, error));
+      }, () => undefined).catch(error => refused(p, context, error));
     },
     async cancel(result: DeliveryLease) {
       const attempt = attempts.get(result);

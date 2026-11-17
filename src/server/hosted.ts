@@ -524,8 +524,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     };
   }
   // `endTouch`: whether the call's end is touched (`touchAfter`); an exchange's selection for a tool call leaves it
-  // to the tool's own gate, which ends later (#907).
-  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true): Promise<T> {
+  // to the tool's own gate, which ends later (#907). `create`: false admits no unknown ID (#1097): `fn` then gets no
+  // row, and the gate writes nothing but settle's.
+  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true, create = true): Promise<T> {
     authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
@@ -546,12 +547,13 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (waited) authorized(p, tx);
           // authorized(p) passed with no await since: settle skips p's own disabled read (#881).
           const settled = settle(tx, context.id, p.authed.user_id);
-          try { return { row: await tx.savepoint(async sp => { const r = (await rowFor(sp, p, context, later.defer, true, wake, declare, settled))!; return { r, seen: touch(sp, r) }; }) }; }
+          try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: touch(sp, r) }; }) }; }
           catch (error) { await later.flush(tx); return { error }; }
         });
         waited = true;
         const selected = await pending;
         if ("error" in selected) throw selected.error;
+        if (!selected.row) return fn(undefined);
         const { r: row, seen } = selected.row;
         if ((row.root_session_id ?? row.session_id) !== id) return retry;
         const ids = [...new Set([row.session_id, id])];
@@ -682,11 +684,12 @@ export function createHostedSessions(application: Application, options: { now?: 
     // gate does, except session_end's, so ending a parked child is never refused for capacity.
     // `verdict`: the rows it selected, for the same request's tool call (`run`'s `prior`, #907). `endTouch`: false
     // for a tool call's exchange, whose tool gate touches its end.
-    async snapshot(p: OAuthPrincipal, context: SessionContext, endTouch = true) {
+    // `create`: false for a session_end exchange, which admits no unknown ID (#1097).
+    async snapshot(p: OAuthPrincipal, context: SessionContext, endTouch = true, create = true) {
       return withGate(p, context, false, async row => {
         const root = row ? rootOf(repo.read, row) : undefined;
         return { ...snapshot(p, row, undefined, root), verdict: row && root ? { row, root } as Verdict : undefined };
-      }, false, true, endTouch);
+      }, false, true, endTouch, create);
     },
     // `told` (a native tool call): gets the alias_lost notice, if any, for the result. `prior`: its exchange's
     // verdict (#907).
@@ -754,12 +757,14 @@ export function createHostedSessions(application: Application, options: { now?: 
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
       });
     },
-    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T): Promise<T> {
+    // `absent`: an ending call's answer for an ID the server doesn't hold, which it then doesn't admit (#1097).
+    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T): Promise<T> {
       return withGate(p, context, writer, async row => {
+        if (!row && absent) return absent();
         if (!row) throw new ApplicationError("unbound", "unbound; bind a name first");
         rootOnly(row);
         return fn(row);
-      });
+      }, true, true, true, !absent);
     },
     // `held`: every hold, oldest first, and `primary` the one it sends as (#451): the client's
     // hold list, which the Controller restarts on when it changes (a bind, an unbind, a revocation).
@@ -920,7 +925,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           candidate.root_session_id ? store.childEnd(tx, target, now(), "closed") : store.end(tx, target, "closed", now());
         }); } catch (e) { await later.flushQueued(); throw e; }
         return { ended: true };
-      }, false, false);
+      }, false, false, true, false);
     },
     release(id: string, reason: HostedEnd, deadline?: number): Promise<void> {
       return store.write(tx => store.end(tx, id, reason, now(), deadline));

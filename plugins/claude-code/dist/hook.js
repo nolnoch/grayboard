@@ -223,7 +223,7 @@ function runHook(event, stdin, o) {
       pruneRecords(dir, now);
       if (o.hosted && content === ROOT) {
         const level = input.effort?.level;
-        if (level === undefined)
+        if (level === undefined || level === null)
           noFact(dir, "effort");
         else
           putFact(dir, "effort", level);

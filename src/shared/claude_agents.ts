@@ -205,9 +205,10 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       // The root's effort, which the call this record names carries. None means
       // the model has no effort level: an empty file, which the reader sends as
       // a clear (#558); a removed file is only "unknown" and keeps the server's.
+      // A null level is none too, should a build send one (#563 item 4).
       if (o.hosted && content === ROOT) {
-        const level = (input.effort as { level?: unknown } | undefined)?.level;
-        if (level === undefined) noFact(dir, "effort");
+        const level = (input.effort as { level?: unknown } | null | undefined)?.level;
+        if (level === undefined || level === null) noFact(dir, "effort");
         else putFact(dir, "effort", level);
       }
     } else if (event === "post-tool-use") {
