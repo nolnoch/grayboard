@@ -14,7 +14,7 @@ import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META, GRAYBOARD_WRITES_AS_META } from "../shared/session_meta.ts";
-import { aliasUser, boundInstructions, childCapacity } from "../core/bindings.ts";
+import { aliasUser, boundInstructions, childCapacity, dropHold } from "../core/bindings.ts";
 import { COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE } from "../core/tools.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
@@ -1988,4 +1988,91 @@ test("#807 P3 A7d2b: a close while a hosted token check awaits refuses the call"
   await service.close();
   held.release(true);
   await expect(call).rejects.toThrow("unauthenticated");
+});
+
+// #807 P3 A7g1: a named commit's holder facts are read on its committing transaction, and a full reconcile reads and
+// applies inside one queued body.
+const rootId = () => (context("root") as { id: string }).id;
+const bumpGen = () => seed(database.repo, tx => {
+  const r = database.repo.hosted.get(tx, rootId())!;
+  return database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 });
+});
+
+test("#807 P3 A7g1: a full reconcile's read holds the write queue; two commits during it land after its apply and the holder matches the last", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const start = database.repo.hosted.get(database.repo.read, rootId())!.bind_gen;
+  expect(hosted.holder(rootId())?.generation).toBe(start);
+  let bumps: Promise<void>[] = [];
+  await paused("hosted:reconcile:read", () => hosted.reconcile(), async () => {
+    expect(queueFor(database.db).held).toBe(true);
+    bumps = [bumpGen(), bumpGen()];
+  });
+  await Promise.all(bumps);
+  const row = database.repo.hosted.get(database.repo.read, rootId())!;
+  expect(row.bind_gen).toBe(start + 2);
+  expect(hosted.holder(rootId())).toEqual({ ownership: row.ownership_id, generation: row.bind_gen });
+});
+
+test("#807 P3 A7g1: a named commit's facts are read at COMMIT, so a hold dropped after the mark in the same body leaves no holder", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  expect(hosted.holderCount).toBe(1);
+  await seed(database.repo, async tx => {
+    const r = database.repo.hosted.get(tx, rootId())!;
+    await database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 });
+    dropHold(database.repo.coreOn(tx), at("be"), rootId());
+  });
+  expect(hosted.holder(rootId())).toBeUndefined();
+  expect(hosted.holderCount).toBe(0);
+});
+
+test("#807 P3 A7g1 (#899): a named apply whose build throws still tells the listeners, and the commit stands", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const seen: (string | null)[] = [];
+  hosted.listen(changed => { seen.push(changed); });
+  const build = spyOn(application, "hostedBuild").mockImplementation(() => { throw new Error("build failed"); });
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const before = database.repo.hosted.get(database.repo.read, rootId())!.bind_gen;
+    await bumpGen();
+    expect(build).toHaveBeenCalled();
+    expect(seen).toContain(rootId());
+    expect(database.repo.hosted.get(database.repo.read, rootId())!.bind_gen).toBe(before + 1);
+    expect(hosted.holder(rootId())).toBeUndefined();
+  } finally { build.mockRestore(); log.mockRestore(); }
+});
+
+test("#807 P3 A7g1 (#899): a full reconcile tells the listeners null before its read is released", async () => {
+  const seen: (string | null)[] = [];
+  hosted.listen(changed => { seen.push(changed); });
+  await paused("hosted:reconcile:read", () => hosted.reconcile(), async () => { expect(seen).toEqual([null]); });
+  expect(seen).toEqual([null]);
+});
+
+test("#807 P3 A7g1: close() during a held full read applies nothing", async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  // A held root with no holder: the rebuild after a generation bump fails once.
+  const failing = spyOn(application, "hostedBuild").mockImplementation(() => { throw new Error("build failed"); });
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  try { await bumpGen(); } finally { failing.mockRestore(); log.mockRestore(); }
+  expect(hosted.holderCount).toBe(0);
+  const build = spyOn(application, "hostedBuild");
+  let closing!: Promise<void>;
+  try {
+    await paused("hosted:reconcile:read", () => hosted.reconcile(), async () => { closing = hosted.close(); });
+    await closing;
+    expect(hosted.holderCount).toBe(0);
+    expect(build).not.toHaveBeenCalled();
+  } finally { build.mockRestore(); }
+});
+
+test("#807 P3 A7g1: full reconciles requested before the queued one starts share its body", async () => {
+  let release!: () => void;
+  const holder = queueFor(database.db).run(() => new Promise<void>(r => { release = r; }));
+  const all = spyOn(database.repo.hosted, "all");
+  try {
+    const first = hosted.reconcile(), second = hosted.reconcile();
+    expect(second).toBe(first);
+    release(); await holder; await first;
+    expect(all).toHaveBeenCalledTimes(1);
+  } finally { all.mockRestore(); }
 });
