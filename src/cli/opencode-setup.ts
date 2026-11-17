@@ -303,6 +303,9 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
     } else set(["plugins", pluginIndex], pluginEntry);
   }
   const changed = text !== current.text;
+  // rename(2) would detach the selected file from its other hard links, as it would replace a symlink.
+  const linked = () => existed && (info(path)?.nlink ?? 1) > 1;
+  if (changed && linked()) fail(`Config ${JSON.stringify(path)} has other hard links; setup replaces the file, which would detach them`);
   let configBackup = backupPath(path);
   // Reported only when they say something: a non-default server name, adapters to move.
   const extra = { ...(mcpName !== "grayboard" ? { mcpName } : {}), ...(moves.length ? { adapters: moves.length } : {}) };
@@ -343,6 +346,7 @@ export function setupOpenCode(opts: OpenCodeSetupOptions, expectedAdapterSource:
       beforeReplace?.();
       if (document(path).text !== current.text) fail("Config changed during setup");
       if (document(sibling(path)).text !== otherDocument.text) fail("Sibling config changed during setup");
+      if (linked()) fail("Config changed during setup (it gained other hard links)");
       if (existed) renameSync(temp, path);
       else {
         // No config at preflight: a file created since must be kept, never replaced.
