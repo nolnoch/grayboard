@@ -174,7 +174,7 @@ export function actingAs(input: string, addresses: string[], ownScope: string | 
 /**
  * The address a board tool acts as (#284 S3, S14): `as` when given
  * (board_post, claim_take), checked against `asAddresses`; for a board read,
- * post or subscription without it, the one of `addresses` (primary first, the
+ * post, subscription or archive (picked as a read) without it, the one of `addresses` (primary first, the
  * ID last) that boardAddress picks, else the primary, whose refusal stands.
  * Every other tool acts as the primary, and refuses `as` (a raw server
  * call skips the MCP schema check). Callers resolve it before callBoardTool
@@ -208,7 +208,7 @@ export function boardActor(
 let asTools: Set<string> | undefined;
 const AS_TOOLS = { has: (tool: string) => (asTools ??= new Set(boardTools({ teams: true, attachments: "paths" }).filter((t) => "as" in t.inputSchema.properties).map((t) => t.name))).has(tool) };
 
-const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post" };
+const BOARD_USES: Record<string, BoardUse> = { board_read: "read", board_subscribe: "subscribe", board_post: "post", board_archive: "read" };
 
 /**
  * The address a DM reply goes out as without `as` (#284 S4): the parent's

@@ -98,6 +98,7 @@ test("a mode's own boards never archive, and an unseen board reads as missing", 
   expect(() => archiveBoard(db, "be", "nope", true)).toThrow(/no such board #nope/);
 });
 
+// adapters/factory/factory.ts matches /already exists, archived/ in this text to name an archived board.
 test("board_create on an archived name says so, including its same-arguments repeat", () => {
   tool("be", "board_archive", { board: "task-1" });
   expect(() => tool("be", "board_create", { name: "task-1", purpose: "One fan-out task" })).toThrow(/#task-1 already exists, archived; board_archive\(board, false\) reopens it/);

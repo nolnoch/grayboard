@@ -94,7 +94,7 @@ const SHARE_POLLS = 10;
 const CHECK = "white_check_mark";
 
 const HINT =
-  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread. To make a board: "new #board what it\'s for".';
+  'To start a conversation, begin a message with "@handle" (a direct message to that agent) or "#board" (a post on that board). To answer an agent, reply in its thread. To make a board: "new #board what it\'s for"; to archive or reopen one: "archive #board", "reopen #board".';
 
 export class Relay {
   private draining = false;
@@ -484,6 +484,8 @@ export class Relay {
     const nb = /^new\s+#([a-z0-9_-]{1,32})(?:[\s:,]+(\S[\s\S]*))?$/i.exec(text);
     if (nb && files.length) return this.say(ts, `⚠️ not created: files don't come along when making a board; make #${nb[1]!.toLowerCase()} first, then post them with "#${nb[1]!.toLowerCase()} …"`);
     if (nb) return this.createBoard(nb[1]!.toLowerCase(), nb[2], ts);
+    const ar = /^(archive|reopen)\s+#([a-z0-9_-]{1,32})\s*$/i.exec(text);
+    if (ar && !files.length) return this.archiveBoard(ar[2]!.toLowerCase(), ar[1]!.toLowerCase() === "archive", ts);
     const bp = /^#([a-z0-9_-]{1,32})(?:\s+(\S[\s\S]*))?$/i.exec(text);
     if (bp && (bp[2] || files.length)) return this.sendPost(bp[1]!.toLowerCase(), bp[2] ?? "", files, undefined, ts, null);
     await this.say(ts, HINT);
@@ -606,6 +608,17 @@ export class Relay {
     await this.bus.call("board_subscribe", { board, mode: "quiet" });
     await this.react(ts);
     await this.say(ts, `created #${board}. Post with "#${board} …"; @mention the agents you want to hear from, since no one else is subscribed yet.`);
+  }
+
+  // The owner's way to archive a board (#848): board_archive lets the creator's
+  // own user's human archive or reopen it.
+  private async archiveBoard(board: string, archived: boolean, ts: string): Promise<void> {
+    const r = await this.bus.call("board_archive", { board, archived });
+    const verb = archived ? "archived" : "reopened";
+    if (!r.ok) return this.say(ts, `⚠️ not ${verb}: ${/no such board/.test(r.error) ? await this.noBoard(board) : r.error}`);
+    const v = r.value as { note?: string };
+    if (v.note) return this.say(ts, v.note);
+    await this.react(ts);
   }
 
   // The bus's "no such board" points agents at board_list; the owner gets the

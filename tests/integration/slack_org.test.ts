@@ -1081,3 +1081,31 @@ test("#1062: the receipt drops the overlay of a progress write that failed", asy
     await until(() => store.progress(again) === undefined, 5000, "the receipt dropped the failed write's overlay");
   } finally { holder.release(); errors.mockRestore(); }
 });
+
+// #848: the Slack human archives and reopens with "archive #board"/"reopen #board", but only a board its own user's
+// agent created: on a server the human override doesn't cross users.
+test("the Slack human archives and reopens its own user's boards, not another user's", async () => {
+  const alice = await login("alice@example.com");
+  await login("bob@example.com");
+  await link(alice);
+  const be = await hosted("alice@example.com", "be");
+  const fe = await hosted("bob@example.com", "fe");
+  await be.call("board_create", { name: "mine", purpose: "alice's" });
+  await fe.call("board_create", { name: "theirs", purpose: "bob's" });
+  const listed = async () => (await be.call<{ name: string }[]>("board_list")).map((b) => b.name);
+  const reply = (ts: string) => until(() => slack.posts().find((p) => p.thread_ts === ts), 5000, "the reply reached Slack");
+  const reacted = (ts: string) => until(() => slack.reactions().some((r) => r.timestamp === ts), 5000, "the reaction reached Slack");
+
+  const refused = slack.say("archive #theirs");
+  expect((await reply(refused.ts)).markdown_text).toBe("⚠️ not archived: only #theirs's creator (bob@example.com/fe) or its user (bob@example.com, from Slack: archive #theirs / reopen #theirs) can archive or reopen it");
+  expect(await listed()).toContain("theirs");
+
+  await reacted(slack.say("archive #mine").ts);
+  expect(await listed()).not.toContain("mine");
+  const again = slack.say("ARCHIVE #mine");
+  expect((await reply(again.ts)).markdown_text).toStartWith("#mine was already archived at ");
+  await reacted(slack.say("reopen #mine").ts);
+  expect(await listed()).toContain("mine");
+  const missing = slack.say("archive #nope");
+  expect((await reply(missing.ts)).markdown_text).toStartWith("⚠️ not archived: no board #nope");
+});
