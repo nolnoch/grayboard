@@ -12,8 +12,8 @@ import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, aliasUser, aliasUses, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holderOf, holdsOf, idRow,
-  idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
+  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holdsOf,
+  logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
@@ -24,7 +24,7 @@ import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, lastSeen, parseAliasMeta, pendingFor, pendingKey, refOf,
+  acknowledge, age, boardCatalog, snapshot, canSeeBoard, checkBody, checkPostAccess, parseAliasMeta, pendingFor, pendingKey, refOf,
   setAliasMeta, setPlace, touchAlias, touchId, registerId, setIdFacts, cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -374,9 +374,12 @@ function helloFields(hub: Hub, authed: AuthedUser, f: HelloFacts): SessionFacts 
 // The sentences a session's instructions carry for its addresses: active
 // claims, and direct messages it sent that still haven't arrived a day later.
 async function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[] = []): Promise<string[]> {
+  const undelivered = await hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS);
+  // Read before the synchronous helper (#807 P3 B1a), which asks per stale recipient.
+  const seen = await hub.repo.bindings.lastSeen(r, undelivered.map((u) => u.recipient));
   return [
     ...first,
-    ...undeliveredInstruction(await hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(hub.repo.coreOn(r), h)),
+    ...undeliveredInstruction(undelivered, (h) => seen.get(h) ?? null),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(hub.repo.coreOn(r)), addresses),
   ];
@@ -436,7 +439,7 @@ async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, sco
 // `place` describes the holder's machine, so only its own principal sees it
 // (#349): a team alias's asker can be another member. `r`: the bind's body.
 async function describeHolder(hub: Hub, r: Read, id: string, asker: string): Promise<string> {
-  const row = idRow(hub.repo.coreOn(r), id);
+  const row = await hub.repo.bindings.idRow(r, id);
   const place = row?.principal === asker ? row.place : null;
   // A hosted root has no connection to disconnect: it is last seen when its client last called (#402).
   const hosted = await hub.repo.hosted.get(r, id);
@@ -704,7 +707,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // The pool's synchronous check first, so a start with no leftovers writes nothing; the ends' write reads them again.
   const ready = !unendedIds(repo.coreOn(repo.read)).length ? Promise.resolve() : endIds(async (tx) => {
     const ids: string[] = [];
-    for (const id of unendedIds(repo.coreOn(tx))) if (!(await repo.hosted.owned(tx, id))) ids.push(id);
+    for (const id of await repo.bindings.unendedIds(tx)) if (!(await repo.hosted.owned(tx, id))) ids.push(id);
     return ids;
   }, "wss_removed");
   // Re-checks the aliases that sessions act as (S9) against policy.ts (scope.act), for
@@ -722,7 +725,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const revoked: (AliasUse & { reason: string })[] = [];
       // One decision per (principal, scope): the sweep holds the write queue while it reads.
       const reasons = new Map<string, string | null>();
-      for (const u of aliasUses(repo.coreOn(tx), principal)) {
+      for (const u of await repo.bindings.aliasUses(tx, principal)) {
         const key = JSON.stringify([u.principal, u.scope_kind, u.scope_ref]);
         let reason = reasons.get(key);
         if (reason === undefined) {
@@ -783,7 +786,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // A hosted root's change goes through the hosted store's writes, whose commit tells the hosted
     // service and delivery to close the lease now, not at its next renewal.
     await tx.savepoint(async sp => {
-      const primary = hosted && holdsOf(repo.coreOn(sp), u.id)[0] === u.address;
+      const primary = hosted && (await repo.bindings.holdsOf(sp, u.id))[0] === u.address;
       dropHold(repo.coreOn(sp), u.address, u.id);
       logBinding(repo.coreOn(sp), u.id, u.address, "released", `access revoked: ${reason}`);
       writeAudit(repo, sp, "alias.revoked", by, u.address, { session: u.id, principal: u.principal, reason });
@@ -791,7 +794,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         const row = await repo.hosted.get(sp, u.id);
         if (row) {
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
-          await repo.hosted.update(sp, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: holdsOf(repo.coreOn(sp), u.id).length ? row.lease_deadline : null });
+          await repo.hosted.update(sp, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: (await repo.bindings.holdsOf(sp, u.id)).length ? row.lease_deadline : null });
           if (row.lease_deadline !== null) writeAudit(repo, sp, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
           await repo.hosted.lose(sp, u.id, { alias: u.address, reason, primary }, now());
         }
@@ -898,14 +901,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Another session's hold is never taken over. The hosted service clears a stale
     // hosted holder first (#402): one idle past the hosted window ended and freed the
     // alias; a live one refuses the bind.
-    const holder = holderOf(repo.coreOn(tx), address);
+    const holder = await repo.bindings.holderOf(tx, address);
     if (holder !== null && holder !== id) {
       const who = await describeHolder(hub, tx, holder, authed.user_email);
       return refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, { holder: who });
     }
     // Another user's tools-only session writing as it holds nothing, but the
     // alias is in use, so it's exclusive all the same (S8, decided).
-    const writer = aliasUser(repo.coreOn(tx), address, authed.user_email);
+    const writer = await repo.bindings.userOf(tx, address, authed.user_email);
     if (writer !== null) {
       const why = `another user's session ${writer}`;
       return refuse("alias_held", aliasHeldText(address, why, "bind another name"), why);
@@ -979,7 +982,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // facts can be read on the committing Tx before COMMIT and its build run in the after-commit notice. `shape` is the
     // build's: the facts carry candidates only for the read-only session that shows them.
     async hostedBuildFacts(r: Read, authed: AuthedUser, id: string, shape: { holds: string[]; writesAs: string | null; suggested: string | null; root: string | null }): Promise<BuildFacts> {
-      const own = idRow(repo.coreOn(r), id)?.principal === authed.user_email;
+      const own = (await repo.bindings.idRow(r, id))?.principal === authed.user_email;
       const hello = await helloFacts(hub, authed, r);
       const readOnly = shape.holds.length === 0 && shape.writesAs === null;
       return { own, hello, ...(readOnly && !(shape.root !== null && own) ? { candidates: await candidates(hub, r, authed, shape.suggested) } : {}) };
@@ -1027,7 +1030,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
     // (`hostedCollided`, written after the rollback); without it the row is written here.
     async hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
-      const prior = idRow(repo.coreOn(tx), id);
+      const prior = await repo.bindings.idRow(tx, id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
         if (collided) collided(why); else writeAudit(repo, tx, "id.collision", authed.user_email, id, { why });
@@ -1088,7 +1091,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         }
         return fail(target.code, target.error);
       }
-      const other = aliasUser(repo.coreOn(tx), target.address, authed.user_email);
+      const other = await repo.bindings.userOf(tx, target.address, authed.user_email);
       if (other) {
         const why = `another user's session ${other}`;
         note(target.address, why);
@@ -1110,7 +1113,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const target = await bindTarget(hub, r, authed, alias);
       return "error" in target ? undefined : target.address;
     },
-    aliasHolderId(r: Read, address: string): string | null { return holderOf(repo.coreOn(r), address); },
+    aliasHolderId(r: Read, address: string): Promise<string | null> { return repo.bindings.holderOf(r, address); },
     // Every session's holds, oldest first, for the hosted sweep and reconcile, on `h` (the full reconcile's body Tx).
     async holdsByOwner(h: Read): Promise<Map<string, string[]>> {
       const byOwner = new Map<string, string[]>();
@@ -1350,11 +1353,10 @@ async function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput:
   const full = (n: string) => `${authed.user_email}/${n}`;
   const all = (await repo.aliases.listForScope(r, "person", authed.user_email)).map((i) => i.name);
   const seen = await repo.aliases.seen(r, all.map(full));
-  // Every await first (#807 P3 A7i): the holder reads below are synchronous, so the names and the suggestion are
-  // judged on one state. Queued counts are read for every name; the held ones are dropped with them.
-  const queued = await repo.messages.queuedTo(r, all.map(full));
-  const free = (n: string) => n !== HUMAN_NAME && holderOf(repo.coreOn(r), full(n)) === null;
+  const held = await repo.bindings.holdersOf(r, [...all, ...(suggestedInput !== null ? [suggestedInput] : [])].map(full));
+  const free = (n: string) => n !== HUMAN_NAME && !held.has(full(n));
   const names = all.filter(free);
+  const queued = await repo.messages.queuedTo(r, names.map(full));
   const claims = new Map<string, number>();
   for (const c of listClaims(repo.coreOn(r))) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const suggested = suggestedInput !== null && free(suggestedInput) ? suggestedInput : null;
@@ -1376,8 +1378,12 @@ async function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput:
 // listed as master listed it (#402). One row per session ID.
 async function unboundPeers(hub: Hub, r: Read, session: ApplicationSession): Promise<UnboundPeer[]> {
   const user = session.authed.user_id;
-  // The one await (#807 P3 A7h1), before the in-memory connection list is read.
+  // Every await comes before the in-memory connection list is read (#807 P3 A7h1): the roots, then their holds and
+  // statuses (B1a; statuses for every root, a superset of those listed).
   const own = await hub.repo.hosted.roots(r, user);
+  const ownIds = own.map((row) => row.session_id);
+  const holds = await hub.repo.bindings.holdsOfMany(r, ownIds);
+  const statuses = await hub.repo.bindings.idStatuses(r, ownIds);
   // Per live session ID: whether any of its connections is listed (#489: a call adds its own beside others).
   const live = new Map<string, boolean>();
   for (const c of hub.sessions) {
@@ -1385,8 +1391,7 @@ async function unboundPeers(hub: Hub, r: Read, session: ApplicationSession): Pro
     live.set(c.sessionId, (live.get(c.sessionId) ?? false) || c.listed);
   }
   const roots = own.filter((row) =>
-    row.writes_as === null && live.get(row.session_id) !== false && holdsOf(hub.repo.coreOn(r), row.session_id).length === 0);
-  const statuses = idStatuses(hub.repo.coreOn(r), roots.map((r) => r.session_id));
+    row.writes_as === null && live.get(row.session_id) !== false && holds.get(row.session_id)!.length === 0);
   const now = hub.now();
   return roots.map((r) => {
     const s = statuses.get(r.session_id);
@@ -1538,7 +1543,7 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
     // Named whenever it isn't the primary (S4).
     ...(p.from !== session.primary ? { sent_as: p.from } : {}),
   };
-  const seen = lastSeen(repo.coreOn(tx), p.to);
+  const seen = (await repo.bindings.lastSeen(tx, [p.to])).get(p.to) ?? null;
   const decided = await unwoken(repo, tx, session, registry.get(p.to), p.to);
   await testPauseAsync("send:wake:decided");
   // Read after the await (#807 P3 A7f2, H-A): a wake note about a holder that closed meanwhile is dropped.
@@ -1976,8 +1981,10 @@ async function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days:
   const owed = unanswered(mine, received, await threadsOf(repo, r, received), session.primary);
   const sentPending = await repo.messages.sentPending(r, mine, hub.now() - PROMISE_DAYS * 86_400_000);
   const promises = promised(mine, sentPending, await threadsOf(repo, r, sentPending));
-  const queued = (await repo.messages.undeliveredFrom(r, mine)).map((u) => {
-    const seen = lastSeen(repo.coreOn(r), u.recipient);
+  const undelivered = await repo.messages.undeliveredFrom(r, mine);
+  const lastSeenAt = await repo.bindings.lastSeen(r, undelivered.map((u) => u.recipient));
+  const queued = undelivered.map((u) => {
+    const seen = lastSeenAt.get(u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(hub.now() - seen)} ago` } : {}) };
   });
   const marks = await writerMarks(repo, r, session, owed.map((m) => m.id), []);

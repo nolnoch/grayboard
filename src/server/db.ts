@@ -6,8 +6,8 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { ALIAS_SESSION_SQL, HOLD_ORDER, setAccess, type CoreDb } from "../core/boards.ts";
-import { dropHold, logBinding } from "../core/bindings.ts";
+import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, setAccess, type CoreDb } from "../core/boards.ts";
+import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
@@ -320,6 +320,30 @@ export interface Repo {
     seen(r: Read, addresses: string[]): Promise<Map<string, { last_seen: number; cwd: string | null; place: string | null }>>;
     // Also deletes the alias's read points.
     remove(tx: Tx, address: string): Promise<void>;
+  };
+  // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a). The writes
+  // (holdAlias, logBinding, the ids and presence stamps) are still core's, through coreOn, until B1c.
+  bindings: {
+    // The aliases a session holds, oldest hold first (HOLD_ORDER).
+    holdsOf(r: Read, id: string): Promise<string[]>;
+    // holdsOf for each of ids in one statement; an ID that holds nothing maps to [].
+    holdsOfMany(r: Read, ids: string[]): Promise<Map<string, string[]>>;
+    // The session holding an address now, or null.
+    holderOf(r: Read, address: string): Promise<string | null>;
+    // holderOf for each of addresses in one statement; a free address is absent.
+    holdersOf(r: Read, addresses: string[]): Promise<Map<string, string>>;
+    // A session acting as an address, live or in its grace (core aliasUser): with exceptPrincipal, only another principal's.
+    userOf(r: Read, address: string, exceptPrincipal?: string | null): Promise<string | null>;
+    // The address set a caller acting as address reads as (core addressSet).
+    addressSet(r: Read, address: string, principal: string | null): Promise<string[]>;
+    idRow(r: Read, id: string): Promise<IdRow | undefined>;
+    // The sessions not yet ended (viewers aside).
+    unendedIds(r: Read): Promise<string[]>;
+    idStatuses(r: Read, ids: string[]): Promise<Map<string, { status: string; status_at: number | null }>>;
+    // The aliases unended sessions act as, every principal's or one's.
+    aliasUses(r: Read, principal: string | null): Promise<AliasUse[]>;
+    // When each handle (an alias or a session ID) was last seen; one never seen is absent.
+    lastSeen(r: Read, handles: string[]): Promise<Map<string, number>>;
   };
   // The writes return promises (#807 P3 A6g), and so do the reads, on the caller's handle (A7e3).
   teams: {
@@ -1355,6 +1379,39 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("DELETE FROM mailbox_cursors WHERE address = ?", [address]);
           db.run("DELETE FROM aliases WHERE address = ?", [address]);
         })();
+      },
+    },
+
+    bindings: {
+      holdsOf: async (r, id) => holdsOf(sqliteOf(r), id),
+      async holdsOfMany(r, ids) {
+        const out = new Map<string, string[]>(ids.map(id => [id, []]));
+        const rows = sqliteOf(r).query<{ id: string; address: string }, [string]>(
+          `SELECT id, address FROM alias_holds WHERE id IN (SELECT value FROM json_each(?)) ${HOLD_ORDER}`,
+        ).all(JSON.stringify(ids));
+        for (const { id, address } of rows) out.get(id)!.push(address);
+        return out;
+      },
+      holderOf: async (r, address) => holderOf(sqliteOf(r), address),
+      async holdersOf(r, addresses) {
+        const rows = sqliteOf(r).query<{ id: string; address: string }, [string]>(
+          `SELECT id, address FROM alias_holds WHERE address IN (SELECT value FROM json_each(?))`,
+        ).all(JSON.stringify(addresses));
+        return new Map(rows.map(({ id, address }) => [address, id]));
+      },
+      userOf: async (r, address, exceptPrincipal = null) => aliasUser(sqliteOf(r), address, exceptPrincipal),
+      addressSet: async (r, address, principal) => addressSet(sqliteOf(r), address, principal),
+      idRow: async (r, id) => idRow(sqliteOf(r), id),
+      unendedIds: async (r) => unendedIds(sqliteOf(r)),
+      idStatuses: async (r, ids) => idStatuses(sqliteOf(r), ids),
+      aliasUses: async (r, principal) => aliasUses(sqliteOf(r), principal),
+      async lastSeen(r, handles) {
+        const db = sqliteOf(r), out = new Map<string, number>();
+        for (const h of new Set(handles)) {
+          const at = lastSeen(db, h);
+          if (at !== null) out.set(h, at);
+        }
+        return out;
       },
     },
 

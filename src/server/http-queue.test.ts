@@ -111,17 +111,24 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
 }
 
 // #807 P1c-15c-1: the claim, identity and team routes reach core's helpers through `repo.coreOn(handle)`: their write
-// body's `Tx` inside it, the pool outside (the claim list).
+// body's `Tx` inside it, the pool outside (the claim list). P3 B1a: and their binding reads through `repo.bindings`, the same way.
 test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's Tx", async () => {
   const srv = new TestServer();
   cleanups.push(() => srv.stop());
   const { repo, db } = srv.app;
   const you = await srv.login("you@example.com"), bob = await srv.login("bob@example.com");
-  const checks: { route: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   let route = "";
+  const bindingSpies = (Object.keys(repo.bindings) as (keyof typeof repo.bindings)[]).map(name => {
+    const own = (repo.bindings[name] as (...a: unknown[]) => unknown).bind(repo.bindings);
+    return spyOn(repo.bindings, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push({ route, op: name, inTxn: db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return own(r, ...rest);
+    }) as never);
+  });
   const original = repo.coreOn.bind(repo);
   const spy = spyOn(repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
-    checks.push({ route, inTxn: db.inTransaction, handle: h === repo.read ? "pool" : "tx" });
+    checks.push({ route, op: "coreOn", inTxn: db.inTransaction, handle: h === repo.read ? "pool" : "tx" });
     return original(h);
   }) as never);
   const call = async (name: string, token: string, method: string, path: string, body?: unknown, status = 200) => {
@@ -149,8 +156,14 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     // Each in-body route reached core at least once, so the last check isn't vacuous for it.
     expect(inBody.filter(r => !checks.some(c => c.route === r && c.handle === "tx"))).toEqual([]);
     expect(checks.some(c => c.route === "claim list" && c.handle === "pool")).toBe(true);
+    // B1a: the ID branch's row, the alias-in-use checks and the claim's address set read on the body's Tx.
+    const reads = (r: string) => checks.filter(c => c.route === r && c.op !== "coreOn").map(c => `${c.op}:${c.handle}`);
+    expect(reads("claim call as id")).toEqual(["idRow:tx", "addressSet:tx"]);
+    expect(reads("claim call")).toEqual(["userOf:tx", "addressSet:tx"]);
+    expect(reads("identity delete")).toEqual(["userOf:tx"]);
+    expect(reads("team delete-alias")).toEqual(["userOf:tx"]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
-  } finally { spy.mockRestore(); }
+  } finally { spy.mockRestore(); for (const s of bindingSpies) s.mockRestore(); }
 });
 
 // #807 P1c-15c-2: the attachment routes and retention reach core's helpers through `repo.coreOn(handle)`: a write
