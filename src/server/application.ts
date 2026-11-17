@@ -16,7 +16,8 @@ import {
   orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
-import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
+import { participant, type MessageRow, type Repo } from "./db.ts";
+import { sweepStoredBlobs } from "./attachments.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -34,7 +35,7 @@ import { countRefusal } from "./metrics.ts";
 import type { Principal } from "../core/resolver.ts";
 import { assertDeliverableId, coreRefusalCode, endSession, Undeliverable } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
-import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs, type Uploader } from "../core/attachments.ts";
+import { attachmentIds, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
@@ -711,7 +712,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         console.error("[grayboard] delivering an end's bounces failed:", error);
       }
       wake(hub, onCommit(repo.read), [...woken]);
-      void sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
+      void sweepStoredBlobs(repo);
     })();
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
@@ -1524,7 +1525,7 @@ async function prepareSend(
   try {
     checkBody(body);
     ids = attachmentIds(attachmentIdsRaw);
-    digests = uploadDigests(repo.coreOn(r), ids, uploaderOf(session));
+    digests = await repo.attachments.unsentDigests(r, ids, uploaderOf(session));
   } catch (e) {
     if (e instanceof CoreError) fail("bad_request", e.message);
     throw e;
@@ -1656,14 +1657,14 @@ async function writeOnce<W extends Written>(
   const { authed } = session;
   const out = await dedupWrite(repo, tx, hub.now(), {
     tool, session: session.sessionId, sender, actor: authed.user_email, transport: session.transport, args, resend,
-  }, write, sp => {
-    for (const row of dropUnsentUploads(hub.repo.coreOn(sp), uploads, uploaderOf(session))) {
+  }, write, async sp => {
+    for (const row of await repo.attachments.dropUnsent(sp, uploads, uploaderOf(session))) {
       writeAudit(repo, sp, "attachment.released", authed.user_email, `attachment:${row.id}`, {
         identity: row.uploader, filename: row.filename, size: row.size, sha256: row.sha256, reason: "replayed",
       });
     }
   }, recheck);
-  if ("replay" in out && uploads.length > 0) tx.afterCommit(async () => { await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo)); });
+  if ("replay" in out && uploads.length > 0) tx.afterCommit(async () => { await sweepStoredBlobs(repo); });
   return out;
 }
 
@@ -1849,7 +1850,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || (await repo.cursors.directFor(tx, m.recipient)) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (!(await repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId }))) return fail("bad_request", retractRefusal.replied(id));
-  tx.afterCommit(async () => { await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo)); });
+  tx.afterCommit(async () => { await sweepStoredBlobs(repo); });
   return {};
 }
 
@@ -1917,7 +1918,7 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     if (parentId !== null && typeof parentId !== "number") throw new CoreError("parent_id must be a number");
     // Before the write is deduplicated: access is re-checked on a repeat, so a caller who has lost the board is refused, not replayed (#296).
     checkPostAccess(repo.coreOn(tx), me, postArgs.board, parentId);
-    const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: uploadDigests(repo.coreOn(tx), ids, uploaderOf(session)) };
+    const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: await repo.attachments.unsentDigests(tx, ids, uploaderOf(session)) };
     out = await writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, sp => {
       const o = callBoardTool(repo.coreOn(sp), me, "board_post", postArgs, ctx);
       const r = o.result as BoardPostResult;

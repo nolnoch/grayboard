@@ -1,8 +1,8 @@
-import { queuedTx, type Repo } from "./db.ts";
+import type { Repo } from "./db.ts";
+import { sweepStoredBlobs } from "./attachments.ts";
 import type { Tx } from "./store/tx.ts";
 import type { Config } from "./config.ts";
 import { pruneEndedIds, prunePosts } from "../core/boards.ts";
-import { pruneUnbound, sweepBlobs } from "../core/attachments.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
@@ -52,13 +52,13 @@ export async function runRetention(repo: Repo, config: Config, now = Date.now(),
     // tombstone, so its key coming back is audited as reused.
     await repo.write(tx => pruneEndedIds(repo.coreOn(tx), now - config.messageRetentionDays * 86_400_000, now));
     await repo.write((tx) => pruneAudit(repo, tx, now - config.auditRetentionDays * 86_400_000));
-    await repo.write(tx => pruneUnbound(repo.coreOn(tx), now - UNBOUND_TTL_MS));
+    await repo.write(tx => repo.attachments.pruneUnbound(tx, now - UNBOUND_TTL_MS));
     await repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS));
   } catch (e) {
     console.error("[grayboard] retention failed:", e);
   }
   // Also finishes any sweep a crash or a failed delete left.
-  const swept = await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
+  const swept = await sweepStoredBlobs(repo);
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
   try {
     // As the queue's holder: no other write is mid-transaction while the pages go.

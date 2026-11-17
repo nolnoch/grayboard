@@ -285,4 +285,13 @@ describe("dedupWrite", () => {
     expect(audits("request.replayed")).toEqual([]);
     expect(count("SELECT COUNT(*) AS n FROM messages")).toBe(1);
   });
+
+  // onReplay is async (#807 P3 B3: the replay's upload drop goes through repo.attachments): it is awaited inside the
+  // savepoint, so its failure fails the replay rather than settling after the replay went out.
+  test("a replay's async onReplay that rejects refuses the replay", async () => {
+    await dedup(1_000, call(), send());
+    const refused = seed(repo, tx => dedupWrite(repo, tx, 2_000, call(), send(), async () => { await Promise.resolve(); throw new Error("drop failed"); }));
+    await expect(refused).rejects.toThrow("drop failed");
+    expect(audits("request.replayed")).toEqual([]);
+  });
 });

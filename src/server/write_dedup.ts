@@ -64,7 +64,7 @@ export type DedupOutcome<W extends Written> =
 // fresh call would get when authority over what the first call wrote has gone
 // since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
 export function dedupWrite<W extends Written>(
-  repo: Repo, parent: Tx, now: number, call: DedupCall, write: (tx: Tx) => W | Promise<W>, onReplay: (tx: Tx) => void = () => {},
+  repo: Repo, parent: Tx, now: number, call: DedupCall, write: (tx: Tx) => W | Promise<W>, onReplay: (tx: Tx) => void | Promise<void> = () => {},
   recheck: (stored: W["payload"], tx: Tx) => void | Promise<void> = () => {},
 ): Promise<DedupOutcome<W>> {
   const fp = fingerprint(call.tool, call.session, call.sender, call.args);
@@ -104,7 +104,7 @@ export function dedupWrite<W extends Written>(
       writeAudit(repo, tx, "request.replayed", call.actor, call.sender, {
         tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
       });
-      onReplay(tx);
+      await onReplay(tx);
       return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
     }
     const w = await write(tx);

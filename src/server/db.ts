@@ -10,7 +10,7 @@ import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, registerId, setAccess, setAlia
 import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
-import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
+import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type AttachmentRow, type BlobStore, type NewUpload, type Uploader } from "../core/attachments.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
@@ -160,32 +160,10 @@ const isThenable = (v: unknown): v is PromiseLike<unknown> =>
 
 // Core's shared writes (attachment store/release/sweep, claim expiry, #807 D4) through repo's write queue, each body
 // given the connection its queued body's `Tx` resolves to (P1c-15c-2). Core's bodies are synchronous, so the cast
-// only restates that.
+// only restates that. The server's own flows reach these through `repo.claims` and `repo.attachments` (P3 B2, B3); this
+// stays for tests that drive core's flows against a server database.
 export function queuedTx(repo: Repo): WriteTx {
   return <T>(fn: (db: CoreDb) => T) => repo.write((tx: Tx) => fn(repo.coreOn(tx)) as Sync<T>) as Promise<T>;
-}
-
-// queuedTx, plus the core-shaped guard (`() => void`) core calls inside those bodies (attachment store and release):
-// it runs the server's `guard` on the body's own `Tx` (#1053), so the check reads the writer, not a second pool
-// connection. The server's guard is async and core's bodies are synchronous (#807 P3 A7d2a), so each body awaits the
-// guard on its Tx first, while it holds the queue, and only then runs core's body, whose core-shaped guard throws that
-// verdict: the same check on the same Tx, with no write of core's before it. Every body through `tx` pays the check,
-// the ones whose core body never calls the guard (the blob sweep, a failed store's cleanup) too. `body` is set and
-// cleared with no await between, and the queue runs one body at a time, so one slot serves them all.
-export function queuedGuardTx(repo: Repo, guard?: (r: Read) => void | Promise<void>): { tx: WriteTx; guard?: () => void } {
-  let body: { refused?: { error: unknown } } | undefined;
-  const tx: WriteTx = <T>(fn: (db: CoreDb) => T) => repo.write(async (t: Tx) => {
-    let refused: { error: unknown } | undefined;
-    if (guard) {
-      try { await guard(t); } catch (error) { refused = { error }; }
-    }
-    body = { refused };
-    try { return fn(repo.coreOn(t)); } finally { body = undefined; }
-  }) as Promise<T>;
-  return { tx, guard: guard && (() => {
-    if (!body) throw new Error("an attachment guard ran outside its transaction body");
-    if (body.refused) throw body.refused.error;
-  }) };
 }
 
 // A write no caller waits for (an audit row, a closing session's last-seen touch, a lapsed lease's settle; #807 P1b-4b),
@@ -361,6 +339,25 @@ export interface Repo {
     setPlace(tx: Tx, id: string, place: string | null): Promise<void>;
     // An alias's labels (core setAliasMeta), audited through `audit`.
     setMeta(tx: Tx, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string): Promise<void>;
+  };
+  // Uploads and the blob catalog (#807 P3 B3), on the caller's handle. Messages' attachments stay inside the messages
+  // store; posts' go with the board writes (B5b). The flows over these (store, release, sweep) are in attachments.ts.
+  attachments: {
+    get(r: Read, id: number): Promise<AttachmentRow | undefined>;
+    // The blob digests of `from`'s unsent uploads `ids`, in call order; rejects with CoreError on an id that isn't one.
+    unsentDigests(r: Read, ids: number[], from: Uploader): Promise<string[]>;
+    // Deletes `from`'s unsent uploads among `ids`, returning them.
+    dropUnsent(tx: Tx, ids: number[], from: Uploader): Promise<AttachmentRow[]>;
+    // Deletes the uploads left unbound since before `olderThanMs`; returns how many.
+    pruneUnbound(tx: Tx, olderThanMs: number): Promise<number>;
+    // Prunes, checks the quota (rejects with TooLargeError), and inserts the catalog entry and the row (core
+    // insertUpload). On Postgres the quota check holds the principal's lock (D3).
+    insertUpload(tx: Tx, upload: NewUpload): Promise<{ row: AttachmentRow; pruned: boolean }>;
+    remove(tx: Tx, id: number): Promise<void>;
+    // The catalog's blobs no attachment names; whether one is named; its entry dropped while unnamed (0 or 1).
+    unnamedBlobs(r: Read): Promise<string[]>;
+    named(r: Read, sha256: string): Promise<boolean>;
+    dropBlobEntry(tx: Tx, sha256: string): Promise<number>;
   };
   // Claims' reads and the expiry sweep (#807 P3 B2), on the caller's handle. The claim tools' writes stay with
   // callBoardTool (B5b).
@@ -1461,6 +1458,18 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       setIdFacts: async (tx, id, facts) => setIdFacts(sqliteOf(tx), id, facts),
       setPlace: async (tx, id, place) => setPlace(sqliteOf(tx), id, place),
       setMeta: async (tx, address, meta, session, audit, actor) => setAliasMeta(sqliteOf(tx), address, meta, session, audit, actor),
+    },
+
+    attachments: {
+      get: async (r, id) => getAttachment(sqliteOf(r), id),
+      unsentDigests: async (r, ids, from) => uploadDigests(sqliteOf(r), ids, from),
+      dropUnsent: async (tx, ids, from) => dropUnsentUploads(sqliteOf(tx), ids, from),
+      pruneUnbound: async (tx, olderThanMs) => pruneUnbound(sqliteOf(tx), olderThanMs),
+      insertUpload: async (tx, upload) => insertUpload(sqliteOf(tx), upload),
+      remove: async (tx, id) => removeUpload(sqliteOf(tx), id),
+      unnamedBlobs: async (r) => unnamedBlobs(sqliteOf(r)),
+      named: async (r, sha256) => blobNamed(sqliteOf(r), sha256),
+      dropBlobEntry: async (tx, sha256) => dropBlobEntry(sqliteOf(tx), sha256),
     },
 
     claims: {

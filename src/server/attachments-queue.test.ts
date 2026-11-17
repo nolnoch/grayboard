@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, queuedTx } from "./db.ts";
-import { releaseStored, storeUpload } from "./attachments.ts";
+import { releaseStored, storeUpload, sweepStoredBlobs } from "./attachments.ts";
 import { sweepBlobs } from "../core/attachments.ts";
 import { sha256Hex } from "../shared/hash.ts";
 import { queueFor } from "./store/queue.ts";
@@ -99,6 +99,8 @@ test("#974: a failed blob put's row delete waits behind another body holding the
   await holder!.done;
   await expect(stored).rejects.toThrow("disk full");
   expect(rows(db)).toEqual([]);
+  // P3 B3: the dropped row's catalog entry is swept with it: no entry names bytes that were never put.
+  expect(catalog(db)).toEqual([]);
 });
 
 // #807 P3 A7d2a: the guard is async; each body awaits it on its own Tx, so a refusal that settles after a microtask
@@ -138,4 +140,36 @@ test("#974: an upload whose guard refuses is released through the write queue", 
   await holder!.done;
   await expect(stored).rejects.toThrow("revoked");
   expect(rows(db)).toEqual([]);
+});
+
+// #807 P3 B3: the server's store checks its principal's quotas in the row's write, through repo.attachments: a refused
+// upload leaves no row, no catalog entry and no bytes.
+test("#807 P3 B3: an upload over the stored-byte quota is refused before anything is stored", async () => {
+  const { db, repo } = setup();
+  repo.attachmentUserQuota = 8;
+  await storeUpload(repo, "you@example.com", "be", file("hello"));
+  let puts = 0;
+  const put = repo.blobs.put.bind(repo.blobs);
+  repo.blobs.put = async (sha: string, data: Uint8Array) => { puts++; await put(sha, data); };
+  await expect(storeUpload(repo, "you@example.com", "be", file("world"))).rejects.toThrow("your stored attachments would exceed");
+  expect(puts).toBe(0);
+  expect(rows(db)).toHaveLength(1);
+  expect(catalog(db)).toEqual([sha256Hex(new TextEncoder().encode("hello"))]);
+});
+
+// #807 P3 B3: the sweep reads its candidates on the pool, then rechecks each under the blob's lock: an upload that
+// named the sha256 after the first read keeps its bytes and its catalog entry.
+test("#807 P3 B3: a blob an upload names after the sweep's first read is kept", async () => {
+  const { db, repo } = setup();
+  const named = await storeUpload(repo, "you@example.com", "be", file("kept"));
+  const orphan = sha256Hex(new TextEncoder().encode("orphan"));
+  await seed(repo, () => { db.prepare(`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (?, 6, 0)`).run(orphan); });
+  // A stale first read: it lists the named blob as unnamed too.
+  repo.attachments.unnamedBlobs = async () => [named.sha256, orphan];
+  const deleted: string[] = [];
+  const del = repo.blobs.delete.bind(repo.blobs);
+  repo.blobs.delete = async (sha: string) => { deleted.push(sha); await del(sha); };
+  expect(await sweepStoredBlobs(repo)).toBe(1);
+  expect(deleted).toEqual([orphan]);
+  expect(catalog(db)).toEqual([named.sha256]);
 });
