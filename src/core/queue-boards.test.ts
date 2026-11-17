@@ -175,6 +175,17 @@ test("a lapse's [unclaimed] reply is the user of the lane's session", () => {
   ]);
 });
 
+// #855 audit: a lane alias no session held at delivery takes its user at the lapse, from the session holding it then.
+test("a lapse's [unclaimed] reply for a lane alias held only after delivery is the user of its holder at the lapse", () => {
+  db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+  const r = post(db, "be", "work", "work item"); // fe, the only lane and held by nobody, claims
+  expect(db.prepare(`SELECT holder_user FROM claims WHERE key = ?`).get(claimKey(r.post.id))).toEqual({ holder_user: null });
+  registerId(db, { id: "id:00000000000fe", principal: "u-fe", launcher: false });
+  holdAlias(db, "fe", "id:00000000000fe");
+  sweepExpired(db, Date.now() + 31 * 60_000);
+  expect(db.prepare(`SELECT author, author_user FROM posts WHERE parent_id = ?`).all(r.post.id)).toEqual([{ author: "fe", author_user: "u-fe" }]);
+});
+
 test("a reply by the claim holder acks and releases the claim", () => {
   const r = post(db, "be", "work", "work item"); // fe claims
   const reply = post(db, "fe", "work", "done: landed", r.post.id);

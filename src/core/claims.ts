@@ -22,12 +22,16 @@ const CLAIM_COLS = "key, holder, note, board, acquired_at, expires_at";
 type ClaimRow = Claim & { holder_user: string | null };
 
 // The user an announcement the system writes for a claim (its expiry, a session end's release) is recorded
-// as written by (#855): the claimant's, or for a claim from before holder_user an ID holder's principal, else a
-// person alias's person (a team alias names no user).
+// as written by (#855): the claimant's, or for a claim from before holder_user (or a queue delivery to an alias
+// no session held then) an ID holder's principal, else the user of the session holding the alias now, else a
+// person alias's person. A team alias nobody holds names no user.
 function holderUser(db: Database, c: ClaimRow): string | undefined {
   if (c.holder_user) return c.holder_user;
   const principal = idRow(db, c.holder)?.principal;
   if (principal) return principal;
+  const held = db.prepare(`SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`).get(c.holder) as
+    { principal: string | null } | null;
+  if (held?.principal) return held.principal;
   const p = addressParts(c.holder);
   return p?.kind === "alias" && p.scopeKind === "person" ? p.scope : undefined;
 }
@@ -193,7 +197,7 @@ export function claim(
 // that hasn't held it. With none left, the post stays readable on its board
 // unclaimed, and a reply in its thread, as the lane that held it last, tells
 // the poster and the claim's watchers (#220). The reply's author shows that
-// last lane, as `[expired]` posts show a holder; its text counts the others
+// last lane, as `[expired]` posts show a holder; its text counts the lanes
 // rather than naming them. A decline's reply is the declining session's
 // (`ctx`); a lapse's is the claimant's user (#855). Like a holder that lost
 // access, one that can't post there now ends it quietly.
