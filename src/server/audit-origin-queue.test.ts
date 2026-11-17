@@ -29,7 +29,8 @@ test("#1042: bodies queued behind an async body write their own request's origin
   const gate = new Promise<void>(r => { release = r; });
   // A holds the queue across an await, as a Postgres-era body will (#807 D4).
   const held = inRequest(a, () => repo.write(async () => { await gate; repo.audit.write(row("t.a")); }));
-  const wrote = inRequest(b, () => repo.write(() => { repo.audit.write(row("t.b")); }));
+  // B's committed runs after its commit, still as B's work: its row too carries b.
+  const wrote = inRequest(b, () => repo.write(() => { repo.audit.write(row("t.b")); }, () => repo.post(() => { repo.audit.write(row("t.b.committed")); })));
   expect(inRequest(c, () => repo.post(() => { repo.audit.write(row("t.c")); }))).toBe(false);
   expect(detached(() => repo.post(() => { repo.audit.write(row("t.none")); }))).toBe(false);
   release();
@@ -39,6 +40,7 @@ test("#1042: bodies queued behind an async body write their own request's origin
   expect(got).toEqual([
     { action: "t.a", ip: a.ip, ua: a.ua },
     { action: "t.b", ip: b.ip, ua: b.ua },
+    { action: "t.b.committed", ip: b.ip, ua: b.ua },
     { action: "t.c", ip: c.ip, ua: c.ua },
     { action: "t.none", ip: null, ua: null },
   ]);
