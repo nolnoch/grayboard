@@ -160,7 +160,6 @@ var sessionDir = (base, claudePid) => join(agentsRoot(base), String(claudePid));
 var FACTS = ["model", "effort"];
 var HOOK_ERROR = "hook-error";
 var HOOK_ERROR_MAX = 1024;
-var FACT_EVENTS = new Set(["session-start", "pre-tool-use", "model-switch"]);
 var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
 var validFact = (v) => typeof v === "string" && FACT.test(v);
 function putFact(dir, fact, value) {
@@ -206,38 +205,47 @@ function ageMs(path, now) {
   }
 }
 function runHook(event, stdin, o) {
+  const errorPath = () => {
+    const pid = Number(o.env.CLAUDE_PID);
+    return Number.isSafeInteger(pid) && pid > 1 ? join(sessionDir(o.base, pid), HOOK_ERROR) : undefined;
+  };
   const failed = (error) => {
-    if (!o.hosted || !FACT_EVENTS.has(event))
-      return;
     try {
-      const pid = Number(o.env.CLAUDE_PID);
-      if (!Number.isSafeInteger(pid) || pid <= 1)
+      const path = errorPath();
+      if (!path)
         return;
-      const text = `${event}: ${error instanceof Error ? error.message : String(error)}`.replace(/[\x00-\x1f\x7f]+/g, " ").slice(0, HOOK_ERROR_MAX);
-      put(join(sessionDir(o.base, pid), HOOK_ERROR), text);
+      const text = `${event}: ${error instanceof Error ? error.message : String(error)}`.replace(/\.tmp\.\d+/g, ".tmp").replace(CONTROLS, " ").slice(0, HOOK_ERROR_MAX);
+      put(path, text);
     } catch {}
   };
+  const cleared = () => {
+    const path = errorPath();
+    if (path)
+      try {
+        rmSync(path, { force: true });
+      } catch (error) {
+        failed(error);
+      }
+  };
+  const facts = { state: "none" };
   let out;
   try {
-    out = hookEvent(event, stdin, o);
+    out = hookEvent(event, stdin, o, facts);
   } catch (error) {
-    failed(error);
+    if (facts.state === "writing")
+      failed(error);
+    else if (facts.state === "written")
+      cleared();
     if (o.hosted)
       return;
     throw error;
   }
-  if (o.hosted && FACT_EVENTS.has(event)) {
-    const pid = Number(o.env.CLAUDE_PID);
-    if (Number.isSafeInteger(pid) && pid > 1)
-      try {
-        rmSync(join(sessionDir(o.base, pid), HOOK_ERROR), { force: true });
-      } catch (error) {
-        failed(error);
-      }
-  }
+  if (facts.state === "written")
+    cleared();
   return out;
 }
-function hookEvent(event, stdin, o) {
+var CONTROLS = /[\x00-\x1f\x7f-\x9f]+/g;
+function hookEvent(event, stdin, o, facts) {
   try {
     const pid = Number(o.env.CLAUDE_PID);
     if (!Number.isSafeInteger(pid) || pid <= 1)
@@ -260,11 +268,13 @@ function hookEvent(event, stdin, o) {
       put(join(dir, "start"), start ?? "");
       if (!o.hosted && validSourceId(input.session_id))
         put(join(dir, "current"), JSON.stringify({ session: input.session_id, start: start ?? "", token: `${now}-${process.pid}-${Math.random().toString(36).slice(2)}` }));
-      if (o.hosted) {
+      if (o.hosted && (input.source !== "clear" || validFact(input.model))) {
+        facts.state = "writing";
         if (input.source !== "clear")
           for (const fact of FACTS)
             dropFact(dir, fact);
         putFact(dir, "model", input.model);
+        facts.state = "written";
       }
       pruneSessions(o.base, pid);
     } else if (event === "pre-tool-use") {
@@ -282,12 +292,14 @@ function hookEvent(event, stdin, o) {
       if (o.hosted && content === ROOT) {
         const level = input.effort?.level;
         testPause("hook-root-effort", o.env);
+        facts.state = "writing";
         if (level === undefined || level === null)
           noFact(dir, "effort");
         else
           putFact(dir, "effort", level);
         if (stamp(join(dir, "model")) !== modelAt)
           dropFact(dir, "effort");
+        facts.state = "written";
       }
     } else if (event === "post-tool-use") {
       if (!o.hosted)
@@ -297,8 +309,10 @@ function hookEvent(event, stdin, o) {
         return JSON.stringify({ systemMessage: `grayboard: open ${url} to sign in` });
     } else if (event === "model-switch") {
       if (o.hosted && validFact(input.to_model)) {
+        facts.state = "writing";
         putFact(dir, "model", input.to_model);
         dropFact(dir, "effort");
+        facts.state = "written";
       }
     } else if (event === "subagent-stop") {
       if (!o.hosted)

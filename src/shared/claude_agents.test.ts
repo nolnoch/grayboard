@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dropCalled, dropSignIn, factReader, HOOK_ERROR, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
@@ -253,12 +253,40 @@ describe("facts (#545)", () => {
     expect(facts()).toEqual({ model: "claude-opus-5-5" });
     expect(said.map(s => s.split(":")[0])).toEqual(["effort", "hook"]);
     expect(said[1]).toStartWith("hook: pre-tool-use: ");
+    // Without the temporary's pid: every hook is a new process, and a lasting failure must read the same.
+    expect(said[1]).toContain("effort.tmp");
+    expect(said[1]).not.toMatch(/\.tmp\.\d/);
+    // A hook that wrote no fact neither clears it (a subagent's call, an invalid one, a /clear without a model)...
+    hook("pre-tool-use", { tool_use_id: id(7), agent_id: "sub-1" }, true);
+    hook("pre-tool-use", { tool_use_id: "bad id" }, true);
+    hook("model-switch", { to_model: "" }, true);
+    hook("session-start", { source: "clear" }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(true);
+    // ...nor fails one: a subagent's record that can't be written is the reader's missing-record error.
+    const before = readFileSync(join(dir, HOOK_ERROR), "utf8");
+    mkdirSync(join(dir, id(8), "x"), { recursive: true });
+    hook("pre-tool-use", { tool_use_id: id(8), agent_id: "sub-1" }, true);
+    expect(readFileSync(join(dir, HOOK_ERROR), "utf8")).toBe(before);
     rmSync(join(dir, "effort"), { recursive: true });
     hook("pre-tool-use", { tool_use_id: id(2), effort: { level: "high" } }, true);
     expect(existsSync(join(dir, HOOK_ERROR))).toBe(false);
     said.length = 0;
     expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "high" });
     expect(said).toEqual([]);
+    // A model switch's failed write is said too, and a startup SessionStart's success clears it.
+    mkdirSync(join(dir, "model.tmp." + process.pid, "x"), { recursive: true });
+    hook("model-switch", { to_model: "claude-haiku-4-5" }, true);
+    expect(readFileSync(join(dir, HOOK_ERROR), "utf8")).toStartWith("model-switch: ");
+    rmSync(join(dir, "model.tmp." + process.pid), { recursive: true });
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    expect(existsSync(join(dir, HOOK_ERROR))).toBe(false);
+  });
+
+  test("the reader folds a hook-error's control characters (#561)", () => {
+    hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+    writeFileSync(join(sessionDir(base, pid), HOOK_ERROR), "pre-tool-use: \x1b[31mred\u009b2J\nnext");
+    facts();
+    expect(said).toEqual(["hook: pre-tool-use:  [31mred 2J next"]);
   });
 
   test("the plugin's reader says a problem once, and again only after a read without it (#561)", () => {

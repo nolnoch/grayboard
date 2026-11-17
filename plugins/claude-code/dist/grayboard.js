@@ -38032,7 +38032,6 @@ var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid))
 var FACTS = ["model", "effort"];
 var HOOK_ERROR = "hook-error";
 var HOOK_ERROR_MAX = 1024;
-var FACT_EVENTS = new Set(["session-start", "pre-tool-use", "model-switch"]);
 var FACT = new RegExp(`^[\\x21-\\x7e]{1,${SESSION_FACT_MAX}}$`);
 var validFact = (v) => typeof v === "string" && FACT.test(v);
 function put(path, text) {
@@ -38069,6 +38068,7 @@ function dropSignIn(base, claudePid, url) {
   }
   rmSync(path, { force: true });
 }
+var CONTROLS = /[\x00-\x1f\x7f-\x9f]+/g;
 var MISSING_TEXT = {
   bad_tool_use_id: "the call's tool_use_id isn't one Claude Code makes",
   no_session: "no SessionStart record for this Claude Code process (its grayboard hooks didn't run)",
@@ -38153,9 +38153,12 @@ function readFacts(base, claudePid, harnessStart, bad) {
     else
       bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);
   }
+  let failure;
   try {
-    bad("hook", readSmall(join5(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4));
+    failure = readSmall(join5(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4).replace(CONTROLS, " ");
   } catch {}
+  if (failure !== undefined)
+    bad("hook", failure);
   return out;
 }
 function factReader(read, say) {
