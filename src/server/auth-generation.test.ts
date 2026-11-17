@@ -12,10 +12,10 @@ const open = (): Repo => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(jo
 const gate = () => { let open!: () => void; const p = new Promise<void>(r => { open = r; }); return { p, open }; };
 
 // Holds a write body open after `fn`'s writes until the returned release() is called; settles with the body.
-function hold(repo: Repo, fn: (tx: Tx) => void, fail = false) {
+function hold(repo: Repo, fn: (tx: Tx) => unknown, fail = false) {
   const g = gate(), wrote = gate();
   const done = repo.write(async tx => {
-    fn(tx);
+    await fn(tx);
     wrote.open();
     await g.p;
     if (fail) throw new Error("rolled back");
@@ -30,7 +30,7 @@ test("another task's generation stays the committed one while a holder's uncommi
   expect(before).toBeDefined();
   expect(repo.users.activeEmail(user.id)).toBe("a@example.com");
   let inside: string | undefined = "unset";
-  const h = hold(repo, tx => { repo.users.setDisabled(tx, user.id, true); inside = repo.authGeneration(); });
+  const h = hold(repo, async tx => { await repo.users.setDisabled(tx, user.id, true); inside = repo.authGeneration(); });
   await h.wrote;
   expect(inside).toBeUndefined();
   // Outside the holder's transaction: the committed generation, and the committed (enabled) user.
@@ -47,7 +47,7 @@ test("a rolled-back holder leaves the generation and the cached user as committe
   const repo = open();
   const user = await repo.write(tx => repo.users.upsertByEmail(tx, "b@example.com", null));
   const before = repo.authGeneration();
-  const h = hold(repo, tx => { repo.users.setDisabled(tx, user.id, true); }, true);
+  const h = hold(repo, tx => repo.users.setDisabled(tx, user.id, true), true);
   await h.wrote;
   expect(repo.users.activeEmail(user.id)).toBe("b@example.com");
   h.release();
@@ -62,7 +62,8 @@ test("a transaction's commit moves the generation too, a synchronous post's too"
   await repo.write(tx => repo.users.upsertByEmail(tx, "c@example.com", null));
   const mid = repo.authGeneration();
   expect(mid).not.toBe(before);
-  expect(repo.post(tx => { repo.users.upsertByEmail(tx, "d@example.com", null); })).toBe(true);
+  // A synchronous body (users.upsertByEmail answers with a promise, #807 P3 A6b): the user row on its Tx.
+  expect(repo.post(tx => { sqliteOf(tx).run("INSERT INTO users (email, created_at) VALUES (?, 0)", ["d@example.com"]); })).toBe(true);
   expect(repo.authGeneration()).not.toBe(mid);
 });
 

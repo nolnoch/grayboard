@@ -454,14 +454,24 @@ test("Origin and identity diagnostics are address-limited and omit URL secrets",
 for (const revoked of [false, true]) test(`authentication lost between HTTP preflight and factory (${revoked ? "revoked" : "disabled"}) returns 401 without an unexpected log`, async () => {
   let last!: Response;
   const client = await connect("2026-07-28", async response => { last = response.clone(); });
-  const original = application.admitHosted;
+  const original = application.admitHosted, { snapshot } = hosted.sessions;
   const logs = spyOn(console, "error").mockImplementation(() => {});
+  // Lost right after admission, before the factory's selection reads it. The revoke and the disable answer with a
+  // promise (#807 P3 A6b), so they run in a queued write the selection awaits, not a synchronous hook's seedSync.
+  let admitted = false;
   application.admitHosted = (...args) => {
     original(...args);
-    seedSync(store.repo, tx => {
-      if (revoked) store.repo.sessions.revokeAllForUser(tx, user.user_id);
-      else store.repo.users.setDisabled(tx, user.user_id, true);
-    });
+    admitted = true;
+  };
+  hosted.sessions.snapshot = async (...args) => {
+    if (admitted) {
+      admitted = false;
+      await seed(store.repo, async tx => {
+        if (revoked) await store.repo.sessions.revokeAllForUser(tx, user.user_id);
+        else await store.repo.users.setDisabled(tx, user.user_id, true);
+      });
+    }
+    return snapshot.apply(hosted.sessions, args);
   };
   try {
     await expect(client.callTool({ name: "board_list", arguments: {} })).rejects.toThrow();
@@ -470,7 +480,7 @@ for (const revoked of [false, true]) test(`authentication lost between HTTP pref
     expect(await last.json()).toMatchObject({ error: "invalid_token" });
     expect(logs).not.toHaveBeenCalled();
     expect(hosted.activeContexts).toBe(0);
-  } finally { application.admitHosted = original; logs.mockRestore(); }
+  } finally { application.admitHosted = original; hosted.sessions.snapshot = snapshot; logs.mockRestore(); }
 });
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const status of [401, 403]) test(`${version}: explicit factory ${status} response is preserved unchanged`, async () => {

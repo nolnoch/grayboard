@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase, type Sync } from "./db.ts";
+import { openDatabase } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";

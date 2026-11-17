@@ -473,9 +473,9 @@ test("global quota applies across users transactionally without creating an over
   await hosted.whoami(principal, context("template"));
   const template = database.repo.hosted.all(database.repo.read)[0]!;
   await hosted.end(principal, context("template"));
-  await seed(database.repo, tx => {
+  await seed(database.repo, async tx => {
     for (let userIndex = 0; userIndex < hosted.limits.global / hosted.limits.user; userIndex++) {
-      const user = database.repo.users.upsertByEmail(tx, `user${userIndex}@example.com`, null);
+      const user = await database.repo.users.upsertByEmail(tx, `user${userIndex}@example.com`, null);
       for (let i = 0; i < hosted.limits.user; i++) {
         const id = `seed-${userIndex}-${i}`;
         const ownership = database.repo.hosted.start(tx, id, user.id, OPENCODE_CLIENT, now);

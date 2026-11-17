@@ -232,18 +232,18 @@ export interface Repo {
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
-    upsertByEmail(tx: Tx, email: string, displayName: string | null): User;
+    upsertByEmail(tx: Tx, email: string, displayName: string | null): Promise<User>;
     // An IdP sign-in: matches (issuer, subject) first, then the email (F-13, #928 D4).
-    signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): IdpSignIn;
+    signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn>;
     // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
-    clearSubject(tx: Tx, userId: number): void;
+    clearSubject(tx: Tx, userId: number): Promise<void>;
     findByEmail(email: string): User | undefined;
     findById(userId: number): User | undefined;
     // findById(id)?.disabled_at != null, cached on authGeneration (#853).
     isDisabled(userId: number): boolean;
     // The user's email while it exists and isn't disabled, cached on authGeneration (#853).
     activeEmail(userId: number): string | undefined;
-    setDisabled(tx: Tx, userId: number, disabled: boolean): void;
+    setDisabled(tx: Tx, userId: number, disabled: boolean): Promise<void>;
   };
   sessions: {
     create(tx: Tx, userId: number, tokenHash: string, label: string | null): Promise<Session>;
@@ -378,23 +378,25 @@ export interface Repo {
     prune(tx: Tx, olderThanMs: number): void;
   };
   slack: {
-    links(r: Read): SlackLink[];
+    links(r: Read): Promise<SlackLink[]>;
+    // Synchronous for now (#807 P3 A6b): helloOkFields reads it in application.hostedSession, whose callers (hosted
+    // reconcile, the delivery lease's committed callback) are synchronous, and core's delegation fallback calls it.
     linkFor(r: Read, userId: number): SlackLink | undefined;
-    linkBySlackUser(r: Read, slackUser: string): SlackLink | undefined;
+    linkBySlackUser(r: Read, slackUser: string): Promise<SlackLink | undefined>;
     // Replaces the user's earlier link, if any.
-    link(tx: Tx, userId: number, slackUser: string, dmChannel: string): void;
+    link(tx: Tx, userId: number, slackUser: string, dmChannel: string): Promise<void>;
     // Also forgets the user's thread map.
-    unlink(tx: Tx, userId: number): void;
-    thread(r: Read, userId: number, kind: "dm" | "board", board: string | null, rootId: number): SlackThread | undefined;
-    threadByTs(r: Read, userId: number, threadTs: string): SlackThread | undefined;
-    addThread(tx: Tx, userId: number, t: SlackThread): void;
+    unlink(tx: Tx, userId: number): Promise<void>;
+    thread(r: Read, userId: number, kind: "dm" | "board", board: string | null, rootId: number): Promise<SlackThread | undefined>;
+    threadByTs(r: Read, userId: number, threadTs: string): Promise<SlackThread | undefined>;
+    addThread(tx: Tx, userId: number, t: SlackThread): Promise<void>;
     // Moves a thread's reply target forward, never back; a DM item's sender becomes its peer (#524).
-    advanceThread(tx: Tx, userId: number, threadTs: string, id: number, peer?: string): void;
+    advanceThread(tx: Tx, userId: number, threadTs: string, id: number, peer?: string): Promise<void>;
     // How far an outbound item got in Slack, keyed by its grayboard ref
     // ("dm:<message id>" or "post:<post id>"); cleared once it's done.
-    progress(r: Read, userId: number, ref: string): unknown;
-    setProgress(tx: Tx, userId: number, ref: string, progress: unknown): void;
-    clearProgress(tx: Tx, userId: number, ref: string): void;
+    progress(r: Read, userId: number, ref: string): Promise<unknown>;
+    setProgress(tx: Tx, userId: number, ref: string, progress: unknown): Promise<void>;
+    clearProgress(tx: Tx, userId: number, ref: string): Promise<void>;
   };
   writeReceipts: {
     // The receipt for (session, sender, fp) written after `since`.
@@ -877,6 +879,21 @@ function uniqueViolation(e: unknown): string | undefined {
   return /^UNIQUE constraint failed: (\S+)$/.exec(e.message)?.[1];
 }
 
+// A user row by email, created or renamed, with its principal: one SQLite transaction (nested as a savepoint inside
+// the caller's). Shared by users.upsertByEmail and signIn, whose own SQLite transaction stays synchronous.
+function upsertUser(db: Database, email: string, displayName: string | null, now: number): User {
+  return db.transaction(() => {
+    db.run(
+      `INSERT INTO users (email, display_name, created_at) VALUES (?, ?, ?)
+       ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name`,
+      [email, displayName, now],
+    );
+    const user = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email)!;
+    db.run(`INSERT OR IGNORE INTO principals (kind, name, user_id, created_at) VALUES ('user', ?, ?, ?)`, [email, user.id, now]);
+    return user;
+  })();
+}
+
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
   const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
   // Refuses to take `userId`'s ownership away when it is the team's last
@@ -999,21 +1016,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
       subscribe(fn) { observers.add(fn); return () => { observers.delete(fn); }; } },
     users: {
-      upsertByEmail(tx, email, displayName) {
-        const db = sqliteOf(tx);
-        const now = clock();
-        return db.transaction(() => {
-          db.run(
-            `INSERT INTO users (email, display_name, created_at) VALUES (?, ?, ?)
-             ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name`,
-            [email, displayName, now],
-          );
-          const user = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email)!;
-          db.run(`INSERT OR IGNORE INTO principals (kind, name, user_id, created_at) VALUES ('user', ?, ?, ?)`, [email, user.id, now]);
-          return user;
-        })();
+      async upsertByEmail(tx, email, displayName) {
+        return upsertUser(sqliteOf(tx), email, displayName, clock());
       },
-      signIn(tx, issuer, subject, email, displayName) {
+      async signIn(tx, issuer, subject, email, displayName) {
         const db = sqliteOf(tx);
         return db.transaction((): IdpSignIn => {
           // A link is conditional on the row still being unlinked (D3): on Postgres another sign-in may link it
@@ -1044,13 +1050,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
               continue;
             }
             // 6. A new user, created with both.
-            const user = this.upsertByEmail(tx, email, displayName);
+            const user = upsertUser(db, email, displayName, clock());
             if (link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject }, linked: false };
           }
           throw new Error(`sign-in for ${email} kept losing its link to concurrent sign-ins`);
         }).immediate();
       },
-      clearSubject(tx, userId) {
+      async clearSubject(tx, userId) {
         sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
       },
       findByEmail(email) {
@@ -1064,7 +1070,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         const u = cachedUser(userId);
         return u && u.disabled_at === null ? u.email : undefined;
       },
-      setDisabled(tx, userId, disabled) {
+      async setDisabled(tx, userId, disabled) {
         const db = sqliteOf(tx);
         db.transaction(() => {
           const now = clock();
@@ -1488,7 +1494,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     slack: {
-      links(r) {
+      async links(r) {
         const db = sqliteOf(r);
         return db.query<SlackLink, []>(
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id ORDER BY l.user_id",
@@ -1500,13 +1506,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id WHERE l.user_id = ?",
         ).get(userId) ?? undefined;
       },
-      linkBySlackUser(r, slackUser) {
+      async linkBySlackUser(r, slackUser) {
         const db = sqliteOf(r);
         return db.query<SlackLink, [string]>(
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id WHERE l.slack_user = ?",
         ).get(slackUser) ?? undefined;
       },
-      link(tx, userId, slackUser, dmChannel) {
+      async link(tx, userId, slackUser, dmChannel) {
         const db = sqliteOf(tx);
         db.transaction(() => {
           // Threads and progress live in the old account's DM; a new account starts fresh.
@@ -1524,7 +1530,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           );
         })();
       },
-      unlink(tx, userId) {
+      async unlink(tx, userId) {
         const db = sqliteOf(tx);
         db.transaction(() => {
           db.run("DELETE FROM slack_threads WHERE user_id = ?", [userId]);
@@ -1532,40 +1538,40 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("DELETE FROM slack_links WHERE user_id = ?", [userId]);
         })();
       },
-      thread(r, userId, kind, board, rootId) {
+      async thread(r, userId, kind, board, rootId) {
         const db = sqliteOf(r);
         const row = db.query<SlackThread, [number, string, string, number]>(
           "SELECT thread_ts, kind, board, root_id, peer, last_id FROM slack_threads WHERE user_id = ? AND kind = ? AND board = ? AND root_id = ?",
         ).get(userId, kind, board ?? "", rootId);
         return row ? { ...row, board: row.board || null } : undefined;
       },
-      threadByTs(r, userId, threadTs) {
+      async threadByTs(r, userId, threadTs) {
         const db = sqliteOf(r);
         const row = db.query<SlackThread, [number, string]>(
           "SELECT thread_ts, kind, board, root_id, peer, last_id FROM slack_threads WHERE user_id = ? AND thread_ts = ?",
         ).get(userId, threadTs);
         return row ? { ...row, board: row.board || null } : undefined;
       },
-      addThread(tx, userId, t) {
+      async addThread(tx, userId, t) {
         const db = sqliteOf(tx);
         db.run(
           `INSERT OR IGNORE INTO slack_threads (user_id, thread_ts, kind, board, root_id, peer, last_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [userId, t.thread_ts, t.kind, t.board ?? "", t.root_id, t.peer, t.last_id],
         );
       },
-      advanceThread(tx, userId, threadTs, id, peer) {
+      async advanceThread(tx, userId, threadTs, id, peer) {
         const db = sqliteOf(tx);
         db.run(
           "UPDATE slack_threads SET peer = CASE WHEN ? IS NOT NULL AND ? > last_id THEN ? ELSE peer END, last_id = MAX(last_id, ?) WHERE user_id = ? AND thread_ts = ?",
           [peer ?? null, id, peer ?? null, id, userId, threadTs],
         );
       },
-      progress(r, userId, ref) {
+      async progress(r, userId, ref) {
         const db = sqliteOf(r);
         const row = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);
         return row ? JSON.parse(row.progress) : undefined;
       },
-      setProgress(tx, userId, ref, progress) {
+      async setProgress(tx, userId, ref, progress) {
         const db = sqliteOf(tx);
         db.run(
           `INSERT INTO slack_progress (user_id, ref, progress) VALUES (?, ?, ?)
@@ -1573,7 +1579,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           [userId, ref, JSON.stringify(progress)],
         );
       },
-      clearProgress(tx, userId, ref) {
+      async clearProgress(tx, userId, ref) {
         const db = sqliteOf(tx);
         db.run("DELETE FROM slack_progress WHERE user_id = ? AND ref = ?", [userId, ref]);
       },

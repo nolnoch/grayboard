@@ -191,6 +191,15 @@ function runHook(event, stdin, o) {
     if (event === "session-start") {
       mkdirSync(dir, { recursive: true, mode: 448 });
       const start = procStart(pid);
+      if (o.hosted && start) {
+        let before = "";
+        try {
+          before = readFileSync2(join(dir, "start"), "utf8");
+        } catch {}
+        if (before && before !== start)
+          for (const sub of ["called", "ended"])
+            rmSync(join(dir, sub), { recursive: true, force: true });
+      }
       put(join(dir, "start"), start ?? "");
       if (!o.hosted && validSourceId(input.session_id))
         put(join(dir, "current"), JSON.stringify({ session: input.session_id, start: start ?? "", token: `${now}-${process.pid}-${Math.random().toString(36).slice(2)}` }));

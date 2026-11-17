@@ -53,8 +53,8 @@ test("#807: a server claim expiry timer's sweep waits behind another body holdin
   const woken: string[][] = [];
   const timer = claimExpiryTimer(db, h => { woken.push(h); }, undefined, queuedTx(repo));
   cleanups.push(() => timer.stop());
-  await seed(repo, tx => {
-    repo.users.upsertByEmail(tx, "a@example.com", null);
+  await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
     repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
     createBoard(db, "a@example.com/be", "e2e", "test");
     claim(db, "a@example.com/be", "soon", { board: "e2e", ttl_minutes: 0.001 });

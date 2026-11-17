@@ -38,10 +38,10 @@ describe("reachesHuman", () => {
   let repo: Repo;
   beforeEach(async () => {
     repo = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).repo;
-    await seed(repo, tx => {
-      const wade = repo.users.upsertByEmail(tx, "wade@example.com", null);
-      const bob = repo.users.upsertByEmail(tx, "bob@example.com", null);
-      repo.users.upsertByEmail(tx, "eve@example.com", null);
+    await seed(repo, async tx => {
+      const wade = await repo.users.upsertByEmail(tx, "wade@example.com", null);
+      const bob = await repo.users.upsertByEmail(tx, "bob@example.com", null);
+      await repo.users.upsertByEmail(tx, "eve@example.com", null);
       const eng = repo.teams.create(tx, "eng", wade.id);
       repo.teams.addMember(tx, eng.id, wade.id);
       repo.teams.addMember(tx, eng.id, bob.id);

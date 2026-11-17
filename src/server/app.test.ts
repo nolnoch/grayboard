@@ -344,7 +344,7 @@ test("a server started without dev auth revokes dev sign-in tokens for good", as
     const dev = (await login.json() as { session_token: string }).session_token;
     const real = mintToken();
     const repo = app.repo;
-    await seed(repo, tx => repo.sessions.create(tx, repo.users.upsertByEmail(tx, "them@example.com", null).id, hashToken(real), "grayboard/1.0"));
+    await seed(repo, async tx => repo.sessions.create(tx, (await repo.users.upsertByEmail(tx, "them@example.com", null)).id, hashToken(real), "grayboard/1.0"));
     expect(await whoami(dev)).toBe(200);
     await app.stop(); app = undefined;
 
