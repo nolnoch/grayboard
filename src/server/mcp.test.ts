@@ -84,7 +84,7 @@ test("legacy identity headers cannot select or create names; explicit bind retai
   expect(hosted.activeContexts).toBe(0);
 });
 
-async function connect(version = "2026-07-28", intercept?: (response: Response) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void) {
+async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void) {
   const client = new Client({ name: "unit", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
   });
@@ -101,7 +101,7 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
       headers?.forEach((value, key) => request.headers.set(key, value));
       observeRequest?.(request);
       const response = await hosted.fetch(request);
-      await intercept?.(response);
+      await intercept?.(response, request);
       return response;
     },
   }));
@@ -410,7 +410,8 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 
 for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: selection errors log once, expected refusals do not log, and lost authentication returns 401`, async () => {
   let last!: Response;
-  const client = await connect(version, async response => { last = response.clone(); });
+  // POSTs only: a legacy client's GET stream may answer after a later POST (#807 P3 A6e2).
+  const client = await connect(version, async (response, request) => { if (request.method === "POST") last = response.clone(); });
   const logs = spyOn(console, "error").mockImplementation(() => {});
   const original = hosted.sessions.snapshot;
   try {
@@ -485,7 +486,7 @@ for (const revoked of [false, true]) test(`authentication lost between HTTP pref
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const status of [401, 403]) test(`${version}: explicit factory ${status} response is preserved unchanged`, async () => {
   let response: Response | undefined;
-  const client = await connect(version, async r => { response = r; });
+  const client = await connect(version, async (r, request) => { if (request.method === "POST") response = r; });
   const credential = status === 401 ? "invalid" : (await issuedOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:delivery"])).token;
   const refusal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${credential}` } }));
   if (!(refusal instanceof Response)) throw new Error("expected fixture OAuth refusal");
@@ -1436,9 +1437,11 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   expect(hosted.activeListens).toBe(1);
   f.time.now += 4_999; f.tick();
   expect(hosted.activeListens).toBe(1);
-  // Synchronously, before the hosted sweep's own timer could end the root: the stream tick settles it.
+  // Before the hosted sweep's own timer could end the root, the stream tick ends the listen at once and posts the
+  // settle, which ends the root when its async body commits (#807 P3 A6e2).
   f.time.now += 1; f.tick();
   expect(hosted.activeListens).toBe(0);
+  await store.repo.write(() => {});
   expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
   await f.listen.close();
 });

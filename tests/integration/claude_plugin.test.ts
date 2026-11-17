@@ -255,7 +255,7 @@ for (const mode of ["push", "tools-only"] as const) {
       // The server ends the root (the idle sweep, say), which ends its child; the
       // subagent's next call registers it again under the root, never as a root
       // of its own (#553 audit 3).
-      srv.app.mcp.sessions.release(hostedSessionId(user(), CLIENT_ID, id), "idle");
+      await srv.app.mcp.sessions.release(hostedSessionId(user(), CLIENT_ID, id), "idle");
       await until(() => !childRow(id, "a573e90bd84bce7ff"), 10_000, "the root's end to end its child");
       // The end freed the root's name, so the new root is unbound: the child is
       // refused as its subagent, and its row is a child again, not a root.

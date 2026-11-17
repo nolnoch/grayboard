@@ -71,7 +71,9 @@ test("#807: behind a write backlog longer than a tick, the timer keeps one sweep
     // FIFO: a write queued now runs after every sweep the ticks queued.
     await store.write(() => {});
     expect(expired.mock.calls.length - before).toBe(1);
-    // The guard clears once the sweep settles: the next tick queues another.
+    // The guard clears once the sweep settles, a few microtasks after its async body commits (#807 P3 A6e2):
+    // a macrotask runs only once they drain. Then the next tick queues another.
+    await new Promise<void>(resolve => setImmediate(resolve));
     tick();
     await store.write(() => {});
     expect(expired.mock.calls.length - before).toBe(2);
