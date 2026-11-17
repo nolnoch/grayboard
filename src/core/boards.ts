@@ -1420,7 +1420,7 @@ export function boardCatalog(db: Database, handle: Viewer, after?: string): Cata
 
 // The catalog's walk, shared with the server's async catalog: pages of boards after `after` (in name order), each
 // filtered by `visible`, until a page of 100 visible boards is filled; `next_after` names the last one when more may follow.
-export const CATALOG_PAGE = 100;
+const CATALOG_PAGE = 100;
 export function catalogWalk(after: unknown, page: (cursor: string) => Board[], visible: (rows: Board[]) => Board[]): Catalog;
 export function catalogWalk(after: unknown, page: (cursor: string) => Promise<Board[]>, visible: (rows: Board[]) => Promise<Board[]>): Promise<Catalog>;
 export function catalogWalk(after: unknown, page: (cursor: string) => Board[] | Promise<Board[]>, visible: (rows: Board[]) => Board[] | Promise<Board[]>): Catalog | Promise<Catalog> {
