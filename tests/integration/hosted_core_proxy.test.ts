@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
-import { hostTools, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
+import { CallAborted, hostTools, unlessAborted, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
 import { NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -355,6 +355,153 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
   expect(outside.isError).toBe(true);
   expect(textOf(outside)).toStartWith("error: attachment ");
   expect(sender.reports).toEqual([]);
+});
+
+// #438 item 26: the harness's abort (pi's Esc, /new) ends the wait for one
+// call: it throws CallAborted, never an outage, and leaves the shared
+// connection, the other calls on it and the proxy's retire() alone.
+test("a call's signal aborts only that call: CallAborted, the shared connection and its other calls untouched, nothing saved", async () => {
+  const { token } = await issue();
+  const hooks = recorder();
+  const p = proxy({ token: async () => token }, { hooks });
+  const list = NativeWire.prototype.listTools, fetch0 = globalThis.fetch;
+  let lists = 0, posts = 0;
+  NativeWire.prototype.listTools = async function () { lists++; return list.call(this); };
+  // board_list POSTs and attachment GETs are held at the network until their own signal aborts.
+  const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
+  const { promise: held, resolve: release } = Promise.withResolvers<void>();
+  const getReached = Promise.withResolvers<void>();
+  const stall = async (init?: RequestInit, reached = entered) => {
+    reached();
+    await Promise.race([held, new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true }))]);
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (input instanceof Request && input.method === "POST") {
+      const body = await input.clone().text();
+      if (body.includes(`"name":"whoami"`) || body.includes(`"name":"board_list"`)) posts++;
+      if (body.includes(`"name":"board_list"`)) await stall({ signal: input.signal });
+    }
+    if (init?.method === "GET" && String(input).includes("/attachments/")) await stall(init, getReached.resolve);
+    return fetch0(input, init);
+  }) as typeof fetch;
+  try {
+    await p.call("bind", { name: "proxy-abort", create: true }, "pi-root");
+    // Already aborted: nothing goes out.
+    const before = posts;
+    await expect(p.call("whoami", {}, "pi-root", AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+    expect(posts).toBe(before);
+
+    const ac = new AbortController();
+    const aborted = p.call("board_list", {}, "pi-root", ac.signal);
+    await reached;
+    ac.abort();
+    await expect(aborted).rejects.toBeInstanceOf(CallAborted);
+    // The shared connection stays: a call after the abort runs on it, unlisted again.
+    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-abort" });
+    expect(lists).toBe(1);
+    expect(p.reports).toEqual([]);
+    // afterCall still ran for the aborted call, as an error.
+    expect(hooks.calls.filter(c => c.tool === "board_list").map(c => [c.phase, c.result?.status])).toEqual([["before", undefined], ["after", "error"]]);
+
+    // An aborted download saves nothing.
+    writeFileSync(join(dir, "small.txt"), "small file");
+    const sent = JSON.parse(textOf(await p.call("dm_send", { to: "proxy-abort", body: "file", attachments: [join(dir, "small.txt")] }, "pi-root"))) as { attachments: { id: number }[] };
+    const download = new AbortController();
+    const got = p.call("attachment_get", { id: sent.attachments[0]!.id, dir }, "pi-root", download.signal);
+    await getReached.promise;
+    download.abort();
+    await expect(got).rejects.toBeInstanceOf(CallAborted);
+    expect(readdirSync(dir)).toEqual(["small.txt"]);
+
+    // /new's teardown: retire() settles at once after an abort.
+    const last = new AbortController();
+    const pending = p.call("board_list", {}, "pi-root", last.signal);
+    last.abort();
+    await expect(pending).rejects.toBeInstanceOf(CallAborted);
+    await p.retire();
+  } finally {
+    release();
+    globalThis.fetch = fetch0;
+    NativeWire.prototype.listTools = list;
+  }
+});
+
+// An aborted send never leaves its uploads unsent: the releases don't take
+// the call's signal, so each upload is deleted and nothing is reported.
+test("an aborted dm_send with attachments still releases every upload", async () => {
+  const { token } = await issue();
+  const p = proxy({ token: async () => token });
+  await p.call("bind", { name: "abort-send", create: true }, "pi-send");
+  writeFileSync(join(dir, "a.txt"), "first file");
+  writeFileSync(join(dir, "b.txt"), "second file");
+  const unsent = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM attachments WHERE message_id IS NULL").get()!.n;
+  const before = unsent();
+  const fetch0 = globalThis.fetch;
+  const deletes: string[] = [];
+  const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "DELETE") deletes.push(String(input));
+    if (input instanceof Request && input.method === "POST" && (await input.clone().text()).includes(`"name":"dm_send"`)) {
+      entered();
+      // Held until its own signal aborts: the server never takes the send.
+      await new Promise((_, reject) => input.signal.addEventListener("abort", () => reject(input.signal.reason), { once: true }));
+    }
+    return fetch0(input, init);
+  }) as typeof fetch;
+  try {
+    const ac = new AbortController();
+    const sending = p.call("dm_send", { to: "abort-send", body: "files", attachments: [join(dir, "a.txt"), join(dir, "b.txt")] }, "pi-send", ac.signal);
+    await reached;
+    expect(unsent()).toBe(before + 2);
+    ac.abort();
+    await expect(sending).rejects.toBeInstanceOf(CallAborted);
+    expect(deletes).toHaveLength(2);
+    expect(unsent()).toBe(before);
+    expect(p.reports).toEqual([]);
+  } finally { globalThis.fetch = fetch0; }
+  await p.retire();
+});
+
+// A connect still in flight (here, its tool listing) is shared: an abort ends
+// only the aborted call's wait for it, and the next call still gets it.
+test("an abort ends a call's wait for the shared connect, which the next call still uses", async () => {
+  const { token } = await issue();
+  const p = proxy({ token: async () => token });
+  const list = NativeWire.prototype.listTools;
+  const { promise: listing, resolve: listed } = Promise.withResolvers<void>();
+  const { promise: gate, resolve: open } = Promise.withResolvers<void>();
+  NativeWire.prototype.listTools = async function () { listed(); await gate; return list.call(this); };
+  try {
+    const ac = new AbortController();
+    const waiting = p.call("whoami", {}, "pi-connect", ac.signal);
+    await listing;
+    ac.abort();
+    await expect(waiting).rejects.toBeInstanceOf(CallAborted);
+    const next = p.call("whoami", {}, "pi-connect");
+    open();
+    expect((await next).isError).toBeFalsy();
+  } finally {
+    open();
+    NativeWire.prototype.listTools = list;
+  }
+  await p.retire();
+});
+
+// An already-aborted signal still observes the work: a connect only this call
+// opened would otherwise reject unhandled, and pi exits on that.
+test("unlessAborted with an already-aborted signal leaves the work's later rejection handled", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { promise: work, reject } = Promise.withResolvers<never>();
+    await expect(unlessAborted(work, AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+    reject(new Error("connect failed"));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
 });
 
 test("attachment_get cancels an oversized download before saving it", async () => {
