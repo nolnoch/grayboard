@@ -364,7 +364,7 @@ const ticks = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((
 test("#807: an HTTP unlink while another body holds the write queue waits, then removes the link", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   const holder = holdQueue();
   const unlinked = srv.app.slack!.unlink(userId);
   await ticks();
@@ -556,7 +556,7 @@ test("#1016: a Slack reply in a thread whose row waits in the write queue reache
   try {
     const q = await be.call<SendResult>("dm_send", { to: "human", body: "thread fixture" });
     const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("thread fixture") && slack.postTs.has(p)), 5000, "Slack answered the post");
-    const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+    const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
     expect(await srv.app.repo.slack.threadByTs(srv.app.repo.read, userId, tsOf(top))).toBeUndefined();
     // The reply's dm_send queues behind the hold too: a write the Slack bridge starts is the sign the relay read the
     // thread's row. Its bus call reaches repo.write before any await, so the bridge is on the stack.
@@ -582,7 +582,7 @@ test("#1016: a Slack reply in a thread whose row waits in the write queue reache
 test("#807: an unlink for one Slack account leaves a link that moved to another account while it waited", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   expect(await srv.app.slack!.unlink(userId, "U0SOMEONEELSE")).toBe(false);
   expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toMatchObject({ slack_user: ALICE_SLACK });
   expect(await srv.app.slack!.unlink(userId, ALICE_SLACK)).toBe(true);
@@ -591,7 +591,7 @@ test("#807: an unlink for one Slack account leaves a link that moved to another 
 test("#807: a rolled-back unlink leaves the link and its human online", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   const be = await hosted("alice@example.com", "be");
   srv.app.db.run(`CREATE TRIGGER fail_unlink BEFORE INSERT ON access_log WHEN NEW.action = 'slack.unlinked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
   const spy = spyOn(console, "error").mockImplementation(() => {});
@@ -607,7 +607,7 @@ test("#807: a rolled-back unlink leaves the link and its human online", async ()
 
 test("#807: a rolled-back link leaves no link, no human identity and nothing attached", async () => {
   const alice = await login("alice@example.com");
-  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   srv.app.db.run(`CREATE TRIGGER fail_link BEFORE INSERT ON access_log WHEN NEW.action = 'slack.linked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
   const spy = spyOn(console, "error").mockImplementation(() => {});
   try {
@@ -904,7 +904,7 @@ test("a link code redeemed from a Slack account with another email is refused an
   const seen = slack.posts().length;
   slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
   await until(() => slack.posts().slice(seen).find((p) => p.channel === "D0MALLORY" && p.markdown_text?.includes("email isn't `alice@example.com`")));
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, srv.app.repo.users.findByEmail("alice@example.com")!.id)).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id)).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0MALLORY", { reason: "email_mismatch" }]]);
 
   // Used up: the right account can't redeem it after the refusal.
@@ -920,7 +920,7 @@ test("without the email scope, a link is refused with what the admin must add", 
   const r = await api(alice, "POST", "/api/slack/link");
   slack.say(`link ${r.body.code}`);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("users:read.email")));
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id)).toBeUndefined();
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
 }, 30_000);
 
@@ -933,7 +933,7 @@ test("when Slack can't be reached to check the email, the link is refused with a
   slack.say(`link ${r.body.code}`);
   const reply = await until(() => slack.posts().find((p) => p.markdown_text?.includes("couldn't reach Slack")));
   expect(reply.markdown_text).not.toContain("users:read.email");
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, srv.app.repo.users.findByEmail("alice@example.com")!.id)).toBeUndefined();
+  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id)).toBeUndefined();
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);
 
@@ -977,7 +977,7 @@ const attached = (userId: number) => {
 
 async function linkedAlice(): Promise<{ userId: number; relay: Relay; store: RelayStore }> {
   await link(await login("alice@example.com"));
-  const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
+  const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   return { userId, ...attached(userId) };
 }
 

@@ -492,11 +492,11 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 
   // The stamp runs once, with the column: a row unlink-idp cleared isn't re-stamped by a later open.
-  await srv.app.repo.write(tx => srv!.app.repo.users.clearSubject(tx, srv!.app.repo.users.findByEmail("bob@example.com")!.id));
+  await srv.app.repo.write(async tx => srv!.app.repo.users.clearSubject(tx, (await srv!.app.repo.users.findByEmail(tx, "bob@example.com"))!.id));
   await srv.stop();
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
-  expect(srv.app.repo.users.findByEmail("bob@example.com")).toMatchObject({ idp_issuer: null, idp_subject: null });
-  expect(srv.app.repo.users.findByEmail("alice@example.com")).toMatchObject({ idp_issuer: GOOGLE_ISSUER });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))).toMatchObject({ idp_issuer: GOOGLE_ISSUER });
 }, 60_000);
 
 // #928 D3, the documented rollback: this tree opens a database, the release's binary then runs on it, and this

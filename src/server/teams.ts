@@ -41,7 +41,7 @@ export function onAliasCreated(repo: Repo, tx: Tx, userId: number, handle: strin
   if (!creator) return;
   const p = addressParts(handle);
   if (p?.kind !== "alias") return;
-  const teams = p.scopeKind === "person" ? repo.teams.listForUser(userId) : [repo.teams.findByName(p.scope)].filter((t): t is Team => !!t);
+  const teams = p.scopeKind === "person" ? repo.policyNow.teamsOf(userId) : [repo.policyNow.teamByName(p.scope)].filter((t): t is Team => !!t);
   for (const team of teams) {
     ensureTeamBoard(repo, tx, team, creator);
     follow(repo.coreOn(tx), handle, team);

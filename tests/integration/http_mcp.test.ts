@@ -36,7 +36,7 @@ async function login(email = "alice@example.com", scopes = ["grayboard:tools"]) 
 async function legacyLogin(email = "alice@example.com") {
   const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
   const token = (await res.json() as { session_token: string }).session_token;
-  const user = app.repo.users.findByEmail(email)!;
+  const user = (await app.repo.users.findByEmail(app.repo.read, email))!;
   await seed(app.repo, async tx => {
     for (const name of ["be", "allowed"]) {
       if (!app.repo.aliases.find(tx, `${user.email}/${name}`)) await app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
@@ -245,7 +245,7 @@ test("revocation is checked on subsequent calls, including legacy", async () => 
   for (const version of ["2026-07-28", "2025-11-25"]) {
     const token = await login("bob@example.com");
     const c = await connect(token, "be", version);
-    await seed(app.repo, tx => app.repo.sessions.revokeAllForUser(tx, app.repo.users.findByEmail("bob@example.com")!.id));
+    await seed(app.repo, async tx => app.repo.sessions.revokeAllForUser(tx, (await app.repo.users.findByEmail(tx, "bob@example.com"))!.id));
     await expect(c.listTools()).rejects.toThrow();
   }
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);

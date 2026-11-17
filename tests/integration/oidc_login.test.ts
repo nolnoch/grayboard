@@ -93,7 +93,7 @@ test("Okta alone: authorize goes straight to the IdP, the real OIDC provider sig
   const session = new HostedSession(`${srv.base}/mcp`, access, null);
   sessions.push(session);
   expect(JSON.stringify((await session.connect()).whoami)).toContain(EMAIL);
-  expect(srv.app.repo.users.findByEmail(EMAIL)).toMatchObject({ idp_issuer: fake.issuer, idp_subject: "okta-you" });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, EMAIL))).toMatchObject({ idp_issuer: fake.issuer, idp_subject: "okta-you" });
   expect(accessAudits(srv.app.db, "oauth.upstream_authenticated").map(r => [r.actor, r.detail])).toEqual([[EMAIL, { client_id: CLIENT, provider: "okta" }]]);
 });
 
@@ -124,7 +124,7 @@ test("two providers: the chooser lists each in config order, each link reaches i
   expect(googleExchanges).toBe(0);
   const idp = await fetch(atOkta, { redirect: "manual" });
   expect(outcome(await browser.request(idp.headers.get("Location")!), srv.issuer, a)).toBe("consent");
-  expect(srv.app.repo.users.findByEmail(EMAIL)).toMatchObject({ idp_issuer: fake.issuer });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, EMAIL))).toMatchObject({ idp_issuer: fake.issuer });
 
   // The chooser's route needs the flow's binding cookie, and a provider the server lists.
   expect((await new Browser().request(links.get("okta")!)).status).toBe(400);
@@ -226,7 +226,7 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
     const root = await srv.login("root@example.com");
     expect((await srv.api(root, "POST", "/api/admin/unlink-idp", { email: EMAIL })).status).toBe(200);
     expect((await signIn(srv, second)).result).toBe("consent");
-    expect(srv.app.repo.users.findByEmail(EMAIL)).toMatchObject({ idp_issuer: issuer(second), idp_subject: `${second}-you` });
+    expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, EMAIL))).toMatchObject({ idp_issuer: issuer(second), idp_subject: `${second}-you` });
     expect(browsers(srv)).toBe(2);
   });
 }

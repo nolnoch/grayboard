@@ -31,7 +31,7 @@ const dm = (body: string) => direct((m) => m.body === body);
 const pushed = (body: string) => board((i) => i.kind === "push" && i.post.body === body);
 
 async function human(email: string) {
-  const user = srv.app.repo.users.findByEmail(email)!;
+  const user = (await srv.app.repo.users.findByEmail(srv.app.repo.read, email))!;
   return (await srv.app.application.attachHuman({ user_id: user.id, user_email: email, session_id: 0 }, { deliver() {}, closed() {} })).session;
 }
 

@@ -211,7 +211,7 @@ test("admin unlink-idp clears a user's IdP issuer and subject and audits them", 
   expect((await signIn(GOOGLE_ISSUER, "google-new")).status).toBe("subject_mismatch");
   expect((await signIn(okta, "okta-bob")).status).toBe("issuer_mismatch");
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "Bob@Example.com" })).status).toBe(200);
-  expect(srv.app.repo.users.findByEmail("bob@example.com")).toMatchObject({ idp_issuer: null, idp_subject: null });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
   expect(await signIn(okta, "okta-bob")).toMatchObject({ status: "ok", linked: true, user: { idp_issuer: okta } });
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "nobody@example.com" })).status).toBe(404);
   expect(srv.app.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'auth.subject_cleared'").all())

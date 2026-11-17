@@ -1,0 +1,255 @@
+// The synchronous and async policy drivers give one answer (#807 P3 A7e3): `authorizeNow` over `repo.policyNow`,
+// `authorize` on the store's read handle and `authorize` on a write body's Tx agree on every rule branch, make the
+// same reads in the same order, and see a body's own uncommitted writes. Every rule literal in policy.ts has a row,
+// so a new branch fails here until it's covered. The H1 race: a membership change committed between two of a
+// decision's reads must not combine into an allow neither state gives.
+import { describe, test, expect, beforeEach } from "bun:test";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { idAddress } from "../core/bindings.ts";
+import { registerId, type CoreDb } from "../core/boards.ts";
+import type { Principal } from "../core/resolver.ts";
+import { authorize, authorizeNow, type AuthzRequest, type PolicyContext } from "./policy.ts";
+import { openDatabase, type Repo, type Team, type User } from "./db.ts";
+import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { seed, seedSync } from "../../tests/support/seed.ts";
+
+type Fixture = { repo: Repo; db: CoreDb; a: User; b: User; c: User; d: User; eng: Team; ops: Team; x: Team; id: string };
+
+// Users a, b, c, d; eng collaborative (a owner, b), ops delegating (a owner, c), x open (d owner); an ID registered
+// by a; aliases a@example.com/x and eng/bot; a service principal, svc, by raw SQL (nothing creates one before #270).
+async function fixture(): Promise<Fixture> {
+  const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const id = idAddress("a".repeat(64));
+  const rows = await seed(repo, async tx => {
+    const [a, b, c, d] = [
+      await repo.users.upsertByEmail(tx, "a@example.com", null),
+      await repo.users.upsertByEmail(tx, "b@example.com", null),
+      await repo.users.upsertByEmail(tx, "c@example.com", null),
+      await repo.users.upsertByEmail(tx, "d@example.com", null),
+    ];
+    const eng = await repo.teams.create(tx, "eng", a.id);
+    await repo.teams.addMember(tx, eng.id, a.id, "owner");
+    await repo.teams.addMember(tx, eng.id, b.id);
+    await repo.teams.setPolicy(tx, eng.id, "collaborative");
+    const ops = await repo.teams.create(tx, "ops", a.id);
+    await repo.teams.addMember(tx, ops.id, a.id, "owner");
+    await repo.teams.addMember(tx, ops.id, c.id);
+    await repo.teams.setPolicy(tx, ops.id, "delegating");
+    const x = await repo.teams.create(tx, "x", d.id);
+    await repo.teams.addMember(tx, x.id, d.id, "owner");
+    await repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "x" }, "a@example.com");
+    await repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "bot" }, "a@example.com");
+    return { a, b, c, d, eng: (await repo.teams.findByName(tx, "eng"))!, ops: (await repo.teams.findByName(tx, "ops"))!, x };
+  });
+  await seed(db, () => {
+    registerId(db, { id, principal: "a@example.com", launcher: false });
+    db.run("INSERT INTO principals (kind, name, created_at) VALUES ('service', 'svc', 0)");
+  });
+  return { repo, db, id, ...rows };
+}
+
+type Row = { name: string; ctx?: PolicyContext; req: AuthzRequest; allow: boolean; rule: string };
+
+const user = (email: string): Principal => ({ kind: "user", name: email });
+const teamScope = (ref: string) => ({ scope_kind: "team" as const, scope_ref: ref });
+const personScope = (ref: string) => ({ scope_kind: "person" as const, scope_ref: ref });
+
+function rows(f: Fixture): Row[] {
+  const A = "a@example.com", B = "b@example.com", C = "c@example.com", D = "d@example.com";
+  const ua = { id: f.a.id, email: A }, ub = { id: f.b.id, email: B }, uc = { id: f.c.id, email: C }, ud = { id: f.d.id, email: D };
+  const live = { principal: A, viewer: false, ended_at: null };
+  return [
+    // msg.send / human.reach
+    { name: "not a human", req: { verb: "msg.send", from: `${A}/fe`, to: `${B}/be` }, allow: true, rule: "human.not_human" },
+    { name: "reach all", ctx: { humanReach: "all" }, req: { verb: "msg.send", from: `${D}/fe`, to: `${B}/human` }, allow: true, rule: "human.reach_all" },
+    { name: "own human", req: { verb: "msg.send", from: `${A}/fe`, to: `${A}/human` }, allow: true, rule: "human.self" },
+    { name: "a teammate's human", req: { verb: "human.reach", from: `${A}/fe`, to: `${B}/human` }, allow: true, rule: "human.teammates" },
+    { name: "an ID's registering user", req: { verb: "msg.send", from: f.id, to: `${B}/human` }, allow: true, rule: "human.teammates" },
+    { name: "a stranger's human", req: { verb: "msg.send", from: `${D}/fe`, to: `${B}/human` }, allow: false, rule: "human.teammates" },
+    { name: "no principal", req: { verb: "human.reach", from: "nobody/fe", to: `${B}/human` }, allow: false, rule: "human.teammates" },
+    { name: "a service's alias", req: { verb: "msg.send", from: "svc/bot", to: `${B}/human` }, allow: false, rule: "human.teammates" },
+    { name: "team alias to a member", req: { verb: "msg.send", from: "eng/bot", to: `${B}/human` }, allow: true, rule: "human.team_alias" },
+    { name: "team alias to a non-member", req: { verb: "human.reach", from: "eng/bot", to: `${C}/human` }, allow: false, rule: "human.team_alias" },
+    // scope.act / alias.bind / act_as
+    { name: "service principal", req: { verb: "scope.act", principal: { kind: "service", name: "svc" }, scope: teamScope("eng") }, allow: false, rule: "scope.service" },
+    { name: "service scope", req: { verb: "scope.act", principal: user(A), scope: { scope_kind: "service", scope_ref: "svc" } }, allow: false, rule: "scope.service" },
+    { name: "team principal", req: { verb: "scope.act", principal: { kind: "team", name: "eng" }, scope: personScope(A) }, allow: false, rule: "scope.user_only" },
+    { name: "own person scope", req: { verb: "scope.act", principal: user(A), scope: personScope(A) }, allow: true, rule: "scope.own_person" },
+    { name: "another's person scope", req: { verb: "scope.act", principal: user(A), scope: personScope(B) }, allow: false, rule: "scope.own_person" },
+    { name: "member's team", req: { verb: "scope.act", principal: user(B), scope: teamScope("eng") }, allow: true, rule: "scope.team_member" },
+    { name: "non-member's team", req: { verb: "scope.act", principal: user(D), scope: teamScope("eng") }, allow: false, rule: "scope.team_member" },
+    { name: "missing team", req: { verb: "scope.act", principal: user(A), scope: teamScope("nope") }, allow: false, rule: "scope.team_member" },
+    { name: "bind human", req: { verb: "alias.bind", principal: user(A), scope: personScope(A), name: "human" }, allow: false, rule: "alias.human_reserved" },
+    { name: "bind in a team", req: { verb: "alias.bind", principal: user(C), scope: teamScope("ops"), name: "deploy" }, allow: true, rule: "scope.team_member" },
+    { name: "as human", req: { verb: "act_as", principal: user(A), address: `${A}/human`, name: "human", scope: personScope(A) }, allow: false, rule: "alias.human_reserved" },
+    { name: "as an ownerless scope", req: { verb: "act_as", principal: user(A), address: "nobody/fe", name: "fe", scope: null }, allow: false, rule: "scope.ownerless" },
+    { name: "as a team alias", req: { verb: "act_as", principal: user(B), address: "eng/bot", name: "bot", scope: teamScope("eng") }, allow: true, rule: "scope.team_member" },
+    // session.act
+    { name: "unknown session", req: { verb: "session.act", user: A, session: f.id, row: undefined }, allow: false, rule: "session.unknown" },
+    { name: "viewer session", req: { verb: "session.act", user: A, session: f.id, row: { ...live, viewer: true } }, allow: false, rule: "session.viewer" },
+    { name: "another's session", req: { verb: "session.act", user: B, session: f.id, row: live }, allow: false, rule: "session.other_user" },
+    { name: "ended session", req: { verb: "session.act", user: A, session: f.id, row: { ...live, ended_at: 5 } }, allow: false, rule: "session.ended" },
+    { name: "own session", req: { verb: "session.act", user: A, session: f.id, row: live }, allow: true, rule: "session.own" },
+    // hosted.session
+    { name: "another user's hosted row", req: { verb: "hosted.session", session: "s", user: 1, client: "k", row: { user: 2, client: "k" } }, allow: false, rule: "hosted.other_user" },
+    { name: "another client's hosted row", req: { verb: "hosted.session", session: "s", user: 1, client: "k", row: { user: 1, client: "j" } }, allow: false, rule: "hosted.other_client" },
+    { name: "own hosted row", req: { verb: "hosted.session", session: "s", user: 1, client: "k", row: { user: 1, client: "k" } }, allow: true, rule: "hosted.own" },
+    // attachment.read
+    ...(["post", "message", "unbound"] as const).flatMap(carrier => [true, false].map(readable => ({
+      name: `${carrier} attachment, readable ${readable}`,
+      req: { verb: "attachment.read", identity: `${A}/fe`, attachment: "att", reach: { carrier, readable } } as AuthzRequest,
+      allow: readable,
+      rule: { post: "attachment.board_visible", message: "attachment.dm_party", unbound: "attachment.uploader" }[carrier],
+    }))),
+    { name: "unknown attachment", req: { verb: "attachment.read", identity: `${A}/fe`, attachment: "att", reach: undefined }, allow: false, rule: "attachment.unknown" },
+    // team.*
+    { name: "member leaves", req: { verb: "team.leave", user: ub, team: f.eng }, allow: true, rule: "team.member" },
+    { name: "non-member leaves", req: { verb: "team.leave", user: ud, team: f.eng }, allow: false, rule: "team.member" },
+    { name: "member reads", req: { verb: "team.read", user: uc, team: f.ops }, allow: true, rule: "team.member" },
+    { name: "admin reads", ctx: { admins: [D] }, req: { verb: "team.read", user: ud, team: f.eng }, allow: true, rule: "admin.env" },
+    { name: "stranger reads", req: { verb: "team.read", user: ud, team: f.eng }, allow: false, rule: "team.member" },
+    { name: "owner manages", req: { verb: "team.manage", user: ua, team: f.eng }, allow: true, rule: "team.owner" },
+    { name: "admin manages", ctx: { admins: [D] }, req: { verb: "team.manage", user: ud, team: f.eng }, allow: true, rule: "admin.env" },
+    { name: "member manages", req: { verb: "team.manage", user: ub, team: f.eng }, allow: false, rule: "team.owner" },
+    { name: "stranger manages", req: { verb: "team.manage", user: uc, team: f.eng }, allow: false, rule: "team.member" },
+    { name: "missing team managed", req: { verb: "team.manage", user: ua, team: undefined }, allow: false, rule: "team.member" },
+    // admin
+    { name: "admin", ctx: { admins: [A] }, req: { verb: "admin", email: A }, allow: true, rule: "admin.env" },
+    { name: "not admin", ctx: { admins: [A] }, req: { verb: "admin", email: B }, allow: false, rule: "admin.env" },
+    // msg.wake / delegate.to
+    { name: "wake self", req: { verb: "msg.wake", from_user: A, to_user: A }, allow: true, rule: "wake.same_user" },
+    { name: "wake collaborative", req: { verb: "msg.wake", from_user: A, to_user: B }, allow: true, rule: "wake.team_policy" },
+    { name: "wake delegating", req: { verb: "msg.wake", from_user: C, to_user: A }, allow: true, rule: "wake.team_policy" },
+    { name: "wake open", req: { verb: "msg.wake", from_user: D, to_user: A }, allow: false, rule: "wake.cross_user" },
+    { name: "delegate self", req: { verb: "delegate.to", from_user: B, to_user: B }, allow: true, rule: "delegate.same_user" },
+    { name: "delegate delegating", req: { verb: "delegate.to", from_user: A, to_user: C }, allow: true, rule: "delegate.team_policy" },
+    { name: "delegate collaborative", req: { verb: "delegate.to", from_user: A, to_user: B }, allow: false, rule: "delegate.cross_user" },
+    // alias.see
+    { name: "see a person's alias", req: { verb: "alias.see", principal: user(D), scope: personScope(A) }, allow: true, rule: "alias.see_person" },
+    { name: "team sees its own", req: { verb: "alias.see", principal: { kind: "team", name: "eng" }, scope: teamScope("eng") }, allow: true, rule: "alias.see_own_team" },
+    { name: "member sees a team's", req: { verb: "alias.see", principal: user(B), scope: teamScope("eng") }, allow: true, rule: "scope.team_member" },
+    { name: "stranger sees a team's", req: { verb: "alias.see", principal: user(D), scope: teamScope("eng") }, allow: false, rule: "scope.team_member" },
+  ];
+}
+
+const READS: Record<string, Record<string, string>> = {
+  principals: { findByName: "principalByName", of: "principalOf" },
+  teams: { findByName: "teamByName", isMember: "isMember", isOwner: "isOwner", shareAny: "shareAny", shareCollaborative: "shareCollaborative", shareDelegating: "shareDelegating", listForUser: "teamsOf" },
+  users: { findByEmail: "userByEmail" },
+};
+
+// A copy of the Repo whose policy reads, async and synchronous, log their read name and arguments (less the handle) to
+// `log` once they return; `after` runs then, before the rule sees the value.
+function traced(repo: Repo, log: unknown[][], after?: (read: string) => void): Repo {
+  const out: Record<string, unknown> = { ...repo };
+  for (const [group, names] of Object.entries(READS)) {
+    const src = (repo as unknown as Record<string, Record<string, (...a: unknown[]) => Promise<unknown>>>)[group];
+    const copy: Record<string, unknown> = { ...src };
+    for (const [method, read] of Object.entries(names)) {
+      copy[method] = async (r: unknown, ...args: unknown[]) => {
+        const v = await src[method].call(src, r, ...args);
+        log.push([read, ...args]);
+        after?.(read);
+        return v;
+      };
+    }
+    out[group] = copy;
+  }
+  out.policyNow = Object.fromEntries(Object.entries(repo.policyNow).map(([k, fn]) => [k, (...args: unknown[]) => {
+    const v = (fn as (...a: unknown[]) => unknown)(...args);
+    log.push([k, ...args]);
+    after?.(k);
+    return v;
+  }]));
+  return out as unknown as Repo;
+}
+
+// Every rule literal policy.ts can return, as rule:allow / rule:deny.
+function ruleLiterals(): string[] {
+  const src = readFileSync(join(import.meta.dir, "policy.ts"), "utf8").split("\n").filter(l => !l.trim().startsWith("//")).join("\n");
+  const out = new Set<string>();
+  for (const m of src.matchAll(/\ballow\("([\w.]+)"\)/g)) out.add(`${m[1]}:allow`);
+  for (const m of src.matchAll(/\bdeny\("([\w.]+)"/g)) out.add(`${m[1]}:deny`);
+  for (const m of src.matchAll(/\{ allow: ([^}]*?), rule: "([\w.]+)" \}/g)) {
+    if (m[1] !== "false") out.add(`${m[2]}:allow`);
+    if (m[1] !== "true") out.add(`${m[2]}:deny`);
+  }
+  // attachment.read's carrier map: readable ? allow(rule) : deny(rule).
+  for (const m of src.matchAll(/(?:post|message|unbound): "([\w.]+)"/g)) { out.add(`${m[1]}:allow`); out.add(`${m[1]}:deny`); }
+  return [...out].sort();
+}
+
+describe("policy drivers agree", () => {
+  let f: Fixture;
+  beforeEach(async () => { f = await fixture(); });
+
+  test("every rule literal has a row", () => {
+    const covered = new Set(rows(f).map(r => `${r.rule}:${r.allow ? "allow" : "deny"}`));
+    const literals = ruleLiterals();
+    expect(literals.length).toBeGreaterThan(40);
+    expect(literals.filter(l => !covered.has(l))).toEqual([]);
+  });
+
+  test("authorizeNow, authorize on the read handle and authorize in a body give each row's decision", async () => {
+    for (const row of rows(f)) {
+      const ctx = row.ctx ?? { humanReach: "team" };
+      const now = authorizeNow(f.repo, ctx, row.req);
+      expect({ name: row.name, ...now }).toMatchObject({ name: row.name, allow: row.allow, rule: row.rule });
+      expect({ name: row.name, ...(await authorize(f.repo, f.repo.read, ctx, row.req)) }).toEqual({ name: row.name, ...now });
+      expect({ name: row.name, ...(await f.repo.write(tx => authorize(f.repo, tx, ctx, row.req))) }).toEqual({ name: row.name, ...now });
+    }
+  });
+
+  test("both drivers make the same reads in the same order", async () => {
+    for (const row of rows(f)) {
+      const ctx = row.ctx ?? { humanReach: "team" };
+      const sync: unknown[][] = [], async: unknown[][] = [];
+      authorizeNow(traced(f.repo, sync), ctx, row.req);
+      const t = traced(f.repo, async);
+      await authorize(t, t.read, ctx, row.req);
+      expect({ name: row.name, reads: async }).toEqual({ name: row.name, reads: sync });
+    }
+  });
+
+  test("both drivers see a body's own uncommitted write, and neither its rollback", async () => {
+    const req: AuthzRequest = { verb: "delegate.to", from_user: "b@example.com", to_user: "c@example.com" };
+    const inside = await f.repo.write(async tx => {
+      await f.repo.teams.addMember(tx, f.ops.id, f.b.id);
+      return [authorizeNow(f.repo, {}, req), await authorize(f.repo, tx, {}, req)];
+    });
+    expect(inside.map(d => d.allow)).toEqual([true, true]);
+
+    const rolledBack = f.repo.write(async tx => {
+      await f.repo.teams.removeMember(tx, f.ops.id, f.b.id);
+      expect([authorizeNow(f.repo, {}, req).allow, (await authorize(f.repo, tx, {}, req)).allow]).toEqual([false, false]);
+      throw new Error("roll back");
+    });
+    await expect(rolledBack).rejects.toThrow("roll back");
+    expect([authorizeNow(f.repo, {}, req).allow, (await authorize(f.repo, f.repo.read, {}, req)).allow]).toEqual([true, true]);
+  });
+});
+
+// H1: c's agent reaching d's human. Before: d in x, c not. A commit lands right after the decision's first team read:
+// d leaves x, c joins x. Neither state shares a team between them, so the answer is deny; reading each side's teams
+// separately would pair d's old teams with c's new ones and allow.
+test("a membership change between a decision's reads gives no allow neither state gives", async () => {
+  const f = await fixture();
+  const req: AuthzRequest = { verb: "human.reach", from: "c@example.com/x", to: "d@example.com/human" };
+  let committed = false;
+  const log: unknown[][] = [];
+  const t = traced(f.repo, log, read => {
+    if (committed || !["teamsOf", "shareAny"].includes(read)) return;
+    committed = true;
+    seedSync(f.repo, () => {
+      f.db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [f.x.id, f.d.id]);
+      f.db.run("INSERT INTO team_members (team_id, user_id, joined_at) VALUES (?, ?, 0)", [f.x.id, f.c.id]);
+    });
+  });
+  const d = await authorize(t, t.read, { humanReach: "team" }, req);
+  expect(committed).toBe(true);
+  expect(d).toMatchObject({ allow: false, rule: "human.teammates" });
+  // The committed state alone denies too.
+  expect((await authorize(f.repo, f.repo.read, { humanReach: "team" }, req)).allow).toBe(false);
+});

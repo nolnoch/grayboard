@@ -6,7 +6,7 @@
 // next delivery (principle 11). The sender is told (`wakes: false`).
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { DeliveryEvent } from "../../src/server/application.ts";
-import { authorizeNow } from "../../src/server/policy.ts";
+import { authorize } from "../../src/server/policy.ts";
 import { accessAudits } from "../support/audit.ts";
 import { board, direct } from "../support/events.ts";
 import { seed } from "../support/seed.ts";
@@ -41,38 +41,38 @@ async function team(): Promise<void> {
 
 test("the msg.wake rule: same user, a shared collaborative team, else denied; admin is no exemption", async () => {
   const repo = srv.app.repo;
-  const wake = (from: string, to: string, admins: string[] = []) => authorizeNow(repo, { admins }, { verb: "msg.wake", from_user: from, to_user: to });
-  expect(wake(A, A)).toMatchObject({ allow: true, rule: "wake.same_user" });
-  expect(wake(B, A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
-  expect(wake(B, A, [B])).toMatchObject({ allow: false, rule: "wake.cross_user" });
+  const wake = (from: string, to: string, admins: string[] = []) => authorize(repo, repo.read, { admins }, { verb: "msg.wake", from_user: from, to_user: to });
+  expect(await wake(A, A)).toMatchObject({ allow: true, rule: "wake.same_user" });
+  expect(await wake(B, A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
+  expect(await wake(B, A, [B])).toMatchObject({ allow: false, rule: "wake.cross_user" });
   await team();
   // An open team shares membership, not wakes.
-  expect(wake(B, A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
+  expect(await wake(B, A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
   expect((await policy(alice, "eng", "collaborative")).status).toBe(200);
-  expect(wake(B, A)).toMatchObject({ allow: true, rule: "wake.team_policy" });
-  expect(wake(A, B)).toMatchObject({ allow: true, rule: "wake.team_policy" });
+  expect(await wake(B, A)).toMatchObject({ allow: true, rule: "wake.team_policy" });
+  expect(await wake(A, B)).toMatchObject({ allow: true, rule: "wake.team_policy" });
   // Carol is in no team with either.
-  expect(wake(C, A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
+  expect(await wake(C, A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
   // An unknown user is no grant.
-  expect(wake("nobody@example.com", A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
+  expect(await wake("nobody@example.com", A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
 });
 
 // 'delegating' implies 'collaborative' (#256): it grants wakes too. The
 // delegate.to rule is the narrower one: only 'delegating' grants it.
 test("a delegating team grants wakes and delegate.to; collaborative grants wakes only", async () => {
   const repo = srv.app.repo;
-  const rule = (verb: "msg.wake" | "delegate.to", from: string, to: string) => authorizeNow(repo, { admins: [B] }, { verb, from_user: from, to_user: to });
-  expect(rule("delegate.to", A, A)).toMatchObject({ allow: true, rule: "delegate.same_user" });
+  const rule = (verb: "msg.wake" | "delegate.to", from: string, to: string) => authorize(repo, repo.read, { admins: [B] }, { verb, from_user: from, to_user: to });
+  expect(await rule("delegate.to", A, A)).toMatchObject({ allow: true, rule: "delegate.same_user" });
   await team();
   expect((await policy(alice, "eng", "collaborative")).status).toBe(200);
-  expect(rule("delegate.to", B, A)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
+  expect(await rule("delegate.to", B, A)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
   expect((await policy(alice, "eng", "delegating")).status).toBe(200);
-  expect(rule("msg.wake", B, A)).toMatchObject({ allow: true, rule: "wake.team_policy" });
-  expect(rule("delegate.to", B, A)).toMatchObject({ allow: true, rule: "delegate.team_policy" });
-  expect(rule("delegate.to", A, B)).toMatchObject({ allow: true, rule: "delegate.team_policy" });
+  expect(await rule("msg.wake", B, A)).toMatchObject({ allow: true, rule: "wake.team_policy" });
+  expect(await rule("delegate.to", B, A)).toMatchObject({ allow: true, rule: "delegate.team_policy" });
+  expect(await rule("delegate.to", A, B)).toMatchObject({ allow: true, rule: "delegate.team_policy" });
   // Carol shares no team; admin (B here) is no exemption either way.
-  expect(rule("delegate.to", C, A)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
-  expect(rule("delegate.to", B, C)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
+  expect(await rule("delegate.to", C, A)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
+  expect(await rule("delegate.to", B, C)).toMatchObject({ allow: false, rule: "delegate.cross_user" });
 
   // And a DM between the two now wakes: no ungranted mark.
   const abe = await srv.hosted(A, "be");
@@ -153,7 +153,7 @@ test("POST /api/teams/<t>/policy: owner sets it (audited once per change), membe
   const set = await policy(alice, "eng", "collaborative");
   expect(set.status).toBe(200);
   expect(set.body).toEqual({ ok: true, team: "eng", policy: "collaborative", previous: "open" });
-  expect(srv.app.repo.teams.findByName("eng")!.policy).toBe("collaborative");
+  expect((await srv.app.repo.teams.findByName(srv.app.repo.read, "eng"))!.policy).toBe("collaborative");
   // Setting the same value again writes no audit row.
   expect((await policy(alice, "eng", "collaborative")).status).toBe(200);
   const deleg = await policy(alice, "eng", "delegating");
@@ -184,7 +184,7 @@ test("the send result: an offline person alias says wakes:false; a team alias's 
   }
   // A human reads it: reach is msg.send's call, not a wake.
   const bfe = await srv.hosted(B, "fe");
-  const aliceHuman = srv.app.repo.users.findByEmail(A)!;
+  const aliceHuman = (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!;
   const human = (await srv.app.application.attachHuman({ user_id: aliceHuman.id, user_email: A, session_id: 0 }, { deliver() {}, closed() {} })).session;
   expect(await bfe.call<{ wakes?: false }>("dm_send", { to: `${A}/human`, body: "to alice's phone" })).not.toHaveProperty("wakes");
   srv.app.application.close(human);

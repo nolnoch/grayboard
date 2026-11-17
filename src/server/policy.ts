@@ -1,8 +1,9 @@
 // The server's authorization seam (#806). Every allow-or-deny decision the
 // server makes about who may do what is `decide()`'s, writing nothing. Its rules
 // are generators that yield each storage read they need (#807 P3 A7e): one set of
-// rule bodies, driven synchronously over `repo.policyNow` by `authorizeNow` (the
-// SQLite-only loader, until #807 B), or with no reads at all by `decidePure`.
+// rule bodies, driven by `authorize` over the store's reads on the caller's
+// handle, synchronously over `repo.policyNow` by `authorizeNow` (the SQLite-only
+// loader, until #807 A7f/B), or with no reads at all by `decidePure`.
 // The caller that owns a requested act records its decision with
 // `recordDecision` (an `authz.decision` row: every deny, and the allows of
 // team management and admin routes); filter checks (board visibility, mention
@@ -79,12 +80,13 @@ const deny = (rule: string, reason: string, code: "forbidden" | "not_found" = "f
 
 // Every storage read a rule makes, synchronously. `repo.policyNow` implements it (and AccessReadsSync) over the
 // SQLite connection (#807 P3 A7e1): reads in the caller's own transaction see its writes, as routeReads gives them.
+// `PolicyReads` is the same reads as promises, on one handle (A7e3).
 export interface PolicyReadsSync extends Resolver {
   principalByName(name: string): PrincipalRow | undefined;
   teamByName(name: string): Team | undefined;
   isMember(teamId: number, userId: number): boolean;
   isOwner(teamId: number, userId: number): boolean;
-  teamsOf(userId: number): Team[];
+  shareAny(userA: number, userB: number): boolean;
   shareCollaborative(userA: number, userB: number): boolean;
   shareDelegating(userA: number, userB: number): boolean;
   userByEmail(email: string): User | undefined;
@@ -97,6 +99,7 @@ export interface AccessReadsSync {
 }
 
 type ReadName = keyof PolicyReadsSync;
+export type PolicyReads = { [K in ReadName]: (...args: Parameters<PolicyReadsSync[K]>) => Promise<ReturnType<PolicyReadsSync[K]>> };
 type Op = { [K in ReadName]: { read: K; args: Parameters<PolicyReadsSync[K]> } }[ReadName];
 // A rule: yields the reads it needs, one at a time, and returns its answer.
 type Rule<T> = Generator<Op, T, unknown>;
@@ -114,8 +117,39 @@ function drive<T>(g: Rule<T>, reads: PolicyReadsSync): T {
   }
 }
 
+// The same, each read awaited. The rule resumes only after its read settles, so the reads stay sequential.
+async function driveAsync<T>(g: Rule<T>, reads: PolicyReads): Promise<T> {
+  for (let s = g.next(); ; ) {
+    if (s.done) return s.value;
+    const { read, args } = s.value;
+    s = g.next(await (reads[read] as (...a: unknown[]) => Promise<unknown>).apply(reads, args));
+  }
+}
+
+// Policy's reads on one handle: `r` is the caller's body's `Tx` inside a transaction, so the rule sees its writes,
+// else `repo.read`, committed state (#807 P3 A7e3).
+function policyReads(repo: Repo, r: Read): PolicyReads {
+  return {
+    principalByName: (name) => repo.principals.findByName(r, name),
+    principalOf: (address) => repo.principals.of(r, address),
+    teamByName: (name) => repo.teams.findByName(r, name),
+    isMember: (teamId, userId) => repo.teams.isMember(r, teamId, userId),
+    isOwner: (teamId, userId) => repo.teams.isOwner(r, teamId, userId),
+    shareAny: (userA, userB) => repo.teams.shareAny(r, userA, userB),
+    shareCollaborative: (userA, userB) => repo.teams.shareCollaborative(r, userA, userB),
+    shareDelegating: (userA, userB) => repo.teams.shareDelegating(r, userA, userB),
+    userByEmail: (email) => repo.users.findByEmail(r, email),
+  };
+}
+
+// The decision, its reads on the caller's handle `r` (#807 P3 A7e3): the form every caller reaches by A7f. No
+// decision is recorded here, so nothing it returns depends on state an await could change underneath the caller.
+export function authorize(repo: Repo, r: Read, ctx: PolicyContext, req: AuthzRequest): Promise<Decision> {
+  return driveAsync(decide(ctx, req), policyReads(repo, r));
+}
+
 // The decision over the SQLite connection's reads, synchronously: the form for callers that can't await yet (#807
-// P3 A7f converts them to the async loader). The reads see the caller's own transaction when it holds one.
+// P3 A7f converts them to `authorize`). The reads see the caller's own transaction when it holds one.
 export function authorizeNow(repo: Repo, ctx: PolicyContext, req: AuthzRequest): Decision {
   return drive(decide(ctx, req), repo.policyNow);
 }
@@ -355,8 +389,8 @@ function* humanRule(reach: HumanReach, from: string, to: string): Rule<{ allow: 
   if (f.name === them.email) return { allow: true, rule: "human.self" };
   const me = yield* ask("userByEmail", f.name);
   if (!me) return { allow: false, rule: "human.teammates" };
-  const theirs = new Set((yield* ask("teamsOf", them.id)).map((x) => x.id));
-  return { allow: (yield* ask("teamsOf", me.id)).some((x) => theirs.has(x.id)), rule: "human.teammates" };
+  // One statement, not each side's team list: two reads across an await could pair states that never coexisted.
+  return { allow: yield* ask("shareAny", me.id, them.id), rule: "human.teammates" };
 }
 
 // The pre-seam entry points, as authorizeNow() answers them, for the unit tests

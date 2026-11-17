@@ -467,7 +467,7 @@ describe("dedup and state answers (in process)", () => {
 
   test("the Slack bridge's human is exempt: a line typed twice is sent twice", async () => {
     await offline("be");
-    const user = srv.app.repo.users.findByEmail("you@example.com")!;
+    const user = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "you@example.com"))!;
     const { session } = await srv.app.application.attachHuman(
       { user_id: user.id, user_email: user.email, session_id: 0 },
       { deliver() {}, closed() {} },

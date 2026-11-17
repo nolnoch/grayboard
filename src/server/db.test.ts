@@ -246,9 +246,9 @@ describe("Repo", () => {
       const u = await repo.users.upsertByEmail(tx, "you@example.com", null);
       return { u, eng: await repo.teams.create(tx, "eng", u.id) };
     });
-    expect(repo.principals.findByName("you@example.com")).toMatchObject({ kind: "user", user_id: u.id, team_id: null });
-    expect(repo.principals.findByName("eng")).toMatchObject({ kind: "team", user_id: null, team_id: eng.id });
-    expect(repo.principals.findByName("ops")).toBeUndefined();
+    expect((await repo.principals.findByName(repo.read, "you@example.com"))).toMatchObject({ kind: "user", user_id: u.id, team_id: null });
+    expect((await repo.principals.findByName(repo.read, "eng"))).toMatchObject({ kind: "team", user_id: null, team_id: eng.id });
+    expect((await repo.principals.findByName(repo.read, "ops"))).toBeUndefined();
   });
 
   test("teams: create, join, leave, list members", async () => {
@@ -260,9 +260,9 @@ describe("Repo", () => {
       await repo.teams.addMember(tx, t.id, u2.id);
       return { u2, t };
     });
-    expect(repo.teams.listMembers(t.id)).toHaveLength(2);
+    expect((await repo.teams.listMembers(repo.read, t.id))).toHaveLength(2);
     await seed(repo, (tx) => repo.teams.removeMember(tx, t.id, u2.id));
-    expect(repo.teams.listMembers(t.id)).toHaveLength(1);
+    expect((await repo.teams.listMembers(repo.read, t.id))).toHaveLength(1);
   });
 
   test("messages: insert and thread", async () => {
@@ -381,7 +381,7 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
     return { u, eng };
   });
   await expect(seed(repo, (tx) => repo.teams.create(tx, "ingest", u.id))).rejects.toThrow(PrincipalTaken);
-  expect(repo.teams.findByName("ingest")).toBeUndefined();
+  expect((await repo.teams.findByName(repo.read, "ingest"))).toBeUndefined();
   expect(db.prepare(`SELECT kind, name, user_id, team_id FROM principals ORDER BY id`).all()).toEqual([
     { kind: "user", name: "a@example.com", user_id: u.id, team_id: null },
     { kind: "team", name: "eng", user_id: null, team_id: eng.id },
@@ -397,7 +397,7 @@ test("#807 P2-3: teams.create refuses a name another principal takes mid-create,
   db.run(`CREATE TEMP TRIGGER land_ingest AFTER INSERT ON teams WHEN NEW.name = 'ingest'
     BEGIN INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0); END`);
   await expect(seed(repo, tx => repo.teams.create(tx, "ingest", u.id))).rejects.toThrow(PrincipalTaken);
-  expect(repo.teams.findByName("ingest")).toBeUndefined();
+  expect((await repo.teams.findByName(repo.read, "ingest"))).toBeUndefined();
   expect(db.prepare(`SELECT COUNT(*) AS n FROM principals WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
   // Another team of the name: teams.name refuses it before the principal insert runs.
   await seed(repo, tx => repo.teams.create(tx, "eng", u.id));
@@ -406,7 +406,7 @@ test("#807 P2-3: teams.create refuses a name another principal takes mid-create,
   const missing = seed(repo, tx => repo.teams.create(tx, "ops", 999_999));
   await expect(missing).rejects.toThrow(/FOREIGN KEY/);
   await expect(missing).rejects.not.toThrow(PrincipalTaken);
-  expect(repo.teams.findByName("ops")).toBeUndefined();
+  expect((await repo.teams.findByName(repo.read, "ops"))).toBeUndefined();
 });
 
 // Security audit F-13, #928 D4: users are matched by (issuer, subject) first,
@@ -424,7 +424,7 @@ test("signIn D4 branch 1: this (issuer, subject)'s user signs in, or is refused 
   expect(await signIn(repo, G, "s-1", "a@example.com", "A 2")).toMatchObject({ status: "ok", linked: false, user: { id: u.user.id, display_name: "A 2" } });
   // The same IdP account reporting another email is refused, and no user is created.
   expect(await signIn(repo, G, "s-1", "renamed@example.com", null)).toMatchObject({ status: "email_changed", user: { id: u.user.id } });
-  expect(repo.users.findByEmail("renamed@example.com")).toBeUndefined();
+  expect((await repo.users.findByEmail(repo.read, "renamed@example.com"))).toBeUndefined();
 });
 
 test("signIn D4 branch 2: another subject under the same issuer is subject_mismatch, and nothing changes", async () => {
@@ -466,7 +466,7 @@ test("signIn D4 branch 6: no row creates the user with issuer and subject, and i
   const { db, repo } = fresh();
   const r = await signIn(repo, G, "s-new", "new@example.com", "New");
   expect(r).toMatchObject({ status: "ok", linked: false, user: { email: "new@example.com", idp_issuer: G, idp_subject: "s-new", display_name: "New" } });
-  expect(repo.users.findByEmail("new@example.com")).toMatchObject({ idp_issuer: G, idp_subject: "s-new" });
+  expect((await repo.users.findByEmail(repo.read, "new@example.com"))).toMatchObject({ idp_issuer: G, idp_subject: "s-new" });
   expect(db.query("SELECT kind FROM principals WHERE name = 'new@example.com'").all()).toEqual([{ kind: "user" }]);
 });
 
@@ -553,8 +553,8 @@ test("schema: a post-F-13 database (subject, no issuer) is stamped, its old inde
   ]);
   expect(indexes(path)).toEqual(["idx_users_idp_identity"]);
   const { repo, db } = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  await seed(repo, tx => repo.users.clearSubject(tx, repo.users.findByEmail("linked@example.com")!.id));
-  await seed(repo, tx => repo.users.clearSubject(tx, repo.users.findByEmail("legacy@example.com")!.id));
+  await seed(repo, async tx => repo.users.clearSubject(tx, (await repo.users.findByEmail(tx, "linked@example.com"))!.id));
+  await seed(repo, async tx => repo.users.clearSubject(tx, (await repo.users.findByEmail(tx, "legacy@example.com"))!.id));
   db.close();
   reopen(path);
   expect(identities(path)).toEqual([
@@ -718,8 +718,8 @@ test("#807 P1c-7: user writes run on the handle they're given", async () => {
   await expect(repo.users.clearSubject(kept, u.id)).rejects.toThrow(settled);
   await expect(repo.users.setDisabled(kept, u.id, true)).rejects.toThrow(settled);
   await expect(repo.users.setDisabled({} as Tx, u.id, true)).rejects.toThrow("not a SQLite store handle");
-  expect(repo.users.findByEmail("b@example.com")).toBeUndefined();
-  expect(repo.users.findByEmail("c@example.com")).toBeUndefined();
+  expect((await repo.users.findByEmail(repo.read, "b@example.com"))).toBeUndefined();
+  expect((await repo.users.findByEmail(repo.read, "c@example.com"))).toBeUndefined();
   expect(repo.users.findById(u.id)?.disabled_at).toBeNull();
 });
 
@@ -818,9 +818,9 @@ test("#807 P1c-10: team writes run on the handle they're given", async () => {
   await expect(repo.teams.setRole(kept, t.id, a.id, "member")).rejects.toThrow(settled);
   await expect(repo.teams.setPolicy(kept, t.id, "collaborative")).rejects.toThrow(settled);
   await expect(repo.teams.addMember({} as Tx, t.id, b.id)).rejects.toThrow("not a SQLite store handle");
-  expect(repo.teams.findByName("dev")).toBeUndefined();
-  expect(repo.teams.listMembers(t.id)).toEqual([{ user_id: a.id, email: "a@example.com", role: "owner" }]);
-  expect(repo.teams.findByName("ops")?.policy).toBe("open");
+  expect((await repo.teams.findByName(repo.read, "dev"))).toBeUndefined();
+  expect((await repo.teams.listMembers(repo.read, t.id))).toEqual([{ user_id: a.id, email: "a@example.com", role: "owner" }]);
+  expect((await repo.teams.findByName(repo.read, "ops"))?.policy).toBe("open");
 });
 
 // #807 P1c-11: the hosted store's writes run on the handle they're given, as P1c-7's users writes do. The facade

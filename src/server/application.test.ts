@@ -324,7 +324,7 @@ test("unbound hosted reads never use the human address and still list and read b
 
 test("a hosted session whose hello facts throw is left unregistered (#385 item 9)", async () => {
   const pushed: unknown[] = [];
-  const teams = spyOn(store.repo.teams, "listForUser").mockImplementation(() => { throw new Error("db gone"); });
+  const teams = spyOn(store.repo.policyNow, "teamsOf").mockImplementation(() => { throw new Error("db gone"); });
   try {
     expect(() => application.hostedSession(store.repo.read, alice, "id:2222222222222", ["alice@example.com/be"], null, null, { deliver: e => { pushed.push(e); }, closed: () => {} }, true)).toThrow("db gone");
   } finally { teams.mockRestore(); }
