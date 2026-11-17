@@ -28,11 +28,11 @@ test("#1042: bodies queued behind an async body write their own request's origin
   let release!: () => void;
   const gate = new Promise<void>(r => { release = r; });
   // A holds the queue across an await, as a Postgres-era body will (#807 D4).
-  const held = inRequest(a, () => repo.write(async () => { await gate; repo.audit.write(row("t.a")); }));
+  const held = inRequest(a, () => repo.write(async (tx) => { await gate; repo.audit.write(tx, row("t.a")); }));
   // B's committed runs after its commit, still as B's work: its row too carries b.
-  const wrote = inRequest(b, () => repo.write(() => { repo.audit.write(row("t.b")); }, () => repo.post(() => { repo.audit.write(row("t.b.committed")); })));
-  expect(inRequest(c, () => repo.post(() => { repo.audit.write(row("t.c")); }))).toBe(false);
-  expect(detached(() => repo.post(() => { repo.audit.write(row("t.none")); }))).toBe(false);
+  const wrote = inRequest(b, () => repo.write((tx) => { repo.audit.write(tx, row("t.b")); }, () => repo.post((tx) => { repo.audit.write(tx, row("t.b.committed")); })));
+  expect(inRequest(c, () => repo.post((tx) => { repo.audit.write(tx, row("t.c")); }))).toBe(false);
+  expect(detached(() => repo.post((tx) => { repo.audit.write(tx, row("t.none")); }))).toBe(false);
   release();
   await Promise.all([held, wrote]);
   await repo.write(() => undefined); // the posted bodies ran before this one

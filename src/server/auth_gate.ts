@@ -84,16 +84,16 @@ export class AuthGate {
     const limiter = (limit: RateLimit, tier: "address" | "site") => new RateLimiter(limit, {
       start: (key, ctx, retryAfterMs, lastFailure) => {
         console.error(`[grayboard] rate-limiting ${key} after repeated authentication failures`);
-        writeAudit(repo, "auth.rate_limited", null, key, { ...ctx, retry_after_ms: retryAfterMs, last_failure: lastFailure });
+        writeAudit(repo, repo.read, "auth.rate_limited", null, key, { ...ctx, retry_after_ms: retryAfterMs, last_failure: lastFailure });
       },
       end: (key, refused) => {
         console.error(`[grayboard] ${key} no longer rate-limited; ${refused} refused`);
-        writeAudit(repo, "auth.rate_limit_ended", null, key, { refused });
+        writeAudit(repo, repo.read, "auth.rate_limit_ended", null, key, { refused });
       },
       full: (size, uncharged) => {
         const what = tier === "site" ? "IPv6 /48s" : "addresses";
         console.error(`[grayboard] auth-failure limiter is tracking ${size} ${what}, its cap; ${uncharged} failures from new ${what} went uncharged`);
-        writeAudit(repo, "auth.rate_limit_full", null, null, { tracked: size, uncharged, ...(tier === "site" ? { tier } : {}) });
+        writeAudit(repo, repo.read, "auth.rate_limit_full", null, null, { tracked: size, uncharged, ...(tier === "site" ? { tier } : {}) });
       },
     }, opts.now, opts.maxKeys ?? AUTH_FAIL_MAX_KEYS);
     this.limiter = limiter(opts.limit, "address");

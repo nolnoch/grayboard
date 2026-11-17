@@ -91,7 +91,7 @@ export function dedupWrite<W extends Written>(
       // replaced it first, and the audit says why this repeat wrote fresh (#306).
       if (!receipts.refExists(tx, hit.ref_kind, hit.ref_id)) {
         if (!receipts.reclaim(tx, key, hit, now)) continue;
-        writeAudit(repo, "request.receipt_stale", call.actor, call.sender, {
+        writeAudit(repo, tx, "request.receipt_stale", call.actor, call.sender, {
           tool: call.tool, fp, ref_kind: hit.ref_kind, ref_id: hit.ref_id, first_at: new Date(hit.at).toISOString(), session: call.session,
         });
         break;
@@ -100,7 +100,7 @@ export function dedupWrite<W extends Written>(
       const first_at = new Date(hit.at).toISOString();
       const stored = JSON.parse(hit.result_json) as W["payload"];
       recheck(stored);
-      writeAudit(repo, "request.replayed", call.actor, call.sender, {
+      writeAudit(repo, tx, "request.replayed", call.actor, call.sender, {
         tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
       });
       onReplay();
@@ -113,7 +113,7 @@ export function dedupWrite<W extends Written>(
     });
     // A deliberate repeat, told apart from a fresh first call.
     if (call.resend) {
-      writeAudit(repo, "request.resent", call.actor, call.sender, { tool: call.tool, fp, ref_kind: w.ref.kind, ref_id: w.ref.id, session: call.session });
+      writeAudit(repo, tx, "request.resent", call.actor, call.sender, { tool: call.tool, fp, ref_kind: w.ref.kind, ref_id: w.ref.id, session: call.session });
     }
     return { fresh: w };
   });

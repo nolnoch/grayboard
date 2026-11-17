@@ -338,6 +338,39 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
   } finally { spy.mockRestore(); }
 });
 
+// #807 P3 A2: an audit row written inside a hosted body goes on that body's Tx, never through `repo.post` (whose inline
+// branch is what ran it before); the hosted row an audit without a principal reads to name its actor is read on the same Tx.
+test("#807 P3 A2: audit rows inside hosted bodies write on that body's Tx, and the row an audit reads is read on it", async () => {
+  const posts: { what: string; inTxn: boolean }[] = [];
+  const post = database.repo.post.bind(database.repo);
+  const postSpy = spyOn(database.repo, "post").mockImplementation(((fn: never, committed?: never, what?: string) => {
+    posts.push({ what: what ?? "", inTxn: database.db.inTransaction });
+    return post(fn, committed, what);
+  }) as never);
+  const reads: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const get = database.repo.hosted.get.bind(database.repo.hosted);
+  const getSpy = spyOn(database.repo.hosted, "get").mockImplementation((r, id) => {
+    if (new Error().stack?.split("\n").some(l => /\bat audit \(.*\/hosted\.ts:/.test(l))) reads.push({ inTxn: database.db.inTransaction, handle: r === database.repo.read ? "pool" : "tx" });
+    return get(r, id);
+  });
+  const a = context("a2-root"), b = context("a2-other");
+  const rows = (action: string) => (database.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = ?").get(action) as { n: number }).n;
+  try {
+    await hosted.bind(principal, a, { name: "a2", create: true });
+    await delivery.open(principal, a);
+    // A second hold with the lease open closes it: an audit with no principal, which reads the root's row for its actor.
+    await hosted.bind(principal, a, { name: "a2-second", create: true });
+    expect(rows("hosted.lease_closed")).toBe(1);
+    await hosted.run(principal, a, "board_create", (session, tx) => application.call(tx, session, "board_create", { name: "a2", purpose: "tests" }));
+    expect(rows("hosted.write")).toBeGreaterThan(0);
+    await expect(hosted.bind(principal, b, { name: "a2" })).rejects.toHaveProperty("code", "alias_held");
+    await hosted.unbind(principal, a, { name: "a2-second" });
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.filter(r => !(r.inTxn && r.handle === "tx"))).toEqual([]);
+    expect(posts.filter(p => p.what.startsWith("audit ") && p.inTxn)).toEqual([]);
+  } finally { postSpy.mockRestore(); getSpy.mockRestore(); }
+});
+
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
   const invalidations: (string | null)[] = [];

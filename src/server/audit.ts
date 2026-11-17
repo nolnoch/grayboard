@@ -1,5 +1,6 @@
 import type { Repo } from "./db.ts";
 import type { AuditSink } from "../core/audit.ts";
+import { isTx, type Read } from "./store/tx.ts";
 
 export type AuditAction =
   | "attachment.bound"
@@ -120,18 +121,21 @@ export function userAgent(req: Request): string | null {
   return req.headers.get("user-agent")?.slice(0, 120) ?? null;
 }
 
+// `h`: the caller's live `Tx` inside a write body, whose transaction the row joins (and rolls back with); outside one,
+// `repo.read`, and the row is posted: through the write queue, waiting behind another body's transaction rather than
+// landing inside it (#807 P1b-4b), or inline in the caller's open transaction (the post's first branch, until A3).
 export function writeAudit(
   repo: Repo,
+  h: Read,
   action: AuditAction,
   actor: string | null,
   target: string | null,
   detail?: Record<string, unknown>,
 ): void {
   const row = { at: repo.now(), actor, action, target, detail: detail ? JSON.stringify(detail) : null };
-  // Part of the caller's transaction when one is open; else through the write queue, waiting behind another
-  // body's transaction rather than landing inside it (#807 P1b-4b).
-  repo.post(() => repo.audit.write(row), undefined, `audit ${action}`);
+  if (isTx(h)) { repo.audit.write(h, row); return; }
+  repo.post((tx) => repo.audit.write(tx, row), undefined, `audit ${action}`);
 }
 
-/** Core's audit rows, written on the server: access_log through the Repo (#342). */
-export const serverAuditSink = (repo: Repo): AuditSink => (action, actor, target, detail) => writeAudit(repo, action, actor, target, detail);
+/** Core's audit rows, written on the server: access_log through the Repo (#342), on `h` as writeAudit writes. */
+export const serverAuditSink = (repo: Repo, h: Read): AuditSink => (action, actor, target, detail) => writeAudit(repo, h, action, actor, target, detail);
