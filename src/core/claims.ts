@@ -22,12 +22,16 @@ const CLAIM_COLS = "key, holder, note, board, acquired_at, expires_at";
 type ClaimRow = Claim & { holder_user: string | null };
 
 // The user an announcement the system writes for a claim (its expiry, a session end's release) is recorded
-// as written by (#855): the claimant's, or for a claim from before holder_user an ID holder's principal, else a
-// person alias's person (a team alias names no user).
+// as written by (#855): the claimant's, or for a claim from before holder_user (or a queue delivery to an alias
+// no session held then) an ID holder's principal, else the user of the session holding the alias now, else a
+// person alias's person. A team alias nobody holds names no user.
 function holderUser(db: Database, c: ClaimRow): string | undefined {
   if (c.holder_user) return c.holder_user;
   const principal = idRow(db, c.holder)?.principal;
   if (principal) return principal;
+  const held = db.prepare(`SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?`).get(c.holder) as
+    { principal: string | null } | null;
+  if (held?.principal) return held.principal;
   const p = addressParts(c.holder);
   return p?.kind === "alias" && p.scopeKind === "person" ? p.scope : undefined;
 }
@@ -189,6 +193,32 @@ export function claim(
   }).immediate();
 }
 
+// A queue post's claim ended without an ack: offer the post to the next lane
+// that hasn't held it. With none left, the post stays readable on its board
+// unclaimed, and a reply in its thread, as the lane that held it last, tells
+// the poster and the claim's watchers (#220). The reply's author shows that
+// last lane, as `[expired]` posts show a holder; its text counts the lanes
+// rather than naming them. A decline's reply is the declining session's
+// (`ctx`); a lapse's is the claimant's user (#855). Like a holder that lost
+// access, one that can't post there now ends it quietly.
+function requeue(db: Database, c: ClaimRow, now: number, ctx: ClaimCtx = {}): ClaimChanges {
+  const cc = watchersCc(db, c.key, true);
+  const r = redeliverQueuePost(db, c.key, c.holder, now);
+  if (!r) return { wake: [], boards: [] };
+  if ("lane" in r) return { wake: [r.lane], boards: [] };
+  const lanes = r.held === 1 ? "its one lane" : `all ${r.held} lanes`;
+  const text = `[unclaimed] ${c.key}: ${lanes} passed on it, and no other lane is left; it stays here unclaimed${cc}`;
+  try {
+    const res = post(db, c.holder, r.board, text, r.postId, {
+      author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true,
+    });
+    return { wake: res.wake, boards: [res.post.board] };
+  } catch (e) {
+    if (e instanceof CoreError) return { wake: [], boards: [] };
+    throw e;
+  }
+}
+
 // When one of `addresses` released `key`, if nothing has happened to the key
 // since: its release is the key's latest event, or on a queue: key the one
 // its own redelivery directly followed. Otherwise undefined.
@@ -231,9 +261,7 @@ export function release(
       // A declined queue post goes to the next lane with the original post;
       // the decline post would itself rotate as a new work item, so it isn't
       // announced either (#192 review).
-      watchersCc(db, key, true);
-      const lane = redeliverQueuePost(db, key, cur.holder, Date.now());
-      return { wake: lane ? [lane] : [], boards: [] };
+      return requeue(db, cur, Date.now(), ctx);
     }
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
@@ -313,9 +341,9 @@ function sweepChanges(db: Database, now: number): ClaimChanges {
       // A queue post's claim lapsed: re-offer the original post to the next
       // lane instead of announcing - an expiry post on a queue board would
       // itself rotate as a new work item (#192 review).
-      watchersCc(db, c.key, true);
-      const lane = redeliverQueuePost(db, c.key, c.holder, now);
-      if (lane) wake.add(lane);
+      const changed = requeue(db, c, now);
+      for (const h of changed.wake) wake.add(h);
+      for (const board of changed.boards) boards.add(board);
       continue;
     }
     const cc = watchersCc(db, c.key, true);

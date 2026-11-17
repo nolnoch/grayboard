@@ -786,7 +786,8 @@ export function queueLanes(
 // redelivers it to the next lane). At-least-once: the claim key is the
 // idempotency token. The claim does not announce on the board - the delivery
 // IS the visibility, and an announce would cascade back through the queue
-// rotation. Caller is inside post's transaction.
+// rotation. The claim records the lane's session's user (#855), so a reply the
+// bus writes when it ends unclaimed is that user's. Caller is inside post's transaction.
 function claimQueuePost(db: Database, board: string, p: Post, lane: string, now: number, note = "queue post"): void {
   const key = `queue:${board}:${p.id}`;
   const expires = now + QUEUE_CLAIM_TTL_MS;
@@ -798,8 +799,9 @@ function claimQueuePost(db: Database, board: string, p: Post, lane: string, now:
   ).run(lane, p.id);
   const res = db
     .prepare(
-      `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE((SELECT principal FROM ids WHERE id = ?2),
+         (SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?2)))`,
     )
     .run(key, lane, note, board, now, expires);
   // The claim is the idempotency token: when a row already holds the key,
@@ -827,23 +829,29 @@ function postAddresses(db: Database, postId: number): string[] {
 }
 
 // A queue post's claim ended (TTL lapse in sweepIn, or a decline in release):
-// offer the original post to the next eligible lane. The previous holder is
-// excluded - it held the post for a full TTL, or declined. With no other
-// lane, the post sits readable on the board (the documented v1 behavior for
-// an empty rotation). Presence-blind: the sweep has no online predicate, so
-// an offline lane holds the re-offer in its outbox until it wakes, and its
-// own TTL lapse re-rotates. Caller is inside a transaction. Returns the lane
-// woken, or null when there is no next lane.
-export function redeliverQueuePost(db: Database, key: string, prevHolder: string, now = Date.now()): string | null {
+// offer the original post to the next eligible lane that hasn't held it. Each
+// lane gets one turn (#220): one that held it (declined it, or let its TTL
+// lapse) isn't offered it again, so two lanes can't pass it back and forth
+// forever. Presence-blind: the sweep has no online predicate, so an offline
+// lane holds the re-offer in its outbox until it wakes, and its own TTL lapse
+// re-rotates. Caller is inside a transaction. Returns the lane woken; with no
+// lane left, the post and how many lanes held it, for the caller to say so in
+// its thread; null for a key that isn't a live queue post.
+export type Requeue = { lane: string } | { board: string; postId: number; held: number } | null;
+export function redeliverQueuePost(db: Database, key: string, prevHolder: string, now = Date.now()): Requeue {
   const m = /^queue:([^:]+):(\d+)$/.exec(key);
   if (!m) return null;
   const b = getBoard(db, m[1]!);
   const p = getPost(db, Number(m[2]));
   if (!b || !p || p.board !== b.name) return null;
-  const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => h !== prevHolder);
-  if (!lane) return null;
+  const held = new Set(
+    (db.prepare(`SELECT DISTINCT handle FROM claim_events WHERE key = ? AND event = 'take'`).all(key) as { handle: string }[]).map((r) => r.handle),
+  );
+  held.add(prevHolder);
+  const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => !held.has(h));
+  if (!lane) return { board: b.name, postId: p.id, held: held.size };
   claimQueuePost(db, b.name, p, lane, now, REDELIVERED_NOTE);
-  return lane;
+  return { lane };
 }
 
 // What decides whether `handle` may post (or reply) on a board now: it can see
