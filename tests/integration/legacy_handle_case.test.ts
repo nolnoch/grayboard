@@ -6,7 +6,7 @@ import { afterEach, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { busRows } from "../support/local_bus.ts";
+import { busRows, pauseEnv, releasePause } from "../support/local_bus.ts";
 import { closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
 import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
@@ -97,4 +97,30 @@ test(`a ${FROM} DM to Gray while this tree's gray is live arrives at the next op
   await localSession(bus, "fe");
   await until(() => gray.pushes.find((p) => p.content === "late"));
   expect(busRows(bus, `SELECT recipient FROM messages WHERE body = 'late'`)).toEqual([{ recipient: "gray" }]);
+}, 60_000);
+
+// #1192: a 1.x DM to Gray sits below the 1.x DM to gray whose push is in
+// flight when another open merges Gray in; marking the in-flight one must not
+// move gray's cursor past the merged one, so the drain still pushes it.
+test(`a ${FROM} DM merged in while a later DM's push is in flight is still pushed`, async () => {
+  const bus = mkdtempSync(join(tmpdir(), "grayboard-case-"));
+  dirs.push(bus);
+  const point = "drain:before-delivered";
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  const gray = await localSession(bus, "gray", { extra: pauseEnv(bus, point) });
+  expect((await gray.call("whoami")).primary).toBe("gray");
+  await stopSession((await localSession(bus, "Gray", { bin: rel.cli })).c);
+  const be = await localSession(bus, "be", { bin: rel.cli });
+  await be.call("dm_send", { to: "Gray", body: "merged" });
+  await be.call("dm_send", { to: "gray", body: "inflight" });
+  await stopSession(be.c);
+  await until(() => gray.stderr().includes(`test pause hit: ${point}`));
+  expect(gray.pushes.map((p) => p.content)).toContain("inflight");
+  expect(busRows(bus, `SELECT recipient FROM messages WHERE body = 'merged'`)).toEqual([{ recipient: "Gray" }]);
+
+  await localSession(bus, "fe");
+  expect(busRows(bus, `SELECT recipient FROM messages WHERE body = 'merged'`)).toEqual([{ recipient: "gray" }]);
+  releasePause(bus, point);
+  await until(() => gray.pushes.find((p) => p.content === "merged"), 10_000, "the merged DM pushed");
+  expect(gray.pushes.filter((p) => p.content === "inflight")).toHaveLength(1);
 }, 60_000);

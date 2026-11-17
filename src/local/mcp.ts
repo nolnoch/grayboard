@@ -1168,6 +1168,8 @@ async function drainLoop(): Promise<void> {
         if (isHuman(db, msg.sender)) params.meta.human = "true";
         if (!await pushChannel(params)) return;
         if (sessionEnded) return;
+        // A push in flight while another process's open merges a 1.x name in (#1192).
+        await testPauseAsync("drain:before-delivered");
         deliveredTo(reader, msg.id);
       }
     }
