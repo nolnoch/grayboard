@@ -112,8 +112,8 @@ export type AuthPeek = {
 // next body (D4: in-memory state a transaction reads changes only inside one or right after its commit, never in
 // the gap before its caller resumes). Its result is boxed, so a promise it returns doesn't hold the queue.
 // fn may await (#807 P1b-4e): the transaction stays open, and the queue held, until its promise settles; it commits
-// on fulfilment and rolls back on rejection. Meanwhile other tasks read committed state on the reader and their
-// writes wait in the queue (core/sqlite.ts ownWriter).
+// on fulfilment, after the beforeCommit hooks its Tx registered, and rolls back on rejection. Meanwhile other tasks
+// read committed state on the reader and their writes wait in the queue (core/sqlite.ts ownWriter).
 // fn gets the transaction's Tx (#807 P1c), closed when fn settles: a timer or un-awaited promise fn started that uses it
 // later throws instead of writing into whichever transaction is open by then.
 // fn and committed run as the work of the request that called write(), or of none (#1042): a body that waited starts
@@ -136,9 +136,12 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
     const fail = (error: unknown): never => { tx.close(); b.rollback(); throw error; };
     let out: T | PromiseLike<T>;
     try { out = fn(tx); } catch (error) { return fail(error); }
-    if (!isThenable(out)) return settle(out as T);
+    if (!isThenable(out) && !tx.hasBeforeCommit) return settle(out as T);
     // Reactions attached here run as the holder (the queue's context follows them), so the commit is the writer's.
-    return Promise.resolve(out).then(settle, fail);
+    // The beforeCommit hooks run after the body fulfils, on its still-open Tx (#807 P3 A7g); a sync body that
+    // registered one goes this way too. With none, the commit is as many ticks after the body as before: an
+    // un-awaited write's caller resumes after it committed, not inside it.
+    return Promise.resolve(out).then(value => tx.hasBeforeCommit ? tx.runBeforeCommit().then(() => settle(value), fail) : settle(value), fail);
   }
 }
 
@@ -187,10 +190,11 @@ export function queuedGuardTx(repo: Repo, guard?: (r: Read) => void | Promise<vo
 // A write no caller waits for (an audit row, a closing session's last-seen touch, a lapsed lease's settle; #807 P1b-4b),
 // for code that can't await: a sync finally, a timer, a sync check on the request path. It runs as its own transaction
 // when the caller holds the queue outside one (its committed callback, its afterCommit flush), or through the queue:
-// now when it's idle and fn is synchronous, else when fn settles or after the bodies ahead of it. Inside an open
-// transaction it refuses (#807 P3 A3): a write that belongs to a body goes on that body's Tx. fn may be async, except
-// from the holder: the holder resumes while fn awaits, so a thenable there rolls fn back and throws. True when it ran
-// now (its error, and committed's, thrown), false when it waits or awaits; a failure then is logged as `what` failed.
+// now when it's idle and fn is synchronous and registered no beforeCommit hook, else when fn (and its hooks) settles
+// or after the bodies ahead of it. Inside an open transaction it refuses (#807 P3 A3): a write that belongs to a body
+// goes on that body's Tx. fn may be async, except from the holder: the holder resumes while fn awaits, so a thenable
+// there rolls fn back and throws. True when it ran now (its error, and committed's, thrown), false when it waits or
+// awaits; a failure then is logged as `what` failed.
 function posted<T>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, given: ((value: T) => unknown) | undefined, what: string): boolean {
   const queue = queueFor(db);
   // No caller awaits a post, so a promise its committed returns is caught here, on every branch, and logged as `what`
