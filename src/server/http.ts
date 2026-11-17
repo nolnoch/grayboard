@@ -488,7 +488,7 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: S
       throw e;
     }
     onTeamLeft(repo, tx, team, authed.user_email);
-    sessions.accessChanged(authed.user_email, authed.user_email);
+    sessions.accessChanged(tx, authed.user_email, authed.user_email);
     writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: authed.user_email });
     return json({ ok: true });
   });
@@ -546,7 +546,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       throw e;
     }
     onTeamLeft(repo, tx, team, email);
-    sessions.accessChanged(email, authed.user_email);
+    sessions.accessChanged(tx, email, authed.user_email);
     writeAudit(repo, tx, "team.member_removed", authed.user_email, team.name, { member: email, ...managed.audit });
     return json({ ok: true });
   });
@@ -676,7 +676,7 @@ async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, conf
 export type SessionHooks = {
   disconnectUser: (userId: number) => void;
   // principal: a principal's name; its sessions' aliases are re-checked.
-  accessChanged: (principal: string, by: string) => void;
+  accessChanged: (h: Read, principal: string, by: string) => void;
 };
 
 export async function handleHttp(

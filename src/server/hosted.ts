@@ -291,7 +291,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
-      application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
+      application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
       // An ID that was a child (its source row ended) starts as a root: an address again (#523).
       application.hostedRoot(tx, row.session_id, null);
       store.insert(tx, row);
@@ -808,7 +808,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           // A lost hold bound again is no longer lost: neither reader is told it, and the Controller keeps it (#453).
           if (added) store.forgetLost(tx, row.session_id, ok.alias);
           return { ok, added: ok.held.length !== before.length, first: before.length === 0, ownership: row.ownership_id };
-        } finally { application.close(selected.session); }
+        } finally { application.close(selected.session, tx); }
       }, async result => {
         await testPauseAsync("hosted:bind:after-commit");
         authorized(p);
@@ -841,7 +841,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             if (row.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "unbound" });
           }
           return { ok, before, ownership: row.ownership_id, suggested: row.suggested };
-        } finally { application.close(selected.session); }
+        } finally { application.close(selected.session, tx); }
       }, async result => {
         await testPauseAsync("hosted:unbind:after-commit");
         authorized(p);
