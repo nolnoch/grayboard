@@ -69,7 +69,7 @@ for (const revokeFirst of [false, true]) test(`forced attachment/revoke transact
   const results = await overlap(revokeFirst ? revoke : attach, revokeFirst ? attach : revoke, revokeFirst ? "hosted:revoke:in-txn" : "hosted:attach:in-txn");
   if (revokeFirst) {
     expect(results[1]).toMatchObject({ ok: false, code: "unauthenticated" });
-    expect(database.repo.hosted.all(database.repo.read).every(row => row.grant_id === first.grantId)).toBe(true);
+    expect((await database.repo.hosted.all(database.repo.read)).every(row => row.grant_id === first.grantId)).toBe(true);
     expect(releases()).toEqual([]);
   } else {
     expect(results.every(result => result.ok)).toBe(true);
@@ -83,7 +83,7 @@ test("forced bind/bind overlap on one name gives it one holder (#387 item 23)", 
   const results = await overlap({ operation: "bind", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:bind:in-txn");
   expect(results[0]).toMatchObject({ ok: true });
   expect(results[1]).toMatchObject({ ok: false });
-  const holders = database.repo.hosted.all(database.repo.read).filter(row => application.hostedHolds(application.repo.read, row.session_id).map(short).includes("fe"));
+  const holders = (await database.repo.hosted.all(database.repo.read)).filter(row => application.hostedHolds(application.repo.read, row.session_id).map(short).includes("fe"));
   expect(holders).toHaveLength(1);
   expect(holders[0]?.source_session_id).toBe("root");
 }, 15_000);
@@ -93,7 +93,7 @@ test("forced release/bind overlap hands the name to the contender only after the
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const results = await overlap({ operation: "end", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:release:in-txn");
   expect(results.every(result => result.ok)).toBe(true);
-  const rows = database.repo.hosted.all(database.repo.read);
+  const rows = await database.repo.hosted.all(database.repo.read);
   expect(rows.map(row => row.source_session_id)).toEqual(["other"]);
   expect(application.hostedHolds(application.repo.read, rows[0]!.session_id).map(short)).toEqual(["fe"]);
   expect(releases()).toHaveLength(1);
@@ -114,7 +114,7 @@ test("forced expiry/rebind overlap releases only the expired ownership", async (
   const lease = await delivery.open(principal, context(principal));
   const results = await overlap({ operation: "sweep", principal, sweepAt: now + 30_001 }, { operation: "bind", principal }, "hosted:lease-expire:in-txn");
   expect(results.every(result => result.ok)).toBe(true);
-  const rows = database.repo.hosted.all(database.repo.read);
+  const rows = await database.repo.hosted.all(database.repo.read);
   expect(rows).toHaveLength(1);
   expect(rows[0]?.ownership_id).not.toBe(lease.ownership);
   expect(application.hostedHolds(application.repo.read, rows[0]!.session_id).map(short)).toEqual(["fe"]);
@@ -135,7 +135,7 @@ for (const owning of ["bind", "open", "register"] as const) {
     await hosted.whoami(first.principal, context(first.principal));
     if (owning === "open") await hosted.bind(first.principal, context(first.principal), { name: "fe", create: true });
     const id = (context(p) as { id: string }).id;
-    const old = database.repo.hosted.get(database.repo.read, id)!;
+    const old = (await database.repo.hosted.get(database.repo.read, id))!;
     const operation = () => owning === "bind" ? hosted.bind(p, context(p), { name: "new", create: true })
       : owning === "open" ? delivery.open(p, context(p)) : hosted.register(p, context(p), "new-child");
     const point = owning === "register" ? "hosted:register:before-txn" : "hosted:owning:before-txn";
@@ -148,12 +148,12 @@ for (const owning of ["bind", "open", "register"] as const) {
         expect(external({ operation: "bind", name: "be", principal: first.principal }).ok).toBe(true);
       }
     })).rejects.toBeDefined();
-    const fresh = database.repo.hosted.get(database.repo.read, id)!;
+    const fresh = (await database.repo.hosted.get(database.repo.read, id))!;
     expect(fresh.ownership_id).not.toBe(old.ownership_id);
     expect(fresh.grant_id).toBe(first.grantId);
     expect(application.hostedHolds(application.repo.read, fresh.session_id).map(short)).toEqual(change === "convert" ? [] : ["be"]);
     expect(await database.repo.aliases.find(database.repo.read, `${p.authed.user_email}/new`)).toBeUndefined();
-    expect(database.repo.hosted.all(database.repo.read).some(row => row.source_session_id === "new-child")).toBe(false);
+    expect((await database.repo.hosted.all(database.repo.read)).some(row => row.source_session_id === "new-child")).toBe(false);
     expect(delivery.activeLeaseCount).toBe(0);
   });
 }
@@ -162,14 +162,14 @@ test("registration before bind/open preserves the graph and never extends a stic
   const { principal: p } = await issue();
   await hosted.register(p, context(p), "first");
   const id = (context(p) as { id: string }).id;
-  const ownership = database.repo.hosted.get(database.repo.read, id)!.ownership_id;
+  const ownership = (await database.repo.hosted.get(database.repo.read, id))!.ownership_id;
   await hosted.bind(p, context(p), { name: "fe", create: true });
   const lease = await delivery.open(p, context(p));
   now += 20_000;
   await hosted.register(p, context(p), "second");
   await hosted.register(p, context(p), "first");
-  expect(database.repo.hosted.get(database.repo.read, id)).toMatchObject({ ownership_id: ownership, lease_deadline: lease.expiresAt, last_seen_at: now });
-  expect(database.repo.hosted.all(database.repo.read)).toHaveLength(3);
+  expect(await database.repo.hosted.get(database.repo.read, id)).toMatchObject({ ownership_id: ownership, lease_deadline: lease.expiresAt, last_seen_at: now });
+  expect(await database.repo.hosted.all(database.repo.read)).toHaveLength(3);
   now = lease.expiresAt + 1;
   await hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);
@@ -179,16 +179,16 @@ test("a registration that arrives while its root rebinds waits for the bind and 
   const { principal: p } = await issue();
   await hosted.bind(p, context(p), { name: "fe", create: true });
   const id = (context(p) as { id: string }).id;
-  const before = database.repo.hosted.get(database.repo.read, id)!;
+  const before = (await database.repo.hosted.get(database.repo.read, id))!;
   let registering!: Promise<unknown>;
   // The bind holds the root's gate; the registration starts (and reads the root) while it waits for it.
   await hostedPause("hosted:owning:before-txn", () => hosted.bind(p, context(p), { name: "be", create: true }), async () => {
     registering = hosted.register(p, context(p), "child");
   });
   await expect(registering).resolves.toMatchObject({ message: "registered" });
-  const root = database.repo.hosted.get(database.repo.read, id)!;
+  const root = (await database.repo.hosted.get(database.repo.read, id))!;
   expect(root).toMatchObject({ ownership_id: before.ownership_id, bind_gen: before.bind_gen + 1 });
-  expect(database.repo.hosted.all(database.repo.read).find(row => row.source_session_id === "child")?.root_session_id).toBe(id);
+  expect((await database.repo.hosted.all(database.repo.read)).find(row => row.source_session_id === "child")?.root_session_id).toBe(id);
 });
 
 test("successful new and idempotent registration refresh activity but refusals do not", async () => {
@@ -197,20 +197,20 @@ test("successful new and idempotent registration refresh activity but refusals d
   const id = (context(p) as { id: string }).id;
   now += 899_000;
   await hosted.register(p, context(p), "second");
-  expect(database.repo.hosted.get(database.repo.read, id)?.last_seen_at).toBe(now);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.last_seen_at).toBe(now);
   now += 899_000;
   await hosted.register(p, context(p), "second");
-  expect(database.repo.hosted.get(database.repo.read, id)?.last_seen_at).toBe(now);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.last_seen_at).toBe(now);
   const active = now;
   now += 1_001;
   await hosted.sweep();
   // The root and "second" stay active; "first", idle since its registration, is parked (#566).
-  expect(database.repo.hosted.all(database.repo.read)).toHaveLength(2);
-  expect(database.repo.hosted.children(database.repo.read, id)).toHaveLength(2);
+  expect(await database.repo.hosted.all(database.repo.read)).toHaveLength(2);
+  expect(await database.repo.hosted.children(database.repo.read, id)).toHaveLength(2);
   await hosted.bind(p, context(p, "blocked"), { name: "blocked", create: true });
   await expect(hosted.register(second.principal, context(second.principal), "blocked")).rejects.toMatchObject({ code: "child_bound" });
-  expect(database.repo.hosted.get(database.repo.read, id)?.last_seen_at).toBe(active);
-  expect(database.repo.hosted.get(database.repo.read, id)?.grant_id).toBe(first.grantId);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.last_seen_at).toBe(active);
+  expect((await database.repo.hosted.get(database.repo.read, id))?.grant_id).toBe(first.grantId);
   await hosted.end(p, context(p, "blocked"));
   now = active + 900_001;
   await hosted.sweep();
@@ -273,7 +273,7 @@ test("two restarts retain ownership and deadline; downtime is credited; expiry r
   // Downtime longer than the TTL doesn't count against the lease (#423)...
   await close(); now += 31_000; await open();
   expect(releases()).toEqual([]);
-  expect(database.repo.hosted.all(database.repo.read)).toHaveLength(2);
+  expect(await database.repo.hosted.all(database.repo.read)).toHaveLength(2);
   // ...but time while the server is up does.
   now += 31_000; await hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);

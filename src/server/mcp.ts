@@ -474,7 +474,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     // The exchange's selection read the root moments ago (#907).
     const row = context.verdict ? undefined : hosted.row(context.sessionContext.id);
     const root = context.verdict?.root ?? (row && hosted.rootOf(row));
-    return hostedBoundInstruction(context.info, context.declared, application.hostedLauncher(context.sessionContext.id), root?.lease_deadline != null);
+    return hostedBoundInstruction(context.info, context.declared, application.hostedLauncherNow(context.sessionContext.id), root?.lease_deadline != null);
   }
   function makeServer(context: Context, legacy?: Legacy) {
     const { role, info } = context;
