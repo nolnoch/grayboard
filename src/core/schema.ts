@@ -5,8 +5,8 @@ import type { Database } from "bun:sqlite";
 export function initCoreSchema(db: Database): void {
   db.exec(`
     -- The 1.x roster, replaced by aliases and ids (#284). Nothing reads or
-    -- writes it after each mode's open seeds aliases from it; it stays
-    -- because schema changes are additive.
+    -- writes it after each mode's open seeds aliases from it, but for local
+    -- mode's 1.x case move (#216); it stays because schema changes are additive.
     CREATE TABLE IF NOT EXISTS handles (
       name        TEXT PRIMARY KEY,
       first_seen  INTEGER NOT NULL,
