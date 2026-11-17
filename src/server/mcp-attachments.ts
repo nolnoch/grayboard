@@ -75,7 +75,9 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
           await testPauseAsync("attachments:guard:checked");
           live();
           if (current instanceof Response) throw new Refusal(current);
-          bindingGuard(r);
+          // The binding guard's own token check awaits too (#807 P3 A7d2b), and its row reads follow that await.
+          await bindingGuard(r);
+          live();
           if (!repo.aliases.find(r, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
         await guard(repo.read);

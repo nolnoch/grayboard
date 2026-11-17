@@ -464,7 +464,7 @@ test("child quota refusal leaves grant, lease and graph unchanged; ending a chil
   await expect(hosted.register(otherGrant, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
   expect(refusalCount("hosted_child")).toBe(counted + 1);
   expect(database.repo.hosted.all(database.repo.read).every(row => row.grant_id === "G1")).toBe(true);
-  expect(delivery.describe(principal, context("root"), lease.capability).capability).toBe(lease.capability);
+  expect(delivery.describe(principal, context("root"), lease.capability, { row: undefined }).capability).toBe(lease.capability);
   await hosted.end(principal, context("child-0"));
   await hosted.register(principal, context("root"), "overflow");
   expect(database.repo.hosted.all(database.repo.read)).toHaveLength(1 + hosted.limits.children);
@@ -1927,4 +1927,67 @@ test("a child's native tool call under its exchange's verdict coalesces its touc
   touches.mockRestore();
   expect(touched).toEqual([hostedId("child"), hostedId("root")].sort());
   expect([seen("root"), seen("child")]).toEqual([now, now]);
+});
+
+// #807 P3 A7d2b: the hosted and delivery checks await. A check the test holds: after arm(n), the nth call waits for
+// release(), and the test changes state while it waits.
+function heldAuth() {
+  let target = 0, calls = 0, hit!: () => void, go!: (ok: boolean) => void;
+  const reached = new Promise<void>(resolve => { hit = resolve; });
+  const released = new Promise<boolean>(resolve => { go = resolve; });
+  return {
+    isAuthorized: (): boolean | Promise<boolean> => { if (target && ++calls === target) { hit(); return released; } return authorized; },
+    arm(n: number) { target = n; calls = 0; },
+    reached, release: (ok = true) => go(ok),
+  };
+}
+
+test("#807 P3 A7d2b: delivery's pending refuses a lease finished while its token check awaited", async () => {
+  const held = heldAuth();
+  const service = createDelivery(hosted, { isAuthorized: held.isAuthorized });
+  try {
+    await hosted.bind(principal, context("lease-root"), { name: "lease-peer", create: true });
+    const lease = await service.open(principal, context("lease-root"));
+    // pending checks twice: the second check, after which nothing reads the lease map again before items go out.
+    held.arm(2);
+    const call = service.pending(principal, context("lease-root"), lease.capability);
+    await held.reached;
+    await seed(database.repo, tx => database.repo.users.setDisabled(tx, principal.authed.user_id, true));
+    expect(service.activeLeaseCount).toBe(0);
+    held.release(true);
+    await expect(call).rejects.toThrow("no live delivery lease");
+    expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
+  } finally { service.close(); }
+});
+
+test("#807 P3 A7d2b: fence reads the binding after its token check's await: a rebind meanwhile refuses", async () => {
+  const held = heldAuth();
+  const service = createHostedSessions(application, { now: () => now, isAuthorized: held.isAuthorized }); await service.ready;
+  try {
+    await service.bind(principal, context("fence-root"), { name: "fence-peer", create: true });
+    let verdict: string | undefined;
+    const transfer = service.transfer(principal, context("fence-root"), async (_session, guard) => {
+      held.arm(1);
+      const checked = guard(database.repo.read);
+      await held.reached;
+      const row = rowOf(context("fence-root"))!;
+      await seed(database.repo, tx => database.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 }));
+      held.release(true);
+      verdict = await checked.then(() => "passed", (e: { code?: string }) => e.code ?? "error");
+    });
+    await transfer.catch(() => {});
+    expect(verdict).toBe("unbound");
+  } finally { await service.close(); }
+});
+
+test("#807 P3 A7d2b: a close while a hosted token check awaits refuses the call", async () => {
+  const held = heldAuth();
+  const service = createHostedSessions(application, { now: () => now, isAuthorized: held.isAuthorized }); await service.ready;
+  held.arm(1);
+  // No session context: nothing after the entry check would check again.
+  const call = service.whoami(principal, sessionContext(principal, {}));
+  await held.reached;
+  await service.close();
+  held.release(true);
+  await expect(call).rejects.toThrow("unauthenticated");
 });

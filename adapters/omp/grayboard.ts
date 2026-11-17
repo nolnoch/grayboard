@@ -24,7 +24,7 @@ import { extractUriScheme } from "@oh-my-pi/pi-coding-agent/internal-urls/parse"
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import { loadAllMCPConfigs } from "@oh-my-pi/pi-coding-agent/mcp/config";
 import { cfgMcpEnableProjectConfig } from "@oh-my-pi/pi-coding-agent/mcp/settings";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -46,7 +46,11 @@ type Child = {
 
 const SERVER = process.env.GRAYBOARD_MCP_NAME ?? "grayboard";
 // omp's MCP tool naming (mintMCPToolName in its tool-bridge.ts).
-const PREFIX = `mcp__${SERVER.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "server"}_`;
+const prefixOf = (server: string) => `mcp__${server.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "server"}_`;
+const PREFIX = prefixOf(SERVER);
+// Tools only grayboard serves together: an MCP server with all of them is a
+// grayboard, whatever it is named.
+const SIGNATURE = ["bind", "claim_take", "dm_inbox"];
 // The `_meta` key naming a subagent's call (GRAYBOARD_AGENT_META, src/shared/session_meta.ts).
 const AGENT_META = "io.github.nolnoch.grayboard/agent";
 // omp gives session_shutdown handlers 2 s; the grayboard process gets most of it to end its session.
@@ -115,6 +119,10 @@ type Shared = {
   stopping?: Promise<void>;
   exitReason?: string;
   instructions?: string;
+  // MCP servers and processes already reported as a grayboard beside this one.
+  warned?: Set<string>;
+  // Every grayboard process this extension started: never reported.
+  spawned?: Set<number>;
 };
 const KEY = Symbol.for("io.github.nolnoch.grayboard/omp-local");
 const shared = ((globalThis as Record<symbol, unknown>)[KEY] ??= {}) as Shared;
@@ -407,6 +415,7 @@ export default function grayboard(pi: ExtensionAPI) {
     const selection = shared.selected!;
     const env = { ...own.env, BUS_HARNESS_SESSION: selection.id, BUS_ADAPTER_OWNER: own.protocol ? owner : undefined };
     const proc = spawn(own.cmd, own.args, { cwd: own.cwd ?? selection.ctx.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    if (proc.pid) (shared.spawned ??= new Set()).add(proc.pid);
     const pending = new Map<number, PromiseWithResolvers<unknown>>();
     let next = 1;
     let gone: Error | undefined;
@@ -632,8 +641,86 @@ export default function grayboard(pi: ExtensionAPI) {
   // The instructions tell the model what a <channel> message is; only the
   // main session receives any, so a subagent gets none. A prompt sent as omp
   // starts can beat the grayboard process's initialize; the first turn waits.
+  // A grayboard among the MCP servers omp applies after session_start (an
+  // ACP client's declared mcpServers, #1140) escapes secondGrayboard, as
+  // does one under another name that runs grayboard through its own script.
+  // Seen two ways, each said once and not refused: refusing would stop only
+  // this extension's process and leave that one the only delivery owner,
+  // and omp drops its pushes. By tools: a server serving SIGNATURE (an HTTP
+  // one too); this extension's own carry mcpServerName SERVER, and a
+  // client server of that exact name loses every tool to omp's dedup
+  // (deduplicateMCPToolsByName keeps the first of an identical origin, the
+  // extension's). By process: a `grayboard mcp` omp started, directly or
+  // through a wrapper, outside the processes this extension started, which
+  // catches that exact-named one (ps, so not on Windows).
+  const reportServedElsewhere = (ctx: ExtensionContext) => {
+    const servers = new Map<string, { names: Set<string>; shadows: boolean }>();
+    for (const t of pi.getAllTools()) {
+      if (!t.mcpServerName || !t.mcpToolName || t.mcpServerName === SERVER) continue;
+      const s = servers.get(t.mcpServerName) ?? { names: new Set<string>(), shadows: false };
+      s.names.add(t.mcpToolName);
+      // omp kept its tool under this extension's name ("Grayboard" mints the same prefix).
+      s.shadows ||= t.name === PREFIX + t.mcpToolName;
+      servers.set(t.mcpServerName, s);
+    }
+    const warned = (shared.warned ??= new Set());
+    for (const [server, { names, shadows }] of servers) {
+      if (warned.has(`server:${server}`) || !SIGNATURE.every((n) => names.has(n))) continue;
+      warned.add(`server:${server}`);
+      const clause = shadows ? `; some of its tools took this adapter's tool names, so those calls go to that server, another bus session` : "";
+      report(ctx, `grayboard: the MCP server "${server}" serves grayboard's tools beside this adapter's${clause}. Remove it (an ACP client's mcpServers, or omp's MCP config): this adapter already serves grayboard.`);
+    }
+    if (process.platform === "win32") return;
+    execFile("ps", ["-A", "-ww", "-o", "pid=,ppid=,command="], { timeout: 5_000, maxBuffer: 16 << 20 }, (error, stdout) => {
+      try {
+        if (error) {
+          if (!warned.has("ps")) pi.logger.warn(`grayboard: couldn't list processes to look for another grayboard under this omp (${error.message})`);
+          warned.add("ps");
+          return;
+        }
+        const rows = stdout.split("\n").map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+          .filter((m): m is RegExpMatchArray => !!m).map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), line: m[3]! }));
+        // ps joins argv with spaces; Linux keeps it NUL-separated, unless the
+        // process rewrote its title as one string (npm: "npm exec grayboard mcp").
+        const argvOf = (pid: number, line: string): string[] => {
+          try {
+            const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+            while (argv.at(-1) === "") argv.pop();
+            if (argv.length > 1 || (argv.length === 1 && !/\s/.test(argv[0]!))) return argv;
+          } catch { /* not Linux, or gone */ }
+          return line.split(/\s+/);
+        };
+        // omp's own children, past any wrapper, not entering a process this
+        // extension started: omp starts each stdio MCP server as its child, and
+        // what a harness the agent launched starts (pi's or Claude Code's own
+        // grayboard) sits under that harness, which isn't a wrapper.
+        const mine = shared.spawned ?? new Set<number>();
+        for (let queue = [process.pid]; queue.length;) {
+          const parent = queue.shift()!;
+          for (const { pid, ppid, line } of rows) {
+            if (ppid !== parent || mine.has(pid)) continue;
+            const argv = argvOf(pid, line);
+            const program = unwrap(argv);
+            if (!runsGrayboard({ command: argv[0], args: argv.slice(1) }, own)) {
+              if (program !== argv) queue.push(pid);
+              continue;
+            }
+            // One notice per server: its wrapper's descendants run the same one.
+            if (warned.has(`pid:${pid}`)) continue;
+            warned.add(`pid:${pid}`);
+            const shown = program.slice(0, program.indexOf("mcp") + 1).join(" ");
+            report(ctx, `grayboard: process ${pid} (${shown}) runs grayboard under this omp beside this adapter's: another bus session, whose pushes omp drops. Remove the MCP server that starts it (an ACP client's mcpServers, or omp's MCP config): this adapter already serves grayboard.`);
+          }
+        }
+      } catch (e) {
+        pi.logger.warn(`grayboard: looking for another grayboard under this omp failed (${(e as Error).message})`);
+      }
+    });
+  };
+
   pi.on("before_agent_start", async (event, ctx) => {
     if (!registered || ctx.agent.kind !== "main" || shared.owner !== pi) return undefined;
+    reportServedElsewhere(ctx);
     await currentChild();
     return hooks.beforeAgentStart(event);
   });

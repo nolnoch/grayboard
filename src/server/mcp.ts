@@ -61,7 +61,7 @@ type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebSt
 type Checked = { row: HostedSession | undefined; root?: HostedSession };
 type Live = { context: Context; rows: Set<string>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "isAuthorizedNow" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   let closed = false, posts = 0, busListeners = 0;
@@ -135,13 +135,19 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const settled = promise.catch(() => {}).finally(() => closing.delete(settled));
     closing.add(settled);
   };
-  const resources = createResources(application, { caps: caps.watches, isAuthorized: (session, r) => {
+  // A resource session's principal: its context's, or the exchange's; undefined once closed or for another user.
+  const resourcePrincipal = (session: ApplicationSession) => {
     const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
-    return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorizedNow(principal, r);
+    return !closed && principal && session.authed.user_id === principal.authed.user_id ? principal : undefined;
+  };
+  // The principal is resolved before the token read: the exchange store is the caller's, read synchronously. Closed
+  // while the read awaited: refused (#807 P3 A7d2c).
+  const resources = createResources(application, { caps: caps.watches, isCurrent: session => !!resourcePrincipal(session), isAuthorized: async (session, r) => {
+    const principal = resourcePrincipal(session);
+    return !!principal && await oauth.isAuthorized(principal, r) && !closed;
   } });
-  // Resources, hosted and delivery check synchronously, inside bodies and "no await since" reuses that #807 P3 A7d2 re-audits.
-  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorizedNow(principal, r) });
-  const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorizedNow(principal, r), now, caps: caps.leases });
+  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
+  const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
@@ -373,9 +379,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return true;
   }
   function addWatch(live: Live, uri: string) {
+    // Every caller has just authorized live.context, with no read since (makeLive's callers, the legacy control).
     if (live.context.role === "native") live.watches.push(resources.watch(live.context.session, uri, {
       changed: () => live.hint(uri), closed: () => live.stop(),
-    }));
+    }, true));
   }
   // A legacy GET with no watched resource carries nothing a binding governs, so it stays
   // open (idle) across bind changes until a resource subscription attaches it (#431).

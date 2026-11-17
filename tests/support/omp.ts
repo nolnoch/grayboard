@@ -1171,6 +1171,95 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
   });
 }
 
+// A grayboard among an ACP client's declared mcpServers, which omp applies
+// after session_start's check, is reported once and not refused (#1140): by
+// its tools under another name ("Grayboard" takes some of the adapter's tool
+// names), and by its process when named exactly grayboard, whose tools omp's
+// dedup drops. A server without grayboard's tools, and the adapter's own
+// tools, aren't reported, nor is a grayboard a harness under omp starts.
+export function ompLocalAcpClientGrayboardScenario(dir: string): Promise<void> {
+  return named(OMP_HARNESS, async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([scripted("hi", [{ text: "hello" }]), scripted("again", [{ text: "hello again" }])]);
+    try {
+      installLocal(dir, model.port);
+      // A stdio MCP server serving the tool names given as its arguments;
+      // with --harness first, it also starts a grayboard of its own on another
+      // bus, as a harness the agent launched would (pi's adapter child).
+      const fake = join(dir, "fake_mcp.ts");
+      writeFileSync(fake, `
+const names = process.argv.slice(2);
+if (names[0] === "--harness") {
+  names.shift();
+  const env = { ...process.env, BUS_DB_PATH: ${JSON.stringify(join(dir, "harness.db"))} };
+  delete env.BUS_IDENTITY;
+  Bun.spawn([process.execPath, ${JSON.stringify(CLI)}, "mcp", "--mode", "local"], { env, stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+}
+let buf = "";
+process.stdin.setEncoding("utf8").on("data", (c) => {
+  buf += c;
+  let nl;
+  while ((nl = buf.indexOf("\\n")) >= 0) {
+    const m = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1);
+    if (m.id === undefined) continue;
+    const result = m.method === "initialize" ? { protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } }
+      : m.method === "tools/list" ? { tools: names.map((name) => ({ name, description: name, inputSchema: { type: "object", properties: {} } })) } : {};
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
+  }
+});
+`);
+      const server = (name: string, tools: string[]) => ({ name, command: process.execPath, args: [fake, ...tools], env: [] });
+      // The client's grayboard inherits omp's env, BUS_IDENTITY too, and
+      // contends for the name: only the adapter's child has a harness session.
+      const holds = (name: string) => {
+        try {
+          return existsSync(join(dir, "bus.db")) && localRows(dir, "SELECT 1 FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ? AND i.harness_session IS NOT NULL", name).length === 1;
+        } catch {
+          return false; // the file exists before its tables do
+        }
+      };
+      const acp = startAcpOmp(dir, procs);
+      await acp.call("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      const { sessionId } = await acp.call<{ sessionId: string }>("session/new", { cwd: dir, mcpServers: [
+        // A copied entry: the same command as the adapter's.
+        { name: "grayboard", command: process.execPath, args: [CLI, "mcp", "--mode", "local"], env: [] },
+        server("Grayboard", ["bind", "claim_take", "dm_inbox", "whoami"]),
+        server("bus2", ["bind", "claim_take", "dm_inbox"]),
+        server("other", ["bind", "search"]),
+        server("harness", ["--harness", "search"]),
+      ] });
+      await until(() => holds("omp-local"), 30_000, "the adapter's grayboard holds omp-local");
+      await until(() => grayboardDescendants(acp.proc.pid!).length === 3, 30_000, "the client's grayboard and the harness's run beside the adapter's");
+      for (const text of ["hi", "again"]) await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
+      // The adapter's own log lines; ACP also mirrors each notice at debug.
+      const notices = () => ompLog(dir).split("\n").filter(Boolean).map((l) => JSON.parse(l) as { level: string; message: string })
+        .filter((l) => l.level === "error" && l.message.startsWith("grayboard: ")).map((l) => l.message);
+      const proc = (m: string) => m.startsWith("grayboard: process ");
+      // ps runs after the prompt starts.
+      await until(() => notices().some(proc), 10_000, "the client's grayboard process is reported");
+      const said = (server: string) => notices().filter((m) => m.startsWith(`grayboard: the MCP server "${server}"`));
+      expect(said("Grayboard")).toHaveLength(1);
+      expect(said("Grayboard")[0]).toContain("took this adapter's tool names");
+      expect(said("bus2")).toHaveLength(1);
+      expect(said("bus2")[0]).not.toContain("took this adapter's tool names");
+      const procs1 = notices().filter(proc);
+      expect(procs1).toHaveLength(1);
+      expect(procs1[0]).toContain(`${CLI} mcp)`);
+      // Nothing else: not "grayboard" by its tools (dropped), not "other". Here
+      // "Grayboard" takes the signature tools from the adapter's own, so the
+      // pin and carry scenarios, which allow no notice, guard their exclusion.
+      expect(notices()).toHaveLength(3);
+      // Not refused: both processes still run, and the adapter's keeps its name.
+      expect(grayboardDescendants(acp.proc.pid!)).toHaveLength(3);
+      expect(holds("omp-local")).toBe(true);
+      expect(model.unhandled).toEqual([]);
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
 // omp keeps one extension runtime across /fork, /new and /resume
 // (session_switch), so the entry replaces its session each time.
 export const ompHostedCarryScenario = (dir: string): Promise<void> => hostedCarryScenario(OMP_HARNESS, dir);

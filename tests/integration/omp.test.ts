@@ -5,7 +5,7 @@ import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalHandshakeFailScenario, ompLocalInitFailScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalSwitchExhaustScenario, ompLocalTaskScenario } from "../support/omp.ts";
+import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpClientGrayboardScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalHandshakeFailScenario, ompLocalInitFailScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalSwitchExhaustScenario, ompLocalTaskScenario } from "../support/omp.ts";
 import { installLocal, startLocalOmp } from "../support/omp.ts";
 import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
 import { closeSessions } from "../support/mcp.ts";
@@ -63,3 +63,4 @@ for (const kind of ["keyed", "human", "runner"] as const) {
 }
 
 test("omp local, ACP: of two top-level sessions in one omp process, the first runs grayboard and the second is refused; while both live, no subagent of either gets grayboard tools, so none acts as the first session's names (#523, #470)", () => ompLocalAcpScenario(dir), 120_000);
+test("omp local, ACP: a grayboard among the client's declared mcpServers is reported once and not refused: by its tools under another name, by its process when named grayboard, whose tools omp drops; the adapter's own tools are never reported (#1140)", () => ompLocalAcpClientGrayboardScenario(dir), 120_000);

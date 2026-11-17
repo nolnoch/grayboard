@@ -13,6 +13,8 @@ import { createApplication } from "./application.ts";
 import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 
+// Run once, after the next hosted token check's await (the binding guard's `fence`, once armed past the route's own).
+let onCheck: (() => void) | undefined;
 let application: ReturnType<typeof createApplication>;
 let hosted: ReturnType<typeof createHostedSessions>;
 import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
@@ -51,7 +53,7 @@ beforeEach(async () => {
   await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email));
   gate = new UploadGate(1024, 1024);
   application = createApplication(store.repo);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r) => oauth.isAuthorizedNow(p, r) }); await hosted.ready;
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: async (p, r) => { const valid = await oauth.isAuthorized(p, r); const hook = onCheck; onCheck = undefined; hook?.(); return valid; } }); await hosted.ready;
   const principal = await oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
   if (principal instanceof Response) throw new Error("fixture auth failed");
   await hosted.bind(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "attachment-root" }), { name: "be" });
@@ -73,6 +75,11 @@ async function uploaded() {
   return (await response.json() as { id: number }).id;
 }
 const count = () => (store.db.query("SELECT COUNT(*) AS n FROM attachments").get() as { n: number }).n;
+
+// #807 P3 A7d2c: the OAuth server's synchronous checks are gone; every check awaits its token read.
+test("the OAuth server has no synchronous authorization forms", () => {
+  for (const key of ["authenticateNow", "isAuthorizedNow"]) expect(key in oauth).toBe(false);
+});
 
 test("precise routing, canonical challenge, strict query and existing identity only", async () => {
   for (const path of ["/api/attachments", "/hosted/mcp/attachments/1/extra", "/hosted/mcp/attachments-other"]) expect(router.fetch(request("GET", path))).toBeUndefined();
@@ -542,5 +549,21 @@ for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
     await closing;
     expect(response.status).toBe(status);
     expect(everStored()).toBe(false);
+  });
+}
+
+// #1150 audit F3: the binding guard's token check awaits too, so the router's guard checks the close or abort again
+// after it. Armed at the router's last guard call (8, after the route has its response), the next token check is that
+// guard's `fence`; a stop during it refuses rather than returning the upload's response.
+for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
+  test(`a request ${stop === "abort" ? "aborted" : "closed"} while the binding guard's token check awaits is refused there`, async () => {
+    const aborts = new AbortController();
+    let closing: Promise<void> | undefined;
+    const response = await heldGuard(8, () => send(request("POST", undefined, bytes, issued.token, { signal: aborts.signal })), () => {
+      onCheck = () => { if (stop === "abort") aborts.abort(); else closing = router.close(); };
+    });
+    await closing;
+    expect(onCheck).toBeUndefined();
+    expect(response.status).toBe(status);
   });
 }

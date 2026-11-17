@@ -116,7 +116,7 @@ test("successful reuse fences older creator cancellation; canceled reuse does no
   delivery.accept(reuse);
   await delivery.cancel(creator);
   expect(delivery.activeLeaseCount).toBe(1);
-  expect(delivery.describe(bob, context(bob), reuse.capability).capability).toBe(creator.capability);
+  expect(delivery.describe(bob, context(bob), reuse.capability, { row: undefined }).capability).toBe(creator.capability);
   await delivery.release(bob, context(bob), reuse.capability);
   await hosted.bind(bob, context(bob), { name: "fe" });
   const next = await delivery.open(bob, context(bob));
@@ -133,12 +133,12 @@ test("old attempt cancellation cannot end a replacement generation or ownership"
   await hosted.bind(bob, context(bob), { name: "new", create: true });
   const current = await delivery.open(bob, context(bob)); delivery.accept(current);
   await delivery.cancel(old);
-  expect(delivery.describe(bob, context(bob), current.capability).bind_gen).toBeGreaterThan(old.bind_gen);
+  expect(delivery.describe(bob, context(bob), current.capability, { row: undefined }).bind_gen).toBeGreaterThan(old.bind_gen);
   await delivery.release(bob, context(bob), current.capability);
   await hosted.bind(bob, context(bob), { name: "new" });
   const replacement = await delivery.open(bob, context(bob)); delivery.accept(replacement);
   await delivery.cancel(current);
-  expect(delivery.describe(bob, context(bob), replacement.capability).ownership).not.toBe(current.ownership);
+  expect(delivery.describe(bob, context(bob), replacement.capability, { row: undefined }).ownership).not.toBe(current.ownership);
 });
 
 test("reads repeat without admission; receipt and dm_ack remain distinct", async () => {
@@ -235,7 +235,7 @@ test("disable immediately closes held ownership and invalidates capability", asy
   await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.authed.user_id, true));
   expect(hostedRowCount(store.db)).toBe(0);
   expect(delivery.activeLeaseCount).toBe(0);
-  expect(() => delivery.describe(bob, context(bob), lease.capability)).toThrow();
+  expect(() => delivery.describe(bob, context(bob), lease.capability, { row: undefined })).toThrow();
 });
 
 test("board receipt is issued and scoped, not an arbitrary high-water cursor", async () => {
@@ -256,7 +256,7 @@ test("failed rebind preserves lease and original grant attachment", async () => 
   const lease = await delivery.open(bob, context(bob));
   const second = { ...bob, grantId: "G2" };
   await expect(hosted.bind(second, context(bob), { name: "missing" })).rejects.toHaveProperty("code", "identity_unknown");
-  expect(delivery.describe(bob, context(bob), lease.capability).capability).toBe(lease.capability);
+  expect(delivery.describe(bob, context(bob), lease.capability, { row: undefined }).capability).toBe(lease.capability);
 });
 
 test("receipt storage failure rolls back direct admission and keeps the issued batch retryable", async () => {
@@ -268,7 +268,7 @@ test("receipt storage failure rolls back direct admission and keeps the issued b
   try {
     await expect(delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id))).rejects.toThrow("injected receipt rollback");
     expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
-    expect(delivery.describe(bob, context(bob), lease.capability).capability).toBe(lease.capability);
+    expect(delivery.describe(bob, context(bob), lease.capability, { row: undefined }).capability).toBe(lease.capability);
   } finally { application.receiptBoards = original; }
   await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
@@ -286,7 +286,7 @@ test("per-user delivery capacity refuses without attaching another grant or drop
   await expect(delivery.open({ ...bob, grantId: "G2" }, contender)).rejects.toHaveProperty("code", "bad_request");
   expect(delivery.activeLeaseCount).toBe(32);
   expect(hosted.row("id" in contender ? contender.id : "")?.grant_id).toBe(bob.grantId);
-  expect(delivery.describe(bob, context(bob), first.capability).capability).toBe(first.capability);
+  expect(delivery.describe(bob, context(bob), first.capability, { row: undefined }).capability).toBe(first.capability);
 });
 
 test("the per-user lease count frees a slot on release and never double-counts a reopen (#805)", async () => {
@@ -411,7 +411,7 @@ test("renew completes while a transfer holds the reader gate past the original d
   const started = new Promise<void>(resolve => { entered = resolve; });
   const held = new Promise<void>(resolve => { release = resolve; });
   const transfer = hosted.transfer(bob, context(bob), async (_session, guard) => {
-    entered(); await held; guard(store.repo.read);
+    entered(); await held; await guard(store.repo.read);
   });
   await started;
   try {
@@ -421,7 +421,7 @@ test("renew completes while a transfer holds the reader gate past the original d
     now += 20_000;
     await hosted.sweep();
     expect(delivery.activeLeaseCount).toBe(1);
-    expect(delivery.describe(bob, context(bob), lease.capability).ownership).toBe(lease.ownership);
+    expect(delivery.describe(bob, context(bob), lease.capability, { row: undefined }).ownership).toBe(lease.ownership);
   } finally { release(); }
   await transfer;
 });

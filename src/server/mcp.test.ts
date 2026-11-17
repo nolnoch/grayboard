@@ -567,7 +567,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
 
 test("actual access revocation between factory and dispatch prevents mutation", async () => {
   const client = await connect();
-  const original = oauth.isAuthorized, originalNow = oauth.isAuthorizedNow;
+  const original = oauth.isAuthorized;
   let checks = 0;
   // The revoke answers with a promise (#807 P3 A6c), so seedSync's post would queue it; seed runs it now on the idle
   // queue, and it commits a few microtasks later, before the dispatch's check. Awaited below, so a failure shows.
@@ -575,15 +575,14 @@ test("actual access revocation between factory and dispatch prevents mutation", 
   const revokeOnFirst = (principal: OAuthPrincipal) => {
     if (++checks === 1) revoking = seed(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
   };
-  // Selection checks through the async form, dispatch through the synchronous one (#807 P3 A7c): either may be first.
+  // Selection and dispatch both check through the async form (#807 P3 A7d2b): either may be first.
   oauth.isAuthorized = async principal => { const valid = await original(principal); revokeOnFirst(principal); return valid; };
-  oauth.isAuthorizedNow = principal => { const valid = originalNow(principal); revokeOnFirst(principal); return valid; };
   try {
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } })).rejects.toThrow("invalid_token");
     await revoking;
     expect(checks).toBeGreaterThanOrEqual(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
-  } finally { oauth.isAuthorized = original; oauth.isAuthorizedNow = originalNow; }
+  } finally { oauth.isAuthorized = original; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
