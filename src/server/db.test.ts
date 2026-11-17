@@ -8,7 +8,7 @@ import { ACCESS_LOG_LAST_SQL, mailPort, openDatabase, PrincipalTaken, QUEUED_TO_
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { holdAlias } from "../core/bindings.ts";
-import { registerId, touchAlias } from "../core/boards.ts";
+import { createBoard, post, registerId, subscribe, touchAlias } from "../core/boards.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { hashToken } from "./auth.ts";
@@ -1136,6 +1136,47 @@ test("#807 P3 B4a: sessionEnd runs on the Tx it's given and rolls back with its 
   expect((await seed(repo, tx => e.end(tx, id, { why: "t", now: 5 }))).ended).toBe(true);
   expect((await repo.messages.history(repo.read, [peer])).filter(m => m.kind === "bounce").map(m => m.parent_id)).toEqual([unread.id]);
   expect((await seed(repo, tx => e.refusal(tx, id)))?.code).toBe("id_ended");
+});
+
+// #807 P3 B5a1: repo.boards runs on the handle it's given: a kept Tx and a non-store handle are refused, a read inside
+// a body sees that body's writes, and an acknowledge rolls back with its body.
+test("#807 P3 B5a1: repo.boards runs on the handle it's given; acknowledge rolls back with its body", async () => {
+  const { repo } = fresh();
+  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
+  const { kept, id } = await seed(repo, async tx => {
+    // A board reads as missing to an address no principal owns (#284).
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
+    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
+    const core = repo.coreOn(tx);
+    createBoard(core, be, "hall", "tests");
+    subscribe(core, fe, "hall", "push");
+    return { kept: tx, id: post(core, be, "hall", "hi").post.id };
+  });
+  const settled = /used after its transaction settled/;
+  const b = repo.boards;
+  const ref = { kind: "push" as const, post_id: id };
+  await expect(b.get(kept, "hall")).rejects.toThrow(settled);
+  await expect(b.post(kept, id)).rejects.toThrow(settled);
+  await expect(b.catalogPage(kept, "")).rejects.toThrow(settled);
+  await expect(b.snapshotPage(kept, "hall", {})).rejects.toThrow(settled);
+  await expect(b.pendingPushes(kept, fe)).rejects.toThrow(settled);
+  await expect(b.pendingDigests(kept, fe)).rejects.toThrow(settled);
+  await expect(b.acknowledge(kept, fe, ref)).rejects.toThrow(settled);
+  await expect(b.get({} as Tx, "hall")).rejects.toThrow("not a SQLite store handle");
+  expect((await b.get(repo.read, "hall"))?.name).toBe("hall");
+  expect((await b.post(repo.read, id))?.body).toBe("hi");
+  expect((await b.catalogPage(repo.read, "")).map(x => x.name)).toContain("hall");
+  expect((await b.snapshotPage(repo.read, "hall", {})).posts.map(p => p.id)).toEqual([id]);
+  const pushed = async (r: Parameters<typeof b.pendingPushes>[0]) => (await b.pendingPushes(r, fe)).map(p => p.post.id);
+  expect(await pushed(repo.read)).toEqual([id]);
+  await expect(seed(repo, async tx => {
+    await b.acknowledge(tx, fe, ref);
+    expect(await pushed(tx)).toEqual([]);
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(await pushed(repo.read)).toEqual([id]);
+  await seed(repo, tx => b.acknowledge(tx, fe, ref));
+  expect(await pushed(repo.read)).toEqual([]);
 });
 
 // #807 P3 B4b: repo.delegation reads on the handle it's given, and its facts answer only what they read: a question
