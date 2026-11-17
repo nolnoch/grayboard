@@ -69,7 +69,10 @@ export async function runTail(boardInput: string, backlog: number): Promise<void
   };
 
   const stopListening = listenForWakeup(handle, drain);
+  let stopping = false;
   const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
     stopListening();
     await end();
     process.exit(0);
