@@ -4,7 +4,8 @@
 // (adapterBundle("omp")), set up as `grayboard setup --server` leaves it:
 // <agentDir>/extensions/grayboard.js, <agentDir>/grayboard/config.json {url}
 // and no grayboard MCP entry. omp speaks pi's RPC protocol, so the Pi class
-// and the hosted helpers come from tests/support/pi.ts.
+// and the hosted helpers come from tests/support/pi.ts; the hosted scenarios
+// omp shares with pi live in tests/support/hosted_harness.ts.
 import { expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -15,14 +16,15 @@ import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { adapterBundle } from "../../src/cli/adapters.ts" with { type: "macro" };
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { cleanEnv, localEnv } from "./env.ts";
-import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest, type FakeModel, type Rule } from "./fake_model.ts";
-import { browse, hostedServer, seedGrant, tokenRequests, type HostedServer } from "./hosted_oauth.ts";
-import { answerPeer, expectDeliveryRecords, expectSignInOffer, factsOf, hostedPeer, hostedRow, leased, ownershipEnded, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed, type Peer } from "./pi.ts";
+import { messageText, onChannelDm, startFakeModel, taskFanout, type ChatRequest, type FakeModel } from "./fake_model.ts";
+import { browse, seedGrant, type HostedServer } from "./hosted_oauth.ts";
+import { factsOf, hostedRow, leased, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
 import { accessAudits } from "./audit.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
+import { hostedCarryScenario, hostedRefreshLogoutScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
 
 type OmpPackage = { version: string; bin: { omp: string } };
 const OMP_PKG = join(ROOT, "node_modules/@oh-my-pi/pi-coding-agent/package.json");
@@ -34,7 +36,7 @@ const BUNDLE = adapterBundle("omp");
 const LOCAL_BUNDLE = adapterBundle("omp", "local");
 const OMP_CLIENT = "grayboard-omp";
 export const PREFIX = "mcp__grayboard_";
-const LOGIN_NOTICE = "grayboard: Signed out of grayboard in omp; run /grayboard login";
+const LOGIN_NOTICE = loginNotice("omp");
 const GRAYBOARD_TOOLS = hostTools(snapshotTools()).map((t) => PREFIX + t.name).sort();
 
 const agentDirOf = (dir: string) => join(dir, "omp-agent");
@@ -90,9 +92,6 @@ function startHostedOmp(dir: string, procs: ChildProcess[], { persist = false, s
   return new Pi(proc);
 }
 
-const ompRow = (srv: HostedServer, raw: string) => hostedRow(srv, OMP_CLIENT, raw);
-const leasedAs = (srv: HostedServer, raw: string, name: string) => leased(srv, OMP_CLIENT, raw, name);
-const toolResult = (omp: Pi, tool: string, nth = 0) => toolResultNamed(omp, PREFIX + tool, nth);
 // The server's session id for omp's session `raw`.
 const serverId = (srv: HostedServer, raw: string): string | undefined => srv.app.db.query<{ session_id: string }, [string, string]>(
   "SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(OMP_CLIENT, raw)?.session_id;
@@ -119,38 +118,30 @@ function expectInstructed(model: FakeModel, ping: number, name: string): void {
   expect(promptOf(req!.body)).not.toContain("no bus name yet");
 }
 
-type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: { persist?: boolean; session?: string }): Pi };
-
-// A failure names omp's version.
-async function named(run: () => Promise<void>): Promise<void> {
-  try {
-    await run();
-  } catch (e) {
-    if (e instanceof Error) e.message = `omp ${OMP.version}: ${e.message}`;
-    throw e;
-  }
+// omp in the shared hosted scenarios (tests/support/hosted_harness.ts).
+// `settings` adds to config.yml; `reasoning` lets the fake model take a thinking level.
+function ompHarness(settings: Record<string, unknown> = {}, reasoning = false): HostedHarness {
+  return {
+    name: "omp", version: OMP.version, client: OMP_CLIENT, prefix: PREFIX,
+    stateDir: stateDirOf, install: (dir, srv, modelPort) => installHosted(dir, srv, modelPort, settings, reasoning), start: startHostedOmp, idle,
+    stateTimeout: 30_000,
+    onServerTimeout: 20_000,
+    // /fork of the current session: the fork's file also holds the records it copied from the session it left (#504).
+    fork: async (omp) => {
+      expect((await omp.command({ type: "fork" })).cancelled).toBe(false);
+    },
+    forkCopiesRecords: true,
+    // A turn a push started carries the bound name's instructions (#441).
+    delivered: expectInstructed,
+    // omp creates agent.db without a transaction (ompDbReady): b starts once a has created it.
+    beforeSecondStart: (dir) => until(() => ompDbReady(dir), 30_000, "omp agent.db created"),
+    // The logout notice lands after the prompt command returns.
+    logoutNoticeLags: true,
+    // A root whose subscription closed first sits in `retrying` until its next reopen meets the sign-out (#606).
+    pauseLags: true,
+  };
 }
-
-function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void>, settings: Record<string, unknown> = {}, reasoning = false): Promise<void> {
-  return named(async () => {
-    const procs: ChildProcess[] = [];
-    const srv = hostedServer();
-    const model = startFakeModel([answerPeer(PREFIX), ...rules]);
-    let peer: Peer | undefined;
-    try {
-      peer = await hostedPeer(srv, dir);
-      installHosted(dir, srv, model.port, settings, reasoning);
-      await run({ srv, model, peer, start: (o) => startHostedOmp(dir, procs, o) });
-      expect(model.unhandled).toEqual([]);
-      expect(peer.reports).toEqual([]);
-    } finally {
-      await stopAll(procs);
-      await peer?.close();
-      model.stop();
-      await srv.stop();
-    }
-  });
-}
+const OMP_HARNESS = ompHarness();
 
 // The spec's load smoke for omp: the bundle the CLI's macro emits, loaded by
 // the pinned omp under Bun with an isolated HOME and a seeded grant. Its
@@ -161,7 +152,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
 // the delivery lock file exists (node:sqlite under Bun took it). No grayboard
 // process runs, and quitting leaves nothing leased.
 export function ompHostedLoadSmoke(dir: string): Promise<void> {
-  return withHosted(dir, [], async ({ srv, start }) => {
+  return withHosted(OMP_HARNESS, dir, [], async ({ srv, start }) => {
     await seedGrant(srv, stateDirOf(dir), OMP_CLIENT);
     const omp = start();
     const { sessionId } = await omp.command({ type: "get_state" }, 30_000);
@@ -176,7 +167,7 @@ export function ompHostedLoadSmoke(dir: string): Promise<void> {
     expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
     expect(omp.notices()).not.toContain(LOGIN_NOTICE);
     expect(existsSync(deliveryPath(stateDirOf(dir), srv.resource, OMP_CLIENT, sessionId))).toBe(true);
-    expect(ompRow(srv, sessionId)?.name).toBeNull();
+    expect(hostedRow(srv, OMP_CLIENT, sessionId)?.name).toBeNull();
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     await omp.quit();
     await until(() => srv.app.mcp.activeLeases === 0, 10_000, "nothing leased after quit");
@@ -190,7 +181,7 @@ export function ompHostedLoadSmoke(dir: string): Promise<void> {
 // No grayboard process runs.
 export function ompHostedScenario(dir: string): Promise<void> {
   const report = "quarterly report\n", notes = "peer notes\n";
-  return withHosted(dir, [
+  return withHosted(ompHarness({}, true), dir, [
     scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-task", create: true } }]),
     scripted("send report", [{ tool: `${PREFIX}dm_send`, args: { to: PEER, body: "report attached", attachments: [join(dir, "report.txt")] } }]),
     scripted("whoami", [{ tool: `${PREFIX}whoami`, args: {} }]),
@@ -217,10 +208,10 @@ export function ompHostedScenario(dir: string): Promise<void> {
 
     // The model binds through mcp__grayboard_bind, which takes the lease.
     await omp.command({ type: "prompt", message: "bind" });
-    const bound = await toolResult(omp, "bind");
+    const bound = await toolResultNamed(omp, `${PREFIX}bind`);
     expect(bound.isError).toBeFalsy();
     expect(resultText(bound)).toStartWith('Bound to "omp-task"');
-    await until(() => leasedAs(srv, sessionId, "omp-task"), 15_000, "omp-task holds the lease");
+    await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-task"), 15_000, "omp-task holds the lease");
     // Its requests report omp's model and thinking level; `inherit` is none (#364).
     const { thinkingLevel } = await omp.command({ type: "get_state" }, 30_000);
     expect(factsOf(srv, OMP_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel && thinkingLevel !== "inherit" ? thinkingLevel : null });
@@ -272,7 +263,7 @@ export function ompHostedScenario(dir: string): Promise<void> {
     writeFileSync(join(peer.dir, "notes.txt"), notes);
     const withFile = (await peer.call("dm_send", { to: "alice@example.com/omp-task", body: "notes attached", attachments: [join(peer.dir, "notes.txt")] })).message_id;
     const fileId = srv.app.db.query<{ id: number }, [number]>("SELECT id FROM attachments WHERE message_id = ?").get(withFile)!.id;
-    const saved = await toolResult(omp, "attachment_get");
+    const saved = await toolResultNamed(omp, `${PREFIX}attachment_get`);
     expect(saved.isError).toBeFalsy();
     const got = JSON.parse(resultText(saved)) as { path: string };
     expect(got.path).toBe(join(dir, "saved", new URL(srv.resource).host.replace(/[^A-Za-z0-9.-]/g, "_"), `${fileId}-notes.txt`));
@@ -282,8 +273,8 @@ export function ompHostedScenario(dir: string): Promise<void> {
 
     // Quitting releases the lease and ends the session.
     await omp.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, sessionId), 10_000, "released on quit");
-  }, {}, true);
+    await until(() => srv.app.mcp.activeLeases === 0 && !hostedRow(srv, OMP_CLIENT, sessionId), 10_000, "released on quit");
+  });
 }
 
 // A task run with two subagents, each held open (a bash gate) after its
@@ -293,7 +284,7 @@ export function ompHostedScenario(dir: string): Promise<void> {
 // its idle TTL, so this is the agent_end release, not shutdown).
 export function ompHostedTaskScenario(dir: string): Promise<void> {
   const gate = join(dir, "go");
-  return withHosted(dir, [
+  return withHosted(OMP_HARNESS, dir, [
     scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-task", create: true } }]),
     ...taskFanout(2, /^fan out$/, (i) => [
       { tool: `${PREFIX}dm_send`, args: { to: PEER, body: `child ${i}` } },
@@ -304,7 +295,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     const omp = start();
     const { sessionId } = await omp.command({ type: "get_state" }, 30_000);
     await omp.command({ type: "prompt", message: "bind" });
-    await until(() => leasedAs(srv, sessionId, "omp-task"), 30_000, "omp-task holds the lease");
+    await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-task"), 30_000, "omp-task holds the lease");
     await idle(omp);
     const root = serverId(srv, sessionId)!;
 
@@ -355,7 +346,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     expect(model.requests.filter((r) => fromChild(r.body) && r.body.messages.some((m) => messageText(m).includes(`message_id="${ping}"`)))).toEqual([]);
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     await omp.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, sessionId), 10_000, "released on quit");
+    await until(() => srv.app.mcp.activeLeases === 0 && !hostedRow(srv, OMP_CLIENT, sessionId), 10_000, "released on quit");
   });
 }
 
@@ -371,7 +362,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 export function ompHostedNestedScenario(dir: string): Promise<void> {
   const gate = join(dir, "go");
   const nested = { tool: "task", args: { context: "nested", tasks: [{ name: "FakeChild1", task: "You are fake-child-1.", solutionSpace: "scripted" }] } };
-  return withHosted(dir, [
+  return withHosted(ompHarness({ async: { enabled: false } }), dir, [
     scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-nest", create: true } }]),
     ...taskFanout(1, /^nest$/, (i) => i === 0
       ? [nested, { tool: `${PREFIX}dm_send`, args: { to: PEER, body: "middle" } }]
@@ -381,7 +372,7 @@ export function ompHostedNestedScenario(dir: string): Promise<void> {
     const omp = start();
     const { sessionId } = await omp.command({ type: "get_state" }, 30_000);
     await omp.command({ type: "prompt", message: "bind" });
-    await until(() => leasedAs(srv, sessionId, "omp-nest"), 30_000, "omp-nest holds the lease");
+    await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-nest"), 30_000, "omp-nest holds the lease");
     await idle(omp);
     const root = serverId(srv, sessionId)!;
 
@@ -423,8 +414,8 @@ export function ompHostedNestedScenario(dir: string): Promise<void> {
     await idle(omp);
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     await omp.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, sessionId), 10_000, "released on quit");
-  }, { async: { enabled: false } });
+    await until(() => srv.app.mcp.activeLeases === 0 && !hostedRow(srv, OMP_CLIENT, sessionId), 10_000, "released on quit");
+  });
 }
 
 // Local mode, as `grayboard setup` leaves omp: the adapter
@@ -462,7 +453,7 @@ function localRows<T>(dir: string, sql: string, ...args: string[]): T[] {
 // /resume restores its own ordered holds; /new and /fork only seed absent
 // snapshots, and a remembered [] stays unbound under the retained child.
 export function ompLocalResumeScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("bind", [
@@ -490,7 +481,7 @@ export function ompLocalResumeScenario(dir: string): Promise<void> {
       const inspect = async (aliases: string[], expectedChild = child) => {
         const nth = (await omp.messages()).filter(m => m.role === "toolResult" && m.toolName === PREFIX + "whoami").length;
         await omp.command({ type: "prompt", message: "who" });
-        const result = await toolResult(omp, "whoami", nth);
+        const result = await toolResultNamed(omp, `${PREFIX}whoami`, nth);
         expect(!!result.isError).toBe(false);
         await idle(omp);
         const who = JSON.parse(resultText(result));
@@ -547,7 +538,7 @@ export function ompLocalResumeScenario(dir: string): Promise<void> {
 // adapter serves.
 export function ompLocalTaskScenario(dir: string): Promise<void> {
   const gate = join(dir, "go");
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       ...taskFanout(2, /^fan out$/, (i) => [
@@ -645,7 +636,7 @@ export function ompLocalTaskScenario(dir: string): Promise<void> {
 // process. No grayboard runs at any of these commands, so omp's own client
 // starts none either.
 export function ompLocalRefusalScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([]);
     try {
@@ -695,7 +686,7 @@ export function ompLocalRefusalScenario(dir: string): Promise<void> {
 // name, and binds it. No grayboard runs at the entry's command: omp's client
 // doesn't run a disabled entry.
 export function ompLocalPinScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "fe", create: true } }])]);
     try {
@@ -715,7 +706,7 @@ export function ompLocalPinScenario(dir: string): Promise<void> {
       expect(first).toContain("Candidates (free now): fe (this checkout's default: ");
       expect(first).not.toContain("repo (this checkout's default: ");
       expect(localRows<{ address: string }>(dir, "SELECT address FROM alias_holds").map((r) => r.address)).toEqual(["fe"]);
-      expect(resultText(await toolResult(omp, "bind"))).not.toContain("error");
+      expect(resultText(await toolResultNamed(omp, `${PREFIX}bind`))).not.toContain("error");
       expect(grayboardDescendants(omp.pid)).toHaveLength(1);
       expect(omp.notices().filter((n) => n.startsWith("grayboard:"))).toEqual([]);
       expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
@@ -737,7 +728,7 @@ export function ompLocalPinScenario(dir: string): Promise<void> {
 // refreshed instructions even after omp rebuilds its prompt. A local:// URL
 // reaches grayboard as its underlying file path.
 export function ompLocalCarryScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     // omp keeps a --no-session run's local:// files under its temp dir; grayboard may attach from there.
     const tmp = join(dir, "tmp");
@@ -768,7 +759,7 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
 
       await omp.command({ type: "prompt", message: "attach" });
       await idle(omp);
-      expect(resultText(await toolResult(omp, "dm_send"))).not.toContain("error");
+      expect(resultText(await toolResultNamed(omp, `${PREFIX}dm_send`))).not.toContain("error");
       const note = localRows<{ filename: string; size: number }>(dir, "SELECT a.filename, a.size FROM attachments a JOIN messages m ON m.id = a.message_id WHERE m.body = 'note attached'");
       expect(note).toEqual([{ filename: "note.md", size: "note body\n".length }]);
 
@@ -790,7 +781,7 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
       const restarted = await until(() => { const h = holder(); return h !== undefined && h !== first ? h : undefined; }, 15_000, "omp-carry held by the restarted session");
       await omp.command({ type: "prompt", message: "who" });
       await idle(omp);
-      const who = resultText(await toolResult(omp, "whoami"));
+      const who = resultText(await toolResultNamed(omp, `${PREFIX}whoami`));
       expect(who).not.toContain("error");
       expect(who).toContain("omp-carry");
 
@@ -832,7 +823,7 @@ export function ompLocalRestartAbortScenario(dir: string): Promise<void> {
   // The turn's hooks wait for a live process before each request, so the
   // third exit lands while the model's reply with the bind is held.
   const released = Promise.withResolvers<void>();
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("late bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-late", create: true } }]),
@@ -882,7 +873,7 @@ export function ompLocalRestartAbortScenario(dir: string): Promise<void> {
 // and it kills that process before the replacement starts, so the replacement
 // takes the name back and no stale delivery owner remains (#580).
 export function ompLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?: boolean } = {}): Promise<void> {
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([
       scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-580", create: true } }]),
@@ -914,14 +905,14 @@ export function ompLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?
 
       await omp.command({ type: "prompt", message: "stop" });
       await idle(omp);
-      expect(resultText(await toolResult(omp, "dm_send"))).not.toContain("error");
+      expect(resultText(await toolResultNamed(omp, `${PREFIX}dm_send`))).not.toContain("error");
       // The relay and the one grayboard behind it.
       const stale = grayboards(omp.pid);
       expect(stale).toHaveLength(2);
 
       await omp.command({ type: "prompt", message: "big" });
       await idle(omp);
-      expect(resultText(await toolResult(omp, "dm_send", 1))).toContain("grayboard process stopped reading");
+      expect(resultText(await toolResultNamed(omp, `${PREFIX}dm_send`, 1))).toContain("grayboard process stopped reading");
       await until(() => !stale.some(alive), 10_000, "the process that stopped reading killed");
       await until(() => { const h = holder(); return h !== undefined && h !== first ? h : undefined; }, 15_000, "omp-580 held by the replacement");
       const replacement = grayboards(omp.pid);
@@ -937,7 +928,7 @@ export function ompLocalStopsReadingScenario(dir: string, opts: { ignoreSigterm?
 
       await omp.command({ type: "prompt", message: "who" });
       await idle(omp);
-      expect(resultText(await toolResult(omp, "whoami"))).toContain("omp-580");
+      expect(resultText(await toolResultNamed(omp, `${PREFIX}whoami`))).toContain("omp-580");
       expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
       expect(model.unhandled).toEqual([]);
       await omp.quit();
@@ -1005,7 +996,7 @@ function ompLog(dir: string): string {
 // session's names (#470). The first session's subagent, found through its
 // chain of parentIds, serves the tools as a child session.
 export function ompLocalAcpScenario(dir: string): Promise<void> {
-  return named(async () => {
+  return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const send = (i: number) => [{ tool: `${PREFIX}dm_send`, args: { to: "peer", body: `from subagent ${i}` } }];
     const model = startFakeModel([...taskFanout(1, /^fan out a$/, send), ...taskFanout(1, /^fan out b$/, send, 1)]);
@@ -1049,73 +1040,15 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
 }
 
 // omp keeps one extension runtime across /fork, /new and /resume
-// (session_switch), so the entry replaces its session: /fork is a new root
-// with its own lease that carries the name; /new carries it too; /resume of
-// the first session rebinds that session's remembered name. Each time the
-// name receives in the current session and the outgoing one has ended.
-export function ompHostedCarryScenario(dir: string): Promise<void> {
-  return withHosted(dir, [scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-carry", create: true } }])], async ({ srv, model, peer, start }) => {
-    await seedGrant(srv, stateDirOf(dir), OMP_CLIENT);
-    const omp = start({ persist: true });
-    const first = await omp.command({ type: "get_state" }, 30_000);
-    await omp.command({ type: "prompt", message: "bind" });
-    await until(() => leasedAs(srv, first.sessionId, "omp-carry"), 30_000, "first session leased as omp-carry");
-    const p1 = await pingPong(srv, peer, "omp-carry");
-    expectInstructed(model, p1, "omp-carry");
-    await idle(omp);
-    const firstOwnership = ompRow(srv, first.sessionId)!.ownership_id;
-
-    // /fork: the outgoing session ends; the fork binds the name under its own ownership and lease.
-    expect((await omp.command({ type: "fork" })).cancelled).toBe(false);
-    const forked = await omp.command({ type: "get_state" });
-    expect(forked.sessionId).not.toBe(first.sessionId);
-    await until(() => leasedAs(srv, forked.sessionId, "omp-carry"), 15_000, "fork leased as omp-carry");
-    expect(ompRow(srv, first.sessionId)).toBeUndefined();
-    expect(ownershipEnded(srv, firstOwnership)).toBe(true);
-    expect(ompRow(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
-    const p2 = await pingPong(srv, peer, "omp-carry");
-    expectInstructed(model, p2, "omp-carry");
-    await idle(omp);
-
-    // /new carries it on.
-    const forkOwnership = ompRow(srv, forked.sessionId)!.ownership_id;
-    await omp.command({ type: "new_session" });
-    const fresh = await omp.command({ type: "get_state" });
-    expect([first.sessionId, forked.sessionId]).not.toContain(fresh.sessionId);
-    await until(() => leasedAs(srv, fresh.sessionId, "omp-carry"), 15_000, "new session leased as omp-carry");
-    expect(ompRow(srv, forked.sessionId)).toBeUndefined();
-    expect(ownershipEnded(srv, forkOwnership)).toBe(true);
-    const p3 = await pingPong(srv, peer, "omp-carry");
-    expectInstructed(model, p3, "omp-carry");
-    await idle(omp);
-
-    // /resume of the first session: it rebinds the name it remembers.
-    await omp.command({ type: "switch_session", sessionPath: first.sessionFile });
-    expect((await omp.command({ type: "get_state" })).sessionId).toBe(first.sessionId);
-    await until(() => leasedAs(srv, first.sessionId, "omp-carry"), 15_000, "resumed first session leased as omp-carry");
-    expect(ompRow(srv, fresh.sessionId)).toBeUndefined();
-    const p4 = await pingPong(srv, peer, "omp-carry");
-    expectInstructed(model, p4, "omp-carry");
-    await idle(omp);
-    expect(grayboardDescendants(omp.pid)).toEqual([]);
-    expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
-    // Each session's file records its deliveries: the first holds the DMs it
-    // received before the fork and after the resume, /new's the one it did;
-    // the fork's holds its own and the first's records it copied (#504).
-    await expectDeliveryRecords(first.sessionFile, first.sessionId, [p1, p4], "omp-carry");
-    await expectDeliveryRecords(forked.sessionFile, forked.sessionId, [p2], "omp-carry", { root: first.sessionId, pings: [p1] });
-    await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], "omp-carry");
-    await omp.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, first.sessionId), 10_000, "released on quit");
-  });
-}
+// (session_switch), so the entry replaces its session each time.
+export const ompHostedCarryScenario = (dir: string): Promise<void> => hostedCarryScenario(OMP_HARNESS, dir);
 
 // 130 subagents one at a time (task.maxConcurrency 1), more than the root's
 // 128-child cap: each registers at its first call and is ended when its run
 // does, so every call succeeds and the root never holds more than one child.
 export function ompHostedManyChildrenScenario(dir: string): Promise<void> {
   const n = 130;
-  return withHosted(dir, [
+  return withHosted(ompHarness({ task: { maxConcurrency: 1 } }), dir, [
     scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-many", create: true } }]),
     ...taskFanout(n, /^fan out$/, (i) => [{ tool: `${PREFIX}peer_status`, args: { text: `child ${i}` } }]),
   ], async ({ srv, start }) => {
@@ -1123,7 +1056,7 @@ export function ompHostedManyChildrenScenario(dir: string): Promise<void> {
     const omp = start();
     const { sessionId } = await omp.command({ type: "get_state" }, 30_000);
     await omp.command({ type: "prompt", message: "bind" });
-    await until(() => leasedAs(srv, sessionId, "omp-many"), 30_000, "omp-many holds the lease");
+    await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-many"), 30_000, "omp-many holds the lease");
     await idle(omp);
     const root = serverId(srv, sessionId)!;
 
@@ -1143,63 +1076,7 @@ export function ompHostedManyChildrenScenario(dir: string): Promise<void> {
     expect(liveChildren(srv, root)).toEqual([]);
     await idle(omp, 60_000);
     await omp.quit();
-  }, { task: { maxConcurrency: 1 } });
-}
-
-// Two omp processes on one agentDir start with an expired access token: one
-// refresh serves both. Then /grayboard logout in one revokes the grant and
-// pauses both.
-export function ompHostedRefreshLogoutScenario(dir: string): Promise<void> {
-  return withHosted(dir, [
-    scripted("bind a", [{ tool: `${PREFIX}bind`, args: { name: "omp-a", create: true } }]),
-    scripted("bind b", [{ tool: `${PREFIX}bind`, args: { name: "omp-b", create: true } }]),
-    scripted("check", [{ tool: `${PREFIX}whoami`, args: {} }]),
-  ], async ({ srv, start }) => {
-    const seeded = await seedGrant(srv, stateDirOf(dir), OMP_CLIENT, "alice@example.com", -60_000);
-    const refreshTokens = () => srv.app.db.query<{ n: number; spent: number }, [string]>(
-      "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'").get(seeded.grantId)!;
-    expect(refreshTokens()).toEqual({ n: 1, spent: 0 });
-    const tokens = tokenRequests(srv);
-
-    // b starts once a has created omp's agent.db (ompDbReady); the one
-    // rotation must still serve both processes.
-    const a = start();
-    await until(() => ompDbReady(dir), 30_000, "omp agent.db created");
-    const b = start();
-    const [sa, sb] = await Promise.all([a.command({ type: "get_state" }, 30_000), b.command({ type: "get_state" }, 30_000)]);
-    expect(sa.sessionId).not.toBe(sb.sessionId);
-    // Both reached the server on one refresh request, and so one rotation.
-    await until(() => ompRow(srv, sa.sessionId) && ompRow(srv, sb.sessionId), 20_000, "both sessions on the server");
-    expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
-    expect(tokens()).toEqual(["refresh_token"]);
-
-    await a.command({ type: "prompt", message: "bind a" });
-    await b.command({ type: "prompt", message: "bind b" });
-    await until(() => ompRow(srv, sa.sessionId)?.name === "omp-a" && ompRow(srv, sb.sessionId)?.name === "omp-b" && srv.app.mcp.activeLeases === 2, 30_000, "both leased");
-    expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
-    expect(tokens()).toEqual(["refresh_token"]);
-    await Promise.all([idle(a), idle(b)]);
-
-    // Logout in a: the grant is revoked, so the server drops both leases,
-    // and both processes pause with the login notice.
-    const seenA = a.notices().length, seenB = b.notices().length;
-    await a.command({ type: "prompt", message: "/grayboard logout" });
-    await until(() => a.notices().slice(seenA).includes("grayboard: signed out; every omp session on this server pauses until run /grayboard login"), 10_000, "the logout notice");
-    await until(() => srv.app.mcp.activeLeases === 0, 15_000, "both leases dropped");
-    expect(srv.app.db.query<{ revoked_at: number | null }, [string]>("SELECT revoked_at FROM oauth_grants WHERE id = ?").get(seeded.grantId)!.revoked_at).not.toBeNull();
-    await until(() => b.notices().slice(seenB).includes(LOGIN_NOTICE), 15_000, "the login notice in the other process");
-    // A root whose subscription closed first sits in `retrying` until its next reopen meets the sign-out (#606).
-    for (const omp of [a, b]) await until(async () => {
-      const status = await statusOf(omp);
-      return status.includes("\nsign-in: signed out (logged_out); run /grayboard login\n") && /: paused, /.test(status) ? status : undefined;
-    }, 15_000, "both roots paused by the sign-out");
-    // The other process's next tool call offers a sign-in; once it lands,
-    // both processes' roots restart (unbound: the logout's revoke ended their sessions).
-    await expectSignInOffer(srv, b, "omp", { results: 0, whoami: (nth) => toolResult(b, "whoami", nth), idle: (p) => idle(p) });
-    for (const proc of [a, b]) await until(async () => {
-      const status = await statusOf(proc);
-      return status.includes("\nsign-in: signed in\n") && !status.includes("paused") ? status : undefined;
-    }, 20_000, "both roots restarted signed in");
-    await Promise.all([a.quit(), b.quit()]);
   });
 }
+
+export const ompHostedRefreshLogoutScenario = (dir: string): Promise<void> => hostedRefreshLogoutScenario(OMP_HARNESS, dir);
