@@ -1695,6 +1695,24 @@ test("#807 P3 A7d: of two legacy GETs whose checks await together, one takes the
   await raw.delete();
 });
 
+// #807 P3 A7h2: a live keeps its creator's rows only when no notice for them came after the read began; a GET whose
+// root's binding moved while its check awaited re-reads them once it opens, and stops, with no stream tick.
+test("#807 P3 A7h2: a legacy GET whose binding moves while its check awaits re-reads its rows and stops", async () => {
+  const { time } = await clocked(undefined, undefined, true);
+  const access = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const raw = await rawLegacySession(access, meta);
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "moved", purpose: "A7h2" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/moved", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:legacy:get-checked", () => raw.get(abort.signal), async () => {
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+  });
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 0);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
 // #807 P3 A7d: a revoke reaches a legacy GET through two phase-B tasks, its own check and its session's sweep; the
 // sweep writes the close row when it retires the session, so the GET gets one whichever settles first.
 test("#807 P3 A7d: a revoked legacy GET whose session the sweep retires before its own check settles gets one close row", async () => {
