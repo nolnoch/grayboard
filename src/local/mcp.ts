@@ -1460,6 +1460,8 @@ transport.send = async message => {
     });
   }
 };
+// A child that never answers initialize, for the adapters' deadline (#559).
+testPause("mcp:before-connect");
 await mcp.connect(transport);
 connected = true;
 late.watch(transport);

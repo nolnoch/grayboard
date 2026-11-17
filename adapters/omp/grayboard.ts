@@ -56,6 +56,12 @@ const QUIT_KILL_MS = 400;
 // A process that ran STABLE_MS before exiting starts the count over.
 const RESTART_DELAYS_MS = [0, 1_000, 5_000];
 const STABLE_MS = 60_000;
+// How long a new child gets to answer initialize and finish its session
+// handshake before it is killed and restarted as an exit is (#559): a wedged
+// child would otherwise hold every waiting call and the session's switch.
+// Under STABLE_MS, so a child that never initializes uses up its restarts.
+// BUS_TEST_INIT_DEADLINE_MS shortens it for tests.
+const INIT_DEADLINE_MS = Number(process.env.BUS_TEST_INIT_DEADLINE_MS) || 30_000;
 
 // A tool call's wait for the grayboard process (a transition, a restart's
 // backoff, initialization) ends at the call's abort, as pi's does (#559): a
@@ -510,6 +516,8 @@ export default function grayboard(pi: ExtensionAPI) {
     // A call that awaits ready gets the failure; this only keeps an unawaited
     // rejection from crashing omp when no call is waiting.
     ready.catch(() => {});
+    const deadline = setTimeout(() => fail(`grayboard process didn't initialize within ${INIT_DEADLINE_MS / 1000} s`), INIT_DEADLINE_MS);
+    ready.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
     return { proc, ready, call, epoch: selection.epoch };
   };
 

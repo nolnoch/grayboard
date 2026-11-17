@@ -107,9 +107,11 @@ type PiOpts = {
   // Match the hosted launcher's persisted-session options.
   persist?: boolean;
   session?: string;
+  // Extra environment for the pi process (and so the adapter).
+  env?: Record<string, string>;
 };
 
-export function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {}, persist = false, session }: PiOpts = {}): Pi {
+export function startPi(dir: string, modelPort: number, procs: ChildProcess[], { bin, identity = "pi", entry = {}, persist = false, session, env = {} }: PiOpts = {}): Pi {
   const agentDir = join(dir, "pi-agent");
   const extension = join(agentDir, "extensions", "grayboard.ts");
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
@@ -130,7 +132,7 @@ export function startPi(dir: string, modelPort: number, procs: ChildProcess[], {
   writeModels(agentDir, modelPort);
   const proc = spawn("node", [PI_CLI, ...PI_ARGS, ...(persist ? [] : ["--no-session"]), ...(session ? ["--session", session] : [])], {
     cwd: dir,
-    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }),
+    env: localEnv(dir, identity ?? undefined, { PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ...env }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   procs.push(proc);
@@ -386,6 +388,37 @@ export function piLocalRestartScenario(dir: string): Promise<void> {
       await stopAll(procs);
       model.stop();
       db?.close();
+    }
+  });
+}
+
+// A grayboard process that never answers initialize is killed at the
+// deadline and restarted as an exit is (#559); after the last restart a
+// tool call fails with the deadline's reason instead of hanging.
+export function piLocalInitDeadlineScenario(dir: string): Promise<void> {
+  return named(PI_HARNESS, async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([scripted("who", [{ tool: "mcp__grayboard__whoami", args: {} }])]);
+    try {
+      // Every child, restarts included, blocks before it answers initialize.
+      mkdirSync(join(dir, "pause"), { recursive: true });
+      const env = { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" };
+      const pi = startPi(dir, model.port, procs, { identity: null, env });
+      await pi.command({ type: "get_state" }, 60_000);
+      const notice = await until(() => pi.notices().find((n) => n.includes("after 3 restarts; restart pi to reconnect")), 60_000, "restart exhaustion notice");
+      expect(notice).toContain("grayboard process didn't initialize within 1 s");
+      expect(pi.notices().filter((n) => n.includes("didn't initialize within 1 s; restarting it"))).toHaveLength(3);
+      await pi.command({ type: "prompt", message: "who" });
+      const failed = await toolResult(pi, "whoami");
+      expect(failed.isError).toBe(true);
+      expect(resultText(failed)).toContain("grayboard process didn't initialize within 1 s");
+      expect(grayboardChildPids(pi.pid)).toEqual([]);
+      await idle(pi);
+      expect(model.unhandled).toEqual([]);
+      await pi.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
     }
   });
 }
