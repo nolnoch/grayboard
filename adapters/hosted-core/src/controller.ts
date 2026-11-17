@@ -45,7 +45,7 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // recovery whose delivery expires again before it opens never starts over.
 // `binding` counts the root's own native binds and unbinds between beforeCall
 // and afterCall: the recovery never resumes under one, whose completion sets the holds.
-type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease; awaiting?: object; recovery?: { attempt: number; spent: number }; binding?: number };
+type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease; awaiting?: object; recovery?: { attempt: number; spent: number }; binding?: number; released?: number };
 const ADMITTED_LIMIT = 100;
 // Ancestry lookups `childRoot` keeps for sessions not (yet) routed.
 const LOOKUPS = 1024;
@@ -88,8 +88,9 @@ const display = (address: string) => shortOf(address.slice(0, address.lastIndexO
 export class Controller<E extends Enrollment = Enrollment> {
   readonly routes = new SessionRoutes();
   private readonly lookups = new Map<string, SessionPath>();
-  // A descendant's registration under its enrolled root, kept while that root keeps its epoch (#567).
-  private readonly registered = new Map<string, { r: Root<E>; epoch: number; done: Promise<void> }>();
+  // A descendant's registration under its enrolled root (#567): shared while in flight, and once done kept only
+  // while the root keeps its epoch and its lease's server ownership (whose end deletes child rows server-side).
+  private readonly registered = new Map<string, { r: Root<E>; epoch: number; ownership?: number; settled: boolean; done: Promise<void> }>();
   readonly Transport: typeof Wire;
   protected roots = new Map<string, Root<E>>();
   private watches = new Map<string, { dispose(): Promise<void> }>();
@@ -180,19 +181,23 @@ export class Controller<E extends Enrollment = Enrollment> {
   // before this registration landed, so it ends the row it made. A refusal is
   // the root's `child_register` failure unless this is an instructions `fetch`,
   // which reports its own, without degrading the root. Under an enrolled root,
-  // calls and fetches share one registration until the root's epoch moves (a
-  // stop, pause or re-enroll; a re-enroll deletes child rows server-side) (#567).
+  // calls and fetches share a registration in flight; a done one serves while
+  // the root keeps its epoch (a stop, pause or re-enroll moves it) and the
+  // server ownership its lease names: any end of that ownership (a release, a
+  // lapsed lease the run loop reopens, an idle sweep) deletes child rows (#567).
   async enlist(path: SessionPath, fetch = false): Promise<void> {
-    const r = this.roots.get(path.root), live = !!r && !r.paused;
+    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call: Temporary = (sessionID, c) => this.temporary(e, c, sessionID);
     const known = r && this.registered.get(path.sessionID);
-    let done = known && known.r === r && known.epoch === r.epoch ? known.done : undefined;
+    let done = known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
     if (!done) {
       const started = done = register(call, { root: path.root, via: path.via, child: path.sessionID });
       if (r) {
-        this.registered.set(path.sessionID, { r, epoch: r.epoch, done: started });
+        const entry = { r, epoch: r.epoch, ...(r.lease ? { ownership: r.lease.ownership } : {}), settled: false, done: started };
+        this.registered.set(path.sessionID, entry);
         if (this.registered.size > LOOKUPS) this.registered.delete(this.registered.keys().next().value!);
+        started.then(() => { entry.settled = true; }, () => {});
       }
       started.catch(() => { if (this.registered.get(path.sessionID)?.done === started) this.registered.delete(path.sessionID); });
     }
@@ -201,12 +206,12 @@ export class Controller<E extends Enrollment = Enrollment> {
       await end(call, { child: path.sessionID }).catch(error => this.failure("child_end", error, r));
       throw new AncestryError("Grayboard session ended during registration");
     }
-    // A fetch whose root paused while it registered: the pause's release may have landed first, and the
-    // registration then started the root's key a new ownership. A root still paused ends it again, with
-    // the child's row; one a re-enroll replaced owns its key, so its rows stand (#567).
-    if (fetch && live && (this.roots.get(path.root) !== r || r!.paused)) {
-      this.registered.delete(path.sessionID);
-      if (this.roots.get(path.root) === r) {
+    // A fetch whose root released its ownership while it registered: the release may have landed first, and
+    // the registration then started the root's key a new ownership. A root still paused ends it again, with
+    // the child's row; one a re-enroll replaced, or a resume restarted, owns its key, so its rows stand (#567).
+    if (fetch && live && (this.roots.get(path.root) !== r || (r!.released ?? 0) !== releases)) {
+      if (this.registered.get(path.sessionID)?.done === done) this.registered.delete(path.sessionID);
+      if (this.roots.get(path.root) === r && r!.paused) {
         await end(call, { child: path.sessionID }).catch(error => this.failure("child_end", error, r));
         await end(call, { child: path.root }).catch(error => this.failure("session_end", error, r));
       }
@@ -613,7 +618,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   private async stop(r: Root<E>) { r.epoch++; r.abort?.abort(); await r.task; r.task = undefined; r.abort = undefined; }
   private async release(r: Root<E>) {
-    const lease = r.lease; r.lease = undefined;
+    const lease = r.lease; r.lease = undefined; r.released = (r.released ?? 0) + 1;
     await this.temporary(r.e, async wire => {
       if (lease) { wire.capability = lease.capability; await wire.call("delivery_release").catch(error => this.failure("delivery_release", error, r)); }
       await wire.call("session_end");
@@ -875,6 +880,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   // After a native call: a bind or unbind result restarts delivery under the new
   // hold set; an `unbound` result from any tool rebinds the remembered holds.
   async afterCall(event: { sessionID: string; tool: string; result: CallOutcome }): Promise<void> {
+    // A descendant's call the server answered unbound found no child row (one evicted, or its root's ownership
+    // ended unseen): its next call registers again (#567).
+    if (!this.roots.has(event.sessionID) && event.result.status === "completed" && (event.result.output as { unbound?: unknown } | undefined)?.unbound === true) this.registered.delete(event.sessionID);
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
       const own = event.tool === "bind" || event.tool === "unbind";

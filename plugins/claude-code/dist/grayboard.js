@@ -36721,17 +36721,21 @@ class Controller {
     return path.root !== sessionID && r && !r.paused ? path : undefined;
   }
   async enlist(path, fetch2 = false) {
-    const r = this.roots.get(path.root), live = !!r && !r.paused;
+    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call = (sessionID, c) => this.temporary(e, c, sessionID);
     const known = r && this.registered.get(path.sessionID);
-    let done = known && known.r === r && known.epoch === r.epoch ? known.done : undefined;
+    let done = known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
     if (!done) {
       const started = done = register2(call, { root: path.root, via: path.via, child: path.sessionID });
       if (r) {
-        this.registered.set(path.sessionID, { r, epoch: r.epoch, done: started });
+        const entry = { r, epoch: r.epoch, ...r.lease ? { ownership: r.lease.ownership } : {}, settled: false, done: started };
+        this.registered.set(path.sessionID, entry);
         if (this.registered.size > LOOKUPS)
           this.registered.delete(this.registered.keys().next().value);
+        started.then(() => {
+          entry.settled = true;
+        }, () => {});
       }
       started.catch(() => {
         if (this.registered.get(path.sessionID)?.done === started)
@@ -36747,9 +36751,10 @@ class Controller {
       await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
       throw new AncestryError("Grayboard session ended during registration");
     }
-    if (fetch2 && live && (this.roots.get(path.root) !== r || r.paused)) {
-      this.registered.delete(path.sessionID);
-      if (this.roots.get(path.root) === r) {
+    if (fetch2 && live && (this.roots.get(path.root) !== r || (r.released ?? 0) !== releases)) {
+      if (this.registered.get(path.sessionID)?.done === done)
+        this.registered.delete(path.sessionID);
+      if (this.roots.get(path.root) === r && r.paused) {
         await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
         await end(call, { child: path.root }).catch((error) => this.failure("session_end", error, r));
       }
@@ -37235,6 +37240,7 @@ class Controller {
   async release(r) {
     const lease = r.lease;
     r.lease = undefined;
+    r.released = (r.released ?? 0) + 1;
     await this.temporary(r.e, async (wire) => {
       if (lease) {
         wire.capability = lease.capability;
@@ -37515,6 +37521,8 @@ class Controller {
       });
   }
   async afterCall(event) {
+    if (!this.roots.has(event.sessionID) && event.result.status === "completed" && event.result.output?.unbound === true)
+      this.registered.delete(event.sessionID);
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
       const own = event.tool === "bind" || event.tool === "unbind";

@@ -539,6 +539,28 @@ test.each(modes)("a child's calls and fetches share one registration until its r
   } finally { await r.controller.close(); }
 });
 
+// #567 audit: the server's end of a root's ownership (a lapsed lease, an idle sweep) deletes its child rows without
+// moving the root's epoch: a run loop that reopens under a new ownership invalidates the remembered registration,
+// as does a child call the server answers unbound.
+test.each(modes)("a child registers again after its root's ownership changes under it, or after a call answered unbound (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    const before = r.root(r.controller)?.ownership;
+    r.rows.delete("R"); r.closeStream("R");
+    await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.ownership !== before);
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+    await r.controller.afterCall({ sessionID: "C", tool: "dm_send", result: { status: "completed", output: { unbound: true } } });
+    await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(3);
+  } finally { await r.controller.close(); }
+});
+
 // #567: a pause whose release lands before a fetch's registration: that registration started the root's key a
 // new ownership, so the fetch ends it and the child's row, and gives up.
 test.each(modes)("an instructions fetch whose root pauses while it registers ends the rows it made (#567) (%s)", async mode => {
@@ -556,6 +578,24 @@ test.each(modes)("an instructions fetch whose root pauses while it registers end
     await expect(enlisting).rejects.toThrow("paused during registration");
     expect(r.named("session_end").map(c => c.sessionID)).toEqual(["R", "C", "R"]);
     expect(await r.controller.childRoot("C")).toBeUndefined();
+  } finally { await r.controller.close(); }
+});
+
+// #567 audit: a pause that keeps the ownership (a drift) released nothing, so a fetch registering through it ends no row.
+test.each(modes)("an instructions fetch whose root drifts while it registers ends no row (#567) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    let release!: () => void;
+    r.holdRegister(new Promise<void>(resolve => { release = resolve; }));
+    const enlisting = r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true);
+    await until(() => r.named("session_register").length === 1);
+    r.drift();
+    await until(() => r.root(r.controller)?.state === "paused");
+    release();
+    await enlisting;
+    expect(r.named("session_end")).toEqual([]);
   } finally { await r.controller.close(); }
 });
 
