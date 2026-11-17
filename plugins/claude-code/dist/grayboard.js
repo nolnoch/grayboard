@@ -14216,13 +14216,13 @@ class LockTimeout extends Error {
 }
 var SQLITE_BUSY = 5;
 var held = new Set;
-function tryAcquire(path) {
+function tryAcquire(path, busyMs = 50) {
   const file = resolve(path);
   if (held.has(file))
     return;
   const db = new DatabaseSync(file);
   try {
-    db.exec("PRAGMA busy_timeout=50");
+    db.exec(`PRAGMA busy_timeout=${Math.max(0, Math.trunc(busyMs))}`);
     db.exec("BEGIN EXCLUSIVE");
   } catch (error) {
     db.close();
@@ -14251,7 +14251,7 @@ async function acquire(path, options) {
   const deadline = Date.now() + options.deadlineMs;
   for (;; ) {
     options.signal?.throwIfAborted();
-    const lock = tryAcquire(path);
+    const lock = tryAcquire(path, 0);
     if (lock)
       return lock;
     await options.onBusy?.();
@@ -32105,14 +32105,14 @@ class FileStorage {
     return raw === undefined ? {} : SessionState.parse(raw);
   }
 }
-function tryDelivery(path) {
+function tryDelivery(path, busyMs) {
   mkdirSync(dirname(path), { recursive: true, mode: 448 });
-  return tryAcquire(path);
+  return tryAcquire(path, busyMs);
 }
 async function waitDelivery(path, signal, intervalMs = 5000) {
   for (;; ) {
     signal.throwIfAborted();
-    const lock = tryDelivery(path);
+    const lock = tryDelivery(path, 0);
     if (lock)
       return lock;
     await sleep4(intervalMs, undefined, { signal });
