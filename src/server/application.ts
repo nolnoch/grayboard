@@ -452,7 +452,8 @@ async function describeHolder(hub: Hub, r: Read, id: string, asker: string): Pro
 // `tx.savepoint`, so a binding row may be async (#807 P3 B1c).
 export type RefusalRow = (tx: Tx) => void | Promise<void>;
 // A row written where nothing awaits it (an audit or decision row, a streak or throttle row, one core's synchronous
-// `reach` emits): synchronous, so none floats a promise (#807 P3 B1c, R10).
+// `reach` emits): synchronous by convention, so none floats a promise (#807 P3 B1c, R10). The type doesn't refuse an
+// async function (TypeScript accepts one where `void` is returned): every producer must call only synchronous writers.
 export type SyncRow = (tx: Tx) => void;
 function rowAfterRollback(session: ApplicationSession, tx: Tx, write: SyncRow) {
   if (session.afterRollback) session.afterRollback(write); else write(tx);
@@ -955,7 +956,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // concurrent bind) refuses here, naming whoever has it now.
     if (!(await repo.bindings.take(tx, address, id, authed.user_email, now()))) {
       const now_ = await repo.bindings.holderOf(tx, address);
-      const who = now_ !== null ? await describeHolder(hub, tx, now_, authed.user_email) : `another user's session ${await repo.bindings.userOf(tx, address, authed.user_email)}`;
+      // On Postgres an unbind or end may commit between the take and these reads, leaving neither: "another session".
+      const user = now_ === null ? await repo.bindings.userOf(tx, address, authed.user_email) : null;
+      const who = now_ !== null ? await describeHolder(hub, tx, now_, authed.user_email) : user !== null ? `another user's session ${user}` : "another session";
       return await refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, now_ !== null ? { holder: who } : {});
     }
     await repo.bindings.log(tx, id, address, "bound", null);
