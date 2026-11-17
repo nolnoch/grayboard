@@ -480,6 +480,36 @@ for (const [n, phase, reason] of [[1, "start", "failed to initialize"], [2, "swi
   }, 60_000);
 }
 
+// An event that arrives while a switch handshake is in flight waits for the
+// transition; when that handshake fails and schedules a restart, the event
+// must not start a second child beside it, which would outlive dispose as a
+// second delivery owner (#1145 audit).
+test("opencode: an event waiting on a switch handshake that fails starts no second child; one child serves the new root and none outlives dispose (#1145)", async () => {
+  const counter = join(dir, "session-calls");
+  const oc = driver("oc", entry({ command: [process.execPath, REFUSING_MCP, "--session", counter, "2", process.execPath, CLI, "mcp", "--mode", "local"] }));
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+  expect(JSON.parse(await oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).id).toBeString();
+  await oc.send("holdAssociation", { sessionID: "s2" });
+  const selection = oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
+  await until(async () => (await oc.send("state")).heldAssociation === "s2", 10_000, "the held switch refusal");
+  // The driver runs each line's hook up to its first await before reading
+  // the next, so once state answers, this event waits on the transition.
+  const waiting = oc.send("event", { event: { type: "session.updated", properties: { info: { id: "s1" } } } });
+  await oc.send("state");
+  await oc.send("releaseAssociation");
+  await Promise.all([selection, waiting]);
+  const who = JSON.parse(await oc.send("call", { sessionID: "s2", tool: "grayboard_whoami", args: {} }));
+  const db = new Database(join(dir, "bus.db"), { readonly: true });
+  try { expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(who.id)).toEqual({ harness_session: "s2" }); }
+  finally { db.close(); }
+  expect(grayboardChildPids(oc.pid)).toHaveLength(1);
+  // Spawns: the first child and its one replacement.
+  expect((await oc.send("state")).spawnOwners).toHaveLength(2);
+  await oc.send("dispose");
+  expect(grayboardChildPids(oc.pid)).toEqual([]);
+}, 60_000);
+
 test("opencode: child instructions skip restart backoff and degrade to none after exhaustion", async () => {
   // The real retry sequence waits 0 + 1 + 5 seconds; retain the driver's
   // shorter per-call deadline so an actual reconnect hang fails there.

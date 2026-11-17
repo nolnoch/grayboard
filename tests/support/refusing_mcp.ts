@@ -44,15 +44,17 @@ if (!proxy) {
   process.stdin.on("end", () => process.exit(0));
 } else {
   const real = Bun.spawn([cmd!, ...args], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
-  void real.exited.then((code) => process.exit(code ?? 1));
   // Whole lines only, so a refusal never lands inside one of the real process's.
   const out = lines((line) => process.stdout.write(line));
-  void (async () => {
+  const pumped = (async () => {
     const decoder = new TextDecoder();
     for await (const chunk of real.stdout) out(decoder.decode(chunk, { stream: true }));
   })();
+  // Its last lines go out before this exits with its code.
+  void real.exited.then(async (code) => { await pumped.catch(() => {}); process.exit(code ?? 1); });
   process.stdin.setEncoding("utf8").on("data", lines((line) => {
-    const msg = JSON.parse(line);
+    let msg: { id?: unknown; method?: unknown } = {};
+    try { msg = JSON.parse(line); } catch {}
     if (msg.method === "grayboard/session") {
       const seen = (existsSync(proxy.counter) ? Number(readFileSync(proxy.counter, "utf8")) : 0) + 1;
       writeFileSync(proxy.counter, String(seen));

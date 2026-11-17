@@ -339,7 +339,8 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
         if (cancelled || closed) return;
         restart = undefined;
         exitReason = undefined;
-        child = start();
+        // Never replace a live child: the old one would keep delivering.
+        child ??= start();
         waiter.resolve();
       }, RESTART_DELAYS_MS[attempt]);
       restart = {
@@ -613,7 +614,9 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (target && !closed && !refused && !exitReason && !restart) {
         await Promise.all(stopping);
         await transition;
-        if (!closed) child ??= start();
+        // A transition that failed its child (#1145) or an exit while this
+        // waited has a restart pending: starting one here too would orphan it.
+        if (!closed && !exitReason && !restart) child ??= start();
       }
     },
 
@@ -628,7 +631,7 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (transitionError || closed) return;
       if (target && !child && !exitReason && !closed) {
         await Promise.all(stopping);
-        if (!closed) child ??= start();
+        if (!closed && !exitReason && !restart) child ??= start();
       }
       await child?.ready.catch(() => {});
       await transition;
