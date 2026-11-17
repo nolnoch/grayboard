@@ -381,7 +381,7 @@ export async function attachSession(db: Database, s: SessionRow, human: boolean,
     }
     db.prepare(`UPDATE bindings SET attached_pid = ?, attached_start = ?, detached_at = NULL WHERE session_id = ?`)
       .run(s.attached_pid, s.attached_start, s.session_id);
-    writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid, held });
+    writeCoreAudit(db, "id.reattached", s.session_id, s.session_id, { old_pid: b.attached_pid, new_pid: s.attached_pid, harness_pid: b.pid, held, ...(harnessSession !== undefined ? { harness_session: harnessSession } : {}) });
     // The new child reports its own model and effort (#365): what the last
     // one reported is stale, as for a hosted session's new ownership.
     const changed = setIdFacts(db, s.session_id, facts);

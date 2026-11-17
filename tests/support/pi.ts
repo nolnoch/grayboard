@@ -836,10 +836,9 @@ export function piForegroundChildScenario(dir: string): Promise<void> {
   });
 }
 
-// A keyed (BUS_SESSION_KEY) or human (BUS_HUMAN=1) root doesn't own its
-// delivery, so it looks up no parent for its foreground child (#896): the
-// child's grayboard, given no BUS_PARENT_SESSION (which `grayboard mcp`
-// refuses for such a session), starts as a session of its own (#897).
+// A keyed (BUS_SESSION_KEY) or human (BUS_HUMAN=1) root's foreground child
+// (#897, #1075): a keyed root's is its child, started without the root's key;
+// a human root's gets no grayboard, and its call says why. Neither crash-loops.
 export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "human"): Promise<void> {
   const prefix = "mcp__grayboard__";
   const whoami: Reply = { tool: prefix + "whoami", args: {} };
