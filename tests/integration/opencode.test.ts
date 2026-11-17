@@ -510,6 +510,58 @@ test("opencode: an event waiting on a switch handshake that fails starts no seco
   expect(grayboardChildPids(oc.pid)).toEqual([]);
 }, 60_000);
 
+// selectTarget resets the restart count, so switch refusals alone never
+// exhaust it: each restarts as the first of three (#1148).
+test("opencode: every switch handshake refused restarts the process as the first of three; switch refusals alone never exhaust the restarts (#1148)", async () => {
+  const counter = join(dir, "session-calls");
+  const oc = driver("oc", entry({ command: [process.execPath, REFUSING_MCP, "--session", counter, "2,4,6,8", process.execPath, CLI, "mcp", "--mode", "local"] }));
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+  expect(JSON.parse(await oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).id).toBeString();
+  for (const [i, root] of ["s2", "s3", "s4", "s5"].entries()) {
+    await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: root } } } });
+    // The refused switch (2i+2) and the replacement's start handshake (2i+3).
+    await until(() => existsSync(counter) && readFileSync(counter, "utf8") === String(2 * i + 3), 15_000, `${root}'s replacement handshake`);
+    const who = JSON.parse(await oc.send("call", { sessionID: root, tool: "grayboard_whoami", args: {} }));
+    const db = new Database(join(dir, "bus.db"), { readonly: true });
+    try { expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(who.id)).toEqual({ harness_session: root }); }
+    finally { db.close(); }
+  }
+  const toasts: string[] = (await oc.send("state")).toasts;
+  expect(toasts.filter((t) => t.includes("failed its session switch: grayboard: refused for test; restarting it (1 of 3)"))).toHaveLength(4);
+  expect(toasts.filter((t) => /restarting it \([23] of 3\)|restart opencode to reconnect/.test(t))).toEqual([]);
+  expect(grayboardChildPids(oc.pid)).toHaveLength(1);
+  await oc.send("dispose");
+}, 60_000);
+
+// A switch handshake refused after a newer root superseded it restarts
+// nothing: the newer switch runs on the same process (#1148).
+test("opencode: a switch handshake refused after a newer root superseded it doesn't restart the process; the newer root's switch runs on it (#1148)", async () => {
+  const counter = join(dir, "session-calls");
+  const oc = driver("oc", entry({ command: [process.execPath, REFUSING_MCP, "--session", counter, "2", process.execPath, CLI, "mcp", "--mode", "local"] }));
+  await oc.send("init");
+  await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+  expect(JSON.parse(await oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).id).toBeString();
+  const [first] = grayboardChildPids(oc.pid);
+  await oc.send("holdAssociation", { sessionID: "s2" });
+  const s2 = oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
+  await until(async () => (await oc.send("state")).heldAssociation === "s2", 10_000, "the held switch refusal");
+  const s3 = oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s3" } } } });
+  await oc.send("state");
+  await oc.send("releaseAssociation");
+  await Promise.all([s2, s3]);
+  const who = JSON.parse(await oc.send("call", { sessionID: "s3", tool: "grayboard_whoami", args: {} }));
+  const db = new Database(join(dir, "bus.db"), { readonly: true });
+  try { expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(who.id)).toEqual({ harness_session: "s3" }); }
+  finally { db.close(); }
+  expect(readFileSync(counter, "utf8")).toBe("3");
+  expect(grayboardChildPids(oc.pid)).toEqual([first!]);
+  const state = await oc.send("state");
+  expect(state.spawnOwners).toHaveLength(1);
+  expect(state.toasts.filter((t: string) => t.includes("restarting it"))).toEqual([]);
+  await oc.send("dispose");
+}, 60_000);
+
 test("opencode: child instructions skip restart backoff and degrade to none after exhaustion", async () => {
   // The real retry sequence waits 0 + 1 + 5 seconds; retain the driver's
   // shorter per-call deadline so an actual reconnect hang fails there.
