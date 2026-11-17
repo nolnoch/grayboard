@@ -50,7 +50,11 @@ test("#807: behind a write backlog longer than a tick, the timer keeps one sweep
   hosted.close();
   const real = setInterval;
   let tick!: () => void;
-  const interval = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void) => { tick = fn; return real(() => {}, 1 << 30); }) as unknown as typeof setInterval);
+  const interval = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) => {
+    if (ms !== 250) return real(fn, ms, ...args);
+    tick = fn;
+    return real(() => {}, 1 << 30);
+  }) as unknown as typeof setInterval);
   try { hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); } finally { interval.mockRestore(); }
   const store = database.repo.hosted;
   const expired = spyOn(store, "expired");
@@ -918,7 +922,8 @@ test("refusal rows whose queued write fails as a whole are all counted lost, onc
     expect(rows).toBe(2);
     expect(hosted.refusalRowsLost).toBe(2);
     expect(database.db.query("SELECT event FROM binding_events WHERE event = 'refused'").all()).toHaveLength(0);
-    expect(quiet.mock.calls.some(([line]) => String(line).includes('"operation":"hosted.refusal_row"'))).toBe(true);
+    // One diagnostic per failed row, and one for the refused write.
+    expect(quiet.mock.calls.filter(([line]) => String(line).includes('"operation":"hosted.refusal_row"'))).toHaveLength(3);
   } finally { writes.mockRestore(); quiet.mockRestore(); expect(store.atomic).toBe(atomic); }
 });
 
