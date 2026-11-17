@@ -267,7 +267,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
   const touches = createTouchQueue();
   const server = Bun.serve({
     port: 0,
-    fetch: req => handleHttp(req, store.repo, store.db, config, touches, application.wake, undefined, { disconnectUser: application.disconnectUser, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
+    fetch: req => handleHttp(req, store.repo, config, touches, application.wake, undefined, { disconnectUser: application.disconnectUser, accessChanged: application.accessChanged }, "127.0.0.1", application.boardsChanged),
   });
   const base = `http://localhost:${server.port}`;
   try {

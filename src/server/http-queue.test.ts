@@ -83,7 +83,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     const hooks = { disconnectUser: (id: number) => { disconnected.push(id); }, accessChanged: () => {} };
     const call = (path: string, body: unknown, token?: string) => handleHttp(
       new Request(`http://localhost${path}`, { method: "POST", body: JSON.stringify(body), headers: token ? { Authorization: `Bearer ${token}` } : {} }),
-      repo, db, config, touches, () => {}, undefined, hooks, "127.0.0.1");
+      repo, config, touches, () => {}, undefined, hooks, "127.0.0.1");
     const login = async (email: string) => (await (await call("/api/auth/dev-login", { email })).json() as { session_token: string }).session_token;
     const root = await login("root@example.com");
     const bobToken = await login("bob@example.com");
@@ -101,9 +101,49 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     expect(repo.audit.last(action, "bob@example.com")).toBeUndefined();
     expect(bob.disabled_at).toBeNull();
     expect((await handleHttp(new Request("http://localhost/api/whoami", { headers: { Authorization: `Bearer ${bobToken}` } }),
-      repo, db, config, touches, () => {}, undefined, hooks, "127.0.0.1")).status).toBe(200);
+      repo, config, touches, () => {}, undefined, hooks, "127.0.0.1")).status).toBe(200);
     const ok = await call(`/api/admin/${route}`, { email: "bob@example.com" }, root);
     expect(ok.status).toBe(200);
     expect(disconnected).toEqual([bob.id]);
   });
 }
+
+// #807 P1c-15c-1: the claim, identity and team routes reach core's helpers through `repo.coreOn(handle)`: their write
+// body's `Tx` inside it, the pool outside (the claim list).
+test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's Tx", async () => {
+  const srv = new TestServer();
+  cleanups.push(() => srv.stop());
+  const { repo, db } = srv.app;
+  const you = await srv.login("you@example.com"), bob = await srv.login("bob@example.com");
+  const checks: { route: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  let route = "";
+  const original = repo.coreOn.bind(repo);
+  const spy = spyOn(repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
+    checks.push({ route, inTxn: db.inTransaction, handle: h === repo.read ? "pool" : "tx" });
+    return original(h);
+  }) as never);
+  const call = async (name: string, token: string, method: string, path: string, body?: unknown, status = 200) => {
+    route = name;
+    expect((await srv.api(token, method, path, body)).status).toBe(status);
+  };
+  try {
+    await call("team create", you, "POST", "/api/teams", { name: "core" }, 201);
+    // bob's alias makes the join and leave loops (follow, unsubscribe) run.
+    await call("bob identity", bob, "POST", "/api/identities", { name: "helper" }, 201);
+    await call("team add", you, "POST", "/api/teams/core/add", { email: "bob@example.com" });
+    await call("identity create", you, "POST", "/api/identities", { name: "agent" }, 201);
+    await call("claim call", you, "POST", "/api/claims/call", { as: "agent", tool: "claim_take", args: { key: "k" } });
+    await call("claim list", you, "GET", "/api/claims");
+    await call("identity delete", you, "DELETE", "/api/identities/agent");
+    await seed(repo, tx => { repo.aliases.create(tx, { scope_kind: "team", scope_ref: "core", name: "bot" }, "you@example.com"); });
+    await call("team delete-alias", you, "POST", "/api/teams/core/delete-alias", { name: "bot" });
+    await call("team remove", you, "POST", "/api/teams/core/remove", { email: "bob@example.com" });
+    await call("team add again", you, "POST", "/api/teams/core/add", { email: "bob@example.com" });
+    await call("team leave", bob, "POST", "/api/teams/core/leave");
+    const inBody = ["team create", "team add", "identity create", "claim call", "identity delete", "team delete-alias", "team remove", "team leave"];
+    // Each in-body route reached core at least once, so the last check isn't vacuous for it.
+    expect(inBody.filter(r => !checks.some(c => c.route === r && c.handle === "tx"))).toEqual([]);
+    expect(checks.some(c => c.route === "claim list" && c.handle === "pool")).toBe(true);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { spy.mockRestore(); }
+});

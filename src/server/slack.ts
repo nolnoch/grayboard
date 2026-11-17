@@ -241,7 +241,7 @@ export class SlackBridge implements SlackLinker {
         forgetHandle(db, handle);
         repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
         writeAudit(repo, "alias.created", user.email, handle, { slack: true });
-        onAliasCreated(db, repo, user.id, handle);
+        onAliasCreated(repo, tx, user.id, handle);
         const newest = repo.messages.history(tx, [handle], undefined, 1)[0];
         if (newest) repo.cursors.advance(tx, handle, "direct", handle, newest.id);
       }
