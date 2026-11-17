@@ -873,9 +873,9 @@ export class PrincipalTaken extends Error {
   }
 }
 
-// The column a write's UNIQUE violation names ("principals.name"), or undefined for any other error. D7 classifies
+// The column a write's UNIQUE violation names ("principals.name"), or undefined for any other error. D6 classifies
 // Postgres's 23505 by its constraint in P3; on SQLite the message is the only place the column appears.
-export function uniqueViolation(e: unknown): string | undefined {
+function uniqueViolation(e: unknown): string | undefined {
   if (!(e instanceof Error) || e.name !== "SQLiteError" || (e as { code?: unknown }).code !== "SQLITE_CONSTRAINT_UNIQUE") return undefined;
   return /^UNIQUE constraint failed: (\S+)$/.exec(e.message)?.[1];
 }
