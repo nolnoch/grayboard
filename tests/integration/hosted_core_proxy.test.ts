@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
-import { hostTools, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
+import { CallAborted, hostTools, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
 import { NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -355,6 +355,75 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
   expect(outside.isError).toBe(true);
   expect(textOf(outside)).toStartWith("error: attachment ");
   expect(sender.reports).toEqual([]);
+});
+
+// #438 item 26: the harness's abort (pi's Esc, /new) ends the wait for one
+// call: it throws CallAborted, never an outage, and leaves the shared
+// connection, the other calls on it and the proxy's retire() alone.
+test("a call's signal aborts only that call: CallAborted, the shared connection and its other calls untouched, nothing saved", async () => {
+  const { token } = await issue();
+  const hooks = recorder();
+  const p = proxy({ token: async () => token }, { hooks });
+  const list = NativeWire.prototype.listTools, fetch0 = globalThis.fetch;
+  let lists = 0, posts = 0;
+  NativeWire.prototype.listTools = async function () { lists++; return list.call(this); };
+  // board_list POSTs and attachment GETs are held at the network until their own signal aborts.
+  const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
+  const { promise: held, resolve: release } = Promise.withResolvers<void>();
+  const getReached = Promise.withResolvers<void>();
+  const stall = async (init?: RequestInit, reached = entered) => {
+    reached();
+    await Promise.race([held, new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true }))]);
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (input instanceof Request && input.method === "POST") {
+      const body = await input.clone().text();
+      if (body.includes(`"name":"whoami"`) || body.includes(`"name":"board_list"`)) posts++;
+      if (body.includes(`"name":"board_list"`)) await stall({ signal: input.signal });
+    }
+    if (init?.method === "GET" && String(input).includes("/attachments/")) await stall(init, getReached.resolve);
+    return fetch0(input, init);
+  }) as typeof fetch;
+  try {
+    await p.call("bind", { name: "proxy-abort", create: true }, "pi-root");
+    // Already aborted: nothing goes out.
+    const before = posts;
+    await expect(p.call("whoami", {}, "pi-root", AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+    expect(posts).toBe(before);
+
+    const ac = new AbortController();
+    const aborted = p.call("board_list", {}, "pi-root", ac.signal);
+    await reached;
+    ac.abort();
+    await expect(aborted).rejects.toBeInstanceOf(CallAborted);
+    // The shared connection stays: a call after the abort runs on it, unlisted again.
+    expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-abort" });
+    expect(lists).toBe(1);
+    expect(p.reports).toEqual([]);
+    // afterCall still ran for the aborted call, as an error.
+    expect(hooks.calls.filter(c => c.tool === "board_list").map(c => [c.phase, c.result?.status])).toEqual([["before", undefined], ["after", "error"]]);
+
+    // An aborted download saves nothing.
+    writeFileSync(join(dir, "small.txt"), "small file");
+    const sent = JSON.parse(textOf(await p.call("dm_send", { to: "proxy-abort", body: "file", attachments: [join(dir, "small.txt")] }, "pi-root"))) as { attachments: { id: number }[] };
+    const download = new AbortController();
+    const got = p.call("attachment_get", { id: sent.attachments[0]!.id, dir }, "pi-root", download.signal);
+    await getReached.promise;
+    download.abort();
+    await expect(got).rejects.toBeInstanceOf(CallAborted);
+    expect(readdirSync(dir)).toEqual(["small.txt"]);
+
+    // /new's teardown: retire() settles at once after an abort.
+    const last = new AbortController();
+    const pending = p.call("board_list", {}, "pi-root", last.signal);
+    last.abort();
+    await expect(pending).rejects.toBeInstanceOf(CallAborted);
+    await p.retire();
+  } finally {
+    release();
+    globalThis.fetch = fetch0;
+    NativeWire.prototype.listTools = list;
+  }
 });
 
 test("attachment_get cancels an oversized download before saving it", async () => {

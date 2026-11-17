@@ -403,9 +403,10 @@ export class RootDelivery {
   // once. The server refuses a child's bind and unbind. The root's notices
   // stay for the root's next result: a child's agent isn't the one to act on them.
   // `passed` runs once the child is this root's to end (the plugin notes it, #555).
-  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, o: { child?: string; passed?: () => void } = {}): Promise<CallToolResult> {
+  // `signal`: the harness's abort of this call (ToolProxy.call).
+  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, o: { child?: string; passed?: () => void; signal?: AbortSignal } = {}): Promise<CallToolResult> {
     if (!this.proxy) return failure(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
-    if (o.child !== undefined) return this.childCall(o.child, tool, args, before, o.passed);
+    if (o.child !== undefined) return this.childCall(o.child, tool, args, before, o.passed, o.signal);
     // The process holding delivery owns this session's binding: a tools-only
     // one rebinding it would fight the holder. Checked again after `before`,
     // whose retry of a lock error (the plugin's unpause) can find it held.
@@ -418,13 +419,13 @@ export class RootDelivery {
     // Tools-only: a configured name not yet bound goes first (#443).
     if (!this.o.push) await this.bindConfigured();
     this.used = true;
-    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID);
+    const result = await this.client.call(this.proxy, tool, args, this.o.sessionID, o.signal);
     const shown = [...SLOTS.map(slot => this.notices.get(slot)), after].filter((n): n is string => !!n);
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map(n => ({ type: "text" as const, text: `grayboard: ${n}` })), ...result.content] } : result;
   }
 
-  private async childCall(child: string, tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, passed?: () => void): Promise<CallToolResult> {
+  private async childCall(child: string, tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, passed?: () => void, signal?: AbortSignal): Promise<CallToolResult> {
     if (this.closed) return failure(`this ${this.client.options.harness} session is closing`);
     const after = before ? await before() : undefined;
     const proxy = this.proxy!;
@@ -439,7 +440,7 @@ export class RootDelivery {
       try { await register(this.client.temporary, { root: this.o.sessionID, via: [], child }); }
       catch (error) { return failure(`couldn't register this subagent's grayboard session ${child} under its root, so the call didn't run: ${message(error)}; ${this.client.options.retryHint}`); }
     }
-    const result = await this.client.call(proxy, tool, args, child);
+    const result = await this.client.call(proxy, tool, args, child, signal);
     return after ? { ...result, content: [{ type: "text" as const, text: `grayboard: ${after}` }, ...result.content] } : result;
   }
   // A child's agent finished (Claude Code's SubagentStop): its hosted session

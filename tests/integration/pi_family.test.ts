@@ -26,7 +26,7 @@ import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
-import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
+import { CallAborted, ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath, FileStorage, sessionPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
@@ -93,14 +93,14 @@ type Instance = {
   notices: { message: string; level: Level }[];
   records: DeliveryEntry[];
   tools(): NativeTool[];
-  call(tool: string, args?: Record<string, unknown>): Promise<CallToolResult>;
+  call(tool: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult>;
 };
 // `marker`, a function, is read live (omp's entry: the root as it is now).
 // `facts`: the harness's current model and effort (#364), read live.
 // `interactive`: the harness's mode outlives a browser round trip (tui, rpc).
 function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?: () => void, facts?: (sessionID: string) => SessionFacts | undefined, interactive = false): Instance {
   let tools: NativeTool[] = [];
-  let run: ((tool: string, args: Record<string, unknown>) => Promise<CallToolResult>) | undefined;
+  let run: ((tool: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<CallToolResult>) | undefined;
   const self: Instance = {
     deliveries: [], notices: [], records: [],
     ext: createGrayboard({
@@ -115,7 +115,7 @@ function instance(marker: Marker | (() => Marker) = { child: false }, onDeliver?
       ...(facts ? { facts } : {}),
     }),
     tools: () => tools,
-    call: (tool, args = {}) => run!(tool, args),
+    call: (tool, args = {}, signal) => run!(tool, args, signal),
   };
   instances.push(self);
   return self;
@@ -351,6 +351,22 @@ test("reload detaches, keeping the lease the reloaded instance resumes; quit rel
   await resumed.ext.start({ id: "reload-1", reason: "resume" });
   await active(resumed, "reload-1", "reloader");
   expect(row("reload-1")!.ownership_id).not.toBe(leased.ownership_id);
+});
+
+// #438 item 26: the harness's abort reaches the hosted call, for a root and
+// for a child (whose path wraps it in the unattributed retry); an aborted
+// call throws instead of returning an error result for nobody to read.
+test("an aborted tool call throws CallAborted, for a root and a child", async () => {
+  const lead = instance();
+  await lead.ext.start({ id: "abort-root", reason: "startup" });
+  expect((await lead.call("bind", { name: "abort-lead", create: true })).isError).toBeUndefined();
+  await expect(lead.call("whoami", {}, AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+  const child = instance({ child: true, root: "abort-root" });
+  await child.ext.start({ id: "abort-child", reason: "startup" });
+  await expect(child.call("whoami", {}, AbortSignal.abort())).rejects.toBeInstanceOf(CallAborted);
+  // Neither abort broke anything: both still call.
+  expect(payload(await lead.call("whoami"))).toMatchObject({ primary: `${EMAIL}/abort-lead` });
+  expect((await child.call("whoami")).isError).toBeFalsy();
 });
 
 test("a marked child registers under its root before its first call, writes as the root's name, and ends on shutdown", async () => {

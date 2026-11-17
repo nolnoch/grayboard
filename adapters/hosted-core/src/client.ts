@@ -143,10 +143,14 @@ export class HostedClient {
   // refusal, the transport, a JSON-RPC error) comes back as an error result
   // with the retry hint and failureText's detail. `proxy` is any call (pi's
   // child wraps its unattributed retry, so a converted failure never
-  // triggers that retry's whoami probe).
-  async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    try { return await proxy.call(tool, args, sessionID); }
-    catch (error) { return failure(failureText(error, this.options.retryHint)); }
+  // triggers that retry's whoami probe). A call `signal` aborted throws
+  // (CallAborted): the harness cancelled it, so there's no one to read a result.
+  async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    try { return await proxy.call(tool, args, sessionID, signal); }
+    catch (error) {
+      if (signal?.aborted) throw error;
+      return failure(failureText(error, this.options.retryHint));
+    }
   }
 
   // One Login.watch per session: a change of the grant store's epoch (a

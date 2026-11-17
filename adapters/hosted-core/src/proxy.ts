@@ -89,6 +89,11 @@ class Refused extends Error {
 // The wire classified the failure as the transport's (a closed connection, a
 // network error, a gateway 502-504), not a request that ran out of time on a
 // working connection.
+// A tool call its caller aborted (ToolProxy.call's `signal`).
+export class CallAborted extends Error {
+  constructor(options?: ErrorOptions) { super("aborted", options); this.name = "CallAborted"; }
+}
+
 function broken(error: unknown): boolean {
   if (!(error instanceof ServerUnreachable)) return false;
   for (let e: unknown = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
@@ -140,8 +145,10 @@ export class ToolProxy {
   // back verbatim (content, structuredContent, isError, _meta); a transport
   // failure throws the wire's classified error. A call that needs a new login
   // (signed out, expired, insufficient scope) returns one error naming it.
-  call(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    return this.track(this.invoke(name, args, sessionID));
+  // `signal` aborts the wait (it throws CallAborted), not the call: one the
+  // server already took may still land. It never closes the shared connection.
+  call(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    return this.track(this.invoke(name, args, sessionID, signal));
   }
 
   // The server's instructions for this session (its native initialize
@@ -184,7 +191,8 @@ export class ToolProxy {
     return work;
   }
 
-  private async invoke(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  private async invoke(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    if (signal?.aborted) throw new CallAborted();
     const signedOut = await this.signedOut();
     if (signedOut) return failure(signedOut.message);
     try { await this.options.hooks?.beforeCall({ sessionID, tool: name }); }
@@ -195,11 +203,17 @@ export class ToolProxy {
     }
     let outcome: CallOutcome = { status: "error" }, lost = false;
     try {
-      const result = await this.dispatch(name, args, sessionID);
+      if (signal?.aborted) throw new CallAborted();
+      const result = await this.dispatch(name, args, sessionID, signal);
+      // An abort the dispatch turned into an error result (an attachment's) is still an abort.
+      if (signal?.aborted) throw new CallAborted();
       lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError) outcome = { status: "completed", output: outputOf(result) };
       return result;
     } catch (error) {
+      // Before any classification: the SDK reports a caller's abort as a
+      // request timeout, which would otherwise read as an outage.
+      if (signal?.aborted) throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       const expired = this.loginNeeded(error);
       if (expired) return failure(expired.message);
       throw error;
@@ -223,10 +237,10 @@ export class ToolProxy {
     } finally { await wire.close(); }
   }
 
-  private async dispatch(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    if (name === ATTACHMENT_GET_TOOL.name) return this.attachmentGet(args, sessionID);
-    if ((name === "dm_send" || name === "board_post") && args.attachments !== undefined) return this.withUploads(name, args, sessionID);
-    return this.forward(name, args, sessionID);
+  private async dispatch(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    if (name === ATTACHMENT_GET_TOOL.name) return this.attachmentGet(args, sessionID, signal);
+    if ((name === "dm_send" || name === "board_post") && args.attachments !== undefined) return this.withUploads(name, args, sessionID, signal);
+    return this.forward(name, args, sessionID, signal);
   }
 
   // Only a broken transport closes the shared connection at once, and only
@@ -234,14 +248,15 @@ export class ToolProxy {
   // timeout, a 429, a 401 or 403 leaves it to the other calls in flight on it,
   // which closing it would abort (a committed dm_send would then read as
   // unreachable). A connection connect() replaced closes after its last call.
-  private async forward(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  // The connect is shared, so a call's abort ends only its own request.
+  private async forward(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     const native = this.native ?? this.open();
     native.users++;
     try {
       const wire = await native.ready;
-      try { return await wire.callTool(name, args, sessionID); }
+      try { return await wire.callTool(name, args, sessionID, signal); }
       catch (error) {
-        if (broken(error)) this.drop(native);
+        if (!signal?.aborted && broken(error)) this.drop(native);
         throw error;
       }
     } finally {
@@ -259,14 +274,14 @@ export class ToolProxy {
 
   // Reads and checks the files an agent named (all before any is sent), then
   // uploads them for this session and calls the tool with their ids.
-  private async withUploads(name: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  private async withUploads(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     const { attachments, ...rest } = args;
     try {
       return await this.attachments.send(attachments, sessionID, async ids => {
-        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID);
+        const result = await this.forward(name, ids.length ? { ...rest, attachment_ids: ids } : rest, sessionID, signal);
         if (result.isError) throw new Refused(result);
         return result;
-      });
+      }, signal);
     } catch (error) {
       if (error instanceof Refused) return error.result;
       if (error instanceof SendLanded) return text({ sent: true, attachment_ids: error.attachments, note: error.message });
@@ -277,9 +292,9 @@ export class ToolProxy {
 
   // attachment_get(id, dir?): saves under the same roots and default
   // directory as server mode, after checking the server's sha256.
-  private async attachmentGet(args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
+  private async attachmentGet(args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     try {
-      return text(await this.attachments.get(args, sessionID));
+      return text(await this.attachments.get(args, sessionID, signal));
     } catch (error) {
       if (this.transportFailure(error)) throw error;
       return failure((error as Error).message);

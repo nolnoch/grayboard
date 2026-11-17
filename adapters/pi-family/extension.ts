@@ -53,7 +53,8 @@ export interface Harness {
   readonly agentDir: string; // state lives under <agentDir>/grayboard/
   marker(): Marker;
   // (Re)registers the tool list; `call` runs one under the current session.
-  register(tools: NativeTool[], call: (tool: string, args: Record<string, unknown>) => Promise<CallToolResult>): void;
+  // `signal`: the harness's abort of one call; an aborted call throws.
+  register(tools: NativeTool[], call: (tool: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<CallToolResult>): void;
   // A rendered `<channel>`; `wake` starts a turn (idle) or steers in (mid-run).
   deliver(content: string, wake: boolean): void;
   notify(message: string, level: Level): void;
@@ -285,31 +286,31 @@ export function createGrayboard(h: Harness): Grayboard {
 
   // ---- tools ----
 
-  const call = (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
-    const running = dispatch(tool, args);
+  const call = (tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> => {
+    const running = dispatch(tool, args, signal);
     inflight.add(running);
     const settled = () => { inflight.delete(running); };
     running.then(settled, settled);
     return running;
   };
-  const dispatch = async (tool: string, args: Record<string, unknown>): Promise<CallToolResult> => {
+  const dispatch = async (tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
-    if (root) return root.call(tool, args, offer);
+    if (root) return root.call(tool, args, offer, { signal });
     if (!proxy || !session) return failure(`the ${h.name} session hasn't started yet`);
     used = true;
     const p = proxy, id = session.id;
     const note = await offer();
-    const result = await client!.call({ call: (name, a, sid) => attributed(p, name, a, sid) }, tool, args, id);
+    const result = await client!.call({ call: (name, a, sid, s) => attributed(p, name, a, sid, s) }, tool, args, id, signal);
     return note ? { ...result, content: [{ type: "text", text: `grayboard: ${note}` }, ...result.content] } : result;
   };
   // The server refuses an unattributed child's call before running it, so
   // one retry after registering again never repeats a write. The client's
   // error wrapper sits outside it: a converted failure never probes.
-  const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string): Promise<CallToolResult> => {
-    let result = await p.call(tool, args, id);
-    if (role.kind === "child" && registered && result.isError && await unattributed(p, id)) {
+  const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string, signal?: AbortSignal): Promise<CallToolResult> => {
+    let result = await p.call(tool, args, id, signal);
+    if (role.kind === "child" && registered && result.isError && await unattributed(p, id, signal)) {
       registered = false; registration = undefined;
-      result = await p.call(tool, args, id);
+      result = await p.call(tool, args, id, signal);
     }
     return result;
   };
@@ -323,8 +324,8 @@ export function createGrayboard(h: Harness): Grayboard {
   // retried by the next. Concurrent calls share one register. The server ends
   // the registration with the root's ownership (a lapsed lease the root then
   // rebinds), so a refused call checks whether it still holds.
-  const unattributed = async (p: ToolProxy, id: string) => {
-    const who = outputOf(await p.call("whoami", {}, id));
+  const unattributed = async (p: ToolProxy, id: string, signal?: AbortSignal) => {
+    const who = outputOf(await p.call("whoami", {}, id, signal));
     return !!who && typeof who === "object" && "unbound" in who && who.unbound === true && !("child" in who && who.child === true);
   };
   // A child's root and the subagents between, as the harness says at each
