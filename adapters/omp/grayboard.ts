@@ -680,12 +680,13 @@ export default function grayboard(pi: ExtensionAPI) {
         }
         const rows = stdout.split("\n").map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
           .filter((m): m is RegExpMatchArray => !!m).map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), line: m[3]! }));
-        // ps joins argv with spaces; Linux keeps it NUL-separated.
+        // ps joins argv with spaces; Linux keeps it NUL-separated, unless the
+        // process rewrote its title as one string (npm: "npm exec grayboard mcp").
         const argvOf = (pid: number, line: string): string[] => {
           try {
             const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-            if (argv.at(-1) === "") argv.pop();
-            if (argv.length) return argv;
+            while (argv.at(-1) === "") argv.pop();
+            if (argv.length > 1 || (argv.length === 1 && !/\s/.test(argv[0]!))) return argv;
           } catch { /* not Linux, or gone */ }
           return line.split(/\s+/);
         };
