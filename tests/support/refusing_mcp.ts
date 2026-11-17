@@ -3,18 +3,32 @@
 // `<bun> refusing_mcp.ts <real command…>`: `mcp` answers every request with
 // a JSON-RPC error and stays alive (#1142).
 //
-// `<bun> refusing_mcp.ts --session <counter file> <n> <real command…>`: runs
-// the real command and passes every line through both ways, except that the
-// n-th `grayboard/session` request across every process sharing the counter
-// file (restarts included) gets an error reply instead (#1145): n = 1 fails
-// the start handshake, n = 2 the first switch's.
+// `<bun> refusing_mcp.ts --session <counter file> <calls> <real
+// command…>`: runs the real command and passes every line through both
+// ways, except that each `grayboard/session` request whose number, counted
+// across every process sharing the counter file (restarts included), is in
+// <calls> (`2`, `2,4,6`, `2-5`) gets an error reply instead (#1145): 1 fails
+// the start handshake, 2 the first switch's (#1148).
 //
 // Either way, `tools` runs the real command it wraps, so an adapter loads its
 // tool list.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
-const proxy = argv[0] === "--session" ? { counter: argv[1]!, n: Number(argv[2]) } : undefined;
+// `2,4` or `2-5`: the set of call numbers.
+const calls = (spec: string): Set<number> => {
+  const set = new Set(spec.split(",").flatMap((part) => {
+    const [a, b = a] = part.split("-").map(Number);
+    return b! >= a! ? Array.from({ length: b! - a! + 1 }, (_, i) => a! + i) : [NaN];
+  }));
+  // A typo must not quietly refuse nothing.
+  if (!set.size || ![...set].every((n) => Number.isInteger(n) && n > 0)) {
+    console.error(`refusing_mcp: bad --session calls "${spec}"`);
+    process.exit(2);
+  }
+  return set;
+};
+const proxy = argv[0] === "--session" ? { counter: argv[1]!, refused: calls(argv[2]!) } : undefined;
 const [cmd, ...args] = proxy ? argv.slice(3) : argv;
 if (args.includes("tools")) {
   const r = Bun.spawnSync([cmd!, ...args], { stdout: "inherit", stderr: "inherit" });
@@ -58,7 +72,7 @@ if (!proxy) {
     if (msg.method === "grayboard/session") {
       const seen = (existsSync(proxy.counter) ? Number(readFileSync(proxy.counter, "utf8")) : 0) + 1;
       writeFileSync(proxy.counter, String(seen));
-      if (seen === proxy.n) { process.stdout.write(refusal(msg.id)); return; }
+      if (proxy.refused.has(seen)) { process.stdout.write(refusal(msg.id)); return; }
     }
     real.stdin.write(line);
     real.stdin.flush();

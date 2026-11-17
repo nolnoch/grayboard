@@ -69,14 +69,18 @@ export async function runTail(boardInput: string, backlog: number): Promise<void
   };
 
   const stopListening = listenForWakeup(handle, drain);
-  console.error(`-- tailing #${board} (ctrl-c to stop)`);
-  drain(); // anything posted between the backlog query and the listener
-
+  let stopping = false;
   const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
     stopListening();
     await end();
     process.exit(0);
   };
+  // Before the ready line: a signal that arrives with no handler kills the
+  // process with its session left for the next opener to end (#1155).
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+  console.error(`-- tailing #${board} (ctrl-c to stop)`);
+  drain(); // anything posted between the backlog query and the listener
 }

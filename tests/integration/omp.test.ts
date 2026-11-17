@@ -5,7 +5,7 @@ import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalHandshakeFailScenario, ompLocalInitFailScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalTaskScenario } from "../support/omp.ts";
+import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpClientGrayboardScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalHandshakeFailScenario, ompLocalInitFailScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalSwitchExhaustScenario, ompLocalTaskScenario } from "../support/omp.ts";
 import { installLocal, startLocalOmp } from "../support/omp.ts";
 import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
 import { closeSessions } from "../support/mcp.ts";
@@ -51,6 +51,7 @@ test("omp local: a grayboard process that answers initialize with an error is re
 for (const phase of ["start", "switch"] as const) {
   test(`omp local: a grayboard process whose ${phase} handshake is answered with an error is restarted at once, and the replacement serves the selected session; nothing fails the turn or the switch (#1142, #1145)`, () => ompLocalHandshakeFailScenario(dir, phase), 90_000);
 }
+test("omp local: every new_session switch handshake refused counts toward the restart budget, so the fourth gives up and says so (#1148)", () => ompLocalSwitchExhaustScenario(dir), 90_000);
 test("omp local: a grayboard that stops reading while it holds the name is killed on EPIPE before the replacement starts, which takes the name back; no stale process remains (#580)", () => ompLocalStopsReadingScenario(dir), 120_000);
 test("omp local: one that also ignores SIGTERM is SIGKILLed, logged, and gone before the replacement starts (#604)", () => ompLocalStopsReadingScenario(dir, { ignoreSigterm: true }), 120_000);
 for (const kind of ["keyed", "human", "runner"] as const) {
@@ -62,3 +63,4 @@ for (const kind of ["keyed", "human", "runner"] as const) {
 }
 
 test("omp local, ACP: of two top-level sessions in one omp process, the first runs grayboard and the second is refused; while both live, no subagent of either gets grayboard tools, so none acts as the first session's names (#523, #470)", () => ompLocalAcpScenario(dir), 120_000);
+test("omp local, ACP: a grayboard among the client's declared mcpServers is reported once and not refused: by its tools under another name, by its process when named grayboard, whose tools omp drops; the adapter's own tools are never reported (#1140)", () => ompLocalAcpClientGrayboardScenario(dir), 120_000);
