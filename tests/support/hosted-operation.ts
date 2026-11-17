@@ -30,5 +30,5 @@ try {
 } catch (error) {
   console.log(JSON.stringify({ ok: false, code: (error as { code?: string }).code }));
 } finally {
-  delivery.close(); hosted.close(); application.stopExpiry(); db.close();
+  delivery.close(); await hosted.close(); application.stopExpiry(); db.close();
 }

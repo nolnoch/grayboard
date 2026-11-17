@@ -117,9 +117,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
-      return hosted.owning(p, context, (row, _defer, tx) => {
+      return hosted.owning(p, context, async (row, _defer, tx) => {
         if (!application.hostedHolds(tx, row.session_id).length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
-        hosted.seeLost(tx, p, row);
+        await hosted.seeLost(tx, p, row);
         previous = bySession.get(row.session_id);
         if (previous && matches(previous, row)) { previous.context = openOptions.context ?? true; return previous; }
         // A lease this open replaces (another grant's) frees its slot here, not after the check; a

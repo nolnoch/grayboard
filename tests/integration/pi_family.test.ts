@@ -20,13 +20,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
-import { createGrayboard, factReader, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { createGrayboard, factReader, INSTRUCTIONS_BACKOFF_MS, INSTRUCTIONS_WAIT_MS, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import { piMarker } from "../../adapters/pi-family/entry-pi.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
+import { NotStarted, RootDelivery } from "../../adapters/hosted-core/src/root.ts";
+import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import { ToolProxy, type NativeTool } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath, FileStorage, sessionPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -624,6 +626,76 @@ test("a resume whose rebind is refused says so at once and in the next tool resu
   await again.ext.command("resume");
   await active(again, "rebind-s", "rebinder");
   expect(await again.ext.instructions()).toStartWith(`You are "${EMAIL}/rebinder" on grayboard.`);
+});
+
+// #438-25: a stalled or failing server neither holds every prompt nor fails silently.
+test("a model call waits at most INSTRUCTIONS_WAIT_MS for the instructions; a timeout or failure is said once, backs off, and a success clears it", async () => {
+  const r = await root("slow-s", "slow");
+  const real = RootDelivery.prototype.instructions;
+  let mode: "stall" | "late" | "fail" | "signed-out" | "starting" | "real" = "stall";
+  let land: (() => void) | undefined;
+  const fetch = spyOn(RootDelivery.prototype, "instructions").mockImplementation(function (this: RootDelivery) {
+    switch (mode) {
+      case "stall": return new Promise<never>(() => {});
+      case "late": return new Promise<string | undefined>(resolve => { land = () => resolve("late text"); });
+      case "fail": return Promise.reject(new Error("boom"));
+      case "signed-out": return Promise.reject(new Error("wrapped", { cause: new AccessExpired("pi", LOGIN_ACTION) }));
+      case "starting": return Promise.reject(new NotStarted());
+      case "real": return real.call(this);
+    }
+  });
+  const wall = Date.now;
+  let skew = 0;
+  const clock = spyOn(Date, "now").mockImplementation(() => wall() + skew);
+  const warning = (why: string) => ({ level: "warning" as Level, message: `grayboard: fetching the instructions ${why}, so they aren't refreshed; trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s or once a fetch answers` });
+  try {
+    r.notices.length = 0;
+    const began = performance.now();
+    expect(await r.ext.instructions()).toBeUndefined();
+    const waited = performance.now() - began;
+    expect(waited).toBeGreaterThanOrEqual(INSTRUCTIONS_WAIT_MS - 50);
+    expect(waited).toBeLessThan(INSTRUCTIONS_WAIT_MS + 1_500);
+    const slow = warning(`took longer than ${INSTRUCTIONS_WAIT_MS} ms`);
+    expect(r.notices).toEqual([slow]);
+
+    // Backing off: no fetch at all, so no wait.
+    expect(await r.ext.instructions()).toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    // Past the backoff a failure fetches again, unsaid while the streak lasts.
+    skew += INSTRUCTIONS_BACKOFF_MS + 1;
+    mode = "fail";
+    expect(await r.ext.instructions()).toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(r.notices).toEqual([slow]);
+
+    // A success ends the streak; the next failure is said again, with its cause.
+    skew += INSTRUCTIONS_BACKOFF_MS + 1;
+    mode = "real";
+    expect(await r.ext.instructions()).toStartWith(`You are "${EMAIL}/slow" on grayboard.`);
+    mode = "fail";
+    expect(await r.ext.instructions()).toBeUndefined();
+    expect(r.notices).toEqual([slow, warning("failed: boom")]);
+
+    // A timed-out fetch that then lands ends its backoff: the next call fetches at once.
+    skew += INSTRUCTIONS_BACKOFF_MS + 1;
+    mode = "late";
+    expect(await r.ext.instructions()).toBeUndefined();
+    land!();
+    mode = "real";
+    await until(async () => (await r.ext.instructions()) !== undefined);
+    expect(fetch).toHaveBeenCalledTimes(6);
+
+    // A sign-out and a root still starting are neither said nor backed off.
+    r.notices.length = 0;
+    for (const m of ["signed-out", "starting"] as const) {
+      mode = m;
+      expect(await r.ext.instructions()).toBeUndefined();
+    }
+    mode = "real";
+    expect(await r.ext.instructions()).toStartWith(`You are "${EMAIL}/slow" on grayboard.`);
+    expect(r.notices).toEqual([]);
+  } finally { fetch.mockRestore(); clock.mockRestore(); }
 });
 
 // #1020: a team the user left reads as missing (not_found), which a resume skips like a revoked name.

@@ -55,7 +55,7 @@ export interface HostedStore {
   idle(r: Read, cutoff: number): HostedSession[];
   disabled(r: Read): HostedSession[];
   // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
-  start(tx: Tx, session: string, user: number, client: string, now: number, suggested?: string | null): number;
+  start(tx: Tx, session: string, user: number, client: string, now: number, suggested?: string | null): Promise<number>;
   end(tx: Tx, session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
   // A child's release, or a root's end (each of its children), ends the child's ID in the same transaction.
   childEnd(tx: Tx, session: string, now: number, reason: ChildEnd): void;
@@ -66,23 +66,23 @@ export interface HostedStore {
   // agent's; `reportLost` returns the Controller's, marking them reported; `seeLost` takes the reported ones (its
   // delivery_open: the Controller applied them before opening); `forgetLost` drops an alias the root bound again.
   // A hold both readers took is deleted.
-  lose(tx: Tx, session: string, lost: HostedLost, now: number): void;
+  lose(tx: Tx, session: string, lost: HostedLost, now: number): Promise<void>;
   lost(r: Read, session: string, reader: LostReader): HostedLost[];
-  tellLost(tx: Tx, session: string, now: number): HostedLost[];
-  reportLost(tx: Tx, session: string, now: number): HostedLost[];
-  seeLost(tx: Tx, session: string, now: number): HostedLost[];
-  forgetLost(tx: Tx, session: string, alias: string): void;
+  tellLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
+  reportLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
+  seeLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
+  forgetLost(tx: Tx, session: string, alias: string): Promise<void>;
   // The server's last recorded liveness (epoch ms), absent before the first
   // heartbeat on this schema. A restart credits leases with the downtime (#423).
   aliveAt(r: Read): number | undefined;
-  heartbeat(tx: Tx, now: number): void;
+  heartbeat(tx: Tx, now: number): Promise<void>;
   // The hosted facts on a session's `ids` row (#807 P1c-15a): a child's root (#523), an ended ID live again (#475 item 7a),
   // a tools-only root's writes_as (A4) and its ownership's launcher flag (#473, #520). `declareLauncher`: whether it turned
   // the flag on.
-  setRoot(tx: Tx, id: string, root: string | null): void;
-  reopenId(tx: Tx, id: string): void;
-  restateWritesAs(tx: Tx, id: string, writesAs: string): void;
-  declareLauncher(tx: Tx, id: string): boolean;
+  setRoot(tx: Tx, id: string, root: string | null): Promise<void>;
+  reopenId(tx: Tx, id: string): Promise<void>;
+  restateWritesAs(tx: Tx, id: string, writesAs: string): Promise<void>;
+  declareLauncher(tx: Tx, id: string): Promise<boolean>;
   launcher(r: Read, id: string): boolean;
   // Every session's holds, oldest first: the hosted sweep's and reconcile's.
   holds(r: Read): { id: string; address: string }[];
