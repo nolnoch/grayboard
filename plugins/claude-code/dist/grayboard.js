@@ -36541,9 +36541,15 @@ import { createHash as createHash6 } from "crypto";
 // adapters/hosted-core/src/sessions.ts
 class AncestryError extends Error {
 }
+var ENDED_LIMIT = 4096;
+
 class SessionRoutes {
+  limit;
   paths = new Map;
   ended = new Set;
+  constructor(limit = ENDED_LIMIT) {
+    this.limit = limit;
+  }
   remember(path) {
     if (this.ended.has(path.sessionID) || this.ended.has(path.root))
       throw new AncestryError("Grayboard session ended during ancestry lookup");
@@ -36563,6 +36569,8 @@ class SessionRoutes {
     if (this.ended.has(sessionID))
       return;
     this.ended.add(sessionID);
+    if (this.ended.size > this.limit)
+      this.ended.delete(this.ended.values().next().value);
     const path = this.paths.get(sessionID);
     this.paths.delete(sessionID);
     return path ? { ...path, via: [...path.via] } : undefined;
