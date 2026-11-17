@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { dropCalled, dropSignIn, hasCalled, LEFTOVER_TTL_MS, markCalled, ownDir, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
 import { SIGN_IN_FLOW_MS } from "./signin.ts";
 import { procStart } from "./proc.ts";
+import { pauseEnv, releasePause } from "../../tests/support/local_bus.ts";
+import { until } from "../../tests/support/until.ts";
 
 let base: string;
 const pid = process.pid;
@@ -241,6 +243,32 @@ describe("facts (#545)", () => {
     expect(facts()).toEqual({ model: "claude-opus-5-5" });
     expect(said).toEqual([]);
   });
+
+  // #561 item 7: a root call's hook still running when a confirmed /model switch
+  // lands would write the old model's effort after the switch dropped it.
+  for (const [what, effort] of [["a level", { level: "max" }], ["none", undefined]] as const) {
+    test(`a root call's effort (${what}) that a model switch overtook drops itself`, async () => {
+      hook("session-start", { source: "startup", model: "claude-opus-5-5" }, true);
+      hook("pre-tool-use", { tool_use_id: id(1), effort: { level: "low" } }, true);
+      const point = "hook-root-effort";
+      const input = JSON.stringify({ tool_use_id: id(2), ...(effort ? { effort } : {}) });
+      const child = Bun.spawn(["bun", "-e", `import { runHook } from ${JSON.stringify(join(import.meta.dir, "claude_agents.ts"))}; runHook("pre-tool-use", process.argv[1], { base: process.env.GB_BASE, env: process.env, hosted: true });`, input], {
+        env: { ...process.env, ...env, ...pauseEnv(base, point), GB_BASE: base }, stderr: "pipe", stdout: "ignore",
+      });
+      let err = "";
+      void (async () => { for await (const chunk of child.stderr) err += new TextDecoder().decode(chunk); })();
+      await until(() => err.includes(`test pause hit: ${point}`), 10_000, "the root call's hook reaching its effort write");
+      expect(facts()).toEqual({ model: "claude-opus-5-5", effort: "low" });
+      hook("model-switch", { from_model: "claude-opus-5-5", to_model: "claude-haiku-4-5" }, true);
+      releasePause(base, point);
+      expect(await child.exited).toBe(0);
+      // Unknown, not the old model's effort: the next root call names the new model's.
+      expect(facts()).toEqual({ model: "claude-haiku-4-5" });
+      hook("pre-tool-use", { tool_use_id: id(3), effort: { level: "high" } }, true);
+      expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: "high" });
+      expect(said).toEqual([]);
+    });
+  }
 
   test("a subagent's effort and malformed values write nothing", () => {
     hook("session-start", { model: "claude-opus-5-5" }, true);

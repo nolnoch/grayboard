@@ -38003,6 +38003,22 @@ import { join as join5, resolve as resolve3 } from "path";
 // src/shared/protocol.ts
 var SESSION_FACT_MAX = 64;
 
+// src/shared/testpause.ts
+import { existsSync } from "fs";
+import { dirname as dirname3 } from "path";
+async function testPauseAsync(point, env = process.env) {
+  const file = env.BUS_TEST_PAUSE_FILE;
+  if (env.BUS_TEST_PAUSE !== point || !file)
+    return;
+  console.error(`[grayboard] test pause hit: ${point}`);
+  while (!existsSync(file)) {
+    if (!existsSync(dirname3(file)))
+      throw new Error(`test pause abandoned: ${point}`);
+    await Bun.sleep(10);
+  }
+  console.error(`[grayboard] test pause released: ${point}`);
+}
+
 // src/shared/claude_agents.ts
 var SIGN_IN = "signin";
 var ROOT = "-";
@@ -38197,22 +38213,6 @@ function takeEnded(base, claudePid) {
     }
   }
   return out;
-}
-
-// src/shared/testpause.ts
-import { existsSync } from "fs";
-import { dirname as dirname3 } from "path";
-async function testPauseAsync(point, env = process.env) {
-  const file = env.BUS_TEST_PAUSE_FILE;
-  if (env.BUS_TEST_PAUSE !== point || !file)
-    return;
-  console.error(`[grayboard] test pause hit: ${point}`);
-  while (!existsSync(file)) {
-    if (!existsSync(dirname3(file)))
-      throw new Error(`test pause abandoned: ${point}`);
-    await Bun.sleep(10);
-  }
-  console.error(`[grayboard] test pause released: ${point}`);
 }
 
 // src/shared/identity.ts

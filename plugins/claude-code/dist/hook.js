@@ -130,6 +130,24 @@ function signInUrl(text) {
   return { url };
 }
 
+// src/shared/testpause.ts
+import { existsSync } from "fs";
+import { dirname } from "path";
+function testPause(point, env = process.env) {
+  const file = env.BUS_TEST_PAUSE_FILE;
+  if (env.BUS_TEST_PAUSE !== point || !file)
+    return;
+  console.error(`[grayboard] test pause hit: ${point}`);
+  while (!existsSync(file)) {
+    if (!existsSync(dirname(file))) {
+      console.error(`[grayboard] test pause abandoned: ${point}`);
+      process.exit(1);
+    }
+    Bun.sleepSync(10);
+  }
+  console.error(`[grayboard] test pause released: ${point}`);
+}
+
 // src/shared/claude_agents.ts
 var SIGN_IN = "signin";
 var ROOT = "-";
@@ -152,6 +170,10 @@ var dropFact = (dir, fact) => rmSync(join(dir, fact), { force: true });
 function noFact(dir, fact) {
   mkdirSync(dir, { recursive: true, mode: 448 });
   put(join(dir, fact), "");
+}
+function stamp(path) {
+  const s = lstatSync(path, { throwIfNoEntry: false });
+  return s ? `${s.ino}:${s.mtimeMs}:${s.ctimeMs}` : "";
 }
 function put(path, text) {
   const tmp = `${path}.tmp.${process.pid}`;
@@ -218,15 +240,19 @@ function runHook(event, stdin, o) {
       const content = agent === undefined ? ROOT : validSourceId(agent) && agent !== ROOT ? agent : undefined;
       if (content === undefined)
         return;
+      const modelAt = o.hosted && content === ROOT ? stamp(join(dir, "model")) : undefined;
       mkdirSync(dir, { recursive: true, mode: 448 });
       put(join(dir, id), JSON.stringify({ agent: content === ROOT ? null : content, ...!o.hosted && validSourceId(input.session_id) ? { session: input.session_id } : {} }));
       pruneRecords(dir, now);
       if (o.hosted && content === ROOT) {
         const level = input.effort?.level;
+        testPause("hook-root-effort", o.env);
         if (level === undefined || level === null)
           noFact(dir, "effort");
         else
           putFact(dir, "effort", level);
+        if (stamp(join(dir, "model")) !== modelAt)
+          dropFact(dir, "effort");
       }
     } else if (event === "post-tool-use") {
       if (!o.hosted)

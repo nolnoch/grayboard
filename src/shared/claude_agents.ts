@@ -20,6 +20,8 @@
 //                         ends that child's session at its SubagentStop (#555)
 //   model, effort         hosted only: the root session's latest model and
 //                         effort (#545), each written whole by one hook event
+//                         (a root call's effort drops itself when a model
+//                         switch overtook it, #561)
 //   signin                hosted only: the live sign-in link (#500), which the
 //                         plugin's server writes and its post-tool-use hook shows
 //
@@ -46,6 +48,7 @@ import { isAlive, procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
 import { validSourceId } from "./session_meta.ts";
 import { SIGN_IN_FLOW_MS, signInUrl } from "./signin.ts";
+import { testPause } from "./testpause.ts";
 
 /**
  * The live sign-in link (#500). The plugin's server writes it while its flow
@@ -98,6 +101,13 @@ const dropFact = (dir: string, fact: Fact) => rmSync(join(dir, fact), { force: t
 function noFact(dir: string, fact: Fact) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   put(join(dir, fact), "");
+}
+
+// A file's identity without opening it (a planted FIFO or link never blocks,
+// #588): put() renames a new inode into place, so every write changes it.
+function stamp(path: string): string {
+  const s = lstatSync(path, { throwIfNoEntry: false });
+  return s ? `${s.ino}:${s.mtimeMs}:${s.ctimeMs}` : "";
 }
 
 // Write through a temporary name, so a reader never sees a partial file.
@@ -199,6 +209,8 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       const agent = input.agent_id;
       const content = agent === undefined ? ROOT : validSourceId(agent) && agent !== ROOT ? agent : undefined;
       if (content === undefined) return;
+      // The model file as this call's effort found it, taken first (see below).
+      const modelAt = o.hosted && content === ROOT ? stamp(join(dir, "model")) : undefined;
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       put(join(dir, id), JSON.stringify({ agent: content === ROOT ? null : content, ...(!o.hosted && validSourceId(input.session_id) ? { session: input.session_id } : {}) }));
       pruneRecords(dir, now);
@@ -208,8 +220,17 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       // A null level is none too, should a build send one (#563 item 4).
       if (o.hosted && content === ROOT) {
         const level = (input.effort as { level?: unknown } | null | undefined)?.level;
+        testPause("hook-root-effort", o.env);
         if (level === undefined || level === null) noFact(dir, "effort");
         else putFact(dir, "effort", level);
+        // A model switch while this hook ran (#561 item 7): PostModelSwitch writes
+        // the model, then drops the effort, so a write of the old model's effort
+        // landing after that drop would stand. The model file changed under us:
+        // drop ours, and the next root call names the new model's. A switch
+        // whose write lands after this check drops ours itself; one that landed
+        // before the first stamp, while Claude Code was spawning this hook, isn't
+        // caught, and the next root call heals it.
+        if (stamp(join(dir, "model")) !== modelAt) dropFact(dir, "effort");
       }
     } else if (event === "post-tool-use") {
       // PostToolUse and PostToolUseFailure (a signed-out call's result is an error).
