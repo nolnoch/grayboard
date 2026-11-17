@@ -35833,13 +35833,13 @@ class HostedAttachments {
     this.options = options;
   }
   async send(paths, sessionID, send, signal) {
-    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(), cwd: this.options.cwd });
+    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(signal), cwd: this.options.cwd });
     return sendWithUploads(files, this.transport(sessionID, signal), send);
   }
   async get(args, sessionID, signal) {
     const id = checkAttachmentId(args.id);
     const target = await saveTarget(args.dir, this.options.roots, serverBusDir(this.options.resource.href), this.options.env, this.options.cwd);
-    return downloadAttachment(id, target, (await this.options.limits()).file, this.transport(sessionID, signal));
+    return downloadAttachment(id, target, (await this.options.limits(signal)).file, this.transport(sessionID, signal));
   }
   transport(sessionID, signal) {
     const base = `${this.options.resource.href.replace(/\/$/, "")}/attachments`;
@@ -36002,6 +36002,23 @@ class CallAborted extends Error {
     this.name = "CallAborted";
   }
 }
+function unlessAborted(work, signal) {
+  if (!signal)
+    return work;
+  if (signal.aborted)
+    return Promise.reject(new CallAborted);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new CallAborted);
+    signal.addEventListener("abort", abort, { once: true });
+    work.then((value) => {
+      signal.removeEventListener("abort", abort);
+      resolve(value);
+    }, (error) => {
+      signal.removeEventListener("abort", abort);
+      reject(error);
+    });
+  });
+}
 function broken(error) {
   if (!(error instanceof ServerUnreachable))
     return false;
@@ -36034,7 +36051,7 @@ class ToolProxy {
       signal: this.closing.signal,
       roots: options.roots ?? attachRoots(),
       env: options.env,
-      limits: () => this.limits(),
+      limits: (signal) => this.limits(signal),
       unreleased: (id, error) => options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error }))
     });
   }
@@ -36106,11 +36123,11 @@ class ToolProxy {
       if (signal?.aborted)
         throw new CallAborted;
       const result = await this.dispatch(name, args, sessionID, signal);
-      if (signal?.aborted)
-        throw new CallAborted;
       lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError)
         outcome = { status: "completed", output: outputOf(result) };
+      if (signal?.aborted)
+        throw new CallAborted;
       return result;
     } catch (error) {
       if (signal?.aborted)
@@ -36154,7 +36171,7 @@ class ToolProxy {
     const native = this.native ?? this.open();
     native.users++;
     try {
-      const wire = await native.ready;
+      const wire = await unlessAborted(native.ready, signal);
       try {
         return await wire.callTool(name, args, sessionID, signal);
       } catch (error) {
@@ -36167,8 +36184,8 @@ class ToolProxy {
         this.shut(native);
     }
   }
-  async limits() {
-    const wire = await (this.native ?? this.open()).ready;
+  async limits(signal) {
+    const wire = await unlessAborted((this.native ?? this.open()).ready, signal);
     return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
   }
   async withUploads(name, args, sessionID, signal) {
@@ -36368,7 +36385,7 @@ class HostedClient {
       return await proxy.call(tool, args, sessionID, signal);
     } catch (error) {
       if (signal?.aborted)
-        throw error;
+        throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       return failure2(failureText(error, this.options.retryHint));
     }
   }
@@ -37910,6 +37927,8 @@ ${record.message}`;
     this.log(text, "warning");
   };
   async call(tool, args, before, o = {}) {
+    if (o.signal?.aborted)
+      throw new CallAborted;
     if (!this.proxy)
       return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
     if (o.child !== undefined)

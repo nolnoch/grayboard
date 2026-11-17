@@ -86,14 +86,28 @@ export const failure = (message: string): CallToolResult => ({ ...text(`error: $
 class Refused extends Error {
   constructor(readonly result: CallToolResult) { super("tool call refused"); }
 }
-// The wire classified the failure as the transport's (a closed connection, a
-// network error, a gateway 502-504), not a request that ran out of time on a
-// working connection.
 // A tool call its caller aborted (ToolProxy.call's `signal`).
 export class CallAborted extends Error {
   constructor(options?: ErrorOptions) { super("aborted", options); this.name = "CallAborted"; }
 }
 
+// `work`, or CallAborted as soon as `signal` aborts. The work itself goes on
+// (a shared connect other calls wait on); its later failure is theirs to see.
+export function unlessAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(new CallAborted());
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new CallAborted());
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(
+      value => { signal.removeEventListener("abort", abort); resolve(value); },
+      (error: unknown) => { signal.removeEventListener("abort", abort); reject(error); });
+  });
+}
+
+// The wire classified the failure as the transport's (a closed connection, a
+// network error, a gateway 502-504), not a request that ran out of time on a
+// working connection.
 function broken(error: unknown): boolean {
   if (!(error instanceof ServerUnreachable)) return false;
   for (let e: unknown = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
@@ -122,7 +136,7 @@ export class ToolProxy {
     this.current = hostTools(snapshotTools());
     this.attachments = new HostedAttachments({
       resource, auth: options.auth, harness: options.harness, loginAction: options.loginAction,
-      signal: this.closing.signal, roots: options.roots ?? attachRoots(), env: options.env, limits: () => this.limits(),
+      signal: this.closing.signal, roots: options.roots ?? attachRoots(), env: options.env, limits: signal => this.limits(signal),
       unreleased: (id, error) => options.report("release_upload", new Error(`couldn't release upload ${id} (it expires in an hour): ${error.message}`, { cause: error })),
     });
   }
@@ -146,7 +160,10 @@ export class ToolProxy {
   // failure throws the wire's classified error. A call that needs a new login
   // (signed out, expired, insufficient scope) returns one error naming it.
   // `signal` aborts the wait (it throws CallAborted), not the call: one the
-  // server already took may still land. It never closes the shared connection.
+  // server already took may still land. It ends the wait for the shared
+  // connect, the server's answer and an upload or download at once; the
+  // before/after hooks (the Controller's queue) and an aborted send's upload
+  // releases still run first. It never closes the shared connection.
   call(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     return this.track(this.invoke(name, args, sessionID, signal));
   }
@@ -205,10 +222,12 @@ export class ToolProxy {
     try {
       if (signal?.aborted) throw new CallAborted();
       const result = await this.dispatch(name, args, sessionID, signal);
-      // An abort the dispatch turned into an error result (an attachment's) is still an abort.
-      if (signal?.aborted) throw new CallAborted();
+      // Recorded before the abort check: a call that completed is recorded so
+      // (afterCall, a lost hold's instructions) even when nobody reads it.
       lost = result._meta?.[GRAYBOARD_ALIAS_LOST_META] === true;
       if (!result.isError) outcome = { status: "completed", output: outputOf(result) };
+      // An abort the dispatch turned into an error result (an attachment's) is still an abort.
+      if (signal?.aborted) throw new CallAborted();
       return result;
     } catch (error) {
       // Before any classification: the SDK reports a caller's abort as a
@@ -253,7 +272,9 @@ export class ToolProxy {
     const native = this.native ?? this.open();
     native.users++;
     try {
-      const wire = await native.ready;
+      // A connect still in flight (connect timeouts, 429 backoff) is shared, so
+      // an abort stops only this call's wait for it.
+      const wire = await unlessAborted(native.ready, signal);
       try { return await wire.callTool(name, args, sessionID, signal); }
       catch (error) {
         if (!signal?.aborted && broken(error)) this.drop(native);
@@ -267,8 +288,8 @@ export class ToolProxy {
   // The server's attachment caps, published as a capability of the shared
   // connection; a server older than #430 publishes none, and gets the
   // shared defaults its own config also starts from.
-  private async limits(): Promise<AttachmentLimits> {
-    const wire = await (this.native ?? this.open()).ready;
+  private async limits(signal?: AbortSignal): Promise<AttachmentLimits> {
+    const wire = await unlessAborted((this.native ?? this.open()).ready, signal);
     return publishedLimits(wire.client.getServerCapabilities()?.experimental) ?? DEFAULT_ATTACHMENT_LIMITS;
   }
 

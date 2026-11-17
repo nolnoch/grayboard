@@ -24,7 +24,8 @@ export type HostedAttachmentOptions = {
   roots: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
-  limits(): Promise<AttachmentLimits>;
+  // `signal`: the tool call's; the caps wait on the shared connection.
+  limits(signal?: AbortSignal): Promise<AttachmentLimits>;
   unreleased(id: number, error: Error): void;
 };
 
@@ -33,13 +34,13 @@ export class HostedAttachments {
   // `signal` (one tool call's abort) stops the uploads and the download; it
   // never stops a release, so an aborted send still frees what it uploaded.
   async send<T>(paths: unknown, sessionID: string, send: (ids: number[]) => Promise<T>, signal?: AbortSignal): Promise<T> {
-    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(), cwd: this.options.cwd });
+    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(signal), cwd: this.options.cwd });
     return sendWithUploads(files, this.transport(sessionID, signal), send);
   }
   async get(args: { id?: unknown; dir?: unknown }, sessionID: string, signal?: AbortSignal): Promise<SavedAttachment> {
     const id = checkAttachmentId(args.id);
     const target = await saveTarget(args.dir, this.options.roots, serverBusDir(this.options.resource.href), this.options.env, this.options.cwd);
-    return downloadAttachment(id, target, (await this.options.limits()).file, this.transport(sessionID, signal));
+    return downloadAttachment(id, target, (await this.options.limits(signal)).file, this.transport(sessionID, signal));
   }
   // The hosted attachment routes act as the bound session whose raw source ID
   // rides in X-Grayboard-Session (the canonical encodeURIComponent form).

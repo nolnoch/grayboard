@@ -26,7 +26,7 @@ import * as signIns from "../hosted-core/src/offer.ts";
 import type { Flow, Last, Origin, Outcome, SignInState } from "../hosted-core/src/offer.ts";
 import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
-import { failure, hostTools, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { CallAborted, failure, hostTools, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
 import { outputOf } from "../hosted-core/src/results.ts";
 import { RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
@@ -294,6 +294,8 @@ export function createGrayboard(h: Harness): Grayboard {
     return running;
   };
   const dispatch = async (tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<CallToolResult> => {
+    // Aborted before it started: no sign-in offer, no registration, nothing sent.
+    if (signal?.aborted) throw new CallAborted();
     if ("error" in config) return failure(config.error);
     if (root) return root.call(tool, args, offer, { signal });
     if (!proxy || !session) return failure(`the ${h.name} session hasn't started yet`);

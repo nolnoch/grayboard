@@ -14,7 +14,7 @@ import type { Temporary } from "./children.js";
 import { failureMessage } from "./diagnostics.js";
 import type { Login } from "./login.js";
 import { accessExpiry } from "./model.js";
-import { failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
+import { CallAborted, failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
 import type { SessionFacts } from "./port.js";
 import { SubscriberError, Wire, type WireOptions } from "./wire.js";
 import { GRAYBOARD_SESSION_META } from "../../../src/shared/session_meta.ts";
@@ -148,7 +148,7 @@ export class HostedClient {
   async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     try { return await proxy.call(tool, args, sessionID, signal); }
     catch (error) {
-      if (signal?.aborted) throw error;
+      if (signal?.aborted) throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
       return failure(failureText(error, this.options.retryHint));
     }
   }

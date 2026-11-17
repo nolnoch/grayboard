@@ -16,7 +16,7 @@ import type { DiagnosticSink } from "./diagnostics.js";
 import type { Lock } from "./lock.js";
 import { accessExpiry, DeliveryHeldElsewhere, Refusal, type AccessExpired, type Identity, type Item } from "./model.js";
 import type { HostPort } from "./port.js";
-import { failure, hostTools, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
+import { CallAborted, failure, hostTools, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
 import { outputOf } from "./results.js";
 import { end, register } from "./children.js";
 import { AncestryError } from "./sessions.js";
@@ -405,6 +405,7 @@ export class RootDelivery {
   // `passed` runs once the child is this root's to end (the plugin notes it, #555).
   // `signal`: the harness's abort of this call (ToolProxy.call).
   async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, o: { child?: string; passed?: () => void; signal?: AbortSignal } = {}): Promise<CallToolResult> {
+    if (o.signal?.aborted) throw new CallAborted();
     if (!this.proxy) return failure(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
     if (o.child !== undefined) return this.childCall(o.child, tool, args, before, o.passed, o.signal);
     // The process holding delivery owns this session's binding: a tools-only
