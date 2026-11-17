@@ -788,12 +788,13 @@ export function queueLanes(
 // IS the visibility, and an announce would cascade back through the queue
 // rotation. The claim records the lane's session's user (#855), so a reply the
 // bus writes when it ends unclaimed is that user's. Caller is inside post's transaction.
-function claimQueuePost(db: Database, board: string, p: Post, lane: string, now: number, note = "queue post"): void {
+// `push: false`: the caller queues the lane's push itself (a mention's, #219).
+function claimQueuePost(db: Database, board: string, p: Post, lane: string, now: number, note = "queue post", push = true): void {
   const key = `queue:${board}:${p.id}`;
   const expires = now + QUEUE_CLAIM_TTL_MS;
   // Redelivery to a lane that already had this post resets its push, so the
   // re-offer actually reaches it (at-least-once).
-  db.prepare(
+  if (push) db.prepare(
     `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, 'subscription', 1)
      ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
   ).run(lane, p.id);
@@ -957,7 +958,13 @@ export function post(
       for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
       // A mention the poster may not see exists routes as one that matched nobody (#871): a lane still gets
       // the post, so whether a team's name exists shows neither in who was notified nor in a queue claim.
-      if (seenHandles(db, opts.author_id ?? handle, mentioned).length === 0) {
+      const seen = seenHandles(db, opts.author_id ?? handle, mentioned);
+      // One lane addressed by name holds the post like a rotated one (#219): its reply acks, its decline or lapse
+      // redelivers through the rotation. Several names, or a human, viewer or the poster's own address, take no
+      // claim: one claim names one lane, and only lanes hold queue work.
+      const lanes = seen.filter((h) => !own.includes(h) && !isHuman(db, h) && !isViewer(h));
+      if (seen.length === 1 && lanes.length === 1) claimQueuePost(db, board, p, lanes[0]!, now, "queue post (mentioned)", false);
+      if (seen.length === 0) {
         // Eligible lanes, least-recently-woken first, live lanes preferred: a
         // post claimed by an offline lane would sit for the full TTL while
         // live lanes idle (#192 review).

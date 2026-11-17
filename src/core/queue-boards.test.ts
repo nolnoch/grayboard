@@ -232,8 +232,38 @@ test("a reply by a different lane does not release the holder's claim", () => {
 
 test("a resolved @mention is direct addressing and bypasses the rotation", () => {
   const r = post(db, "be", "work", "@sim take this one");
-  const rows = db.prepare(`SELECT handle FROM outbox WHERE post_id = ?`).all(r.post.id) as { handle: string }[];
-  expect(rows.map((x) => x.handle)).toEqual(["sim"]);
+  const rows = db.prepare(`SELECT handle, reason FROM outbox WHERE post_id = ?`).all(r.post.id) as { handle: string }[];
+  expect(rows).toEqual([{ handle: "sim", reason: "mention" }]);
+});
+
+// #219: a post addressed to one lane by name is tracked like a rotated one.
+test("one mentioned lane holds the post: its reply acks it", () => {
+  const r = post(db, "be", "work", "@sim take this one");
+  const key = claimKey(r.post.id);
+  expect(listClaims(db).filter((c) => c.key === key).map((c) => [c.holder, c.note])).toEqual([["sim", "queue post (mentioned)"]]);
+  expect(claimEvents(key)).toEqual([{ event: "take", handle: "sim" }]);
+  post(db, "sim", "work", "on it, done", r.post.id);
+  expect(listClaims(db).some((c) => c.key === key)).toBe(false);
+});
+
+test("a mentioned lane's lapse or decline redelivers through the rotation, never back to it", () => {
+  const r = post(db, "be", "work", "@sim take this one");
+  const key = claimKey(r.post.id);
+  sweepExpired(db, Date.now() + 31 * 60_000);
+  expect(listClaims(db).filter((c) => c.key === key).map((c) => c.holder)).toEqual(["fe"]);
+  const r2 = post(db, "be", "work", "@fe and this one");
+  release(db, "fe", claimKey(r2.post.id), "pass");
+  expect(listClaims(db).filter((c) => c.key === claimKey(r2.post.id)).map((c) => c.holder)).toEqual(["sim"]);
+});
+
+test("several mentions, or a human's handle, take no claim", () => {
+  const several = post(db, "be", "work", "@sim @fe either of you");
+  expect(several.wake.sort()).toEqual(["fe", "sim"]);
+  ensureAlias(db, "wade", "test");
+  db.prepare(`UPDATE aliases SET human = 1 WHERE address = 'wade'`).run();
+  const human = post(db, "be", "work", "@wade a question");
+  expect(human.wake).toEqual(["wade"]);
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claims WHERE key LIKE 'queue:%'`).get()).toEqual({ n: 0 });
 });
 
 test("status text is not a busy flag; only the explicit opt-out skips a lane", () => {
