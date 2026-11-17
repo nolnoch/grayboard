@@ -128,7 +128,7 @@ async function driveAsync<T>(g: Rule<T>, reads: PolicyReads): Promise<T> {
 
 // Policy's reads on one handle: `r` is the caller's body's `Tx` inside a transaction, so the rule sees its writes,
 // else `repo.read`, committed state (#807 P3 A7e3).
-export function policyReads(repo: Repo, r: Read): PolicyReads {
+function policyReads(repo: Repo, r: Read): PolicyReads {
   return {
     principalByName: (name) => repo.principals.findByName(r, name),
     principalOf: (address) => repo.principals.of(r, address),
