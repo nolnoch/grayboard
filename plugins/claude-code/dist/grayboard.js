@@ -37026,7 +37026,7 @@ class Controller {
     const attempts = new Map;
     while (!signal.aborted && failures < 8) {
       let wire;
-      const began = Date.now();
+      const began = performance.now(), attempt = grace;
       try {
         await this.guard(r, epoch, signal);
         wire = await this.wire(e, e.sessionID, signal, () => this.guard(r, epoch, signal));
@@ -37164,7 +37164,7 @@ class Controller {
           continue;
         }
         if (error instanceof AccessExpired && error.reason === "expired" && graceLeft(grace) > 0) {
-          grace.spent += Date.now() - began + ROTATION_POLL_MS;
+          grace.spent += (grace === attempt ? performance.now() - began : 0) + ROTATION_POLL_MS;
           this.set(r, "retrying", `Access expired; waiting for ${this.port.harness} to refresh it, approval retained`, "reopen", failureCode(error));
           ready();
           await this.wait(ROTATION_POLL_MS, signal);
@@ -37271,13 +37271,13 @@ class Controller {
   }
   async rotated(grace, call) {
     for (;; ) {
-      const began = Date.now();
+      const began = performance.now();
       try {
         return await call();
       } catch (error) {
         if (this.stopped || accessExpiry(error)?.reason !== "expired" || graceLeft(grace) <= 0)
           throw error;
-        grace.spent += Date.now() - began + ROTATION_POLL_MS;
+        grace.spent += performance.now() - began + ROTATION_POLL_MS;
         await this.wait(ROTATION_POLL_MS, this.closing.signal);
         if (this.stopped)
           throw error;
@@ -37291,7 +37291,7 @@ class Controller {
     });
     if (!this.port.approval)
       return;
-    const spent = { spent: 0 };
+    const grace = { spent: 0 };
     for (const saved of await this.port.approval.saved()) {
       const id = saved.sessionID;
       if (this.stopped)
@@ -37319,13 +37319,15 @@ class Controller {
         if (expired)
           this.set(r, "retrying", `Access expired before the restart; waiting for ${this.port.harness} to refresh it, approval retained`, "restore", "native_access_expired");
         try {
-          await this.rotated(spent, () => this.port.credential.check(e));
+          await this.rotated(grace, () => this.port.credential.check(e));
         } catch (error) {
           if (!expired)
             throw error;
           if (this.roots.get(id) !== r || r.paused || r.task)
             continue;
           const cause = this.expired(error);
+          if (!(cause instanceof Refusal))
+            throw error;
           r.paused = true;
           if (cause instanceof AccessExpired && cause.reason === "expired")
             this.awaitRefresh(r, "restore");
@@ -37336,7 +37338,7 @@ class Controller {
         if (this.roots.get(id) !== r)
           continue;
         await this.watch(e);
-        await this.rotated(spent, () => this.prepare(r, true, true));
+        await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
         if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {

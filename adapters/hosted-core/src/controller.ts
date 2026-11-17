@@ -712,8 +712,10 @@ export class Controller<E extends Enrollment = Enrollment> {
           // A session ended, or a native bind started this root, during the grace: that state stands.
           if (this.roots.get(id) !== r || r.paused || r.task) continue;
           // Still expired after the grace: the next restart checks again. A
-          // refusal now (another account, a revoked grant) is the pause's cause from here on.
+          // refusal now (another account, a revoked grant) is the pause's cause from here on; any other
+          // failure is the outer catch's (an outage retry, or a degraded record the next restart re-checks).
           const cause = this.expired(error);
+          if (!(cause instanceof Refusal)) throw error;
           r.paused = true;
           // Still expired: wait for the refresh here too, so a reload during the wait recovers (#661).
           if (cause instanceof AccessExpired && cause.reason === "expired") this.awaitRefresh(r, "restore");
