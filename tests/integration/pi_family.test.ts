@@ -323,7 +323,7 @@ test("/new carries the outgoing root's name, bound with this checkout as its pla
 
   // The session keeps the carried name, so the resume its notice names takes
   // it once the holder lets go.
-  srv.app.mcp.sessions.release(hostedId("carry-thief"), "expired");
+  await srv.app.mcp.sessions.release(hostedId("carry-thief"), "expired");
   await third.ext.command("resume");
   await active(third, "carry-3", "carrier");
   expect(row("carry-3")).toMatchObject({ name: "carrier" });
@@ -395,7 +395,7 @@ test("a child whose root's ownership lapsed and was rebound registers again on i
 
   // The root's lease lapses (a suspended laptop); the server ends its
   // ownership and every child registered under it.
-  srv.app.mcp.sessions.release(hostedId("lapse-root"), "expired");
+  await srv.app.mcp.sessions.release(hostedId("lapse-root"), "expired");
   expect(row("lapse-child")).toBeNull();
   // The root's Controller rebinds its name under a new ownership.
   await until(() => { const r = row("lapse-root"); return r?.name === "lapser" && r.ownership_id !== before; });
@@ -592,7 +592,7 @@ test("/new after a sign-in that dropped the root's name carries nothing: a remem
   await logoutElsewhere();
   await until(async () => (await a.ext.status()).includes(`  stale-a (${EMAIL}/stalename): paused, `), 10_000, "paused by the sign-out");
   // The lease lapsed meanwhile, so the name is free to take.
-  srv.app.mcp.sessions.release(hostedId("stale-a"), "expired");
+  await srv.app.mcp.sessions.release(hostedId("stale-a"), "expired");
   await loginElsewhere("stale-relogin");
   await until(async () => (await a.ext.status()).includes("  stale-a: unbound, "), 10_000, "restarted unbound");
   await a.ext.shutdown("new");
@@ -622,7 +622,7 @@ test("a resume whose rebind is refused says so at once and in the next tool resu
   expect(await again.ext.instructions()).toStartWith("This session has no bus name yet.");
 
   // The Controller's own bind drops the cached unbound instructions.
-  srv.app.mcp.sessions.release(hostedId("rebind-thief"), "expired");
+  await srv.app.mcp.sessions.release(hostedId("rebind-thief"), "expired");
   await again.ext.command("resume");
   await active(again, "rebind-s", "rebinder");
   expect(await again.ext.instructions()).toStartWith(`You are "${EMAIL}/rebinder" on grayboard.`);

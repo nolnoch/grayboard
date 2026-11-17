@@ -124,7 +124,7 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
     await expect(seed(database.repo, async tx => {
       await tx.savepoint(async sp => {
         await application.send(sp, recipient.session, "launcher", "rolled back nested");
-        database.repo.hosted.end(sp, context().id!, "closed", Date.now());
+        await database.repo.hosted.end(sp, context().id!, "closed", Date.now());
       });
       expect(closed).not.toHaveBeenCalled();
       expect(events).toEqual([]); expect(invalidations).toBe(0);
@@ -136,7 +136,7 @@ test("nested savepoint success waits for outer transaction commit; outer rollbac
     expect(await application.history(database.repo.read, recipient.session)).toEqual([]);
     // A touch alone tells nothing (#399); an ended row tells, after the outer commit.
     await seed(database.repo, async tx => {
-      await tx.savepoint(async sp => { await application.send(sp, recipient.session, "launcher", "committed nested"); database.repo.hosted.touch(sp, id, Date.now()); });
+      await tx.savepoint(async sp => { await application.send(sp, recipient.session, "launcher", "committed nested"); await database.repo.hosted.touch(sp, id, Date.now()); });
       expect(events).toEqual([]); expect(invalidations).toBe(0);
     });
     expect(events).toHaveLength(1); expect(invalidations).toBe(0);

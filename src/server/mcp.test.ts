@@ -84,7 +84,7 @@ test("legacy identity headers cannot select or create names; explicit bind retai
   expect(hosted.activeContexts).toBe(0);
 });
 
-async function connect(version = "2026-07-28", intercept?: (response: Response) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void) {
+async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void) {
   const client = new Client({ name: "unit", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
   });
@@ -101,7 +101,7 @@ async function connect(version = "2026-07-28", intercept?: (response: Response) 
       headers?.forEach((value, key) => request.headers.set(key, value));
       observeRequest?.(request);
       const response = await hosted.fetch(request);
-      await intercept?.(response);
+      await intercept?.(response, request);
       return response;
     },
   }));
@@ -410,7 +410,8 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
 
 for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: selection errors log once, expected refusals do not log, and lost authentication returns 401`, async () => {
   let last!: Response;
-  const client = await connect(version, async response => { last = response.clone(); });
+  // POSTs only: a legacy client's GET stream may answer after a later POST (#807 P3 A6e2).
+  const client = await connect(version, async (response, request) => { if (request.method === "POST") last = response.clone(); });
   const logs = spyOn(console, "error").mockImplementation(() => {});
   const original = hosted.sessions.snapshot;
   try {
@@ -485,7 +486,7 @@ for (const revoked of [false, true]) test(`authentication lost between HTTP pref
 
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const status of [401, 403]) test(`${version}: explicit factory ${status} response is preserved unchanged`, async () => {
   let response: Response | undefined;
-  const client = await connect(version, async r => { response = r; });
+  const client = await connect(version, async (r, request) => { if (request.method === "POST") response = r; });
   const credential = status === 401 ? "invalid" : (await issuedOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:delivery"])).token;
   const refusal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${credential}` } }));
   if (!(refusal instanceof Response)) throw new Error("expected fixture OAuth refusal");
@@ -1239,7 +1240,7 @@ test("a subscriber-role legacy GET without a lease stays open, primed, across a 
   try {
     expect(await raw.until(text => text.length > 0)).toBe(": keepalive\n\n");
     // The reconcile runs synchronously inside the sweep's commit, so a stop would already show here.
-    hosted.sessions.sweep();
+    await hosted.sessions.sweep();
     expect(hosted.activeGetStreams).toBe(1);
   } finally { await raw.close(); }
 });
@@ -1352,7 +1353,7 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   // A binding change committed outside any request of either session, so only the notice can reach the listens.
   const rebind = (email: string) => seed(store.repo, tx => {
     const row = store.repo.hosted.all(tx).find(r => store.repo.users.findById(r.user_id)?.email === email)!;
-    store.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 });
+    return store.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 });
   });
   await rebind("bob@example.com");
   await untilHosted(() => hosted.activeListens === 1);
@@ -1405,7 +1406,7 @@ const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][
   ["sign-out everywhere", () => seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id))],
   ["disable", () => seed(store.repo, tx => store.repo.users.setDisabled(tx, user.user_id, true))],
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
-  ["binding change", () => seed(store.repo, tx => { const r = aliceRoot(); store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); })],
+  ["binding change", () => seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); })],
 ];
 // Only the stream timer ticks (the hosted sweep would end an expired session's row itself), and the backstop sits
 // past the access TTL, so the expiry case reaches phase A's auth check with a fresh stamp.
@@ -1431,15 +1432,39 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   const f = await stampedListen();
   const root = aliceRoot().session_id;
   // The update's notice makes the next tick a full check, which stamps the new deadline.
-  await seed(store.repo, tx => { const r = aliceRoot(); store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
+  await seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
   f.tick(); f.tick();
   expect(hosted.activeListens).toBe(1);
   f.time.now += 4_999; f.tick();
   expect(hosted.activeListens).toBe(1);
-  // Synchronously, before the hosted sweep's own timer could end the root: the stream tick settles it.
+  // Before the hosted sweep's own timer could end the root, the stream tick ends the listen at once and posts the
+  // settle, which ends the root when its async body commits (#807 P3 A6e2).
   f.time.now += 1; f.tick();
   expect(hosted.activeListens).toBe(0);
+  await store.repo.write(() => {});
   expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
+  await f.listen.close();
+});
+
+// A board commit hints the listen from the write queue's holder (its afterCommit flush), where a lapsed root's settle
+// can't run as an async post: it goes through the queue behind the holder and ends the root (#807 P3 A6e2 audit).
+test("a lapsed root's settle from a board commit's hint, inside the write queue's holder, ends the root", async () => {
+  const f = await stampedListen();
+  const root = aliceRoot().session_id;
+  await seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
+  f.time.now += 5_000;
+  token = (await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
+  const bob = await connect();
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect((await bob.callTool({ name: "bind", arguments: { name: "bob-poster", create: true } })).isError).not.toBe(true);
+    const posted = await bob.callTool({ name: "board_post", arguments: { board: "stamped", body: "wake the listen" } });
+    expect(posted.isError, JSON.stringify(posted.content)).not.toBe(true);
+    await untilHosted(() => hosted.activeListens === 0);
+    await store.repo.write(() => {});
+    expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
+    expect(logged.mock.calls.filter(args => args.some(a => String(a).includes("write queue's holder")))).toEqual([]);
+  } finally { logged.mockRestore(); }
   await f.listen.close();
 });
 

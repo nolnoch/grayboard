@@ -71,7 +71,9 @@ test("#807: behind a write backlog longer than a tick, the timer keeps one sweep
     // FIFO: a write queued now runs after every sweep the ticks queued.
     await store.write(() => {});
     expect(expired.mock.calls.length - before).toBe(1);
-    // The guard clears once the sweep settles: the next tick queues another.
+    // The guard clears once the sweep settles, a few microtasks after its async body commits (#807 P3 A6e2):
+    // a macrotask runs only once they drain. Then the next tick queues another.
+    await new Promise<void>(resolve => setImmediate(resolve));
     tick();
     await store.write(() => {});
     expect(expired.mock.calls.length - before).toBe(2);
@@ -445,7 +447,7 @@ test("unbound row quota survives service restart, idle cleanup frees rows and ga
   await hosted.close();
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);
   await hosted.whoami(principal, context("overflow"));
   expect(hosted.gateCount).toBe(0);
@@ -479,7 +481,7 @@ test("global quota applies across users transactionally without creating an over
       for (let i = 0; i < hosted.limits.user; i++) {
         const id = `seed-${userIndex}-${i}`;
         const ownership = await database.repo.hosted.start(tx, id, user.id, OPENCODE_CLIENT, now);
-        database.repo.hosted.insert(tx, { ...template, session_id: id, ownership_id: ownership, user_id: user.id });
+        await database.repo.hosted.insert(tx, { ...template, session_id: id, ownership_id: ownership, user_id: user.id });
       }
     }
   });
@@ -769,7 +771,7 @@ test("durable lease deadline expires once without a contender", async () => {
   await hosted.register(principal, context("root"), "child");
   await delivery.open(principal, context("root"));
   now += 30_001;
-  hosted.sweep(); hosted.sweep();
+  await hosted.sweep(); await hosted.sweep();
   expect(delivery.activeLeaseCount).toBe(0);
   expect(hostedRowCount(database.db)).toBe(0);
 });
@@ -1118,7 +1120,7 @@ test("a root whose last hold is revoked or unbound has no lease, so the sweep le
   expect(delivery.activeLeaseCount).toBe(0);
   for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(database.repo.read, id(raw))).toMatchObject({ lease_deadline: null });
   now += 300_000; // past any lease, short of the idle window
-  hosted.sweep();
+  await hosted.sweep();
   for (const raw of ["revoked", "unbound"]) expect(database.repo.hosted.get(database.repo.read, id(raw))).toBeDefined();
 });
 
@@ -1386,7 +1388,7 @@ test("the sweep parks children idle past the window, audited; parked children fr
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
   await expect(hosted.register(principal, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   const parked = childAudits("hosted.child_parked");
   expect(parked).toHaveLength(hosted.limits.children);
   expect(parked.every(a => a.target === hostedId("root") && a.idle_ms > 900_000)).toBe(true);
@@ -1402,7 +1404,7 @@ test("a parked child's next call runs as its root's child under the same ownersh
   await hosted.register(principal, context("root"), "child");
   const ownerships = () => database.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_ownerships").get()!.n;
   const before = ownerships();
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   expect(database.repo.hosted.get(database.repo.read, hostedId("child"))?.parked_at).not.toBeNull();
   await hosted.run(principal, context("child"), "dm_send", (session, tx) => application.send(tx, session, "be", "after parking"));
   expect(database.db.query("SELECT sender_id FROM messages WHERE body='after parking'").get()).toEqual({ sender_id: hostedId("child") });
@@ -1419,9 +1421,9 @@ test("register of an existing child moves the child's last_seen_at; of a parked 
   now += 600_000;
   expect(await hosted.register(principal, context("root"), "child")).toEqual({ message: "already registered" });
   expect(database.repo.hosted.get(database.repo.read, hostedId("child"))?.last_seen_at).toBe(now);
-  now += 600_000; hosted.sweep();
+  now += 600_000; await hosted.sweep();
   expect(database.repo.hosted.get(database.repo.read, hostedId("child"))?.parked_at).toBeNull();
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   expect(database.repo.hosted.get(database.repo.read, hostedId("child"))?.parked_at).not.toBeNull();
   expect(await hosted.register(principal, context("root"), "child")).toEqual({ message: "already registered" });
   expect(database.repo.hosted.get(database.repo.read, hostedId("child"))).toMatchObject({ parked_at: null, last_seen_at: now });
@@ -1431,7 +1433,7 @@ test("register of an existing child moves the child's last_seen_at; of a parked 
 test("an unpark at full child capacity is refused and leaves the child parked; its session_end still ends it (#566)", async () => {
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   await hosted.register(principal, context("root"), "sleeper");
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
   await expect(hosted.whoami(principal, context("sleeper"))).rejects.toHaveProperty("code", "bad_request");
   expect(database.repo.hosted.get(database.repo.read, hostedId("sleeper"))?.parked_at).not.toBeNull();
@@ -1446,7 +1448,7 @@ test("a parked child goes with its root's ownership; it and an ended child start
   await hosted.register(principal, context("root"), "parked");
   await hosted.register(principal, context("root"), "ended");
   await hosted.end(principal, context("ended"));
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   await hosted.end(principal, context("root"));
   expect(database.repo.hosted.get(database.repo.read, hostedId("parked"))).toBeUndefined();
   for (const raw of ["parked", "ended"]) {
@@ -1458,7 +1460,7 @@ test("a parked child goes with its root's ownership; it and an ended child start
 test("a root that holds parked children can't become a child (#566)", async () => {
   await hosted.register(principal, context("middle"), "leaf");
   now += 600_000; await hosted.whoami(principal, context("middle"));
-  now += 300_001; hosted.sweep();
+  now += 300_001; await hosted.sweep();
   expect(database.repo.hosted.get(database.repo.read, hostedId("leaf"))?.parked_at).not.toBeNull();
   await expect(hosted.register(principal, context("top"), "middle")).rejects.toHaveProperty("code", "has_children");
 });
@@ -1482,10 +1484,10 @@ test("past the parked ceiling the sweep evicts a root's oldest parked children, 
   hosted.limits.parked = 2;
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   for (const raw of ["first", "second"]) { await hosted.register(principal, context("root"), raw); now += 1000; }
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   expect(database.repo.hosted.children(database.repo.read, hostedId("root")).filter(r => r.parked_at !== null)).toHaveLength(2);
   await hosted.register(principal, context("root"), "third");
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   expect(database.repo.hosted.get(database.repo.read, hostedId("first"))).toBeUndefined();
   expect(database.repo.hosted.children(database.repo.read, hostedId("root")).map(r => r.session_id).sort()).toEqual([hostedId("second"), hostedId("third")].sort());
   expect(childAudits("hosted.child_parked").map(a => a.child)).toEqual([hostedId("first"), hostedId("second"), hostedId("third")]);
@@ -1500,7 +1502,7 @@ test("children parked in one sweep past the ceiling are evicted by last activity
   for (const raw of ["c", "a", "b"]) await hosted.register(principal, context("root"), raw);
   // Past the touch window (5 s, #912): activity inside it doesn't move last_seen_at.
   now += 10_000; await hosted.whoami(principal, context("c"));
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   expect(database.repo.hosted.children(database.repo.read, hostedId("root")).map(r => r.session_id)).toEqual([hostedId("c")]);
   const evicted = childAudits("hosted.child_released").map(a => a.child);
   expect(evicted).toEqual([hostedId("a"), hostedId("b")].sort());
@@ -1511,7 +1513,7 @@ test("children parked in one sweep past the ceiling are evicted by last activity
 test("a refused unpark, new register and convert each say local mode's child-capacity text (#584)", async () => {
   await hosted.bind(principal, context("root"), { name: "be", create: true });
   await hosted.register(principal, context("root"), "sleeper");
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   await hosted.whoami(principal, context("loose"));
   for (let i = 0; i < hosted.limits.children; i++) await hosted.register(principal, context("root"), `child-${i}`);
   const text = childCapacity(hostedId("root"));
@@ -1532,13 +1534,13 @@ test("a child's call past the idle window neither parks it nor ends its unheld r
   await hosted.whoami(generic, meta("root", "fe"));
   await hosted.register(generic, meta("root", "fe"), "kid");
   const during = await hosted.transfer(generic, meta("kid"), async () => {
-    now += 900_001; hosted.sweep();
+    now += 900_001; await hosted.sweep();
     return { kid: rowOf(meta("kid"))?.parked_at, root: rowOf(meta("root", "fe")) !== undefined };
   });
   expect(during).toEqual({ kid: null, root: true });
   expect(rowOf(meta("kid"))?.last_seen_at).toBe(now);
   expect(rowOf(meta("root", "fe"))?.last_seen_at).toBe(now);
-  now += 600_000; hosted.sweep();
+  now += 600_000; await hosted.sweep();
   expect(rowOf(meta("kid"))?.parked_at).toBeNull();
   expect(childAudits("hosted.child_parked")).toHaveLength(0);
   expect(hosted.inflightCount).toBe(0);
@@ -1548,7 +1550,7 @@ test("an unheld root's own call past the idle window doesn't end it (#584)", asy
   const { generic, meta } = toolsOnly();
   await seed(database.repo, tx => application.hostedWritesAs(tx, generic.authed, "id:probe", "fe", true));
   await hosted.whoami(generic, meta("root", "fe"));
-  const alive = await hosted.transfer(generic, meta("root", "fe"), async () => { now += 900_001; hosted.sweep(); return rowOf(meta("root", "fe")) !== undefined; });
+  const alive = await hosted.transfer(generic, meta("root", "fe"), async () => { now += 900_001; await hosted.sweep(); return rowOf(meta("root", "fe")) !== undefined; });
   expect(alive).toBe(true);
   expect(rowOf(meta("root", "fe"))?.last_seen_at).toBe(now);
 });
@@ -1569,7 +1571,7 @@ test("a call whose root's ownership ended and restarted before it returns keeps 
   const before = rowOf(context("root"))!.ownership_id;
   const value = await hosted.control(principal, context("root"), false, async () => {
     await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]));
-    hosted.sweep();
+    await hosted.sweep();
     await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = NULL WHERE id = ?", [principal.authed.user_id]));
     now += 1000;
     await hosted.whoami(principal, context("root"));
@@ -1649,7 +1651,7 @@ test("a released child's ID ends with the release's reason, not at the next star
   await hosted.end(principal, context("closed"));
   expect(idEnd(hostedId("closed"))).toBe(now);
   expect(endedWhy(hostedId("closed"))).toEqual(["closed"]);
-  now += 900_001; hosted.sweep();
+  now += 900_001; await hosted.sweep();
   expect(database.repo.hosted.get(database.repo.read, hostedId("evicted"))).toBeUndefined();
   expect(endedWhy(hostedId("evicted"))).toEqual(["evicted"]);
   // A root's end takes its children with it, each ended with the root's reason.
@@ -1816,16 +1818,16 @@ test("#902: a bound native call reads its root's holds once, for the bound check
 const windows: [string, (m: { root: string; child: string; other: string; name: string }) => Promise<void> | void][] = [
   ["nothing", () => {}],
   // The child alone goes idle: the root stays live (touched, its lease renewed), so a miss here is the child's.
-  ["the child parked", async ({ root, child }) => { now += 900_001; await keepLive(root); hosted.sweep(); const row = database.repo.hosted.get(database.repo.read, hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
+  ["the child parked", async ({ root, child }) => { now += 900_001; await keepLive(root); await hosted.sweep(); const row = database.repo.hosted.get(database.repo.read, hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
   ["the root's lease lapsed", async ({ root }) => { await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, hostedId(root)])); }],
-  ["the root's generation moved", async ({ root }) => { await seed(database.repo, tx => { const r = database.repo.hosted.get(tx, hostedId(root))!; database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); }); }],
+  ["the root's generation moved", async ({ root }) => { await seed(database.repo, tx => { const r = database.repo.hosted.get(tx, hostedId(root))!; return database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); }); }],
   ["the root ended and started again", async ({ root }) => { await hosted.end(principal, context(root)); await hosted.whoami(principal, context(root)); }],
   ["the child moved to another root", async ({ root, other, child }) => { await hosted.end(principal, context(root), hostedId(child)); await hosted.register(principal, context(other), child); }],
   ["the child's idle window passed", async ({ root, child }) => { now += 900_001; await keepLive(root); expect(database.repo.hosted.get(database.repo.read, hostedId(child))).toBeDefined(); }],
 ];
 function keepLive(root: string) {
-  return seed(database.repo, tx => {
-    database.repo.hosted.touch(tx, hostedId(root), now);
+  return seed(database.repo, async tx => {
+    await database.repo.hosted.touch(tx, hostedId(root), now);
     database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ? AND lease_deadline IS NOT NULL", [now + 30_000, hostedId(root)]);
   });
 }
@@ -1840,7 +1842,7 @@ for (const [change, apply] of windows) for (const caller of ["root", "child"] as
       if (!parkedFirst) await delivery.open(principal, context(m.root));
       await hosted.register(principal, context(m.root), m.child);
       const self = caller === "root" ? m.root : m.child;
-      if (parkedFirst) { now += 900_001; hosted.sweep(); }
+      if (parkedFirst) { now += 900_001; await hosted.sweep(); }
       const { verdict } = await hosted.snapshot(principal, context(self), false);
       await apply(m);
       const body = `${mode} ${change} ${caller} ${parkedFirst}`;

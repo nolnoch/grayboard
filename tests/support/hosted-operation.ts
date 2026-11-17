@@ -25,7 +25,7 @@ try {
   else if (input.operation === "receipt") { await delivery.receipt(input.principal, context, lease!.capability, pending.map(item => item.id)); result = { cursor: await repo.cursors.directFor(repo.read, lease!.identity.identity_full) }; }
   else if (input.operation === "register") result = await hosted.register(input.principal, context, input.child!);
   else if (input.operation === "end") result = await hosted.end(input.principal, context);
-  else { now = input.sweepAt!; hosted.sweep(); result = { swept: true }; }
+  else { now = input.sweepAt!; await hosted.sweep(); result = { swept: true }; }
   console.log(JSON.stringify({ ok: true, result }));
 } catch (error) {
   console.log(JSON.stringify({ ok: false, code: (error as { code?: string }).code }));

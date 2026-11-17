@@ -196,9 +196,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   const idle = rawIdle * 1000;
   const touchEvery = Math.min(TOUCH_EVERY_MS, Math.floor(idle / 10));
   // Returns the row's last_seen_at after the touch.
-  const touchRow = (tx: Tx, r: HostedSession, t: number): number => {
+  const touchRow = async (tx: Tx, r: HostedSession, t: number): Promise<number> => {
     if (t - r.last_seen_at < touchEvery) return r.last_seen_at;
-    store.touch(tx, r.session_id, t);
+    await store.touch(tx, r.session_id, t);
     return t;
   };
   // A delivery lease's TTL (createDelivery reads it from the service); the
@@ -220,22 +220,24 @@ export function createHostedSessions(application: Application, options: { now?: 
   // never ends or evicts the session being admitted. At most one such sweep per tick: a refusal rolls its sweep
   // back, so a caller retrying at capacity would otherwise pay a fleet sweep per request.
   let sweptAt = -Infinity;
-  const full = (tx: Tx, over: () => boolean, own: string[]) => {
+  // The nested sweep is awaited inside the try: `own` stays busy until its last write, and its rejection fails the
+  // caller's body whole rather than committing a half-done sweep.
+  const full = async (tx: Tx, over: () => boolean, own: string[]) => {
     if (!over()) return false;
     if (now() - sweptAt < TICK_MS) return true;
     for (const id of own) inflight.set(id, (inflight.get(id) ?? 0) + 1);
-    try { void sweep(true, "nested", tx); } finally { for (const id of own) { const n = inflight.get(id)! - 1; if (n) inflight.set(id, n); else inflight.delete(id); } }
+    try { await sweep(true, "nested", tx); } finally { for (const id of own) { const n = inflight.get(id)! - 1; if (n) inflight.set(id, n); else inflight.delete(id); } }
     return over();
   };
-  function admitChild(tx: Tx, root: string, own: string[]) {
-    if (full(tx, () => store.children(tx, root).filter(r => r.parked_at === null).length >= limits.children, own)) { countRefusal("hosted_child"); throw new ApplicationError("bad_request", childCapacity(root)); }
+  async function admitChild(tx: Tx, root: string, own: string[]) {
+    if (await full(tx, () => store.children(tx, root).filter(r => r.parked_at === null).length >= limits.children, own)) { countRefusal("hosted_child"); throw new ApplicationError("bad_request", childCapacity(root)); }
   }
-  function admit(tx: Tx, user: number, own: string[], root?: string) {
-    if (full(tx, () => { const n = store.counts(tx, user); return n.total >= limits.global || n.user >= limits.user; }, own)) {
+  async function admit(tx: Tx, user: number, own: string[], root?: string) {
+    if (await full(tx, () => { const n = store.counts(tx, user); return n.total >= limits.global || n.user >= limits.user; }, own)) {
       countRefusal("hosted_session");
       throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
     }
-    if (root) admitChild(tx, root, own);
+    if (root) await admitChild(tx, root, own);
   }
   const holders = new Map<string, { row: HostedSession; session: ApplicationSession }>();
   const listeners = new Set<(changed: string | null) => void>();
@@ -282,9 +284,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (!("id" in context)) return undefined;
     let row = settled ? settled.row : store.get(tx, context.id);
     if (row) ownRow(p, row, later);
-    if (row && row.parked_at !== null && wake) row = unpark(tx, p, row);
+    if (row && row.parked_at !== null && wake) row = await unpark(tx, p, row);
     if (!row && create) {
-      admit(tx, p.authed.user_id, []);
+      await admit(tx, p.authed.user_id, []);
       const t = now();
       const writesAs = context.writesAs === undefined ? null : await application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, true, (address, detail) => later(w => application.hostedRefused(w, context.id, address, detail)), later);
       row = { session_id: context.id, ownership_id: await store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
@@ -293,7 +295,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       await application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
       // An ID that was a child (its source row ended) starts as a root: an address again (#523).
       await application.hostedRoot(tx, row.session_id, null);
-      store.insert(tx, row);
+      await store.insert(tx, row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
       // its shape is refused on every request (#451 A4).
@@ -317,10 +319,10 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (row.root_session_id) throw new ApplicationError("child_session", `this session acts under its root ${row.root_session_id}; bind and delivery are the root's. Call them from the root session.`);
   }
   // Returns the older last_seen_at of the row and its root after the touch, for `touchAfter`.
-  function touch(tx: Tx, row: HostedSession): number {
+  async function touch(tx: Tx, row: HostedSession): Promise<number> {
     const root = rootOf(tx, row), t = now();
-    const seen = touchRow(tx, root, t);
-    return row.session_id === root.session_id ? seen : Math.min(seen, touchRow(tx, row, t));
+    const seen = await touchRow(tx, root, t);
+    return row.session_id === root.session_id ? seen : Math.min(seen, await touchRow(tx, row, t));
   }
   // A call's end is activity too (#584), so the idle window runs from it. Only a row still as the call found it,
   // under the same root ownership: a call that ended its own session or whose root was replaced touches nothing.
@@ -330,20 +332,20 @@ export function createHostedSessions(application: Application, options: { now?: 
   // but a full-row update), so the call ends without a transaction (#998).
   async function touchAfter(row: HostedSession, seen: number) {
     if (stopped || now() - seen < touchEvery) return;
-    try { await store.write(tx => {
+    try { await store.write(async tx => {
       const current = store.get(tx, row.session_id), root = row.root_session_id ? store.get(tx, row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
       const t = now();
-      touchRow(tx, root, t);
-      if (current !== root) touchRow(tx, current, t);
+      await touchRow(tx, root, t);
+      if (current !== root) await touchRow(tx, current, t);
     }); } catch (failure) { console.error(`hosted ${row.session_id}: end-of-call touch not written: ${failure instanceof Error ? failure.message : String(failure)}`); }
   }
   // A parked child acts again (#566): admitted against its root's child capacity and the user's and global rows,
   // as a registration is (a refusal leaves it parked), under the root's grant, which `attach` moved past it.
-  function unpark(tx: Tx, p: OAuthPrincipal, row: HostedSession): HostedSession {
+  async function unpark(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<HostedSession> {
     const root = rootOf(tx, row), t = now();
-    admit(tx, p.authed.user_id, [root.session_id, row.session_id], root.session_id);
-    store.unpark(tx, row.session_id, root.grant_id, t);
+    await admit(tx, p.authed.user_id, [root.session_id, row.session_id], root.session_id);
+    await store.unpark(tx, row.session_id, root.grant_id, t);
     audit(tx, root.session_id, "hosted.child_unparked", { child: row.session_id, ownership: row.ownership_id, parked_ms: t - row.parked_at! }, p);
     return { ...row, parked_at: null, grant_id: root.grant_id, last_seen_at: t };
   }
@@ -395,37 +397,36 @@ export function createHostedSessions(application: Application, options: { now?: 
   function sweep(full = true, mode: "queued" | "nested" = "queued", outer?: Tx): Promise<void> {
     if (stopped) return Promise.resolve();
     if (full) sweptAt = now();
-    const body = (tx: Tx) => {
+    const body = async (tx: Tx) => {
       const t = now();
-      if (full) for (const row of store.disabled(tx)) store.end(tx, row.session_id, "disabled", t);
-      for (const row of store.expired(tx, t)) store.end(tx, row.session_id, "expired", t, row.lease_deadline!);
+      if (full) for (const row of store.disabled(tx)) await store.end(tx, row.session_id, "disabled", t);
+      for (const row of store.expired(tx, t)) await store.end(tx, row.session_id, "expired", t, row.lease_deadline!);
       if (!full) return;
-      for (const row of store.idle(tx, t - idle)) if (!row.root_session_id && !busy(row.session_id)) store.end(tx, row.session_id, "idle", t);
+      for (const row of store.idle(tx, t - idle)) if (!row.root_session_id && !busy(row.session_id)) await store.end(tx, row.session_id, "idle", t);
       // A child idle past the window is parked (#566): it stops counting against its root's capacity and the
       // user's rows, and its next request makes it active again. Roots ended above took their children with them.
       const parkedUnder = new Set<string>();
-      for (const row of store.idle(tx, t - idle)) if (row.root_session_id && !busy(row.session_id)) park(tx, row, parkedUnder);
-      evictParked(tx, parkedUnder);
+      for (const row of store.idle(tx, t - idle)) if (row.root_session_id && !busy(row.session_id)) await park(tx, row, parkedUnder);
+      await evictParked(tx, parkedUnder);
     };
     if (mode === "queued") return store.write(body);
     if (!outer) throw new Error("a nested sweep runs in its caller's transaction: pass its Tx");
     // No savepoint of its own (#807 P3 A1b): its caller (`full`, under admission) runs inside withGate's rowFor
     // savepoint or register's write body, and neither catches, so a throw here rolls that back whole, as a refusal
     // rolls this sweep back. A catch added around either would commit a half-done sweep.
-    body(outer);
-    return Promise.resolve();
+    return body(outer);
   }
-  function park(tx: Tx, row: HostedSession, parkedUnder: Set<string>) {
-    store.park(tx, row.session_id, now());
+  async function park(tx: Tx, row: HostedSession, parkedUnder: Set<string>) {
+    await store.park(tx, row.session_id, now());
     audit(tx, row.root_session_id!, "hosted.child_parked", { child: row.session_id, ownership: row.ownership_id, idle_ms: now() - row.last_seen_at });
     parkedUnder.add(row.root_session_id!);
   }
   // Past the parked ceiling, the oldest parked children are released (#584): one returning starts as a root.
-  function evictParked(tx: Tx, parkedUnder: Set<string>) {
+  async function evictParked(tx: Tx, parkedUnder: Set<string>) {
     for (const root of parkedUnder) {
       const parked = store.children(tx, root).filter(r => r.parked_at !== null && !busy(r.session_id))
         .sort((a, b) => a.parked_at! - b.parked_at! || a.last_seen_at - b.last_seen_at || (a.session_id < b.session_id ? -1 : 1));
-      for (const row of parked.slice(0, Math.max(0, parked.length - limits.parked))) store.childEnd(tx, row.session_id, now(), "evicted");
+      for (const row of parked.slice(0, Math.max(0, parked.length - limits.parked))) await store.childEnd(tx, row.session_id, now(), "evicted");
     }
   }
   // The sweep's rules for one request's own rows (#399): its root (disabled, lease lapsed, idle with no hold and
@@ -434,7 +435,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // transaction takes uncached, since a disabled user no longer authorizes (activeAccess refuses one) and
   // setDisabled ends their rows in the transaction that disables them. Returns the row as read when it wrote nothing, for the caller's next transaction (#881);
   // undefined when it wrote, so the caller reads again.
-  function settle(tx: Tx, id: string, authed?: number): { row: HostedSession | undefined } | undefined {
+  async function settle(tx: Tx, id: string, authed?: number): Promise<{ row: HostedSession | undefined } | undefined> {
     if (stopped) return undefined;
     // No savepoint of its own (#807 P3 A1b): its caller's write body doesn't catch, so a throw fails that whole body.
     const row = store.get(tx, id);
@@ -443,16 +444,16 @@ export function createHostedSessions(application: Application, options: { now?: 
     let ended = false;
     if (root && !root.root_session_id) {
       const t = now();
-      if (root.user_id !== authed && repo.users.isDisabled(root.user_id)) { store.end(tx, root.session_id, "disabled", t); ended = true; }
-      else if (root.lease_deadline !== null && root.lease_deadline <= t) { store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
-      else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(tx, root.session_id).length) { store.end(tx, root.session_id, "idle", t); ended = true; }
+      if (root.user_id !== authed && repo.users.isDisabled(root.user_id)) { await store.end(tx, root.session_id, "disabled", t); ended = true; }
+      else if (root.lease_deadline !== null && root.lease_deadline <= t) { await store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
+      else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(tx, root.session_id).length) { await store.end(tx, root.session_id, "idle", t); ended = true; }
     }
     // A root's end may have ended this child with it.
     const child = !row.root_session_id ? undefined : ended ? store.get(tx, row.session_id) : row;
     if (child && child.parked_at === null && idleAt(child)) {
       const parkedUnder = new Set<string>();
-      park(tx, child, parkedUnder);
-      evictParked(tx, parkedUnder);
+      await park(tx, child, parkedUnder);
+      await evictParked(tx, parkedUnder);
       return undefined;
     }
     return ended ? undefined : { row };
@@ -481,7 +482,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             if (row.lease_deadline > alive) credit = { field: "lease_deadline", before: row.lease_deadline, after: Math.min(row.lease_deadline + downtime, t + leaseTtl) };
           } else if (row.last_seen_at > alive - idle) credit = { field: "last_seen_at", before: row.last_seen_at, after: Math.min(row.last_seen_at + downtime, t) };
           if (!credit || credit.after <= credit.before) continue;
-          store.update(tx, { ...row, [credit.field]: credit.after });
+          await store.update(tx, { ...row, [credit.field]: credit.after });
           audit(tx, row.session_id, "hosted.lease_restart_credit", { ownership: row.ownership_id, field: credit.field, downtime_ms: downtime, before: credit.before, after: credit.after });
           credited++;
         }
@@ -546,8 +547,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         const pending = store.write(async tx => {
           if (waited) authorized(p, tx);
           // authorized(p) passed with no await since: settle skips p's own disabled read (#881).
-          const settled = settle(tx, context.id, p.authed.user_id);
-          try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: touch(sp, r) }; }) }; }
+          const settled = await settle(tx, context.id, p.authed.user_id);
+          try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
           catch (error) { await later.flush(tx); return { error }; }
         });
         waited = true;
@@ -581,15 +582,15 @@ export function createHostedSessions(application: Application, options: { now?: 
     const result = await gate(id).call(async () => {
       authorized(p);
       if (stopped) return MISS;
-      const touched = await store.write(tx => {
+      const touched = await store.write(async tx => {
         const fresh = store.get(tx, prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? store.get(tx, fresh.root_session_id) : fresh;
         const t = now();
         if (!fresh || !root || fresh.ownership_id !== prior.row.ownership_id || fresh.root_session_id !== prior.row.root_session_id || fresh.parked_at !== null
           || root.session_id !== id || root.ownership_id !== prior.root.ownership_id || root.bind_gen !== prior.root.bind_gen || root.root_session_id
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
-        const seen = touchRow(tx, root, t);
-        return { row: fresh, seen: fresh === root ? seen : Math.min(seen, touchRow(tx, fresh, t)) };
+        const seen = await touchRow(tx, root, t);
+        return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
       });
       if (!touched) return MISS;
       const { row, seen } = touched;
@@ -603,7 +604,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     });
     return result === MISS ? withGate(p, context, false, fn) : result as T;
   }
-  function attach(tx: Tx, p: OAuthPrincipal, row: HostedSession): HostedSession {
+  async function attach(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<HostedSession> {
     authorized(p, tx);
     const fresh = store.get(tx, row.session_id);
     if (!fresh) throw new ApplicationError("unbound", "unbound; bind again");
@@ -612,7 +613,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (fresh.grant_id === p.grantId) return fresh;
     testPause("hosted:attach:in-txn");
     authorized(p, tx);
-    for (const child of store.ofOwnership(tx, fresh.ownership_id)) store.update(tx, { ...child, grant_id: p.grantId });
+    for (const child of store.ofOwnership(tx, fresh.ownership_id)) await store.update(tx, { ...child, grant_id: p.grantId });
     audit(tx, row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
     // The lease is tied to the grant (delivery.ts), so a reattach closes one only if it was open.
     if (fresh.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "reattached" });
@@ -753,7 +754,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // every open's cap check); its own failure isn't a rollback, so it flushes no refusal rows.
         let done = false;
         try {
-          return await store.write(async tx => fn(attach(tx, p, row), late.defer, tx), (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
+          return await store.write(async tx => fn(await attach(tx, p, row), late.defer, tx), (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
       });
     },
@@ -798,7 +799,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         const holder = address ? application.aliasHolderId(tx, address) : null;
         const other = holder && holder !== row.session_id ? store.get(tx, holder) : undefined;
         if (other && !other.root_session_id && ((other.lease_deadline !== null && other.lease_deadline <= now()) || (other.lease_deadline === null && idleAt(other)))) {
-          store.end(tx, other.session_id, other.lease_deadline === null ? "idle" : "expired", now());
+          await store.end(tx, other.session_id, other.lease_deadline === null ? "idle" : "expired", now());
         }
         const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
@@ -806,7 +807,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           const ok = await application.bindNow(tx, selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) });
           const added = ok.held.length !== before.length;
           // `where` restates the place even when the name was already held (a re-bind), as on the other surfaces.
-          if (added || args.where !== undefined) store.update(tx, { ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
+          if (added || args.where !== undefined) await store.update(tx, { ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
           if (args.where !== undefined) application.hostedPlace(tx, row.session_id, args.where);
           if (added && row.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "rebound" });
           // A lost hold bound again is no longer lost: neither reader is told it, and the Controller keeps it (#453).
@@ -833,7 +834,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     // unbind (#451): release one hold. Its mail and claims stay with the alias; the primary becomes the
     // oldest remaining hold, and the last one leaves the root unbound but owning, its lease closed.
     async unbind(p: OAuthPrincipal, context: SessionContext, args: { name: string }, declared?: DeclaredDelivery) {
-      const result = await service.owning(p, context, (row, defer, tx) => {
+      const result = await service.owning(p, context, async (row, defer, tx) => {
         const before = application.hostedHolds(tx, row.session_id);
         const selected = application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
@@ -841,7 +842,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           const ok = application.unbind(tx, selected.session, args.name);
           if (ok.released) {
             // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
-            store.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: ok.held.length ? row.lease_deadline : null });
+            await store.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: ok.held.length ? row.lease_deadline : null });
             if (row.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "unbound" });
           }
           return { ok, before, ownership: row.ownership_id, suggested: row.suggested };
@@ -887,20 +888,20 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
           const descendants = store.children(tx, childId);
           if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);
-          if (!existing) admit(tx, p.authed.user_id, [root.session_id, childId], root.session_id);
-          else if (!existing.root_session_id) admitChild(tx, root.session_id, [root.session_id, childId]);
-          const attached = attach(tx, p, root);
-          touch(tx, attached);
+          if (!existing) await admit(tx, p.authed.user_id, [root.session_id, childId], root.session_id);
+          else if (!existing.root_session_id) await admitChild(tx, root.session_id, [root.session_id, childId]);
+          const attached = await attach(tx, p, root);
+          await touch(tx, attached);
           // A registration is the child's activity too (#566): the call that follows never meets it parked.
           if (existing?.root_session_id === root.session_id) {
             const current = store.get(tx, childId)!;
-            if (current.parked_at !== null) unpark(tx, p, current); else store.touch(tx, current.session_id, now());
+            if (current.parked_at !== null) await unpark(tx, p, current); else await store.touch(tx, current.session_id, now());
             return { message: "already registered" };
           }
-          if (existing) store.end(tx, existing.session_id, "closed", now());
+          if (existing) await store.end(tx, existing.session_id, "closed", now());
           await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId));
           await application.hostedRoot(tx, childId, root.session_id);
-          store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
+          await store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
           audit(tx, root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
           return { message: "registered", child: childId, root: root.session_id };
@@ -916,13 +917,13 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (row.root_session_id && target !== row.session_id) rootOnly(row);
         const root = rootOf(repo.read, row);
         const later = refusalRows();
-        try { await store.write(tx => {
+        try { await store.write(async tx => {
           fence(tx, p, row, root);
           const candidate = store.get(tx, target);
           if (candidate) ownRow(p, candidate, later.defer, row.session_id);
           // The caller's own session outside this root, or a missing ID: not a policy question, so no row.
           if (!candidate || candidate.ownership_id !== row.ownership_id || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
-          candidate.root_session_id ? store.childEnd(tx, target, now(), "closed") : store.end(tx, target, "closed", now());
+          await (candidate.root_session_id ? store.childEnd(tx, target, now(), "closed") : store.end(tx, target, "closed", now()));
         }); } catch (e) { await later.flushQueued(); throw e; }
         return { ended: true };
       }, false, false, true, false);

@@ -108,7 +108,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
       expect(rows).toEqual([]);
       expect(credits).toEqual([]);
       expect(released()).toBe(1);
-      app.mcp.sessions.sweep();
+      await app.mcp.sessions.sweep();
       expect(released()).toBe(1);
       return;
     }

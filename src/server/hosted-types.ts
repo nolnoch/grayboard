@@ -43,12 +43,12 @@ export interface HostedStore {
   // A user's live roots, oldest first (#475): peer_list's unbound sessions are those holding nothing.
   roots(r: Read, user: number): HostedSession[];
   // Park an idle child, or make a parked one active again under its root's current grant (#566).
-  park(tx: Tx, session: string, now: number): void;
-  unpark(tx: Tx, session: string, grant: string, now: number): void;
-  insert(tx: Tx, row: HostedSession): void;
-  update(tx: Tx, row: HostedSession): void;
+  park(tx: Tx, session: string, now: number): Promise<void>;
+  unpark(tx: Tx, session: string, grant: string, now: number): Promise<void>;
+  insert(tx: Tx, row: HostedSession): Promise<void>;
+  update(tx: Tx, row: HostedSession): Promise<void>;
   // Activity only: `last_seen_at`, observed by no one (#399).
-  touch(tx: Tx, session: string, now: number): void;
+  touch(tx: Tx, session: string, now: number): Promise<void>;
   // The sweep's candidates by query, not by scanning every row (#399): roots whose lease lapsed by `now`; idle
   // unparked rows (children, and roots with no lease and no hold) last seen before `cutoff`; disabled users' roots.
   expired(r: Read, now: number): HostedSession[];
@@ -56,9 +56,9 @@ export interface HostedStore {
   disabled(r: Read): HostedSession[];
   // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
   start(tx: Tx, session: string, user: number, client: string, now: number, suggested?: string | null): Promise<number>;
-  end(tx: Tx, session: string, reason: HostedEnd, now: number, deadline?: number): boolean;
+  end(tx: Tx, session: string, reason: HostedEnd, now: number, deadline?: number): Promise<boolean>;
   // A child's release, or a root's end (each of its children), ends the child's ID in the same transaction.
-  childEnd(tx: Tx, session: string, now: number, reason: ChildEnd): void;
+  childEnd(tx: Tx, session: string, now: number, reason: ChildEnd): Promise<void>;
   // The child IDs ended since the last take: the application's post-commit wakes and bounce deliveries.
   takeEnded(): EndedChild[];
   // A root's lost holds `reader` hasn't taken, oldest first (#453). `lose` records one in the revocation's
