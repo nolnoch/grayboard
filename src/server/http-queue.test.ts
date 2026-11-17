@@ -181,7 +181,7 @@ test("#807 P1c-15c-2: attachment routes and retention reach the store on their b
   expect((await srv.api(you, "POST", "/api/identities", { name: "agent" })).status).toBe(201);
   const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   let route = "";
-  const groupSpies = [repo.attachments, repo.sessionEnd].flatMap(group => (Object.keys(group) as (keyof typeof group)[]).map(name => {
+  const groupSpies = [repo.attachments, repo.sessionEnd, repo.boards].flatMap(group => (Object.keys(group) as (keyof typeof group)[]).map(name => {
     const own = (group[name] as (...a: unknown[]) => unknown).bind(group);
     return spyOn(group, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
       checks.push({ route, op: String(name), inTxn: db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
@@ -204,11 +204,11 @@ test("#807 P1c-15c-2: attachment routes and retention reach the store on their b
     expect((await srv.releaseAs(you, "agent", up.body.id as number)).status).toBe(200);
     route = "retention";
     await runRetention(repo, { ...srv.config, messageRetentionDays: 1, auditRetentionDays: 1 }, Date.now() + 30 * 86_400_000);
-    // The download's reach (core's attachmentReach) stays on coreOn until B5a ports the post reads it takes;
+    // The download's reach reads through repo (P3 B5a1: an unsent upload names no post, so no repo.boards read);
     // retention's coreOn body is its post prune; its ended-ID prune goes through repo.sessionEnd (P3 B4a).
     const ops = (r: string) => checks.filter(c => c.route === r).map(c => `${c.op}:${c.handle}`);
     expect(ops("upload")).toEqual(["insertUpload:tx"]);
-    expect(ops("download")).toEqual(["coreOn:pool", "get:pool", "coreOn:tx", "get:tx"]);
+    expect(ops("download")).toEqual(["get:pool", "get:tx"]);
     expect(ops("release")).toEqual(["dropUnsent:tx", "unnamedBlobs:pool", "named:pool", "dropBlobEntry:tx"]);
     expect(ops("retention")).toEqual(["coreOn:tx", "pruneEnded:tx", "pruneUnbound:tx", "unnamedBlobs:pool"]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);

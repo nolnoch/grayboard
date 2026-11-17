@@ -1,4 +1,5 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
+import { until } from "../../tests/support/until.ts";
 import { AppSession, type AppEvent } from "../../tests/support/app_session.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
@@ -206,12 +207,15 @@ test("a failing postcommit effect does not suppress later effects or retain boar
       await application.call(tx, recipient.session, "board_create", { name: "updates", purpose: "test" });
       await application.call(tx, recipient.session, "board_subscribe", { board: "updates", mode: "push" });
     });
-    recipient.session.sink.deliver = () => { throw new Error("board sink failed"); };
+    // The board drain runs after the commit, off the post's call (#807 P3 B5a1): wait for its failed delivery.
+    let failed = false;
+    recipient.session.sink.deliver = () => { failed = true; throw new Error("board sink failed"); };
     await mcp.sessions.run(principal, context(), "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "updates", body: "durable post" }));
+    await until(() => failed);
     expect(recipient.session.inflight.size).toBe(0);
     recipient.session.sink.deliver = event => { events.push(event); };
     application.wake([recipient.session.identityFull]);
-    expect(events.some(event => event.kind === "board")).toBe(true);
+    await until(() => events.some(event => event.kind === "board"));
     expect(log).toHaveBeenCalled();
   } finally { log.mockRestore(); }
 });
