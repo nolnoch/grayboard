@@ -423,7 +423,8 @@ export interface Repo {
     // Returns up to `maxPages` (> 0) free pages to the filesystem with
     // `PRAGMA incremental_vacuum`. A file without auto_vacuum=INCREMENTAL
     // (created before #170) reclaims nothing until a one-time VACUUM converts it.
-    reclaimFreePages(maxPages: number): { reclaimed: number; remaining: number; incremental: boolean };
+    // Async because the Repo interface is async for the Postgres store (#807 P3 A6f), not because SQLite awaits.
+    reclaimFreePages(maxPages: number): Promise<{ reclaimed: number; remaining: number; incremental: boolean }>;
   };
   // Attachment bytes, by sha256; the attachment rows are metadata in this database.
   blobs: BlobStore;
@@ -1626,7 +1627,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     storage: {
-      reclaimFreePages(maxPages) {
+      async reclaimFreePages(maxPages) {
         return reclaimFreePages(db, maxPages);
       },
     },
