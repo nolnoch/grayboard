@@ -16,7 +16,7 @@ import {
   idStatuses, logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
-import { participant, queuedTx, type MessageRow, type Repo, type Sync } from "./db.ts";
+import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -1180,7 +1180,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         : m.pending && mine.includes(m.sender) ? m.sender
         : null;
       if (!m || reader === null) fail("not_found", `no message ${id} to you or pending from you; dm_inbox lists them`);
-      repo.messages.ack(tx, reader, m.id);
+      await repo.messages.ack(tx, reader, m.id);
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
       valid(session, false, tx);
@@ -1421,14 +1421,15 @@ function prepareSend(
 }
 
 // Writes the message and builds its result. Runs inside the caller's
-// transaction; whether the recipient is live is read here, with nothing
-// awaited before deliverSend pushes, so the result says what happens.
-function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend): Written<SendResult> & { msg: MessageRow } {
+// transaction; whether the recipient is live is read here, inside the
+// queued body. The registry changes only in queued bodies or afterCommit
+// (D4), so the result says what deliverSend does after the commit.
+async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend): Promise<Written<SendResult> & { msg: MessageRow }> {
   const { repo, registry } = hub;
   let msg: MessageRow;
   try {
     if (addressParts(p.to)?.kind === "id") assertDeliverableId(repo.coreOn(tx), p.to);
-    msg = repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
+    msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     throw e;
@@ -1490,7 +1491,7 @@ function deliverSend(hub: Hub, msg: MessageRow): void {
 // afresh, and nothing will bind them), audited like any release.
 // write and recheck run in a savepoint, on its Tx (the caller's refuses statements while it's open).
 async function writeOnce<W extends Written>(
-  hub: Hub, tx: Tx, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: (sp: Tx) => Sync<W>,
+  hub: Hub, tx: Tx, session: ApplicationSession, tool: DedupTool, sender: string, args: Record<string, unknown>, resend: boolean, uploads: number[], write: (sp: Tx) => W | Promise<W>,
   recheck?: (stored: W["payload"], sp: Tx) => void,
 ): Promise<DedupOutcome<W>> {
   const { repo } = hub;
@@ -1596,7 +1597,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
     return { refused: crossUserRefusal(to) };
   };
   try {
-    out = await writeOnce(hub, tx, session, "delegate", session.primary, args, m.resend === true, [], sp => {
+    out = await writeOnce(hub, tx, session, "delegate", session.primary, args, m.resend === true, [], async sp => {
       // Checked and spent in here, so a dedup replay is neither charged nor
       // refused; resend writes again, so it's charged (#252).
       // The user's bucket, not the address's (#252): the row names the session that tripped it.
@@ -1604,7 +1605,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
       if (!t.ok) fail("rate_limited", delegateThrottled(hub.delegateLimit, t.retryAfterMs, "your user"), { retry_after_ms: t.retryAfterMs });
       const d = resolveDelegation(repo.coreOn(sp), session.primary, authed.user_email, { ...m, to }, online, humanReachable(sp), (h) => session.addresses.includes(h), open(sp), hub.delegateOpenCap, reach(sp));
       picked = d.to;
-      const w = writeSend(hub, sp, session, prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
+      const w = await writeSend(hub, sp, session, prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
       writeAudit(repo, sp, "delegation.requested", authed.user_email, d.to, {
         requester: session.primary,
@@ -1676,7 +1677,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || (await repo.cursors.directFor(tx, m.recipient)) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  if (!repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId })) return fail("bad_request", retractRefusal.replied(id));
+  if (!(await repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId }))) return fail("bad_request", retractRefusal.replied(id));
   tx.afterCommit(async () => { await sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo)); });
   return {};
 }
@@ -1869,7 +1870,7 @@ async function handleAck(tx: Tx, session: ApplicationSession, messageIds: number
   for (const msgId of messageIds) {
     const msg = repo.messages.getById(tx, msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
-    if (at !== null) repo.messages.markDelivered(tx, msgId, at);
+    if (at !== null) await repo.messages.markDelivered(tx, msgId, at);
     await repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
   }
 }

@@ -435,6 +435,18 @@ test("dm_retract withdraws a queued message; one the recipient is holding or has
   await expect(a.call("dm_retract", { message_id: fresh.message_id })).rejects.toMatchObject({ message: expect.stringContaining("already reached") });
 });
 
+test("dm_retract refuses a queued message that has a reply, and leaves it in place", async () => {
+  const b = await srv.hosted(B, "fe");
+  await b.close();
+  const a = await srv.hosted(A, "be");
+  const first = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "first" });
+  expect(first.note).toMatch(/^Recipient offline/);
+  await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "also", parent_id: first.message_id });
+
+  await expect(a.call("dm_retract", { message_id: first.message_id })).rejects.toMatchObject({ message: expect.stringMatching(/has a reply/) });
+  expect((await a.call<HistoryMessage[]>("dm_history", { peer: `${B}/fe` })).map((m) => m.body)).toEqual(["first", "also"]);
+});
+
 test("dm_inbox: replied and acked messages drop out; only the recipient can ack", async () => {
   const a = await srv.hosted(A, "be");
   const b = await srv.hosted(B, "fe");
