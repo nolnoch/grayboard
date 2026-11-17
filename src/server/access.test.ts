@@ -32,12 +32,12 @@ beforeEach(async () => {
     const wade = await repo.users.upsertByEmail(tx, "wade@example.com", null);
     const bob = await repo.users.upsertByEmail(tx, "bob@example.com", null);
     const eve = await repo.users.upsertByEmail(tx, "eve@example.com", null);
-    const eng = repo.teams.create(tx, "eng", wade.id);
-    repo.teams.addMember(tx, eng.id, wade.id);
-    repo.teams.addMember(tx, eng.id, bob.id);
-    const ops = repo.teams.create(tx, "ops", eve.id);
-    repo.teams.addMember(tx, ops.id, eve.id);
-    repo.teams.addMember(tx, ops.id, wade.id);
+    const eng = await repo.teams.create(tx, "eng", wade.id);
+    await repo.teams.addMember(tx, eng.id, wade.id);
+    await repo.teams.addMember(tx, eng.id, bob.id);
+    const ops = await repo.teams.create(tx, "ops", eve.id);
+    await repo.teams.addMember(tx, ops.id, eve.id);
+    await repo.teams.addMember(tx, ops.id, wade.id);
     for (const [email, name] of [["wade@example.com", "be"], ["bob@example.com", "be"], ["bob@example.com", "qa"], ["eve@example.com", "be"]] as const) {
       await repo.aliases.create(tx, person(email, name), email);
     }

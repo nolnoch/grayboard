@@ -116,10 +116,10 @@ test("separate multiwatcher fanout needs no attention subscriptions and preserve
 });
 
 test("only authorized same-board watchers receive hints; lost membership closes without private data", async () => {
-  const team = await seed(store.repo, (tx) => {
-    const t = store.repo.teams.create(tx, "private", alice.user_id);
-    store.repo.teams.addMember(tx, t.id, alice.user_id);
-    store.repo.teams.addMember(tx, t.id, bob.user_id);
+  const team = await seed(store.repo, async (tx) => {
+    const t = await store.repo.teams.create(tx, "private", alice.user_id);
+    await store.repo.teams.addMember(tx, t.id, alice.user_id);
+    await store.repo.teams.addMember(tx, t.id, bob.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);
@@ -144,9 +144,9 @@ test("only authorized same-board watchers receive hints; lost membership closes 
 });
 
 test("attachments are metadata only and cannot escape the selected board/page", async () => {
-  const team = await seed(store.repo, (tx) => {
-    const t = store.repo.teams.create(tx, "private", alice.user_id);
-    store.repo.teams.addMember(tx, t.id, alice.user_id);
+  const team = await seed(store.repo, async (tx) => {
+    const t = await store.repo.teams.create(tx, "private", alice.user_id);
+    await store.repo.teams.addMember(tx, t.id, alice.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);
@@ -219,9 +219,9 @@ test("claim create/update/release and refused acquisition's opportunistic lapse 
 });
 
 test("rolled back claims and unauthorized board mutations emit no hint or transient lapse", async () => {
-  const team = await seed(store.repo, (tx) => {
-    const t = store.repo.teams.create(tx, "private", alice.user_id);
-    store.repo.teams.addMember(tx, t.id, alice.user_id);
+  const team = await seed(store.repo, async (tx) => {
+    const t = await store.repo.teams.create(tx, "private", alice.user_id);
+    await store.repo.teams.addMember(tx, t.id, alice.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);
@@ -244,10 +244,10 @@ test("rolled back claims and unauthorized board mutations emit no hint or transi
 });
 
 test("real bearer CLI claim route hints committed posts without attention subscribers or private leaks", async () => {
-  const team = await seed(store.repo, (tx) => {
-    const t = store.repo.teams.create(tx, "private", alice.user_id);
-    store.repo.teams.addMember(tx, t.id, alice.user_id);
-    store.repo.teams.addMember(tx, t.id, bob.user_id);
+  const team = await seed(store.repo, async (tx) => {
+    const t = await store.repo.teams.create(tx, "private", alice.user_id);
+    await store.repo.teams.addMember(tx, t.id, alice.user_id);
+    await store.repo.teams.addMember(tx, t.id, bob.user_id);
     return t;
   });
   const a = await select(alice), b = await select(bob);

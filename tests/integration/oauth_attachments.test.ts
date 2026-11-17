@@ -92,10 +92,10 @@ test("private board visibility is checked again after reading the blob", async (
   const alice = await issue(), bob = await issue("bob@example.com");
   const [a, b] = await Promise.all([connect(alice.token, "2026-07-28"), connect(bob.token, "2026-07-28")]);
   const { ensureTeamBoard, onTeamJoined, onTeamLeft } = await import("../../src/server/teams.ts");
-  const team = await seed(app.repo, (tx) => {
-    const team = app.repo.teams.create(tx, "private", alice.authed.user_id);
-    app.repo.teams.addMember(tx, team.id, alice.authed.user_id);
-    app.repo.teams.addMember(tx, team.id, bob.authed.user_id);
+  const team = await seed(app.repo, async (tx) => {
+    const team = await app.repo.teams.create(tx, "private", alice.authed.user_id);
+    await app.repo.teams.addMember(tx, team.id, alice.authed.user_id);
+    await app.repo.teams.addMember(tx, team.id, bob.authed.user_id);
     ensureTeamBoard(app.repo, tx, team, "alice@example.com");
     onTeamJoined(app.repo, tx, team, "alice@example.com");
     onTeamJoined(app.repo, tx, team, "bob@example.com");
@@ -111,8 +111,8 @@ test("private board visibility is checked again after reading the blob", async (
   const reading = attachment(bob.token, "GET", id);
   await Promise.race([entered, reading.then(response => { throw new Error(`blob read was bypassed: ${response.status}`); })]);
   // The download holds no write: its blob read waits outside the queue, so this body runs now.
-  await seed(app.repo, (tx) => {
-    app.repo.teams.removeMember(tx, team.id, bob.authed.user_id);
+  await seed(app.repo, async (tx) => {
+    await app.repo.teams.removeMember(tx, team.id, bob.authed.user_id);
     onTeamLeft(app.repo, tx, team, "bob@example.com");
   });
   resume();

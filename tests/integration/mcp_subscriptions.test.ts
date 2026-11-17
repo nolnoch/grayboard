@@ -319,9 +319,9 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membership loss and background storage fault close streams`, async () => {
   const grant = await issue();
-  const team = await seed(app.repo, (tx) => {
-    const t = app.repo.teams.create(tx, "private", grant.authed.user_id);
-    app.repo.teams.addMember(tx, t.id, grant.authed.user_id);
+  const team = await seed(app.repo, async (tx) => {
+    const t = await app.repo.teams.create(tx, "private", grant.authed.user_id);
+    await app.repo.teams.addMember(tx, t.id, grant.authed.user_id);
     return t;
   });
   const c = await connect(grant.token, version);

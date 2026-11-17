@@ -204,9 +204,9 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   const grant = await issue();
   const alice = grant.authed.user_id;
   const bob = await issue("bob@example.com");
-  const team = await seed(app.repo, (tx) => {
-    const t = app.repo.teams.create(tx, "private", alice);
-    app.repo.teams.addMember(tx, t.id, alice);
+  const team = await seed(app.repo, async (tx) => {
+    const t = await app.repo.teams.create(tx, "private", alice);
+    await app.repo.teams.addMember(tx, t.id, alice);
     return t;
   });
   const native = await connect(grant.token);
@@ -251,10 +251,10 @@ test("issued contiguous DM prefix receipts survive lost responses, but not out-o
 test("wire board receipts bind the issued snapshot and reject removed private-board membership", async () => {
   const alice = await issue();
   const bob = await issue("bob@example.com");
-  const team = await seed(app.repo, (tx) => {
-    const t = app.repo.teams.create(tx, "private", alice.authed.user_id);
-    app.repo.teams.addMember(tx, t.id, alice.authed.user_id);
-    app.repo.teams.addMember(tx, t.id, bob.authed.user_id);
+  const team = await seed(app.repo, async (tx) => {
+    const t = await app.repo.teams.create(tx, "private", alice.authed.user_id);
+    await app.repo.teams.addMember(tx, t.id, alice.authed.user_id);
+    await app.repo.teams.addMember(tx, t.id, bob.authed.user_id);
     return t;
   });
   const sender = await connect(alice.token);
