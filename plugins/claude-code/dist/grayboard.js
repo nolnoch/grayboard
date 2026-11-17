@@ -37895,7 +37895,7 @@ ${record.message}`;
     if (!this.proxy)
       return failure2(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
     if (o.child !== undefined)
-      return this.childCall(o.child, tool, args, before);
+      return this.childCall(o.child, tool, args, before, o.passed);
     const refused = () => this.held && (tool === "bind" || tool === "unbind") ? failure2(`${this.held}; bind and unbind work from the process that holds delivery`) : undefined;
     const early = refused();
     if (early)
@@ -37912,12 +37912,13 @@ ${record.message}`;
     this.notices.clear();
     return shown.length ? { ...result, content: [...shown.map((n) => ({ type: "text", text: `grayboard: ${n}` })), ...result.content] } : result;
   }
-  async childCall(child, tool, args, before) {
+  async childCall(child, tool, args, before, passed) {
     if (this.closed)
       return failure2(`this ${this.client.options.harness} session is closing`);
     const after = before ? await before() : undefined;
     const proxy = this.proxy;
     this.children.add(child);
+    passed?.();
     this.used = true;
     if (proxy !== this.hooked) {
       try {
@@ -37929,8 +37930,8 @@ ${record.message}`;
     const result = await this.client.call(proxy, tool, args, child);
     return after ? { ...result, content: [{ type: "text", text: `grayboard: ${after}` }, ...result.content] } : result;
   }
-  async endChild(child) {
-    if (!this.children.delete(child))
+  async endChild(child, called = false) {
+    if (!this.children.delete(child) && !called)
       return;
     try {
       await end(this.client.temporary, { child });
@@ -37996,6 +37997,7 @@ ${record.message}`;
 
 // src/shared/claude_agents.ts
 import { closeSync, constants as constants3, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { createHash as createHash7 } from "crypto";
 import { join as join5, resolve as resolve3 } from "path";
 
 // src/shared/protocol.ts
@@ -38132,6 +38134,39 @@ function readFacts(base, claudePid, harnessStart, bad) {
       bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);
   }
   return out;
+}
+var calledPath = (base, claudePid, agent) => join5(sessionDir(base, claudePid), "called", createHash7("sha256").update(agent).digest("hex"));
+function markCalled(base, claudePid, agent) {
+  const path = calledPath(base, claudePid, agent);
+  mkdirSync2(join5(path, ".."), { recursive: true, mode: 448 });
+  writeFileSync(path, "", { mode: 384 });
+}
+function ownDir(base, claudePid, harnessStart) {
+  let start;
+  try {
+    start = readFileSync4(join5(sessionDir(base, claudePid), "start"), "utf8");
+  } catch {
+    return false;
+  }
+  return harnessStart === null || start === "" || start === harnessStart;
+}
+function dropCalled(base, claudePid) {
+  rmSync(join5(sessionDir(base, claudePid), "called"), { recursive: true, force: true });
+}
+function hasCalled(base, claudePid) {
+  try {
+    return readdirSync2(join5(sessionDir(base, claudePid), "called")).length > 0;
+  } catch {
+    return false;
+  }
+}
+function takeCalled(base, claudePid, agent) {
+  try {
+    unlinkSync(calledPath(base, claudePid, agent));
+    return true;
+  } catch {
+    return false;
+  }
 }
 function takeEnded(base, claudePid) {
   const dir = join5(sessionDir(base, claudePid), "ended");
@@ -38578,9 +38613,11 @@ function createPlugin(o) {
   const drainEnded = () => {
     if ("error" in config || closed)
       return;
+    const ours = ownDir(config.dataDir, o.claude.pid, o.claude.start);
     for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      const called = takeCalled(config.dataDir, o.claude.pid, agent) && ours;
       if (validSourceId(childOf(agent)))
-        root?.endChild(childOf(agent));
+        root?.endChild(childOf(agent), called);
     }
   };
   const watchEnded = () => {
@@ -38599,6 +38636,8 @@ function createPlugin(o) {
     }
     drainEnded();
   };
+  if (!("error" in config) && ownDir(config.dataDir, o.claude.pid, o.claude.start) && hasCalled(config.dataDir, o.claude.pid))
+    watchEnded();
   const call = async (name, args, meta) => {
     if ("error" in config)
       return failure2(config.error);
@@ -38618,9 +38657,17 @@ function createPlugin(o) {
       say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
       return failure2(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
     }
+    const agent = taken.agent;
+    const passed = () => {
+      try {
+        markCalled(config.dataDir, o.claude.pid, agent);
+      } catch (error) {
+        say(`couldn't note subagent ${agent.slice(0, 160)}'s call: ${message(error)}; if this plugin restarts first, its session lasts until this one ends`);
+      }
+    };
     watchEnded();
     drainEnded();
-    return root.call(name, args, before, { child });
+    return root.call(name, args, before, { child, passed });
   };
   const tools = () => root?.tools() ?? hostTools(snapshotTools());
   const serve = (instructions) => {
@@ -38683,7 +38730,15 @@ function createPlugin(o) {
     closed = true;
     endWatch?.close();
     signins.flow?.abort.abort();
+    const held = root?.status().held;
     await root?.shutdown("release");
+    if (root && !held && !("error" in config)) {
+      try {
+        dropCalled(config.dataDir, o.claude.pid);
+      } catch (error) {
+        say(`couldn't clear subagent notes: ${message(error)}`);
+      }
+    }
     await server?.close().catch(() => {});
   };
   return { connect: connectTransport, shutdown };

@@ -402,9 +402,10 @@ export class RootDelivery {
   // above; the tools-only proxy has no hooks, so the root registers it here,
   // once. The server refuses a child's bind and unbind. The root's notices
   // stay for the root's next result: a child's agent isn't the one to act on them.
-  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, o: { child?: string } = {}): Promise<CallToolResult> {
+  // `passed` runs once the child is this root's to end (the plugin notes it, #555).
+  async call(tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, o: { child?: string; passed?: () => void } = {}): Promise<CallToolResult> {
     if (!this.proxy) return failure(`grayboard hasn't started in this ${this.client.options.harness} session yet`);
-    if (o.child !== undefined) return this.childCall(o.child, tool, args, before);
+    if (o.child !== undefined) return this.childCall(o.child, tool, args, before, o.passed);
     // The process holding delivery owns this session's binding: a tools-only
     // one rebinding it would fight the holder. Checked again after `before`,
     // whose retry of a lock error (the plugin's unpause) can find it held.
@@ -423,11 +424,12 @@ export class RootDelivery {
     return shown.length ? { ...result, content: [...shown.map(n => ({ type: "text" as const, text: `grayboard: ${n}` })), ...result.content] } : result;
   }
 
-  private async childCall(child: string, tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>): Promise<CallToolResult> {
+  private async childCall(child: string, tool: string, args: Record<string, unknown>, before?: () => Promise<string | undefined>, passed?: () => void): Promise<CallToolResult> {
     if (this.closed) return failure(`this ${this.client.options.harness} session is closing`);
     const after = before ? await before() : undefined;
     const proxy = this.proxy!;
     this.children.add(child);
+    passed?.();
     this.used = true;
     // The push proxy's Controller registers the child before each call. The
     // tools-only proxy does the same here: a registration remembered across
@@ -443,9 +445,12 @@ export class RootDelivery {
   // A child's agent finished (Claude Code's SubagentStop): its hosted session
   // ends now: the server's idle sweep ends only roots, so a child's session
   // otherwise lasts until its root's does. Only a child a call passed; said on
-  // failure. Never rejects.
-  async endChild(child: string): Promise<void> {
-    if (!this.children.delete(child)) return;
+  // failure. `called`: the host knows a call passed in an earlier process of
+  // this session (the plugin's record dir survives its restart, #555): the end
+  // of a session the server no longer has starts one to end it, so the host
+  // forgets a call once its root's release ended the child. Never rejects.
+  async endChild(child: string, called = false): Promise<void> {
+    if (!this.children.delete(child) && !called) return;
     try { await end(this.client.temporary, { child }); }
     catch (error) { this.log(`couldn't end subagent session ${child} on the server: ${message(error)}`, "warning"); }
   }

@@ -25,8 +25,10 @@ export type Session = {
   protocol: () => string | undefined;
   // Restart grayboard under the same harness, as `/mcp` reconnect does
   // ("reconnect") or a crash does ("crash"), and handshake with the new
-  // process. The returned session replaces this one.
-  restart: (how: "reconnect" | "crash") => Promise<Session>;
+  // process. The returned session replaces this one. `pid`: signal that
+  // process instead, a stand-in between the harness and grayboard that
+  // restarts its own child the same way, keeping its pid.
+  restart: (how: "reconnect" | "crash", pid?: number) => Promise<Session>;
 };
 
 const open = new Set<Client>();
@@ -81,9 +83,9 @@ async function handshake(t: HarnessTransport, shape: ClientShape): Promise<Sessi
   return {
     c, pushes, stderr: t.stderr, harnessPid: t.pid, protocol: () => t.protocol,
     call: (name, args) => call(c, name, args).catch((e) => Promise.reject(withStderr(e, t.stderr))),
-    restart: async (how) => {
+    restart: async (how, pid) => {
       open.delete(c);
-      await t.restart(how === "crash" ? "SIGUSR2" : "SIGUSR1");
+      await t.restart(how === "crash" ? "SIGUSR2" : "SIGUSR1", pid);
       return handshake(t, shape);
     },
   };
@@ -139,10 +141,11 @@ class HarnessTransport implements Transport {
     return new Promise((ok) => (stdin.write(serializeMessage(message)) ? ok() : stdin.once("drain", ok)));
   }
 
-  async restart(signal: "SIGUSR1" | "SIGUSR2"): Promise<void> {
+  async restart(signal: "SIGUSR1" | "SIGUSR2", pid?: number): Promise<void> {
     const before = this.err.split(RESTARTED).length;
     this.buf.clear();
-    this.p!.kill(signal);
+    if (pid === undefined) this.p!.kill(signal);
+    else process.kill(pid, signal);
     await until(() => this.err.split(RESTARTED).length > before, 10_000, "the harness to restart grayboard");
   }
 
