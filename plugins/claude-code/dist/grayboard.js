@@ -36732,7 +36732,7 @@ class Controller {
     return path.root !== sessionID && r && !r.paused ? path : undefined;
   }
   async enlist(path, fetch2 = false) {
-    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0;
+    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call = (sessionID, c) => this.temporary(e, c, sessionID);
     const shared = () => {
@@ -36756,6 +36756,7 @@ class Controller {
       });
       return started;
     };
+    const unmoved = () => !this.stopped && !this.routes.isEnded(path.sessionID) && !this.routes.isEnded(path.root) && this.roots.get(path.root) === r && !!r && !r.paused && r.epoch === epoch;
     let done = shared(), joined = !!done;
     for (;; ) {
       done ??= start();
@@ -36764,7 +36765,7 @@ class Controller {
       }, (error) => ({ error }));
       if (!error)
         break;
-      if (joined) {
+      if (joined && unmoved()) {
         joined = false;
         done = shared();
         continue;

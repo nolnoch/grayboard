@@ -205,7 +205,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // server ownership its lease names: any end of that ownership (a release, a
   // lapsed lease the run loop reopens, an idle sweep) deletes child rows (#567).
   async enlist(path: SessionPath, fetch = false): Promise<void> {
-    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0;
+    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call: Temporary = (sessionID, c) => this.temporary(e, c, sessionID);
     const shared = () => {
@@ -225,13 +225,17 @@ export class Controller<E extends Enrollment = Enrollment> {
     };
     // A joined registration that fails may have failed on an older request's deadline (one held at the bind
     // gate, its 10s spent before this call began): this call then registers once on its own, as it would have
-    // unshared, joining instead any newer one a peer started first (#567).
+    // unshared, joining instead any newer one a peer started first (#567). Only while nothing it registers
+    // under has moved since it began: a root stopped, paused, re-enrolled or ended, or a child ended, would
+    // have the retry start an ownership nothing then ends, so the joined failure stands.
+    const unmoved = () => !this.stopped && !this.routes.isEnded(path.sessionID) && !this.routes.isEnded(path.root)
+      && this.roots.get(path.root) === r && !!r && !r.paused && r.epoch === epoch;
     let done = shared(), joined = !!done;
     for (;;) {
       done ??= start();
       const error = await done.then(() => undefined, (error: unknown) => ({ error }));
       if (!error) break;
-      if (joined) { joined = false; done = shared(); continue; }
+      if (joined && unmoved()) { joined = false; done = shared(); continue; }
       if (!fetch) this.failure("child_register", error.error, r);
       throw error.error;
     }

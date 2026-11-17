@@ -569,6 +569,29 @@ test.each(modes)("a call whose joined registration fails registers once on its o
   } finally { await r.controller.close(); }
 });
 
+// #567 audit: the retry happens only while nothing the call registers under has moved: a root paused, or a child
+// ended, while the joined registration was held fails the call with it rather than starting an ownership nothing ends.
+test.each(modes)("a call whose joined registration fails after its root paused or its child ended doesn't register again (#567) (%s)", async mode => {
+  for (const move of ["pause", "end"] as const) {
+    const r = runtime(mode);
+    try {
+      await r.controller.enroll("R", ["be"], true);
+      await until(() => r.root(r.controller)?.state === "active");
+      let fail!: (error: Error) => void;
+      r.holdRegister(new Promise<void>((_, reject) => { fail = reject; }));
+      const fetching = r.controller.enlist({ sessionID: "C", root: "R", via: [] }, true);
+      await until(() => r.named("session_register").length === 1);
+      const calling = r.controller.enlist({ sessionID: "C", root: "R", via: [] });
+      r.holdRegister();
+      if (move === "pause") await r.controller.pause(); else await r.controller.ended("C");
+      fail(new Error("MCP request timed out"));
+      const out = await Promise.allSettled([fetching, calling]);
+      expect(out.map(o => o.status === "rejected" && String(o.reason))).toEqual(["Error: MCP request timed out", "Error: MCP request timed out"]);
+      expect(r.named("session_register")).toHaveLength(1);
+    } finally { await r.controller.close(); }
+  }
+});
+
 // #567 audit: the server's end of a root's ownership (a lapsed lease, an idle sweep) deletes its child rows without
 // moving the root's epoch: a run loop that reopens under a new ownership invalidates the remembered registration,
 // as does a child call the server answers unbound.
