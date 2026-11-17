@@ -101,8 +101,8 @@ test("a name the identity rule refuses stays as written", () => {
 });
 
 test("the human flag moves with its handle", () => {
-  const path = legacyBus(["Wade"], (db) => db.prepare(`UPDATE handles SET human = 1 WHERE name = 'Wade'`).run());
+  const path = legacyBus(["Alex"], (db) => db.prepare(`UPDATE handles SET human = 1 WHERE name = 'Alex'`).run());
   const { db } = openLocalDb(path);
-  expect(db.prepare(`SELECT address, human FROM aliases WHERE human = 1`).all()).toEqual([{ address: "wade", human: 1 }]);
+  expect(db.prepare(`SELECT address, human FROM aliases WHERE human = 1`).all()).toEqual([{ address: "alex", human: 1 }]);
   db.close();
 });
