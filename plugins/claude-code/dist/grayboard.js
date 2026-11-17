@@ -36547,6 +36547,7 @@ class SessionRoutes {
   limit;
   paths = new Map;
   ended = new Set;
+  orphans = new Set;
   constructor(limit = ENDED_LIMIT) {
     this.limit = limit;
   }
@@ -36557,6 +36558,7 @@ class SessionRoutes {
     if (previous && previous.root !== path.root)
       throw new AncestryError("Grayboard session ancestry changed");
     this.paths.set(path.sessionID, { ...path, via: [...path.via] });
+    this.orphans.delete(path.sessionID);
   }
   get(sessionID) {
     const path = this.paths.get(sessionID);
@@ -36573,6 +36575,18 @@ class SessionRoutes {
       this.ended.delete(this.ended.values().next().value);
     const path = this.paths.get(sessionID);
     this.paths.delete(sessionID);
+    this.orphans.delete(sessionID);
+    if (path && path.root === sessionID) {
+      for (const [id, p] of this.paths)
+        if (p.root === sessionID)
+          this.orphans.add(id);
+      for (const id of this.orphans) {
+        if (this.orphans.size <= this.limit)
+          break;
+        this.orphans.delete(id);
+        this.paths.delete(id);
+      }
+    }
     return path ? { ...path, via: [...path.via] } : undefined;
   }
 }
