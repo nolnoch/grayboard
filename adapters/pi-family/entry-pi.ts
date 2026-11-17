@@ -38,7 +38,7 @@ export default function grayboard(pi: ExtensionAPI) {
           // Plain JSON Schema: pi-ai validates by it when the schema isn't TypeBox.
           parameters: { ...tool.inputSchema, properties: tool.inputSchema.properties ?? {} } as never,
           namespace: { name: `mcp__${SERVER}`, aliases: [SERVER] },
-          execute: async (_id, params) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params))),
+          execute: async (_id, params, signal) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params), signal)),
         });
       }
     },

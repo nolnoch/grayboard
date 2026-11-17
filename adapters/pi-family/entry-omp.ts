@@ -77,7 +77,7 @@ export default function grayboard(pi: ExtensionAPI) {
           approval: "write",
           strict: false,
           loadMode: loadMode(tool),
-          execute: async (_id, params) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params))),
+          execute: async (_id, params, signal) => toolResult(SERVER, tool.name, await call(tool.name, toolArgs(params), signal)),
         });
       }
     },
