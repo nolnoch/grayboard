@@ -171,15 +171,18 @@ test("setup --server <another server> signs pi out of the old one and points con
   f.signIn();
   f.run("setup", "--server", SERVER, "-y");
   await f.seedGrant();
+  // Signed in already: a re-run on the same server asks for no login.
+  expect(f.run("setup", "--server", SERVER, "-y")).not.toContain("/grayboard login");
   const other = "http://localhost:9";
   f.signIn(other);
   const out = f.run("setup", "--server", other, "-y");
   await expectLoggedOut(f, out);
+  expect(out).toContain("Run /grayboard login in pi to sign it in.");
   expect(JSON.parse(readFileSync(f.paths.config, "utf8"))).toEqual({ url: `${other}/mcp` });
   expect(existsSync(f.paths.hosted)).toBe(true);
 }, 60_000);
 
-for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${h} adapter where either is installed, and leaves symlinks and absent installs alone`, () => {
+for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${h} adapter where either is installed, and leaves symlinks and absent installs alone`, async () => {
   const f = fixture(h);
   // Nothing installed: nothing written.
   f.signIn();
@@ -190,8 +193,23 @@ for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${
   mkdirSync(join(f.paths.local, ".."), { recursive: true });
   writeFileSync(f.paths.local, "// stale");
   writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry } }));
-  expect(f.run("refresh-adapters")).toContain(`Refreshed ${f.paths.hosted}`);
+  const login = `Run /grayboard login in ${h} to sign it in.`;
+  const migrated = f.run("refresh-adapters");
+  expect(migrated).toContain(`Refreshed ${f.paths.hosted}`);
+  expect(migrated).toContain(login);
   expectHosted(f);
+  // The step follows the grant, not the config: still signed out, it's asked
+  // for again; signed in, never, even when config.json was rewritten.
+  expect(f.run("refresh-adapters")).toContain(login);
+  await f.seedGrant();
+  expect(f.run("refresh-adapters")).not.toContain(login);
+  rmSync(f.paths.config);
+  expect(f.run("refresh-adapters")).not.toContain(login);
+  // Another server: signed out of the old one, and the new one needs a login.
+  f.signIn("http://localhost:9");
+  const moved = f.run("refresh-adapters");
+  expect(moved).toContain(`Signed ${h} out of ${SERVER}/mcp`);
+  expect(moved).toContain(login);
 
   // Back in local mode the entry the local adapter reads is recreated.
   rmSync(join(f.root, "credentials"));
