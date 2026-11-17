@@ -139,9 +139,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const principal = principals.get(session) ?? exchanges.getStore()?.context?.principal;
     return !closed && !!principal && session.authed.user_id === principal.authed.user_id && oauth.isAuthorizedNow(principal, r);
   } });
-  // Resources, hosted and delivery check synchronously, inside bodies and "no await since" reuses that #807 P3 A7d2 re-audits.
-  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorizedNow(principal, r) });
-  const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorizedNow(principal, r), now, caps: caps.leases });
+  // Resources check synchronously until #807 P3 A7d2c; hosted and delivery await the check (A7d2b).
+  const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
+  const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);

@@ -18,7 +18,7 @@ export type PendingDelivery = { id: string; actionable: boolean; event: Delivery
 export type DeliveryOpenOptions = { context?: boolean };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
 // `r`: the body's Tx when the check runs inside one, so it sees that body's own revokes; else the pool.
-export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal, r?: Read): boolean; now?: () => number; caps?: HostedCaps["leases"] };
+export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal, r?: Read): boolean | Promise<boolean>; now?: () => number; caps?: HostedCaps["leases"] };
 type Issued = { item: PendingDelivery; ref?: PendingRef };
 // What a retried receipt of an acknowledged id re-checks, without the item's body (#805).
 type Acked = { ownership: number; bind_gen: number; address?: string; board?: string };
@@ -95,25 +95,34 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     if (error instanceof StaleCapability) hosted.audit(pool, id, "hosted.stale_capability", {}, p);
     throw error;
   }
-  // `authorized`: the caller checked p's token this turn, with no await since (#853).
-  // `r`: the body's Tx when this runs inside one, so the fallback row read and the access check stay in that transaction; else the pool.
-  function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, authorized = false, r: Read = pool) {
+  // The lease for `capability`, without the token check: only for a caller that checked p's token this turn, with no
+  // await since (#853), so synchronous.
+  // `r`: the body's Tx when this runs inside one, so the fallback row read stays in that transaction; else the pool.
+  function getChecked(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, r: Read = pool) {
     const lease = leases.get(capability);
     if (stopped || !lease || !("id" in context) || context.id !== lease.sessionId ||
       p.authed.user_id !== lease.principal.authed.user_id || p.clientId !== lease.principal.clientId || p.grantId !== lease.principal.grantId ||
-      !matches(lease, row ?? store.get(r, lease.sessionId)) || (!authorized && !options.isAuthorized(p, r))) return stale(p, context, capability);
+      !matches(lease, row ?? store.get(r, lease.sessionId))) return stale(p, context, capability);
+    return lease;
+  }
+  // getChecked, then p's token checked on `r` (#807 P3 A7d2b). A lease finished while the check awaited (a commit's
+  // hosted.listen, a shutdown) is refused, never returned.
+  async function get(p: DeliveryPrincipal, context: SessionContext, capability: string, row?: HostedSession, r: Read = pool) {
+    const lease = getChecked(p, context, capability, row, r);
+    if (!await options.isAuthorized(p, r) || stopped || leases.get(capability) !== lease) return stale(p, context, capability);
     return lease;
   }
   const describe = (l: Lease): DeliveryLease => ({ capability: l.capability, identity: structuredClone(l.identity), expiresAt: l.expiresAt, ownership: l.ownership, bind_gen: l.generation });
   const service = {
     get activeLeaseCount() { return leases.size; },
-    // `checked`: the caller's row for context.id, read after it authorized p with no await since (#853).
-    describe(p: DeliveryPrincipal, context: SessionContext, capability: string, checked?: { row: HostedSession | undefined }) {
-      try { return describe(get(p, context, capability, checked?.row, !!checked)); } catch (error) { return refused(p, context, error); }
+    // `checked`: the caller's row for context.id, read after it authorized p with no await since (#853). Required: a
+    // caller without one has no synchronous way to check the token (#807 P3 A7d2b).
+    describe(p: DeliveryPrincipal, context: SessionContext, capability: string, checked: { row: HostedSession | undefined }) {
+      try { return describe(getChecked(p, context, capability, checked.row)); } catch (error) { return refused(p, context, error); }
     },
     // `describe`'s check without its copy of the identity: the per-request lease check reads one field (#912).
-    identityFull(p: DeliveryPrincipal, context: SessionContext, capability: string, checked?: { row: HostedSession | undefined }): string {
-      try { return get(p, context, capability, checked?.row, !!checked).identity.identity_full; } catch (error) { return refused(p, context, error); }
+    identityFull(p: DeliveryPrincipal, context: SessionContext, capability: string, checked: { row: HostedSession | undefined }): string {
+      try { return getChecked(p, context, capability, checked.row).identity.identity_full; } catch (error) { return refused(p, context, error); }
     },
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
@@ -161,7 +170,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       return hosted.control(p, context, false, async row => {
         const { lease } = await store.write(async tx => {
           const fresh = store.get(tx, row.session_id);
-          const lease = get(p, context, capability, fresh, false, tx), deadline = now() + ttl;
+          const lease = await get(p, context, capability, fresh, tx), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
           await store.update(tx, { ...fresh, lease_deadline: deadline, last_seen_at: now() });
           // The lease was read before the update's await (#807 P3 A6e2): one finished meanwhile is refused here, which
@@ -180,9 +189,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async pending(p: DeliveryPrincipal, context: SessionContext, capability: string, limit = 100): Promise<PendingDelivery[]> {
       return hosted.control(p, context, false, async row => {
-        const lease = get(p, context, capability, row);
+        const lease = await get(p, context, capability, row);
         await testPauseAsync("hosted:pending:in-gate");
-        get(p, context, capability);
+        await get(p, context, capability);
         let items = (await application.pending(application.repo.read, lease.session, limit)).map(event => itemOf(event, lease));
         // Security audit F-03 (#854): a host without context starts a turn for every item it's given, so
         // after the ownership's first drain (local mode's) a lone non-waking item (ungranted,
@@ -203,7 +212,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         await store.write(async tx => {
           testPause("hosted:receipt:in-txn");
           const row = "id" in context ? store.get(tx, context.id) : undefined;
-          const lease = get(p, context, capability, row, false, tx);
+          const lease = await get(p, context, capability, row, tx);
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
           const records: Issued[] = [];
@@ -223,6 +232,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           application.receiptBoards(tx, lease.session, records.filter(r => r.ref).map(r => r.ref!));
           return { lease, records };
         }, ({ lease, records }) => {
+          // No lease recheck: get rechecked after its await, the body holds the queue, and a lease a shutdown finished
+          // since is detached (its maps cleared), so writing to it changes nothing a caller reads.
           for (const { item } of records) {
             lease.issued.delete(item.id);
             lease.acknowledged.set(item.id, { ownership: item.ownership, bind_gen: item.bind_gen, ...(item.address !== undefined ? { address: item.address } : {}), ...(boardOf(item) !== undefined ? { board: boardOf(item) } : {}) });
@@ -235,7 +246,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
         await store.write(async tx => {
-          get(p, context, capability, store.get(tx, row.session_id), false, tx);
+          await get(p, context, capability, store.get(tx, row.session_id), tx);
           await store.end(tx, row.session_id, "closed", now());
         });
       }, () => undefined).catch(error => refused(p, context, error));
