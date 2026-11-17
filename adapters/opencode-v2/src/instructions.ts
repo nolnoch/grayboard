@@ -31,22 +31,33 @@ const MCP_SEGMENT = new Set([
   "The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:",
 ]);
 
-// The [start, stop) lines of a part's MCP instructions. OpenCode joins its
-// instruction sources with a blank line, the code-mode catalog first and MCP
-// instructions next, ahead of references, skills and project instruction
-// files (#538). The segment holds no blank line: `entries()` indents every
-// instruction line, an empty one too. So it runs from the first opening line
-// that starts a segment to the next blank line, and a project file or skill
-// that quotes a grayboard entry later in the part is never rewritten. The
-// search stops at the first project file (core/instructions renders each as
-// `Instructions from: <path>`), so a part with no MCP instructions is left
-// alone even where a file quotes a whole segment.
+// How each paragraph of OpenCode's code-mode catalog source starts, in its
+// initial, changed and removed renders (@opencode/core 2.1.4,
+// src/codemode/instructions.ts): its tool and namespace lines start "- ".
+const CODE_MODE = [
+  "# Code Mode", "Use the `execute` tool", "The catalog is ", "## Available tools", "- ",
+  "No Code Mode tools", "The Code Mode tool catalog has changed.", "New tool namespaces are available",
+  "The following namespace inventories", "The following tool namespaces are no longer", "New tools are available",
+  "Changed tool listings", "The following tools are no longer available", "Code Mode tools are no longer available.",
+];
+
+// The [start, stop) lines of a part's MCP instructions (#538). OpenCode joins
+// its instruction sources with a blank line in a fixed order: the code-mode
+// catalog, MCP instructions, then references, skills, project instruction
+// files, built-ins and context entries. So the segment is accepted only
+// where every paragraph before it is the code-mode catalog's; any other
+// source's paragraph first ends the search, and a later source that quotes a
+// grayboard entry (a project file in its initial or changed render, a context
+// entry) is never rewritten. The segment holds no blank line: `entries()`
+// indents every instruction line, an empty one too. So it runs to the next
+// blank line.
 function mcpSegment(lines: string[]): [number, number] | undefined {
   let start = -1;
   for (let i = 0; i < lines.length && start < 0; i++) {
     if (i > 0 && lines[i - 1] !== "") continue;
-    if (lines[i]!.startsWith("Instructions from: ")) return undefined;
-    if (MCP_SEGMENT.has(lines[i]!)) start = i;
+    const line = lines[i]!;
+    if (MCP_SEGMENT.has(line)) start = i;
+    else if (line !== "" && !CODE_MODE.some(prefix => line.startsWith(prefix))) return undefined;
   }
   if (start < 0) return undefined;
   const stop = lines.indexOf("", start + 1);
@@ -173,8 +184,10 @@ export class RootInstructions {
 }
 
 // The `context` hook's work on one request: grayboard's entry in the system
-// prompt (OpenCode's `system[1]`, the session's initial context render) and in any persisted "instructions changed" system message, rebuilt
-// around the root's current text. Never rejects.
+// prompt's context render and in any persisted "instructions changed" system
+// message, rebuilt around the root's current text. OpenCode puts the agent
+// prompt at `system[0]` and the context render after it; the agent prompt is
+// user-authored text and is never touched. Never rejects.
 export async function rewrite(request: Pick<SessionContext, "sessionID" | "system" | "messages">, mcpName: string, instructions: (sessionID: string) => Promise<string | undefined>): Promise<Plan> {
   try {
     const current = await instructions(request.sessionID);
@@ -186,7 +199,7 @@ export async function rewrite(request: Pick<SessionContext, "sessionID" | "syste
       plan = "replace";
       if (rebuilt.text !== part.text) part.text = rebuilt.text;
     };
-    for (const part of request.system) apply(part as { text: string });
+    for (const part of request.system.slice(1)) apply(part as { text: string });
     const open = `  <server name="${mcpName}">`;
     for (const message of request.messages) {
       if (message.role !== "system") continue;

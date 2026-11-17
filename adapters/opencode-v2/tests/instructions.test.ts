@@ -28,19 +28,24 @@ test("rebuild replaces only grayboard's entry, keeps its frame and codemode line
   // No grayboard entry (denied tools, disconnected at start): unchanged.
   const other = ["<mcp_instructions>", '  <server name="docs">', "    Read the docs.", "  </server>", "</mcp_instructions>"].join("\n");
   expect(rebuild(other, "grayboard", bound)).toEqual({ plan: "none", text: other });
-  // An unclosed frame is left alone.
-  expect(rebuild('  <server name="grayboard">\n    x', "grayboard", bound).plan).toBe("none");
+  // An unclosed frame inside the segment, or one whose close lies past the segment's blank line, is left alone.
+  const unclosed = '<mcp_instructions>\n  <server name="grayboard">\n    x';
+  expect(rebuild(unclosed, "grayboard", bound)).toEqual({ plan: "none", text: unclosed });
+  const pastStop = '<mcp_instructions>\n  <server name="grayboard">\n    x\n\n  </server>\n</mcp_instructions>';
+  expect(rebuild(pastStop, "grayboard", bound)).toEqual({ plan: "none", text: pastStop });
   // Another mcpName.
   expect(rebuild(render(unbound).replaceAll('"grayboard"', '"bus"'), "bus", bound).plan).toBe("replace");
 });
 
 // OpenCode joins its instruction sources with a blank line: code-mode catalog,
-// MCP instructions, then references, skills and project instruction files.
+// MCP instructions, then references, skills, project instruction files,
+// built-ins and context entries (@opencode/core 2.1.4).
 test("rebuild rewrites only the MCP instructions segment, never a project file or skill that quotes an entry (#538)", () => {
   const catalog = "# Code Mode\n\nUse the `execute` tool.\n\n## Available tools\n\n- grayboard (12 tools)\n  - board_read(...) // Read a board";
   const quoted = render(unbound).replace(unbound, "Quoted from a project file.");
   const file = `Instructions from: /repo/AGENTS.md\nAn example of OpenCode's prompt:\n\n${quoted}`;
-  const prompt = (text: string) => [catalog, render(text), "Skill: review", file].join("\n\n");
+  const skills = "Skills provide specialized instructions and workflows for specific tasks.\n<available_skills>\n  <skill>\n    <name>review</name>\n  </skill>\n</available_skills>";
+  const prompt = (text: string) => [catalog, render(text), skills, file].join("\n\n");
   expect(rebuild(prompt(unbound), "grayboard", bound)).toEqual({ plan: "replace", text: prompt(bound) });
   // An empty instruction line is indented, so it doesn't end the segment.
   expect(rebuild(prompt(`${unbound}\n\nMore.`), "grayboard", bound).text).toBe(prompt(bound));
@@ -56,6 +61,34 @@ test("rebuild rewrites only the MCP instructions segment, never a project file o
   const entry = (text: string) => ['  <server name="grayboard">', execute, `    ${text}`, "  </server>"].join("\n");
   const added = (text: string) => `New MCP server instructions are available in addition to those previously listed:\n${entry(text)}`;
   expect(rebuild([added(unbound), file].join("\n\n"), "grayboard", bound).text).toBe([added(bound), file].join("\n\n"));
+  // An update that adds, changes and removes servers: each listing paragraph is its own; the first opens the segment.
+  const removed = "Instructions for the following MCP servers are no longer available: docs.";
+  const changedEntry = (text: string) => `The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:\n${entry(text)}`;
+  const mixed = (text: string) => [added(text), changedEntry("other"), removed].join("\n\n");
+  expect(rebuild(mixed(unbound), "grayboard", bound).text).toBe(mixed(bound));
+  // A code-mode delta paragraph before an MCP update: the update is still the segment.
+  const delta = "The Code Mode tool catalog has changed.\n- grayboard (13 tools)";
+  expect(rebuild([delta, changedEntry(unbound)].join("\n\n"), "grayboard", bound).text).toBe([delta, changedEntry(bound)].join("\n\n"));
+});
+
+// Persisted update messages carry more than MCP: a project file added or changed
+// after the update, quoting an entry, is never the segment (#538 audit).
+test("rebuild leaves a quoted entry alone in a project-file update that follows an MCP update or a removal-only MCP paragraph", () => {
+  const quoted = render(unbound).replace(unbound, "Quoted from a project file.");
+  const entry = (text: string) => ['  <server name="grayboard">', execute, `    ${text}`, "  </server>"].join("\n");
+  const changedEntry = (text: string) => `The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:\n${entry(text)}`;
+  const removed = "Instructions for the following MCP servers are no longer available: x.";
+  const fileAdded = `New instructions apply from:\nInstructions from: /repo/AGENTS.md\n${quoted}`;
+  const fileChanged = `The instructions changed:\nInstructions from: /repo/AGENTS.md\n${quoted}`;
+  for (const file of [fileAdded, fileChanged]) {
+    // After an MCP update: the update is rewritten, the file untouched.
+    expect(rebuild([changedEntry(unbound), file].join("\n\n"), "grayboard", bound).text).toBe([changedEntry(bound), file].join("\n\n"));
+    // After a removal-only MCP paragraph: nothing is a segment.
+    const message = [removed, file].join("\n\n");
+    expect(rebuild(message, "grayboard", bound)).toEqual({ plan: "none", text: message });
+    // The file alone.
+    expect(rebuild(file, "grayboard", bound)).toEqual({ plan: "none", text: file });
+  }
 });
 
 test("rewrite rebuilds the system prompt and persisted instructions-changed system messages, keeps cache hints, and never rejects", async () => {
@@ -70,6 +103,11 @@ test("rewrite rebuilds the system prompt and persisted instructions-changed syst
   expect(messages[1]!.content[0]!.text).not.toContain(unbound);
   // A user message is never touched.
   expect(messages[0]!.content[0]!.text).toBe('  <server name="grayboard">');
+  // Nor is the agent prompt at system[0], even one that opens with a segment.
+  const agent = { type: "text" as const, text: render(unbound) };
+  const own = { sessionID: "R", system: [agent, { type: "text" as const, text: render(unbound) }], messages: [] } as never;
+  expect(await rewrite(own, "grayboard", async () => bound)).toBe("replace");
+  expect(agent.text).toBe(render(unbound));
   // Unchanged text leaves the same bytes; no text leaves the request as built.
   const before = system[1]!.text;
   expect(await rewrite(request, "grayboard", async () => bound)).toBe("replace");
@@ -298,9 +336,9 @@ test("setup's context hook leaves unenrolled sessions as built, never rejects, a
   // An enrolled root's request goes through rewrite (#538): rebuilt, and a malformed one still never rejects.
   const enrolled = spyOn(OpenCodeController.prototype, "enrollment").mockImplementation(id => id === "R" ? {} as never : undefined);
   try {
-    const rootSystem = [{ type: "text", text: render(unbound) }];
+    const rootSystem = [{ type: "text", text: "agent prompt" }, { type: "text", text: render(unbound) }];
     await hook!({ sessionID: "R", system: rootSystem, messages: [] });
-    expect(rootSystem[0]!.text).toBe(render(bound));
+    expect(rootSystem[1]!.text).toBe(render(bound));
     await expect(hook!({ sessionID: "R", system: null, messages: null })).resolves.toBeUndefined();
     expect(debugged.map(d => [d.root, d.plan])).toEqual([["R", "replace"], ["R", "none"]]);
   } finally { enrolled.mockRestore(); }
