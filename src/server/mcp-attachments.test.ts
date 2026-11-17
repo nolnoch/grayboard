@@ -271,8 +271,8 @@ test("a concurrently bound upload survives fail-closed cleanup", async () => {
   const operation = send();
   await entered.promise;
   const row = store.db.query("SELECT id FROM attachments").get() as { id: number };
-  const message = await seed(store.repo, tx => {
-    const inserted = store.repo.messages.insert(tx, "alice@example.com/be", "user", "alice@example.com/be", "sent", null);
+  const message = await seed(store.repo, async tx => {
+    const inserted = await store.repo.messages.insert(tx, "alice@example.com/be", "user", "alice@example.com/be", "sent", null);
     bindAttachments(store.db, [row.id], { addresses: ["alice@example.com/be"], principal: "alice@example.com" }, { message_id: inserted.id }, store.repo.attachmentLimits);
     return inserted;
   });

@@ -9,8 +9,8 @@ import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
 
 export { RECLAIM_PAGES_PER_RUN };
 
-export function pruneMessages(repo: Repo, tx: Tx, cutoffMs: number): void {
-  repo.messages.prune(tx, cutoffMs);
+export function pruneMessages(repo: Repo, tx: Tx, cutoffMs: number): Promise<void> {
+  return repo.messages.prune(tx, cutoffMs);
 }
 
 export function pruneAudit(repo: Repo, tx: Tx, cutoffMs: number): void {

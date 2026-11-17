@@ -45,10 +45,10 @@ describe("retention pruning", () => {
 
   test("pruneMessages keeps replies whose parent aged out", async () => {
     const { db, repo: r } = open();
-    const { root, reply } = await seed(r, tx => {
-      const root = r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
+    const { root, reply } = await seed(r, async tx => {
+      const root = await r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null);
       db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [root.id]);
-      return { root, reply: r.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
+      return { root, reply: await r.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
     });
     await expect(seed(r, tx => pruneMessages(r, tx, 1))).resolves.toBeUndefined(); // used to fail the parent_id foreign key
     expect(r.messages.getById(r.read, root.id)).toBeUndefined();
@@ -65,8 +65,8 @@ describe("retention pruning", () => {
     const oldFile = await up("a@example.com/fe");
     const old = await seed(r, tx => r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null, false, { ids: [oldFile], uploader: from }, null));
     const keptFile = await up("a@example.com/fe");
-    const kept = await seed(r, tx => {
-      const kept = r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [keptFile], uploader: from }, null);
+    const kept = await seed(r, async tx => {
+      const kept = await r.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "new", null, false, { ids: [keptFile], uploader: from }, null);
       db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
       return kept;
     });
