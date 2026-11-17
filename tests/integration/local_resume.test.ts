@@ -220,14 +220,17 @@ test("a real tail viewer is never eligible to restore an ordinary conversation",
   await remembered.call("board_create", { name: "work", purpose: "viewer provenance" });
   await stopSession(remembered.c);
   const p = Bun.spawn([process.execPath, CLI, "tail", "work"], {
-    cwd: dir, env: localEnv(dir, undefined, { BUS_HARNESS_SESSION: "viewer-conversation" }), stdout: "ignore", stderr: "ignore",
+    cwd: dir, env: localEnv(dir, undefined, { BUS_HARNESS_SESSION: "viewer-conversation" }), stdout: "ignore", stderr: "pipe",
   });
   viewers.push(p);
-  await until(() => rows(`SELECT i.id FROM ids i JOIN bindings b ON b.session_id = i.id WHERE i.viewer = 1 AND b.pid = ?`, p.pid).length === 1);
+  let err = "";
+  void (async () => { for await (const chunk of p.stderr) err += new TextDecoder().decode(chunk); })();
+  // The ready line follows tail's signal handlers (#1155), so the SIGINT below ends it gracefully.
+  await until(() => err.includes("-- tailing #work"), 10_000, "the tail's ready line");
   const [viewer] = rows<{ id: string; local_resume: number }>(`SELECT i.id, i.local_resume FROM ids i JOIN bindings b ON b.session_id = i.id WHERE i.viewer = 1 AND b.pid = ?`, p.pid);
   expect(viewer!.local_resume).toBe(0);
   p.kill("SIGINT");
-  await p.exited;
+  expect(await p.exited).toBe(0);
   viewers.splice(viewers.indexOf(p), 1);
   const resumed = await session("viewer-conversation");
   expect(endedAt(viewer!.id)).not.toBeNull();
