@@ -184,8 +184,14 @@ function queuedNow<T>(db: Database, fn: (tx: Tx) => T, committed?: (value: T) =>
 // transaction when the caller holds the queue outside one, or through the idle queue; when another body holds the
 // queue it waits behind it, and its failure is logged as `what` failed. True when it ran now (its error thrown,
 // `committed` run after the open transaction's commit or at once), false when it waits.
-function posted<T>(db: Database, fn: (tx: Tx) => T, committed: ((value: T) => unknown) | undefined, what: string): boolean {
+function posted<T>(db: Database, fn: (tx: Tx) => T, given: ((value: T) => unknown) | undefined, what: string): boolean {
   const queue = queueFor(db);
+  // No caller awaits a post, so a promise its committed returns is caught here, on every branch, and logged as `what`
+  // (#1051); returning nothing, the waited branch's own catch doesn't log it twice. A synchronous throw is unchanged.
+  const committed = given && ((value: T) => {
+    const r = given(value);
+    if (isThenable(r)) Promise.resolve(r).catch(error => console.error(`[grayboard] ${what} failed:`, error));
+  });
   if (queue.mine && db.inTransaction) {
     const value = withTx(db, fn)();
     if (committed) afterCommit(db, () => { committed(value); });
@@ -218,7 +224,8 @@ export interface Repo {
   // its error, and throws when the queue is held or a transaction is open.
   writeNow<T>(fn: (tx: Tx) => Sync<T>): T;
   // A write no caller awaits, for code that can't (posted, above): true when it ran now, false when it waits behind
-  // another body, its failure then logged as `what` failed. fn's Tx is live until fn returns.
+  // another body, its failure then logged as `what` failed. A promise `committed` returns is caught and its rejection
+  // logged as `what` failed on every branch (#1051). fn's Tx is live until fn returns.
   post<T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => unknown, what?: string): boolean;
   // The store's read handle outside any transaction (#807 P1c): reads committed state.
   read: Read;

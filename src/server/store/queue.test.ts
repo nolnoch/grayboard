@@ -312,6 +312,36 @@ test("a post that waited and failed is logged as its `what`, not thrown", async 
   expect(logged.some(a => a[0] === "[grayboard] test write failed:" && String(a[1]).includes("late"))).toBe(true);
 });
 
+// #1051: no caller awaits a post, so an async committed's rejection is logged as its `what` on every branch, once.
+test("a post's async committed that rejects is logged as its `what` on every branch, once", async () => {
+  const { db, repo } = open();
+  const logged: unknown[][] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  const rejecting = (branch: string) => async () => { throw new Error(`committed ${branch}`); };
+  const settle = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
+  try {
+    // Idle queue: runs now, through it.
+    expect(repo.post(tx => { repo.users.upsertByEmail(tx, "idle@example.com", null); }, rejecting("idle"), "idle write")).toBe(true);
+    // Inside a write body's transaction: committed after the commit.
+    await repo.write(() => { repo.post(tx => { repo.users.upsertByEmail(tx, "intx@example.com", null); }, rejecting("intx"), "intx write"); });
+    // The holder outside a transaction (its own committed callback).
+    await repo.write(() => 1, () => { repo.post(tx => { repo.users.upsertByEmail(tx, "holder@example.com", null); }, rejecting("holder"), "holder write"); });
+    // Behind another body's hold: it waits.
+    let release!: () => void;
+    const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
+    expect(repo.post(tx => { repo.users.upsertByEmail(tx, "waited@example.com", null); }, rejecting("waited"), "waited write")).toBe(false);
+    release();
+    await holder;
+    await queueFor(db).run(() => {});
+    await settle();
+  } finally { console.error = error; }
+  for (const branch of ["idle", "intx", "holder", "waited"]) {
+    expect(repo.users.findByEmail(`${branch}@example.com`)).toBeDefined();
+    expect(logged.filter(a => a[0] === `[grayboard] ${branch} write failed:` && String(a[1]).includes(`committed ${branch}`))).toHaveLength(1);
+  }
+});
+
 test("writeAudit under another body's hold waits for it rather than writing into it", async () => {
   const { db, repo } = open();
   let release!: () => void;
