@@ -55,10 +55,11 @@ export type DedupOutcome<W extends Written> =
 // replayed, nothing else is written but a request.replayed audit row, and the
 // caller must push, wake and audit nothing; `onReplay` runs in the replay's
 // transaction, for what the repeat brought that nothing will use (its fresh
-// uploads). The lookup, the write, the
-// receipt and the audit row are one IMMEDIATE transaction (a savepoint inside
-// an open one): two calls can't interleave, and a write that throws leaves no
-// receipt. `now` is the hub's clock. `recheck` runs on a hit, in the same
+// uploads). The receipt is claimed before the write by one statement (D3,
+// #807 P2-2), so of two identical calls on any isolation level one writes and
+// the other replays; the claim, the write, the receipt and the audit row are
+// one transaction (a savepoint inside an open one), and a write that throws
+// leaves no receipt. `now` is the hub's clock. `recheck` runs on a hit, in the same
 // transaction, before anything is answered or audited: it throws the refusal a
 // fresh call would get when authority over what the first call wrote has gone
 // since, so no replay outlives a revocation (docs/vision.md principle 11, #806).
@@ -70,27 +71,35 @@ export function dedupWrite<W extends Written>(
   const since = now - WRITE_DEDUP_WINDOW_MS;
   return repo.atomic((): DedupOutcome<W> => {
     const receipts = repo.writeReceipts;
-    // Bounds one session's rows by what it wrote in the window.
+    const key = { session: call.session, sender: call.sender, fp };
+    // Bounds one session's rows by what it wrote in the window, so a receipt the claim meets is inside it.
     receipts.pruneSession(tx, call.session, since);
-    if (!call.resend) {
+    // A lost claim reads the receipt that beat it. A pass that neither claims nor answers saw another transaction
+    // change that receipt in between (pruned it, or replaced a stale one first), which a single writer never allows;
+    // three passes bound it.
+    for (let pass = 0; !call.resend; pass++) {
+      if (pass === 3) throw new Error(`write receipt for ${call.tool} by ${call.sender} kept changing under this call; retry it`);
+      if (receipts.claim(tx, key, call.tool, now)) break;
       const hit = receipts.find(tx, call.session, call.sender, fp, since);
-      // A receipt whose row is gone (retracted, pruned) is a miss: the upsert
-      // below replaces it, and the audit says why this repeat wrote fresh (#306).
-      if (hit && !receipts.refExists(tx, hit.ref_kind, hit.ref_id)) {
+      if (!hit) continue;
+      // A receipt whose row is gone (retracted, pruned) is a miss: this call takes it over, unless another call
+      // replaced it first, and the audit says why this repeat wrote fresh (#306).
+      if (!receipts.refExists(tx, hit.ref_kind, hit.ref_id)) {
+        if (!receipts.reclaim(tx, key, hit, now)) continue;
         writeAudit(repo, "request.receipt_stale", call.actor, call.sender, {
           tool: call.tool, fp, ref_kind: hit.ref_kind, ref_id: hit.ref_id, first_at: new Date(hit.at).toISOString(), session: call.session,
         });
-      } else if (hit) {
-        const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
-        const first_at = new Date(hit.at).toISOString();
-        const stored = JSON.parse(hit.result_json) as W["payload"];
-        recheck(stored);
-        writeAudit(repo, "request.replayed", call.actor, call.sender, {
-          tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
-        });
-        onReplay();
-        return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
+        break;
       }
+      const ref: WriteRef = { kind: hit.ref_kind, id: hit.ref_id };
+      const first_at = new Date(hit.at).toISOString();
+      const stored = JSON.parse(hit.result_json) as W["payload"];
+      recheck(stored);
+      writeAudit(repo, "request.replayed", call.actor, call.sender, {
+        tool: call.tool, fp, ref_kind: ref.kind, ref_id: ref.id, first_at, transport: call.transport, session: call.session,
+      });
+      onReplay();
+      return { replay: { ...stored, replayed: { first_at, ref }, note: replayNote(call, stored, first_at, ref) } };
     }
     const w = write() as W;
     receipts.upsert(tx, {

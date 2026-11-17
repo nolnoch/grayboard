@@ -86,6 +86,7 @@ export type WriteReceipt = {
   session: string; sender: string; fp: string; tool: string;
   ref_kind: "message" | "post"; ref_id: number; result_json: string; at: number;
 };
+export type WriteReceiptKey = Pick<WriteReceipt, "session" | "sender" | "fp">;
 
 // A message's columns as readers see them. sender_id (#284) is the sending
 // session's provenance, kept in the database and left out of reads and pushes;
@@ -408,6 +409,12 @@ export interface Repo {
   writeReceipts: {
     // The receipt for (session, sender, fp) written after `since`.
     find(r: Read, session: string, sender: string, fp: string, since: number): WriteReceipt | undefined;
+    // Takes (session, sender, fp) for a write about to run, as a placeholder the write's `upsert` fills in the same
+    // transaction; false when a receipt for it exists (D3: one statement, so of two identical calls one claims it).
+    claim(tx: Tx, key: WriteReceiptKey, tool: string, at: number): boolean;
+    // Takes over the receipt for `key` only while it still names `stale` (a row since retracted or pruned, #306);
+    // false when another call replaced it first.
+    reclaim(tx: Tx, key: WriteReceiptKey, stale: { ref_kind: "message" | "post"; ref_id: number }, at: number): boolean;
     // Replaces any receipt for the same (session, sender, fp).
     upsert(tx: Tx, r: WriteReceipt): void;
     // Whether the row a receipt names still exists (a retract or retention removes it).
@@ -1583,6 +1590,19 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return sqliteOf(r).query<WriteReceipt, [string, string, string, number]>(
           "SELECT * FROM write_receipts WHERE session = ? AND sender = ? AND fp = ? AND at > ?",
         ).get(session, sender, fp, since) ?? undefined;
+      },
+      claim(tx, key, tool, at) {
+        // ref_id 0 names no row; ref_kind only satisfies the column's CHECK until `upsert` fills both.
+        return !!sqliteOf(tx).query<{ x: number }, [string, string, string, string, number]>(
+          `INSERT INTO write_receipts (session, sender, fp, tool, ref_kind, ref_id, result_json, at) VALUES (?, ?, ?, ?, 'message', 0, '', ?)
+           ON CONFLICT(session, sender, fp) DO NOTHING RETURNING 1 AS x`,
+        ).get(key.session, key.sender, key.fp, tool, at);
+      },
+      reclaim(tx, key, stale, at) {
+        return !!sqliteOf(tx).query<{ x: number }, [number, string, string, string, string, number]>(
+          `UPDATE write_receipts SET ref_id = 0, result_json = '', at = ?
+           WHERE session = ? AND sender = ? AND fp = ? AND ref_kind = ? AND ref_id = ? RETURNING 1 AS x`,
+        ).get(at, key.session, key.sender, key.fp, stale.ref_kind, stale.ref_id);
       },
       upsert(tx, r) {
         sqliteOf(tx).run(

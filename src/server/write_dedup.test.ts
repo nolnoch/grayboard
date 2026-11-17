@@ -150,6 +150,46 @@ describe("dedupWrite", () => {
     expect(audits("request.replayed")).toEqual([]);
   });
 
+  // #807 P2-2 (D3): the receipt is claimed by one statement before the write, and a stale one is taken over only while
+  // it still names the gone row. SQLite's single writer can't interleave two calls; these land the other call's
+  // receipt where Postgres could, and the two-transaction tests come with P3.
+  test("the receipt is claimed before the write runs", async () => {
+    const fp = fingerprint("dm_send", "s1", SENDER, call().args);
+    let seen: unknown;
+    await dedup(1_000, call(), tx => {
+      seen = repo.writeReceipts.find(tx, "s1", SENDER, fp, 0);
+      return send()(tx);
+    });
+    expect(seen).toMatchObject({ ref_id: 0, at: 1_000 });
+    expect(await seed(repo, tx => repo.writeReceipts.claim(tx, { session: "s1", sender: SENDER, fp }, "dm_send", 2_000))).toBe(false);
+  });
+
+  test("a stale receipt another call replaced after this one read it answers with that call's write", async () => {
+    const first = await dedup(1_000, call(), send());
+    if (!("fresh" in first)) throw new Error("expected a fresh write");
+    await seed(repo, tx => repo.messages.retract(tx, SENDER, first.fresh.ref.id, { actor: "a@example.com", session: "s1" }));
+    const receipts = repo.writeReceipts;
+    const reclaim = receipts.reclaim;
+    let winner = 0;
+    // The other call's write and receipt land between this call's read of the stale receipt and its takeover.
+    receipts.reclaim = (tx, key, stale, at) => {
+      const w = send("hi")(tx);
+      winner = w.ref.id;
+      receipts.upsert(tx, { ...key, tool: "dm_send", ref_kind: "message", ref_id: w.ref.id, result_json: JSON.stringify(w.payload), at });
+      return reclaim(tx, key, stale, at);
+    };
+    let again: Awaited<ReturnType<typeof dedup>>;
+    try {
+      again = await dedup(2_000, call(), (): ReturnType<ReturnType<typeof send>> => { throw new Error("must not run"); });
+    } finally {
+      receipts.reclaim = reclaim;
+    }
+    expect("replay" in again && again.replay.replayed.ref.id).toBe(winner);
+    expect(count("SELECT COUNT(*) AS n FROM messages")).toBe(1);
+    expect(audits("request.receipt_stale")).toEqual([]);
+    expect(audits("request.replayed")).toHaveLength(1);
+  });
+
   test("past the window a repeat writes again; another session or sender never collides", async () => {
     await dedup(1_000, call(), send());
     expect("fresh" in await dedup(1_000 + WRITE_DEDUP_WINDOW_MS, call(), send())).toBe(true);
