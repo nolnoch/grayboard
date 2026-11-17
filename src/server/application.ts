@@ -36,7 +36,7 @@ import { assertDeliverableId, coreRefusalCode, endSession, Undeliverable } from 
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, dropUnsentUploads, uploadDigests, sweepBlobs, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
-import { claimExpiryTimer, listClaims } from "../core/claims.ts";
+import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
 import { principalCanSee } from "./access.ts";
@@ -377,11 +377,12 @@ async function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[
   const undelivered = await hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS);
   // Read before the synchronous helper (#807 P3 B1a), which asks per stale recipient.
   const seen = await hub.repo.bindings.lastSeen(r, undelivered.map((u) => u.recipient));
+  const claims = await hub.repo.claims.list(r);
   return [
     ...first,
     ...undeliveredInstruction(undelivered, (h) => seen.get(h) ?? null),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
-    ...claimsInstruction(listClaims(hub.repo.coreOn(r)), addresses),
+    ...claimsInstruction(claims, addresses),
   ];
 }
 
@@ -573,9 +574,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // Announces claims that lapse on their boards.
   // Armed from requests, it fires for every holder: detached, so its rows
   // don't carry the arming request's address (security audit F-19).
-  // The sweep writes on its queued body's connection; `arm` runs after commits and outside bodies, on the pool.
-  const expiryTimer = claimExpiryTimer(repo.coreOn(repo.read), handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards), queuedTx(repo));
-  const expiry = { arm: () => detached(() => expiryTimer.arm()), stop: () => expiryTimer.stop() };
+  // The sweep is a queued write that reads the clock inside it; `arm` runs after commits and outside bodies, and reads
+  // on the pool (#807 P3 B2).
+  const claimTimer = expiryTimer({
+    next: () => repo.claims.nextExpiry(repo.read),
+    sweep: () => repo.write(tx => repo.claims.sweep(tx, Date.now())),
+  }, handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards));
+  const expiry = { arm: () => detached(() => claimTimer.arm()), stop: () => claimTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
     for (const a of session.addresses) if (hub.registry.get(a) === session) hub.registry.delete(a);
@@ -990,10 +995,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     await repo.bindings.release(tx, address, id);
     await repo.bindings.log(tx, id, address, "released", "unbind");
     await repo.bindings.touchAlias(tx, address);
+    const left = (await repo.claims.list(tx)).filter((c) => c.holder === address).map((c) => c.key);
     // After the last await (R2), as bind's.
     stillOpen(session);
     setHolds(hub, session, session.holds.filter((a) => a !== address));
-    const left = listClaims(repo.coreOn(tx)).filter((c) => c.holder === address).map((c) => c.key);
     return { alias: address, released: true, held: [...session.holds], ...(left.length ? { left } : {}) };
   }
 
@@ -1392,7 +1397,7 @@ async function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput:
   const names = all.filter(free);
   const queued = await repo.messages.queuedTo(r, names.map(full));
   const claims = new Map<string, number>();
-  for (const c of listClaims(repo.coreOn(r))) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
+  for (const c of await repo.claims.list(r)) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const suggested = suggestedInput !== null && free(suggestedInput) ? suggestedInput : null;
   return orderCandidates(
     names.map((n) => ({

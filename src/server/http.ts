@@ -19,7 +19,6 @@ import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
-import { listClaims } from "../core/claims.ts";
 import { aliasHeldText } from "../core/bindings.ts";
 import { callBoardTool } from "../core/tools.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
@@ -174,7 +173,7 @@ async function claimList(url: URL, authed: AuthedUser, repo: Repo): Promise<Resp
     const scope = a ? { scope_kind: a.scope_kind, scope_ref: a.scope_ref } : p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team" as const, scope_ref: p.scope } : null;
     return !scope || scope.scope_ref === null || (await authorize(repo, repo.read, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
   };
-  const claims = listClaims(repo.coreOn(repo.read), prefix);
+  const claims = await repo.claims.list(repo.read, prefix);
   // One decision per distinct holder.
   const seen = new Map<string, boolean>();
   for (const c of claims) if (!seen.has(c.holder)) seen.set(c.holder, await sees(c.holder));
