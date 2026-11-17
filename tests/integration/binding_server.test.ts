@@ -62,7 +62,7 @@ const connect = (identity: string | null, { token, ...opts }: AppSessionOptions 
 // (#282: no grace, no clean-exit frame), so tests that need an ended session end it.
 async function endIt(s: AppSession): Promise<void> {
   s.close();
-  await seed(srv.app.repo, tx => endSession(srv.app.db, srv.app.repo.mailOn(tx), s.id, { why: "exit", now: Date.now() }));
+  await seed(srv.app.repo, tx => srv.app.repo.sessionEnd.end(tx, s.id, { why: "exit", now: Date.now() }));
 }
 // The server restarts on the same database, a new in-process TestServer.
 async function restarted(): Promise<void> {

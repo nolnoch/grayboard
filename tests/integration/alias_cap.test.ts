@@ -5,7 +5,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { endSession } from "../../src/core/session_end.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
@@ -83,7 +82,7 @@ test("a team owner or an admin deletes an unused team name, freeing a slot; a me
   await writer.connect();
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toMatchObject({ status: 409, body: { code: "alias_held" } });
   writer.close();
-  await seed(srv.app.repo, tx => endSession(srv.app.db, srv.app.repo.mailOn(tx), writer.id, { why: "exit", now: Date.now() }));
+  await seed(srv.app.repo, tx => srv.app.repo.sessionEnd.end(tx, writer.id, { why: "exit", now: Date.now() }));
   expect(subs("eng/b").length).toBeGreaterThan(0);
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "a" })).toMatchObject({ status: 409, body: { code: "alias_held", message: expect.stringContaining(held.id) } });
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "zzz" })).toMatchObject({ status: 404 });
