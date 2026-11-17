@@ -40,7 +40,7 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
-  const { db, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
+  const { db: testDb, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.
@@ -172,7 +172,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     mcp,
     oauth,
     repo,
-    db,
+    // Exposed for tests only (their spies read `db.inTransaction`): no server code holds the raw connection (#807 P1c-15c-2).
+    db: testDb,
     // Exposed for tests: the bridge instance, to drive fatal stops directly.
     slack,
     // The auth re-check and limiter sweep, for tests that run without it.
@@ -197,7 +198,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       stopPromise = Promise.allSettled([mcp.close(), attachments.close()]).then(outcomes => {
         const failure = outcomes.find(outcome => outcome.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
-      }).finally(() => { oauth.close(); db.close(); });
+      }).finally(() => { oauth.close(); repo.close(); });
       return stopPromise;
     },
   };

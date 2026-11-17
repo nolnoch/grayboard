@@ -342,6 +342,8 @@ export interface Repo {
   // The connection a handle resolves to, for core helpers that take a `db` (#807 P1c-15b; D1 keeps core's signatures until
   // P3 forks it): a body's `Tx` inside one, `repo.read` outside. Resolved at the call, so a settled `Tx` is refused there.
   coreOn(h: Read): CoreDb;
+  // Closes the database: the reader, then the writer (#807 P1c-15c-2: the server holds no raw connection to close).
+  close(): void;
   // Read points (#284), keyed by the reading address: how far it has
   // received a stream (its direct messages, stream_ref = the address itself).
   cursors: {
@@ -440,6 +442,8 @@ export const RETRACTABLE_SQL = `SELECT recipient FROM messages WHERE id = ? AND 
 
 // audit.last: the newest row for (action, target), searched by idx_access_log_action_target (#295).
 export const ACCESS_LOG_LAST_SQL = `SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1`;
+// `db` is the raw writer, returned for tests only (#807 P1c-15c-2): server code reaches the database through `repo`, and
+// a core helper through `repo.coreOn(handle)`, so nothing outside this file writes without a live `Tx`.
 export function openDatabase(path: string, opts: OpenOptions): { db: Database; repo: Repo } {
   mkdirSync(dirname(path), { recursive: true });
   // auto_vacuum must precede the first page write.
@@ -1400,6 +1404,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     coreOn: (h) => sqliteOf(h),
+    close: () => { db.close(); },
 
     // Each method resolves the handle when called, so a port kept past its body is refused, as a kept Tx is.
     mailOn: (tx) => {

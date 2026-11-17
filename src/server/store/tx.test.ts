@@ -39,6 +39,29 @@ test("a Tx used after its body settles throws, and writes nothing", async () => 
   expect(rows(repo.read)).toEqual([]);
 });
 
+// D4, #807 P1c-15c-2: a body awaits only its own statements. Even the raw connection a body reached through
+// `repo.coreOn(tx)`, used by a timer or un-awaited promise after the body settled, is refused: the write queue's owner
+// check runs on every write, with the queue idle or held by a later body.
+test("D4: a write a body leaves running past its settle is refused, on its raw connection too, idle queue or held", async () => {
+  const repo = open();
+  const refused: string[] = [];
+  const attempt = (c: ReturnType<Repo["coreOn"]>, v: string) => { try { c.run("INSERT INTO t (v) VALUES (?)", [v]); } catch (e) { refused.push(`${v}: ${String(e)}`); } };
+  let fire!: () => void;
+  const gate = new Promise<void>(r => { fire = r; });
+  await repo.write(async tx => {
+    const c = repo.coreOn(tx);
+    setTimeout(() => attempt(c, "timer, idle"), 0);
+    void (async () => { await gate; attempt(c, "promise, held"); })();
+  });
+  await tick(); await tick();
+  // A later body holds the queue while the first body's un-awaited promise writes.
+  await repo.write(async tx => { put(tx, "later"); fire(); await tick(); await tick(); });
+  expect(refused).toHaveLength(2);
+  expect(refused[0]).toContain("timer, idle: Error: write outside the write queue");
+  expect(refused[1]).toContain("promise, held: Error: write or top-level transaction while another body holds the write queue");
+  expect(rows(repo.read)).toEqual(["later"]);
+});
+
 test("a rolled-back body's Tx is closed too", async () => {
   const repo = open();
   let kept!: Tx;
