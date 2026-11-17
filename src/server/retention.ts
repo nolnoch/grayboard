@@ -28,8 +28,8 @@ function msUntilMidnightUTC(): number {
 // Shrinks the file by the pages retention freed (#137). A database created
 // before #170 has auto_vacuum=NONE and reclaims nothing: say so, with the fix,
 // while it has free pages to reclaim.
-export function reclaimFreePages(repo: Repo, maxPages = RECLAIM_PAGES_PER_RUN): void {
-  logReclaimed(repo.storage.reclaimFreePages(maxPages), "docs/guide/server.md §Reclaiming disk space");
+export async function reclaimFreePages(repo: Repo, maxPages = RECLAIM_PAGES_PER_RUN): Promise<void> {
+  logReclaimed(await repo.storage.reclaimFreePages(maxPages), "docs/guide/server.md §Reclaiming disk space");
 }
 
 // The nightly job: messages, posts, ended sessions and audit rows past retention, uploads
