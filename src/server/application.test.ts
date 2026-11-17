@@ -200,7 +200,7 @@ test("bind budget is per user and spent before an alias is created or a hold tak
   application = createApplication(store.repo, { helloLimit: { burst: 1, perSec: 0.01 } });
   const a = await connect(alice, "be");
   await expect(a.bind("refused")).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
-  expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email).map(x => x.name)).toEqual(["be"]);
+  expect((await store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email)).map(x => x.name)).toEqual(["be"]);
   expect(store.db.query("SELECT event FROM binding_events").all()).toEqual([{ event: "bound" }]);
   expect(store.db.query("SELECT * FROM access_log WHERE action = 'bind.rate_limited'").all()).toHaveLength(1);
   expect((await application.attachHuman(alice, delivery())).session.human).toBe(true);
@@ -349,7 +349,7 @@ test("unbound hosted sessions cannot use named operations or persist synthetic h
   const { session, info } = await application.hostedSession(store.repo.read, alice, "hosted-unbound", [], null, null, delivery());
   expect(session.writerId).toBeUndefined();
   expect(info.candidates).toEqual([]);
-  expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email)).toEqual([]);
+  expect((await store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email))).toEqual([]);
   expect(store.db.query("SELECT * FROM handles").all()).toEqual([]);
   const operations = [
     () => seed(store.repo, tx => application.send(tx, session, "be", "no")),
@@ -385,7 +385,7 @@ test("hold sessions block binding and candidates without push or online presence
   expect(tools.session.toolsOnly).toBe(true);
   expect(tools.session.holds).toEqual([]);
   await expect(connect(alice, "held")).rejects.toMatchObject({ code: "alias_held", extra: { holder: expect.stringContaining(owner.id) } });
-  expect(application.hostedCandidates(store.repo.read, alice, null)).toEqual([]);
+  expect((await application.hostedCandidates(store.repo.read, alice, null))).toEqual([]);
   const sender = await connect(bob, "sender");
   expect((await sender.send("alice@example.com/held", "queued")).delivered_now).toBe(false);
   await owner.none(() => true);
@@ -398,7 +398,7 @@ test("hold sessions block binding and candidates without push or online presence
 
 test("unknown and reserved names are audited without creation; trusted human gets binding attribution", async () => {
   await expect(connect(alice, "typo", { bind: { create: false }, key: "typo-secret" })).rejects.toMatchObject({ code: "identity_unknown", extra: { known: [] } });
-  expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email)).toEqual([]);
+  expect((await store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email))).toEqual([]);
   await expect(connect(alice, "human", { key: "human-secret" })).rejects.toMatchObject({ code: "forbidden" });
   const human = (await application.attachHuman(alice, delivery())).session;
   // The bridge's human has no session ID (#284 S16); it logs as `human`.

@@ -332,7 +332,7 @@ test("opening a pre-hosted SQLite schema adds tables without changing users, mes
   });
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
   await close(); await open();
-  expect(database.repo.aliases.listForScope(database.repo.read, "person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
+  expect((await database.repo.aliases.listForScope(database.repo.read, "person", first.authed.user_email)).map(row => row.name)).toEqual(["fe"]);
   expect(await database.repo.oauth.isGrantActive(database.repo.read, first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
   expect(hostedRowCount(database.db)).toBe(0);
