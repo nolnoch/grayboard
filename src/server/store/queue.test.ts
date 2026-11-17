@@ -203,6 +203,13 @@ test("a top-level transaction refuses unless its caller holds the queue; the hol
   expect(() => db.exec("DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
   expect(repo.users.findByEmail("holder@example.com")).toBeDefined();
   db.run("CREATE TEMP TRIGGER IF NOT EXISTS t_queue_test AFTER INSERT ON users BEGIN SELECT 1; END");
+  // #995: a script that leads with DDL is still checked for the writes after it, and a statement prepared with its
+  // bindings (native, past the routing) is refused.
+  expect(() => db.run("CREATE TEMP TABLE IF NOT EXISTS t995(a); DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
+  expect(() => db.exec("CREATE TEMP TABLE IF NOT EXISTS t995(a); DELETE FROM users WHERE email = 'holder@example.com'")).toThrow("write outside the write queue");
+  expect(repo.users.findByEmail("holder@example.com")).toBeDefined();
+  expect(() => db.prepare("DELETE FROM users WHERE email = ?", ["holder@example.com"])).toThrow("prepare(sql, params) on a routed connection");
+  expect(repo.users.findByEmail("holder@example.com")).toBeDefined();
   expect(repo.users.findByEmail("after@example.com")).toBeUndefined();
   // committed runs inside its body, so a write there (cancel's settle) opens.
   expect(await repo.write(() => 1, v => repo.atomic(() => { addUser(db, "committed@example.com"); return v + 1; }))).toBe(2);
