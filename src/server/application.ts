@@ -72,6 +72,9 @@ export type IdentityInfo = SessionFacts & {
   candidates?: Candidate[];
   identity_full: string;
 };
+// What application.hostedBuildFacts reads for application.hostedBuild (#807 P3 A7g): whether the session's ID is its
+// user's, the hello's reads, and the candidates a read-only session shows.
+export type BuildFacts = { own: boolean; hello: HelloFacts; candidates?: Candidate[] };
 export type SendResult = WireSendResult;
 export type InboxResult = {
   unanswered: InboxItem[];
@@ -350,14 +353,21 @@ async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<stri
   return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
 }
 
-// `r`: the caller's handle, its body's `Tx` when it runs inside one (#807 P3 A7e2: a holder's `repo.read` is refused).
-function helloOkFields(hub: Hub, authed: AuthedUser, r: Read): SessionFacts {
+// What a hello's fields read, split from building them (#807 P3 A7g): a caller reads these in its body, on its `Tx`
+// (#807 P3 A7e2: a holder's `repo.read` is refused), and builds the fields synchronously where it registers the session.
+export type HelloFacts = { teams: string[]; linked: boolean };
+async function helloFacts(hub: Hub, authed: AuthedUser, r: Read): Promise<HelloFacts> {
   const { repo } = hub;
+  const teams = (await repo.teams.listForUser(r, authed.user_id)).map((t) => formatTeamAddress(t.name));
+  return { teams, linked: !!repo.slack.linkFor(r, authed.user_id) };
+}
+// Reads nothing: whether the bridge runs is in memory, read when the fields are built.
+function helloFields(hub: Hub, authed: AuthedUser, f: HelloFacts): SessionFacts {
   return {
     user_email: authed.user_email,
-    teams: repo.policyNow.teamsOf(authed.user_id).map((t) => formatTeamAddress(t.name)),
-    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(r, authed.user_id) },
-    attachment_limits: repo.attachmentLimits,
+    teams: f.teams,
+    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && f.linked },
+    attachment_limits: hub.repo.attachmentLimits,
   };
 }
 
@@ -791,12 +801,15 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         writeAudit(repo, tx, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
         await onAliasCreated(repo, tx, authed.user_id, addr);
       }
+      // Read in the body, on its Tx, for the hello the committed callback builds (#807 P3 A7g).
+      const hello = await helloFacts(hub, authed, tx);
       // Again after the awaits (#807 P3 A7f3 audit): a stop outside the write queue lands meanwhile; the throw rolls the create back.
       const late = current?.(tx);
       if (late) fail("unauthenticated", late);
       touchAlias(repo.coreOn(tx), addr);
       logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "bound");
-    }, () => {
+      return hello;
+    }, hello => {
       const session = new ApplicationSession(authed, sink, true, true);
       session.primary = addr;
       session.addresses = [addr];
@@ -805,8 +818,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
       hub.sessions.add(session);
       hub.registry.set(addr, session);
-      // After the commit: the write's transaction is closed, so committed state.
-      return { session, ok: { id: HUMAN_NAME, ...helloOkFields(hub, authed, repo.read) } };
+      return { session, ok: { id: HUMAN_NAME, ...helloFields(hub, authed, hello) } };
     });
   }
 
@@ -947,8 +959,17 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // place and suggested name (#443), null with no row. `root`: set for a child session (#523),
     // which acts under its root's addresses, never its own ID (not an address), and whose writes
     // carry its ID as `via`.
-    // `r`: the body the session is built in, or the pool outside one (the candidates read on it).
-    hostedSession(r: Read, authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, push = false, root: string | null = null) {
+    // A hosted session is read, then built (#807 P3 A7g): `hostedBuildFacts` reads on `r` (the body's Tx inside one, else the
+    // pool), and `hostedBuild` builds and registers synchronously from what it read, reading nothing, so a holder's
+    // facts can be read on the committing Tx before COMMIT and its build run in the after-commit notice. `shape` is the
+    // build's: the facts carry candidates only for the read-only session that shows them.
+    async hostedBuildFacts(r: Read, authed: AuthedUser, id: string, shape: { holds: string[]; writesAs: string | null; suggested: string | null; root: string | null }): Promise<BuildFacts> {
+      const own = idRow(repo.coreOn(r), id)?.principal === authed.user_email;
+      const hello = await helloFacts(hub, authed, r);
+      const readOnly = shape.holds.length === 0 && shape.writesAs === null;
+      return { own, hello, ...(readOnly && !(shape.root !== null && own) ? { candidates: candidates(hub, r, authed, shape.suggested) } : {}) };
+    },
+    hostedBuild(authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, facts: BuildFacts, push = false, root: string | null = null) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
@@ -964,18 +985,24 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         session.addresses = [...holds, root ?? id];
       }
       // A child is one whether or not its root holds a name yet: its text and refusals are a child's.
-      const own = idRow(repo.coreOn(r), id)?.principal === authed.user_email;
-      if (!session.readOnly && own) session.writerId = id;
-      if (root !== null && own) session.via = id;
-      // Computed before the session is registered: a throw here leaves no holder or route behind (#385 item 9).
+      if (!session.readOnly && facts.own) session.writerId = id;
+      if (root !== null && facts.own) session.via = id;
+      const shows = session.readOnly && session.via === undefined;
+      // Before the session is registered: a throw leaves no holder or route behind (#385 item 9).
+      if (shows && !facts.candidates) throw new Error("hosted session facts were read for another shape: no candidates");
       const info: IdentityInfo = {
         identity_full: session.primary,
-        ...helloOkFields(hub, authed, r),
-        ...(session.readOnly && session.via === undefined ? { candidates: candidates(hub, r, authed, row?.suggested ?? null) } : {}),
+        ...helloFields(hub, authed, facts.hello),
+        ...(shows ? { candidates: facts.candidates } : {}),
       };
       hub.sessions.add(session);
       if (push && holds.length) for (const a of session.addresses) hub.registry.set(a, session);
       return { session, info };
+    },
+    // Both, on `r`: a build that may await between its reads and its registration.
+    async hostedSession(r: Read, authed: AuthedUser, id: string, holds: string[], writesAs: string | null, row: { place: string | null; suggested: string | null } | null, sink: DeliverySink, push = false, root: string | null = null) {
+      const facts = await application.hostedBuildFacts(r, authed, id, { holds, writesAs, suggested: row?.suggested ?? null, root });
+      return application.hostedBuild(authed, id, holds, writesAs, row, sink, facts, push, root);
     },
     // The root a hosted child acts under (#523), recorded on the child's ids row, where it outlives the
     // child's source row (deleted at the child's end) so a send or mention to the child's ID keeps
@@ -1069,10 +1096,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       return "error" in target ? undefined : target.address;
     },
     aliasHolderId(r: Read, address: string): string | null { return holderOf(repo.coreOn(r), address); },
-    // Every session's holds, oldest first, for the hosted sweep and reconcile.
-    holdsByOwner(): Map<string, string[]> {
+    // Every session's holds, oldest first, for the hosted sweep and reconcile, on `h` (the full reconcile's body Tx).
+    holdsByOwner(h: Read): Map<string, string[]> {
       const byOwner = new Map<string, string[]>();
-      for (const r of repo.hosted.holds(repo.read)) {
+      for (const r of repo.hosted.holds(h)) {
         const list = byOwner.get(r.id);
         if (list) list.push(r.address); else byOwner.set(r.id, [r.address]);
       }
