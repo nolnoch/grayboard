@@ -272,6 +272,53 @@ test.each(modes)("a resume during a server outage retries on the outage backoff,
     expect(r.named("bind").slice(binds).map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/work" }]);
   } finally { await restarted.close(); }
 });
+// The server back, the remembered name is now refused: a root without a saved approval ends as its resume would
+// have without the outage (unpaused, with the cause), so the agent's own bind starts delivery; an approval
+// host's saved root pauses, as its restore's retry always has.
+test.each(modes)("a resume's outage retry that comes back to a refused name ends with the cause (#895, %s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  const down = Promise.reject(new ServerUnreachable(new Error("down")));
+  down.catch(() => {});
+  r.holdPrepare(down);
+  const restarted: Controller = r.make({ wait: async () => { r.holdElsewhere("be"); r.holdPrepare(Promise.resolve()); } });
+  try {
+    await restarted.resume("R");
+    expect(r.root(restarted)).toMatchObject({ state: "retrying", message: mode === "approval" ? "Server unreachable at restore; retrying, approval retained" : "Server unreachable at resume; retrying" });
+    await until(() => r.root(restarted)?.state !== "retrying");
+    if (mode === "approval") expect(r.root(restarted)).toMatchObject({ state: "degraded", operation: "restore" });
+    else {
+      expect(r.root(restarted)).toMatchObject({ state: "approved", operation: "enroll", code: "alias_held" });
+      await restarted.beforeCall({ sessionID: "R", tool: "bind" });
+      r.rows.set("R", { held: ["you@example.com/fe"], ownership: 99, generation: 1 });
+      await restarted.afterCall({ sessionID: "R", tool: "bind", result: { status: "completed", output: { name: "fe", ownership: 99, instructions: ["bound"] } } });
+      await until(() => r.root(restarted)?.state === "active");
+    }
+  } finally { await restarted.close(); }
+});
+// Several processes sharing one grant store restart during an upgrade: one holds the refresh lock while the
+// server is slow, and the others' prepares find the refresh in progress. They retry, as the run loop does.
+test.each(modes)("a resume that finds the token refresh in another process retries on the outage backoff (#895, %s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  const busy = Promise.reject(new RefreshInProgress("pi"));
+  busy.catch(() => {});
+  r.holdPrepare(busy);
+  let waits = 0;
+  const restarted: Controller = r.make({ wait: async () => { if (++waits === 2) r.holdPrepare(Promise.resolve()); } });
+  try {
+    await restarted.resume("R");
+    expect(r.root(restarted)).toMatchObject({ state: "retrying", code: "refresh_in_progress" });
+    await until(() => r.root(restarted)?.state === "active");
+    expect(waits).toBe(2);
+  } finally { await restarted.close(); }
+});
 test.each(modes)("a close during a resume's outage retry ends it: nothing prepares after it (#895, %s)", async mode => {
   const r = runtime(mode);
   await r.controller.enroll("R", ["be"], true);

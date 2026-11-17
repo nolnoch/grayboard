@@ -36541,7 +36541,6 @@ var ROTATION_GRACE_MS = 1e4;
 var RECOVERY_FIRST_MS = 1000;
 var RECOVERY_MAX_MS = 30000;
 var RECOVERY_BUDGET_MS = 60 * 60000;
-var UNREACHABLE_AT_RESTORE = "Server unreachable at restore; retrying, approval retained";
 var UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
@@ -36838,8 +36837,8 @@ class Controller {
         await this.rotated({ ms: 0 }, () => this.prepare(r, true));
       } catch (caught) {
         const error = this.expired(caught);
-        if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
-          this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+        if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+          this.retrying(r, error);
           this.retryRestore(r);
         } else if (!this.drifted)
           this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
@@ -37282,7 +37281,7 @@ class Controller {
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
         if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
-          this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+          this.retrying(r, error);
           this.retryRestore(r);
         } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
           r.paused = true;
@@ -37295,6 +37294,10 @@ class Controller {
           this.diagnostics.record({ state: "paused", sessionID: id, message: `Saved enrollment invalid; ${this.hint}`, operation: "restore" });
       }
     }
+  }
+  retrying(r, error) {
+    const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying` : `Server unreachable at ${this.port.approval ? "restore" : "resume"}; retrying`;
+    this.set(r, "retrying", this.port.approval ? `${text}, approval retained` : text, "restore", failureCode(error));
   }
   restorable(r, epoch) {
     return !this.stopped && !this.drifted && !this.ending.has(r.e.sessionID) && !r.paused && !r.task && r.epoch === epoch && this.roots.get(r.e.sessionID) === r;
@@ -37320,8 +37323,8 @@ class Controller {
             const error = this.expired(caught);
             if (!this.restorable(r, epoch))
               return true;
-            if (error instanceof ServerUnreachable) {
-              this.set(r, "retrying", UNREACHABLE_AT_RESTORE, "restore", failureCode(error));
+            if (error instanceof ServerUnreachable || error instanceof RefreshInProgress) {
+              this.retrying(r, error);
               return false;
             }
             if (error instanceof AccessExpired && error.reason === "expired") {
@@ -37329,9 +37332,13 @@ class Controller {
               expired = true;
               return false;
             }
-            r.paused = true;
-            await this.stop(r);
-            this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+            if (!this.port.approval)
+              this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+            else {
+              r.paused = true;
+              await this.stop(r);
+              this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+            }
             return true;
           }
         });
