@@ -179,5 +179,16 @@ test("#995: checksWrite sees a write after a leading DDL statement, not one insi
   expect(checksWrite(`CREATE TRIGGER r BEFORE INSERT ON t BEGIN SELECT CASE WHEN 1 THEN RAISE(ABORT, 'end; delete') END; END`)).toBe(false);
   expect(checksWrite("CREATE TABLE t(a TEXT DEFAULT 'x; DELETE FROM users') -- ; UPDATE users\n")).toBe(false);
   expect(checksWrite("CREATE TABLE t(a) /* ; INSERT INTO users */; DROP TABLE t")).toBe(false);
-  expect(scriptStatements("CREATE TABLE a(x); ; CREATE TABLE b(y);").map(s => s.trim())).toEqual(["CREATE TABLE a(x)", "CREATE TABLE b(y)"]);
+  // CASE … END inside a body doesn't close it: uncounted, the END after CASE would leave the UPDATE top-level.
+  expect(checksWrite("CREATE TRIGGER r AFTER INSERT ON t BEGIN SELECT CASE WHEN 1 THEN 1 END; UPDATE c SET n = 1; END")).toBe(false);
+  // A comment is whitespace, not nothing; begin, end and trigger are identifiers too.
+  expect(checksWrite("CREATE TABLE t(a); DELETE/**/FROM users")).toBe(true);
+  expect(checksWrite("CREATE TABLE t(a); INSERT/**/INTO users VALUES (1)")).toBe(true);
+  expect(checksWrite("CREATE TRIGGER g AFTER INSERT ON t BEGIN UPDATE c SET begin = 1; END; DELETE FROM users")).toBe(true);
+  expect(checksWrite("CREATE TRIGGER g AFTER UPDATE OF begin ON t BEGIN SELECT 1; END; DELETE FROM users")).toBe(true);
+  expect(checksWrite("CREATE TABLE t(trigger, begin); DELETE FROM users")).toBe(true);
+  // A body that never closes fails closed.
+  expect(scriptStatements("CREATE TRIGGER g AFTER INSERT ON t BEGIN UPDATE c SET n = 1;")).toBeNull();
+  expect(checksWrite("CREATE TRIGGER g AFTER INSERT ON t BEGIN UPDATE c SET n = 1;")).toBe(true);
+  expect(scriptStatements("CREATE TABLE a(x); ; CREATE TABLE b(y);")!.map(s => s.trim())).toEqual(["CREATE TABLE a(x)", "CREATE TABLE b(y)"]);
 });

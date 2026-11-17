@@ -180,8 +180,10 @@ const writes = /\b(INSERT|UPDATE|DELETE|REPLACE)\b/i, ddl = /^\s*(CREATE|DROP|AL
 
 // The top-level statements of a script, with string literals, quoted identifiers, comments and trigger bodies blanked:
 // a trigger's body runs only when its trigger fires, as part of the write that fires it, which the check sees then.
-// A trigger body ends at the END that closes its BEGIN, counting CASE … END inside it.
-export function scriptStatements(sql: string): string[] {
+// A trigger body ends at the END that closes its BEGIN, counting CASE … END inside it (a body nests no BEGIN). A comment
+// is whitespace, as SQLite reads it (`DELETE/**/FROM`). Null when a trigger body never closes: the caller can't tell
+// what follows it, so it fails closed.
+export function scriptStatements(sql: string): string[] | null {
   const out: string[] = [];
   let cur = "", i = 0;
   const word = /[A-Za-z_]\w*/y;
@@ -196,16 +198,17 @@ export function scriptStatements(sql: string): string[] {
       cur += " "; i = j + 1; continue;
     }
     if (ch === "-" && sql[i + 1] === "-") { const j = sql.indexOf("\n", i); i = j < 0 ? sql.length : j; continue; }
-    if (ch === "/" && sql[i + 1] === "*") { const j = sql.indexOf("*/", i + 2); i = j < 0 ? sql.length : j + 2; continue; }
+    if (ch === "/" && sql[i + 1] === "*") { const j = sql.indexOf("*/", i + 2); i = j < 0 ? sql.length : j + 2; cur += " "; continue; }
     word.lastIndex = i;
     const m = word.exec(sql);
     if (m) {
       const w = m[0].toUpperCase();
       if (depth > 0) {
-        if (w === "CASE" || w === "BEGIN") depth++;
+        if (w === "CASE") depth++;
         else if (w === "END" && --depth === 0) trigger = false;
       } else {
-        if (w === "TRIGGER" && /^\s*CREATE\b/i.test(cur)) trigger = true;
+        // TRIGGER as the object CREATE names, not a column or table called trigger.
+        if (w === "TRIGGER" && /^\s*CREATE\s+((TEMP|TEMPORARY)\s+)?$/i.test(cur)) trigger = true;
         else if (w === "BEGIN" && trigger) depth = 1;
         cur += m[0];
       }
@@ -215,6 +218,7 @@ export function scriptStatements(sql: string): string[] {
     if (depth === 0) cur += ch;
     i++;
   }
+  if (depth > 0) return null;
   if (cur.trim()) out.push(cur);
   return out;
 }
@@ -225,7 +229,8 @@ export function scriptStatements(sql: string): string[] {
 export function checksWrite(sql: string): boolean {
   if (!writes.test(sql)) return false;
   if (!ddl.test(sql)) return true;
-  return scriptStatements(sql).some(statement => !ddl.test(statement) && writes.test(statement));
+  const statements = scriptStatements(sql);
+  return statements === null || statements.some(statement => !ddl.test(statement) && writes.test(statement));
 }
 const writerOnly = /\btemp\.|^\s*(PRAGMA|BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
 type Routed = Pick<ReturnType<Database["query"]>, "get" | "all" | "run" | "values">;
@@ -267,7 +272,7 @@ export function routeReads(db: Database, reader: Database): void {
   db.exec = db.run;
   // prepare(sql) is query(sql) (cacheStatements), routed above. prepare(sql, params) would compile a native statement
   // with its bindings, past the routing and the write check (#995): refused; bind at the call (`.run(...params)`).
-  const prepare = db.prepare;
+  const prepare = db.prepare.bind(db);
   db.prepare = ((sql: string, params?: unknown) => {
     if (params !== undefined) throw new Error("prepare(sql, params) on a routed connection: pass the bindings to the statement's run/get/all (#995)");
     return prepare(sql);
