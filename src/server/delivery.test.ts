@@ -64,7 +64,7 @@ test("shutdown detaches each accepted lease with one hosted.lease_detached row n
   const lease = await delivery.open(bob, context(bob)); delivery.accept(lease);
   delivery.close();
   const rows = store.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'hosted.lease_detached'").all();
-  expect(rows.map(r => [r.actor, r.target, JSON.parse(r.detail)])).toEqual([[bob.authed.user_email, store.repo.hosted.all(store.repo.read)[0]!.session_id, { reason: "shutdown", client_id: OPENCODE_CLIENT }]]);
+  expect(rows.map(r => [r.actor, r.target, JSON.parse(r.detail)])).toEqual([[bob.authed.user_email, (await store.repo.hosted.all(store.repo.read))[0]!.session_id, { reason: "shutdown", client_id: OPENCODE_CLIENT }]]);
 });
 
 test("a DM to the session's own ID is pushed unstamped, an alias DM carries its alias (#451: the client checks held addresses only)", async () => {
@@ -103,7 +103,7 @@ test("canceling duplicate open preserves accepted lease, children, receipts and 
   const duplicate = await delivery.open(bob, context(bob), { changed: () => { duplicateHints++; } });
   await delivery.cancel(duplicate);
   expect(delivery.activeLeaseCount).toBe(1);
-  expect(store.repo.hosted.all(store.repo.read)).toHaveLength(2);
+  expect(await store.repo.hosted.all(store.repo.read)).toHaveLength(2);
   expect(originalHints).toBe(1);
   await send("next message");
   expect(originalHints).toBe(2); expect(duplicateHints).toBe(0);
@@ -385,8 +385,8 @@ test("acknowledged items' bodies aren't retained by the receipt history", async 
 
 test("a lease finished while renew's update awaits stays finished: renew refuses it (#807 P3 A6e2)", async () => {
   const lease = await delivery.open(bob, context(bob));
-  const deadlines = () => store.repo.hosted.all(store.repo.read).map(r => r.lease_deadline);
-  const before = deadlines();
+  const deadlines = async () => (await store.repo.hosted.all(store.repo.read)).map(r => r.lease_deadline);
+  const before = await deadlines();
   now += 1_000; // a renew now would write a later deadline
   const update = store.repo.hosted.update.bind(store.repo.hosted);
   let entered!: () => void, release!: () => void;
@@ -402,7 +402,7 @@ test("a lease finished while renew's update awaits stays finished: renew refuses
     await expect(renewed).rejects.toHaveProperty("code", "not_found");
     expect(delivery.activeLeaseCount).toBe(0);
     // The refusal rolled the renew's new deadline back.
-    expect(deadlines()).toEqual(before);
+    expect(await deadlines()).toEqual(before);
   } finally { release(); spy.mockRestore(); }
 });
 

@@ -279,7 +279,7 @@ describe("pre-seam refusals", () => {
     const unknown = hostedSessionId(1, HOSTED_CLIENT, "nobody");
     for (const id of [theirs, otherClient, unknown]) {
       await expect(b.subscriber.call("session_end", { session: id })).rejects.toMatchObject({ code: "not_found" });
-      expect(srv.app.repo.hosted.get(srv.app.repo.read, id)?.session_id ?? null).toBe(id === unknown ? null : id);
+      expect((await srv.app.repo.hosted.get(srv.app.repo.read, id))?.session_id ?? null).toBe(id === unknown ? null : id);
     }
     const got = accessAudits(srv.app.db, "authz.decision");
     // A missing ID isn't a policy question: no row.
