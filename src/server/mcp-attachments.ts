@@ -66,8 +66,9 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
           if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
         };
         // Every read on `r`, the handle of the context it runs in: the pool here, a body's own Tx inside one (#1053).
-        // The binding and alias reads follow the token read's await, so they see `r` as of the token check, and a
-        // close or abort while it awaited refuses (#807 P3 A7d2a).
+        // The binding and alias reads run after the token read's await: inside a body, on its Tx as of the token check
+        // (the body holds the write queue); on the pool, on whatever committed meanwhile. A close or abort while it
+        // awaited refuses (#807 P3 A7d2a).
         const guard = async (r: Read) => {
           live();
           const current = await oauth.authenticate(req, ["grayboard:tools"], r);

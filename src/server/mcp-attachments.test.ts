@@ -475,8 +475,10 @@ async function heldGuard(hit: number, start: () => Promise<Response>, during: ()
   const reached = Promise.withResolvers<void>();
   // The spy runs inside the pause's own log line, before it first looks for the file: every hit but the `hit`th
   // finds the file and passes at once, and the `hit`th finds none and holds until `during` is done.
-  const log = spyOn(console, "error").mockImplementation((message: unknown) => {
-    if (message !== `[grayboard] test pause hit: ${point}`) return;
+  const original = console.error.bind(console);
+  // Every other line still reaches stderr, so a failure's own error stays visible.
+  const log = spyOn(console, "error").mockImplementation((message: unknown, ...rest: unknown[]) => {
+    if (message !== `[grayboard] test pause hit: ${point}`) return original(message, ...rest);
     if (++seen === hit) { rmSync(file, { force: true }); reached.resolve(); } else writeFileSync(file, "");
   });
   process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
