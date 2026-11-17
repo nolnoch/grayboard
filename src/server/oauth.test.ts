@@ -309,7 +309,7 @@ test("the first start with built-in clients revokes the grants and codes an oper
     // A refused config changes nothing: the cutover runs only once the clients parse.
     expect(() => createOAuthServer(storage.repo, { ...config, oauthClients: [{ ...registrations[0]!, clientId: "grayboard-pi" }] })).toThrow("reserved for a built-in client");
     expect([storage.repo.oauth.isGrantActive(storage.repo.read, oldPrincipal.grantId, clock), audit().length]).toEqual([true, 0]);
-    service = makeService();
+    service = makeService(); await service.ready;
     expect(revokedLines().map(([line]) => line)).toEqual([expect.stringContaining("revoked 1 OAuth grant(s)")]);
     expect(audit()).toEqual([{ actor: "you@example.com", target: oldPrincipal.grantId, detail: JSON.stringify({ client_id: "grayboard-pi" }) }]);
     expect(service.isAuthorized(oldPrincipal)).toBe(false);
@@ -318,7 +318,7 @@ test("the first start with built-in clients revokes the grants and codes an oper
     expect(service.isAuthorized(unrelated)).toBe(true);
     // From then on a grant under a built-in ID is the built-in's: later starts keep it.
     const fresh = await redeem(await issue("grayboard-omp", scope));
-    for (let i = 0; i < 2; i++) { service.close(); service = makeService(); }
+    for (let i = 0; i < 2; i++) { service.close(); service = makeService(); await service.ready; }
     expect([revokedLines().length, audit().length]).toEqual([1, 1]);
     expect(service.isAuthorized(principal(fresh))).toBe(true);
     expect((await post("/oauth/token", { grant_type: "refresh_token", client_id: "grayboard-omp", refresh_token: fresh.refresh_token })).status).toBe(200);
@@ -1513,7 +1513,7 @@ test("the grayboard-cli cutover revokes earlier grants and pending codes under i
   await pending(CLI_CLIENT_ID); await pending("native");
   const log = spyOn(console, "error").mockImplementation(() => {});
   let logged: string;
-  try { service = makeService(); logged = log.mock.calls.flat().join("\n"); } finally { log.mockRestore(); }
+  try { service = makeService(); await service.ready; logged = log.mock.calls.flat().join("\n"); } finally { log.mockRestore(); }
   expect(service.isGrantActive(old.grantId)).toBe(false);
   expect(service.isGrantActive(other.grantId)).toBe(true);
   const codes = () => storage.db.query<{ client: string }, []>("SELECT json_extract(data, '$.clientId') AS client FROM oauth_codes WHERE grant_id IS NULL").all().map(r => r.client);
@@ -1524,7 +1524,7 @@ test("the grayboard-cli cutover revokes earlier grants and pending codes under i
   service.close();
   const later = await issueOAuth(storage.repo, service.resource, "op@example.com", ["grayboard:tools"], clock, CLI_CLIENT_ID);
   await pending(CLI_CLIENT_ID);
-  service = makeService();
+  service = makeService(); await service.ready;
   expect(service.isGrantActive(later.grantId)).toBe(true);
   expect(codes().sort()).toEqual([CLI_CLIENT_ID, "native"]);
 });

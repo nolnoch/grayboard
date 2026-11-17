@@ -7,9 +7,9 @@ import { openDatabase, type Repo } from "../db.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 import { sqliteOf, type Read, type Tx } from "./tx.ts";
 
-function open(): Repo {
+async function open(): Promise<Repo> {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  repo.writeNow(tx => { sqliteOf(tx).run("CREATE TABLE t (v TEXT)"); });
+  await repo.write(tx => { sqliteOf(tx).run("CREATE TABLE t (v TEXT)"); });
   return repo;
 }
 const put = (tx: Tx, v: string) => { sqliteOf(tx).run("INSERT INTO t (v) VALUES (?)", [v]); };
@@ -17,14 +17,14 @@ const rows = (r: Read) => sqliteOf(r).query<{ v: string }, []>("SELECT v FROM t 
 const tick = () => new Promise<void>(r => setTimeout(r, 0));
 
 test("a write body's Tx writes in its transaction; the read handle sees the commit", async () => {
-  const repo = open();
+  const repo = await open();
   await repo.write(tx => { put(tx, "a"); expect(rows(tx)).toEqual(["a"]); });
   await repo.write(async tx => { await tick(); put(tx, "b"); });
   expect(rows(repo.read)).toEqual(["a", "b"]);
 });
 
 test("a Tx used after its body settles throws, and writes nothing", async () => {
-  const repo = open();
+  const repo = await open();
   let kept!: Tx;
   await repo.write(tx => { kept = tx; });
   expect(() => put(kept, "late")).toThrow("Tx used after its transaction settled");
@@ -43,7 +43,7 @@ test("a Tx used after its body settles throws, and writes nothing", async () => 
 // `repo.coreOn(tx)`, used by a timer or un-awaited promise after the body settled, is refused: the write queue's owner
 // check runs on every write, with the queue idle or held by a later body.
 test("D4: a write a body leaves running past its settle is refused, on its raw connection too, idle queue or held", async () => {
-  const repo = open();
+  const repo = await open();
   const refused: string[] = [];
   const attempt = (c: ReturnType<Repo["coreOn"]>, v: string) => { try { c.run("INSERT INTO t (v) VALUES (?)", [v]); } catch (e) { refused.push(`${v}: ${String(e)}`); } };
   let fire!: () => void;
@@ -63,7 +63,7 @@ test("D4: a write a body leaves running past its settle is refused, on its raw c
 });
 
 test("a rolled-back body's Tx is closed too", async () => {
-  const repo = open();
+  const repo = await open();
   let kept!: Tx;
   await expect(repo.write(async tx => { kept = tx; put(tx, "x"); throw new Error("no"); })).rejects.toThrow("no");
   expect(() => put(kept, "y")).toThrow("settled");
@@ -71,7 +71,7 @@ test("a rolled-back body's Tx is closed too", async () => {
 });
 
 test("Tx.afterCommit runs after the commit, never on rollback", async () => {
-  const repo = open();
+  const repo = await open();
   const seen: string[] = [];
   await repo.write(tx => { tx.afterCommit(() => { seen.push(`ok:${rows(repo.read).length}`); }); put(tx, "a"); seen.push("body"); });
   expect(seen).toEqual(["body", "ok:1"]);
@@ -80,7 +80,7 @@ test("Tx.afterCommit runs after the commit, never on rollback", async () => {
 });
 
 test("a savepoint that throws rolls back its writes and effects alone; the outer body's stand", async () => {
-  const repo = open();
+  const repo = await open();
   const seen: string[] = [];
   await repo.write(async tx => {
     put(tx, "outer");
@@ -99,7 +99,7 @@ test("a savepoint that throws rolls back its writes and effects alone; the outer
 });
 
 test("a committed savepoint's effects wait for the outer commit, and drop with the outer rollback", async () => {
-  const repo = open();
+  const repo = await open();
   const seen: string[] = [];
   await repo.write(async tx => {
     await tx.savepoint(async sp => { put(sp, "a"); sp.afterCommit(() => { seen.push("sp"); }); await tick(); });
@@ -116,7 +116,7 @@ test("a committed savepoint's effects wait for the outer commit, and drop with t
 });
 
 test("nested savepoints: an inner rollback inside a committed savepoint", async () => {
-  const repo = open();
+  const repo = await open();
   await repo.write(async tx => {
     await tx.savepoint(async a => {
       put(a, "a1");
@@ -129,7 +129,7 @@ test("nested savepoints: an inner rollback inside a committed savepoint", async 
 });
 
 test("the parent Tx refuses statements and a second savepoint while a savepoint is open", async () => {
-  const repo = open();
+  const repo = await open();
   await repo.write(async tx => {
     let parentErr: unknown, siblingErr: unknown;
     await tx.savepoint(async sp => {
@@ -145,7 +145,7 @@ test("the parent Tx refuses statements and a second savepoint while a savepoint 
 });
 
 test("a body that returns without awaiting its savepoint: the savepoint dies with the transaction, the next one is sound", async () => {
-  const repo = open();
+  const repo = await open();
   let kept!: Tx, settled: Promise<unknown> = Promise.resolve();
   await repo.write(tx => {
     settled = tx.savepoint(async sp => { kept = sp; put(sp, "a"); await tick(); }).catch(e => e);
@@ -159,10 +159,10 @@ test("a body that returns without awaiting its savepoint: the savepoint dies wit
   expect(rows(repo.read)).toEqual(["a", "b"]);
 });
 
-test("writeNow and post bodies get a Tx live only for the body", () => {
-  const repo = open();
+test("write and post bodies get a Tx live only for the body", async () => {
+  const repo = await open();
   let a!: Tx, b!: Tx;
-  repo.writeNow(tx => { a = tx; put(tx, "now"); });
+  await repo.write(tx => { a = tx; put(tx, "now"); });
   expect(repo.post(tx => { b = tx; put(tx, "post"); })).toBe(true);
   expect(() => put(a, "x")).toThrow("settled");
   expect(() => put(b, "x")).toThrow("settled");
@@ -174,7 +174,7 @@ test("sqliteOf refuses a handle that isn't a SQLite store's", () => {
 });
 
 test("an orphaned savepoint that fails during a later transaction leaves that transaction alone", async () => {
-  const repo = open();
+  const repo = await open();
   let fail!: () => void;
   const gate = new Promise<void>((_, reject) => { fail = () => reject(new Error("orphan failed")); });
   let settled: Promise<unknown> = Promise.resolve();
@@ -189,26 +189,25 @@ test("an orphaned savepoint that fails during a later transaction leaves that tr
 });
 
 test("a synchronous body's Tx refuses a savepoint (#999 audit A)", async () => {
-  const repo = open();
+  const repo = await open();
   const errs: string[] = [];
-  repo.writeNow(tx => { tx.savepoint(() => {}).catch(e => errs.push(String(e))); put(tx, "now"); });
-  // post from the queue's holder outside a transaction (its committed callback): its own Tx, also synchronous. A post
+  // post from the queue's holder outside a transaction (its committed callback): its own Tx, synchronous. A post
   // through the queue gets a write body's Tx, which may open one (#807 P3 A3).
   await repo.write(() => 1, () => {
     expect(repo.post(tx => { tx.savepoint(() => {}).catch(e => errs.push(String(e))); put(tx, "holder"); })).toBe(true);
   });
   await tick();
-  expect(errs).toHaveLength(2);
+  expect(errs).toHaveLength(1);
   for (const e of errs) expect(e).toContain("savepoint in a synchronous write body");
-  // Effects of later synchronous transactions still run: no frame was left behind.
+  // Effects of later transactions still run: no frame was left behind.
   const seen: string[] = [];
-  repo.writeNow(tx => { tx.afterCommit(() => { seen.push("later"); }); });
+  await repo.write(tx => { tx.afterCommit(() => { seen.push("later"); }); });
   expect(seen).toEqual(["later"]);
-  expect(rows(repo.read)).toEqual(["now", "holder"]);
+  expect(rows(repo.read)).toEqual(["holder"]);
 });
 
 test("a post body run from a write's committed callback gets a Tx closed after it", async () => {
-  const repo = open();
+  const repo = await open();
   let after!: Tx;
   await repo.write(() => 1, () => { repo.post(tx => { after = tx; put(tx, "after"); }); });
   expect(() => put(after, "x")).toThrow("settled");
@@ -216,7 +215,7 @@ test("a post body run from a write's committed callback gets a Tx closed after i
 });
 
 test("an unawaited savepoint started inside atomic doesn't strand the atomic's frame (#999 audit A)", async () => {
-  const repo = open();
+  const repo = await open();
   const seen: string[] = [];
   let settled: Promise<unknown> = Promise.resolve();
   await repo.write(async tx => {
@@ -225,12 +224,12 @@ test("an unawaited savepoint started inside atomic doesn't strand the atomic's f
     tx.afterCommit(() => { seen.push("outer"); });
   });
   expect(seen).toEqual(["outer"]);
-  repo.writeNow(tx => { tx.afterCommit(() => { seen.push("next"); }); });
+  await repo.write(tx => { tx.afterCommit(() => { seen.push("next"); }); });
   expect(seen).toEqual(["outer", "next"]);
 });
 
 test("a savepoint rolled back with an inner one left open: the caller's later effects still run (#999 audit B)", async () => {
-  const repo = open();
+  const repo = await open();
   const seen: string[] = [];
   let inner: Promise<unknown> = Promise.resolve();
   await repo.write(async tx => {
@@ -247,7 +246,7 @@ test("a savepoint rolled back with an inner one left open: the caller's later ef
 });
 
 test("a savepoint committing with an inner one still open rolls back instead of staying open (#999 audit B)", async () => {
-  const repo = open();
+  const repo = await open();
   const seen: string[] = [];
   let inner: Promise<unknown> = Promise.resolve();
   await repo.write(async tx => {

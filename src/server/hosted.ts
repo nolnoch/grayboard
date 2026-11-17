@@ -390,9 +390,10 @@ export function createHostedSessions(application: Application, options: { now?: 
   // disabled passes too, which the timer runs every IDLE_EVERY ticks (the idle window is minutes, and
   // setDisabled ends a disabled user's rows itself, so that pass is a backstop). A test's injected clock calls
   // it directly. The commits tell reconcile which rows changed.
-  // Through the write queue; startup's first sweep runs now (`writeNow`), before anything serves. `nested`: inside
-  // the caller's transaction (a capacity refusal's re-sweep), as its savepoint, on `outer`, that transaction's Tx.
-  function sweep(full = true, mode: "queued" | "startup" | "nested" = "queued", outer?: Tx): Promise<void> {
+  // Through the write queue (startup's first sweep too, which the server's `ready` waits for before anything serves,
+  // #807 P3 A4). `nested`: inside the caller's transaction (a capacity refusal's re-sweep), as its savepoint, on
+  // `outer`, that transaction's Tx.
+  function sweep(full = true, mode: "queued" | "nested" = "queued", outer?: Tx): Promise<void> {
     if (stopped) return Promise.resolve();
     if (full) sweptAt = now();
     const body = (tx: Tx) => {
@@ -408,11 +409,8 @@ export function createHostedSessions(application: Application, options: { now?: 
       evictParked(tx, parkedUnder);
     };
     if (mode === "queued") return store.write(body);
-    if (mode === "startup") store.writeNow(body);
-    else {
-      if (!outer) throw new Error("a nested sweep runs in its caller's transaction: pass its Tx");
-      store.atomic(() => body(outer));
-    }
+    if (!outer) throw new Error("a nested sweep runs in its caller's transaction: pass its Tx");
+    store.atomic(() => body(outer));
     return Promise.resolve();
   }
   function park(tx: Tx, row: HostedSession, parkedUnder: Set<string>) {
@@ -470,8 +468,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   // measure, and a gap within LIVE_STALENESS_MS is indistinguishable from a
   // live server (a concurrent opener). Writing alive_at in the same
   // transaction makes a second start measure ~0, so the credit is applied once.
-  function creditDowntime() {
-    store.writeNow(tx => {
+  function creditDowntime(): Promise<void> {
+    return store.write(tx => {
       const t = now(), alive = store.aliveAt(tx), downtime = alive === undefined ? null : t - alive;
       let credited = 0;
       if (alive !== undefined && downtime !== null && downtime > LIVE_STALENESS_MS) {
@@ -941,10 +939,14 @@ export function createHostedSessions(application: Application, options: { now?: 
   };
   // Subscribed after the credit: its transaction would otherwise reconcile once before the sweep, opening
   // holder sessions for roots the sweep then ends (#424 item 7). The full reconcile after the sweep opens the rest.
-  creditDowntime();
-  const unsubscribe = store.subscribe(reconcile);
-  void sweep(true, "startup");
-  reconcile();
+  // Both writes are queued (#807 P3 A4): `ready` settles once the sweep has committed and reconcile has run, and the
+  // server serves nothing before it. A timer tick's sweep queues behind them. A close before then stops the rest.
+  let unsubscribe = () => {};
+  const ready = creditDowntime().then(() => {
+    if (stopped) return;
+    unsubscribe = store.subscribe(reconcile);
+    return sweep(true).then(() => { if (!stopped) reconcile(); });
+  });
   let beat = now(), tick = 0, sweeping = false, fullDue = false;
   const timer = setInterval(() => {
     tick++;
@@ -966,6 +968,6 @@ export function createHostedSessions(application: Application, options: { now?: 
     }
   }, TICK_MS);
   timer.unref();
-  return service;
+  return Object.assign(service, { ready });
 }
 export type HostedSessions = ReturnType<typeof createHostedSessions>;

@@ -35,7 +35,7 @@ beforeEach(async () => {
   };
   alice = await principal("alice@example.com"); bob = await principal("bob@example.com");
   now = Date.now(); authorized = true;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
   sender = new AppSession(application, store.repo, alice.authed, "be", { push: false });
   await sender.connect();
@@ -200,7 +200,7 @@ test("shutdown leaves ownership and deadline durable; reopen retains ownership",
   const lease = await delivery.open(bob, context(bob));
   delivery.close(); hosted.close();
   now += 10_000;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
   expect(await hosted.whoami(bob, context(bob))).toHaveProperty("ownership", lease.ownership);
   const reopened = await delivery.open(bob, context(bob));

@@ -23,11 +23,11 @@ let hosted: ReturnType<typeof createHostedSessions>;
 let delivery: ReturnType<typeof createDelivery>;
 const resource = "https://grayboard.example/mcp";
 const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
-function open() {
+async function open() {
   database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
   application = createApplication(database.repo);
   const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.oauth.isGrantActive(r, p.grantId, now);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized });
 }
 function close() { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); }
@@ -36,7 +36,7 @@ async function issue(email = "you@example.com") {
   const principal: OAuthPrincipal = { authed: issued.authed, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: issued.grantId, accessHash: hashToken(issued.token), accessExpiry: issued.tokens.accessExpiresAt, scopes: ["tools", "delivery"] };
   return { ...issued, principal };
 }
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "gb-hosted-durable-")); now = Date.now(); open(); });
+beforeEach(async () => { dir = mkdtempSync(join(tmpdir(), "gb-hosted-durable-")); now = Date.now(); await open(); });
 afterEach(() => { close(); rmSync(dir, { recursive: true, force: true }); });
 const releases = () => database.db.query<{ detail: string }, []>("SELECT detail FROM binding_events WHERE event='released'").all();
 
@@ -261,24 +261,24 @@ test("two restarts retain ownership and deadline; downtime is credited; expiry r
   await hosted.register(principal, context(principal), "child");
   const before = await hosted.whoami(principal, context(principal));
   const lease = await delivery.open(principal, context(principal));
-  close(); now += 5_000; open();
+  close(); now += 5_000; await open();
   expect(await hosted.whoami(principal, context(principal))).toMatchObject(before);
   expect(database.db.query("SELECT address, id FROM alias_holds").all()).toEqual([{ address: "you@example.com/fe", id: (context(principal) as { id: string }).id }]);
   const reopened = await delivery.open(principal, context(principal));
   expect(reopened.ownership).toBe(lease.ownership);
   expect(reopened.capability).not.toBe(lease.capability);
-  close(); now += 5_000; open();
+  close(); now += 5_000; await open();
   expect(releases()).toEqual([]);
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM binding_events WHERE event='bound'").get()?.count).toBe(1);
   // Downtime longer than the TTL doesn't count against the lease (#423)...
-  close(); now += 31_000; open();
+  close(); now += 31_000; await open();
   expect(releases()).toEqual([]);
   expect(database.repo.hosted.all(database.repo.read)).toHaveLength(2);
   // ...but time while the server is up does.
   now += 31_000; hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toEqual([{ detail: "expired" }]);
-  close(); open();
+  close(); await open();
   expect(releases()).toEqual([{ detail: "expired" }]);
 });
 
@@ -331,7 +331,7 @@ test("opening a pre-hosted SQLite schema adds tables without changing users, mes
     return database.repo.messages.insert(tx, "you@example.com/fe", "user", "you@example.com/fe", "existing", null, false);
   });
   database.db.exec("DROP TABLE hosted_sessions; DROP TABLE hosted_ownerships;");
-  close(); open();
+  close(); await open();
   expect(database.repo.aliases.listForScope(database.repo.read, "person", first.authed.user_email).map(row => row.name)).toEqual(["fe"]);
   expect(database.repo.oauth.isGrantActive(database.repo.read, first.grantId, now)).toBe(true);
   expect(database.db.query<{ body: string }, [number]>("SELECT body FROM messages WHERE id=?").get(message.id)?.body).toBe("existing");
@@ -346,12 +346,12 @@ test("a database a v2.x release wrote, with a hosted root bound under its single
   const id = (context(first.principal) as { id: string }).id;
   // The v2.x shape: the name on the row under its partial unique index, no writes_as, and the hold row its bind also wrote.
   await seed(database.repo, () => { database.db.exec(`ALTER TABLE hosted_sessions DROP COLUMN writes_as; UPDATE hosted_sessions SET name = 'fe'; CREATE UNIQUE INDEX idx_hosted_name ON hosted_sessions(user_id, name) WHERE name IS NOT NULL;`); });
-  close(); open();
+  close(); await open();
   expect(database.db.query("SELECT name FROM hosted_sessions").get()).toEqual({ name: null });
   expect(database.db.query("SELECT 1 AS x FROM sqlite_master WHERE name = 'idx_hosted_name'").get()).toBeNull();
   expect(application.hostedHolds(application.repo.read, id)).toEqual(["you@example.com/fe"]);
   expect(await hosted.whoami(first.principal, context(first.principal))).toMatchObject({ held: ["you@example.com/fe"], primary: "you@example.com/fe" });
   // A second open changes nothing.
-  close(); open();
+  close(); await open();
   expect(application.hostedHolds(application.repo.read, id)).toEqual(["you@example.com/fe"]);
 });

@@ -123,6 +123,7 @@ export class TestServer {
 
   // appSession, connected (bound unless identity is null or it's tools-only).
   async connected(token: string, identity: string | null, opts: AppSessionOptions = {}): Promise<AppSession> {
+    await this.app.ready;
     const s = this.appSession(token, identity, opts);
     await s.connect();
     return s;
@@ -133,6 +134,8 @@ export class TestServer {
   // stop(). Inbox polling spends hosted requests: give this server a large
   // hostedRequestLimit (serverConfig carries it to the subscriber bucket).
   async hosted(email: string, identity: string | null, opts: HostedOptions = {}): Promise<HostedSession> {
+    // The startup writes first, as the listener waits for them (#807 P3 A4): the grant is written straight to the Repo.
+    await this.app.ready;
     const { token } = await issueOAuth(this.app.repo, this.app.oauth.resource, email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT);
     const s = new HostedSession(`${this.base}/mcp`, token, identity, opts);
     this.hostedSessions.push(s);

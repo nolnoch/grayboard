@@ -124,13 +124,15 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Built-ins and the CLI first; parseOAuthClients refuses an operator entry that reuses one of their IDs.
   const clients = new Map([...BUILTIN_CLIENTS, CLI_CLIENT, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
-  // Before any request, and only once the config parsed: a grant an operator client issued
-  // under a now-built-in ID (before #429) would otherwise act as a built-in's.
-  const revoked = repo.writeNow(tx => repo.oauth.revokePreBuiltinGrants(tx, BUILTIN_CLIENT_IDS, now()));
-  if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
-  // The same once for grayboard-cli (#928 D8), under its own key: the cutover above already ran on most databases.
-  const revokedCli = repo.writeNow(tx => repo.oauth.revokePreBuiltinGrants(tx, [CLI_CLIENT_ID], now(), "builtin_clients_cli"));
-  if (revokedCli) console.error(`[grayboard] revoked ${revokedCli} OAuth grant(s) issued under ${CLI_CLIENT_ID} before this server reserved it for CLI sign-in`);
+  // Before any request (the server's `ready` waits for it, #807 P3 A4), and only once the config parsed: a grant an
+  // operator client issued under a now-built-in ID (before #429) would otherwise act as a built-in's.
+  const ready = repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, BUILTIN_CLIENT_IDS, now())).then(revoked => {
+    if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
+    // The same once for grayboard-cli (#928 D8), under its own key: the cutover above already ran on most databases.
+    return repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, [CLI_CLIENT_ID], now(), "builtin_clients_cli"));
+  }).then(revokedCli => {
+    if (revokedCli) console.error(`[grayboard] revoked ${revokedCli} OAuth grant(s) issued under ${CLI_CLIENT_ID} before this server reserved it for CLI sign-in`);
+  });
   const cimd = createCimdResolver({ ...options.cimd, now });
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
   // redirects that authorize errors follow, and a name the consent page shows.
@@ -613,6 +615,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     });
   }
   return {
+    // Settles once the startup revocations above have committed; the server serves nothing before it.
+    ready,
     issuer, resource, resourceMetadata,
     async fetch(req: Request, context?: OAuthNetworkContext): Promise<Response | undefined> {
       try { return await route(req, context); }

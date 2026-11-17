@@ -15,6 +15,7 @@ import { writeAudit } from "./audit.ts";
 import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 import { serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 
 export type StartOptions = ApplicationOptions & {
   hostname?: string;
@@ -44,10 +45,11 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.
-  if (!config.devAuth) {
-    const revoked = repo.writeNow(tx => repo.sessions.revokeDev(tx));
-    if (revoked > 0) writeAudit(repo, repo.read, "auth.dev_sessions_revoked", null, null, { count: revoked });
-  }
+  // Queued first (#807 P3 A4), so it commits before any other startup write and any request.
+  const devRevoked = config.devAuth ? Promise.resolve() : repo.write(tx => {
+    const revoked = repo.sessions.revokeDev(tx);
+    if (revoked > 0) writeAudit(repo, tx, "auth.dev_sessions_revoked", null, null, { count: revoked });
+  });
   const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
 
@@ -80,6 +82,12 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // Room for four messages' worth of upload bodies at once, one per user.
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
   const attachments = createMcpAttachments(repo, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
+  // The startup writes, each through the write queue in the order queued (#807 P3 A4): the dev-session revocation,
+  // OAuth's built-in client cutovers, and hosted's downtime credit and first sweep. The listener serves nothing until
+  // all have committed; a failure rejects it, and every request then fails, so the caller (main.ts) exits on it.
+  const ready: Promise<void> = Promise.all([devRevoked, oauth.ready, mcp.sessions.ready]).then(() => testPauseAsync("server:ready"));
+  let started = false;
+  ready.then(() => { started = true; }, () => {});
 
   async function route(req: Request, caller: Caller): Promise<Response> {
     const url = new URL(req.url);
@@ -133,6 +141,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     async fetch(req, server) {
+      if (!started) await ready;
       // First, before anything reads the database (#240).
       const caller = authGate.caller(req, server.requestIP(req)?.address);
       // Every audit row this request writes carries where it came from (security audit F-19).
@@ -180,6 +189,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     revalidate,
     sweepLimits,
     authGate,
+    // Settles once the startup writes have committed (the listener waits for it); rejects when one failed.
+    ready,
     // Settles once the Slack bridge is up, or has given up.
     slackReady: slackReady ?? Promise.resolve(),
     touches,
@@ -195,7 +206,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       stopExpiry();
       touches.cancelAll();
       server.stop(true);
-      stopPromise = Promise.allSettled([mcp.close(), attachments.close()]).then(outcomes => {
+      // After the startup writes settle: closing the database under a queued one would fail it mid-flight.
+      stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(outcomes => {
         const failure = outcomes.find(outcome => outcome.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
       }).finally(() => { oauth.close(); repo.close(); });

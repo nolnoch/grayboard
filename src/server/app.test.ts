@@ -1,8 +1,8 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startLimits, startServer } from "./app.ts";
@@ -71,7 +71,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
   const config = restartConfig(dir);
   let app: ReturnType<typeof startServer> | undefined;
   try {
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     const { principal, context, lease } = await leasedRoot(app);
     await app.stop(); app = undefined;
     const alive = Date.now() - (scenario === "idle" ? 20 * 60_000 : 300_000);
@@ -89,7 +89,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
       }
     } finally { outage.close(); }
     const before = Date.now();
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     const after = Date.now();
     const rows = app.repo.hosted.all(app.repo.read);
     const credits = restartCredits(app);
@@ -149,7 +149,7 @@ test("a clean stop records its time, so a quick restart credits nothing", async 
   const config = restartConfig(dir);
   let app: ReturnType<typeof startServer> | undefined;
   try {
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     await leasedRoot(app);
     const deadline = app.repo.hosted.all(app.repo.read).find(row => !row.root_session_id)!.lease_deadline!;
     const stopping = Date.now();
@@ -161,7 +161,7 @@ test("a clean stop records its time, so a quick restart credits nothing", async 
       expect(alive).toBeGreaterThanOrEqual(stopping);
       expect(alive).toBeLessThanOrEqual(stopped);
     } finally { outage.close(); }
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     expect(app.repo.hosted.all(app.repo.read).find(row => !row.root_session_id)!.lease_deadline).toBe(deadline);
     expect(restartCredits(app)).toEqual([]);
   } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
@@ -172,7 +172,7 @@ test("a second opener during a credited restart doesn't credit the outage again"
   const config = restartConfig(dir);
   let app: ReturnType<typeof startServer> | undefined, second: ReturnType<typeof startServer> | undefined;
   try {
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     await leasedRoot(app);
     await app.stop(); app = undefined;
     const alive = Date.now() - 300_000;
@@ -181,9 +181,9 @@ test("a second opener during a credited restart doesn't credit the outage again"
       outage.run("UPDATE server_state SET value = ? WHERE key = 'alive_at'", [alive]);
       outage.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE root_session_id IS NULL", [alive + 20_000]);
     } finally { outage.close(); }
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     const credited = app.repo.hosted.all(app.repo.read).find(row => !row.root_session_id)!.lease_deadline!;
-    second = startServer(config, { hostname, background: false });
+    second = startServer(config, { hostname, background: false }); await second.ready;
     expect(restartCredits(second)).toEqual([expect.objectContaining({ before: alive + 20_000, after: credited })]);
     expect(second.repo.hosted.all(second.repo.read).find(row => !row.root_session_id)!.lease_deadline).toBe(credited);
   } finally { await second?.stop(); await app?.stop(); rmSync(dir, { recursive: true, force: true }); }
@@ -191,7 +191,7 @@ test("a second opener during a credited restart doesn't credit the outage again"
 
 test("a running server's liveness heartbeat advances", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-heartbeat-"));
-  const app = startServer(restartConfig(dir), { hostname, background: false });
+  const app = startServer(restartConfig(dir), { hostname, background: false }); await app.ready;
   try {
     const first = app.repo.hosted.aliveAt(app.repo.read)!;
     await until(() => app.repo.hosted.aliveAt(app.repo.read)! > first, 5_000);
@@ -260,7 +260,7 @@ test("a started server's hosted MCP surface takes its session caps from the conf
   let app: ReturnType<typeof startServer> | undefined;
   try {
     const hostedCaps = { sessions: { global: 5000, perUser: 300 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
-    app = startServer({ ...restartConfig(dir), hostedCaps }, { hostname, background: false });
+    app = startServer({ ...restartConfig(dir), hostedCaps }, { hostname, background: false }); await app.ready;
     expect(app.mcp.sessions.limits).toMatchObject({ user: 300, global: 5000 });
   } finally {
     await app?.stop();
@@ -277,13 +277,42 @@ test("an explicit observerCap start option overrides the configured watch cap (#
 // F-04: a dev sign-in token must not outlive dev auth. A restart without it
 // revokes every dev token, and turning dev auth back on doesn't revive them;
 // a token from the real sign-in survives.
+// #807 P3 A4: the startup writes are queued, and the listener serves nothing until they've committed: a request that
+// arrives first waits for `ready`. The pause holds `ready` open after the writes, so the request is in flight while it is.
+test("a request that arrives before the startup writes commit waits for them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-ready-"));
+  const release = join(dir, "release");
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  process.env.BUS_TEST_PAUSE = "server:ready"; process.env.BUS_TEST_PAUSE_FILE = release;
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    app = startServer(restartConfig(dir), { hostname, background: false });
+    let ready = false;
+    void app.ready.then(() => { ready = true; });
+    await until(() => log.mock.calls.some(([line]) => String(line).includes("test pause hit: server:ready")), 5_000, "the startup pause");
+    let answered = false;
+    const health = fetch(`http://${hostname}:${app.server.port}/healthz`).then(res => { answered = true; return res.status; });
+    // A window, not a sync point: nothing in the server signals that a gated request is parked.
+    await Bun.sleep(200);
+    expect([ready, answered]).toEqual([false, false]);
+    writeFileSync(release, "");
+    expect(await health).toBe(200);
+    expect(ready).toBe(true);
+  } finally {
+    writeFileSync(release, "");
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore();
+    await app?.stop(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a server started without dev auth revokes dev sign-in tokens for good", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-dev-revoke-"));
   const config = restartConfig(dir);
   let app: ReturnType<typeof startServer> | undefined;
   const whoami = (token: string) => fetch(`http://${hostname}:${app!.server.port}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } }).then(res => res.status);
   try {
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     const login = await fetch(`http://${hostname}:${app.server.port}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "you@example.com" }) });
     expect(login.status).toBe(200);
     const dev = (await login.json() as { session_token: string }).session_token;
@@ -293,14 +322,14 @@ test("a server started without dev auth revokes dev sign-in tokens for good", as
     expect(await whoami(dev)).toBe(200);
     await app.stop(); app = undefined;
 
-    app = startServer({ ...config, devAuth: false }, { hostname, background: false });
+    app = startServer({ ...config, devAuth: false }, { hostname, background: false }); await app.ready;
     expect(await whoami(dev)).toBe(401);
     expect(await whoami(real)).toBe(200);
     const revoked = app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'auth.dev_sessions_revoked'").all();
     expect(revoked.map(row => JSON.parse(row.detail))).toEqual([{ count: 1 }]);
     await app.stop(); app = undefined;
 
-    app = startServer(config, { hostname, background: false });
+    app = startServer(config, { hostname, background: false }); await app.ready;
     expect(await whoami(dev)).toBe(401);
     expect(await whoami(real)).toBe(200);
   } finally { await app?.stop(); rmSync(dir, { recursive: true, force: true }); }

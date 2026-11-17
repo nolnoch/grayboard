@@ -40,7 +40,7 @@ beforeEach(async () => {
   const user = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "you@example.com", null));
   principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
   now = Date.now(); authorized = true;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
 });
 afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
@@ -56,6 +56,7 @@ test("#807: behind a write backlog longer than a tick, the timer keeps one sweep
     return real(() => {}, 1 << 30);
   }) as unknown as typeof setInterval);
   try { hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); } finally { interval.mockRestore(); }
+  await hosted.ready;
   const store = database.repo.hosted;
   const expired = spyOn(store, "expired");
   try {
@@ -78,7 +79,7 @@ test("#807: behind a write backlog longer than a tick, the timer keeps one sweep
 
 test("#807 audit: withGate authorizes outside the transaction (the auth cache serves it) and again inside only after waiting in the queue", async () => {
   const inTxn: boolean[] = [];
-  const service = createHostedSessions(application, { now: () => now, isAuthorized: () => { inTxn.push(database.db.inTransaction); return true; } });
+  const service = createHostedSessions(application, { now: () => now, isAuthorized: () => { inTxn.push(database.db.inTransaction); return true; } }); await service.ready;
   try {
     await service.bind(principal, context("auth-root"), { name: "auth-peer", create: true });
     inTxn.length = 0;
@@ -105,6 +106,7 @@ test("#998: an access check inside a hosted body reads on that body's Tx, one ou
     checks.push({ inTxn: database.db.inTransaction, handle: r === undefined || r === database.repo.read ? "pool" : "tx" });
     return true;
   } });
+  await service.ready;
   try {
     await service.bind(principal, context("check-root"), { name: "check-peer", create: true });
     await service.register(principal, context("check-root"), "check-child");
@@ -409,7 +411,7 @@ test("startup opens no holder session for a root its first sweep ends (#424 item
   now += 5 * 60_000;
   const opened = spyOn(application, "hostedSession");
   try {
-    hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+    hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
     expect(database.repo.hosted.get(database.repo.read, root.id)).toBeUndefined();
     expect(opened).not.toHaveBeenCalled();
   } finally { opened.mockRestore(); }
@@ -440,7 +442,7 @@ test("unbound row quota survives service restart, idle cleanup frees rows and ga
   await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
   expect(database.db.query<{ count: number }, []>("SELECT count(*) AS count FROM hosted_ownerships").get()?.count).toBe(before);
   hosted.close();
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   await expect(hosted.whoami(principal, context("overflow"))).rejects.toHaveProperty("code", "bad_request");
   now += 900_001; hosted.sweep();
   expect(hostedRowCount(database.db)).toBe(0);
@@ -908,7 +910,7 @@ test("a refused writes_as declaration through the hosted gate keeps its refused 
 
 test("a rate-limited hosted bind keeps its bind.rate_limited row after the transaction rolls back, and the streak's end is written once (#467)", async () => {
   const limited = createApplication(database.repo, { helloLimit: { burst: 1, perSec: 0.01 }, now: () => now });
-  const service = createHostedSessions(limited, { now: () => now, isAuthorized: () => true });
+  const service = createHostedSessions(limited, { now: () => now, isAuthorized: () => true }); await service.ready;
   const rows = (action: string) => (database.db.query("SELECT count(*) AS n FROM access_log WHERE action = ?").get(action) as { n: number }).n;
   try {
     await service.bind(principal, context("root"), { name: "fe", create: true });
@@ -1464,7 +1466,7 @@ test("after an outage past the window the startup sweep parks children; each ret
   await hosted.register(principal, context("root"), "child");
   hosted.close();
   now += 900_001;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   expect(database.repo.hosted.get(database.repo.read, hostedId("child"))?.parked_at).toBe(now);
   expect(childAudits("hosted.child_parked")).toHaveLength(1);
   expect(await hosted.whoami(principal, context("child"))).toHaveProperty("child", true);
@@ -1590,7 +1592,7 @@ test("the restart credit is what keeps an unbound idle root alive across a long 
   hosted.close();
   // 20 minutes down: without the credit, the unbound root is past the 15-minute idle window at startup.
   now += 20 * 60_000;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   expect(database.repo.hosted.get(database.repo.read, root.id)?.last_seen_at).toBe(now);
   expect(creditRows()).toEqual([expect.objectContaining({ field: "last_seen_at", before: seen, after: now, downtime_ms: 20 * 60_000 })]);
   expect(lastStart()).toMatchObject({ credited: 1 });
@@ -1605,7 +1607,7 @@ test("a disabled user's root earns no restart credit", async () => {
   hosted.close();
   await seed(database.repo, () => database.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [now, principal.authed.user_id]));
   now += 5 * 60_000;
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   expect(creditRows()).toEqual([]);
   expect(lastStart()).toMatchObject({ downtime_ms: 5 * 60_000, credited: 0 });
   expect(database.repo.hosted.get(database.repo.read, root.id)).toBeUndefined();
@@ -1655,7 +1657,7 @@ test("a released child's ID ends with the release's reason, not at the next star
   // Nothing is left for the startup sweep to label a WSS leftover.
   hosted.close(); application.stopExpiry();
   application = createApplication(database.repo);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   expect(childAudits("id.ended").filter(a => a.why === "wss_removed")).toEqual([]);
 });
 
@@ -1745,7 +1747,7 @@ test("a user at capacity with idle rows is admitted after the refusal's re-sweep
 
 test("a configured per-user session cap admits past the default and refuses at its size (#805 F-06)", async () => {
   hosted.close();
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 300 } });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 300 } }); await hosted.ready;
   expect(hosted.limits).toMatchObject({ user: 300, global: 4096 });
   for (let i = 0; i < 300; i++) await hosted.whoami(principal, context(`unbound-${i}`));
   expect(hostedRowCount(database.db)).toBe(300);
@@ -1783,7 +1785,7 @@ test("#881: a settle that ends a lapsed root stands when the same request is the
   await delivery.open(principal, lapsed);
   await hosted.whoami(principal, other);
   delivery.close(); hosted.close();
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 1 } });
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized, caps: { global: 4096, perUser: 1 } }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
   await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, lapsed.id]));
   // settle ends the lapsed root; rowFor then starts a new row there, which the one-row cap refuses.
@@ -1871,7 +1873,7 @@ test("a call within the touch window leaves last_seen_at; one past it moves it, 
   touches.mockRestore();
 
   hosted.close();
-  hosted = createHostedSessions(application, { now: () => now, idleSeconds: 2, isAuthorized: () => authorized });
+  hosted = createHostedSessions(application, { now: () => now, idleSeconds: 2, isAuthorized: () => authorized }); await hosted.ready;
   const before = seen("root");
   now += 199; await hosted.whoami(principal, context("root"));
   expect(seen("root")).toBe(before);

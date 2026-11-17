@@ -167,23 +167,6 @@ export function queuedGuardTx(repo: Repo, guard?: (r: Read) => void): { tx: Writ
   }) };
 }
 
-// A write at startup, before anything serves (a constructor's first sweep, #807 P1b-4): fn's transaction through the
-// write queue, run now, its value returned and its error thrown, as the synchronous transaction it was. It throws when
-// the queue is held: a request, timer or callback path awaits write() instead.
-function queuedNow<T>(db: Database, fn: (tx: Tx) => T, committed?: (value: T) => unknown): T {
-  const queue = queueFor(db);
-  if (queue.held) throw new Error("writeNow while the write queue is held: only startup calls it; await write() instead");
-  let box: { value: T } | { error: unknown } | undefined;
-  void queue.run(() => {
-    try { box = { value: db.transaction(withTx(db, fn)).immediate() as T }; } catch (error) { box = { error }; return; }
-    // Before the queue's next body, as write()'s committed (D4); its throw is the caller's, the commit stands.
-    try { committed?.(box.value); } catch (error) { box = { error }; }
-  });
-  if (!box) throw new Error("writeNow: the idle queue didn't run its body synchronously");
-  if ("error" in box) throw box.error;
-  return box.value;
-}
-
 // A write no caller waits for (an audit row, a closing session's last-seen touch, a lapsed lease's settle; #807 P1b-4b),
 // for code that can't await: a sync finally, a timer, a sync check on the request path. It runs as its own transaction
 // when the caller holds the queue outside one (its committed callback, its afterCommit flush), or through the queue:
@@ -232,9 +215,6 @@ export interface Repo {
   // fn gets the transaction's Tx (#807 P1c), live until fn settles; a store function it calls writes through it.
   write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
-  // write's transaction run now, for startup only (a constructor, before anything serves): returns fn's value, throws
-  // its error, and throws when the queue is held or a transaction is open.
-  writeNow<T>(fn: (tx: Tx) => Sync<T>): T;
   // A write no caller awaits, for code that can't (posted, above): true when it ran now, false when it waits behind
   // another body or awaits, its failure then logged as `what` failed. It refuses inside an open transaction (a body's
   // write goes on its Tx). A promise `committed` returns is caught and its rejection logged as `what` failed on every
@@ -1007,7 +987,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       return db.transaction(fn).immediate() as T;
     },
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
-    writeNow: <T>(fn: (tx: Tx) => Sync<T>) => queuedNow(db, fn) as T,
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
     read: sqliteRead(db),
     authRead<T>(fn: () => Sync<T>): T {
@@ -2073,7 +2052,6 @@ function makeHostedStore(db: Database): HostedStoreOf {
     writesOn,
     atomic: fn => db.transaction(fn).immediate(),
     write: (fn, committed) => queued(db, fn, committed),
-    writeNow: fn => queuedNow(db, fn),
     subscribe: () => () => {},
     get: (r, id) => hostedRow(sqliteOf(r), id),
     owned: (r, id) => sqliteOf(r).query<{ n: number }, [string, string]>(
