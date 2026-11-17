@@ -236,34 +236,85 @@ test("a resolved @mention is direct addressing and bypasses the rotation", () =>
   expect(rows).toEqual([{ handle: "sim", reason: "mention" }]);
 });
 
-// #219: a post addressed to one lane by name is tracked like a rotated one.
+// #219: a post addressed to one agent by name is tracked like a rotated one. An agent's post is strict
+// (tools.ts passes strictIds); a system post is not.
+const said = { strictIds: true };
+const takes = (key: string) => claimEvents(key).filter((e) => e.event === "take").map((e) => e.handle);
+
 test("one mentioned lane holds the post: its reply acks it", () => {
-  const r = post(db, "be", "work", "@sim take this one");
+  const r = post(db, "be", "work", "@sim take this one", null, said);
   const key = claimKey(r.post.id);
   expect(listClaims(db).filter((c) => c.key === key).map((c) => [c.holder, c.note])).toEqual([["sim", "queue post (mentioned)"]]);
   expect(claimEvents(key)).toEqual([{ event: "take", handle: "sim" }]);
-  post(db, "sim", "work", "on it, done", r.post.id);
+  post(db, "sim", "work", "on it, done", r.post.id, said);
   expect(listClaims(db).some((c) => c.key === key)).toBe(false);
 });
 
 test("a mentioned lane's lapse or decline redelivers through the rotation, never back to it", () => {
-  const r = post(db, "be", "work", "@sim take this one");
+  const r = post(db, "be", "work", "@sim take this one", null, said);
   const key = claimKey(r.post.id);
   sweepExpired(db, Date.now() + 31 * 60_000);
   expect(listClaims(db).filter((c) => c.key === key).map((c) => c.holder)).toEqual(["fe"]);
-  const r2 = post(db, "be", "work", "@fe and this one");
+  const r2 = post(db, "be", "work", "@fe and this one", null, said);
   release(db, "fe", claimKey(r2.post.id), "pass");
   expect(listClaims(db).filter((c) => c.key === claimKey(r2.post.id)).map((c) => c.holder)).toEqual(["sim"]);
 });
 
-test("several mentions, or a human's handle, take no claim", () => {
-  const several = post(db, "be", "work", "@sim @fe either of you");
+test("a sole mentioned lane's lapse ends the post unclaimed, never re-offered to it", () => {
+  db.prepare(`DELETE FROM subscriptions WHERE handle = 'fe'`).run();
+  const r = post(db, "be", "work", "@sim take this one", null, said);
+  const key = claimKey(r.post.id);
+  sweepExpired(db, Date.now() + 31 * 60_000);
+  expect(takes(key)).toEqual(["sim"]);
+  expect(listClaims(db).some((c) => c.key === key)).toBe(false);
+  const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+  expect(replies.map((x) => x.body.startsWith("[unclaimed]"))).toEqual([true]);
+});
+
+test("a mention of a session's other alias, or its ID, gives that session its one turn (#219 audit)", () => {
+  const ID = "id:0123456789abc";
+  registerId(db, { id: ID, principal: null, launcher: false });
+  for (const a of ["zed", "alpha"]) ensureAlias(db, a, "test");
+  holdAlias(db, "zed", ID, 100);
+  holdAlias(db, "alpha", ID, 101);
+  subscribe(db, "zed", "work", "push");
+  db.prepare(`DELETE FROM subscriptions WHERE handle IN ('fe', 'sim')`).run();
+  const r = post(db, "be", "work", "@alpha take this", null, said);
+  release(db, "alpha", claimKey(r.post.id), "pass");
+  expect(takes(claimKey(r.post.id))).toEqual(["alpha"]);
+  const r2 = post(db, "be", "work", `@${ID} and this`, null, said);
+  sweepExpired(db, Date.now() + 31 * 60_000);
+  expect(takes(claimKey(r2.post.id))).toEqual([ID]);
+});
+
+test("several mentions, a human's handle or the poster's own address take no claim", () => {
+  const several = post(db, "be", "work", "@sim @fe either of you", null, said);
   expect(several.wake.sort()).toEqual(["fe", "sim"]);
   ensureAlias(db, "wade", "test");
   db.prepare(`UPDATE aliases SET human = 1 WHERE address = 'wade'`).run();
-  const human = post(db, "be", "work", "@wade a question");
+  const human = post(db, "be", "work", "@wade a question", null, said);
   expect(human.wake).toEqual(["wade"]);
+  const tail = "id:00000000000aa";
+  registerId(db, { id: tail, principal: null, launcher: false, viewer: true });
+  // An agent's post naming a viewer is refused whole (boards.md §3 Mentions); naming only itself reaches nobody.
+  expect(() => post(db, "be", "work", `@${tail} look`, null, said)).toThrow("no session");
+  post(db, "be", "work", "@be note to self", null, said);
   expect(db.prepare(`SELECT COUNT(*) AS n FROM claims WHERE key LIKE 'queue:%'`).get()).toEqual({ n: 0 });
+});
+
+test("a thread reply naming one lane takes no claim", () => {
+  const r = post(db, "be", "work", "work item"); // fe claims by rotation
+  post(db, "be", "work", "@sim can you help fe", r.post.id, said);
+  expect(listClaims(db).filter((c) => c.key.startsWith("queue:")).map((c) => c.holder)).toEqual(["fe"]);
+});
+
+test("a system post's cc of one watcher takes no queue claim", () => {
+  claim(db, "be", "ticket:ENG-142", { board: "work" });
+  watch(db, "sim", "ticket:ENG-142");
+  release(db, "be", "ticket:ENG-142", "done");
+  expect(listClaims(db).filter((c) => c.key.startsWith("queue:") && c.holder === "sim")).toEqual([]);
+  const notes = db.prepare(`SELECT note FROM claim_events WHERE note = 'queue post (mentioned)'`).all();
+  expect(notes).toEqual([]);
 });
 
 test("status text is not a busy flag; only the explicit opt-out skips a lane", () => {

@@ -789,7 +789,9 @@ export function queueLanes(
 // rotation. The claim records the lane's session's user (#855), so a reply the
 // bus writes when it ends unclaimed is that user's. Caller is inside post's transaction.
 // `push: false`: the caller queues the lane's push itself (a mention's, #219).
-function claimQueuePost(db: Database, board: string, p: Post, lane: string, now: number, note = "queue post", push = true): void {
+function claimQueuePost(
+  db: Database, board: string, p: Post, lane: string, now: number, { note = "queue post", push = true }: { note?: string; push?: boolean } = {},
+): void {
   const key = `queue:${board}:${p.id}`;
   const expires = now + QUEUE_CLAIM_TTL_MS;
   // Redelivery to a lane that already had this post resets its push, so the
@@ -849,9 +851,15 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
     (db.prepare(`SELECT DISTINCT handle FROM claim_events WHERE key = ? AND event = 'take'`).all(key) as { handle: string }[]).map((r) => r.handle),
   );
   held.add(prevHolder);
+  // A holder named by a mention may be a session's other alias or its ID (#219): its session's lane, as
+  // queueLanes names it (the primary hold, else the address), has had its turn too.
+  const laneOf = db.prepare(
+    `SELECT COALESCE(${primaryHoldSql("COALESCE((SELECT id FROM alias_holds WHERE address = ?1), ?1)")}, ?1) AS lane`,
+  );
+  for (const h of [...held]) held.add((laneOf.get(h) as { lane: string }).lane);
   const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => !held.has(h));
   if (!lane) return { board: b.name, postId: p.id, held: held.size };
-  claimQueuePost(db, b.name, p, lane, now, REDELIVERED_NOTE);
+  claimQueuePost(db, b.name, p, lane, now, { note: REDELIVERED_NOTE });
   return { lane };
 }
 
@@ -944,7 +952,8 @@ export function post(
     ).filter((s) => a.canSee(s.handle, b) && (!announce || isViewer(s.handle)));
     // A queue-kind board delivers each top-level post to exactly ONE
     // subscriber: the claim IS the delivery. A resolved @mention is direct
-    // addressing (it bypasses the rotation); with none, the rotation picks the
+    // addressing (it bypasses the rotation; one named agent holds the claim,
+    // #219); with none, the rotation picks the
     // least-recently-woken eligible subscriber and claims the post (TTL
     // takeover releases it to the next wake). Replies follow thread semantics
     // and release the claimer's claim.
@@ -959,11 +968,14 @@ export function post(
       // A mention the poster may not see exists routes as one that matched nobody (#871): a lane still gets
       // the post, so whether a team's name exists shows neither in who was notified nor in a queue claim.
       const seen = seenHandles(db, opts.author_id ?? handle, mentioned);
-      // One lane addressed by name holds the post like a rotated one (#219): its reply acks, its decline or lapse
-      // redelivers through the rotation. Several names, or a human, viewer or the poster's own address, take no
-      // claim: one claim names one lane, and only lanes hold queue work.
-      const lanes = seen.filter((h) => !own.includes(h) && !isHuman(db, h) && !isViewer(h));
-      if (seen.length === 1 && lanes.length === 1) claimQueuePost(db, board, p, lanes[0]!, now, "queue post (mentioned)", false);
+      // One agent addressed by name holds the post like a rotated lane (#219): its reply acks, its decline or
+      // lapse redelivers through the rotation. Only an author's own words (strictIds): a system post's `cc @watcher`
+      // isn't work. Exactly one visible name, and it no human, viewer or poster's own address: one claim names
+      // one agent, and only agents hold queue work. Subscription and opt-out govern the rotation, not a name.
+      const agents = seen.filter((h) => !own.includes(h) && !isHuman(db, h) && !isViewer(h));
+      if (opts.strictIds === true && seen.length === 1 && agents.length === 1) {
+        claimQueuePost(db, board, p, agents[0]!, now, { note: "queue post (mentioned)", push: false });
+      }
       if (seen.length === 0) {
         // Eligible lanes, least-recently-woken first, live lanes preferred: a
         // post claimed by an offline lane would sit for the full TTL while
