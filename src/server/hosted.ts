@@ -823,9 +823,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         const selected = await snapshot(p, row);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
-        // fence only reads, its row reads back to back with no await after its token check's, so no transaction:
-        // nothing in this process commits between them. Its caller names the handle (#1053): the pool here, a body's
-        // own Tx inside one.
+        // fence only reads, so no transaction: on the pool a commit can land between its reads (#807 P3 A7h1), but each
+        // read is compared to the selection, so a mixed read only refuses. Its caller names the handle (#1053): the pool
+        // here, a body's own Tx inside one.
         const guard = (r: Read) => fence(r, p, row, root);
         try {
           await guard(repo.read);
