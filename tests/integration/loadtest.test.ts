@@ -82,8 +82,8 @@ async function run(extra: string[]): Promise<{ code: number; out: string; summar
   try {
     // runCli kills the whole process group on timeout: the coordinator, its drivers and the server.
     const { code, out, err } = await runCli([join(ROOT, "scripts/loadtest.ts"),
-      "--sessions", "6", "--users", "2", "--drivers", "2", "--duration", "8", "--warmup", "2", "--window", "2",
-      "--period", "1", "--boards", "2", "--post-share", "0.3", "--churn", "0.5", "--churn-every", "3", "--grace", "1",
+      "--sessions", "6", "--users", "2", "--drivers", "2", "--duration", "10", "--warmup", "2", "--window", "2",
+      "--period", "1", "--boards", "2", "--post-share", "0.3", "--churn", "0.5", "--churn-every", "5", "--grace", "1",
       "--out", dir, ...extra], { bin: process.execPath, cwd: ROOT, env: { PATH: process.env.PATH ?? "" }, timeoutMs: 60_000 });
     let summary: any;
     try { summary = JSON.parse(readFileSync(join(dir, "summary.json"), "utf8")); } catch { summary = undefined; }

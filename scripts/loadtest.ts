@@ -61,8 +61,9 @@ export function options(argv: string[]): Options {
     if (!Number.isFinite(x) || x < 0) throw new Error(`--${name} must be a non-negative number, not "${raw}"`);
     return x;
   };
-  // The full profile's steady period is the bar's hour, after its 10 min warm-up.
-  const durationS = n("duration", 4200, 40);
+  // The full profile's steady period is the bar's hour, after its 10 min warm-up. Quick's 45 s leaves its ops
+  // pool two non-churning steady windows (≥ 100 ops, the 80% floor) even when a churn wave is slow (#1038).
+  const durationS = n("duration", 4200, 45);
   const o: Options = {
     sessions: n("sessions", 1000, 40), users: n("users", 100, 4), drivers: n("drivers", 8, 2),
     durationS, warmupS: n("warmup", 600, 15), periodS: n("period", 30, 3), boards: n("boards", 20, 2),
@@ -330,7 +331,8 @@ async function main() {
       });
       const lagSamples = ["0.5", "0.99", "1"].map(q => one(s, "grayboard_event_loop_lag_seconds", { quantile: q }));
       const w: Window = {
-        at: now, t: (now - start) / 1000, steady: now - start >= o.warmupS * 1000, churning: now < churnUntil,
+        // Steady from the first window that starts after the warm-up (#1038), by schedule, so scrape jitter can't flip it.
+        at: now, t: (now - start) / 1000, steady: next - o.windowS * 1000 - start >= o.warmupS * 1000, churning: now < churnUntil,
         rss: one(s, "grayboard_process_resident_memory_bytes") ?? -1, heap: one(s, "grayboard_process_heap_used_bytes") ?? -1,
         ...(lagSamples.every(x => x !== undefined) ? { lag: { p50: lagSamples[0]!, p99: lagSamples[1]!, max: lagSamples[2]! } } : {}),
         leases: one(s, "grayboard_delivery_leases") ?? -1, listens: one(s, "grayboard_mcp_admissions", { kind: "listen" }) ?? -1,
