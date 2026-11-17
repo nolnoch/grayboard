@@ -123,7 +123,7 @@ export function userAgent(req: Request): string | null {
 
 // `h`: the caller's live `Tx` inside a write body, whose transaction the row joins (and rolls back with); outside one,
 // `repo.read`, and the row is posted: through the write queue, waiting behind another body's transaction rather than
-// landing inside it (#807 P1b-4b), or inline in the caller's open transaction (the post's first branch, until A3).
+// landing inside it (#807 P1b-4b). A post inside an open transaction refuses (#807 P3 A3), so an in-body caller passes its Tx.
 export function writeAudit(
   repo: Repo,
   h: Read,

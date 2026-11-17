@@ -338,8 +338,8 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
   } finally { spy.mockRestore(); }
 });
 
-// #807 P3 A2: an audit row written inside a hosted body goes on that body's Tx, never through `repo.post` (whose inline
-// branch is what ran it before); the hosted row an audit without a principal reads to name its actor is read on the same Tx.
+// #807 P3 A2: an audit row written inside a hosted body goes on that body's Tx, never through `repo.post` (which ran it
+// inline before A2, and refuses inside a transaction since A3); the hosted row an audit without a principal reads to name its actor is read on the same Tx.
 test("#807 P3 A2: audit rows inside hosted bodies write on that body's Tx, and the row an audit reads is read on it", async () => {
   const posts: { what: string; inTxn: boolean }[] = [];
   const post = database.repo.post.bind(database.repo);

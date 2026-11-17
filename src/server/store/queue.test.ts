@@ -268,20 +268,65 @@ test("post waits behind another body's hold, lands after it, and outlives the ho
   expect(seen).toEqual(["committed"]);
 });
 
-test("post inside a write body is part of its transaction; committed runs after the commit", async () => {
+// #807 P3 A3: a body's write goes on its Tx; a post inside an open transaction refuses, and the body rolls back.
+test("post inside a write body refuses: the body's write goes on its Tx", async () => {
   const { repo } = open();
   const seen: string[] = [];
   await expect(repo.write(() => {
-    expect(repo.post(tx => { repo.users.upsertByEmail(tx, "rolled@example.com", null); }, () => seen.push("never"))).toBe(true);
-    throw new Error("body rolls back");
-  })).rejects.toThrow("body rolls back");
+    repo.post(tx => { repo.users.upsertByEmail(tx, "rolled@example.com", null); }, () => seen.push("never"), "in-body write");
+  })).rejects.toThrow("post inside an open transaction (in-body write)");
   expect(repo.users.findByEmail("rolled@example.com")).toBeUndefined();
-  await repo.write(() => {
-    repo.post(tx => { repo.users.upsertByEmail(tx, "kept@example.com", null); }, () => seen.push("committed"));
-    seen.push("body");
+  expect(seen).toEqual([]);
+});
+
+// #807 P3 A3: an async post body holds the queue across its awaits, as an async write body does.
+test("an async post on an idle queue holds the queue until it settles, then commits and runs committed", async () => {
+  const { db, repo } = open();
+  let resume!: () => void;
+  const seen: string[] = [];
+  expect(repo.post(async tx => {
+    await new Promise<void>(r => { resume = r; });
+    repo.users.upsertByEmail(tx, "async@example.com", null);
+    return 7;
+  }, v => seen.push(`committed ${v}`))).toBe(false);
+  expect(queueFor(db).held).toBe(true);
+  let waited = false;
+  const behind = repo.write(() => { waited = repo.users.findByEmail("async@example.com") !== undefined; });
+  resume();
+  await behind;
+  expect(waited).toBe(true);
+  expect(seen).toEqual(["committed 7"]);
+});
+
+test("an async post that rejects rolls back and is logged as its `what`", async () => {
+  const { db, repo } = open();
+  const logged: unknown[][] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  try {
+    expect(repo.post(async tx => {
+      repo.users.upsertByEmail(tx, "undone@example.com", null);
+      await Promise.resolve();
+      throw new Error("async late");
+    }, undefined, "async write")).toBe(false);
+    await queueFor(db).run(() => {});
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+  } finally { console.error = error; }
+  expect(repo.users.findByEmail("undone@example.com")).toBeUndefined();
+  expect(logged.some(a => a[0] === "[grayboard] async write failed:" && String(a[1]).includes("async late"))).toBe(true);
+});
+
+test("an async post from the holder outside a transaction refuses and rolls back", async () => {
+  const { db, repo } = open();
+  let thrown: unknown;
+  await repo.write(() => 1, () => {
+    try {
+      repo.post(async tx => { repo.users.upsertByEmail(tx, "holder-async@example.com", null); await Promise.resolve(); }, undefined, "holder async");
+    } catch (error) { thrown = error; }
   });
-  expect(repo.users.findByEmail("kept@example.com")).toBeDefined();
-  expect(seen).toEqual(["body", "committed"]);
+  expect(String(thrown)).toContain("async post from the write queue's holder (holder async)");
+  expect(db.inTransaction).toBe(false);
+  expect(repo.users.findByEmail("holder-async@example.com")).toBeUndefined();
 });
 
 test("post from the holder outside a transaction (its committed callback) opens its own", async () => {
@@ -323,8 +368,9 @@ test("a post's async committed that rejects is logged as its `what` on every bra
   try {
     // Idle queue: runs now, through it.
     expect(repo.post(tx => { repo.users.upsertByEmail(tx, "idle@example.com", null); }, rejecting("idle"), "idle write")).toBe(true);
-    // Inside a write body's transaction: committed after the commit.
-    await repo.write(() => { repo.post(tx => { repo.users.upsertByEmail(tx, "intx@example.com", null); }, rejecting("intx"), "intx write"); });
+    // An async body on the idle queue: committed after it settles and commits.
+    expect(repo.post(async tx => { await Promise.resolve(); repo.users.upsertByEmail(tx, "async@example.com", null); }, rejecting("async"), "async write")).toBe(false);
+    await queueFor(db).run(() => {});
     // The holder outside a transaction (its own committed callback).
     await repo.write(() => 1, () => { repo.post(tx => { repo.users.upsertByEmail(tx, "holder@example.com", null); }, rejecting("holder"), "holder write"); });
     // Behind another body's hold: it waits.
@@ -336,7 +382,7 @@ test("a post's async committed that rejects is logged as its `what` on every bra
     await queueFor(db).run(() => {});
     await settle();
   } finally { console.error = error; }
-  for (const branch of ["idle", "intx", "holder", "waited"]) {
+  for (const branch of ["idle", "async", "holder", "waited"]) {
     expect(repo.users.findByEmail(`${branch}@example.com`)).toBeDefined();
     expect(logged.filter(a => a[0] === `[grayboard] ${branch} write failed:` && String(a[1]).includes(`committed ${branch}`))).toHaveLength(1);
   }

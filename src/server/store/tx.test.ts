@@ -192,30 +192,27 @@ test("a synchronous body's Tx refuses a savepoint (#999 audit A)", async () => {
   const repo = open();
   const errs: string[] = [];
   repo.writeNow(tx => { tx.savepoint(() => {}).catch(e => errs.push(String(e))); put(tx, "now"); });
-  expect(repo.post(tx => { tx.savepoint(() => {}).catch(e => errs.push(String(e))); })).toBe(true);
-  await repo.write(tx => {
-    // post inside the caller's open transaction: its own Tx, also synchronous.
-    repo.post(inner => { inner.savepoint(() => {}).catch(e => errs.push(String(e))); put(inner, "inline"); });
+  // post from the queue's holder outside a transaction (its committed callback): its own Tx, also synchronous. A post
+  // through the queue gets a write body's Tx, which may open one (#807 P3 A3).
+  await repo.write(() => 1, () => {
+    expect(repo.post(tx => { tx.savepoint(() => {}).catch(e => errs.push(String(e))); put(tx, "holder"); })).toBe(true);
   });
   await tick();
-  expect(errs).toHaveLength(3);
+  expect(errs).toHaveLength(2);
   for (const e of errs) expect(e).toContain("savepoint in a synchronous write body");
   // Effects of later synchronous transactions still run: no frame was left behind.
   const seen: string[] = [];
   repo.writeNow(tx => { tx.afterCommit(() => { seen.push("later"); }); });
   expect(seen).toEqual(["later"]);
-  expect(rows(repo.read)).toEqual(["now", "inline"]);
+  expect(rows(repo.read)).toEqual(["now", "holder"]);
 });
 
-test("post bodies that run now inside a write body, or from its committed callback, get a Tx closed after them", async () => {
+test("a post body run from a write's committed callback gets a Tx closed after it", async () => {
   const repo = open();
-  let inline!: Tx, after!: Tx;
-  await repo.write(() => { repo.post(tx => { inline = tx; put(tx, "inline"); }); }, () => {
-    repo.post(tx => { after = tx; put(tx, "after"); });
-  });
-  expect(() => put(inline, "x")).toThrow("settled");
+  let after!: Tx;
+  await repo.write(() => 1, () => { repo.post(tx => { after = tx; put(tx, "after"); }); });
   expect(() => put(after, "x")).toThrow("settled");
-  expect(rows(repo.read)).toEqual(["inline", "after"]);
+  expect(rows(repo.read)).toEqual(["after"]);
 });
 
 test("an unawaited savepoint started inside atomic doesn't strand the atomic's frame (#999 audit A)", async () => {
