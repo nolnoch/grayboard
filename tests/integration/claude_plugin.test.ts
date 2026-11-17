@@ -36,6 +36,7 @@ import { browse, hostedServer, seedGrant, type HostedServer } from "../support/h
 import { accessAudits } from "../support/audit.ts";
 import { closeSessions, mcpSession, stopSession, type ClientShape, type Session } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
+import { RESTARTED } from "../support/harness.ts";
 import { descendants } from "../support/claude_code.ts";
 
 const ENTRY = resolve(import.meta.dir, "../../plugins/claude-code/src/main.ts");
@@ -56,8 +57,12 @@ beforeEach(() => {
   fake = join(dir, "claude");
   symlinkSync(process.execPath, fake);
   host = join(dir, "host.ts");
+  // SIGUSR2: the plugin crashes and Claude Code starts it again, keeping its pid (#555).
   writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
-Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
+let restarting = false;
+const run = () => { const p = Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }); p.exited.then((c) => { if (!restarting) process.exit(c ?? 0); }); return p; };
+let child = run();
+process.on("SIGUSR2", async () => { restarting = true; child.kill("SIGKILL"); await child.exited; restarting = false; child = run(); process.stderr.write(${JSON.stringify(RESTARTED + "\n")}); });`);
 });
 afterEach(async () => {
   await closeSessions();
@@ -265,6 +270,26 @@ for (const mode of ["push", "tools-only"] as const) {
     expect(row(id)?.name).toBe("lead");
   }, 60_000);
 }
+
+test("a plugin restarted after a subagent's call still ends that child's session at its SubagentStop (#555 item 8)", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const id = "sess-sub-restart", agent = "a5550000000000008";
+  let root = await plugin(id, { flags: [] });
+  runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
+  expect((await modelCall(root, "bind", { name: "lead", create: true })).error).toBe(false);
+  expect((await modelCall(root, "whoami", {}, { agent })).error).toBe(false);
+  expect(childRow(id, agent)?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+  // Killed, so it ends nothing; Claude Code (its pid, so its record dir) lives
+  // on, and the new process never saw the child's call.
+  const claude = claudePid(root);
+  root = Object.assign(await root.restart("crash", claude), { elicits: [], completed: [], withdrawn: [], aborted: [] });
+  expect(childRow(id, agent)?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+  expect(claudePid(root)).toBe(claude);
+  // No call after the restart: it watches the ended markers from its start.
+  runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: agent });
+  await until(() => !childRow(id, agent), 10_000, "the earlier child's hosted session to end");
+  expect(row(id)?.name).toBe("lead");
+}, 60_000);
 
 test("a call whose PreToolUse record is missing or from a recycled pid is refused and writes nothing", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);

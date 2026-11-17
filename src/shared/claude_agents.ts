@@ -15,6 +15,9 @@
 //   connections/<pid>     local only: retained MCP control endpoint (claude_identity.ts)
 //   <id>.taken.<pid>      a record a reader claimed (rename is the atomic take)
 //   ended/<name>          hosted only: an agent id whose SubagentStop ran
+//   called/<sha256>       hosted only: an agent whose call the plugin passed,
+//                         named by its id's hash, so a restarted plugin still
+//                         ends that child's session at its SubagentStop (#555)
 //   model, effort         hosted only: the root session's latest model and
 //                         effort (#545), each written whole by one hook event
 //   signin                hosted only: the live sign-in link (#500), which the
@@ -37,6 +40,7 @@
 // Imports nothing heavy: the local hook entry (src/cli/main.ts) loads this
 // module alone, so a hook costs a process start and a few file operations.
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { isAlive, procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
@@ -418,6 +422,26 @@ export function readFacts(base: string, claudePid: number, harnessStart: string 
     else bad(fact, `${join(dir, fact)} isn't a Claude Code ${fact}`);
   }
   return out;
+}
+
+const calledPath = (base: string, claudePid: number, agent: string) =>
+  join(sessionDir(base, claudePid), "called", createHash("sha256").update(agent).digest("hex"));
+
+/** Notes that subagent `agent` made a call the plugin passed; throws on a write that fails. */
+export function markCalled(base: string, claudePid: number, agent: string): void {
+  const path = calledPath(base, claudePid, agent);
+  mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+  writeFileSync(path, "", { mode: 0o600 });
+}
+
+/** Whether any subagent's call is noted and not yet taken: an earlier plugin process's, at startup. */
+export function hasCalled(base: string, claudePid: number): boolean {
+  try { return readdirSync(join(sessionDir(base, claudePid), "called")).length > 0; } catch { return false; }
+}
+
+/** Whether subagent `agent` made a call some plugin process passed, consumed once. */
+export function takeCalled(base: string, claudePid: number, agent: string): boolean {
+  try { unlinkSync(calledPath(base, claudePid, agent)); return true; } catch { return false; }
 }
 
 /** The agent ids whose SubagentStop ran since the last call, each consumed once. */

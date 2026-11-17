@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dropSignIn, LEFTOVER_TTL_MS, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeEnded, takeRecord } from "./claude_agents.ts";
+import { dropSignIn, hasCalled, LEFTOVER_TTL_MS, markCalled, putSignIn, readFacts, RECORD_CAP, ROOT, runHook, sessionDir, SIGN_IN, takeCalled, takeEnded, takeRecord } from "./claude_agents.ts";
 import { SIGN_IN_FLOW_MS } from "./signin.ts";
 import { procStart } from "./proc.ts";
 
@@ -149,6 +149,20 @@ describe("session lifecycle", () => {
     hook("subagent-stop", { agent_id: "a2" }, true);
     expect(takeEnded(base, pid).sort()).toEqual(["a1", "a2"]);
     expect(takeEnded(base, pid)).toEqual([]);
+  });
+
+  test("a noted subagent call is taken once per agent, whatever its id holds; none noted is false (#555)", () => {
+    expect(hasCalled(base, pid)).toBe(false);
+    expect(takeCalled(base, pid, "a1")).toBe(false);
+    const odd = `../${"x".repeat(1000)}/a2`;
+    markCalled(base, pid, "a1");
+    markCalled(base, pid, odd);
+    markCalled(base, pid, "a1");
+    expect(hasCalled(base, pid)).toBe(true);
+    expect(takeCalled(base, pid, "a1")).toBe(true);
+    expect(takeCalled(base, pid, "a1")).toBe(false);
+    expect(takeCalled(base, pid, odd)).toBe(true);
+    expect(hasCalled(base, pid)).toBe(false);
   });
 
   test("SubagentStop keeps at most RECORD_CAP undrained markers, dropping the oldest", () => {

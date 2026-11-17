@@ -34,7 +34,7 @@ import { failure, hostTools, snapshotTools, type NativeTool } from "../../../ada
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
-import { dropSignIn, MISSING_TEXT, putSignIn, readFacts, sessionDir, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
+import { dropSignIn, hasCalled, markCalled, MISSING_TEXT, putSignIn, readFacts, sessionDir, takeCalled, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
 import { SIGN_IN_FLOW_MS } from "../../../src/shared/signin.ts";
 import { testPauseAsync } from "../../../src/shared/testpause.ts";
 import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
@@ -335,7 +335,9 @@ export function createPlugin(o: PluginOptions): Plugin {
     if ("error" in config || closed) return;
     for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
       // A child id over the server's limit was refused at its call, so it has no session to end.
-      if (validSourceId(childOf(agent))) void root?.endChild(childOf(agent));
+      // A call this process didn't see still ends it: the plugin restarted since (#555).
+      const called = takeCalled(config.dataDir, o.claude.pid, agent);
+      if (validSourceId(childOf(agent))) void root?.endChild(childOf(agent), called);
     }
   };
   const watchEnded = () => {
@@ -348,6 +350,8 @@ export function createPlugin(o: PluginOptions): Plugin {
     } catch (error) { say(`couldn't watch subagent ends: ${message(error)}; they end at the next subagent call, or with this session`); }
     drainEnded();
   };
+  // A restarted plugin watches at once when an earlier process passed a subagent's call (#555).
+  if (!("error" in config) && hasCalled(config.dataDir, o.claude.pid)) watchEnded();
 
   const call = async (name: string, args: Record<string, unknown>, meta: Record<string, unknown> | undefined): Promise<CallToolResult> => {
     if ("error" in config) return failure(config.error);
@@ -368,6 +372,9 @@ export function createPlugin(o: PluginOptions): Plugin {
       say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
       return failure(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
     }
+    // Kept beside the records, so a restarted plugin still ends this child (#555).
+    try { markCalled(config.dataDir, o.claude.pid, taken.agent); }
+    catch (error) { say(`couldn't note subagent ${taken.agent.slice(0, 160)}'s call: ${message(error)}; if this plugin restarts first, its session lasts until this one ends`); }
     watchEnded();
     drainEnded();
     return root!.call(name, args, before, { child });

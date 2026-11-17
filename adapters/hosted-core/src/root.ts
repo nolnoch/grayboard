@@ -443,9 +443,10 @@ export class RootDelivery {
   // A child's agent finished (Claude Code's SubagentStop): its hosted session
   // ends now: the server's idle sweep ends only roots, so a child's session
   // otherwise lasts until its root's does. Only a child a call passed; said on
-  // failure. Never rejects.
-  async endChild(child: string): Promise<void> {
-    if (!this.children.delete(child)) return;
+  // failure. `called`: the host knows a call passed in an earlier process of
+  // this session (the plugin's record dir survives its restart, #555). Never rejects.
+  async endChild(child: string, called = false): Promise<void> {
+    if (!this.children.delete(child) && !called) return;
     try { await end(this.client.temporary, { child }); }
     catch (error) { this.log(`couldn't end subagent session ${child} on the server: ${message(error)}`, "warning"); }
   }

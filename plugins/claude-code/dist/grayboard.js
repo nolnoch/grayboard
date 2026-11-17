@@ -37929,8 +37929,8 @@ ${record.message}`;
     const result = await this.client.call(proxy, tool, args, child);
     return after ? { ...result, content: [{ type: "text", text: `grayboard: ${after}` }, ...result.content] } : result;
   }
-  async endChild(child) {
-    if (!this.children.delete(child))
+  async endChild(child, called = false) {
+    if (!this.children.delete(child) && !called)
       return;
     try {
       await end(this.client.temporary, { child });
@@ -37996,6 +37996,7 @@ ${record.message}`;
 
 // src/shared/claude_agents.ts
 import { closeSync, constants as constants3, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { createHash as createHash7 } from "crypto";
 import { join as join5, resolve as resolve3 } from "path";
 
 // src/shared/protocol.ts
@@ -38132,6 +38133,27 @@ function readFacts(base, claudePid, harnessStart, bad) {
       bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);
   }
   return out;
+}
+var calledPath = (base, claudePid, agent) => join5(sessionDir(base, claudePid), "called", createHash7("sha256").update(agent).digest("hex"));
+function markCalled(base, claudePid, agent) {
+  const path = calledPath(base, claudePid, agent);
+  mkdirSync2(join5(path, ".."), { recursive: true, mode: 448 });
+  writeFileSync(path, "", { mode: 384 });
+}
+function hasCalled(base, claudePid) {
+  try {
+    return readdirSync2(join5(sessionDir(base, claudePid), "called")).length > 0;
+  } catch {
+    return false;
+  }
+}
+function takeCalled(base, claudePid, agent) {
+  try {
+    unlinkSync(calledPath(base, claudePid, agent));
+    return true;
+  } catch {
+    return false;
+  }
 }
 function takeEnded(base, claudePid) {
   const dir = join5(sessionDir(base, claudePid), "ended");
@@ -38579,8 +38601,9 @@ function createPlugin(o) {
     if ("error" in config || closed)
       return;
     for (const agent of takeEnded(config.dataDir, o.claude.pid)) {
+      const called = takeCalled(config.dataDir, o.claude.pid, agent);
       if (validSourceId(childOf(agent)))
-        root?.endChild(childOf(agent));
+        root?.endChild(childOf(agent), called);
     }
   };
   const watchEnded = () => {
@@ -38599,6 +38622,8 @@ function createPlugin(o) {
     }
     drainEnded();
   };
+  if (!("error" in config) && hasCalled(config.dataDir, o.claude.pid))
+    watchEnded();
   const call = async (name, args, meta) => {
     if ("error" in config)
       return failure2(config.error);
@@ -38617,6 +38642,11 @@ function createPlugin(o) {
     if (!validSourceId(child)) {
       say(`refused ${name}: subagent child id is ${length} characters, over the server's 1024`);
       return failure2(`grayboard can't run this subagent's call: its hosted session id (this session's id, then "/agent/", then the subagent's id) is ${length} characters, over the server's 1024-character limit. The main agent's calls still work.`);
+    }
+    try {
+      markCalled(config.dataDir, o.claude.pid, taken.agent);
+    } catch (error) {
+      say(`couldn't note subagent ${taken.agent.slice(0, 160)}'s call: ${message(error)}; if this plugin restarts first, its session lasts until this one ends`);
     }
     watchEnded();
     drainEnded();
