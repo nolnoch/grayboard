@@ -746,6 +746,57 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
   });
 }
 
+// A tool call waiting out a restart's backoff ends at its abort (#559), as
+// pi's does, rather than holding the turn until the grayboard process is
+// back, and it never runs there: the bind it carried takes no name.
+export function ompLocalRestartAbortScenario(dir: string): Promise<void> {
+  // The turn's hooks wait for a live process before each request, so the
+  // third exit lands while the model's reply with the bind is held.
+  const released = Promise.withResolvers<void>();
+  return named(async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([
+      scripted("late bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-late", create: true } }]),
+    ], { hold: () => released.promise });
+    try {
+      installLocal(dir, model.port);
+      const omp = startLocalOmp(dir, dir, procs, null);
+      await omp.command({ type: "get_state" }, 30_000);
+      await until(() => grayboardChildPids(omp.pid).length === 1, 15_000, "the grayboard process");
+      // Restarts after 0 and 1 s; the third exit backs off 5 s.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const [dead] = grayboardChildPids(omp.pid);
+        await sigkill(dead!);
+        await until(() => grayboardChildPids(omp.pid).some((p) => p !== dead), 15_000, `restart ${attempt + 1}`);
+      }
+      await omp.command({ type: "prompt", message: "late bind" });
+      await until(() => model.requests.length === 1, 15_000, "the turn's request at the model");
+      const [dead] = grayboardChildPids(omp.pid);
+      await sigkill(dead!);
+      await until(() => grayboardChildPids(omp.pid).length === 0, 5_000, "the third exit reaped");
+      released.resolve();
+      await until(() => omp.events.some((e) => e.type === "tool_execution_start" && e.toolName === `${PREFIX}bind`), 5_000, "the bind waiting on the backoff");
+      const aborted = Date.now();
+      await omp.command({ type: "abort" });
+      await until(() => omp.events.some((e) => e.type === "tool_execution_end" && e.toolName === `${PREFIX}bind`), 2_000, "the bind ended at its abort");
+      expect(Date.now() - aborted).toBeLessThan(2_000);
+      await idle(omp, 2_000);
+      // The backoff runs out and the process is back. A negative assertion:
+      // a bind still waiting would run once the process is ready.
+      await until(() => grayboardChildPids(omp.pid).length === 1, 15_000, "the restarted grayboard process");
+      await Bun.sleep(2_000);
+      expect(localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-late'")).toEqual([]);
+      expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
+      expect(model.unhandled).toEqual([]);
+      await omp.quit();
+    } finally {
+      released.resolve();
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
 // A grayboard that stops reading while it still runs and holds the name
 // (tests/support/stops_reading.ts): the adapter's next write fails with EPIPE,
 // and it kills that process before the replacement starts, so the replacement
