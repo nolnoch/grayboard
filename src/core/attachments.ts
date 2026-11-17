@@ -53,7 +53,7 @@ export interface BlobStore {
 // sweep can't delete bytes an upload has just put. A store other processes
 // share must also refuse to delete bytes an attachment row names.
 const held = new Map<string, Promise<void>>();
-async function withBlob<T>(sha256: string, fn: () => Promise<T>): Promise<T> {
+export async function withBlob<T>(sha256: string, fn: () => Promise<T>): Promise<T> {
   const before = held.get(sha256) ?? Promise.resolve();
   const run = before.then(fn);
   const done = run.then(() => {}, () => {});
@@ -81,7 +81,7 @@ export async function storeAttachment(
   blobs: BlobStore,
   uploader: string,
   file: AttachmentFile,
-  opts: { now?: number; quota?: UploadQuota; guard?: () => void; tx?: WriteTx } = {},
+  opts: { now?: number; quota?: UploadQuota; tx?: WriteTx } = {},
 ): Promise<AttachmentRow> {
   const now = opts.now ?? Date.now();
   const tx = opts.tx ?? immediateTx(db);
@@ -90,30 +90,15 @@ export async function storeAttachment(
   try {
     return await withBlob(sha256, async () => {
       const row = await tx((w) => {
-        opts.guard?.();
-        unnamed = pruneUnbound(w, now - UNBOUND_TTL_MS) > 0;
-        const q = opts.quota;
-        // Bytes the principal already has under this blob add nothing.
-        const adds = (unbound: boolean) => (q && heldBlob(w, q.principal, sha256, unbound) ? 0 : file.data.length);
-        if (q && uploadedBytes(w, q.principal, true) + adds(true) > q.unsent) {
-          throw new TooLargeError(`your unsent uploads would exceed ${formatSize(q.unsent)}; send or wait for them to expire`);
-        }
-        if (q && uploadedBytes(w, q.principal, false) + adds(false) > q.stored) {
-          throw new TooLargeError(`your stored attachments would exceed ${formatSize(q.stored)}; they're freed as their messages and posts age out`);
-        }
-        w.prepare(`INSERT OR IGNORE INTO attachment_blobs (sha256, size, created_at) VALUES (?, ?, ?)`).run(sha256, file.data.length, now);
-        return w
-          .prepare(
-            `INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-          )
-          .get(sha256, file.filename, file.type, file.data.length, uploader, q?.principal ?? null, now) as AttachmentRow;
+        const added = insertUpload(w, { sha256, filename: file.filename, type: file.type, size: file.data.length, uploader, quota: opts.quota, now });
+        unnamed = added.pruned;
+        return added.row;
       });
       try {
         // Put even when the catalog knew this sha256: it heals bytes a crash lost.
         await blobs.put(sha256, file.data);
       } catch (e) {
-        await tx((w) => w.prepare(`DELETE FROM attachments WHERE id = ?`).run(row.id));
+        await tx((w) => removeUpload(w, row.id));
         unnamed = true;
         throw e;
       }
@@ -122,6 +107,37 @@ export async function storeAttachment(
   } finally {
     if (unnamed) await sweepBlobs(db, blobs, tx);
   }
+}
+
+// An upload's catalog row, as one write: prunes uploads left unbound past their TTL, checks `quota` and inserts the
+// blob's catalog entry and the row. A caller whose transactions can interleave (a Postgres store, #807 P3 B3) holds
+// the principal's lock first, so two uploads can't both fit under the quota. `pruned`: some upload was pruned, so a
+// blob sweep after the commit has bytes to free.
+export type NewUpload = { sha256: string; filename: string; type: string; size: number; uploader: string; quota?: UploadQuota; now: number };
+export function insertUpload(db: Database, u: NewUpload): { row: AttachmentRow; pruned: boolean } {
+  const pruned = pruneUnbound(db, u.now - UNBOUND_TTL_MS) > 0;
+  const q = u.quota;
+  // Bytes the principal already has under this blob add nothing.
+  const adds = (unbound: boolean) => (q && heldBlob(db, q.principal, u.sha256, unbound) ? 0 : u.size);
+  if (q && uploadedBytes(db, q.principal, true) + adds(true) > q.unsent) {
+    throw new TooLargeError(`your unsent uploads would exceed ${formatSize(q.unsent)}; send or wait for them to expire`);
+  }
+  if (q && uploadedBytes(db, q.principal, false) + adds(false) > q.stored) {
+    throw new TooLargeError(`your stored attachments would exceed ${formatSize(q.stored)}; they're freed as their messages and posts age out`);
+  }
+  db.prepare(`INSERT OR IGNORE INTO attachment_blobs (sha256, size, created_at) VALUES (?, ?, ?)`).run(u.sha256, u.size, u.now);
+  const row = db
+    .prepare(
+      `INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    )
+    .get(u.sha256, u.filename, u.type, u.size, u.uploader, q?.principal ?? null, u.now) as AttachmentRow;
+  return { row, pruned };
+}
+
+// Drops an upload row whose bytes failed to store.
+export function removeUpload(db: Database, id: number): void {
+  db.prepare(`DELETE FROM attachments WHERE id = ?`).run(id);
 }
 
 // The attachment ids a tool call or wire frame carries, checked for shape.
@@ -283,15 +299,12 @@ function heldBlob(db: Database, principal: string, sha256: string, unbound: bool
 
 // Drops one of `from`'s unsent uploads, for a send that failed after
 // uploading. Null if it isn't theirs (any address of `from`, made by its user,
-// #367) or a message or post already carries it. guard: a hosted transfer's
-// binding check, run inside the delete's transaction.
+// #367) or a message or post already carries it.
 export async function releaseUpload(
-  db: Database, blobs: BlobStore, id: number, from: Uploader, guard?: () => void, tx: WriteTx = immediateTx(db),
+  db: Database, blobs: BlobStore, id: number, from: Uploader,
 ): Promise<AttachmentRow | null> {
-  const row = await tx((w) => {
-    guard?.();
-    return w.prepare(`DELETE FROM attachments WHERE ${UNSENT} RETURNING *`).get(...unsentArgs([id], from)) as AttachmentRow | null;
-  });
+  const tx = immediateTx(db);
+  const row = await tx((w) => dropUnsentUploads(w, [id], from)[0] ?? null);
   if (row) await sweepBlobs(db, blobs, tx);
   return row;
 }
@@ -304,6 +317,18 @@ export function pruneUnbound(db: Database, olderThanMs: number): number {
 
 const UNNAMED = `NOT EXISTS (SELECT 1 FROM attachments a WHERE a.sha256 = attachment_blobs.sha256)`;
 
+// A blob sweep's three steps (#807 P3 B3: a server's store runs them asynchronously, src/server/attachments.ts):
+// the catalog's blobs no attachment names, whether one is named now, and dropping its catalog entry while still unnamed.
+export function unnamedBlobs(db: Database): string[] {
+  return (db.prepare(`SELECT sha256 FROM attachment_blobs WHERE ${UNNAMED}`).all() as { sha256: string }[]).map((r) => r.sha256);
+}
+export function blobNamed(db: Database, sha256: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM attachments WHERE sha256 = ?`).get(sha256);
+}
+export function dropBlobEntry(db: Database, sha256: string): number {
+  return db.prepare(`DELETE FROM attachment_blobs WHERE sha256 = ? AND ${UNNAMED}`).run(sha256).changes;
+}
+
 // Deletes the bytes, then the catalog entry, of every blob no attachment
 // names. A crash between the two leaves an entry the next sweep finishes,
 // never bytes nothing names. Never throws: a failure is logged and left for
@@ -311,7 +336,7 @@ const UNNAMED = `NOT EXISTS (SELECT 1 FROM attachments a WHERE a.sha256 = attach
 export async function sweepBlobs(db: Database, blobs: BlobStore, tx: WriteTx = immediateTx(db)): Promise<number> {
   let shas: string[];
   try {
-    shas = (db.prepare(`SELECT sha256 FROM attachment_blobs WHERE ${UNNAMED}`).all() as { sha256: string }[]).map((r) => r.sha256);
+    shas = unnamedBlobs(db);
   } catch (e) {
     console.error(`[grayboard] blob sweep: ${(e as Error).message}`);
     return 0;
@@ -320,9 +345,9 @@ export async function sweepBlobs(db: Database, blobs: BlobStore, tx: WriteTx = i
   for (const sha256 of shas) {
     try {
       await withBlob(sha256, async () => {
-        if (db.prepare(`SELECT 1 FROM attachments WHERE sha256 = ?`).get(sha256)) return;
+        if (blobNamed(db, sha256)) return;
         await blobs.delete(sha256);
-        swept += await tx((w) => w.prepare(`DELETE FROM attachment_blobs WHERE sha256 = ? AND ${UNNAMED}`).run(sha256).changes);
+        swept += await tx((w) => dropBlobEntry(w, sha256));
       });
     } catch (e) {
       console.error(`[grayboard] blob sweep: ${sha256}: ${(e as Error).message}`);

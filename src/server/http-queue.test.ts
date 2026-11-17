@@ -170,20 +170,27 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
   } finally { spy.mockRestore(); for (const s of bindingSpies) s.mockRestore(); }
 });
 
-// #807 P1c-15c-2: the attachment routes and retention reach core's helpers through `repo.coreOn(handle)`: a write
-// body's `Tx` inside it (core's store and release transactions through `queuedTx`, the guarded download's recheck,
-// retention's prunes), the pool outside (the download's first access check, the blob sweep).
-test("#807 P1c-15c-2: attachment routes and retention reach core on their body's Tx, the pool outside one", async () => {
+// #807 P1c-15c-2: the attachment routes and retention reach the store on the handle of their context: a write body's
+// `Tx` inside it (the upload's and release's writes, the guarded download's recheck, retention's prunes), the pool
+// outside (the download's first access check, the blob sweep's reads). P3 B3: the attachment rows through repo.attachments.
+test("#807 P1c-15c-2: attachment routes and retention reach the store on their body's Tx, the pool outside one", async () => {
   const srv = new TestServer();
   cleanups.push(() => srv.stop());
   const { repo, db } = srv.app;
   const you = await srv.login("you@example.com");
   expect((await srv.api(you, "POST", "/api/identities", { name: "agent" })).status).toBe(201);
-  const checks: { route: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   let route = "";
+  const groupSpies = (Object.keys(repo.attachments) as (keyof typeof repo.attachments)[]).map(name => {
+    const own = (repo.attachments[name] as (...a: unknown[]) => unknown).bind(repo.attachments);
+    return spyOn(repo.attachments, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      checks.push({ route, op: String(name), inTxn: db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return own(r, ...rest);
+    }) as never);
+  });
   const original = repo.coreOn.bind(repo);
   const spy = spyOn(repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
-    checks.push({ route, inTxn: db.inTransaction, handle: h === repo.read ? "pool" : "tx" });
+    checks.push({ route, op: "coreOn", inTxn: db.inTransaction, handle: h === repo.read ? "pool" : "tx" });
     return original(h);
   }) as never);
   try {
@@ -197,9 +204,13 @@ test("#807 P1c-15c-2: attachment routes and retention reach core on their body's
     expect((await srv.releaseAs(you, "agent", up.body.id as number)).status).toBe(200);
     route = "retention";
     await runRetention(repo, { ...srv.config, messageRetentionDays: 1, auditRetentionDays: 1 }, Date.now() + 30 * 86_400_000);
-    const want = { upload: ["tx"], download: ["pool", "tx"], release: ["pool", "tx"], retention: ["pool", "tx"] } as Record<string, string[]>;
-    // Each route reached core on each handle it should, so the last check isn't vacuous for it.
-    expect(Object.entries(want).flatMap(([r, hs]) => hs.filter(h => !checks.some(c => c.route === r && c.handle === h)).map(h => `${r}:${h}`))).toEqual([]);
+    // The download's reach (core's attachmentReach) stays on coreOn until B5a ports the post reads it takes;
+    // retention's two coreOn bodies are its post and ended-ID prunes.
+    const ops = (r: string) => checks.filter(c => c.route === r).map(c => `${c.op}:${c.handle}`);
+    expect(ops("upload")).toEqual(["insertUpload:tx"]);
+    expect(ops("download")).toEqual(["coreOn:pool", "get:pool", "coreOn:tx", "get:tx"]);
+    expect(ops("release")).toEqual(["dropUnsent:tx", "unnamedBlobs:pool", "named:pool", "dropBlobEntry:tx"]);
+    expect(ops("retention")).toEqual(["coreOn:tx", "coreOn:tx", "pruneUnbound:tx", "unnamedBlobs:pool"]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
-  } finally { spy.mockRestore(); }
+  } finally { spy.mockRestore(); for (const s of groupSpies) s.mockRestore(); }
 });

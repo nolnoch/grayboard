@@ -1,9 +1,10 @@
 // Who may read an attachment on the server: the HTTP download route and the
 // Slack bridge's human identities ask the same question.
-import { attachmentReach, getAttachment, releaseUpload, storeAttachment, type AttachmentRow } from "../core/attachments.ts";
+import { attachmentReach, withBlob, type AttachmentRow, type UploadQuota, type Uploader } from "../core/attachments.ts";
 import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
-import { participant, queuedGuardTx, queuedTx, type Repo } from "./db.ts";
+import { sha256Hex } from "../shared/hash.ts";
+import { participant, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
 import { decidePure, recordDecision, type Actor, type PureRequest } from "./policy.ts";
 
@@ -14,11 +15,12 @@ import { decidePure, recordDecision, type Actor, type PureRequest } from "./poli
 // null for the Slack bridge's humans, which have no session. `user` is the
 // reading user's email, always set on a server: an unsent upload is readable
 // only by the user who made it, not by whoever holds its address next (#367).
-// The carrying message is read before core's synchronous attachmentReach asks about it (#807 P3 A7i).
+// The carrying message is read before core's synchronous attachmentReach asks about it (#807 P3 A7i); a post carrier's
+// board visibility is still core's, on `r`, until the boards port (B5a).
 async function readRequest(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, user: string) {
   const db = repo.coreOn(r);
   const id = Number(idText);
-  const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
+  const row = Number.isInteger(id) && id > 0 ? await repo.attachments.get(r, id) : undefined;
   const addresses = await repo.bindings.addressSet(r, handle, principal);
   const carrier = row?.message_id != null ? await repo.messages.getById(r, row.message_id) : undefined;
   const dmVisible = (messageId: number) => {
@@ -61,10 +63,7 @@ export async function storeUpload(
   guard?: Guard,
 ): Promise<AttachmentRow> {
   const quota = { principal: email, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
-  const inBody = queuedGuardTx(repo, guard);
-  const tx = inBody.tx;
-  const pool = repo.coreOn(repo.read);
-  const row = await storeAttachment(pool, repo.blobs, handle, file, { quota, guard: inBody.guard, tx });
+  const row = await storeFile(repo, handle, file, quota, guard);
   try {
     // The guard and the audit row are one awaited write (#965): a failed audit row fails the upload, which is
     // released, rather than keeping bytes no `attachment.uploaded` row records.
@@ -76,9 +75,9 @@ export async function storeUpload(
     });
     return row;
   } catch (error) {
-    // Only this upload, and only while unbound; concurrent sends keep their bytes. Unguarded, so through the plain
-    // queue: the guarded one would run the guard again in each of its bodies (queuedGuardTx).
-    await releaseUpload(pool, repo.blobs, row.id, { addresses: [handle], principal: email }, undefined, queuedTx(repo));
+    // Only this upload, and only while unbound; concurrent sends keep their bytes. Unguarded: the release is the
+    // upload's own cleanup, not a fresh access.
+    await releaseFile(repo, row.id, { addresses: [handle], principal: email });
     throw error;
   }
 }
@@ -93,12 +92,77 @@ export async function releaseStored(
   detail: Record<string, unknown> = {},
   guard?: Guard,
 ): Promise<AttachmentRow | null> {
-  const inBody = queuedGuardTx(repo, guard);
-  const row = await releaseUpload(repo.coreOn(repo.read), repo.blobs, id, { addresses: [handle], principal: email }, inBody.guard, inBody.tx);
+  const row = await releaseFile(repo, id, { addresses: [handle], principal: email }, guard);
   if (row) {
     writeAudit(repo, repo.read, "attachment.released", email, `attachment:${row.id}`, {
       identity: handle, filename: row.filename, size: row.size, sha256: row.sha256, ...detail,
     });
   }
   return row;
+}
+
+// Core's storeAttachment, releaseUpload and sweepBlobs over the server's store (#807 P3 B3), in their order: the
+// upload's row commits before its bytes are put, so a sweep never sees bytes no row names; a failed put drops the row;
+// a sweep deletes the bytes before their catalog entry. Each blob's uploads and sweeps run one at a time in this
+// process (core's withBlob, which local mode's share). `guard` runs on each flow's first body, the row's, and a
+// refusal rolls it back.
+async function storeFile(repo: Repo, uploader: string, file: AttachmentFile, quota: UploadQuota, guard?: Guard): Promise<AttachmentRow> {
+  const now = Date.now();
+  const sha256 = sha256Hex(file.data);
+  let unnamed = false;
+  try {
+    return await withBlob(sha256, async () => {
+      const added = await repo.write(async (tx) => {
+        await guard?.(tx);
+        return repo.attachments.insertUpload(tx, { sha256, filename: file.filename, type: file.type, size: file.data.length, uploader, quota, now });
+      });
+      unnamed = added.pruned;
+      try {
+        // Put even when the catalog knew this sha256: it heals bytes a crash lost.
+        await repo.blobs.put(sha256, file.data);
+      } catch (e) {
+        await repo.write((tx) => repo.attachments.remove(tx, added.row.id));
+        unnamed = true;
+        throw e;
+      }
+      return added.row;
+    });
+  } finally {
+    if (unnamed) await sweepStoredBlobs(repo);
+  }
+}
+
+// One of `from`'s unsent uploads dropped, its bytes swept; null if it isn't theirs or a message or post carries it.
+async function releaseFile(repo: Repo, id: number, from: Uploader, guard?: Guard): Promise<AttachmentRow | null> {
+  const row = await repo.write(async (tx) => {
+    await guard?.(tx);
+    return (await repo.attachments.dropUnsent(tx, [id], from))[0] ?? null;
+  });
+  if (row) await sweepStoredBlobs(repo);
+  return row;
+}
+
+// Deletes the bytes, then the catalog entry, of every blob no attachment names. Never throws: a failure is logged and
+// left for the next sweep. Returns how many went.
+export async function sweepStoredBlobs(repo: Repo): Promise<number> {
+  let shas: string[];
+  try {
+    shas = await repo.attachments.unnamedBlobs(repo.read);
+  } catch (e) {
+    console.error(`[grayboard] blob sweep: ${(e as Error).message}`);
+    return 0;
+  }
+  let swept = 0;
+  for (const sha256 of shas) {
+    try {
+      await withBlob(sha256, async () => {
+        if (await repo.attachments.named(repo.read, sha256)) return;
+        await repo.blobs.delete(sha256);
+        swept += await repo.write((tx) => repo.attachments.dropBlobEntry(tx, sha256));
+      });
+    } catch (e) {
+      console.error(`[grayboard] blob sweep: ${sha256}: ${(e as Error).message}`);
+    }
+  }
+  return swept;
 }
