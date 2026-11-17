@@ -7,6 +7,7 @@ import type { NativeInput, NativeAdmission } from "./effect-instrument.js";
 import { afterProducers } from "./causal.ts";
 import type { SubscriberWork } from "./subscriber-work.ts";
 import { bounded, drainSessions } from "./reload-state.ts";
+import { until } from "../../../tests/support/until.ts";
 
 type Host = FixtureHost;
 type Input = NativeInput;
@@ -46,16 +47,12 @@ export class DurableFixture {
     for (const id of ids) { assert(this.batches.get(session)?.some(i => i.id === id)); this.cursor.add(id); }
   }
 }
-async function until(read: () => boolean | Promise<boolean>, label: string) {
-  for (let n = 0; n < 160; n++) { if (await read()) return; await Bun.sleep(50); }
-  throw new Error("Durable wait expired: " + label);
-}
 export async function durableCases(f: DurableFixture, host: Host, ctx: Context, rpc: { enroll(input: { sessionID: string; name?: string }, options: { location: { directory: string } }): Promise<unknown>; pause(input: {}, options: { location: { directory: string } }): Promise<unknown>; status(input: {}, options: { location: { directory: string } }): Promise<unknown> }, location: { directory: string }, state: (id: string) => { held: string[]; ownership: number | null; gen: number; capability?: string }, subscriberWork: SubscriberWork) {
   const replay = f.scenario === "reload";
   if (replay && f.phase === "reload") {
     const saved = await Bun.file(join(f.root, "durable.json")).json();
     f.holding = false;
-    await until(() => f.cursor.size === 2, "replayed receipts");
+    await until(() => f.cursor.size === 2, 8_000, "replayed receipts");
     assert.deepEqual(f.inputs.map(i => i.id).sort(), saved.inputs.map((i: Input) => i.id).sort());
     for (const value of f.admitted) {
       const old = saved.inputs.find((i: Input) => i.id === value.id);
@@ -86,16 +83,16 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
   };
   const root = await create("Durable root"), other = await create("Untouched root"), child = await create("Untouched child", root);
   await rpc.enroll({ sessionID: root, name: "durable" }, { location });
-  await until(() => !!state(root).capability, "initial lease");
+  await until(() => !!state(root).capability, 8_000, "initial lease");
   const batch = (session: string, id: string, actionable: boolean): Batch => ({ id, actionable, event: { text: "IMMUTABLE ORIGINAL " + id }, ownership: state(session).ownership!, bind_gen: state(session).gen, address: "you@example.com/" + state(session).held[0]! });
   if (replay) {
     try {
     const action = await create("Durable action");
     await rpc.enroll({ sessionID: action, name: "action" }, { location });
-    await until(() => !!state(action).capability, "action lease");
+    await until(() => !!state(action).capability, 8_000, "action lease");
     f.holding = false; f.dropReceipts = true;
     f.batches.set(root, [batch(root, "fixture:digest", false)]); f.batches.set(action, [batch(action, "fixture:action", true)]);
-    await until(() => f.admitted.length >= 2 && f.receiptAttempts.length >= 2, "durable admissions before lost receipts");
+    await until(() => f.admitted.length >= 2 && f.receiptAttempts.length >= 2, 8_000, "durable admissions before lost receipts");
     await bounded(afterProducers(async () => {
       assert(f.receiptAttempts.includes("fixture:digest") && f.receiptAttempts.includes("fixture:action"), "Both forwarding continuations reached the held failed-receipt response boundary");
     }, () => drainSessions(join(f.root, "native-host.sqlite"), sessionID => host.session.wait({ sessionID })), () => {
@@ -144,7 +141,7 @@ export async function durableCases(f: DurableFixture, host: Host, ctx: Context, 
     default: throw new Error("Unknown durable case " + f.scenario);
   }
   if (["account", "account-away-back", "config", "away-back", "late-away-back"].includes(f.scenario)) {
-    await until(async () => (await rpc.status({}, { location }) as { state: string }).state === "paused", "observed drift latched before forwarding/returning the held write");
+    await until(async () => (await rpc.status({}, { location }) as { state: string }).state === "paused", 8_000, "observed drift latched before forwarding/returning the held write");
   }
   f.holding = false; f.released.resolve();
   await transition;

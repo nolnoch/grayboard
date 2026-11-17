@@ -16,6 +16,7 @@ import { assertWrote, audits, hostedRow, releases } from "./server-db.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../../src/server/oauth-config.ts";
 import type { OAuthPrincipal } from "../../../src/server/oauth.ts";
 import { transactionProcess } from "../../../tests/support/transaction-process.ts";
+import { until } from "../../../tests/support/until.ts";
 
 export const transactionScenarios = ["pending-gate", "bind-commit", "register-txn", "attach-revoke", "lease-expire"];
 
@@ -43,12 +44,6 @@ export interface TransactionRace {
 type ToolResult = { isError?: boolean; content?: unknown };
 const RACE = "you@example.com/race";
 
-async function until(read: () => boolean | Promise<boolean>, label: string, ms = 20_000) {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) { if (await read()) return; await Bun.sleep(50); }
-  throw new Error("Transaction race wait expired: " + label);
-}
-
 // The plugin's grant, used out of band: tool calls as any session, on the same MCP endpoint and server.
 async function outOfBand(f: TransactionRace) {
   const client = new Client({ name: "transaction-race", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
@@ -73,7 +68,7 @@ export async function transactionRace(f: TransactionRace) {
     await host.session.switchModel({ sessionID: s.id, model: { providerID: "fixture", id: "fixture" } }); return s.id;
   };
   const root = await create("Transaction race root");
-  await f.enroll(root, "race"); await until(() => row(root)?.lease_deadline != null, "approved root's lease");
+  await f.enroll(root, "race"); await until(() => row(root)?.lease_deadline != null, 20_000, "approved root's lease");
   const oob = await outOfBand(f);
   const sender = "transaction-race-sender";
   await oob.ok(sender, "bind", { name: "sender", create: true });
@@ -96,7 +91,7 @@ export async function transactionRace(f: TransactionRace) {
         assert.deepEqual(auditOf("hosted.lease_closed", before.session_id), [], "The waiting bind closes no lease");
         held.release();
         await bounded(binding, 20_000, "The bind runs once the pending answers");
-        await until(() => paused.text !== undefined, "The held pending answers");
+        await until(() => paused.text !== undefined, 20_000, "The held pending answers");
         assert(!paused.text!.includes('"isError":true') && !paused.text!.includes('"error"'), "The held pending answers its batch, not a refusal: " + paused.text);
         assert(paused.text!.includes("Transaction race pending"), "The held pending's batch carries the DM queued before it answered");
         assert.deepEqual(row(root)!.held, ["race", "be"]);
@@ -120,7 +115,7 @@ export async function transactionRace(f: TransactionRace) {
         assert.equal(dm.recipient, RACE, "Queued for the old name");
         held.release();
         await bounded(binding, 30_000, "The native bind completes");
-        await until(() => cursor(RACE) === dm.id, "The DM reaches the root under the reopened lease", 30_000);
+        await until(() => cursor(RACE) === dm.id, 30_000, "The DM reaches the root under the reopened lease");
         const admitted = f.admissions.filter(a => a.sessionID === root && a.text.includes("Transaction race after commit"));
         assert(admitted.length >= 1 && admitted.every(a => a.id === admitted[0]!.id), "Admitted to the root under one stable id");
         assert.equal(row(root)!.bind_gen, before.bind_gen + 1);
@@ -160,7 +155,7 @@ export async function transactionRace(f: TransactionRace) {
           childCall = f.invoke(child, "dm_send", { to: "sender", body });
           // The plugin registers a new child as soon as it sees it, so the registration may already be on its
           // way when the child's call is made; either way it is sent after the held bind.
-          await until(() => f.calls.slice(mark).some(c => c.name === "session_register" && c.session === root), "The child's registration is sent while the bind is held");
+          await until(() => f.calls.slice(mark).some(c => c.name === "session_register" && c.session === root), 20_000, "The child's registration is sent while the bind is held");
           await waiting.hit();
         }
         assert.equal(row(child), null, "Nothing registered while the first is held");
@@ -186,12 +181,12 @@ export async function transactionRace(f: TransactionRace) {
         // name, no attachment) and the plugin's bind lands under a new G2 ownership. Never both.
         const before = row(root)!, g1 = before.grant_id;
         await f.signIn();
-        await until(async () => await f.rootState(root) === "paused", "The new grant latches receiving approval");
+        await until(async () => await f.rootState(root) === "paused", 20_000, "The new grant latches receiving approval");
         const refresh = db.query<{ hash: string }, [string]>("SELECT hash FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' LIMIT 1").get(g1)!.hash;
         const user = db.query<{ id: number }, [string]>("SELECT id FROM users WHERE email = ?").get("you@example.com")!.id;
         const principal: OAuthPrincipal = { authed: { user_id: user, user_email: "you@example.com", session_id: 0 }, grantId: g1, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "", accessExpiry: 0 };
         const releaseFile = join(f.pauses, "revoke-release");
-        const revoker = transactionProcess("tests/support/hosted-operation.ts", [f.dbPath, f.blobDir, JSON.stringify({ principal, operation: "revoke", refreshHash: refresh, now: Date.now() })], f.boundary === "before" ? "" : "hosted:revoke:in-txn", releaseFile);
+        const revoker = transactionProcess("tests/support/hosted-operation.ts", [f.dbPath, f.blobDir, JSON.stringify({ principal, operation: "revoke", refreshHash: refresh, now: Date.now() })], f.boundary === "before" ? "" : "hosted:revoke:in-txn", releaseFile, "REVOKER");
         try {
           await bounded(revoker.wait("READY"), 20_000, "Revoker ready");
           let binding: Promise<void>;
@@ -207,14 +202,14 @@ export async function transactionRace(f: TransactionRace) {
             await bounded(revoker.wait("test pause hit: hosted:revoke:in-txn"), 10_000, "Revoke held in its transaction");
             const mark = f.calls.length;
             binding = f.invoke(root, "bind", { name: "final", create: true });
-            await until(() => f.calls.slice(mark).some(c => c.name === "bind" && c.session === root), "The G2 owning call is sent while the revoke is held");
+            await until(() => f.calls.slice(mark).some(c => c.name === "bind" && c.session === root), 20_000, "The G2 owning call is sent while the revoke is held");
             await Bun.write(releaseFile, "release");
           }
           assert.equal(await bounded(revoker.proc.exited, 20_000, "Revoker exits"), 0); await revoker.done;
           assert.deepEqual(JSON.parse(revoker.output().trim().split("\n").at(-1)!), { ok: true }, "The revoke commits either way");
           assert.notEqual(db.query<{ revoked_at: number | null }, [string]>("SELECT revoked_at FROM oauth_grants WHERE id = ?").get(g1)?.revoked_at ?? null, null, "G1 is revoked");
           await bounded(binding, 30_000, "The native bind completes");
-        } finally { await Bun.write(releaseFile, "release"); revoker.proc.kill(); await revoker.proc.exited; }
+        } finally { await Bun.write(releaseFile, "release"); await revoker.stop(); }
         const attached = auditOf("hosted.grant_attached", before.session_id);
         const revoked = releases(db).filter(r => r.session_id === before.session_id && r.reason === "revoked");
         if (f.boundary === "before") {
@@ -227,7 +222,7 @@ export async function transactionRace(f: TransactionRace) {
         } else {
           assert.deepEqual(attached, [], "Released first: nothing attaches");
           assert.deepEqual(revoked, [{ session_id: before.session_id, name: RACE, reason: "revoked" }], "One released(revoked) per held name");
-          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, "The plugin's bind lands under a new ownership", 30_000);
+          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, 30_000, "The plugin's bind lands under a new ownership");
           assert.notEqual(row(root)!.grant_id, g1, "The new ownership is G2's");
         }
         console.log("REAL_TXN_ATTACH_REVOKE_OK", JSON.stringify({ boundary: f.boundary, attached: attached.length, revoked: revoked.length }));
@@ -244,9 +239,9 @@ export async function transactionRace(f: TransactionRace) {
         // Its retry opens a new connection, so any request it sends now reaches the held server first.
         const mark = f.methods.length;
         f.outage(false);
-        await until(() => f.methods.slice(mark).some(m => m.subscriber), "The subscriber's retry is sent while the expiry is held", 30_000);
+        await until(() => f.methods.slice(mark).some(m => m.subscriber), 30_000, "The subscriber's retry is sent while the expiry is held");
         held.release();
-        await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.lease_deadline !== null; }, "The plugin reopens under a new ownership", 45_000);
+        await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.lease_deadline !== null; }, 45_000, "The plugin reopens under a new ownership");
         assert.deepEqual(releases(db).filter(r => r.session_id === before.session_id), [{ session_id: before.session_id, name: RACE, reason: "expired" }], "Exactly one released(expired)");
         const ended = db.query<{ end_reason: string | null }, [number]>("SELECT end_reason FROM hosted_ownerships WHERE id = ?").get(before.ownership_id);
         assert.equal(ended?.end_reason, "expired", "The expired ownership stays ended");

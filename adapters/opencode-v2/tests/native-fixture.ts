@@ -46,4 +46,3 @@ export function fixture() {
 }
 
 // Polls a condition for up to a second.
-export async function until(check: () => boolean) { for (let i = 0; i < 200; i++) { if (check()) return; await Bun.sleep(5); } throw new Error("condition timed out"); }

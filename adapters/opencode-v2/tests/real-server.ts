@@ -3,7 +3,7 @@
 // driver and a second writer (tests/support/hosted-operation.ts) keep running. The same OAuth seams as
 // host.ts's in-process server: a fake Google exchange and the saved CIMD document.
 // As a process: prints its port; a stdin line `pause <point> <file>` arms BUS_TEST_PAUSE (replacing any
-// earlier point), answered on stdout. Stops on SIGTERM.
+// earlier point), answered on stdout. Stops on SIGTERM or when its stdin closes (the test process died).
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -23,15 +23,17 @@ export interface RealServer {
   pause(point: string): Promise<HeldPause>;
   // Arms `point` already released: its hit line traces when a path reaches it, without holding it.
   trace(point: string): Promise<Pick<HeldPause, "hit">>;
-  // Abandons any held pause, stops the server and copies its output into this process's log.
+  // Abandons any held pause and stops the server (SIGKILL after 5 s). Its output streams into this
+  // process's log as it arrives, prefixed `REAL_SERVER |`.
   stop(): Promise<void>;
 }
 
 // `dir` holds the pause files; deleting it abandons a held pause, so the server exits instead of hanging.
 export async function spawnRealServer(config: Config, dir: string): Promise<RealServer> {
   mkdirSync(dir, { recursive: true });
-  const child = transactionProcess("adapters/opencode-v2/tests/real-server.ts", [JSON.stringify(config)], "", "");
-  await bounded(child.wait("REAL_SERVER_PORT "), 20_000, "Real server process listening");
+  const child = transactionProcess("adapters/opencode-v2/tests/real-server.ts", [JSON.stringify(config)], "", "", "REAL_SERVER");
+  try { await bounded(child.wait("REAL_SERVER_PORT "), 20_000, "Real server process listening"); }
+  catch (e) { await child.stop(); throw e; }
   const port = Number(/REAL_SERVER_PORT (\d+)/.exec(child.output())![1]);
   const count = (text: string) => child.errors().split(text).length - 1;
   let files = 0, commands = 0;
@@ -58,8 +60,7 @@ export async function spawnRealServer(config: Config, dir: string): Promise<Real
     },
     async stop() {
       rmSync(dir, { recursive: true, force: true });
-      child.proc.kill("SIGTERM"); await child.proc.exited; await child.done;
-      for (const line of (child.output() + child.errors()).split("\n").filter(Boolean)) console.log("REAL_SERVER | " + line);
+      await child.stop();
     },
   };
 }
@@ -73,7 +74,8 @@ if (import.meta.main) {
       read: async url => { if (url.href !== OPENCODE_CLIENT) throw new Error("Unexpected CIMD URL"); return savedClientMetadata(url); },
     },
   } });
-  process.on("SIGTERM", () => { void app.stop().finally(() => process.exit(0)); });
+  const exit = () => { void app.stop().finally(() => process.exit(0)); };
+  process.on("SIGTERM", exit);
   console.log("REAL_SERVER_PORT " + app.server.port);
   for await (const line of createInterface({ input: process.stdin })) {
     const [command, point, file] = line.split(" ");
@@ -81,4 +83,5 @@ if (import.meta.main) {
     process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
     console.log("REAL_SERVER_ARMED " + line);
   }
+  exit();
 }

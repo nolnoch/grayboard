@@ -19,7 +19,7 @@ import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
 import { channelInstructions, DEFAULT_CHANNEL_SOURCE } from "../../../src/core/tools.ts";
 import { launcherInstruction } from "../../../src/core/delegation.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
-import { spawnRealServer } from "./real-server.ts";
+import { spawnRealServer, type RealServer } from "./real-server.ts";
 import { transactionRace, transactionScenarios, type SeenMethod, type SeenRead } from "./real-transactions.ts";
 import { observeSubscriberWork } from "./subscriber-work.ts";
 import { FailedContinuation } from "./failed-continuation.js";
@@ -49,7 +49,8 @@ let app = start();
 // transactions holds the server alone; this process's in-process server stops before anything uses it.
 const transactionCase = transactionScenarios.includes(process.env.GRAYBOARD_TEST_REAL_RACE ?? "");
 if (transactionCase) await app.stop();
-const realServer = transactionCase ? await spawnRealServer(config, join(root, "pauses")) : undefined;
+// Spawned under the try below, so the finally stops it whatever fails after.
+let realServer: RealServer | undefined;
 // The fixture model's next tool call, issued only to a request carrying the
 // invoking prompt's nonce: a bus delivery can wake another session meanwhile,
 // and its model turn must not take the call.
@@ -189,6 +190,7 @@ const row = (raw: string) => hostedRow(app.db, raw);
 const wrote = (tool: string, sessionID: string, rootID: string) => assertWrote(app.db, tool, row(sessionID)!, row(rootID)!, OPENCODE_CLIENT);
 const makeRoot = (title: string) => host!.session.create({ location, title, permissions: [{ action: "*", resource: "*", effect: "allow" }] });
 try {
+  if (transactionCase) realServer = await spawnRealServer(config, join(root, "pauses"));
   host = await createHost(); await host.agent.list({ location }); await wait(() => ctx, Boolean, "fixture setup");
   const native = await wait(async () => (await ctx.mcp.list()).data.find(x => x.name === "grayboard"), x => x?.status.status === "needs_auth", "native discovery"); assert(native?.integrationID);
   const selected = await signIn(native.integrationID); assert(selected?.type === "credential");
