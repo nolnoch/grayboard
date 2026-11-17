@@ -7,7 +7,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localEnv } from "../support/env.ts";
@@ -446,6 +446,39 @@ test("opencode: a grayboard process that answers initialize with an error is res
   await until(() => grayboardChildPids(oc.pid).length === 0, 5_000, "no grayboard process left");
   await oc.send("dispose");
 }, 60_000);
+
+// A `grayboard/session` handshake answered with an error, at the child's
+// start (#1142) or at a root switch (#1145), restarts the process at once,
+// and the replacement serves the selected root. Only that one request is
+// refused; everything else reaches the real grayboard.
+for (const [n, phase, reason] of [[1, "start", "failed to initialize"], [2, "switch", "failed its session switch"]] as const) {
+  test(`opencode: a grayboard process whose ${phase} handshake is answered with an error is restarted at once, and the replacement serves the selected root (#1142, #1145)`, async () => {
+    const counter = join(dir, "session-calls");
+    const oc = driver("oc", entry({ command: [process.execPath, REFUSING_MCP, "--session", counter, String(n), process.execPath, CLI, "mcp", "--mode", "local"] }));
+    await oc.send("init");
+    await oc.send("event", { event: { type: "session.created", properties: { info: { id: "s1" } } } });
+    let first: number | undefined;
+    if (phase === "switch") {
+      expect(JSON.parse(await oc.send("call", { sessionID: "s1", tool: "grayboard_whoami", args: {} })).id).toBeString();
+      [first] = grayboardChildPids(oc.pid);
+      await oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
+    }
+    const target = phase === "start" ? "s1" : "s2";
+    await until(async () => (await oc.send("state")).toasts.some((t: string) => t.includes(`grayboard process ${reason}: grayboard: refused for test; restarting it (1 of 3)`)), 15_000, "the restart notice");
+    const who = JSON.parse(await oc.send("call", { sessionID: target, tool: "grayboard_whoami", args: {} }));
+    const db = new Database(join(dir, "bus.db"), { readonly: true });
+    try { expect(db.query("SELECT harness_session FROM ids WHERE id = ?").get(who.id)).toEqual({ harness_session: target }); }
+    finally { db.close(); }
+    expect(readFileSync(counter, "utf8")).toBe(String(n + 1));
+    const live = grayboardChildPids(oc.pid);
+    expect(live).toHaveLength(1);
+    if (first !== undefined) expect(live).not.toContain(first);
+    const toasts: string[] = (await oc.send("state")).toasts;
+    expect(toasts.filter((t) => t.includes("restarting it"))).toHaveLength(1);
+    expect(toasts.filter((t) => t.includes("transition failed"))).toEqual([]);
+    await oc.send("dispose");
+  }, 60_000);
+}
 
 test("opencode: child instructions skip restart backoff and degrade to none after exhaustion", async () => {
   // The real retry sequence waits 0 + 1 + 5 seconds; retain the driver's
