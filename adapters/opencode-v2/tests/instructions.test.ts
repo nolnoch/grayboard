@@ -424,6 +424,11 @@ test("the native fetcher registers a subagent under its enrolled root before nam
     expect(order).toEqual([`register R {"child":"X"}`]);
     // The fetch reports its own failure; the refusal doesn't degrade the root.
     expect(records.filter(r => r.operation === "child_register")).toEqual([]);
+    // A fetch whose entry was forgotten (its signal aborted) while it registered names no wire (#567).
+    order.length = 0;
+    const forgotten = new AbortController(); forgotten.abort();
+    expect(await fetch("G", forgotten.signal)).toBeUndefined();
+    expect(order).toEqual([`register R {"child":"G","via":["C"]}`]);
   } finally {
     await controller.close();
     instructions.mockRestore(); connect.mockRestore(); close.mockRestore();
