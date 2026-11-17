@@ -454,10 +454,14 @@ test("#1016: a Slack reply in a thread whose row waits in the write queue reache
     const top = await until(() => slack.posts().find((p) => p.markdown_text?.includes("thread fixture") && slack.postTs.has(p)), 5000, "Slack answered the post");
     const userId = srv.app.repo.users.findByEmail("alice@example.com")!.id;
     expect(srv.app.repo.slack.threadByTs(srv.app.repo.read, userId, tsOf(top))).toBeUndefined();
-    // The reply's dm_send queues behind the hold too: its write is the sign the relay read the thread's row.
+    // The reply's dm_send queues behind the hold too: a write the Slack bridge starts is the sign the relay read the
+    // thread's row. Its bus call reaches repo.write before any await, so the bridge is on the stack.
     const repo = srv.app.repo, { write } = repo;
     let writes = 0;
-    repo.write = ((...a: Parameters<typeof write>) => { writes++; return write.apply(repo, a); }) as typeof write;
+    repo.write = ((...a: Parameters<typeof write>) => {
+      if (new Error().stack?.includes("/src/server/slack.ts")) writes++;
+      return write.apply(repo, a);
+    }) as typeof write;
     const seen = slack.posts().length;
     try {
       slack.say("queued reply", { thread_ts: tsOf(top) });

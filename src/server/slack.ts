@@ -324,7 +324,8 @@ export class SlackBridge implements SlackLinker {
     // behind another body's hold, and its reads go to committed state, so a read could miss the relay's own earlier
     // write (#1016): a second item in a new thread posted unthreaded, a stale peer, a retry's stale progress. Until its
     // last write commits, a row's value as those writes leave it is kept here, and reads take it first. An entry is
-    // dropped by the commit of the write that last set it; one whose write failed stays: the relay did what it records.
+    // dropped by the commit of the write that last set it. One whose write failed stays, best effort, until a later
+    // write on that row commits: the relay did what it records.
     let seq = 0;
     const pendingThreads = new Map<string, { row: SlackThread; seq: number }>();
     const pendingProgress = new Map<string, { value: unknown; seq: number }>();
