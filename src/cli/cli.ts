@@ -1,7 +1,7 @@
 // The grayboard CLI. Loaded by main.ts (the entry) for every command but a
 // hook, so a hook doesn't pay for this module's imports (#551).
 import { Command } from "commander";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync, realpathSync, statSync, openSync, fchmodSync, writeSync, fsyncSync, closeSync, renameSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync, readlinkSync, statSync, accessSync, constants, openSync, fchmodSync, fchownSync, writeSync, fsyncSync, closeSync, renameSync, type Stats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
@@ -198,24 +198,44 @@ function readConfig<T extends object>(path: string, empty: T): T {
   return value as T;
 }
 
+/** The file a write to `path` lands in: its symlinks followed, a dangling one's target included. */
+function writeTarget(path: string): string {
+  let target = path;
+  for (let hops = 0; hops < 40; hops++) {
+    try { if (!lstatSync(target).isSymbolicLink()) return target; } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return target;
+      throw e;
+    }
+    target = resolve(dirname(target), readlinkSync(target));
+  }
+  throw new Error(`Can't write ${path}: too many levels of symbolic links`);
+}
+
 /**
  * Replace a harness's JSON config atomically (#439): a temp file beside it,
  * synced, then renamed over it, so a crash leaves the old file or the new
- * one, never a truncated one. A symlinked config is written at its target,
- * keeping the link, and an existing file keeps its mode.
+ * one, never a truncated one. A symlinked config, dangling or not, is
+ * written at its target, keeping the link. An existing file keeps its mode
+ * and, where this user may set them, its owner and group; one this user
+ * can't write is refused, as an in-place write would be. A hard-linked
+ * config is split from its other links.
  */
 function writeConfig(path: string, cfg: object): void {
-  let target = path;
-  let mode: number | undefined;
-  try { target = realpathSync(path); mode = statSync(target).mode & 0o7777; } catch (e) {
+  const target = writeTarget(path);
+  let old: Stats | undefined;
+  try { old = statSync(target); } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
+  if (old) accessSync(target, constants.W_OK);
   mkdirSync(dirname(target), { recursive: true });
   const temp = `${target}.grayboard-${process.pid}-${randomUUID()}.tmp`;
-  const fd = openSync(temp, "wx", mode ?? 0o666);
+  const fd = openSync(temp, "wx", old ? old.mode & 0o7777 : 0o666);
   try {
     try {
-      if (mode !== undefined) fchmodSync(fd, mode); // the umask may have narrowed it
+      if (old) {
+        try { fchownSync(fd, old.uid, old.gid); } catch {} // only root may give a file away
+        fchmodSync(fd, old.mode & 0o7777); // after chown, which clears setuid bits; the umask may have narrowed it
+      }
       writeSync(fd, JSON.stringify(cfg, null, 2) + "\n");
       fsyncSync(fd);
     } finally { closeSync(fd); }
